@@ -12,13 +12,17 @@ This is NOT cluster membership - just health monitoring using probe/ack.
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Awaitable, Any
 
 from hyperscale.distributed.models import Message
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class DCReachability(Enum):
@@ -95,7 +99,7 @@ class DCLeaderAnnouncement(Message):
     leader_tcp_addr: tuple[str, int]
     leader_udp_addr: tuple[str, int]
     term: int
-    timestamp: float = field(default_factory=time.time)
+    timestamp: float = field(default_factory=_DEFAULT_CLOCK.time)
 
 
 @dataclass(slots=True)
@@ -417,7 +421,7 @@ class FederatedHealthMonitor:
             try:
                 dcs = list(self._dc_health.keys())
                 if not dcs:
-                    await asyncio.sleep(self.probe_interval)
+                    await _DEFAULT_CLOCK.sleep(self.probe_interval)
                     continue
 
                 # Probe each DC with interval spread across all DCs
@@ -428,7 +432,7 @@ class FederatedHealthMonitor:
                         break
                     await self._probe_datacenter(dc)
                     self._check_ack_timeouts()
-                    await asyncio.sleep(interval_per_dc)
+                    await _DEFAULT_CLOCK.sleep(interval_per_dc)
 
             except asyncio.CancelledError:
                 await self._log_error("Probe loop cancelled")
@@ -446,7 +450,7 @@ class FederatedHealthMonitor:
                         )
                 else:
                     await self._log_error(f"Probe loop error: {error}")
-                await asyncio.sleep(1.0)
+                await _DEFAULT_CLOCK.sleep(1.0)
 
     async def _probe_datacenter(self, datacenter: str) -> None:
         """Send a probe to a datacenter's leader."""
@@ -464,12 +468,12 @@ class FederatedHealthMonitor:
             source_addr=(self.node_id, 0),  # Will be filled by transport
         )
 
-        state.last_probe_sent = time.monotonic()
+        state.last_probe_sent = _DEFAULT_CLOCK.monotonic()
 
         # Send probe (with timeout)
         try:
             probe_data = b"xprobe>" + probe.dump()
-            success = await asyncio.wait_for(
+            success = await _DEFAULT_CLOCK.wait_for(
                 self._send_udp(state.leader_udp_addr, probe_data),
                 timeout=self.probe_timeout,
             )
@@ -501,7 +505,7 @@ class FederatedHealthMonitor:
         never-acked DC remains UNKNOWN so "not yet established" is not treated
         as confirmed reachability failure.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         ack_grace_period = self.probe_timeout * self.max_consecutive_failures
 
         for state in self._dc_health.values():
@@ -545,9 +549,9 @@ class FederatedHealthMonitor:
         if state.consecutive_failures >= self.max_consecutive_failures:
             if state.reachability == DCReachability.REACHABLE:
                 state.reachability = DCReachability.SUSPECTED
-                state.suspected_at = time.monotonic()
+                state.suspected_at = _DEFAULT_CLOCK.monotonic()
             elif state.reachability == DCReachability.SUSPECTED:
-                if time.monotonic() - state.suspected_at > self.suspicion_timeout:
+                if _DEFAULT_CLOCK.monotonic() - state.suspected_at > self.suspicion_timeout:
                     state.reachability = DCReachability.UNREACHABLE
 
         if state.reachability != old_reachability and self._on_dc_health_change:
@@ -573,7 +577,7 @@ class FederatedHealthMonitor:
         old_reachability = state.reachability
         old_health = state.effective_health
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Calculate latency for cross-DC correlation (Phase 7)
         # Latency = time between sending probe and receiving ack

@@ -1,5 +1,4 @@
-import time
-
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.models.coordinates import (
     NetworkCoordinate,
     VivaldiConfig,
@@ -7,6 +6,9 @@ from hyperscale.distributed.models.coordinates import (
 from hyperscale.distributed.swim.coordinates.coordinate_engine import (
     NetworkCoordinateEngine,
 )
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class CoordinateTracker:
@@ -21,10 +23,13 @@ class CoordinateTracker:
         self,
         engine: NetworkCoordinateEngine | None = None,
         config: VivaldiConfig | None = None,
+        *,
+        clock: Clock | None = None,
     ) -> None:
         self._engine = engine or NetworkCoordinateEngine(config=config)
         self._peers: dict[str, NetworkCoordinate] = {}
         self._peer_last_seen: dict[str, float] = {}
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
 
     def get_coordinate(self) -> NetworkCoordinate:
         """Get the local node's coordinate."""
@@ -53,7 +58,7 @@ class CoordinateTracker:
             return self.get_coordinate()
 
         self._peers[peer_id] = peer_coordinate
-        self._peer_last_seen[peer_id] = time.monotonic()
+        self._peer_last_seen[peer_id] = self._clock.monotonic()
         return self._engine.update_with_rtt(peer_coordinate, rtt_ms / 1000.0)
 
     def estimate_rtt_ms(self, peer_coordinate: NetworkCoordinate) -> float:
@@ -132,7 +137,7 @@ class CoordinateTracker:
         if max_age_seconds is None:
             max_age_seconds = self._engine.get_config().coord_ttl_seconds
 
-        now = time.monotonic()
+        now = self._clock.monotonic()
         stale_peers = [
             peer_id
             for peer_id, last_seen in self._peer_last_seen.items()

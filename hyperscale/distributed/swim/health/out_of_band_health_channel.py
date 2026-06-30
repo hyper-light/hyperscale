@@ -24,11 +24,15 @@ Integration:
 
 import asyncio
 import socket
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 # Message format: single byte type + payload
@@ -119,7 +123,7 @@ class OutOfBandHealthChannel:
     # Rate limiting
     _last_probe_time: dict[tuple[str, int], float] = field(default_factory=dict)
     _global_probe_count: int = 0
-    _global_probe_window_start: float = field(default_factory=time.monotonic)
+    _global_probe_window_start: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
 
     # Callback for when we receive a probe (to generate response)
     _is_overloaded: Callable[[], bool] | None = None
@@ -236,7 +240,7 @@ class OutOfBandHealthChannel:
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending_probes[target] = future
 
-        start_time = time.monotonic()
+        start_time = _DEFAULT_CLOCK.monotonic()
 
         try:
             # Send probe
@@ -247,16 +251,16 @@ class OutOfBandHealthChannel:
                 target,
             )
             self._probes_sent += 1
-            self._last_probe_time[target] = time.monotonic()
+            self._last_probe_time[target] = _DEFAULT_CLOCK.monotonic()
 
             # Wait for response
             try:
-                response = await asyncio.wait_for(
+                response = await _DEFAULT_CLOCK.wait_for(
                     future,
                     timeout=self.config.probe_timeout_seconds,
                 )
 
-                latency = (time.monotonic() - start_time) * 1000
+                latency = (_DEFAULT_CLOCK.monotonic() - start_time) * 1000
                 is_overloaded = response == OOB_NACK
 
                 return OOBProbeResult(
@@ -272,7 +276,7 @@ class OutOfBandHealthChannel:
                     target=target,
                     success=False,
                     is_overloaded=False,
-                    latency_ms=(time.monotonic() - start_time) * 1000,
+                    latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
                     error="Timeout",
                 )
 
@@ -283,7 +287,7 @@ class OutOfBandHealthChannel:
                     target=target,
                     success=False,
                     is_overloaded=False,
-                    latency_ms=(time.monotonic() - start_time) * 1000,
+                    latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
                     error="Cancelled",
                 )
 
@@ -293,7 +297,7 @@ class OutOfBandHealthChannel:
                 target=target,
                 success=False,
                 is_overloaded=False,
-                latency_ms=(time.monotonic() - start_time) * 1000,
+                latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
                 error="Cancelled",
             )
 
@@ -302,7 +306,7 @@ class OutOfBandHealthChannel:
                 target=target,
                 success=False,
                 is_overloaded=False,
-                latency_ms=(time.monotonic() - start_time) * 1000,
+                latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
                 error=str(e),
             )
 
@@ -409,7 +413,7 @@ class OutOfBandHealthChannel:
 
     def _check_rate_limit(self, target: tuple[str, int]) -> bool:
         """Check if we can send a probe (rate limiting)."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Per-target cooldown
         last_probe = self._last_probe_time.get(target, 0)
@@ -434,7 +438,7 @@ class OutOfBandHealthChannel:
         Returns:
             Number of entries removed
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         stale = [
             target
             for target, last_time in self._last_probe_time.items()

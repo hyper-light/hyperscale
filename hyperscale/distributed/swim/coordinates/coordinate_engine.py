@@ -1,11 +1,14 @@
 import math
-import time
 from typing import Iterable
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.models.coordinates import (
     NetworkCoordinate,
     VivaldiConfig,
 )
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class NetworkCoordinateEngine:
@@ -20,7 +23,10 @@ class NetworkCoordinateEngine:
         adjustment_smoothing: float = 0.05,
         min_error: float = 0.05,
         max_error: float = 10.0,
+        *,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
         # Use config if provided, otherwise use individual parameters
         self._config = config or VivaldiConfig(
             dimensions=dimensions,
@@ -92,7 +98,7 @@ class NetworkCoordinateEngine:
         self._coordinate.error = self._clamp(
             new_error, self._min_error, self._max_error
         )
-        self._coordinate.updated_at = time.monotonic()
+        self._coordinate.updated_at = self._clock.monotonic()
         self._coordinate.sample_count += 1
 
         return self.get_coordinate()
@@ -216,7 +222,7 @@ class NetworkCoordinateEngine:
         )
 
         # Staleness quality: degrades after coord_ttl_seconds
-        staleness_seconds = time.monotonic() - coord.updated_at
+        staleness_seconds = self._clock.monotonic() - coord.updated_at
         if staleness_seconds <= self._config.coord_ttl_seconds:
             staleness_quality = 1.0
         else:

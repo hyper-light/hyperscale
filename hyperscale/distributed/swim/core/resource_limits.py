@@ -5,10 +5,14 @@ Provides bounded data structures that prevent unbounded memory growth
 in high-churn distributed environments.
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import TypeVar, Generic, Callable, Any
 from collections import OrderedDict
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 K = TypeVar('K')
 V = TypeVar('V')
@@ -95,7 +99,7 @@ class BoundedDict(Generic[K, V]):
             self._data[key] = value
             # Only track add time for LRA/OLDEST policies
             if self.eviction_policy in ('LRA', 'OLDEST'):
-                self._add_times[key] = time.monotonic()
+                self._add_times[key] = _DEFAULT_CLOCK.monotonic()
     
     def __delitem__(self, key: K) -> None:
         if key in self._data:
@@ -192,7 +196,7 @@ class BoundedDict(Generic[K, V]):
         Returns:
             Number of entries removed.
         """
-        cutoff = time.monotonic() - max_age_seconds
+        cutoff = _DEFAULT_CLOCK.monotonic() - max_age_seconds
         return self.cleanup_by_predicate(
             lambda k, _: self._add_times.get(k, 0) < cutoff
         )

@@ -14,7 +14,6 @@ from typing import Callable, Awaitable, Any
 from collections import deque
 from enum import Enum, auto
 import asyncio
-import time
 import traceback
 from hyperscale.logging.hyperscale_logging_models import ServerError
 
@@ -29,6 +28,11 @@ from .errors import (
     InternalError,
     UnexpectedError,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class CircuitState(Enum):
@@ -100,7 +104,7 @@ class ErrorStats:
 
     def record_error(self) -> None:
         """Record an error occurrence."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         self._timestamps.append(now)  # Deque maxlen handles overflow automatically
         self._prune_old_entries(now)
         error_count = len(self._timestamps)
@@ -148,7 +152,7 @@ class ErrorStats:
             self._timestamps.clear()
         elif current_state == CircuitState.CLOSED:
             # Prune old entries to keep window current
-            self._prune_old_entries(time.monotonic())
+            self._prune_old_entries(_DEFAULT_CLOCK.monotonic())
 
     def _prune_old_entries(self, now: float) -> None:
         """Remove entries outside the window."""
@@ -159,7 +163,7 @@ class ErrorStats:
     @property
     def error_count(self) -> int:
         """Number of errors in current window."""
-        self._prune_old_entries(time.monotonic())
+        self._prune_old_entries(_DEFAULT_CLOCK.monotonic())
         return len(self._timestamps)
 
     @property
@@ -173,7 +177,7 @@ class ErrorStats:
     @property
     def circuit_state(self) -> CircuitState:
         """Get current circuit state, transitioning to half-open if appropriate."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         if self._circuit_state == CircuitState.OPEN:
             if self._circuit_opened_at is None:
                 self._circuit_opened_at = now

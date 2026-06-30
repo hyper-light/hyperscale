@@ -4,12 +4,16 @@ Gossip buffer for SWIM membership update dissemination.
 
 import heapq
 import math
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..core.types import UpdateType
 from .piggyback_update import PiggybackUpdate
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 # UDP MTU considerations:
@@ -114,7 +118,7 @@ class GossipBuffer:
                 update_type=update_type,
                 node=node,
                 incarnation=incarnation,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
                 role=role,
                 node_id=node_id,
@@ -126,7 +130,7 @@ class GossipBuffer:
                 update_type=update_type,
                 node=node,
                 incarnation=incarnation,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
                 role=role,
                 node_id=node_id,
@@ -140,7 +144,7 @@ class GossipBuffer:
                     update_type=update_type,
                     node=node,
                     incarnation=incarnation,
-                    timestamp=time.monotonic(),
+                    timestamp=_DEFAULT_CLOCK.monotonic(),
                     max_broadcasts=max_broadcasts,
                     role=role,
                     node_id=node_id,
@@ -362,7 +366,7 @@ class GossipBuffer:
         Returns:
             Number of stale updates removed.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.stale_age_seconds
         
         to_remove = []

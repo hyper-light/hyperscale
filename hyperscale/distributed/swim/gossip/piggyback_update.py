@@ -3,12 +3,16 @@ Piggyback update for SWIM gossip dissemination.
 """
 
 import sys
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..core.constants import DELIM_COLON, encode_int
 from ..core.types import UpdateType
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from typing import Self
@@ -133,7 +137,7 @@ class PiggybackUpdate:
                 update_type=update_type,
                 node=(host, port),
                 incarnation=incarnation,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 role=role,
                 node_id=node_id,
             )

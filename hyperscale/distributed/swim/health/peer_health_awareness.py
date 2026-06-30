@@ -18,12 +18,16 @@ This integrates with:
 - ProbeScheduler: May reorder probing to prefer healthy peers
 """
 
-import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable
 
 from hyperscale.distributed.health.tracker import HealthPiggyback
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class PeerLoadLevel(IntEnum):
@@ -81,7 +85,7 @@ class PeerHealthInfo:
 
     def is_stale(self, max_age_seconds: float = 30.0) -> bool:
         """Check if this info is stale."""
-        return (time.monotonic() - self.last_update) > max_age_seconds
+        return (_DEFAULT_CLOCK.monotonic() - self.last_update) > max_age_seconds
 
     @classmethod
     def from_piggyback(cls, piggyback: HealthPiggyback) -> "PeerHealthInfo":
@@ -98,7 +102,7 @@ class PeerHealthInfo:
             capacity=piggyback.capacity,
             throughput=piggyback.throughput,
             expected_throughput=piggyback.expected_throughput,
-            last_update=time.monotonic(),
+            last_update=_DEFAULT_CLOCK.monotonic(),
         )
 
 

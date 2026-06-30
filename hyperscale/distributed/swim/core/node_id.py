@@ -6,8 +6,12 @@ for human-readable, sortable, unique node identification.
 """
 
 from dataclasses import dataclass, field
-import time
 import uuid
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(frozen=True)
@@ -33,7 +37,7 @@ class NodeId:
     
     datacenter: str
     priority: int
-    created_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    created_ms: int = field(default_factory=lambda: int(_DEFAULT_CLOCK.time() * 1000))
     random: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     
     def __post_init__(self):
@@ -84,7 +88,7 @@ class NodeId:
     @property
     def age_seconds(self) -> float:
         """How old this node ID is in seconds."""
-        return (time.time() * 1000 - self.created_ms) / 1000
+        return (_DEFAULT_CLOCK.time() * 1000 - self.created_ms) / 1000
     
     @classmethod
     def parse(cls, s: str) -> 'NodeId':

@@ -7,7 +7,6 @@ is under stress.
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable, Any
 from collections import deque
@@ -16,6 +15,11 @@ from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
 from ..core.protocols import LoggerProtocol, TaskRunnerProtocol
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -198,18 +202,18 @@ class EventLoopHealthMonitor:
             try:
                 sample = await self._take_sample()
                 await self._process_sample(sample)
-                await asyncio.sleep(self.sample_interval)
+                await _DEFAULT_CLOCK.sleep(self.sample_interval)
             except asyncio.CancelledError:
                 break
             except Exception:
                 # Don't let monitoring errors crash the node
-                await asyncio.sleep(self.sample_interval)
+                await _DEFAULT_CLOCK.sleep(self.sample_interval)
     
     async def _take_sample(self) -> HealthSample:
         """Take a single health measurement."""
-        start = time.monotonic()
-        await asyncio.sleep(self.expected_sleep)
-        end = time.monotonic()
+        start = _DEFAULT_CLOCK.monotonic()
+        await _DEFAULT_CLOCK.sleep(self.expected_sleep)
+        end = _DEFAULT_CLOCK.monotonic()
         
         actual = end - start
         lag_ratio = (actual - self.expected_sleep) / self.expected_sleep
@@ -405,8 +409,8 @@ async def measure_event_loop_lag() -> float:
         Lag ratio (0.0 = no lag, 1.0 = 100% lag)
     """
     expected = 0.01
-    start = time.monotonic()
-    await asyncio.sleep(expected)
-    actual = time.monotonic() - start
+    start = _DEFAULT_CLOCK.monotonic()
+    await _DEFAULT_CLOCK.sleep(expected)
+    actual = _DEFAULT_CLOCK.monotonic() - start
     return (actual - expected) / expected
 

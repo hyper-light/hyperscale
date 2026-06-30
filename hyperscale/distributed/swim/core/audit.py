@@ -4,13 +4,17 @@ Audit trail for SWIM membership and leadership changes.
 Provides a bounded event log for debugging and compliance.
 """
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 from collections import deque
 
 from .protocols import LoggerProtocol
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class AuditEventType(Enum):
@@ -111,7 +115,7 @@ class AuditLog:
         
         event = AuditEvent(
             event_type=event_type,
-            timestamp=time.time(),  # Wall-clock time for audit
+            timestamp=_DEFAULT_CLOCK.time(),  # Wall-clock time for audit
             node=node,
             details=details,
         )

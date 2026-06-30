@@ -7,7 +7,6 @@ managers using the same O(log n) piggyback strategy as membership gossip.
 
 import heapq
 import math
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +14,11 @@ from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
     WorkerStatePiggybackUpdate,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 MAX_WORKER_STATE_PIGGYBACK_SIZE = 600
 
@@ -81,7 +85,7 @@ class WorkerStateGossipBuffer:
         if existing is None:
             self.updates[worker_id] = WorkerStatePiggybackUpdate(
                 update=update,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
             )
             return True
@@ -89,7 +93,7 @@ class WorkerStateGossipBuffer:
         if update.incarnation > existing.update.incarnation:
             self.updates[worker_id] = WorkerStatePiggybackUpdate(
                 update=update,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
             )
             return True
@@ -98,7 +102,7 @@ class WorkerStateGossipBuffer:
             if update.is_dead_state() and existing.update.is_alive_state():
                 self.updates[worker_id] = WorkerStatePiggybackUpdate(
                     update=update,
-                    timestamp=time.monotonic(),
+                    timestamp=_DEFAULT_CLOCK.monotonic(),
                     max_broadcasts=max_broadcasts,
                 )
                 return True
@@ -233,7 +237,7 @@ class WorkerStateGossipBuffer:
         return evicted
 
     def cleanup_stale(self) -> int:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.stale_age_seconds
 
         to_remove = [

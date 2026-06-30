@@ -4,11 +4,15 @@ Simple metrics collection for SWIM protocol.
 Provides counters and gauges for monitoring key events.
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from .protocols import LoggerProtocol
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -79,7 +83,7 @@ class Metrics:
     messages_deduplicated: int = 0
     
     # Start time for uptime calculation
-    _start_time: float = field(default_factory=time.monotonic)
+    _start_time: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     
     # Logger for structured logging (optional)
     _logger: LoggerProtocol | None = None
@@ -160,7 +164,7 @@ class Metrics:
     
     def uptime(self) -> float:
         """Get uptime in seconds."""
-        return time.monotonic() - self._start_time
+        return _DEFAULT_CLOCK.monotonic() - self._start_time
     
     def to_dict(self) -> dict[str, Any]:
         """Export all metrics as a dictionary."""
@@ -225,5 +229,5 @@ class Metrics:
         for name in dir(self):
             if not name.startswith('_') and isinstance(getattr(self, name), int):
                 setattr(self, name, 0)
-        self._start_time = time.monotonic()
+        self._start_time = _DEFAULT_CLOCK.monotonic()
         self._saturated_counters.clear()

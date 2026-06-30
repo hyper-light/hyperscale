@@ -17,12 +17,16 @@ This integrates with the Lifeguard LHM (Local Health Multiplier) by:
 """
 
 import heapq
-import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable
 
 from hyperscale.distributed.health.tracker import HealthPiggyback
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class OverloadSeverity(IntEnum):
@@ -146,7 +150,7 @@ class HealthGossipEntry:
 
             return cls(
                 health=health,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
             )
         except (ValueError, UnicodeDecodeError, IndexError):
             return None
@@ -297,7 +301,7 @@ class HealthGossipBuffer:
 
         self._entries[health.node_id] = HealthGossipEntry(
             health=health,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             broadcast_count=broadcast_count,
             max_broadcasts=max_broadcasts,
         )

@@ -16,13 +16,17 @@ from __future__ import annotations
 
 import heapq
 import math
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from hyperscale.distributed.health.extension_outcome import (
     ExtensionOutcomeEvent,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 MAX_EXTENSION_OUTCOME_PIGGYBACK_SIZE: int = 600
@@ -105,7 +109,7 @@ class ExtensionOutcomeGossipBuffer:
         if existing is None:
             self.updates[event_id] = ExtensionOutcomePiggybackUpdate(
                 event=event,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
             )
             return True
@@ -113,7 +117,7 @@ class ExtensionOutcomeGossipBuffer:
         if event.leader_term > existing.event.leader_term:
             self.updates[event_id] = ExtensionOutcomePiggybackUpdate(
                 event=event,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
             )
             return True
@@ -245,7 +249,7 @@ class ExtensionOutcomeGossipBuffer:
         return evicted
 
     def cleanup_stale(self) -> int:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.stale_age_seconds
 
         to_remove = [

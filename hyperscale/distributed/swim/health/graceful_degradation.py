@@ -8,7 +8,6 @@ When a node is overloaded (high LHM, event loop lag, etc.), it should:
 4. Shed load progressively
 """
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Any
@@ -17,6 +16,11 @@ from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
 from ..core.protocols import LoggerProtocol
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class DegradationLevel(Enum):
@@ -157,7 +161,7 @@ class GracefulDegradation:
     
     # Current state
     _current_level: DegradationLevel = DegradationLevel.NORMAL
-    _level_entered_at: float = field(default_factory=time.monotonic)
+    _level_entered_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     _min_level_duration: float = 5.0  # Min seconds at a level before changing
     
     # Callbacks
@@ -207,7 +211,7 @@ class GracefulDegradation:
                 pass  # Don't let logging errors propagate
     
     def __post_init__(self):
-        self._level_entered_at = time.monotonic()
+        self._level_entered_at = _DEFAULT_CLOCK.monotonic()
     
     def set_health_callbacks(
         self,
@@ -230,7 +234,7 @@ class GracefulDegradation:
         new_level = self._calculate_level()
         
         # Check if we can change level (hysteresis)
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         time_at_level = now - self._level_entered_at
         
         if new_level != self._current_level and time_at_level >= self._min_level_duration:
@@ -385,7 +389,7 @@ class GracefulDegradation:
         if level != self._current_level:
             old_level = self._current_level
             self._current_level = level
-            self._level_entered_at = time.monotonic()
+            self._level_entered_at = _DEFAULT_CLOCK.monotonic()
             if self._on_level_change:
                 try:
                     self._on_level_change(old_level, level)
@@ -415,6 +419,6 @@ class GracefulDegradation:
             'level_changes': self._level_changes,
             'probes_skipped': self._probes_skipped,
             'gossips_skipped': self._gossips_skipped,
-            'time_at_level': time.monotonic() - self._level_entered_at,
+            'time_at_level': _DEFAULT_CLOCK.monotonic() - self._level_entered_at,
         }
 

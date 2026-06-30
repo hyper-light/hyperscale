@@ -17,7 +17,6 @@ alongside membership gossip.
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import Protocol, Callable, Any
-import time
 
 from hyperscale.distributed.models import (
     WorkerHeartbeat,
@@ -27,6 +26,11 @@ from hyperscale.distributed.models import (
 from hyperscale.distributed.models.coordinates import NetworkCoordinate
 from hyperscale.distributed.health.tracker import HealthPiggyback
 from typing import cast
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 # Maximum size for probe RTT cache to prevent unbounded memory growth
 _PROBE_RTT_CACHE_MAX_SIZE = 100
@@ -297,7 +301,7 @@ class WorkerStateEmbedder:
             overload_state=self.get_health_overload_state()
             if self.get_health_overload_state
             else "healthy",
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
         )
 
     def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None:
@@ -499,7 +503,7 @@ class ManagerStateEmbedder:
             overload_state=self.get_health_overload_state()
             if self.get_health_overload_state
             else "healthy",
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
         )
 
     def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None:
@@ -708,7 +712,7 @@ class GateStateEmbedder:
             overload_state=self.get_health_overload_state()
             if self.get_health_overload_state
             else "healthy",
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
         )
 
     def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None:
