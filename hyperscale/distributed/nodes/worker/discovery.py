@@ -10,6 +10,11 @@ from typing import TYPE_CHECKING
 
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.distributed.discovery import DiscoveryService
     from hyperscale.logging import Logger
@@ -54,7 +59,7 @@ class WorkerDiscoveryManager:
         self._running = True
         while self._running:
             try:
-                await asyncio.sleep(self._failure_decay_interval)
+                await _DEFAULT_CLOCK.sleep(self._failure_decay_interval)
 
                 # Decay failure counts to allow peers to recover
                 self._discovery_service.decay_failures()

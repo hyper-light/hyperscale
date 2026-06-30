@@ -4,7 +4,6 @@ Job leadership transfer TCP handler for worker.
 Handles job leadership transfer notifications from managers (AD-31, Section 8).
 """
 
-import time
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
@@ -17,6 +16,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerWarning,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from ..server import WorkerServer
@@ -70,7 +74,7 @@ class JobLeaderTransferHandler:
             Serialized JobLeaderWorkerTransferAck
         """
         self._server._transfer_metrics_received += 1
-        transfer_start_time = time.monotonic()
+        transfer_start_time = _DEFAULT_CLOCK.monotonic()
 
         try:
             transfer = JobLeaderWorkerTransfer.load(data)
@@ -106,7 +110,7 @@ class JobLeaderTransferHandler:
                         new_manager_addr=transfer.new_manager_addr,
                         fence_token=transfer.fence_token,
                         old_manager_id=transfer.old_manager_id,
-                        received_at=time.monotonic(),
+                        received_at=_DEFAULT_CLOCK.monotonic(),
                     )
 
                 # 8.6: Update metrics
@@ -259,7 +263,7 @@ class JobLeaderTransferHandler:
         start_time: float,
     ) -> None:
         """Log transfer result details."""
-        transfer_duration_ms = (time.monotonic() - start_time) * 1000
+        transfer_duration_ms = (_DEFAULT_CLOCK.monotonic() - start_time) * 1000
 
         if workflows_updated > 0 or workflows_not_found:
             rescue_msg = ""

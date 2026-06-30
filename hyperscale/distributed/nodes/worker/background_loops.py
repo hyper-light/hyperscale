@@ -12,7 +12,6 @@ Extracted from worker_impl.py for modularity.
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING
 
 from hyperscale.logging.hyperscale_logging_models import (
@@ -20,6 +19,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
     ServerError,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -132,9 +136,9 @@ class WorkerBackgroundLoops:
         self._running = True
         while is_running() and self._running:
             try:
-                await asyncio.sleep(self._dead_manager_check_interval)
+                await _DEFAULT_CLOCK.sleep(self._dead_manager_check_interval)
 
-                current_time = time.monotonic()
+                current_time = _DEFAULT_CLOCK.monotonic()
                 managers_to_reap: list[str] = []
 
                 for manager_id, unhealthy_since in list(
@@ -206,14 +210,14 @@ class WorkerBackgroundLoops:
         self._running = True
         while is_running() and self._running:
             try:
-                await asyncio.sleep(self._orphan_check_interval)
+                await _DEFAULT_CLOCK.sleep(self._orphan_check_interval)
 
                 workflows_to_cancel: list[tuple[str, str]] = []
 
                 for workflow_id, orphan_timestamp in list(
                     self._state._orphaned_workflows.items()
                 ):
-                    elapsed = time.monotonic() - orphan_timestamp
+                    elapsed = _DEFAULT_CLOCK.monotonic() - orphan_timestamp
                     if elapsed >= self._orphan_grace_period:
                         workflows_to_cancel.append(
                             (workflow_id, "orphan_grace_period_expired")
@@ -288,7 +292,7 @@ class WorkerBackgroundLoops:
         self._running = True
         while is_running() and self._running:
             try:
-                await asyncio.sleep(self._discovery_failure_decay_interval)
+                await _DEFAULT_CLOCK.sleep(self._discovery_failure_decay_interval)
 
                 # Decay failure counts
                 self._discovery_service.decay_failures()
@@ -351,7 +355,7 @@ class WorkerBackgroundLoops:
                     if delay_ms > 0:
                         effective_interval += delay_ms / 1000.0
 
-                await asyncio.sleep(effective_interval)
+                await _DEFAULT_CLOCK.sleep(effective_interval)
 
                 # Check backpressure level
                 if self._backpressure_manager:

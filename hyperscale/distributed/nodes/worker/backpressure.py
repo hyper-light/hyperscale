@@ -18,6 +18,11 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
     from .registry import WorkerRegistry
@@ -86,7 +91,7 @@ class WorkerBackpressureManager:
         self._running = True
         while self._running:
             try:
-                await asyncio.sleep(self._poll_interval)
+                await _DEFAULT_CLOCK.sleep(self._poll_interval)
 
                 # Sample current resource usage
                 cpu_percent = self._get_cpu_percent()

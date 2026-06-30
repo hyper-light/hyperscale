@@ -6,7 +6,6 @@ Implements job leader routing and backpressure-aware delivery.
 """
 
 import asyncio
-import time
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -31,6 +30,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerWarning,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 _TRANSIENT_SEND_ERRORS: tuple[type[BaseException], ...] = (
@@ -554,7 +558,7 @@ class WorkerProgressReporter:
                             base_delay * (2**attempt),
                             base_delay * (2**max_retries),
                         )
-                        await asyncio.sleep(
+                        await _DEFAULT_CLOCK.sleep(
                             delay
                         )
                         continue
@@ -744,7 +748,7 @@ class WorkerProgressReporter:
                 )
 
     def _enqueue_pending_result(self, final_result: WorkflowFinalResult) -> None:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         pending = PendingResult(
             final_result=final_result,
             enqueued_at=now,
@@ -766,7 +770,7 @@ class WorkerProgressReporter:
 
         Should be called periodically from a background loop.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         sent_count = 0
         expired_count = 0
         still_pending: list[PendingResult] = []

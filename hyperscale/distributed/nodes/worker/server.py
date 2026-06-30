@@ -6,8 +6,6 @@ All business logic is delegated to specialized modules.
 """
 
 import asyncio
-import random
-import time
 
 try:
     import psutil
@@ -616,7 +614,7 @@ class WorkerServer(HealthAwareServer):
             self._config.initial_registration_jitter_max_seconds
         )
         if registration_jitter_max_seconds > 0.0:
-            await asyncio.sleep(random.uniform(0.0, registration_jitter_max_seconds))
+            await self._clock.sleep(self._random.uniform(0.0, registration_jitter_max_seconds))
 
         # Set core availability callback
         self._lifecycle_manager.set_on_cores_available(self._on_cores_available)
@@ -687,7 +685,7 @@ class WorkerServer(HealthAwareServer):
             return
 
         try:
-            await asyncio.wait_for(
+            await self._clock.wait_for(
                 self._stop_after_leave(),
                 timeout=drain_timeout,
             )
@@ -925,7 +923,7 @@ class WorkerServer(HealthAwareServer):
         self._extension_trigger_task = self._create_background_task(
             self._extension_trigger.run_loop(
                 is_running=lambda: self._running,
-                sleep=asyncio.sleep,
+                sleep=self._clock.sleep,
             ),
             "extension_trigger",
         )
@@ -946,7 +944,7 @@ class WorkerServer(HealthAwareServer):
                         node_id_short=self._node_id.short,
                         task_runner_run=self._task_runner.run,
                     )
-                await asyncio.sleep(5.0)
+                await self._clock.sleep(5.0)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -954,13 +952,13 @@ class WorkerServer(HealthAwareServer):
                     f"Pending result retry failed: {exc}",
                     level="debug",
                 )
-                await asyncio.sleep(5.0)
+                await self._clock.sleep(5.0)
 
     async def _run_resource_sample_loop(self) -> None:
         while self._running:
             try:
                 await self._resource_monitor.sample()
-                await asyncio.sleep(1.0)
+                await self._clock.sleep(1.0)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -968,14 +966,14 @@ class WorkerServer(HealthAwareServer):
                     f"Resource sampling failed: {exc}",
                     level="debug",
                 )
-                await asyncio.sleep(1.0)
+                await self._clock.sleep(1.0)
 
     async def _run_worker_pool_health_loop(self) -> None:
         """Fail active workflows when a local runner process exits mid-flight."""
         while self._running:
             try:
                 await self._check_worker_pool_health()
-                await asyncio.sleep(0.25)
+                await self._clock.sleep(0.25)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -983,7 +981,7 @@ class WorkerServer(HealthAwareServer):
                     f"Worker pool health check failed: {exc}",
                     level="debug",
                 )
-                await asyncio.sleep(1.0)
+                await self._clock.sleep(1.0)
 
     async def _check_worker_pool_health(self) -> None:
         process_exitcodes = self._lifecycle_manager.get_server_pool_process_exitcodes()
@@ -1247,7 +1245,7 @@ class WorkerServer(HealthAwareServer):
                 Secondary progress dimension.
             actions_completed: Sum of StepStats.completed_count across active steps.
                 Tertiary progress dimension.
-            snapshot_time: ``time.monotonic()`` on the worker when the
+            snapshot_time: ``self._clock.monotonic()`` on the worker when the
                 snapshot was constructed. Used for rate-limiting and the
                 throughput-witness time-windowed velocity check.
         """
@@ -1352,7 +1350,7 @@ class WorkerServer(HealthAwareServer):
         self._cleanup_pending_transfer_if_complete(job_id, workflow_id, pending)
 
     def _is_pending_transfer_expired(self, pending: PendingTransfer) -> bool:
-        current_time = time.monotonic()
+        current_time = self._clock.monotonic()
         pending_transfer_ttl = self._config.pending_transfer_ttl_seconds
         return current_time - pending.received_at > pending_transfer_ttl
 
@@ -1491,7 +1489,7 @@ class WorkerServer(HealthAwareServer):
         try:
             while self._running:
                 if backoff_seconds > 0:
-                    await asyncio.sleep(backoff_seconds)
+                    await self._clock.sleep(backoff_seconds)
                 try:
                     succeeded = await self.refresh_manager_registrations()
                 except Exception as refresh_error:
@@ -1977,7 +1975,7 @@ class WorkerServer(HealthAwareServer):
                 workflow_id=dispatch.workflow_id,
                 step_transitions=0,
                 actions_completed=0,
-                snapshot_time=time.monotonic(),
+                snapshot_time=self._clock.monotonic(),
             )
 
         await self._check_pending_transfer_for_job(
@@ -2024,7 +2022,7 @@ class WorkerServer(HealthAwareServer):
                 workflow_id,
                 success,
                 errors,
-                time.monotonic(),
+                self._clock.monotonic(),
                 self._node_id.full,
                 self.send_tcp,
                 self._host,

@@ -5,11 +5,15 @@ Handles manager registration, health tracking, and peer management.
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Any, Callable
 
 from hyperscale.distributed.models import ManagerInfo
 from hyperscale.distributed.swim.core import ErrorStats, CircuitState
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -129,7 +133,7 @@ class WorkerRegistry:
         async with self._counter_lock:
             self._healthy_manager_ids.discard(manager_id)
             if manager_id not in self._manager_unhealthy_since:
-                self._manager_unhealthy_since[manager_id] = time.monotonic()
+                self._manager_unhealthy_since[manager_id] = _DEFAULT_CLOCK.monotonic()
         self._signal_healthy_set_changed()
 
     def _signal_healthy_set_changed(self) -> None:

@@ -9,7 +9,6 @@ to maintain single source of truth (no duplicate state).
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.models import (
@@ -17,6 +16,11 @@ from hyperscale.distributed.models import (
     WorkflowStatus,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -197,7 +201,7 @@ class WorkerExecutor:
         while self._running:
             try:
                 # Base sleep interval
-                await asyncio.sleep(self._progress_flush_interval)
+                await _DEFAULT_CLOCK.sleep(self._progress_flush_interval)
 
                 # Check backpressure state (AD-37)
                 if self._backpressure_manager is not None:
@@ -221,7 +225,7 @@ class WorkerExecutor:
                             self._backpressure_manager.get_throttle_delay_seconds()
                         )
                         if throttle_delay > 0:
-                            await asyncio.sleep(throttle_delay)
+                            await _DEFAULT_CLOCK.sleep(throttle_delay)
 
                 # Flush the buffer
                 await self.flush_progress_buffer(send_progress)
@@ -289,8 +293,8 @@ class WorkerExecutor:
             failed_count=0,
             rate_per_second=0.0,
             elapsed_seconds=0.0,
-            timestamp=time.monotonic(),
-            collected_at=time.time(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
+            collected_at=_DEFAULT_CLOCK.time(),
             assigned_cores=allocated_cores,
             worker_available_cores=available_cores,
             worker_workflow_completed_cores=0,

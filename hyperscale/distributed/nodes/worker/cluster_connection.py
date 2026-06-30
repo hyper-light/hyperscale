@@ -49,12 +49,16 @@ rejoin task is fire-and-forget bounded by state.
 """
 
 import asyncio
-import random
-import time
 from enum import Enum
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+_DEFAULT_RANDOM: Random = RealRandom()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.taskex import TaskRunner
@@ -188,7 +192,7 @@ class WorkerClusterConnection:
         perspective. We don't require both — either is sufficient
         to reset the staleness clock.
         """
-        self._manager_last_heartbeat[manager_id] = time.monotonic()
+        self._manager_last_heartbeat[manager_id] = _DEFAULT_CLOCK.monotonic()
 
     def update(self) -> None:
         """Re-derive state from the live-manager set and transition.
@@ -215,7 +219,7 @@ class WorkerClusterConnection:
         # watchdog as soon as the threshold elapses since process
         # start.
         healthy_ids = self._get_healthy_manager_ids()
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         for manager_id in healthy_ids:
             if manager_id not in self._manager_last_heartbeat:
                 self._manager_last_heartbeat[manager_id] = now
@@ -315,14 +319,14 @@ class WorkerClusterConnection:
         marking freshly-registered managers stale before their first
         heartbeat round-trip.
         """
-        watchdog_start = time.monotonic()
+        watchdog_start = _DEFAULT_CLOCK.monotonic()
         try:
             while self._running:
-                await asyncio.sleep(self._liveness_check_interval_seconds)
+                await _DEFAULT_CLOCK.sleep(self._liveness_check_interval_seconds)
                 if not self._running:
                     return
 
-                now = time.monotonic()
+                now = _DEFAULT_CLOCK.monotonic()
                 stale_managers: list[str] = []
                 for manager_id in list(self._get_healthy_manager_ids()):
                     last_heartbeat = self._manager_last_heartbeat.get(manager_id)
@@ -454,11 +458,11 @@ class WorkerClusterConnection:
                     1.0, self._get_lhm_multiplier()
                 )
                 if self._rejoin_jitter_max_seconds > 0.0:
-                    backoff += random.uniform(
+                    backoff += _DEFAULT_RANDOM.uniform(
                         self._rejoin_jitter_min_seconds,
                         self._rejoin_jitter_max_seconds,
                     )
-                await asyncio.sleep(backoff)
+                await _DEFAULT_CLOCK.sleep(backoff)
         except asyncio.CancelledError:
             return
 

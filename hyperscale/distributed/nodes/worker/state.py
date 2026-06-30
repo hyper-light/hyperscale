@@ -6,7 +6,6 @@ core allocation, backpressure, and metrics.
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
@@ -17,6 +16,11 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.reliability import BackpressureLevel
 from hyperscale.distributed.swim.core import ErrorStats
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs import CoreAllocator
@@ -142,7 +146,7 @@ class WorkerState:
 
         # Throughput tracking (AD-19)
         self._throughput_completions: int = 0
-        self._throughput_interval_start: float = time.monotonic()
+        self._throughput_interval_start: float = _DEFAULT_CLOCK.monotonic()
         self._throughput_last_value: float = 0.0
         self._completion_times: list[float] = []
 
@@ -202,7 +206,7 @@ class WorkerState:
         async with self._get_counter_lock():
             self._healthy_manager_ids.discard(manager_id)
             if manager_id not in self._manager_unhealthy_since:
-                self._manager_unhealthy_since[manager_id] = time.monotonic()
+                self._manager_unhealthy_since[manager_id] = _DEFAULT_CLOCK.monotonic()
 
     def is_manager_healthy(self, manager_id: str) -> bool:
         """Check if a manager is in the healthy set."""
@@ -340,7 +344,7 @@ class WorkerState:
             return self._workflow_fence_tokens.get(workflow_id, -1)
 
     def set_workflow_timeout(self, workflow_id: str, timeout_seconds: float) -> None:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         self._workflow_start_times[workflow_id] = now
         self._workflow_timeout_seconds[workflow_id] = timeout_seconds
 
@@ -356,7 +360,7 @@ class WorkerState:
         """
         Returns (workflow_id, elapsed_seconds) for workflows exceeding their timeout.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         stuck: list[tuple[str, float]] = []
         for workflow_id in list(self._active_workflows.keys()):
             start_time = self._workflow_start_times.get(workflow_id)
@@ -370,7 +374,7 @@ class WorkerState:
 
     def mark_workflow_orphaned(self, workflow_id: str) -> None:
         if workflow_id not in self._orphaned_workflows:
-            self._orphaned_workflows[workflow_id] = time.monotonic()
+            self._orphaned_workflows[workflow_id] = _DEFAULT_CLOCK.monotonic()
 
     def clear_workflow_orphaned(self, workflow_id: str) -> None:
         """Clear orphaned status for a workflow."""
@@ -382,7 +386,7 @@ class WorkerState:
 
     def get_orphaned_workflows_expired(self, grace_period_seconds: float) -> list[str]:
         """Get workflow IDs whose orphan grace period has expired."""
-        current_time = time.monotonic()
+        current_time = _DEFAULT_CLOCK.monotonic()
         return [
             workflow_id
             for workflow_id, orphaned_at in self._orphaned_workflows.items()
@@ -535,7 +539,7 @@ class WorkerState:
 
     def get_throughput(self) -> float:
         """Get current throughput (completions per second)."""
-        current_time = time.monotonic()
+        current_time = _DEFAULT_CLOCK.monotonic()
         elapsed = current_time - self._throughput_interval_start
         if elapsed >= 10.0:
             self._throughput_last_value = self._throughput_completions / elapsed

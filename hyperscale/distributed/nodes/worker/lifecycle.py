@@ -18,6 +18,11 @@ from hyperscale.distributed.protocol.version import NodeCapabilities
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerError, ServerInfo
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.distributed.env import Env
     from hyperscale.logging import Logger
@@ -213,7 +218,7 @@ class WorkerLifecycleManager:
         worker_ips = self.get_worker_ips()
 
         try:
-            await asyncio.wait_for(
+            await _DEFAULT_CLOCK.wait_for(
                 self._remote_manager.connect_to_workers(
                     worker_ips,
                     timeout=effective_timeout,

@@ -5,8 +5,12 @@ Handles SWIM callbacks, health embedding, and overload detection
 integration for worker health reporting.
 """
 
-import time
 from typing import TYPE_CHECKING, Any, Callable
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -92,7 +96,7 @@ class WorkerHealthIntegration:
         """
         return {
             "overload_state": self._backpressure_manager.get_overload_state_str(),
-            "timestamp": time.monotonic(),
+            "timestamp": _DEFAULT_CLOCK.monotonic(),
         }
 
     def is_healthy(self) -> bool:

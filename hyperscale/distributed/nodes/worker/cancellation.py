@@ -6,7 +6,6 @@ Extracted from worker_impl.py for modularity.
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
@@ -15,6 +14,11 @@ from hyperscale.distributed.models import (
     WorkflowStatus,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerInfo
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -198,7 +202,7 @@ class WorkerCancellationHandler:
         self._running = True
         while is_running() and self._running:
             try:
-                await asyncio.sleep(self._poll_interval)
+                await _DEFAULT_CLOCK.sleep(self._poll_interval)
 
                 # Skip if no active workflows
                 if not self._state._active_workflows:

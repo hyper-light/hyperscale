@@ -6,7 +6,6 @@ Extracted from worker_impl.py for modularity (AD-33 compliance).
 """
 
 import asyncio
-import time
 from typing import Any, TYPE_CHECKING
 
 import cloudpickle
@@ -30,6 +29,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     WorkerJobCompleted,
     WorkerJobFailed,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -172,8 +176,8 @@ class WorkerWorkflowExecutor:
             failed_count=0,
             rate_per_second=0.0,
             elapsed_seconds=0.0,
-            timestamp=time.monotonic(),
-            collected_at=time.time(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
+            collected_at=_DEFAULT_CLOCK.time(),
             assigned_cores=allocated_cores,
             worker_available_cores=self._core_allocator.available_cores,
             worker_workflow_completed_cores=0,
@@ -241,7 +245,7 @@ class WorkerWorkflowExecutor:
             increment_version: Function to increment state version
             node_id_full: Full node identifier
         """
-        start_time = time.monotonic()
+        start_time = _DEFAULT_CLOCK.monotonic()
         run_id = hash(dispatch.workflow_id) % (2**31)
         error: Exception | None = None
         workflow_error: str | None = None
@@ -277,8 +281,8 @@ class WorkerWorkflowExecutor:
 
             # Transition to RUNNING
             progress.status = WorkflowStatus.RUNNING.value
-            progress.timestamp = time.monotonic()
-            progress.collected_at = time.time()
+            progress.timestamp = _DEFAULT_CLOCK.monotonic()
+            progress.collected_at = _DEFAULT_CLOCK.time()
 
             # Phase 2: Execute
             remote_manager = self._lifecycle.remote_manager
@@ -331,7 +335,7 @@ class WorkerWorkflowExecutor:
 
         finally:
             # Record completion for throughput tracking
-            elapsed = time.monotonic() - start_time
+            elapsed = _DEFAULT_CLOCK.monotonic() - start_time
             if self._backpressure_manager:
                 latency_ms = elapsed * 1000.0
                 self._backpressure_manager.record_workflow_latency(latency_ms)
@@ -343,7 +347,7 @@ class WorkerWorkflowExecutor:
 
             self._lifecycle.start_server_cleanup()
 
-        elapsed_seconds = time.monotonic() - start_time
+        elapsed_seconds = _DEFAULT_CLOCK.monotonic() - start_time
 
         if self._event_logger is not None:
             if progress.status == WorkflowStatus.COMPLETED.value:
@@ -449,7 +453,7 @@ class WorkerWorkflowExecutor:
             node_port: This worker's port
             node_id_short: This worker's short node ID
         """
-        start_time = time.monotonic()
+        start_time = _DEFAULT_CLOCK.monotonic()
         workflow_name = progress.workflow_name
         remote_manager = self._lifecycle.remote_manager
 
@@ -479,14 +483,14 @@ class WorkerWorkflowExecutor:
                 # Update progress
                 progress.completed_count = workflow_status_update.completed_count
                 progress.failed_count = workflow_status_update.failed_count
-                progress.elapsed_seconds = time.monotonic() - start_time
+                progress.elapsed_seconds = _DEFAULT_CLOCK.monotonic() - start_time
                 progress.rate_per_second = (
                     workflow_status_update.completed_count / progress.elapsed_seconds
                     if progress.elapsed_seconds > 0
                     else 0.0
                 )
-                progress.timestamp = time.monotonic()
-                progress.collected_at = time.time()
+                progress.timestamp = _DEFAULT_CLOCK.monotonic()
+                progress.collected_at = _DEFAULT_CLOCK.time()
                 progress.avg_cpu_percent = avg_cpu
                 progress.avg_memory_mb = avg_mem
 
