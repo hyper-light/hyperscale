@@ -79,6 +79,14 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
+# Runaway-loop threshold for ``run_window``: the most times ``_run_once``
+# may fire at a single virtual instant before we conclude a callback is
+# re-scheduling itself in a same-instant loop. Set far above any
+# legitimate fan-out (a cluster startup schedules thousands, not
+# hundreds of thousands, of same-instant callbacks).
+_MAX_ITERATIONS_PER_INSTANT = 500_000
+
+
 _BANNED_SYNC_METHODS = (
     # Each entry: (method_name, reason). The reason is included in
     # the raised exception so a regression trace immediately
@@ -314,7 +322,20 @@ class SimulationLoop(base_events.BaseEventLoop):
         # empty + not stopping = nothing can ever advance the loop.
         # Real asyncio loops would block forever in ``select()``;
         # here we raise so the failure is loud and attributable.
-        if not self._ready and not self._scheduled and not self._stopping:
+        #
+        # Only in single-process mode (``_window_deadline is None``). In
+        # multi-process mode a process reaching empty queues mid-window
+        # is simply idle — waiting on a cross-process message the
+        # coordinator will deliver in a later window. ``run_window``
+        # returns ``None`` for that (idle) and the coordinator detects
+        # true global termination (every process idle AND no pending
+        # deliveries), so a per-process "deadlock" here is a false alarm.
+        if (
+            self._window_deadline is None
+            and not self._ready
+            and not self._scheduled
+            and not self._stopping
+        ):
             raise SimulationConstraintError(
                 "SimulationLoop deadlocked: no ready callbacks, no "
                 "scheduled timers, and the loop has not been stopped. "
@@ -369,6 +390,8 @@ class SimulationLoop(base_events.BaseEventLoop):
         # running loop is correctly cleared.
         self._thread_id = threading.get_ident()
         events._set_running_loop(self)
+        iterations_at_instant = 0
+        last_instant = self._virtual_now
         try:
             while True:
                 # A fully idle loop (no ready work, no timers) means this
@@ -378,6 +401,25 @@ class SimulationLoop(base_events.BaseEventLoop):
                 # injected cross-process message later.
                 if not self._ready and not self._scheduled:
                     return None
+                # Runaway guard: a callback that re-schedules itself via
+                # ``call_soon`` at the current virtual instant will spin
+                # ``_run_once`` forever without advancing time. Surface it
+                # loudly (with the callbacks currently queued) rather than
+                # hanging the whole simulation at the barrier.
+                if self._virtual_now == last_instant:
+                    iterations_at_instant += 1
+                    if iterations_at_instant > _MAX_ITERATIONS_PER_INSTANT:
+                        queued = [self._describe_handle(h) for h in list(self._ready)[:8]]
+                        raise SimulationConstraintError(
+                            "SimulationLoop.run_window spun "
+                            f"{iterations_at_instant} times at virtual time "
+                            f"{self._virtual_now} without advancing — a callback "
+                            "is re-scheduling itself at the same instant. "
+                            f"Currently queued: {queued}"
+                        )
+                else:
+                    iterations_at_instant = 0
+                    last_instant = self._virtual_now
                 self._window_exhausted = False
                 self._run_once()
                 if self._window_exhausted:
@@ -392,6 +434,15 @@ class SimulationLoop(base_events.BaseEventLoop):
             self._thread_id = None
             self._window_deadline = None
             self._window_exhausted = False
+
+    @staticmethod
+    def _describe_handle(handle) -> str:
+        """Best-effort human name for a queued ``Handle`` (for the
+        runaway-loop diagnostic)."""
+        callback = getattr(handle, "_callback", None)
+        if callback is None:
+            return repr(handle)
+        return getattr(callback, "__qualname__", repr(callback))
 
     def call_soon(
         self,

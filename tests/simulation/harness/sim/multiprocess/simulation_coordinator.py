@@ -35,10 +35,17 @@ class SimulationCoordinator:
     then ``run`` returns ``{process_id: result}``.
     """
 
-    def __init__(self, latency: float = 0.001) -> None:
+    def __init__(
+        self, latency: float = 0.001, max_virtual_time: float | None = None
+    ) -> None:
         if latency <= 0.0:
             raise ValueError("latency must be strictly positive (lookahead)")
         self._latency = latency
+        # Safety bound: stop advancing once global virtual time would
+        # exceed this (a runaway scenario — e.g. a process stuck retrying
+        # forever — should surface, not hang the test host). ``None``
+        # means unbounded (run to natural quiescence).
+        self._max_virtual_time = max_virtual_time
         self._specs: list[tuple] = []
 
     def add_process(self, process_id, entry, *entry_args) -> None:
@@ -99,6 +106,11 @@ class SimulationCoordinator:
             if not candidates:
                 break
             target_time = min(candidates)
+            if (
+                self._max_virtual_time is not None
+                and target_time > self._max_virtual_time
+            ):
+                break
 
             due = {process_id: [] for process_id in connections}
             while pending and pending[0][0] <= target_time:
