@@ -175,6 +175,18 @@ class Env(BaseModel):
         5.0  # Seconds between cancellation poll requests
     )
 
+    # Worker Load-Sampling Settings. Consumed by
+    # ``WorkerConfig.from_env`` via ``getattr(env, ...)``; the fields
+    # must exist here or the override silently no-ops (the getattr
+    # falls through to its literal default). Defaults match those
+    # fallbacks so unset behavior is unchanged.
+    WORKER_OVERLOAD_POLL_INTERVAL: StrictFloat = (
+        0.25  # Seconds between CPU/overload samples
+    )
+    WORKER_THROUGHPUT_INTERVAL_SECONDS: StrictFloat = (
+        10.0  # Seconds between throughput-rate samples
+    )
+
     # Worker Backpressure Delay Settings (AD-37)
     WORKER_BACKPRESSURE_THROTTLE_DELAY_MS: StrictInt = 500  # Default THROTTLE delay
     WORKER_BACKPRESSURE_BATCH_DELAY_MS: StrictInt = 1000  # Default BATCH delay
@@ -841,6 +853,9 @@ class Env(BaseModel):
             "WORKER_CLUSTER_LIVENESS_CHECK_INTERVAL": float,
             "WORKER_CLUSTER_HEARTBEAT_STALENESS_THRESHOLD": float,
             "WORKER_CLUSTER_REJOIN_BASE_BACKOFF": float,
+            # Worker load-sampling settings
+            "WORKER_OVERLOAD_POLL_INTERVAL": float,
+            "WORKER_THROUGHPUT_INTERVAL_SECONDS": float,
             # Worker cancellation polling settings
             "WORKER_CANCELLATION_POLL_INTERVAL": float,
             # Worker backpressure delay settings (AD-37)

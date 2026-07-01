@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.server.protocol import MessagePriority
 from hyperscale.distributed.server.protocol.in_flight_tracker import (
     PriorityLimits,
@@ -46,6 +47,7 @@ def _make_receive_server(
     dispatcher = RecordingDispatcher()
     rate_limit_calls: list[tuple[tuple[str, int], str]] = []
 
+    server._clock = RealClock()
     server._udp_addr_slug = b"127.0.0.1:9000"
     server._udp_logger = RecordingLogger()
     server._host = "127.0.0.1"

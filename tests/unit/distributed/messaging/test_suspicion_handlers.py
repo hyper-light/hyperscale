@@ -30,10 +30,11 @@ class TestAliveHandlerHappyPath:
     ) -> None:
         """Alive handler confirms the sender."""
         handler = AliveHandler(mock_server)
+        # ALIVE is a first-party refutation: the sender is the subject.
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            target=("192.168.1.2", 9001),
-            target_addr_bytes=b"192.168.1.2:9001",
+            target=("192.168.1.1", 8000),
+            target_addr_bytes=b"192.168.1.1:8000",
             message_type=b"alive",
             message=b"alive:5",
             clock_time=12345,
@@ -52,10 +53,11 @@ class TestAliveHandlerHappyPath:
         future = asyncio.get_event_loop().create_future()
         mock_server._pending_probe_acks[("192.168.1.1", 8000)] = future
 
+        # First-party refutation completes the pending probe future.
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            target=("192.168.1.2", 9001),
-            target_addr_bytes=b"192.168.1.2:9001",
+            target=("192.168.1.1", 8000),
+            target_addr_bytes=b"192.168.1.1:8000",
             message_type=b"alive",
             message=b"alive:5",
             clock_time=12345,
@@ -91,10 +93,12 @@ class TestAliveHandlerHappyPath:
     ) -> None:
         """Alive handler updates node state to OK."""
         handler = AliveHandler(mock_server)
+        # First-party refutation: the sender ("192.168.1.1", 8000) is the
+        # subject whose state must flip to OK at the claimed incarnation.
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            target=("192.168.1.2", 9001),
-            target_addr_bytes=b"192.168.1.2:9001",
+            target=("192.168.1.1", 8000),
+            target_addr_bytes=b"192.168.1.1:8000",
             message_type=b"alive",
             message=b"alive:5",
             clock_time=12345,
@@ -103,7 +107,7 @@ class TestAliveHandlerHappyPath:
         await handler.handle(context)
 
         # Check node was updated
-        node_state = mock_server.incarnation_tracker._nodes.get(("192.168.1.2", 9001))
+        node_state = mock_server.incarnation_tracker._nodes.get(("192.168.1.1", 8000))
         assert node_state is not None
         assert node_state[0] == b"OK"
         assert node_state[1] == 5  # Incarnation number
@@ -401,10 +405,12 @@ class TestSuspicionHandlersConcurrency:
         handler = AliveHandler(mock_server)
 
         async def handle_alive(index: int) -> None:
+            # Each ALIVE is a first-party refutation from its own sender.
+            sender = ("192.168.1.1", 8000 + index)
             context = MessageContext(
-                source_addr=("192.168.1.1", 8000 + index),
-                target=("192.168.1.2", 9001),
-                target_addr_bytes=b"192.168.1.2:9001",
+                source_addr=sender,
+                target=sender,
+                target_addr_bytes=f"192.168.1.1:{8000 + index}".encode(),
                 message_type=b"alive",
                 message=f"alive:{index}".encode(),
                 clock_time=index,

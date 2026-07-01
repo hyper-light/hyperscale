@@ -394,6 +394,8 @@ class TestWorkerExecutorProgressBuffering:
         """Test flush handles exceptions gracefully."""
         allocator = MockCoreAllocator()
         logger = MagicMock()
+        # flush_progress_buffer awaits logger.log on the send-failure path.
+        logger.log = AsyncMock()
         state = MockWorkerState()
         executor = WorkerExecutor(allocator, logger, state)
 

@@ -63,6 +63,9 @@ class MockWindowedStatsCollector:
             return self.stats_data[job_id]
         return None
 
+    async def cleanup_job_windows(self, job_id: str) -> None:
+        self.stats_data.pop(job_id, None)
+
 
 @dataclass
 class MockJobStatus:
@@ -84,6 +87,7 @@ def create_coordinator(
     get_job_callback=None,
     get_job_status=None,
     get_all_running_jobs=None,
+    has_job=None,
     send_tcp=None,
     windowed_stats=None,
 ) -> GateStatsCoordinator:
@@ -98,6 +102,7 @@ def create_coordinator(
         get_job_callback=get_job_callback or (lambda x: None),
         get_job_status=get_job_status or (lambda x: None),
         get_all_running_jobs=get_all_running_jobs or (lambda: []),
+        has_job=has_job or (lambda job_id: True),
         send_tcp=send_tcp or AsyncMock(),
     )
 
@@ -164,7 +169,7 @@ class TestClassifyUpdateTierEdgeCases:
 class TestSendImmediateUpdateHappyPath:
     @pytest.mark.asyncio
     async def test_sends_update_with_callback(self):
-        send_tcp = AsyncMock()
+        send_tcp = AsyncMock(return_value=(b"ok", None))
         job_status = MockJobStatus()
 
         coordinator = create_coordinator(
@@ -357,6 +362,7 @@ class TestPushWindowedStats:
         coordinator = create_coordinator(
             state=state,
             windowed_stats=windowed_stats,
+            get_job_status=lambda x: MockJobStatus(),
             send_tcp=send_tcp,
         )
 
@@ -374,6 +380,7 @@ class TestPushWindowedStats:
 
         coordinator = create_coordinator(
             state=state,
+            get_job_status=lambda x: MockJobStatus(),
             send_tcp=send_tcp,
         )
 
@@ -392,6 +399,7 @@ class TestPushWindowedStats:
         coordinator = create_coordinator(
             state=state,
             windowed_stats=windowed_stats,
+            get_job_status=lambda x: MockJobStatus(),
             send_tcp=send_tcp,
         )
 
@@ -417,6 +425,7 @@ class TestPushWindowedStats:
         coordinator = create_coordinator(
             state=state,
             windowed_stats=windowed_stats,
+            get_job_status=lambda x: MockJobStatus(),
             send_tcp=send_tcp,
         )
 
@@ -438,7 +447,11 @@ class TestConcurrency:
             nonlocal call_count
             call_count += 1
 
-        send_tcp.side_effect = counting_send
+        async def counting_send_tuple(*args, **kwargs):
+            await counting_send(*args, **kwargs)
+            return (b"ok", None)
+
+        send_tcp.side_effect = counting_send_tuple
 
         coordinator = create_coordinator(
             get_job_callback=lambda x: ("10.0.0.1", 8000),

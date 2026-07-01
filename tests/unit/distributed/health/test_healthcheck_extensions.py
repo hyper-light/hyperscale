@@ -188,12 +188,13 @@ class TestExtensionTracker:
             base_deadline=16.0,
         )
 
-        # First: 8s, Second: 4s, Third: 2s = 14s total
+        # AD-26 line 32 (grant = base / 2^count, count is pre-grant):
+        # First: 16s, Second: 8s, Third: 4s = 28s total
         tracker.request_extension("busy", 1.0)
         tracker.request_extension("busy", 2.0)
         tracker.request_extension("busy", 3.0)
 
-        assert tracker.total_extended == 14.0  # 8 + 4 + 2
+        assert tracker.total_extended == 28.0  # 16 + 8 + 4
 
 
 class TestExtensionTrackerConfig:

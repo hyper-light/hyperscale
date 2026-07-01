@@ -52,6 +52,7 @@ class MockServerForHandlers:
         # State containers
         self._active_workflows = {}
         self._workflow_job_leader = {}
+        self._primary_manager_id = None
         self._workflow_fence_tokens = {}
         self._orphaned_workflows = {}
         self._pending_workflows = []

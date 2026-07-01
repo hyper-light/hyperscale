@@ -295,10 +295,13 @@ class TestJoinHandlerHappyPath:
     ) -> None:
         """Join handler confirms both sender and joining node."""
         handler = JoinHandler(mock_server)
+        # Current JOIN wire format: v{ver}|{role}|host:port|i:{incarnation}.
+        # The mandatory incarnation trailer is required or the handler
+        # nacks before it reaches the peer-confirmation step.
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
             target=("192.168.1.2", 9001),
-            target_addr_bytes=b"v1.0|192.168.1.2:9001",
+            target_addr_bytes=b"v1.0|worker|192.168.1.2:9001|i:5",
             message_type=b"join",
             message=b"join",
             clock_time=12345,
@@ -400,7 +403,7 @@ class TestLeaveHandlerHappyPath:
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"leave",
-            message=b"leave:7",
+            message=b"leave:7:worker-2",
             clock_time=12345,
         )
 
@@ -564,7 +567,7 @@ class TestLeaveHandlerEdgeCases:
             target=("127.0.0.1", 9000),  # Self address
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"leave",
-            message=b"leave",
+            message=b"leave:7:worker-1",
             clock_time=12345,
         )
 

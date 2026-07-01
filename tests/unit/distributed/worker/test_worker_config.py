@@ -493,10 +493,13 @@ class TestCreateWorkerConfigFromEnv:
             udp_port=8001,
         )
 
-        # All should use defaults
+        # All should use defaults sourced from Env (create_worker_config_from_env
+        # builds an Env, so Env's defaults are authoritative here). Env sets
+        # WORKER_DEAD_MANAGER_REAP_INTERVAL to 900.0 (15 minutes), which differs
+        # from the WorkerConfig dataclass literal default of 60.0.
         assert config.tcp_timeout_short_seconds == 2.0
         assert config.tcp_timeout_standard_seconds == 5.0
-        assert config.dead_manager_reap_interval_seconds == 60.0
+        assert config.dead_manager_reap_interval_seconds == 900.0
 
 
 class TestGetOsCpus:

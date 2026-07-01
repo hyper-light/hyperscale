@@ -753,7 +753,9 @@ class TestExtensionGracePeriods:
         worker = SimulatedWorker("worker-1")
         manager.register_worker(worker)
 
-        expected_grants = [16.0, 8.0, 4.0, 2.0, 2.0]  # Decays then clamps to min_grant
+        # AD-26 line 32 (grant = base / 2^count, count is pre-grant):
+        # 32, 16, 8, 4, then floored to min_grant=2.0
+        expected_grants = [32.0, 16.0, 8.0, 4.0, 2.0]
 
         progress = 0.1
         for idx, expected in enumerate(expected_grants):

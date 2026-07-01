@@ -113,12 +113,14 @@ def mock_worker_registration():
     node = MagicMock()
     node.node_id = "worker-test-123"
     node.host = "10.0.0.100"
+    node.port = 6000
     node.tcp_port = 6000
     node.udp_port = 6001
     node.total_cores = 8
 
     registration = MagicMock()
     registration.node = node
+    registration.total_cores = 8
 
     return registration
 
@@ -358,21 +360,23 @@ class TestManagerRegistryHealthBuckets:
 
         health_states: dict[str, str] = {}
 
-        for worker_id, health_state in [
+        for worker_index, (worker_id, health_state) in enumerate([
             ("worker-healthy-1", "healthy"),
             ("worker-healthy-2", "healthy"),
             ("worker-busy-1", "busy"),
             ("worker-stressed-1", "stressed"),
-        ]:
+        ]):
             node = MagicMock()
             node.node_id = worker_id
             node.host = "10.0.0.1"
-            node.tcp_port = 6000
-            node.udp_port = 6001
+            node.port = 6000 + worker_index * 2
+            node.tcp_port = 6000 + worker_index * 2
+            node.udp_port = 6001 + worker_index * 2
             node.total_cores = 4
 
             reg = MagicMock()
             reg.node = node
+            reg.total_cores = 4
 
             registry.register_worker(reg)
             health_states[worker_id] = health_state
@@ -543,10 +547,10 @@ class TestManagerLeaseCoordinatorFencing:
         leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
 
         version1 = leases.get_layer_version("job-123")
-        assert version1 == 1
+        assert version1 == 0
 
         version2 = leases.increment_layer_version("job-123")
-        assert version2 == 2
+        assert version2 == 1
 
 
 class TestManagerLeaseCoordinatorEdgeCases:
@@ -692,7 +696,8 @@ class TestManagerCancellationCoordinatorHappyPath:
 class TestManagerHealthMonitorHappyPath:
     """Happy path tests for ManagerHealthMonitor."""
 
-    def test_handle_worker_failure(
+    @pytest.mark.asyncio
+    async def test_handle_worker_failure(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can handle worker failure."""
@@ -713,11 +718,12 @@ class TestManagerHealthMonitorHappyPath:
             task_runner=mock_task_runner,
         )
 
-        monitor.handle_worker_failure("worker-123")
+        await monitor.handle_worker_failure("worker-123")
 
         assert "worker-123" in manager_state._worker_unhealthy_since
 
-    def test_handle_worker_recovery(
+    @pytest.mark.asyncio
+    async def test_handle_worker_recovery(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can handle worker recovery."""
@@ -739,7 +745,7 @@ class TestManagerHealthMonitorHappyPath:
         )
 
         manager_state._worker_unhealthy_since["worker-123"] = time.monotonic()
-        monitor.handle_worker_recovery("worker-123")
+        await monitor.handle_worker_recovery("worker-123")
 
         assert "worker-123" not in manager_state._worker_unhealthy_since
 
@@ -779,7 +785,8 @@ class TestManagerHealthMonitorHappyPath:
 class TestManagerHealthMonitorJobSuspicion:
     """Tests for AD-30 job suspicion tracking."""
 
-    def test_suspect_job(
+    @pytest.mark.asyncio
+    async def test_suspect_job(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can start job suspicion."""
@@ -800,11 +807,12 @@ class TestManagerHealthMonitorJobSuspicion:
             task_runner=mock_task_runner,
         )
 
-        monitor.suspect_job("job-123", "worker-456")
+        await monitor.suspect_job("job-123", "worker-456")
 
         assert ("job-123", "worker-456") in monitor._job_suspicions
 
-    def test_refute_job_suspicion(
+    @pytest.mark.asyncio
+    async def test_refute_job_suspicion(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can refute job suspicion."""
@@ -825,12 +833,13 @@ class TestManagerHealthMonitorJobSuspicion:
             task_runner=mock_task_runner,
         )
 
-        monitor.suspect_job("job-123", "worker-456")
-        monitor.refute_job_suspicion("job-123", "worker-456")
+        await monitor.suspect_job("job-123", "worker-456")
+        await monitor.refute_job_suspicion("job-123", "worker-456")
 
         assert ("job-123", "worker-456") not in monitor._job_suspicions
 
-    def test_get_node_status(
+    @pytest.mark.asyncio
+    async def test_get_node_status(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can get comprehensive node status."""
@@ -860,7 +869,7 @@ class TestManagerHealthMonitorJobSuspicion:
 
         # Clear and suspect for job
         del manager_state._worker_unhealthy_since["worker-123"]
-        monitor.suspect_job("job-456", "worker-123")
+        await monitor.suspect_job("job-456", "worker-123")
         assert (
             monitor.get_node_status("worker-123", "job-456") == NodeStatus.SUSPECTED_JOB
         )
@@ -995,7 +1004,8 @@ class TestExtensionTracker:
 class TestManagerStatsCoordinatorHappyPath:
     """Happy path tests for ManagerStatsCoordinator."""
 
-    def test_record_dispatch(
+    @pytest.mark.asyncio
+    async def test_record_dispatch(
         self,
         manager_state,
         manager_config,
@@ -1017,11 +1027,11 @@ class TestManagerStatsCoordinatorHappyPath:
 
         assert manager_state._dispatch_throughput_count == 0
 
-        stats.record_dispatch()
+        await stats.record_dispatch()
         assert manager_state._dispatch_throughput_count == 1
 
-        stats.record_dispatch()
-        stats.record_dispatch()
+        await stats.record_dispatch()
+        await stats.record_dispatch()
         assert manager_state._dispatch_throughput_count == 3
 
 
@@ -1121,7 +1131,8 @@ class TestManagerStatsCoordinatorBackpressure:
 class TestManagerStatsCoordinatorMetrics:
     """Tests for stats metrics."""
 
-    def test_get_stats_metrics(
+    @pytest.mark.asyncio
+    async def test_get_stats_metrics(
         self,
         manager_state,
         manager_config,
@@ -1141,8 +1152,8 @@ class TestManagerStatsCoordinatorMetrics:
             windowed_stats=windowed_stats,
         )
 
-        stats.record_dispatch()
-        stats.record_dispatch()
+        await stats.record_dispatch()
+        await stats.record_dispatch()
 
         for _ in range(12):
             stats_buffer.record(1.0)

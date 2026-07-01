@@ -399,7 +399,9 @@ class TestPingReqAckHandlerEdgeCases:
         """Parse status correctly extracts alive."""
         handler = PingReqAckHandler(mock_server)
 
-        status = handler._parse_status(b"ping-req-ack:alive>127.0.0.1:9000")
+        status, _ = handler._parse_status_and_request_id(
+            b"ping-req-ack:alive>127.0.0.1:9000"
+        )
 
         assert status == b"alive"
 
@@ -408,7 +410,9 @@ class TestPingReqAckHandlerEdgeCases:
         """Parse status correctly extracts dead."""
         handler = PingReqAckHandler(mock_server)
 
-        status = handler._parse_status(b"ping-req-ack:dead>127.0.0.1:9000")
+        status, _ = handler._parse_status_and_request_id(
+            b"ping-req-ack:dead>127.0.0.1:9000"
+        )
 
         assert status == b"dead"
 
@@ -417,7 +421,9 @@ class TestPingReqAckHandlerEdgeCases:
         """Parse status correctly extracts timeout."""
         handler = PingReqAckHandler(mock_server)
 
-        status = handler._parse_status(b"ping-req-ack:timeout>127.0.0.1:9000")
+        status, _ = handler._parse_status_and_request_id(
+            b"ping-req-ack:timeout>127.0.0.1:9000"
+        )
 
         assert status == b"timeout"
 
@@ -428,7 +434,7 @@ class TestPingReqAckHandlerEdgeCases:
         """Parse status handles empty message."""
         handler = PingReqAckHandler(mock_server)
 
-        status = handler._parse_status(b"ping-req-ack")
+        status, _ = handler._parse_status_and_request_id(b"ping-req-ack")
 
         assert status == b""
 
