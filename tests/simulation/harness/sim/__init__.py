@@ -21,6 +21,7 @@ from .seeded_random import SeededRandom
 from .sim_transport_factory import SimTransportFactory
 from .simulation_constraint_error import SimulationConstraintError
 from .simulation_loop import SimulationLoop
+from .simulation_runtime import SimulationRuntime
 from .virtual_clock import VirtualClock
 
 
@@ -33,6 +34,7 @@ __all__ = [
     "SimTransportFactory",
     "SimulationConstraintError",
     "SimulationLoop",
+    "SimulationRuntime",
     "TraceEntry",
     "VirtualClock",
 ]

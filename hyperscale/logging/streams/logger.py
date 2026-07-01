@@ -8,6 +8,7 @@ import threading
 from typing import Any, Callable, Dict, Literal, TypeVar
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
+from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.models import Entry, Log
 
 from .logger_context import LoggerContext
@@ -281,6 +282,19 @@ class Logger:
         ]
         | None = None,
     ) -> int | None:
+        # Honor the global logging kill-switch at the outermost entry,
+        # BEFORE opening the logger context. The context's ``__aenter__``
+        # eagerly sets up its output stream (``connect_write_pipe``) and
+        # reads the cwd via ``run_in_executor`` — both real-I/O
+        # operations. Gating here means a disabled logger performs zero
+        # I/O setup (an optimization in REAL) and, critically, never
+        # touches those operations under SIM mode, where the
+        # SimulationLoop bans them. The inner ``LoggerStream._log``
+        # already honors this flag; this lifts the same check above the
+        # context so the setup is skipped too.
+        if LoggingConfig().disabled:
+            return None
+
         if name is None:
             name = "default"
 
