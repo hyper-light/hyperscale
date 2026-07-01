@@ -30,6 +30,13 @@ TRANSIENT_ERRORS = frozenset({
     # classification lets the client round-robin to another target.
     "not dc leader",
     "not job leader",
+    # Gate-forwarded cancel where no DC could confirm because manager
+    # leadership is mid-failover. The gate stamps its aggregate cancel
+    # error with ``GateCancellationHandler._CANCEL_RETRYABLE_MARKER``
+    # ("cancellation pending leader transition") so the client retries
+    # across its time budget until leadership reconverges. Keep this
+    # substring in sync with that marker.
+    "leader transition",
 })
 
 

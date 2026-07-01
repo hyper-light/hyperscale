@@ -22,6 +22,15 @@ from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
 _DEFAULT_CLOCK: Clock = RealClock()
 _DEFAULT_RANDOM: Random = RealRandom()
 
+# Per-send timeout for a single cancel round-trip. Kept well under the
+# caller's total cancellation budget so one slow hop — e.g. a gate
+# fanning a cancel out to a partly-dead DC mid-failover — cannot
+# swallow the whole budget; the budget is spent across many quick
+# fleet sweeps instead. Must exceed the gate's own fail-fast
+# DC-forward ceiling so a healthy gate round-trip is never cut off
+# (see ``GateCancellationHandler`` forward retry config).
+_CANCEL_PER_SEND_TIMEOUT_SECONDS = 12.0
+
 
 class ClientCancellationManager:
     """
@@ -54,18 +63,6 @@ class ClientCancellationManager:
         self._targets = targets
         self._tracker = tracker
         self._send_tcp = send_tcp_func
-
-    async def _apply_retry_delay(
-        self,
-        retry: int,
-        max_retries: int,
-        base_delay: float,
-    ) -> None:
-        """Apply exponential backoff with jitter (AD-21) before retry."""
-        if retry < max_retries:
-            calculated_delay = base_delay * (2 ** retry)
-            jittered_delay = calculated_delay * (0.5 + _DEFAULT_RANDOM.random())
-            await _DEFAULT_CLOCK.sleep(jittered_delay)
 
     def _handle_successful_response(
         self,
@@ -233,53 +230,76 @@ class ClientCancellationManager:
             if not configured_targets:
                 raise RuntimeError("No managers or gates configured")
 
-            # Pending = the failover fleet; tried = targets that have
-            # returned a transient error already this call (so we don't
-            # cycle back into them). The job-specific target is at
-            # index 0 by ``get_targets_for_job`` contract; preserve order.
-            pending: list[tuple[str, int]] = list(configured_targets)
-            tried: set[tuple[str, int]] = set()
-
-            # Managers this attempt has demonstrably failed to reach
-            # (connection refused / timeout). Threaded into every
+            # Managers/gates this attempt has demonstrably failed to
+            # reach (connection refused / timeout). Threaded into every
             # subsequent request so a freshly-elected DC leader can
             # treat a cached job-leader in this set as genuinely dead
             # and take over immediately, rather than redirecting the
             # client back to an address it already proved unreachable
             # while its own SWIM failure detector is still catching up.
+            # Accumulated across the whole budget: a node proven dead
+            # stays dead for the duration of this cancel.
             unreachable: set[tuple[str, int]] = set()
 
+            # Retry is bounded by a TIME budget, not a fixed count. A
+            # cancel issued mid-failover must keep sweeping the fleet
+            # until the DC's manager leadership reconverges and a target
+            # confirms — which can take a full SWIM/Raft failover
+            # convergence (tens of seconds), far longer than a fixed
+            # ``max_retries`` of quick round-trips would span. The
+            # per-send timeout is kept modest (bounded well under the
+            # total budget) so one slow hop — e.g. a gate fanning out to
+            # a partly-dead DC — cannot swallow the whole budget; the
+            # budget is spent across many quick sweeps instead.
+            per_send_timeout = min(timeout, _CANCEL_PER_SEND_TIMEOUT_SECONDS)
+            deadline = _DEFAULT_CLOCK.monotonic() + timeout
             last_error: str | None = None
-            retries_used = 0
+            sweep = 0
 
-            while pending and retries_used <= max_retries:
-                target = pending.pop(0)
-                tried.add(target)
+            while True:
+                # Each sweep re-tries the full fleet from scratch:
+                # ``tried`` resets so redirect hints can be followed
+                # afresh as leadership converges, while ``unreachable``
+                # persists as accumulated ground truth.
+                pending: list[tuple[str, int]] = list(configured_targets)
+                tried: set[tuple[str, int]] = set()
 
-                result = await self._attempt_with_redirects(
-                    initial_target=target,
-                    request=request,
-                    job_id=job_id,
-                    timeout=timeout,
-                    max_redirects=max_redirects,
-                    tried=tried,
-                    unreachable=unreachable,
-                )
+                while pending:
+                    target = pending.pop(0)
+                    tried.add(target)
 
-                if isinstance(result, JobCancelResponse):
-                    return result
+                    result = await self._attempt_with_redirects(
+                        initial_target=target,
+                        request=request,
+                        job_id=job_id,
+                        timeout=per_send_timeout,
+                        max_redirects=max_redirects,
+                        tried=tried,
+                        unreachable=unreachable,
+                    )
 
-                # ``result`` is a transient error string — back off then
-                # fall over to the next pending target.
-                last_error = result
-                await self._apply_retry_delay(
-                    retries_used, max_retries, retry_base_delay
-                )
-                retries_used += 1
+                    if isinstance(result, JobCancelResponse):
+                        return result
+
+                    # ``result`` is a transient error string — record it
+                    # and fall over to the next target in this sweep.
+                    last_error = result
+
+                # A full sweep produced only transient errors. Stop if
+                # the budget is spent; otherwise back off (capped,
+                # jittered, and never past the deadline) and sweep again.
+                remaining = deadline - _DEFAULT_CLOCK.monotonic()
+                if remaining <= 0:
+                    break
+                base = min(retry_base_delay * (2 ** min(sweep, 4)), 5.0)
+                delay = base * (0.5 + _DEFAULT_RANDOM.random())
+                await _DEFAULT_CLOCK.sleep(min(delay, remaining))
+                sweep += 1
 
             raise RuntimeError(
-                f"Job cancellation failed after {retries_used} retries "
-                f"across {len(tried)} target(s): {last_error}"
+                f"Job cancellation failed within {timeout:.1f}s budget "
+                f"({sweep + 1} sweep(s) over {len(configured_targets)} "
+                f"target(s)): {last_error}"
             )
         except BaseException:
             # Drop the tracking we installed if the request itself

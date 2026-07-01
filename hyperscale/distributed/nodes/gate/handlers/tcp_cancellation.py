@@ -36,6 +36,14 @@ from hyperscale.logging.hyperscale_logging_models import (
 
 from ..state import GateRuntimeState
 
+# Prefix stamped on a cancel response when no DC confirmed the cancel,
+# so the client classifies the failure as retryable. The substring
+# ``leader transition`` is registered in
+# ``hyperscale.distributed.nodes.client.config.TRANSIENT_ERRORS``; the
+# two must stay in sync — changing this marker requires updating that
+# set.
+_CANCEL_RETRYABLE_MARKER = "cancellation pending leader transition"
+
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.jobs.gates import GateJobManager
@@ -209,8 +217,20 @@ class GateCancellationHandler:
                     error="Job already completed",
                 )
 
+            # Fail-fast forward: try each manager once (no per-manager
+            # connection retry) so a full DC sweep — even against a
+            # partly-dead DC mid-failover — returns to the client well
+            # inside the client's per-send timeout. Robustness against
+            # the failover convergence window comes from the *client*
+            # re-issuing the cancel across its total time budget (see
+            # ``ClientCancellationManager.cancel_job``), not from the
+            # gate blocking on internal retries. Retrying here instead
+            # would stack per-manager backoff into a multi-tens-of-
+            # seconds round-trip that the client would time out on,
+            # which is exactly what stranded gate-routed cancels during
+            # a manager-leader failover.
             retry_config = RetryConfig(
-                max_attempts=3,
+                max_attempts=1,
                 base_delay=0.5,
                 max_delay=5.0,
                 jitter=JitterStrategy.FULL,
@@ -219,78 +239,57 @@ class GateCancellationHandler:
 
             cancelled_workflows = 0
             errors: list[str] = []
+            any_dc_confirmed = False
 
             for dc in self._get_available_datacenters():
                 managers = self._datacenter_managers.get(dc, [])
-                dc_cancelled = False
+                dc_cancelled_count, dc_confirmed, dc_error = (
+                    await self._cancel_job_in_dc_with_redirects(
+                        dc=dc,
+                        managers=managers,
+                        use_ad20=use_ad20,
+                        job_id=job_id,
+                        requester_id=requester_id,
+                        fence_token=fence_token,
+                        reason=reason,
+                        timestamp=timestamp,
+                        retry_config=retry_config,
+                    )
+                )
+                cancelled_workflows += dc_cancelled_count
+                any_dc_confirmed = any_dc_confirmed or dc_confirmed
+                if dc_error:
+                    errors.append(f"DC {dc}: {dc_error}")
 
-                for manager_addr in managers:
-                    if dc_cancelled:
-                        break
+            # Only mark the job CANCELLED locally when at least one DC
+            # confirmed it actually cancelled (or the job was already
+            # terminal there). Flipping the status to CANCELLED while
+            # every DC forward failed — the prior behavior — reports a
+            # false success to the client and desyncs the gate's view
+            # from the managers that are still running the workflows.
+            if any_dc_confirmed:
+                job.status = JobStatus.CANCELLED.value
+                await self._state.increment_state_version()
 
-                    retry_executor = RetryExecutor(retry_config)
-
-                    async def send_cancel_to_manager(
-                        use_ad20: bool = use_ad20,
-                        job_id: str = job_id,
-                        requester_id: str = requester_id,
-                        fence_token: int = fence_token,
-                        reason: str = reason,
-                        manager_addr: tuple[str, int] = manager_addr,
-                        timestamp: float = timestamp,
-                    ):
-                        if use_ad20:
-                            cancel_data = JobCancelRequest(
-                                job_id=job_id,
-                                requester_id=requester_id,
-                                timestamp=timestamp,
-                                fence_token=fence_token,
-                                reason=reason,
-                            ).dump()
-                        else:
-                            cancel_data = CancelJob(
-                                job_id=job_id,
-                                reason=reason,
-                                fence_token=fence_token,
-                            ).dump()
-
-                        response, _ = await self._send_tcp(
-                            manager_addr,
-                            "cancel_job",
-                            cancel_data,
-                            timeout=5.0,
-                        )
-                        return response
-
-                    try:
-                        response = await retry_executor.execute(
-                            send_cancel_to_manager,
-                            operation_name=f"cancel_job_dc_{dc}",
-                        )
-
-                        if isinstance(response, bytes):
-                            try:
-                                dc_response = JobCancelResponse.load(response)
-                                cancelled_workflows += (
-                                    dc_response.cancelled_workflow_count
-                                )
-                                dc_cancelled = True
-                            except Exception:
-                                dc_ack = CancelAck.load(response)
-                                cancelled_workflows += dc_ack.workflows_cancelled
-                                dc_cancelled = True
-                    except Exception as error:
-                        errors.append(f"DC {dc}: {str(error)}")
-                        continue
-
-            job.status = JobStatus.CANCELLED.value
-            await self._state.increment_state_version()
-
-            error_str = "; ".join(errors) if errors else None
+            # When no DC confirmed the cancel, the response is a
+            # non-success that the client must be able to RETRY: during
+            # a manager-leader failover every DC transiently returns
+            # "not job leader" / unreachable until leadership
+            # reconverges. Prefix the aggregate error with an
+            # explicit transient marker so the client classifies it as
+            # retryable (see ``TRANSIENT_ERRORS``) and re-issues the
+            # cancel across its time budget instead of giving up. A
+            # confirmed cancel carries the raw per-DC detail (which may
+            # still include a non-fatal error from a *different* DC).
+            if any_dc_confirmed:
+                error_str = "; ".join(errors) if errors else None
+            else:
+                detail = "; ".join(errors) if errors else "no DC confirmed"
+                error_str = f"{_CANCEL_RETRYABLE_MARKER}: {detail}"
             return self._build_cancel_response(
                 use_ad20,
                 job_id,
-                success=True,
+                success=any_dc_confirmed,
                 cancelled_count=cancelled_workflows,
                 error=error_str,
             )
@@ -300,6 +299,227 @@ class GateCancellationHandler:
             is_ad20 = self._is_ad20_cancel_request(data)
             return self._build_cancel_response(
                 is_ad20, "unknown", success=False, error=str(error)
+            )
+
+    async def _cancel_job_in_dc_with_redirects(
+        self,
+        *,
+        dc: str,
+        managers: list[tuple[str, int]],
+        use_ad20: bool,
+        job_id: str,
+        requester_id: str,
+        fence_token: int,
+        reason: str,
+        timestamp: float,
+        retry_config: RetryConfig,
+        max_redirects: int = 3,
+    ) -> tuple[int, bool, str | None]:
+        """Forward a cancel to one DC, following the manager's leader
+        redirects until a manager confirms cancellation.
+
+        Returns ``(cancelled_count, confirmed, error)``. ``confirmed``
+        is True when a manager reported the job cancelled, already
+        cancelled, or already completed — i.e. a definitive terminal
+        answer, not a redirect or a transport failure.
+
+        Why this exists: the gate must reach the DC's *actual* job
+        leader. A manager that isn't the job leader answers
+        ``JobCancelResponse(success=False, leader_addr=X)``. The prior
+        implementation accepted any parseable response as "DC done",
+        so if the gate's cached manager list didn't happen to put the
+        leader first — the common case right after a manager-leader
+        failover — the cancel silently under-cancelled and the gate
+        reported a false success. We now follow the redirect and try
+        alternate managers, exactly like the client's own
+        ``ClientCancellationManager._attempt_with_redirects``.
+
+        Two pieces of context ride along on every forwarded
+        ``JobCancelRequest``:
+
+        * ``callback_addr`` = this gate's address. A manager that takes
+          over job leadership after a failover may never have inherited
+          the job's callback (the ``_broadcast_job_leadership`` fan-out
+          is fire-and-forget and is readily dropped when a leader dies
+          mid-send). Carrying the gate address lets the new leader push
+          ``job_cancellation_complete`` back to us to forward to the
+          client, so the client's ``await_job_cancellation`` unblocks.
+
+        * ``unreachable_addrs`` = managers we've already failed to
+          reach this attempt, so the manager's redirect resolver never
+          bounces us to a peer we've proved dead.
+        """
+        gate_callback = (self._get_host(), self._get_tcp_port())
+        pending: list[tuple[str, int]] = list(managers)
+        tried: set[tuple[str, int]] = set()
+        unreachable: set[tuple[str, int]] = set()
+        redirects_used = 0
+        last_error: str | None = None
+
+        while pending:
+            target = tuple(pending.pop(0))
+            if target in tried:
+                continue
+            tried.add(target)
+
+            cancel_data = self._build_forward_cancel_data(
+                use_ad20=use_ad20,
+                job_id=job_id,
+                requester_id=requester_id,
+                fence_token=fence_token,
+                reason=reason,
+                timestamp=timestamp,
+                callback_addr=gate_callback,
+                unreachable_addrs=sorted(unreachable),
+            )
+
+            retry_executor = RetryExecutor(retry_config)
+            try:
+                response = await retry_executor.execute(
+                    lambda addr=target, payload=cancel_data: self._forward_cancel(
+                        addr, payload
+                    ),
+                    operation_name=f"cancel_job_dc_{dc}",
+                )
+            except Exception as error:
+                # Exhausted connection retries — this manager is
+                # unreachable. Record it so later requests in this DC
+                # carry it in ``unreachable_addrs``, then fall over.
+                unreachable.add(target)
+                last_error = str(error)
+                continue
+
+            if not isinstance(response, bytes):
+                last_error = "no response from manager"
+                continue
+
+            confirmed, cancelled_count, leader_addr, transient_error = (
+                self._interpret_manager_cancel_response(response)
+            )
+            if confirmed:
+                return cancelled_count, True, None
+
+            if (
+                leader_addr is not None
+                and redirects_used < max_redirects
+                and tuple(leader_addr) not in tried
+            ):
+                # Honor the manager's leader hint: try it next.
+                pending.insert(0, tuple(leader_addr))
+                redirects_used += 1
+                continue
+
+            if transient_error:
+                last_error = transient_error
+
+        return 0, False, last_error or "no manager confirmed cancellation"
+
+    def _build_forward_cancel_data(
+        self,
+        *,
+        use_ad20: bool,
+        job_id: str,
+        requester_id: str,
+        fence_token: int,
+        reason: str,
+        timestamp: float,
+        callback_addr: tuple[str, int],
+        unreachable_addrs: list[tuple[str, int]],
+    ) -> bytes:
+        """Serialize the manager-bound cancel request.
+
+        AD-20 clients get a ``JobCancelRequest`` carrying the failover
+        context (``callback_addr`` / ``unreachable_addrs``); legacy
+        clients get the minimal ``CancelJob``, which has no fields for
+        that context — legacy deployments simply forgo the
+        failover-hardening, matching their pre-existing behavior.
+        """
+        if use_ad20:
+            return JobCancelRequest(
+                job_id=job_id,
+                requester_id=requester_id,
+                timestamp=timestamp,
+                fence_token=fence_token,
+                reason=reason,
+                callback_addr=callback_addr,
+                unreachable_addrs=unreachable_addrs,
+            ).dump()
+        return CancelJob(
+            job_id=job_id,
+            reason=reason,
+            fence_token=fence_token,
+        ).dump()
+
+    # Per-manager forward timeout. Short so a full fail-fast DC sweep
+    # (this timeout × manager count + a redirect hop or two) stays
+    # inside the client's per-send budget; the client's total-budget
+    # retry, not a long gate timeout, is what spans a failover.
+    _FORWARD_TIMEOUT_SECONDS = 3.0
+
+    async def _forward_cancel(
+        self,
+        manager_addr: tuple[str, int],
+        cancel_data: bytes,
+    ) -> bytes | None:
+        """Send one cancel request to a manager and return the raw
+        response bytes (or raise for the retry executor)."""
+        response, _ = await self._send_tcp(
+            manager_addr,
+            "cancel_job",
+            cancel_data,
+            timeout=self._FORWARD_TIMEOUT_SECONDS,
+        )
+        return response
+
+    def _interpret_manager_cancel_response(
+        self,
+        response: bytes,
+    ) -> tuple[bool, int, tuple[str, int] | None, str | None]:
+        """Classify a manager's cancel response.
+
+        Returns ``(confirmed, cancelled_count, leader_addr,
+        transient_error)``:
+
+        * ``confirmed`` — the manager gave a definitive terminal
+          answer (cancelled / already cancelled / already completed).
+        * ``leader_addr`` — a redirect hint to follow when not
+          confirmed.
+        * ``transient_error`` — a non-terminal error worth recording
+          for diagnostics when neither confirmed nor redirected.
+
+        The manager always answers with ``JobCancelResponse`` (its
+        ``_build_cancel_response`` returns that shape regardless of the
+        request format); the ``CancelAck`` fallback covers any legacy
+        peer that still replies in the old shape. ``JobCancelResponse``
+        is tried first because ``Message.load`` is deliberately lax
+        about the concrete type.
+        """
+        try:
+            parsed = JobCancelResponse.load(response)
+            confirmed = (
+                parsed.success
+                or parsed.already_cancelled
+                or parsed.already_completed
+            )
+            leader_addr = (
+                tuple(parsed.leader_addr)
+                if parsed.leader_addr is not None
+                else None
+            )
+            transient_error = None if confirmed else parsed.error
+            return (
+                confirmed,
+                parsed.cancelled_workflow_count,
+                leader_addr,
+                transient_error,
+            )
+        except Exception:
+            ack = CancelAck.load(response)
+            return (
+                ack.cancelled,
+                ack.workflows_cancelled,
+                None,
+                None if ack.cancelled else ack.error,
             )
 
     async def handle_cancellation_complete(

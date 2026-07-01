@@ -454,12 +454,12 @@ class TestHandleCancelJobFailureModes:
 
 
 # =============================================================================
-# handle_job_cancellation_complete Tests
+# handle_cancellation_complete Tests
 # =============================================================================
 
 
 class TestHandleJobCancellationComplete:
-    """Tests for handle_job_cancellation_complete."""
+    """Tests for handle_cancellation_complete."""
 
     @pytest.mark.asyncio
     async def test_handles_completion_notification(self):
@@ -480,7 +480,7 @@ class TestHandleJobCancellationComplete:
         async def mock_handle_exception(error, context):
             pass
 
-        result = await handler.handle_job_cancellation_complete(
+        result = await handler.handle_cancellation_complete(
             addr=("10.0.0.1", 8000),
             data=complete.dump(),
             handle_exception=mock_handle_exception,
@@ -498,7 +498,7 @@ class TestHandleJobCancellationComplete:
         async def mock_handle_exception(error, context):
             errors_handled.append((error, context))
 
-        result = await handler.handle_job_cancellation_complete(
+        result = await handler.handle_cancellation_complete(
             addr=("10.0.0.1", 8000),
             data=b"invalid_data",
             handle_exception=mock_handle_exception,

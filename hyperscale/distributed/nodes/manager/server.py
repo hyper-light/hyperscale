@@ -4632,6 +4632,29 @@ class ManagerServer(HealthAwareServer):
         # no further decisions matter.
         self._worker_health_manager.forget_workflow(result.workflow_id)
 
+    def _resolve_manager_tcp_from_udp(
+        self,
+        udp_addr: tuple[str, int],
+    ) -> tuple[str, int] | None:
+        """Translate a manager UDP/SWIM address to its TCP address.
+
+        The leader-election and SWIM layers identify peers by their UDP
+        address; every TCP-facing consumer (redirect targets, cancel /
+        submission forwarding) needs the TCP address instead. Resolve
+        via the known-manager-peers index, with a self short-circuit for
+        the common case where this manager is itself the leader.
+
+        Returns ``None`` when the UDP address matches no known peer —
+        the caller then falls back to a TCP-addressed source rather than
+        forwarding an address it can't otherwise justify.
+        """
+        if udp_addr == (self._host, self._udp_port):
+            return (self._host, self._tcp_port)
+        for _peer_id, info in self._manager_state.iter_known_manager_peers():
+            if (info.udp_host, info.udp_port) == udp_addr:
+                return (info.tcp_host, info.tcp_port)
+        return None
+
     def _resolve_dc_leader_addr(self) -> tuple[str, int] | None:
         """Best-effort lookup of the DC leader's TCP address.
 
@@ -4662,10 +4685,29 @@ class ManagerServer(HealthAwareServer):
         of letting the client guess across N managers, every
         manager that has *any* leader information forwards it.
         """
-        # Layer 1: locally-converged election state.
+        # Layer 1: locally-converged election state. ``current_leader``
+        # is a **UDP/SWIM-namespace** address — the leader election runs
+        # over UDP (``self_addr=self._get_self_udp_addr()`` at
+        # construction), so ``current_leader`` is set from UDP peer
+        # addresses. Redirect targets must be **TCP** addresses (the
+        # gate and client forward cancels/submissions over TCP), so
+        # translate through the peer index before returning. Returning
+        # the raw UDP address — the prior behavior — handed clients and
+        # gates an address one port off the real TCP endpoint (e.g. a
+        # manager listening TCP on 20006 was advertised as its UDP
+        # 20007), which the peer then failed to connect to. In an L2
+        # deployment the client's round-robin over its full manager
+        # list masked this; a gate forwarding by redirect has no such
+        # fallback and the cancel/submit dead-ended.
         election_leader = self._leader_election.state.current_leader
         if election_leader:
-            return tuple(election_leader)
+            translated = self._resolve_manager_tcp_from_udp(
+                tuple(election_leader)
+            )
+            if translated is not None:
+                return translated
+            # Untranslatable (peer not yet in the index) — fall through
+            # to the heartbeat-derived layers, which are TCP-addressed.
 
         # Layer 2: peer-heartbeat-derived dc_leader_manager_id.
         leader_id = self._manager_state.dc_leader_manager_id
