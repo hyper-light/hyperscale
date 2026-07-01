@@ -38,6 +38,7 @@ from hyperscale.distributed.runtime import (
     Random,
     RealClock,
     RealRandom,
+    TransportFactory,
 )
 
 from hyperscale.distributed.server.protocol import (
@@ -105,6 +106,7 @@ class MercurySyncBaseServer(Generic[T]):
         *,
         clock: Clock | None = None,
         random_source: Random | None = None,
+        transport_factory: TransportFactory | None = None,
     ) -> None:
         # Phase 5 dependency-injection seams. ``clock`` covers every
         # wall/monotonic read, ``asyncio.sleep``, and
@@ -118,6 +120,13 @@ class MercurySyncBaseServer(Generic[T]):
         self._random: Random = (
             random_source if random_source is not None else RealRandom()
         )
+        # Phase 6 SIM-mode socket seam. ``None`` in REAL mode — every
+        # socket-creation site (``_start_udp_server`` /
+        # ``_start_tcp_server`` / ``_connect_tcp_client``) then runs its
+        # existing OS-socket code unchanged. In SIM a ``SimTransportFactory``
+        # routes those sites through the in-process transport registry
+        # with no real sockets. See ``runtime/transport_factory.py``.
+        self._transport_factory: TransportFactory | None = transport_factory
         self._tcp_clock = LamportClock()
         self._udp_clock = LamportClock()
 
@@ -506,6 +515,22 @@ class MercurySyncBaseServer(Generic[T]):
         worker_socket: socket.socket | None = None,
         worker_transport: asyncio.DatagramTransport | None = None,
     ) -> None:
+        if self._transport_factory is not None:
+            # SIM mode: register the UDP protocol with the in-process
+            # transport registry instead of binding a real datagram
+            # socket. ``register_datagram_endpoint`` fires
+            # ``connection_made`` before returning (matching
+            # ``loop.create_datagram_endpoint``), so the protocol is
+            # wired to its transport on return.
+            udp_protocol = MercurySyncUDPProtocol(self)
+            self._udp_transport = (
+                self._transport_factory.register_datagram_endpoint(
+                    (self._udp_host, self._udp_port), udp_protocol
+                )
+            )
+            self._udp_connected = True
+            return
+
         if self._udp_connected is False and worker_socket is None:
             self._udp_server_socket = socket.socket(
                 socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
@@ -589,6 +614,20 @@ class MercurySyncBaseServer(Generic[T]):
         worker_socket: socket.socket | None = None,
         worker_server: asyncio.Server | None = None,
     ):
+        if self._transport_factory is not None:
+            # SIM mode: register the server-side TCP protocol factory
+            # with the in-process transport registry instead of binding
+            # a real listening socket. A fresh ``MercurySyncTCPProtocol``
+            # is built per accepted connection (matching
+            # ``loop.create_server``); the server side receives its
+            # transport via ``connection_made`` when a peer dials in.
+            self._transport_factory.register_stream_server(
+                (self._host, self._tcp_port),
+                lambda: MercurySyncTCPProtocol(self, mode="server"),
+            )
+            self._tcp_connected = True
+            return
+
         if self._server_cert_path and self._server_key_path:
             self._server_tcp_ssl_context = self._create_tcp_server_ssl_context()
 
@@ -844,6 +883,20 @@ class MercurySyncBaseServer(Generic[T]):
         address: Tuple[str, int],
         worker_socket: Optional[socket.socket] = None,
     ) -> None:
+        if self._transport_factory is not None:
+            # SIM mode: dial the peer through the in-process transport
+            # registry instead of creating a real socket + connecting
+            # via ``run_in_executor`` (which the SimulationLoop bans) +
+            # ``loop.create_connection``. Raises ``ConnectionRefusedError``
+            # when no server listens at ``address`` — same as REAL.
+            client_transport, _ = await self._transport_factory.connect_stream(
+                (self._host, self._tcp_port),
+                address,
+                lambda: MercurySyncTCPProtocol(self),
+            )
+            self._tcp_client_transports[address] = client_transport
+            return client_transport
+
         if self._client_cert_path and self._client_key_path:
             self._client_tcp_ssl_context = self._create_tcp_client_ssl_context()
 

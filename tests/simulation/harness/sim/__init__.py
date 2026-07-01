@@ -18,6 +18,7 @@ from .fake_tcp_transport import FakeTCPTransport
 from .fake_udp_transport import FakeUDPTransport
 from .in_process_transport import InProcessTransport
 from .seeded_random import SeededRandom
+from .sim_transport_factory import SimTransportFactory
 from .simulation_constraint_error import SimulationConstraintError
 from .simulation_loop import SimulationLoop
 from .virtual_clock import VirtualClock
@@ -29,6 +30,7 @@ __all__ = [
     "FakeUDPTransport",
     "InProcessTransport",
     "SeededRandom",
+    "SimTransportFactory",
     "SimulationConstraintError",
     "SimulationLoop",
     "TraceEntry",

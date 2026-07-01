@@ -27,3 +27,4 @@ from .swap import restore_defaults as restore_defaults
 from .swap import snapshot_defaults as snapshot_defaults
 from .swap import swap_defaults as swap_defaults
 from .transport import Transport as Transport
+from .transport_factory import TransportFactory as TransportFactory
