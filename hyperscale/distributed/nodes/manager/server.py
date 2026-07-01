@@ -6586,6 +6586,43 @@ class ManagerServer(HealthAwareServer):
                             reason=reason,
                         ),
                     )
+
+                    # Race close-out: when the worker reports
+                    # ``already_completed=True`` it means the
+                    # workflow finished BEFORE the cancel request
+                    # arrived, so the worker's cancel handler at
+                    # ``tcp_cancel.py:60`` returns the direct
+                    # response without invoking ``_cancel_workflow``
+                    # — and therefore never schedules the async
+                    # ``workflow_cancellation_complete`` push. Under
+                    # the vanilla flow the manager's pending
+                    # tracker would keep ``workflow_id`` in the set
+                    # forever (it's only decremented by the async
+                    # push handler at line ~7250), the zero-pending
+                    # branch that fires
+                    # ``_push_cancellation_complete_to_origin``
+                    # never activates, and the client's
+                    # ``await_job_cancellation`` times out. Under
+                    # leader-failover-during-cancel this happens
+                    # exactly when the workflow completes on the
+                    # worker between old-leader-kill and new-leader
+                    # -receives-cancel — the exact race
+                    # ``test_cancel_during_leader_failover``
+                    # surfaces intermittently. Synthesizing the
+                    # decrement here — with the same
+                    # decrement-and-maybe-fire semantics the async
+                    # handler uses — closes the race without
+                    # requiring the worker to emit a redundant
+                    # push. ``_finalize_workflow_cancellation`` is
+                    # the shared helper the async handler was
+                    # refactored to use.
+                    if workflow_response.already_completed:
+                        await self._finalize_workflow_cancellation(
+                            job_id=job_id,
+                            workflow_id=workflow_id,
+                            success=True,
+                            errors=[],
+                        )
                     return True, None
 
                 error_msg = (
@@ -7112,6 +7149,76 @@ class ManagerServer(HealthAwareServer):
                 error=str(error),
             ).dump()
 
+    async def _finalize_workflow_cancellation(
+        self,
+        job_id: str,
+        workflow_id: str,
+        success: bool,
+        errors: list[str],
+    ) -> None:
+        """Decrement the pending-cancellation tracker and, if this
+        was the last outstanding workflow, fire the origin push.
+
+        Extracted from the inline body of
+        ``workflow_cancellation_complete`` so both the async push
+        handler AND the synchronous ``already_completed`` detection
+        in ``_cancel_running_workflow_on_worker`` reach the same
+        completion path. The two callers converge on identical
+        state after the last workflow terminates — either via the
+        worker's async push (canonical cancel-mid-flight) or via
+        the direct response's ``already_completed`` field
+        (race-close-out when the workflow finished before the
+        cancel request landed).
+
+        Idempotent: workflows not in the pending set are a no-op,
+        so double-invocation across the race (worker replies
+        already_completed AND races to send the async push before
+        the tracker drains) is safe.
+        """
+        pending = self._manager_state.get_cancellation_pending_workflows(job_id)
+        if workflow_id not in pending:
+            return
+
+        self._manager_state.remove_cancellation_pending_workflow(
+            job_id, workflow_id
+        )
+
+        # Aggregate any errors reported by the worker's push. When
+        # the caller synthesizes the decrement for the
+        # already-completed race, ``errors`` is empty — nothing
+        # went wrong; the workflow simply finished on its own.
+        if not success and errors:
+            for error in errors:
+                self._manager_state.add_cancellation_error(
+                    job_id, f"Workflow {workflow_id[:8]}...: {error}"
+                )
+
+        remaining_pending = (
+            self._manager_state.get_cancellation_pending_workflows(job_id)
+        )
+        if remaining_pending:
+            return
+
+        # All workflows have reported — fire the completion event
+        # and push to origin.
+        event = self._manager_state.get_cancellation_completion_event(job_id)
+        if event:
+            event.set()
+
+        aggregated_errors = self._manager_state.get_cancellation_errors(job_id)
+        aggregated_success = len(aggregated_errors) == 0
+
+        self._task_runner.run(
+            self._push_cancellation_complete_to_origin,
+            job_id,
+            aggregated_success,
+            aggregated_errors,
+        )
+
+        self._manager_state.clear_cancellation_pending_workflows(job_id)
+        self._manager_state.clear_cancellation_completion_events(job_id)
+        self._manager_state.clear_cancellation_initiated_at(job_id)
+
     @tcp.receive()
     async def workflow_cancellation_complete(
         self,
@@ -7246,46 +7353,12 @@ class ManagerServer(HealthAwareServer):
                         )
 
             # Track this workflow as complete
-            pending = self._manager_state.get_cancellation_pending_workflows(job_id)
-            if workflow_id in pending:
-                self._manager_state.remove_cancellation_pending_workflow(
-                    job_id, workflow_id
-                )
-
-                # Collect any errors
-                if not completion.success and completion.errors:
-                    for error in completion.errors:
-                        self._manager_state.add_cancellation_error(
-                            job_id, f"Workflow {workflow_id[:8]}...: {error}"
-                        )
-
-                # Check if all workflows for this job have reported
-                remaining_pending = (
-                    self._manager_state.get_cancellation_pending_workflows(job_id)
-                )
-                if not remaining_pending:
-                    # All workflows cancelled - fire completion event and push to origin
-                    event = self._manager_state.get_cancellation_completion_event(
-                        job_id
-                    )
-                    if event:
-                        event.set()
-
-                    errors = self._manager_state.get_cancellation_errors(job_id)
-                    success = len(errors) == 0
-
-                    # Push completion notification to origin gate/client
-                    self._task_runner.run(
-                        self._push_cancellation_complete_to_origin,
-                        job_id,
-                        success,
-                        errors,
-                    )
-
-                    # Cleanup tracking structures
-                    self._manager_state.clear_cancellation_pending_workflows(job_id)
-                    self._manager_state.clear_cancellation_completion_events(job_id)
-                    self._manager_state.clear_cancellation_initiated_at(job_id)
+            await self._finalize_workflow_cancellation(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                success=completion.success,
+                errors=list(completion.errors or []),
+            )
 
             # Also delegate to cancellation coordinator for additional handling
             await self._cancellation.handle_workflow_cancelled(completion)
