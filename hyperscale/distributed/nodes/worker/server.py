@@ -928,11 +928,19 @@ class WorkerServer(HealthAwareServer):
         )
         self._lifecycle_manager.add_background_task(self._overload_poll_task)
 
-        self._resource_sample_task = self._create_background_task(
-            self._run_resource_sample_loop(),
-            "resource_sample",
-        )
-        self._lifecycle_manager.add_background_task(self._resource_sample_task)
+        # Resource sampling reads the real host through
+        # ``asyncio.to_thread`` (``run_in_executor`` — banned on the
+        # SimulationLoop) and its readings are inherently
+        # non-deterministic; worse, the loop's broad exception handler
+        # would swallow the constraint error once per virtual second
+        # forever. Like the lifecycle monitors, telemetry is skipped
+        # under SIM — scenarios assert on state, not host samples.
+        if self._transport_factory is None:
+            self._resource_sample_task = self._create_background_task(
+                self._run_resource_sample_loop(),
+                "resource_sample",
+            )
+            self._lifecycle_manager.add_background_task(self._resource_sample_task)
 
         self._worker_pool_health_task = self._create_background_task(
             self._run_worker_pool_health_loop(),

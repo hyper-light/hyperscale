@@ -174,10 +174,19 @@ class WorkerLifecycleManager:
         """
         Start CPU and memory monitors.
 
+        Under SIM the monitors never start: their background loops
+        sample the real host via ``run_in_executor`` (banned on the
+        ``SimulationLoop``) and host readings are inherently
+        non-deterministic. Telemetry gets the same treatment as
+        logging — scenarios assert on state, not resource samples.
+
         Args:
             datacenter_id: Datacenter identifier
             node_id: Full node identifier
         """
+        if self._transport_factory is not None:
+            return
+
         await self._cpu_monitor.start_background_monitor(datacenter_id, node_id)
         await self._memory_monitor.start_background_monitor(datacenter_id, node_id)
 
@@ -189,10 +198,15 @@ class WorkerLifecycleManager:
         """
         Stop CPU and memory monitors.
 
+        No-op under SIM — ``start_monitors`` never started them.
+
         Args:
             datacenter_id: Datacenter identifier
             node_id: Full node identifier
         """
+        if self._transport_factory is not None:
+            return
+
         await self._cpu_monitor.stop_background_monitor(datacenter_id, node_id)
         await self._memory_monitor.stop_background_monitor(datacenter_id, node_id)
 
