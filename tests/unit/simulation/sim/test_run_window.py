@@ -85,6 +85,23 @@ def test_timer_exactly_at_deadline_fires():
     assert next_event is None
 
 
+def test_start_time_initializes_virtual_clock():
+    """A loop built with ``start_time`` (a process admitted mid-run by
+    the coordinator) begins at that virtual time: relative scheduling is
+    offset from it and nothing time-travels into the global past."""
+    loop = SimulationLoop(start_time=7.5)
+    fired: list[float] = []
+
+    assert loop.time() == 7.5
+
+    loop.call_later(0.5, lambda: fired.append(loop.time()))
+    next_event = loop.run_window(8.0)
+
+    assert fired == [8.0]
+    assert next_event is None
+    assert loop.time() == 8.0
+
+
 def test_windowed_execution_matches_single_pass_ordering():
     """Driving a schedule window-by-window yields the same fire order as
     running it in one pass — the coordinator must not perturb ordering."""

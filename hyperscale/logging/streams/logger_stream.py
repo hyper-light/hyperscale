@@ -400,6 +400,15 @@ class LoggerStream:
         self._update_logfile_metadata(logfile_path, logfile_metadata)
 
     async def close(self, shutdown_subscribed: bool = False):
+        # A stream that never built its pipeline — ``initialize`` under
+        # the global disable flag marks it initialized without creating a
+        # consumer, provider, or writers — has nothing to close. Guarding
+        # on state (not on the config flag) also keeps a stream that was
+        # *enabled* at setup closing normally even if logging was
+        # disabled midway through its lifetime.
+        if self._consumer is None:
+            return
+
         self._closing = True
 
         await self._stop_consumer(shutdown_subscribed)

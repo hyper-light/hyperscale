@@ -9,7 +9,18 @@ import weakref
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing.context import SpawnContext
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List
+
+if TYPE_CHECKING:
+    # Type-only imports (never loaded at runtime, so no core->distributed
+    # import cycle). Both seams are duck-typed: the pool only calls
+    # ``spawn_process`` on the spawner, and the SIM executor entry only
+    # reads ``loop`` / ``transport`` off the child context — the harness
+    # ``ChildContext`` under ``tests/simulation/`` provides both.
+    from hyperscale.distributed.runtime.process_spawner import ProcessSpawner
+    from hyperscale.distributed.runtime.simulation_child_context import (
+        SimulationChildContext,
+    )
 
 
 # Module-level weak reference set for atexit cleanup
@@ -213,15 +224,73 @@ def run_thread(
         pass
 
 
+def run_sim_executor(
+    context: "SimulationChildContext",
+    worker_index: int,
+    leader_address: tuple[str, int],
+    worker_address: tuple[str, int],
+    worker_env: Dict[str, str | int | float | bool | None],
+    cert_path: str | None,
+    key_path: str | None,
+    enable_server_cleanup: bool,
+) -> None:
+    """SIM counterpart of ``run_thread`` — one pool executor as a
+    coordinator child process.
+
+    Runs inside a freshly spawned simulation child: builds the same
+    ``RemoteGraphController`` ``run_thread`` builds, but pinned to the
+    child's ``SimulationLoop`` and cross-process transport, then drives
+    the *identical* production lifecycle (``run_server``: start, connect
+    back to the leader, acknowledge, serve until stopped). No uvloop, no
+    logging reconfiguration, no fresh event loop — the child runtime owns
+    all three. Top-level so ``spawn`` can re-import it by module +
+    qualname in the executor process.
+    """
+    worker_host, worker_port = worker_address
+    server = RemoteGraphController(
+        worker_index + 1,
+        worker_host,
+        worker_port,
+        Env(**worker_env),
+        loop=context.loop,
+        transport_factory=context.transport,
+    )
+
+    context.loop.create_task(
+        run_server(
+            leader_address,
+            server,
+            cert_path=cert_path,
+            key_path=key_path,
+            enable_server_cleanup=enable_server_cleanup,
+        )
+    )
+
+
 class LocalServerPool:
     def __init__(
         self,
         pool_size: int,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+        process_spawner: "ProcessSpawner | None" = None,
     ) -> None:
+        # Phase 6 SIM seam. ``process_spawner`` is ``None`` in REAL mode —
+        # the pool fans its executors out through a ``ProcessPoolExecutor``
+        # exactly as before. Under SIM the spawner (the coordinator child
+        # context) requests each executor as a *coordinator child process*
+        # instead, so every executor still runs in its own OS process
+        # (multi-process preserved) but on a ``SimulationLoop`` the
+        # ``SimulationCoordinator`` keeps in lockstep. The coordinator
+        # then owns executor lifecycle end-to-end — ``shutdown`` /
+        # ``abort`` have no subprocesses of their own to reap. ``loop``
+        # pins the pool to the caller's ``SimulationLoop`` so lazy
+        # ``get_event_loop`` never resolves a non-simulation loop.
         self._pool_size = pool_size
         self._context: SpawnContext | None = None
         self._executor: ProcessPoolExecutor | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop: asyncio.AbstractEventLoop | None = loop
+        self._process_spawner = process_spawner
         self._pool_task: asyncio.Task | None = None
         self._run_future: asyncio.Future | None = None
         self._logger = Logger()
@@ -231,6 +300,15 @@ class LocalServerPool:
         _active_pools.add(self)
 
     async def setup(self):
+        if self._process_spawner is not None:
+            # SIM: executors are spawned as coordinator child processes at
+            # ``run_pool`` time — no ``ProcessPoolExecutor``, and signal
+            # handlers are banned on the ``SimulationLoop`` (the
+            # coordinator, not signals, drives shutdown).
+            if self._loop is None:
+                self._loop = asyncio.get_event_loop()
+            return
+
         self._context = multiprocessing.get_context("spawn")
         self._executor = ProcessPoolExecutor(
             max_workers=self._pool_size,
@@ -280,6 +358,17 @@ class LocalServerPool:
         key_path: str | None = None,
         enable_server_cleanup: bool = False,
     ):
+        if self._process_spawner is not None:
+            self._spawn_simulation_executors(
+                leader_address,
+                worker_ips,
+                env,
+                cert_path=cert_path,
+                key_path=key_path,
+                enable_server_cleanup=enable_server_cleanup,
+            )
+            return
+
         async with self._logger.context(
             name="local_server_pool",
             path="hyperscale.leader.log.json",
@@ -323,12 +412,49 @@ class LocalServerPool:
             except (Exception, KeyboardInterrupt):
                 pass
 
+    def _spawn_simulation_executors(
+        self,
+        leader_address: tuple[str, int],
+        worker_ips: List[tuple[str, int]],
+        env: Env,
+        *,
+        cert_path: str | None,
+        key_path: str | None,
+        enable_server_cleanup: bool,
+    ) -> None:
+        """SIM counterpart of the ``ProcessPoolExecutor`` fan-out.
+
+        Requests one coordinator child per worker address, each running
+        ``run_sim_executor`` — the production executor lifecycle on a
+        lockstep ``SimulationLoop``. Process ids are derived from the
+        (globally unique) worker addresses, so two pools in one
+        simulation can never collide. The children are admitted by the
+        coordinator at the next window barrier, starting at the current
+        global virtual time.
+        """
+        worker_env = env.model_dump()
+        for worker_index, worker_address in enumerate(worker_ips):
+            worker_host, worker_port = worker_address
+            self._process_spawner.spawn_process(
+                f"executor-{worker_host}-{worker_port}",
+                run_sim_executor,
+                worker_index,
+                leader_address,
+                worker_address,
+                worker_env,
+                cert_path,
+                key_path,
+                enable_server_cleanup,
+            )
+
     def get_process_exitcodes(self) -> dict[int, int | None]:
         """Return a snapshot of worker-process PID to exit code.
 
         ``None`` means the process is still running. A non-``None`` exit code
         means the process exited and any workflow assigned to that local
-        controller is no longer making progress.
+        controller is no longer making progress. Under SIM (executors are
+        coordinator children, not pool subprocesses) there is no executor
+        and this returns ``{}``.
         """
         if self._executor is None:
             return {}

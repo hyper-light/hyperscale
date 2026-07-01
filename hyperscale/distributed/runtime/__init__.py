@@ -19,10 +19,14 @@ boundary in CI.
 """
 
 from .clock import Clock as Clock
+from .process_spawner import ProcessSpawner as ProcessSpawner
 from .random_source import Random as Random
 from .real_clock import RealClock as RealClock
 from .real_random import RealRandom as RealRandom
 from .runner import Runner as Runner
+from .simulation_child_context import (
+    SimulationChildContext as SimulationChildContext,
+)
 from .swap import restore_defaults as restore_defaults
 from .swap import snapshot_defaults as snapshot_defaults
 from .swap import swap_defaults as swap_defaults

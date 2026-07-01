@@ -43,3 +43,42 @@ def ping_pong_entry(context, address, peer, role) -> None:
         context.loop.call_at(5.0, send_ping)
 
     context.set_result(log)
+
+
+def spawning_parent_entry(
+    context, address, child_process_id, child_address, spawn_at
+) -> None:
+    """Child entry: echo endpoint in the ``pong`` role that, at virtual
+    time ``spawn_at``, requests admission of a ``late_child_entry``
+    process — exercising the coordinator's dynamic-spawn path."""
+    log: list = []
+    endpoint = _EchoEndpoint(context.loop, "pong", log)
+    context.transport.register_datagram_endpoint(address, endpoint)
+
+    context.loop.call_at(
+        spawn_at,
+        context.spawn_process,
+        child_process_id,
+        late_child_entry,
+        child_address,
+        address,
+    )
+
+    context.set_result(log)
+
+
+def late_child_entry(context, address, peer) -> None:
+    """Dynamically admitted child: records its (inherited) start time,
+    pings ``peer`` immediately, and records the reply's arrival time —
+    proving a mid-run process joins at global virtual time and exchanges
+    messages coherently in both directions."""
+    log: list = [("started", round(context.loop.time(), 6))]
+    endpoint = _EchoEndpoint(context.loop, "ping", log)
+    context.transport.register_datagram_endpoint(address, endpoint)
+
+    def send_ping() -> None:
+        log.append((round(context.loop.time(), 6), "send", "ping", peer))
+        endpoint.transport.sendto(b"ping", peer)
+
+    context.loop.call_soon(send_ping)
+    context.set_result(log)

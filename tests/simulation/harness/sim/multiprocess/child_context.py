@@ -67,6 +67,7 @@ class CrossProcessTransport:
         self._loop = loop
         self._endpoints: dict[tuple, object] = {}
         self._outbound: list[tuple] = []
+        self._spawn_requests: list[tuple] = []
 
     # -- production transport_factory seam -----------------------------
 
@@ -105,6 +106,27 @@ class CrossProcessTransport:
         self._outbound.clear()
         return out
 
+    # -- production process_spawner seam --------------------------------
+
+    def spawn_process(self, process_id: str, entry, *entry_args) -> None:
+        """Buffer a request for the coordinator to admit a new child
+        process running ``entry(child_context, *entry_args)``.
+
+        This is the SIM implementation of the production
+        ``ProcessSpawner`` seam (``LocalServerPool`` calls it to start
+        its executors). ``entry`` and ``entry_args`` must be picklable —
+        they cross the coordinator pipe and are re-imported by ``spawn``
+        in the new process. The child is admitted at the next window
+        barrier with its virtual clock initialized to global time.
+        """
+        self._spawn_requests.append((process_id, entry, tuple(entry_args)))
+
+    def drain_spawn_requests(self) -> list:
+        """Return and clear this window's buffered spawn requests."""
+        requests = self._spawn_requests[:]
+        self._spawn_requests.clear()
+        return requests
+
 
 class ChildContext:
     """Handed to a child entry function: the loop, the transport, and a
@@ -114,6 +136,11 @@ class ChildContext:
     initial behavior on ``loop`` (via ``call_at`` / ``create_task``), and
     optionally calls ``set_result`` with a value (often a live-mutated log
     or a server handle's state) to be collected when the run ends.
+
+    Implements the production ``SimulationChildContext`` /
+    ``ProcessSpawner`` Protocols: ``spawn_process`` (delegated to the
+    transport's buffer) lets production code running inside this child —
+    ``LocalServerPool`` above all — request further coordinator children.
     """
 
     __slots__ = ("loop", "transport", "_result")
@@ -122,6 +149,11 @@ class ChildContext:
         self.loop = loop
         self.transport = transport
         self._result = None
+
+    def spawn_process(self, process_id: str, entry, *entry_args) -> None:
+        """Request a new coordinator child (see
+        ``CrossProcessTransport.spawn_process``)."""
+        self.transport.spawn_process(process_id, entry, *entry_args)
 
     def set_result(self, value) -> None:
         self._result = value

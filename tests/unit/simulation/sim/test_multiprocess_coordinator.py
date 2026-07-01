@@ -11,7 +11,10 @@ byte-identical per-process logs (replay-determinism across processes).
 """
 
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
-from tests.simulation.harness.sim.multiprocess.demo_endpoints import ping_pong_entry
+from tests.simulation.harness.sim.multiprocess.demo_endpoints import (
+    ping_pong_entry,
+    spawning_parent_entry,
+)
 
 
 def _run_ping_pong() -> dict:
@@ -37,3 +40,31 @@ def test_multi_process_run_is_replay_deterministic():
     first = _run_ping_pong()
     second = _run_ping_pong()
     assert first == second
+
+
+def _run_dynamic_spawn() -> dict:
+    coordinator = SimulationCoordinator(latency=0.5)
+    coordinator.add_process(
+        "parent", spawning_parent_entry, ("proc", 1), "late", ("proc", 2), 3.0
+    )
+    return coordinator.run()
+
+
+def test_dynamically_spawned_child_joins_at_global_virtual_time():
+    """A child admitted mid-run (the ``ProcessSpawner`` seam) starts its
+    clock at the admitting barrier's global time — 3.0, not 0.0 — and
+    exchanges messages coherently in both directions."""
+    results = _run_dynamic_spawn()
+
+    assert results["parent"] == [
+        (3.5, "recv", "ping", ("proc", 2)),
+    ]
+    assert results["late"] == [
+        ("started", 3.0),
+        (3.0, "send", "ping", ("proc", 1)),
+        (4.0, "recv", "pong", ("proc", 1)),
+    ]
+
+
+def test_dynamic_spawn_is_replay_deterministic():
+    assert _run_dynamic_spawn() == _run_dynamic_spawn()

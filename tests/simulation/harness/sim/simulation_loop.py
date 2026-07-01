@@ -216,9 +216,16 @@ class SimulationLoop(base_events.BaseEventLoop):
     set.
     """
 
-    def __init__(self, trace=None) -> None:
+    def __init__(self, trace=None, *, start_time: float = 0.0) -> None:
         super().__init__()
-        self._virtual_now: float = 0.0
+        # ``start_time`` is 0.0 for every process present at simulation
+        # start. A process admitted *mid-run* by the multi-process
+        # ``SimulationCoordinator`` (e.g. a pool executor spawned when the
+        # worker's ``run_pool`` executes at virtual time T) begins its
+        # clock at the coordinator's current global virtual time — a
+        # fresh clock at 0.0 would emit messages timestamped in the
+        # global past and corrupt the total delivery order.
+        self._virtual_now: float = start_time
         self._trace = trace
         # ``BaseEventLoop`` expects ``_thread_id`` to be set by
         # ``run_forever``; nothing else here needs initialization.
