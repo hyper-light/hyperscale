@@ -12,7 +12,9 @@ discrete-event simulation (Chandy-Misra-Bryant style with a fixed
 positive lookahead):
 
 - ``SimulationCoordinator`` (parent process) owns global virtual time
-  and is the sole router of cross-process messages.
+  and is the sole router of cross-process messages — UDP datagrams and
+  TCP stream events (connect/accept/refuse/data/close) alike, carried
+  as opaque payloads routed by destination sockname.
 - Each child runs ``run_child_loop`` over a ``multiprocessing`` pipe:
   it drains its ``SimulationLoop`` up to the granted window edge,
   buffering outbound messages tagged with ``(send_time, seq)``, then

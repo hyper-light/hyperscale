@@ -2,12 +2,14 @@
 Child-process runtime for multi-process SIM.
 
 ``run_child_loop`` is the entry point every simulation child process
-runs. It builds the process's ``SimulationLoop`` + ``CrossProcessTransport``,
-invokes the user ``entry`` (which registers endpoints and schedules the
-process's initial behavior), then services the coordinator over the pipe:
-each ``GRANT`` injects delivered datagrams, drains the loop to the window
-edge via ``SimulationLoop.run_window``, and reports the next-event time
-plus this window's buffered outbound datagrams back across the barrier.
+runs. It builds the process's ``SimulationLoop`` + ``CrossProcessTransport``
+(+ ``VirtualClock`` / ``SeededRandom``, swapped in as the process
+defaults), invokes the user ``entry`` (which registers endpoints and
+schedules the process's initial behavior), then services the coordinator
+over the pipe: each ``GRANT`` injects delivered events, drains the loop
+to the window edge via ``SimulationLoop.run_window``, and reports the
+next-event time plus this window's buffered outbound events, spawn
+requests, and newly registered addresses back across the barrier.
 
 Wire protocol (tuples, ``multiprocessing``-picklable):
 
@@ -15,14 +17,19 @@ Wire protocol (tuples, ``multiprocessing``-picklable):
   ``("READY", addresses, next_event_time, outbound, spawn_requests)``
 - coordinator -> child: ``("GRANT", deadline, inbound)`` | ``("STOP",)``
 - child -> coordinator, per grant:
-  ``("REPORT", next_event_time, outbound, spawn_requests)``
+  ``("REPORT", next_event_time, outbound, spawn_requests, new_addresses)``
 - child -> coordinator, at shutdown: ``("RESULT", result)``
 
-where ``outbound`` items are ``(send_time, src_sockname, dst_addr, data)``,
-``inbound`` items are ``(delivery_time, dst_sockname, src_addr, data)``,
-and ``spawn_requests`` items are ``(process_id, entry, entry_args)`` —
+where ``outbound`` items are ``(send_time, src_sockname, dst_addr,
+payload)`` and ``inbound`` items are ``(delivery_time, dst_sockname,
+src_addr, payload)`` — ``payload`` is a tagged wire event (datagram or
+stream event; see ``child_context``), opaque to the coordinator;
+``spawn_requests`` items are ``(process_id, entry, entry_args)`` —
 requests for the coordinator to admit further child processes (the
-``ProcessSpawner`` seam ``LocalServerPool`` drives under SIM).
+``ProcessSpawner`` seam ``LocalServerPool`` drives under SIM); and
+``addresses`` / ``new_addresses`` are the socknames this process
+registered since the previous barrier (servers may start mid-run, so
+the route map grows incrementally).
 """
 
 import asyncio
@@ -63,7 +70,9 @@ def run_child_loop(
     loop = SimulationLoop(start_time=start_time)
     asyncio.set_event_loop(loop)
     transport = CrossProcessTransport(loop)
-    context = ChildContext(loop, transport)
+    virtual_clock = VirtualClock(loop)
+    seeded_random = SeededRandom(seed)
+    context = ChildContext(loop, transport, virtual_clock, seeded_random)
 
     # The multi-process twin of ``SimulationRuntime``'s default swap:
     # production modules that read the process-default ``Clock`` /
@@ -73,7 +82,7 @@ def run_child_loop(
     # entry's module graph is fully imported by the time we run (spawn
     # unpickled ``entry`` during bootstrap), so the swap covers it.
     defaults_snapshot = snapshot_defaults()
-    swap_defaults(clock=VirtualClock(loop), random_source=SeededRandom(seed))
+    swap_defaults(clock=virtual_clock, random_source=seeded_random)
 
     entry(context, *entry_args)
 
@@ -84,7 +93,7 @@ def run_child_loop(
     conn.send(
         (
             "READY",
-            transport.addresses(),
+            transport.drain_new_addresses(),
             next_event_time,
             transport.drain_outbound(),
             transport.drain_spawn_requests(),
@@ -100,8 +109,8 @@ def run_child_loop(
                 return
 
             _, deadline, inbound = message
-            for delivery_time, dst_sockname, src_addr, data in inbound:
-                transport.inject(delivery_time, dst_sockname, src_addr, data)
+            for delivery_time, dst_sockname, src_addr, payload in inbound:
+                transport.inject(delivery_time, dst_sockname, src_addr, payload)
 
             next_event_time = loop.run_window(deadline)
             conn.send(
@@ -110,6 +119,7 @@ def run_child_loop(
                     next_event_time,
                     transport.drain_outbound(),
                     transport.drain_spawn_requests(),
+                    transport.drain_new_addresses(),
                 )
             )
     finally:

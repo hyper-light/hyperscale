@@ -139,17 +139,30 @@ class SimulationCoordinator:
                 connection.send(("GRANT", target_time, due[process_id]))
 
             # Barrier: collect every report before advancing global time.
+            # Two passes — merge every process's newly registered
+            # addresses first, then enqueue all outbound — so an event
+            # sent toward an address registered in this same window
+            # (e.g. a server that started mid-run) routes rather than
+            # dropping: everything registered by time T is routable at T.
             spawn_requests: list = []
+            outbound_batches: list = []
             for process_id, connection in granted:
-                tag, next_time, outbound, spawns = connection.recv()
+                tag, next_time, outbound, spawns, new_addresses = (
+                    connection.recv()
+                )
                 assert tag == "REPORT", tag
                 next_times[process_id] = next_time
+                for address in new_addresses:
+                    self._merge_address(address_to_process, address, process_id)
+                outbound_batches.append(outbound)
+                spawn_requests.extend(spawns)
+
+            for outbound in outbound_batches:
                 for send_time, src, dst, data in outbound:
                     sequence = self._enqueue(
                         pending, sequence, address_to_process,
                         send_time, src, dst, data,
                     )
-                spawn_requests.extend(spawns)
 
             # Admit requested children at the barrier, starting their
             # virtual clocks at the window edge every report agreed on.
@@ -236,7 +249,7 @@ class SimulationCoordinator:
                 assert tag == "READY", tag
                 next_times[process_id] = next_time
                 for address in addresses:
-                    address_to_process[address] = process_id
+                    self._merge_address(address_to_process, address, process_id)
                 outbound_batches.append(outbound)
                 next_batch.extend(spawns)
 
@@ -250,6 +263,22 @@ class SimulationCoordinator:
                 )
 
         return sequence
+
+    @staticmethod
+    def _merge_address(address_to_process: dict, address, process_id) -> None:
+        """Bind ``address`` to ``process_id`` in the route map.
+
+        Re-announcement by the same process is idempotent-by-value; two
+        *different* processes claiming one address is a topology bug
+        that must surface loudly, not silently shadow the first owner.
+        """
+        existing = address_to_process.get(address)
+        if existing is not None and existing != process_id:
+            raise ValueError(
+                f"simulation address collision: {address!r} is hosted by "
+                f"{existing!r} and re-announced by {process_id!r}"
+            )
+        address_to_process[address] = process_id
 
     def _enqueue(
         self, pending, sequence, address_to_process, send_time, src, dst, data
