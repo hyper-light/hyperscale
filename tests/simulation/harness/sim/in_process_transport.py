@@ -82,6 +82,14 @@ class _Registration:
     ``loop.create_datagram_endpoint`` plus the live UDP protocol
     instance (single per server, persistent across the server's
     lifetime).
+
+    Built INCREMENTALLY: a server starts its UDP and TCP endpoints
+    in separate calls (``_start_udp_server`` / ``_start_tcp_server``),
+    possibly in either order, so the UDP fields and the TCP factory
+    are populated by separate ``register_udp`` / ``register_tcp``
+    calls. Fields not yet registered are ``None``; the routing paths
+    tolerate the partial state (a datagram to a server whose UDP side
+    hasn't registered yet is dropped, matching a closed UDP port).
     """
 
     __slots__ = (
@@ -92,9 +100,9 @@ class _Registration:
 
     def __init__(
         self,
-        tcp_protocol_factory: Callable[[], asyncio.Protocol],
-        udp_protocol: asyncio.DatagramProtocol,
-        udp_transport: FakeUDPTransport,
+        tcp_protocol_factory: Callable[[], asyncio.Protocol] | None = None,
+        udp_protocol: asyncio.DatagramProtocol | None = None,
+        udp_transport: FakeUDPTransport | None = None,
     ) -> None:
         self.tcp_protocol_factory = tcp_protocol_factory
         self.udp_protocol = udp_protocol
@@ -131,34 +139,68 @@ class InProcessTransport:
         tcp_protocol_factory: Callable[[], asyncio.Protocol],
         udp_protocol: asyncio.DatagramProtocol,
     ) -> FakeUDPTransport:
-        """Register a server's TCP / UDP protocols at ``sockname``.
+        """Register a server's TCP + UDP protocols at ``sockname`` in
+        one call (convenience for tests that set both up together).
 
-        Returns the ``FakeUDPTransport`` the server should use as
-        its global UDP transport — wired so ``sendto`` routes
-        through this coordinator's ``route_udp``. Callers should
-        immediately invoke
-        ``udp_protocol.connection_made(returned_transport)``.
-
-        The TCP side registers the factory only; a new
-        ``MercurySyncTCPProtocol`` instance is constructed on each
-        ``connect_tcp`` (matches REAL: ``loop.create_server`` calls
-        the factory once per accepted connection).
+        Equivalent to ``register_tcp`` followed by ``register_udp``.
+        Real servers use the two incremental calls because their UDP
+        and TCP endpoints start separately; see those methods.
         """
-        if sockname in self._registry:
-            raise ValueError(
-                f"server at {sockname} is already registered"
+        self.register_tcp(sockname, tcp_protocol_factory)
+        return self.register_udp(sockname, udp_protocol)
+
+    def register_tcp(
+        self,
+        sockname: tuple[str, int],
+        tcp_protocol_factory: Callable[[], asyncio.Protocol],
+    ) -> None:
+        """Register the TCP protocol factory for a server at ``sockname``.
+
+        A fresh protocol instance is constructed from the factory on
+        each inbound ``connect_tcp`` (matches REAL: ``loop.create_server``
+        calls the factory once per accepted connection). Idempotently
+        fills the TCP slot of an existing (UDP-first) registration.
+        """
+        registration = self._registry.get(sockname)
+        if registration is None:
+            self._registry[sockname] = _Registration(
+                tcp_protocol_factory=tcp_protocol_factory
             )
+        else:
+            registration.tcp_protocol_factory = tcp_protocol_factory
+
+    def register_udp(
+        self,
+        sockname: tuple[str, int],
+        udp_protocol: asyncio.DatagramProtocol,
+    ) -> FakeUDPTransport:
+        """Register a server's UDP protocol at ``sockname`` and return
+        the ``FakeUDPTransport`` it should use as its global UDP
+        transport (``sendto`` routes through this coordinator).
+
+        Fires ``udp_protocol.connection_made(transport)`` before
+        returning, matching ``loop.create_datagram_endpoint``'s
+        contract (asyncio wires the protocol to the transport before
+        handing it back), so callers do NOT call ``connection_made``
+        themselves. Idempotently fills the UDP slot of an existing
+        (TCP-first) registration.
+        """
         udp_transport = FakeUDPTransport(
             loop=self._loop,
             route=self._route_udp,
             sockname=sockname,
         )
         udp_transport.set_protocol(udp_protocol)
-        self._registry[sockname] = _Registration(
-            tcp_protocol_factory=tcp_protocol_factory,
-            udp_protocol=udp_protocol,
-            udp_transport=udp_transport,
-        )
+        registration = self._registry.get(sockname)
+        if registration is None:
+            self._registry[sockname] = _Registration(
+                udp_protocol=udp_protocol,
+                udp_transport=udp_transport,
+            )
+        else:
+            registration.udp_protocol = udp_protocol
+            registration.udp_transport = udp_transport
+        udp_protocol.connection_made(udp_transport)
         return udp_transport
 
     def deregister_server(self, sockname: tuple[str, int]) -> None:
@@ -171,7 +213,7 @@ class InProcessTransport:
         datagrams to closed UDP ports without error).
         """
         registration = self._registry.pop(sockname, None)
-        if registration is not None:
+        if registration is not None and registration.udp_transport is not None:
             registration.udp_transport.close()
 
     def connect_tcp(
@@ -192,9 +234,9 @@ class InProcessTransport:
         to a closed port.
         """
         registration = self._registry.get(peer_sockname)
-        if registration is None:
+        if registration is None or registration.tcp_protocol_factory is None:
             raise ConnectionRefusedError(
-                f"no SIM server registered at {peer_sockname}"
+                f"no SIM server listening on TCP at {peer_sockname}"
             )
 
         # Build the two protocol instances.
@@ -295,8 +337,9 @@ class InProcessTransport:
             delay = 0.0
 
         registration = self._registry.get(target_addr)
-        if registration is None:
+        if registration is None or registration.udp_protocol is None:
             return  # silently drop, matches REAL UDP semantics
+            # (closed port, or UDP side not yet registered)
 
         if delay > 0:
             self._loop.call_later(
