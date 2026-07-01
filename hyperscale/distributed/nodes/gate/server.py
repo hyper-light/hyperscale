@@ -1583,17 +1583,6 @@ class GateServer(HealthAwareServer):
         try:
             push = WorkflowResultPush.load(data)
             callback = self._resolve_job_callback(push.job_id, push.callback_addr)
-            import sys as _sys
-            _sys.stderr.write(
-                f"[GATE-RESULT-RECV job_id={push.job_id[:10]} wf={push.workflow_id[:10]}] "
-                f"from={addr} dc={push.datacenter} status={push.status} "
-                f"has_job={self._job_manager.has_job(push.job_id)} "
-                f"push_cb={push.callback_addr} resolved_cb={callback} "
-                f"is_client_ready={push.is_client_ready} "
-                f"results_len={len(push.results)} target_dcs={push.target_dcs} "
-                f"tdc_count={push.target_dc_count}\n"
-            )
-            _sys.stderr.flush()
 
             stale_response = self._validate_workflow_result_producer(push)
             if stale_response is not None:
@@ -1770,12 +1759,6 @@ class GateServer(HealthAwareServer):
             return b"stored"
 
         except Exception as error:
-            import sys as _sys, traceback as _tb
-            _sys.stderr.write(
-                f"[GATE-RESULT-EXC] error={type(error).__name__}: {error}\n"
-                f"{_tb.format_exc()}\n"
-            )
-            _sys.stderr.flush()
             await self.handle_exception(error, "workflow_result_push")
             return b"error"
 
@@ -2428,23 +2411,12 @@ class GateServer(HealthAwareServer):
         last_error: Exception | None = None
         for attempt in range(GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES):
             try:
-                import sys as _sys
-                _sys.stderr.write(
-                    f"[GATE-CLIENT-SEND job_id={job_id[:10]} method={message_type}] "
-                    f"callback={callback} attempt={attempt}\n"
-                )
-                _sys.stderr.flush()
                 response, _ = await self._send_tcp(
                     callback,
                     message_type,
                     payload,
                     timeout=timeout,
                 )
-                _sys.stderr.write(
-                    f"[GATE-CLIENT-RESP job_id={job_id[:10]} method={message_type}] "
-                    f"callback={callback} response={response!r}\n"
-                )
-                _sys.stderr.flush()
                 if isinstance(response, Exception):
                     raise response
                 if response not in (b"ok", None):
@@ -3226,12 +3198,6 @@ class GateServer(HealthAwareServer):
         unconditionally on the canonical pipeline (AD-31).
         """
         gate_tcp_addr = self._modular_state.get_tcp_addr_for_udp(node_addr)
-        import sys as _sys
-        _sys.stderr.write(
-            f"[GATE-NODE-DEAD self=({self._host}, {self._tcp_port})] "
-            f"dead_udp={node_addr} resolved_tcp={gate_tcp_addr}\n"
-        )
-        _sys.stderr.flush()
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -3599,12 +3565,6 @@ class GateServer(HealthAwareServer):
             )
 
     async def _handle_job_leader_failure(self, tcp_addr: tuple[str, int]) -> None:
-        import sys as _sys
-        _sys.stderr.write(
-            f"[ORPHAN-TRIGGER self=({self._host}, {self._tcp_port}) failed_gate={tcp_addr}] "
-            f"has_coordinator={self._orphan_job_coordinator is not None}\n"
-        )
-        _sys.stderr.flush()
         orphaned_job_ids = await self._mark_confirmed_orphans_for_dead_gate(tcp_addr)
         if orphaned_job_ids:
             self._task_runner.run(
@@ -5859,12 +5819,6 @@ class GateServer(HealthAwareServer):
         if callback:
             self._record_job_callback(job_id, callback)
             payload = client_push.dump()
-            import sys as _sys
-            _sys.stderr.write(
-                f"[GATE-AGG-DELIVER job_id={job_id[:10]} wf={workflow_id[:10]}] "
-                f"callback={callback} status={status} payload_bytes={len(payload)}\n"
-            )
-            _sys.stderr.flush()
             delivered = await self._record_and_send_client_update(
                 job_id,
                 callback,
@@ -5873,10 +5827,6 @@ class GateServer(HealthAwareServer):
                 timeout=5.0,
                 log_failure=False,
             )
-            _sys.stderr.write(
-                f"[GATE-AGG-DONE job_id={job_id[:10]} wf={workflow_id[:10]}] delivered={delivered}\n"
-            )
-            _sys.stderr.flush()
             if not delivered:
                 self._task_runner.run(
                     self._udp_logger.log,

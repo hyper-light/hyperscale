@@ -163,13 +163,6 @@ class GateJobReplicationCoordinator:
         """
         peer_acks_needed = max(0, quorum_size - 1)
 
-        import sys as _sys
-        _sys.stderr.write(
-            f"[REPL-START self={self._get_node_addr()} job={replica.job_id[:10]}] "
-            f"peers={peer_addrs} quorum={quorum_size} need={peer_acks_needed}\n"
-        )
-        _sys.stderr.flush()
-
         if peer_acks_needed == 0:
             await self._apply_committed_with_tracking(replica)
             return True
@@ -201,12 +194,6 @@ class GateJobReplicationCoordinator:
         acked_peers: list[tuple[str, int]] = []
         for peer_addr, ack_result in zip(peer_addrs, ack_results):
             positive = self._is_prepare_ack_positive(ack_result)
-            import sys as _sys
-            _sys.stderr.write(
-                f"[REPL-ACK peer={peer_addr} job={replica.job_id[:10]}] "
-                f"result={type(ack_result).__name__}:{ack_result!r:.120} positive={positive}\n"
-            )
-            _sys.stderr.flush()
             if positive:
                 acked_peers.append(peer_addr)
 

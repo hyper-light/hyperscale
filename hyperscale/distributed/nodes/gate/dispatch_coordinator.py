@@ -932,21 +932,8 @@ class GateDispatchCoordinator:
                 dispatch_operation,
                 operation_name=f"dispatch_to_manager_{manager_addr}",
             )
-            import sys as _sys
-            _sys.stderr.write(
-                f"[L3-HOP2-EXIT gate->mgr] mgr={manager_addr} "
-                f"job_id={submission.job_id} result={result}\n"
-            )
-            _sys.stderr.flush()
             return result
         except Exception as exception:
-            import sys as _sys
-            _sys.stderr.write(
-                f"[L3-HOP2-EXIT-EXC gate->mgr] mgr={manager_addr} "
-                f"job_id={submission.job_id} "
-                f"err={type(exception).__name__}:{exception}\n"
-            )
-            _sys.stderr.flush()
             circuit.record_failure()
             return (False, str(exception))
 

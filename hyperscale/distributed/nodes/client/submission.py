@@ -394,14 +394,6 @@ class ClientJobSubmitter:
                 timeout=10.0,
             )
 
-            import sys as _sys
-            _sys.stderr.write(
-                f"[CLIENT-SUBMIT job={job_id[:10]} target={target}] "
-                f"response_type={type(response).__name__} "
-                f"response_repr={response!r:.200}\n"
-            )
-            _sys.stderr.flush()
-
             if isinstance(response, Exception):
                 return _prepend_redirect_history(redirect_history, str(response))
 
@@ -431,23 +423,7 @@ class ClientJobSubmitter:
                 await _DEFAULT_CLOCK.sleep(rate_limit_response.retry_after_seconds)
                 return rate_limit_response.error  # Transient error
 
-            import sys as _sys
-            try:
-                ack = JobAck.load(response)
-            except Exception as load_error:
-                import traceback as _tb
-                _sys.stderr.write(
-                    f"[CLIENT-ACK-LOAD-FAIL job={job_id[:10]} target={target}] "
-                    f"{type(load_error).__name__}: {load_error}\n{_tb.format_exc()}\n"
-                )
-                _sys.stderr.flush()
-                raise
-            _sys.stderr.write(
-                f"[CLIENT-ACK job={job_id[:10]} target={target}] "
-                f"accepted={ack.accepted} error={ack.error!r} "
-                f"leader_addr={ack.leader_addr}\n"
-            )
-            _sys.stderr.flush()
+            ack = JobAck.load(response)
 
             if ack.accepted:
                 # Track which server accepted this job for future queries

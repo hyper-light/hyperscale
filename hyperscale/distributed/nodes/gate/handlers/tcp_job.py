@@ -550,13 +550,6 @@ class GateJobHandler:
                     )
                 )
 
-            import sys as _sys
-            _sys.stderr.write(
-                f"[SUBMIT-2PC job={submission.job_id[:10]}] "
-                f"quorum_committed={quorum_committed}\n"
-            )
-            _sys.stderr.flush()
-
             if not quorum_committed:
                 await self._release_job_lease(submission.job_id)
                 error_ack = JobAck(
@@ -572,10 +565,6 @@ class GateJobHandler:
                     await self._idempotency_cache.reject(idempotency_key, error_ack)
                 return error_ack
 
-            _sys.stderr.write(
-                f"[SUBMIT-2PC-POST job={submission.job_id[:10]}] broadcasting leadership\n"
-            )
-            _sys.stderr.flush()
             await self._broadcast_job_leadership(
                 submission.job_id,
                 len(target_dcs),
@@ -583,11 +572,6 @@ class GateJobHandler:
             )
 
             self._quorum_circuit.record_success()
-
-            _sys.stderr.write(
-                f"[SUBMIT-2PC-ACK job={submission.job_id[:10]}] returning accepted=True\n"
-            )
-            _sys.stderr.flush()
 
             ack_response = JobAck(
                 job_id=submission.job_id,
@@ -617,11 +601,6 @@ class GateJobHandler:
                 if run:
                     self._state._job_lease_renewal_tokens[submission.job_id] = run.token
 
-            _sys.stderr.write(
-                f"[SUBMIT-2PC-RETURN job={submission.job_id[:10]}] "
-                f"bytes={len(ack_response)}\n"
-            )
-            _sys.stderr.flush()
             return ack_response
 
         except QuorumCircuitOpenError as error:
@@ -650,11 +629,6 @@ class GateJobHandler:
                 await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
         except Exception as error:
-            import sys as _sys, traceback as _tb
-            _sys.stderr.write(
-                f"[SUBMIT-EXC] {type(error).__name__}: {error}\n{_tb.format_exc()}\n"
-            )
-            _sys.stderr.flush()
             if lease_acquired and submission is not None:
                 await self._release_job_lease(submission.job_id)
             await self._logger.log(
