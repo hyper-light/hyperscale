@@ -215,6 +215,16 @@ class SimulationLoop(base_events.BaseEventLoop):
         # ``BaseEventLoop`` expects ``_thread_id`` to be set by
         # ``run_forever``; nothing else here needs initialization.
 
+        # Multi-process coordination (see ``run_window``). ``None`` in
+        # the normal single-process ``run_until_complete`` path, so
+        # ``_run_once`` behaves exactly as documented above. When the
+        # ``SimulationCoordinator`` drives this loop it sets a per-window
+        # deadline so virtual time never advances past the granted
+        # boundary — that is what keeps cross-process virtual time in
+        # lockstep.
+        self._window_deadline: float | None = None
+        self._window_exhausted: bool = False
+
     def time(self) -> float:
         """Return current virtual time in seconds.
 
@@ -267,6 +277,22 @@ class SimulationLoop(base_events.BaseEventLoop):
         # Step 2: advance virtual time if no immediate work.
         if not self._ready and not self._stopping and self._scheduled:
             when = self._scheduled[0]._when
+            # Window guard (multi-process mode): never advance past the
+            # coordinator-granted deadline. When the next timer is beyond
+            # the window, pin virtual time to the deadline, flag the
+            # window exhausted, and return — ``run_window`` reports the
+            # next-event time to the coordinator, which decides the next
+            # global step. In single-process mode ``_window_deadline`` is
+            # ``None`` and this branch is inert.
+            if self._window_deadline is not None and when > self._window_deadline:
+                if self._window_deadline > self._virtual_now:
+                    if self._trace is not None:
+                        self._trace.record_time_advance(
+                            from_t=self._virtual_now, to_t=self._window_deadline
+                        )
+                    self._virtual_now = self._window_deadline
+                self._window_exhausted = True
+                return
             if when > self._virtual_now:
                 if self._trace is not None:
                     self._trace.record_time_advance(
@@ -309,6 +335,48 @@ class SimulationLoop(base_events.BaseEventLoop):
                 self._trace.record_fire(handle)
             handle._run()
         handle = None  # break a reference cycle on exception
+
+    def run_window(self, deadline: float) -> float | None:
+        """Advance the loop up to (and including) virtual time ``deadline``.
+
+        Drives ``_run_once`` — the *same* single-process scheduler, so
+        determinism is identical — but stops as soon as the earliest
+        remaining timer is beyond ``deadline`` rather than advancing to
+        it. This is the primitive the ``SimulationCoordinator`` uses to
+        keep many processes' virtual clocks in lockstep: it grants each
+        process a window, every process drains all work at or before the
+        window edge, and the coordinator then picks the next global
+        boundary from everyone's reported next-event time.
+
+        Returns the virtual time of the next pending timer (strictly
+        ``> deadline``), or ``None`` if the loop is fully idle (no ready
+        callbacks and no scheduled timers) — i.e. this process has no
+        more work until another process delivers it a message.
+
+        Unlike ``run_until_complete`` this never raises the deadlock
+        error: an idle loop in a multi-process run is normal (the
+        process is waiting on a cross-process message), not a bug.
+        """
+        self._check_closed()
+        self._window_deadline = deadline
+        self._window_exhausted = False
+        try:
+            while True:
+                # A fully idle loop (no ready work, no timers) means this
+                # process is quiescent for now. Return ``None`` rather
+                # than letting ``_run_once`` raise its deadlock error —
+                # in a multi-process run the work will arrive as an
+                # injected cross-process message later.
+                if not self._ready and not self._scheduled:
+                    return None
+                self._window_exhausted = False
+                self._run_once()
+                if self._window_exhausted:
+                    # Pinned at the window edge; report the next timer.
+                    return self._scheduled[0]._when if self._scheduled else None
+        finally:
+            self._window_deadline = None
+            self._window_exhausted = False
 
     def call_soon(
         self,
