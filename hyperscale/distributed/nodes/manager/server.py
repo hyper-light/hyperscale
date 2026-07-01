@@ -6879,16 +6879,35 @@ class ManagerServer(HealthAwareServer):
             cancelled_ids.extend(per_worker_ids)
             errors.extend(per_worker_errors)
 
-        # Seed the pending tracker BEFORE the worker's async
-        # ``workflow_cancellation_complete`` pushes can land. The
-        # workers already scheduled those pushes as fire-and-forget
-        # tasks inside their cancel handler, so a completion can
-        # race the manager's seed; seeding here under the cancel
-        # handler's natural lock matches the same discipline the
-        # non-empty-view ``_cancel_running_workflows`` path uses.
+        # Seed the pending tracker, then finalize each entry straight
+        # from this synchronous ``CancelJobWorkflowsResponse``. The
+        # response IS the worker's definitive confirmation that it
+        # cancelled the workflow — exactly the same authority the
+        # direct ``_cancel_running_workflow_on_worker`` path relies on.
+        # We deliberately do NOT wait for the worker's fire-and-forget
+        # ``workflow_cancellation_complete`` push to drain the tracker:
+        # under the degraded post-failover network this handler runs in
+        # (circuit breakers open toward the killed leader, worker
+        # job-leader caches stale) that push is readily lost or
+        # delivered to a manager that isn't the job leader, and the
+        # tracker would never reach zero — the client's
+        # ``await_job_cancellation`` then times out.
+        #
+        # Seed-then-finalize (rather than skipping the tracker) keeps
+        # the completion-event / error-aggregation machinery in
+        # ``_finalize_workflow_cancellation`` on a single code path, and
+        # is idempotent: if a worker's async push does arrive later it
+        # finds the entry already gone and no-ops.
         for workflow_id in cancelled_ids:
             self._manager_state.add_cancellation_pending_workflow(
                 job_id, workflow_id
+            )
+        for workflow_id in cancelled_ids:
+            await self._finalize_workflow_cancellation(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                success=True,
+                errors=[],
             )
 
         return cancelled_ids, errors
@@ -6976,69 +6995,58 @@ class ManagerServer(HealthAwareServer):
             # non-leader has neither the dispatch context nor the
             # workflow-cancellation push chain — silently succeeding
             # with cancelled_count=0 (the prior behavior) leaves
-            # workers running indefinitely. Redirect to the current
-            # leader instead. The client follows ``leader_addr`` via
-            # its bounded redirect loop.
+            # workers running indefinitely.
             #
-            # Resolution first gives the current job leader a chance
-            # to handle the request. If no job leader is known yet,
-            # only a non-self DC leader may be used as a convergence
-            # target. A DC leader that has not acquired the job lease
-            # must attempt the SWIM-leader takeover locally or return
-            # a transient "transition in progress" response; redirecting
-            # the client back to itself creates a bounded redirect cycle.
-            if not self._leases.is_job_leader(job_id):
-                leader_addr = self._leases.get_job_leader_addr(job_id)
-                self_addr = (self._host, self._tcp_port)
-                # The cached job leader counts as dead when either our
-                # own liveness view says so OR the client reported it
-                # unreachable. The client's view is strictly fresher
-                # after a leader kill: it has already failed to
-                # connect, whereas our SWIM failure detector may lag
-                # Raft's DC-leader election by tens of seconds. Folding
-                # the client's ground truth in here is what lets a
-                # freshly-elected DC leader take over immediately
-                # instead of redirecting the client back to the dead
-                # prior leader it just tried.
-                cached_leader_not_live = (
-                    leader_addr is not None
-                    and (
-                        not self._manager_tcp_addr_is_live(leader_addr)
-                        or tuple(leader_addr) in client_unreachable_addrs
-                    )
+            # Takeover authority is Raft, not SWIM. When we are the
+            # Raft DC leader (quorum-elected) but not yet the job
+            # leader, we are in the post-failover transition window:
+            # the prior job leader (typically the old DC leader) has
+            # been superseded and job leadership must reconverge to us.
+            # We attempt takeover *unconditionally* rather than gating
+            # on our SWIM view of the old leader's liveness, because
+            # SWIM failure detection lags Raft election by tens of
+            # seconds — gating on it is what produced the
+            # ``redirect cycles to already-tried target`` hang, where
+            # a freshly-elected leader kept bouncing the client back to
+            # the dead prior leader while waiting for its own suspicion
+            # timers to fire.
+            #
+            # This is safe: ``_take_over_job_leadership_as_cluster_leader``
+            # (a) requires ``is_leader()`` + manager quorum, (b)
+            # re-syncs peer state and refuses to steal leadership from a
+            # genuinely *newer* leader (one that isn't the ``old_leader``
+            # we set out to supersede), and (c) bumps a fence token that
+            # is quorum-replicated before it takes effect. A stale prior
+            # leader that resurfaces is fenced out. Job leadership is
+            # designed to track DC leadership, so reconverging it to the
+            # current Raft leader is correct, not a theft.
+            if not self._leases.is_job_leader(job_id) and self.is_leader():
+                old_leader_id = self._manager_state.get_job_leader(job_id)
+                taken_over = await self._take_over_job_leadership_as_cluster_leader(
+                    job_id,
+                    old_leader_id,
                 )
-                cached_leader_is_actionable_self = (
-                    leader_addr is None
-                    or leader_addr == self_addr
-                    or cached_leader_not_live
-                )
-                if self.is_leader() and cached_leader_is_actionable_self:
-                    # We are the DC leader and the cached job-leader
-                    # address is unknown, self, or a peer we believe to
-                    # be dead. Either way the lease must advance under
-                    # us; otherwise the redirect path below would hand
-                    # the client a stale dead-leader address that it has
-                    # already tried as the job-submission target,
-                    # producing ``redirect cycles to already-tried
-                    # target``. Attempt the SWIM-leader takeover here.
-                    old_leader_id = self._manager_state.get_job_leader(job_id)
-                    taken_over = await self._take_over_job_leadership_as_cluster_leader(
+                if taken_over:
+                    job = self._job_manager.get_job_by_id(job_id)
+                else:
+                    # Quorum unavailable, or a newer leader beat us to
+                    # it. Transient — no ``leader_addr`` so the client
+                    # round-robins to a live target rather than chasing
+                    # a stale address.
+                    return self._build_cancel_response(
                         job_id,
-                        old_leader_id,
+                        success=False,
+                        error="Not job leader; job leader transition in progress",
+                        leader_addr=None,
                     )
-                    if taken_over:
-                        job = self._job_manager.get_job_by_id(job_id)
-                    else:
-                        return self._build_cancel_response(
-                            job_id,
-                            success=False,
-                            error="Not job leader; job leader transition in progress",
-                            leader_addr=None,
-                        )
 
-                if self._leases.is_job_leader(job_id):
-                    leader_addr = None
-
+            # Still not the job leader → we are not the DC leader
+            # either (a DC leader would have taken over above, or
+            # returned the transient response). Redirect to a live
+            # leader. ``_resolve_job_cancel_redirect_addr`` filters out
+            # both our own SWIM-dead peers AND the addresses the client
+            # reported unreachable, so we never hand back an address the
+            # client already proved dead.
             if not self._leases.is_job_leader(job_id):
                 leader_addr = self._resolve_job_cancel_redirect_addr(
                     job_id, client_unreachable_addrs
