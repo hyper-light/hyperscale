@@ -360,6 +360,15 @@ class SimulationLoop(base_events.BaseEventLoop):
         self._check_closed()
         self._window_deadline = deadline
         self._window_exhausted = False
+        # Register this loop as the thread's running loop for the
+        # duration of the window, exactly as ``run_forever`` does.
+        # ``Task.__step`` calls ``get_running_loop()`` and asserts it is
+        # the task's own loop, so driving ``_run_once`` directly without
+        # this setup makes every task step raise "loop is not the running
+        # loop". Between windows (blocked on the coordinator pipe) the
+        # running loop is correctly cleared.
+        self._thread_id = threading.get_ident()
+        events._set_running_loop(self)
         try:
             while True:
                 # A fully idle loop (no ready work, no timers) means this
@@ -375,6 +384,12 @@ class SimulationLoop(base_events.BaseEventLoop):
                     # Pinned at the window edge; report the next timer.
                     return self._scheduled[0]._when if self._scheduled else None
         finally:
+            events._set_running_loop(None)
+            # Clear ``_thread_id`` as ``run_forever`` does on exit, so
+            # the loop is not considered "running" between windows —
+            # otherwise ``close()`` at shutdown raises "Cannot close a
+            # running event loop".
+            self._thread_id = None
             self._window_deadline = None
             self._window_exhausted = False
 

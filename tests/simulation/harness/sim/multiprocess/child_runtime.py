@@ -23,6 +23,8 @@ and ``inbound`` items are ``(delivery_time, dst_sockname, src_addr, data)``.
 
 import asyncio
 
+from hyperscale.logging import LoggingConfig
+
 from ..simulation_loop import SimulationLoop
 from .child_context import ChildContext, CrossProcessTransport
 
@@ -34,6 +36,11 @@ def run_child_loop(conn, entry, entry_args) -> None:
     ``entry`` is a top-level (picklable) callable ``entry(ctx, *entry_args)``
     that sets up the process's servers/behavior on ``ctx``.
     """
+    # The async Logger's stream setup uses connect_write_pipe /
+    # run_in_executor, both banned on the SimulationLoop; SIM asserts on
+    # state, not log output. Disable logging for the whole child process.
+    LoggingConfig().disable()
+
     loop = SimulationLoop()
     asyncio.set_event_loop(loop)
     transport = CrossProcessTransport(loop)
