@@ -6,7 +6,7 @@ import asyncio
 from typing import Awaitable, Callable
 
 from hyperscale.distributed.env import Env
-from hyperscale.distributed.taskex import TaskRunner
+from hyperscale.distributed.runtime import Runner
 
 from .best_effort_state import BestEffortState
 from .reliability_config import ReliabilityConfig, create_reliability_config_from_env
@@ -37,7 +37,7 @@ class BestEffortManager:
 
     def __init__(
         self,
-        task_runner: TaskRunner,
+        task_runner: Runner,
         config: ReliabilityConfig | None = None,
         completion_handler: CompletionHandler | None = None,
     ) -> None:

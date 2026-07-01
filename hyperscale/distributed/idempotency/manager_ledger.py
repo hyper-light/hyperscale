@@ -6,7 +6,7 @@ from pathlib import Path
 import struct
 from typing import Generic, TypeVar
 
-from hyperscale.distributed.taskex import TaskRunner
+from hyperscale.distributed.runtime import Runner
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import IdempotencyError
 
@@ -30,7 +30,7 @@ class ManagerIdempotencyLedger(Generic[T]):
         self,
         config: IdempotencyConfig,
         wal_path: str | Path,
-        task_runner: TaskRunner,
+        task_runner: Runner,
         logger: Logger,
     ) -> None:
         self._config = config

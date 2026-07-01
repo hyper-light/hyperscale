@@ -22,6 +22,7 @@ from .clock import Clock as Clock
 from .random_source import Random as Random
 from .real_clock import RealClock as RealClock
 from .real_random import RealRandom as RealRandom
+from .runner import Runner as Runner
 from .swap import restore_defaults as restore_defaults
 from .swap import snapshot_defaults as snapshot_defaults
 from .swap import swap_defaults as swap_defaults

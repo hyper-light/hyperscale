@@ -4,7 +4,7 @@ import asyncio
 from collections import OrderedDict
 from typing import Generic, TypeVar
 
-from hyperscale.distributed.taskex import TaskRunner
+from hyperscale.distributed.runtime import Runner
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import IdempotencyError
 
@@ -25,7 +25,7 @@ class GateIdempotencyCache(Generic[T]):
     """Gate-level idempotency cache for duplicate detection."""
 
     def __init__(
-        self, config: IdempotencyConfig, task_runner: TaskRunner, logger: Logger
+        self, config: IdempotencyConfig, task_runner: Runner, logger: Logger
     ) -> None:
         self._config = config
         self._task_runner = task_runner
