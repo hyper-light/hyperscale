@@ -13,6 +13,7 @@ import asyncio
 import pytest
 import inspect
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from enum import Enum
 
@@ -48,10 +49,16 @@ class MockTaskRunner:
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
+        # Production TaskRunner.run accepts run-level kwargs (e.g. ``alias``)
+        # that are NOT forwarded to the coroutine, and returns a run handle
+        # exposing ``.token``.
         if inspect.iscoroutinefunction(coro):
-            task = asyncio.create_task(coro(*args, **kwargs))
+            task = asyncio.create_task(coro(*args))
             self.tasks.append(task)
-            return task
+            return SimpleNamespace(token=f"token-{len(self.tasks)}", task=task)
+        return None
+
+    async def cancel(self, token: str):
         return None
 
 
@@ -85,6 +92,9 @@ class MockGateJobManager:
 
     def set_target_dcs(self, job_id: str, dcs: set[str]):
         self.target_dcs[job_id] = dcs
+
+    def get_target_dcs(self, job_id: str) -> set[str]:
+        return self.target_dcs.get(job_id, set())
 
     def set_callback(self, job_id: str, callback):
         self.callbacks[job_id] = callback
@@ -164,6 +174,51 @@ def make_async_rate_limiter(allowed: bool = True, retry_after: float = 0.0):
     return check_rate_limit
 
 
+def make_lease_manager(fence_token: int = 1, lease_duration: float = 30.0):
+    """Build an async job lease manager mock that grants leases."""
+    lease = SimpleNamespace(
+        fence_token=fence_token,
+        lease_duration=lease_duration,
+    )
+    acquire_result = SimpleNamespace(
+        success=True,
+        lease=lease,
+        current_owner=None,
+        expires_in=0.0,
+    )
+    manager = MagicMock()
+    manager.acquire = AsyncMock(return_value=acquire_result)
+    manager.release = AsyncMock(return_value=None)
+    manager.renew = AsyncMock(return_value=True)
+    return manager
+
+
+def make_replication_coordinator(committed: bool = True):
+    """Build a replication coordinator mock whose quorum replication succeeds."""
+    coordinator = MagicMock()
+    coordinator.replicate_with_quorum = AsyncMock(return_value=committed)
+    return coordinator
+
+
+def make_recording_dispatch(job_manager):
+    """Async dispatch callback that records the job, mirroring the real
+    dispatch coordinator (which now owns job/target-DC recording)."""
+
+    async def dispatch(submission, target_dcs):
+        job_manager.set_job(
+            submission.job_id,
+            GlobalJobStatus(
+                job_id=submission.job_id,
+                status=JobStatus.SUBMITTED.value,
+                datacenters=[],
+                timestamp=0.0,
+            ),
+        )
+        job_manager.set_target_dcs(submission.job_id, set(target_dcs))
+
+    return dispatch
+
+
 def create_mock_handler(
     state: GateRuntimeState = None,
     rate_limit_allowed: bool = True,
@@ -187,12 +242,14 @@ def create_mock_handler(
         logger=MockLogger(),
         task_runner=MockTaskRunner(),
         job_manager=MockGateJobManager(),
-        job_router=None,
         job_leadership_tracker=MockJobLeadershipTracker(),
         quorum_circuit=MockQuorumCircuit(circuit_state=circuit_state),
         load_shedder=MockLoadShedder(),
-        job_lease_manager=MagicMock(),
+        job_lease_manager=make_lease_manager(),
         idempotency_cache=None,
+        send_tcp=AsyncMock(),
+        replication_coordinator=make_replication_coordinator(),
+        get_active_peer_addrs=lambda: [],
         get_node_id=lambda: MockNodeId(),
         get_host=lambda: "127.0.0.1",
         get_tcp_port=lambda: 9000,
@@ -255,12 +312,14 @@ class TestHandleSubmissionHappyPath:
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
-            job_router=None,
             job_leadership_tracker=MockJobLeadershipTracker(),
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
-            job_lease_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
             idempotency_cache=None,
+            send_tcp=AsyncMock(),
+            replication_coordinator=make_replication_coordinator(),
+            get_active_peer_addrs=lambda: [],
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
@@ -276,7 +335,7 @@ class TestHandleSubmissionHappyPath:
             ),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
-            dispatch_job_to_datacenters=AsyncMock(),
+            dispatch_job_to_datacenters=make_recording_dispatch(job_manager),
             forward_job_progress_to_peers=AsyncMock(return_value=False),
             record_request_latency=lambda latency: None,
             record_dc_job_stats=AsyncMock(),
@@ -297,6 +356,11 @@ class TestHandleSubmissionHappyPath:
             active_gate_peer_count=0,
         )
 
+        # Job recording now happens in the dispatch coordinator, which the
+        # handler schedules as a background task; let it run.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
         assert "job-456" in job_manager.jobs
 
     @pytest.mark.asyncio
@@ -308,12 +372,14 @@ class TestHandleSubmissionHappyPath:
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
-            job_router=None,
             job_leadership_tracker=MockJobLeadershipTracker(),
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
-            job_lease_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
             idempotency_cache=None,
+            send_tcp=AsyncMock(),
+            replication_coordinator=make_replication_coordinator(),
+            get_active_peer_addrs=lambda: [],
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
@@ -329,7 +395,7 @@ class TestHandleSubmissionHappyPath:
             ),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
-            dispatch_job_to_datacenters=AsyncMock(),
+            dispatch_job_to_datacenters=make_recording_dispatch(job_manager),
             forward_job_progress_to_peers=AsyncMock(return_value=False),
             record_request_latency=lambda latency: None,
             record_dc_job_stats=AsyncMock(),
@@ -349,6 +415,9 @@ class TestHandleSubmissionHappyPath:
             data=submission.dump(),
             active_gate_peer_count=0,
         )
+
+        for _ in range(5):
+            await asyncio.sleep(0)
 
         assert job_manager.target_dcs["job-789"] == {"dc-east", "dc-west"}
 
@@ -398,12 +467,14 @@ class TestHandleSubmissionRateLimiting:
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=MockGateJobManager(),
-            job_router=None,
             job_leadership_tracker=MockJobLeadershipTracker(),
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
-            job_lease_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
             idempotency_cache=None,
+            send_tcp=AsyncMock(),
+            replication_coordinator=make_replication_coordinator(),
+            get_active_peer_addrs=lambda: [],
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
@@ -700,12 +771,14 @@ class TestHandleProgressHappyPath:
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
-            job_router=None,
             job_leadership_tracker=MockJobLeadershipTracker(),
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
-            job_lease_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
             idempotency_cache=None,
+            send_tcp=AsyncMock(),
+            replication_coordinator=make_replication_coordinator(),
+            get_active_peer_addrs=lambda: [],
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
@@ -770,12 +843,14 @@ class TestHandleProgressFencingTokens:
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
-            job_router=None,
             job_leadership_tracker=MockJobLeadershipTracker(),
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
-            job_lease_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
             idempotency_cache=None,
+            send_tcp=AsyncMock(),
+            replication_coordinator=make_replication_coordinator(),
+            get_active_peer_addrs=lambda: [],
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
@@ -836,12 +911,14 @@ class TestHandleProgressFencingTokens:
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
-            job_router=None,
             job_leadership_tracker=MockJobLeadershipTracker(),
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
-            job_lease_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
             idempotency_cache=None,
+            send_tcp=AsyncMock(),
+            replication_coordinator=make_replication_coordinator(),
+            get_active_peer_addrs=lambda: [],
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
@@ -1114,12 +1191,14 @@ class TestFailureModes:
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=MockGateJobManager(),
-            job_router=None,
             job_leadership_tracker=MockJobLeadershipTracker(),
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
-            job_lease_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
             idempotency_cache=None,
+            send_tcp=AsyncMock(),
+            replication_coordinator=make_replication_coordinator(),
+            get_active_peer_addrs=lambda: [],
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,

@@ -133,7 +133,7 @@ def create_mock_handler(
         get_host=lambda: "127.0.0.1",
         get_tcp_port=lambda: 9000,
         get_healthy_gates=lambda: [MockGateInfo()],
-        record_manager_heartbeat=lambda dc, addr, manager_id, workers: None,
+        record_manager_heartbeat=lambda dc, addr, manager_id, version, term, is_leader: None,
         handle_manager_backpressure_signal=AsyncMock(),
         update_dc_backpressure=AsyncMock(),
         set_manager_backpressure_none=AsyncMock(),
@@ -188,13 +188,15 @@ class TestHandleStatusUpdateHappyPath:
         state = GateRuntimeState()
         recorded_heartbeats = []
 
-        def record_heartbeat(dc, addr, manager_id, workers):
+        def record_heartbeat(dc, addr, manager_id, version, term, is_leader):
             recorded_heartbeats.append(
                 {
                     "dc": dc,
                     "addr": addr,
                     "manager_id": manager_id,
-                    "workers": workers,
+                    "version": version,
+                    "term": term,
+                    "is_leader": is_leader,
                 }
             )
 
@@ -267,6 +269,13 @@ class TestHandleStatusUpdateBackpressure:
 
         updated_dcs = []
 
+        # A clean heartbeat from a manager that previously had backpressure is
+        # cleared via ``set_manager_backpressure_none`` (which the server
+        # implementation uses to refresh the DC-level backpressure), so record
+        # the datacenter it is invoked for.
+        async def clear_manager_backpressure(manager_addr, dc_id):
+            updated_dcs.append(dc_id)
+
         handler = GateManagerHandler(
             state=state,
             logger=MockLogger(),
@@ -279,10 +288,10 @@ class TestHandleStatusUpdateBackpressure:
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
             get_healthy_gates=lambda: [],
-            record_manager_heartbeat=lambda dc, addr, manager_id, workers: None,
+            record_manager_heartbeat=lambda dc, addr, manager_id, version, term, is_leader: None,
             handle_manager_backpressure_signal=AsyncMock(),
-            update_dc_backpressure=lambda dc_id: updated_dcs.append(dc_id),
-            set_manager_backpressure_none=AsyncMock(),
+            update_dc_backpressure=AsyncMock(),
+            set_manager_backpressure_none=clear_manager_backpressure,
             broadcast_manager_discovery=AsyncMock(),
         )
 
@@ -404,7 +413,7 @@ class TestHandleRegisterHappyPath:
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
             get_healthy_gates=lambda: healthy_gates,
-            record_manager_heartbeat=lambda dc, addr, manager_id, workers: None,
+            record_manager_heartbeat=lambda dc, addr, manager_id, version, term, is_leader: None,
             handle_manager_backpressure_signal=AsyncMock(),
             update_dc_backpressure=AsyncMock(),
             set_manager_backpressure_none=AsyncMock(),
@@ -865,7 +874,7 @@ class TestFailureModes:
     async def test_handles_exception_in_heartbeat_recording(self):
         """Handles exception during heartbeat recording."""
 
-        def failing_record(dc, addr, manager_id, workers):
+        def failing_record(dc, addr, manager_id, version, term, is_leader):
             raise Exception("Recording failed")
 
         handler = GateManagerHandler(
@@ -934,7 +943,7 @@ class TestFailureModes:
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
             get_healthy_gates=lambda: [],
-            record_manager_heartbeat=lambda dc, addr, manager_id, workers: None,
+            record_manager_heartbeat=lambda dc, addr, manager_id, version, term, is_leader: None,
             handle_manager_backpressure_signal=AsyncMock(),
             update_dc_backpressure=AsyncMock(),
             set_manager_backpressure_none=AsyncMock(),

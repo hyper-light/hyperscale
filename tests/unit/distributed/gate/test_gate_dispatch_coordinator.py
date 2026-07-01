@@ -12,7 +12,8 @@ import asyncio
 import pytest
 import inspect
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 from hyperscale.distributed.nodes.gate.dispatch_coordinator import (
     GateDispatchCoordinator,
@@ -43,12 +44,17 @@ class MockTaskRunner:
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
+        # Production TaskRunner.run accepts run-level kwargs (e.g. ``alias``)
+        # that are NOT forwarded to the coroutine, and returns a run handle
+        # exposing ``.token``.
         if inspect.iscoroutinefunction(coro):
-            task = asyncio.create_task(coro(*args, **kwargs))
-        else:
-            task = asyncio.create_task(asyncio.coroutine(lambda: None)())
-        self.tasks.append(task)
-        return task
+            task = asyncio.create_task(coro(*args))
+            self.tasks.append(task)
+            return SimpleNamespace(token=f"token-{len(self.tasks)}", task=task)
+        return None
+
+    async def cancel(self, token: str):
+        return None
 
 
 @dataclass
@@ -58,16 +64,32 @@ class MockGateJobManager:
     jobs: dict = field(default_factory=dict)
     target_dcs: dict = field(default_factory=dict)
     callbacks: dict = field(default_factory=dict)
+    fence_tokens: dict = field(default_factory=dict)
     job_count_val: int = 0
 
     def set_job(self, job_id: str, job):
         self.jobs[job_id] = job
 
+    def get_job(self, job_id: str):
+        return self.jobs.get(job_id)
+
     def set_target_dcs(self, job_id: str, dcs: set[str]):
         self.target_dcs[job_id] = dcs
 
+    def get_target_dcs(self, job_id: str) -> set[str]:
+        return self.target_dcs.get(job_id, set())
+
     def set_callback(self, job_id: str, callback):
         self.callbacks[job_id] = callback
+
+    def get_callback(self, job_id: str):
+        return self.callbacks.get(job_id)
+
+    def set_fence_token(self, job_id: str, token: int):
+        self.fence_tokens[job_id] = token
+
+    def get_fence_token(self, job_id: str) -> int:
+        return self.fence_tokens.get(job_id, 0)
 
     def job_count(self) -> int:
         return self.job_count_val
@@ -81,8 +103,13 @@ class MockQuorumCircuit:
     half_open_after: float = 10.0
     successes: int = 0
 
+    error_count: int = 0
+
     def record_success(self):
         self.successes += 1
+
+    def record_error(self):
+        self.error_count += 1
 
 
 @dataclass
@@ -116,6 +143,32 @@ def make_async_rate_limiter(allowed: bool = True, retry_after: float = 0.0):
     return check_rate_limit
 
 
+def make_lease_manager(fence_token: int = 1, lease_duration: float = 30.0):
+    """Build an async job lease manager mock that grants leases."""
+    lease = SimpleNamespace(
+        fence_token=fence_token,
+        lease_duration=lease_duration,
+    )
+    acquire_result = SimpleNamespace(
+        success=True,
+        lease=lease,
+        current_owner=None,
+        expires_in=0.0,
+    )
+    manager = MagicMock()
+    manager.acquire = AsyncMock(return_value=acquire_result)
+    manager.release = AsyncMock(return_value=None)
+    manager.renew = AsyncMock(return_value=True)
+    return manager
+
+
+def make_dispatch_time_tracker():
+    """Build a dispatch-time tracker mock with an async record_dispatch."""
+    tracker = MagicMock()
+    tracker.record_dispatch = AsyncMock(return_value=None)
+    return tracker
+
+
 # =============================================================================
 # _check_rate_and_load Tests
 # =============================================================================
@@ -133,17 +186,28 @@ class TestCheckRateAndLoadHappyPath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         result = await coordinator._check_rate_and_load("client-1", "job-1")
@@ -163,17 +227,28 @@ class TestCheckRateAndLoadNegativePath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=False, retry_after=5.0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         result = await coordinator._check_rate_and_load("client-1", "job-1")
@@ -191,17 +266,28 @@ class TestCheckRateAndLoadNegativePath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: True,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         result = await coordinator._check_rate_and_load("client-1", "job-1")
@@ -227,17 +313,28 @@ class TestCheckProtocolVersionHappyPath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=lambda client_id, op: (True, 0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submission = MockJobSubmission()
@@ -260,17 +357,28 @@ class TestCheckProtocolVersionNegativePath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=lambda client_id, op: (True, 0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submission = MockJobSubmission()
@@ -300,17 +408,28 @@ class TestCheckCircuitAndQuorumHappyPath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=lambda client_id, op: (True, 0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(circuit_state=CircuitState.CLOSED),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         result = coordinator._check_circuit_and_quorum("job-1")
@@ -329,17 +448,28 @@ class TestCheckCircuitAndQuorumNegativePath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=lambda client_id, op: (True, 0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(circuit_state=CircuitState.OPEN),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         result = coordinator._check_circuit_and_quorum("job-1")
@@ -358,17 +488,28 @@ class TestCheckCircuitAndQuorumNegativePath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: False,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(circuit_state=CircuitState.CLOSED),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         result = coordinator._check_circuit_and_quorum("job-1")
@@ -393,14 +534,25 @@ class TestSubmitJobHappyPath:
         job_manager = MockGateJobManager()
         quorum_circuit = MockQuorumCircuit()
         broadcast = AsyncMock()
-        dispatch = AsyncMock()
 
         coordinator = GateDispatchCoordinator(
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=job_manager,
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
@@ -411,9 +563,8 @@ class TestSubmitJobHappyPath:
                 [],
                 "healthy",
             ),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=broadcast,
-            dispatch_to_dcs=dispatch,
         )
 
         submission = MockJobSubmission()
@@ -437,17 +588,28 @@ class TestSubmitJobNegativePath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=False, retry_after=5.0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submission = MockJobSubmission()
@@ -465,17 +627,28 @@ class TestSubmitJobNegativePath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: ([], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submission = MockJobSubmission()
@@ -493,8 +666,20 @@ class TestSubmitJobNegativePath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
@@ -505,9 +690,8 @@ class TestSubmitJobNegativePath:
                 [],
                 "initializing",
             ),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submission = MockJobSubmission()
@@ -535,23 +719,34 @@ class TestSetupJobTrackingHappyPath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=job_manager,
-            job_router=None,
             check_rate_limit=lambda client_id, op: (True, 0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submission = MockJobSubmission()
         submission.callback_addr = ("10.0.0.1", 8000)
 
-        coordinator._setup_job_tracking(submission, ["dc-east", "dc-west"])
+        coordinator._setup_job_tracking(submission, ["dc-east", "dc-west"], 1)
 
         assert "job-123" in job_manager.jobs
         assert job_manager.target_dcs["job-123"] == {"dc-east", "dc-west"}
@@ -568,23 +763,34 @@ class TestSetupJobTrackingHappyPath:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=job_manager,
-            job_router=None,
             check_rate_limit=lambda client_id, op: (True, 0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submission = MockJobSubmission()
         submission.reporting_configs = b"config_data"
 
-        coordinator._setup_job_tracking(submission, ["dc-east"])
+        coordinator._setup_job_tracking(submission, ["dc-east"], 1)
 
         assert "job-123" in state._job_submissions
 
@@ -607,17 +813,28 @@ class TestConcurrency:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=job_manager,
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submissions = [MockJobSubmission() for _ in range(10)]
@@ -650,17 +867,28 @@ class TestEdgeCases:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=job_manager,
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submission = MockJobSubmission()
@@ -683,17 +911,28 @@ class TestEdgeCases:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=job_manager,
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, specified, job_id: (dcs, [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         submission = MockJobSubmission()
@@ -713,17 +952,28 @@ class TestEdgeCases:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         result = await coordinator._check_rate_and_load("10.0.0.1:8000", "job-1")
@@ -739,17 +989,28 @@ class TestEdgeCases:
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
+            job_timeout_tracker=MagicMock(),
+            dispatch_time_tracker=make_dispatch_time_tracker(),
+            circuit_breaker_manager=MagicMock(),
+            job_lease_manager=make_lease_manager(),
+            datacenter_managers={},
+            send_tcp=AsyncMock(),
+            increment_version=lambda: None,
+            confirm_manager_for_dc=lambda *a, **k: None,
+            suspect_manager_for_dc=lambda *a, **k: None,
+            record_forward_throughput_event=lambda *a, **k: None,
+            get_node_host=lambda: "127.0.0.1",
+            get_node_port=lambda: 9000,
+            get_node_id_short=lambda: "001",
             job_manager=MockGateJobManager(),
-            job_router=None,
             check_rate_limit=lambda client_id, op: (True, 0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: False,  # Would reject if checked
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
-            assume_leadership=lambda job_id, count: None,
+            assume_leadership=lambda job_id, count, initial_token=None: None,
             broadcast_leadership=AsyncMock(),
-            dispatch_to_dcs=AsyncMock(),
         )
 
         result = coordinator._check_circuit_and_quorum("job-1")

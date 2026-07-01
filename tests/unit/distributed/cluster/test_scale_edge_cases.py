@@ -883,7 +883,11 @@ class TestNumericOverflowBoundary:
             max_extensions=10,
         )
 
-        expected_grants = [16.0, 8.0, 4.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        # AD-26 line 32: grant = base_deadline / 2^extension_count where the
+        # count is the pre-grant value (count=0 yields a full base_deadline
+        # grant), floored at min_grant. The first grant is therefore the full
+        # base_deadline (32.0), not base_deadline/2.
+        expected_grants = [32.0, 16.0, 8.0, 4.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
         for i, expected in enumerate(expected_grants):
             granted, actual_grant, _, _ = tracker.request_extension(

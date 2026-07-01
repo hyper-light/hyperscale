@@ -67,7 +67,7 @@ class MockJobLeadershipTracker:
         else:
             self.fence_tokens[job_id] = self.fence_tokens.get(job_id, 0) + 1
 
-    def get_fence_token(self, job_id: str) -> int | None:
+    def get_fencing_token(self, job_id: str) -> int | None:
         return self.fence_tokens.get(job_id)
 
     def record_external_leader(
