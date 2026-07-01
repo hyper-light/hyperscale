@@ -18,7 +18,12 @@ from hyperscale.distributed.protocol.version import NodeCapabilities
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerError, ServerInfo
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import (
+    Clock,
+    ProcessSpawner,
+    RealClock,
+    TransportFactory,
+)
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -45,6 +50,10 @@ class WorkerLifecycleManager:
         total_cores: int,
         env: "Env",
         logger: "Logger | None" = None,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+        transport_factory: TransportFactory | None = None,
+        process_spawner: ProcessSpawner | None = None,
     ) -> None:
         """
         Initialize lifecycle manager.
@@ -56,6 +65,17 @@ class WorkerLifecycleManager:
             total_cores: Total CPU cores available
             env: Environment configuration
             logger: Logger instance
+            loop: Phase 6 SIM seam — the worker's ``SimulationLoop``
+                (``None`` in REAL mode; everything resolves the running
+                loop lazily as before)
+            transport_factory: Phase 6 SIM seam — forwarded to the
+                ``RemoteGraphManager`` so the pool-leader controller
+                transacts over the simulation transport instead of a
+                real UDP socket
+            process_spawner: Phase 6 SIM seam — forwarded to the
+                ``LocalServerPool`` so pool executors are spawned as
+                simulation-coordinator child processes instead of
+                ``ProcessPoolExecutor`` subprocesses
         """
         self._host: str = host
         self._tcp_port: int = tcp_port
@@ -63,6 +83,9 @@ class WorkerLifecycleManager:
         self._total_cores: int = total_cores
         self._env: "Env" = env
         self._logger: "Logger | None" = logger
+        self._loop: asyncio.AbstractEventLoop | None = loop
+        self._transport_factory: TransportFactory | None = transport_factory
+        self._process_spawner: ProcessSpawner | None = process_spawner
 
         # Compute derived ports
         self._local_udp_port: int = udp_port + (total_cores**2)
@@ -72,7 +95,11 @@ class WorkerLifecycleManager:
         self._memory_monitor: MemoryMonitor = MemoryMonitor(env)
 
         # Initialize server pool and remote manager
-        self._server_pool: LocalServerPool = LocalServerPool(total_cores)
+        self._server_pool: LocalServerPool = LocalServerPool(
+            total_cores,
+            loop=loop,
+            process_spawner=process_spawner,
+        )
         self._remote_manager: RemoteGraphManager | None = None
 
         # Logging configuration
@@ -134,6 +161,8 @@ class WorkerLifecycleManager:
             updates_controller,
             self._total_cores,
             status_update_poll_interval=status_update_poll_interval,
+            loop=self._loop,
+            transport_factory=self._transport_factory,
         )
         return self._remote_manager
 

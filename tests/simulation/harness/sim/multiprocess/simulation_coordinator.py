@@ -43,10 +43,18 @@ class SimulationCoordinator:
     never reorders within an instant. Add processes with ``add_process``,
     then ``run`` returns ``{process_id: result}`` (including any children
     admitted dynamically through spawn requests).
+
+    ``seed`` is the run's base random seed: every admitted child gets its
+    own ``SeededRandom`` seeded ``seed + <admission index>`` — distinct
+    per process, identical across replays (admission order is part of
+    the deterministic schedule).
     """
 
     def __init__(
-        self, latency: float = 0.001, max_virtual_time: float | None = None
+        self,
+        latency: float = 0.001,
+        max_virtual_time: float | None = None,
+        seed: int = 1,
     ) -> None:
         if latency <= 0.0:
             raise ValueError("latency must be strictly positive (lookahead)")
@@ -56,6 +64,7 @@ class SimulationCoordinator:
         # forever — should surface, not hang the test host). ``None``
         # means unbounded (run to natural quiescence).
         self._max_virtual_time = max_virtual_time
+        self._seed = seed
         self._specs: list[tuple] = []
 
     def add_process(self, process_id, entry, *entry_args) -> None:
@@ -205,10 +214,14 @@ class SimulationCoordinator:
                         f"duplicate simulation process id: {process_id!r} — "
                         "process ids must be unique across the whole run"
                     )
+                # Per-child seed: distinct per process, reproducible
+                # across replays (``len(processes)`` is the admission
+                # index, and admission order is deterministic).
+                child_seed = self._seed + len(processes)
                 parent_connection, child_connection = spawn_context.Pipe()
                 process = spawn_context.Process(
                     target=run_child_loop,
-                    args=(child_connection, entry, entry_args, start_time),
+                    args=(child_connection, entry, entry_args, start_time, child_seed),
                 )
                 process.start()
                 connections[process_id] = parent_connection

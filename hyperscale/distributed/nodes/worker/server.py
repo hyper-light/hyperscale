@@ -41,6 +41,12 @@ from hyperscale.distributed.protocol.version import (
     NegotiatedCapabilities,
 )
 from hyperscale.distributed.server import tcp
+from hyperscale.distributed.runtime import (
+    Clock,
+    ProcessSpawner,
+    Random,
+    TransportFactory,
+)
 from hyperscale.logging import Logger
 from hyperscale.logging.config import DurabilityMode
 from hyperscale.logging.hyperscale_logging_models import (
@@ -102,9 +108,10 @@ class WorkerServer(HealthAwareServer):
         dc_id: str = "default",
         seed_managers: list[tuple[str, int]] | None = None,
         *,
-        clock: "Clock | None" = None,
-        random_source: "Random | None" = None,
-        transport_factory: "TransportFactory | None" = None,
+        clock: Clock | None = None,
+        random_source: Random | None = None,
+        transport_factory: TransportFactory | None = None,
+        process_spawner: ProcessSpawner | None = None,
     ) -> None:
         """
         Initialize worker server.
@@ -185,7 +192,13 @@ class WorkerServer(HealthAwareServer):
             logger=None,
         )
 
-        # New modular components
+        # New modular components. The Phase 6 SIM seams flow through the
+        # lifecycle manager to the pool leader (``RemoteGraphManager`` ->
+        # ``RemoteGraphController``) and the executor pool
+        # (``LocalServerPool``): under SIM the leader transacts over the
+        # simulation transport and the executors are spawned as
+        # simulation-coordinator child processes; in REAL mode both are
+        # ``None`` and nothing changes.
         self._lifecycle_manager: WorkerLifecycleManager = WorkerLifecycleManager(
             host=host,
             tcp_port=tcp_port,
@@ -193,6 +206,8 @@ class WorkerServer(HealthAwareServer):
             total_cores=self._total_cores,
             env=env,
             logger=None,
+            transport_factory=transport_factory,
+            process_spawner=process_spawner,
         )
 
         # Initialize after we have discovery service

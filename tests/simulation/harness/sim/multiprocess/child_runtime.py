@@ -27,13 +27,22 @@ requests for the coordinator to admit further child processes (the
 
 import asyncio
 
+from hyperscale.distributed.runtime import (
+    restore_defaults,
+    snapshot_defaults,
+    swap_defaults,
+)
 from hyperscale.logging import LoggingConfig
 
+from ..seeded_random import SeededRandom
 from ..simulation_loop import SimulationLoop
+from ..virtual_clock import VirtualClock
 from .child_context import ChildContext, CrossProcessTransport
 
 
-def run_child_loop(conn, entry, entry_args, start_time: float = 0.0) -> None:
+def run_child_loop(
+    conn, entry, entry_args, start_time: float = 0.0, seed: int = 1
+) -> None:
     """Run one simulation child until the coordinator sends ``STOP``.
 
     ``conn`` is this child's end of a ``multiprocessing`` duplex pipe.
@@ -42,7 +51,9 @@ def run_child_loop(conn, entry, entry_args, start_time: float = 0.0) -> None:
     is 0.0 for children present at simulation start; a child admitted
     mid-run (a spawn request from another child) begins its virtual clock
     at the coordinator's global virtual time so its messages can never be
-    timestamped in the global past.
+    timestamped in the global past. ``seed`` drives this process's
+    ``SeededRandom`` (the coordinator derives a distinct, deterministic
+    seed per child).
     """
     # The async Logger's stream setup uses connect_write_pipe /
     # run_in_executor, both banned on the SimulationLoop; SIM asserts on
@@ -53,6 +64,16 @@ def run_child_loop(conn, entry, entry_args, start_time: float = 0.0) -> None:
     asyncio.set_event_loop(loop)
     transport = CrossProcessTransport(loop)
     context = ChildContext(loop, transport)
+
+    # The multi-process twin of ``SimulationRuntime``'s default swap:
+    # production modules that read the process-default ``Clock`` /
+    # ``Random`` singletons (rather than an injected seam) get the
+    # virtual clock and the seeded random, so jittered timers and
+    # timeout bookkeeping inside this child are deterministic. The
+    # entry's module graph is fully imported by the time we run (spawn
+    # unpickled ``entry`` during bootstrap), so the swap covers it.
+    defaults_snapshot = snapshot_defaults()
+    swap_defaults(clock=VirtualClock(loop), random_source=SeededRandom(seed))
 
     entry(context, *entry_args)
 
@@ -92,6 +113,7 @@ def run_child_loop(conn, entry, entry_args, start_time: float = 0.0) -> None:
                 )
             )
     finally:
+        restore_defaults(defaults_snapshot)
         if not loop.is_closed():
             loop.close()
         asyncio.set_event_loop(None)

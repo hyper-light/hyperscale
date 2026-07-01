@@ -27,6 +27,7 @@ from hyperscale.core.jobs.models import (
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.workers import Provisioner, StagePriority
+from hyperscale.core.runtime import TransportFactory
 from hyperscale.core.state import (
     Context,
     ContextHook,
@@ -90,7 +91,20 @@ class RemoteGraphManager:
         updates: InterfaceUpdatesController,
         workers: int,
         status_update_poll_interval: float = 0.05,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+        transport_factory: TransportFactory | None = None,
     ) -> None:
+        # Phase 6 SIM seams, forwarded to the leader ``RemoteGraphController``
+        # this manager constructs in ``start``. ``None`` in REAL mode — the
+        # controller binds a real UDP socket exactly as before. Under SIM the
+        # worker node runs as a coordinator child: ``transport_factory`` is
+        # its ``CrossProcessTransport`` and ``loop`` its ``SimulationLoop``,
+        # so the pool leader transacts over the deterministic cross-process
+        # boundary like every other server in the simulation.
+        self._injected_loop = loop
+        self._transport_factory = transport_factory
+
         self._updates = updates
         self._workers: List[Tuple[str, int]] | None = None
 
@@ -135,7 +149,7 @@ class RemoteGraphManager:
         ] = []
 
         self._workflow_configs: Dict[str, Dict[str, Any]] = {}
-        self._loop = asyncio.get_event_loop()
+        self._loop = loop if loop is not None else asyncio.get_event_loop()
         self._logger = Logger()
         self._status_lock: asyncio.Lock | None = None
 
@@ -174,6 +188,8 @@ class RemoteGraphManager:
                     host,
                     port,
                     env,
+                    loop=self._injected_loop,
+                    transport_factory=self._transport_factory,
                 )
 
             if self._provisioner is None:
