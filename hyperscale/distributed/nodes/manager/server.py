@@ -9578,6 +9578,22 @@ class ManagerServer(HealthAwareServer):
                 self._aggregate_workflow_results(job)
             )
 
+        # Tier-1 terminal push to whoever registered the job callback.
+        # The gate path below covers L3 deployments; without this push,
+        # gateless (L1/L2, client-direct) deployments never deliver the
+        # terminal JobStatusPush and ``client.wait_for_job`` hangs on
+        # *successful* completion — the timeout path already pushes
+        # ``is_final=True`` through this exact channel, and the RUNNING
+        # transition was likewise patched for gateless visibility. Must
+        # run before ``_send_job_completion_to_gate``, whose
+        # ``_cleanup_job_state`` wipes the callback registration.
+        await self._push_job_status_to_client(
+            job_id,
+            final_status,
+            "Job completed",
+            is_final=True,
+        )
+
         await self._send_job_completion_to_gate(
             job_id,
             final_status,

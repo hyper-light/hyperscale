@@ -2,7 +2,6 @@ import asyncio
 import inspect
 import math
 import socket
-import time
 import warnings
 from collections import defaultdict
 from typing import Any, AsyncGenerator, Coroutine, Dict, List, Literal, Tuple
@@ -67,7 +66,18 @@ class WorkflowRunner:
         env: Env,
         worker_id: int,
         node_id: int,
+        *,
+        monitors_enabled: bool = True,
     ) -> None:
+        # Phase 6 SIM seam. The per-run CPU/memory monitors sample the
+        # real host through ``run_in_executor`` — banned on the
+        # ``SimulationLoop`` and inherently non-deterministic — so the
+        # owning ``RemoteGraphController`` disables them when it runs
+        # under a simulation transport (the same treatment logging and
+        # the worker-node telemetry get). ``True`` in REAL mode:
+        # behavior is byte-identical.
+        self._monitors_enabled = monitors_enabled
+
         self._worker_id = worker_id
 
         self._logfile = f"hyperscale.worker.{self._worker_id}.log.json"
@@ -388,10 +398,13 @@ class WorkflowRunner:
                     name="info",
                 )
 
-                await self._cpu_monitor.start_background_monitor(run_id, workflow_name)
-                await self._memory_monitor.start_background_monitor(
-                    run_id, workflow_name
-                )
+                if self._monitors_enabled:
+                    await self._cpu_monitor.start_background_monitor(
+                        run_id, workflow_name
+                    )
+                    await self._memory_monitor.start_background_monitor(
+                        run_id, workflow_name
+                    )
 
                 self.run_statuses[run_id][workflow_name] = WorkflowStatus.CREATED
 
@@ -454,14 +467,15 @@ class WorkflowRunner:
 
                     self.run_statuses[run_id][workflow_name] = WorkflowStatus.COMPLETED
 
-                    await self._cpu_monitor.stop_background_monitor(
-                        run_id,
-                        workflow_name,
-                    )
-                    await self._memory_monitor.stop_background_monitor(
-                        run_id,
-                        workflow_name,
-                    )
+                    if self._monitors_enabled:
+                        await self._cpu_monitor.stop_background_monitor(
+                            run_id,
+                            workflow_name,
+                        )
+                        await self._memory_monitor.stop_background_monitor(
+                            run_id,
+                            workflow_name,
+                        )
 
                     return (
                         run_id,
@@ -478,14 +492,15 @@ class WorkflowRunner:
                     )
 
                     self.run_statuses[run_id][workflow.name] = WorkflowStatus.FAILED
-                    await self._cpu_monitor.stop_background_monitor(
-                        run_id,
-                        workflow_name,
-                    )
-                    await self._memory_monitor.stop_background_monitor(
-                        run_id,
-                        workflow_name,
-                    )
+                    if self._monitors_enabled:
+                        await self._cpu_monitor.stop_background_monitor(
+                            run_id,
+                            workflow_name,
+                        )
+                        await self._memory_monitor.stop_background_monitor(
+                            run_id,
+                            workflow_name,
+                        )
 
                     return (
                         run_id,
@@ -833,7 +848,12 @@ class WorkflowRunner:
 
         workflow_context = context[workflow_name].dict()
 
-        start = time.monotonic()
+        # Loop time, not wall time: on a real event loop ``loop.time()``
+        # IS the monotonic clock, so REAL behavior is unchanged; under
+        # SIM it is virtual time, so a workflow's duration and elapsed
+        # measurement follow the deterministic schedule instead of
+        # host-dependent wall time.
+        start = loop.time()
 
         if config.get("interval") is None:
             completed, pending = await asyncio.wait(
@@ -879,7 +899,7 @@ class WorkflowRunner:
                 timeout=1,
             )
 
-        elapsed = time.monotonic() - start
+        elapsed = loop.time() - start
 
         if not self._is_stopped.set():
             self._is_stopped.set()
@@ -1064,7 +1084,10 @@ class WorkflowRunner:
 
         elapsed = 0
 
-        start = time.monotonic()
+        # Loop time, not wall time — identical on a real loop, virtual
+        # (deterministic) under SIM. See _execute_test_workflow.
+        loop = asyncio.get_event_loop()
+        start = loop.time()
         while elapsed < duration and self._running:
             try:
                 remaining = duration - elapsed
@@ -1079,7 +1102,7 @@ class WorkflowRunner:
                     and self._active_waiters[run_id][workflow_name] is None
                 ):
                     self._active_waiters[run_id][workflow_name] = (
-                        asyncio.get_event_loop().create_future()
+                        loop.create_future()
                     )
 
                     try:
@@ -1093,12 +1116,13 @@ class WorkflowRunner:
             except Exception:
                 pass
 
-            elapsed = time.monotonic() - start
+            elapsed = loop.time() - start
 
-        await self._cpu_monitor.stop_background_monitor(
-            run_id,
-            workflow_name,
-        )
+        if self._monitors_enabled:
+            await self._cpu_monitor.stop_background_monitor(
+                run_id,
+                workflow_name,
+            )
 
     async def _generate_constant(
         self,
@@ -1113,7 +1137,10 @@ class WorkflowRunner:
         elapsed = 0
         generated = 0
 
-        start = time.monotonic()
+        # Loop time, not wall time — identical on a real loop, virtual
+        # (deterministic) under SIM. See _execute_test_workflow.
+        loop = asyncio.get_event_loop()
+        start = loop.time()
         while elapsed < duration and self._running:
             try:
                 remaining = duration - elapsed
@@ -1134,7 +1161,7 @@ class WorkflowRunner:
                     and self._active_waiters[run_id][workflow_name] is None
                 ):
                     self._active_waiters[run_id][workflow_name] = (
-                        asyncio.get_event_loop().create_future()
+                        loop.create_future()
                     )
 
                     try:
@@ -1148,12 +1175,13 @@ class WorkflowRunner:
             except Exception:
                 pass
 
-            elapsed = time.monotonic() - start
+            elapsed = loop.time() - start
 
-        await self._cpu_monitor.stop_background_monitor(
-            run_id,
-            workflow_name,
-        )
+        if self._monitors_enabled:
+            await self._cpu_monitor.stop_background_monitor(
+                run_id,
+                workflow_name,
+            )
 
     async def _provide_context(
         self,

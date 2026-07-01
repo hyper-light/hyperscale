@@ -92,4 +92,22 @@ def worker_entry(
             await asyncio.sleep(0.5)
         log.append(("manager-healthy", round(context.loop.time(), 6)))
 
+    async def watch_workflows() -> None:
+        # Milestone every time the active-workflow count changes: shows
+        # dispatch arrival and drain (final result sent) on virtual time.
+        last_active_count = -1
+        while True:
+            active_count = len(worker._active_workflows)
+            if active_count != last_active_count:
+                last_active_count = active_count
+                log.append(
+                    (
+                        "workflows-active",
+                        active_count,
+                        round(context.loop.time(), 6),
+                    )
+                )
+            await asyncio.sleep(0.25)
+
     context.loop.create_task(run())
+    context.loop.create_task(watch_workflows())

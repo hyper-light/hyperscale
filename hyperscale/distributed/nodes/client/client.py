@@ -39,6 +39,7 @@ from hyperscale.distributed.models import (
     GlobalJobStatus,
 )
 from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.runtime import Clock, Random, TransportFactory
 from hyperscale.distributed.reliability.rate_limiting import (
     AdaptiveRateLimiter,
     AdaptiveRateLimitConfig,
@@ -110,6 +111,10 @@ class HyperscaleClient(MercurySyncBaseServer):
         env: Env | None = None,
         managers: list[tuple[str, int]] | None = None,
         gates: list[tuple[str, int]] | None = None,
+        *,
+        clock: Clock | None = None,
+        random_source: Random | None = None,
+        transport_factory: TransportFactory | None = None,
     ):
         """
         Initialize the client.
@@ -120,6 +125,10 @@ class HyperscaleClient(MercurySyncBaseServer):
             env: Environment configuration
             managers: List of manager (host, port) addresses
             gates: List of gate (host, port) addresses
+            clock: Phase 6 SIM seam — virtual clock (None in REAL mode)
+            random_source: Phase 6 SIM seam — seeded random (None in REAL mode)
+            transport_factory: Phase 6 SIM seam — simulation transport in
+                place of real sockets (None in REAL mode)
         """
         env = env or Env()
 
@@ -128,6 +137,9 @@ class HyperscaleClient(MercurySyncBaseServer):
             tcp_port=port,
             udp_port=port + 1,  # UDP not used but required by base
             env=env,
+            clock=clock,
+            random_source=random_source,
+            transport_factory=transport_factory,
         )
 
         # Logger used by every client submodule. The base class also creates

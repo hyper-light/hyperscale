@@ -93,6 +93,9 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             env,
             worker_idx,
             self._node_id_base,
+            # Host-telemetry monitors sample through run_in_executor —
+            # banned and non-deterministic under SIM (see WorkflowRunner).
+            monitors_enabled=transport_factory is None,
         )
 
         self.acknowledged_starts: set[str] = set()
