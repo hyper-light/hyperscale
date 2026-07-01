@@ -13,6 +13,7 @@ byte-identical per-process logs (replay-determinism across processes).
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.demo_endpoints import (
     ping_pong_entry,
+    repeating_ping_entry,
     spawning_parent_entry,
 )
 
@@ -68,3 +69,33 @@ def test_dynamically_spawned_child_joins_at_global_virtual_time():
 
 def test_dynamic_spawn_is_replay_deterministic():
     assert _run_dynamic_spawn() == _run_dynamic_spawn()
+
+
+def _run_kill() -> dict:
+    coordinator = SimulationCoordinator(latency=0.5)
+    coordinator.add_process(
+        "sender", repeating_ping_entry, ("proc", 1), ("proc", 2), 1.0
+    )
+    coordinator.add_process("receiver", ping_pong_entry, ("proc", 2), ("proc", 1), "pong")
+    coordinator.schedule_kill("sender", at_time=3.5)
+    return coordinator.run()
+
+
+def test_killed_process_goes_silent_at_its_virtual_instant():
+    """A process killed at K executes nothing at or after K: the
+    receiver sees exactly the heartbeats sent strictly before the kill
+    (1.0, 2.0, 3.0 -> delivered 1.5, 2.5, 3.5), its replies toward the
+    dead sender drop silently, and the victim — otherwise immortal —
+    produces no RESULT."""
+    results = _run_kill()
+
+    assert "sender" not in results
+    assert results["receiver"] == [
+        (1.5, "recv", "ping", ("proc", 1)),
+        (2.5, "recv", "ping", ("proc", 1)),
+        (3.5, "recv", "ping", ("proc", 1)),
+    ]
+
+
+def test_kill_is_replay_deterministic():
+    assert _run_kill() == _run_kill()

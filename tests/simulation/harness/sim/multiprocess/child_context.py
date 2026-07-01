@@ -142,6 +142,7 @@ class CrossProcessTransport:
         self._next_connection_index = 0
         self._outbound: list[tuple] = []
         self._spawn_requests: list[tuple] = []
+        self._spawned_process_exitcodes: dict[str, int | None] = {}
         self._announced_addresses: set[tuple] = set()
         self._new_addresses: list[tuple] = []
 
@@ -260,12 +261,32 @@ class CrossProcessTransport:
         barrier with its virtual clock initialized to global time.
         """
         self._spawn_requests.append((process_id, entry, tuple(entry_args)))
+        self._spawned_process_exitcodes[process_id] = None
 
     def drain_spawn_requests(self) -> list:
         """Return and clear this window's buffered spawn requests."""
         requests = self._spawn_requests[:]
         self._spawn_requests.clear()
         return requests
+
+    def record_process_exit(self, process_id: str, exitcode: int) -> None:
+        """Mark a fault-injected death (coordinator process event).
+
+        Only processes this context spawned are tracked — the exit-code
+        snapshot mirrors what a real ``ProcessPoolExecutor`` owner sees:
+        its own children, nobody else's.
+        """
+        if process_id in self._spawned_process_exitcodes:
+            self._spawned_process_exitcodes[process_id] = exitcode
+
+    def get_process_exitcodes(self) -> dict:
+        """Exit-code snapshot of the processes this context spawned.
+
+        ``None`` means still running — the same contract as
+        ``LocalServerPool.get_process_exitcodes`` in REAL mode, so the
+        worker's pool-health polling runs unchanged over it.
+        """
+        return dict(self._spawned_process_exitcodes)
 
     # -- internals -------------------------------------------------------
 
@@ -432,6 +453,11 @@ class ChildContext:
         """Request a new coordinator child (see
         ``CrossProcessTransport.spawn_process``)."""
         self.transport.spawn_process(process_id, entry, *entry_args)
+
+    def get_process_exitcodes(self) -> dict:
+        """Exit-code snapshot of the children this context spawned (see
+        ``CrossProcessTransport.get_process_exitcodes``)."""
+        return self.transport.get_process_exitcodes()
 
     def set_result(self, value) -> None:
         self._result = value

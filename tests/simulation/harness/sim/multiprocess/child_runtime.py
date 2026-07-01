@@ -15,7 +15,8 @@ Wire protocol (tuples, ``multiprocessing``-picklable):
 
 - child -> coordinator, once after setup:
   ``("READY", addresses, next_event_time, outbound, spawn_requests)``
-- coordinator -> child: ``("GRANT", deadline, inbound)`` | ``("STOP",)``
+- coordinator -> child:
+  ``("GRANT", deadline, inbound, process_events)`` | ``("STOP",)``
 - child -> coordinator, per grant:
   ``("REPORT", next_event_time, outbound, spawn_requests, new_addresses)``
 - child -> coordinator, at shutdown: ``("RESULT", result)``
@@ -26,10 +27,13 @@ src_addr, payload)`` — ``payload`` is a tagged wire event (datagram or
 stream event; see ``child_context``), opaque to the coordinator;
 ``spawn_requests`` items are ``(process_id, entry, entry_args)`` —
 requests for the coordinator to admit further child processes (the
-``ProcessSpawner`` seam ``LocalServerPool`` drives under SIM); and
+``ProcessSpawner`` seam ``LocalServerPool`` drives under SIM);
 ``addresses`` / ``new_addresses`` are the socknames this process
 registered since the previous barrier (servers may start mid-run, so
-the route map grows incrementally).
+the route map grows incrementally); and ``process_events`` items are
+``(kill_time, process_id, exitcode)`` — fault-injected deaths, made
+visible to this process's exit-code snapshot at exactly ``kill_time``
+so the production pool-health polling observes them on virtual time.
 """
 
 import asyncio
@@ -108,9 +112,16 @@ def run_child_loop(
                 conn.send(("RESULT", context.result))
                 return
 
-            _, deadline, inbound = message
+            _, deadline, inbound, process_events = message
             for delivery_time, dst_sockname, src_addr, payload in inbound:
                 transport.inject(delivery_time, dst_sockname, src_addr, payload)
+            for kill_time, process_id, exitcode in process_events:
+                # Recorded as a timer so the death becomes visible to
+                # exit-code polling at exactly its virtual instant, not
+                # at the window edge where the grant arrived.
+                loop.call_at(
+                    kill_time, transport.record_process_exit, process_id, exitcode
+                )
 
             next_event_time = loop.run_window(deadline)
             conn.send(

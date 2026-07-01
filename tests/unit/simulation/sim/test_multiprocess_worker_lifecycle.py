@@ -43,7 +43,13 @@ def test_worker_lifecycle_pool_bring_up_under_sim():
     (tag, acknowledged, exitcodes, virtual_time) = results["worker-node"][0]
     assert tag == "pool-connected"
     assert acknowledged == ["sim-worker:208", "sim-worker:210"]
-    assert exitcodes == {}
+    # The exit-code snapshot mirrors REAL semantics through the spawner
+    # seam: both executors tracked, ``None`` = still running (a
+    # fault-injected kill would flip its entry at the kill instant).
+    assert exitcodes == {
+        "executor-sim-worker-208": None,
+        "executor-sim-worker-210": None,
+    }
     # Executors admitted at 0.0 handshake by 0.02 and acknowledge by
     # 0.03; the production wait path then connects back to each executor
     # (one more round trip) and completes at a fixed virtual instant.

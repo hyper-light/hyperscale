@@ -1065,7 +1065,7 @@ class WorkerServer(HealthAwareServer):
 
     async def _fail_active_workflows_for_pool_exit(
         self,
-        exited_process_ids: set[int],
+        exited_process_ids: set[int | str],
     ) -> None:
         reason = (
             "Worker subprocess exited during workflow execution "

@@ -438,15 +438,20 @@ class LocalServerPool:
                 enable_server_cleanup,
             )
 
-    def get_process_exitcodes(self) -> dict[int, int | None]:
-        """Return a snapshot of worker-process PID to exit code.
+    def get_process_exitcodes(self) -> dict[int | str, int | None]:
+        """Return a snapshot of worker-process id to exit code.
 
         ``None`` means the process is still running. A non-``None`` exit code
         means the process exited and any workflow assigned to that local
-        controller is no longer making progress. Under SIM (executors are
-        coordinator children, not pool subprocesses) there is no executor
-        and this returns ``{}``.
+        controller is no longer making progress. Keys are OS pids in REAL
+        mode and coordinator process ids (strings) under SIM — consumers
+        treat them opaquely. Under SIM the snapshot comes from the
+        spawner seam, where fault-injected kills surface at their exact
+        virtual instant.
         """
+        if self._process_spawner is not None:
+            return self._process_spawner.get_process_exitcodes()
+
         if self._executor is None:
             return {}
 

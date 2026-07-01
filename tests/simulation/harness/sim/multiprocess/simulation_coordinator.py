@@ -48,7 +48,20 @@ class SimulationCoordinator:
     own ``SeededRandom`` seeded ``seed + <admission index>`` — distinct
     per process, identical across replays (admission order is part of
     the deterministic schedule).
+
+    Fault injection: ``schedule_kill(process_id, at_time)`` SIGKILLs a
+    child at a virtual instant. Kill semantics are crisp — a process
+    killed at K executes nothing at or after K (its last granted window
+    ended strictly before K); its addresses leave the route map (silence:
+    datagrams and stream traffic toward it drop, the power-off model),
+    it produces no RESULT (absent from ``run``'s dict), and every
+    surviving child learns ``(kill_time, process_id, exitcode)`` so the
+    production exit-code paths (``LocalServerPool.get_process_exitcodes``
+    feeding the worker pool-health loop) observe the death exactly as
+    they would a real subprocess exit.
     """
+
+    _KILLED_EXITCODE = -9  # SIGKILL, as ProcessPoolExecutor would report
 
     def __init__(
         self,
@@ -66,6 +79,7 @@ class SimulationCoordinator:
         self._max_virtual_time = max_virtual_time
         self._seed = seed
         self._specs: list[tuple] = []
+        self._kill_schedule: list[tuple] = []
 
     def add_process(self, process_id, entry, *entry_args) -> None:
         """Register a child process present at simulation start.
@@ -75,6 +89,16 @@ class SimulationCoordinator:
         sets up that process's servers/behavior on the ``ChildContext``.
         """
         self._specs.append((process_id, entry, entry_args))
+
+    def schedule_kill(self, process_id, at_time: float) -> None:
+        """Schedule ``process_id``'s abrupt death (SIGKILL) at virtual
+        ``at_time``.
+
+        The process may be one admitted dynamically mid-run (a pool
+        executor); it must exist when the kill fires — an unknown or
+        already-dead victim raises rather than silently no-oping.
+        """
+        self._kill_schedule.append((at_time, process_id))
 
     def run(self) -> dict:
         spawn_context = multiprocessing.get_context("spawn")
@@ -109,11 +133,17 @@ class SimulationCoordinator:
             start_time=0.0,
         )
 
+        # Kills fire in (time, schedule order); stable sort keeps
+        # same-instant kills in the order the scenario declared them.
+        remaining_kills = sorted(self._kill_schedule, key=lambda kill: kill[0])
+
         # Lockstep.
         while True:
             candidates = [t for t in next_times.values() if t is not None]
             if pending:
                 candidates.append(pending[0][0])
+            if remaining_kills:
+                candidates.append(remaining_kills[0][0])
             if not candidates:
                 break
             target_time = min(candidates)
@@ -122,6 +152,18 @@ class SimulationCoordinator:
                 and target_time > self._max_virtual_time
             ):
                 break
+
+            # Apply due kills BEFORE granting: a process killed at K has
+            # executed only windows ending strictly before K, so it runs
+            # nothing at or after its death instant. Survivors learn of
+            # each death via the GRANT's process events.
+            kill_events: list = []
+            while remaining_kills and remaining_kills[0][0] <= target_time:
+                kill_time, victim_id = remaining_kills.pop(0)
+                self._kill_child(
+                    victim_id, connections, processes, next_times, address_to_process
+                )
+                kill_events.append((kill_time, victim_id, self._KILLED_EXITCODE))
 
             # Snapshot the children granted this window — admission at
             # the barrier below grows ``connections``, and the new
@@ -133,10 +175,17 @@ class SimulationCoordinator:
                 delivery_time, _seq, dst_process, dst_addr, src_addr, data = (
                     heapq.heappop(pending)
                 )
-                due[dst_process].append((delivery_time, dst_addr, src_addr, data))
+                # Deliveries already in flight toward a since-killed
+                # process drop silently — bytes to a dead host.
+                if dst_process in due:
+                    due[dst_process].append(
+                        (delivery_time, dst_addr, src_addr, data)
+                    )
 
             for process_id, connection in granted:
-                connection.send(("GRANT", target_time, due[process_id]))
+                connection.send(
+                    ("GRANT", target_time, due[process_id], kill_events)
+                )
 
             # Barrier: collect every report before advancing global time.
             # Two passes — merge every process's newly registered
@@ -263,6 +312,45 @@ class SimulationCoordinator:
                 )
 
         return sequence
+
+    def _kill_child(
+        self,
+        victim_id,
+        connections: dict,
+        processes: dict,
+        next_times: dict,
+        address_to_process: dict,
+    ) -> None:
+        """SIGKILL ``victim_id`` and remove it from the simulation.
+
+        The victim is blocked at the window barrier (``conn.recv``), so
+        the wall-clock signal delivery cannot race any of its virtual
+        execution — it has run exactly its granted windows and nothing
+        more. Its addresses leave the route map (subsequent traffic
+        drops, silence semantics) and it will produce no RESULT.
+        """
+        connection = connections.pop(victim_id, None)
+        if connection is None:
+            raise ValueError(
+                f"cannot kill unknown or already-dead process {victim_id!r}"
+            )
+        connection.close()
+        next_times.pop(victim_id, None)
+
+        victim_addresses = [
+            address
+            for address, process_id in address_to_process.items()
+            if process_id == victim_id
+        ]
+        for address in victim_addresses:
+            del address_to_process[address]
+
+        process = processes[victim_id]
+        process.kill()
+        # Reap immediately — the process is already dead, so the join is
+        # deterministic; run()'s final join over ``processes`` is a no-op
+        # for it.
+        process.join()
 
     @staticmethod
     def _merge_address(address_to_process: dict, address, process_id) -> None:

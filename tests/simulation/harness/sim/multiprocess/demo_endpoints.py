@@ -67,6 +67,23 @@ def spawning_parent_entry(
     context.set_result(log)
 
 
+def repeating_ping_entry(context, address, peer, interval) -> None:
+    """Child entry: send ``b"ping"`` to ``peer`` every ``interval``
+    virtual seconds, forever — the immortal heartbeat a kill test cuts
+    short (without a kill this process never quiesces)."""
+    log: list = []
+    endpoint = _EchoEndpoint(context.loop, "ping", log)
+    context.transport.register_datagram_endpoint(address, endpoint)
+
+    def send_ping() -> None:
+        log.append((round(context.loop.time(), 6), "send", "ping", peer))
+        endpoint.transport.sendto(b"ping", peer)
+        context.loop.call_later(interval, send_ping)
+
+    context.loop.call_later(interval, send_ping)
+    context.set_result(log)
+
+
 def late_child_entry(context, address, peer) -> None:
     """Dynamically admitted child: records its (inherited) start time,
     pings ``peer`` immediately, and records the reply's arrival time —

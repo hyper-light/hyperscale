@@ -62,3 +62,15 @@ class ProcessSpawner(Protocol):
         silently shadowing an existing process.
         """
         ...
+
+    def get_process_exitcodes(self) -> dict:
+        """Exit-code snapshot of the processes spawned through this seam.
+
+        Keyed by the ``process_id`` passed to ``spawn_process``;
+        ``None`` means still running, a non-``None`` code means the
+        process died (fault-injected coordinator kills surface here at
+        their exact virtual instant). Mirrors the contract of
+        ``LocalServerPool.get_process_exitcodes`` in REAL mode so the
+        worker's pool-health polling runs unchanged over it.
+        """
+        ...

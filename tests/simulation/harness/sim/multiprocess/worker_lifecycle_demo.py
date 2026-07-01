@@ -62,9 +62,10 @@ def worker_lifecycle_entry(context, host, tcp_port, udp_port, total_cores) -> No
         await lifecycle.run_worker_pool()
         await lifecycle.connect_to_workers()
 
-        # Under SIM the executors are coordinator children, not pool
-        # subprocesses — the exit-code snapshot the worker's health loop
-        # reads is empty by design.
+        # Under SIM the executors are coordinator children; the
+        # exit-code snapshot flows through the spawner seam with REAL
+        # semantics (``None`` = running, fault-injected kills flip an
+        # entry at their virtual instant).
         exitcodes = lifecycle.get_server_pool_process_exitcodes()
 
         leader_controller = remote_manager._controller

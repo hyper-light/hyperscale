@@ -345,8 +345,13 @@ class WorkerLifecycleManager:
         """Shut down the local server pool."""
         await self._server_pool.shutdown()
 
-    def get_server_pool_process_exitcodes(self) -> dict[int, int | None]:
-        """Return the local workflow-runner process exit-code snapshot."""
+    def get_server_pool_process_exitcodes(self) -> dict[int | str, int | None]:
+        """Return the local workflow-runner process exit-code snapshot.
+
+        Keys are OS pids in REAL mode, coordinator process ids under SIM
+        (fault-injected kills surface here at their virtual instant);
+        callers treat them opaquely.
+        """
         return self._server_pool.get_process_exitcodes()
 
     async def kill_child_processes(self) -> None:
