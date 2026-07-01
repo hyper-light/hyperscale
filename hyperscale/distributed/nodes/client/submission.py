@@ -32,6 +32,29 @@ _DEFAULT_CLOCK: Clock = RealClock()
 _DEFAULT_RANDOM: Random = RealRandom()
 
 
+def _prepend_redirect_history(history: list[str], tail: str) -> str:
+    """Join a redirect trail with a trailing error message.
+
+    Used by ``_submit_with_redirects`` to preserve the origin
+    "Not DC leader, retry at leader: X" context when a
+    subsequent redirect hop fails with a transport error. The
+    returned string is what ``_submit_with_retry`` stores in
+    ``last_error`` — and eventually surfaces in the final
+    ``RuntimeError("Job submission failed after N retries:
+    {last_error}")``. Without prepending the history, the outer
+    caller would see only the last transport error and lose the
+    semantically-correct answer from the origin (typical case:
+    "no leader / quorum lost" under partition scenarios where
+    the redirect target is unreachable by construction).
+
+    Empty history is a no-op — the return string matches ``tail``
+    unchanged so the non-redirect fast path is unaffected.
+    """
+    if not history:
+        return tail
+    return "; ".join(history) + f"; {tail}"
+
+
 class ClientJobSubmitter:
     """
     Manages job submission with retry logic and leader redirection.
@@ -341,8 +364,28 @@ class ClientJobSubmitter:
 
         Returns:
             "success", "permanent_failure", or error message (transient)
+
+        Redirect-context preservation: when a manager responds
+        ``JobAck(accepted=False, leader_addr=X)`` we follow the
+        redirect to ``X``. If the redirect target is unreachable
+        (connection refused, timeout, etc.) the outer caller
+        surfaces only the *last* error by default — dropping the
+        initial context (e.g. ``"Not DC leader, retry at leader:
+        X"``) that told us why we were redirecting in the first
+        place. That context is diagnostically load-bearing: a
+        client debugging "why did my submit fail?" needs to know
+        the origin manager considered itself non-leader, not just
+        that a follow-up hop couldn't connect. Under
+        quorum-isolating partition scenarios the origin's
+        response is also the semantically-correct answer (the
+        cluster is split; there's no leader that can accept the
+        submit). Concatenating the redirect trail into the
+        transient-error string preserves both the origin reason
+        and the subsequent transport failure — the caller sees
+        the full causal chain instead of only its tail.
         """
         redirects = 0
+        redirect_history: list[str] = []
         while redirects <= max_redirects:
             response, _ = await self._send_tcp(
                 target,
@@ -360,7 +403,7 @@ class ClientJobSubmitter:
             _sys.stderr.flush()
 
             if isinstance(response, Exception):
-                return str(response)  # Transient error
+                return _prepend_redirect_history(redirect_history, str(response))
 
             # Check for rate limiting response (AD-32). ``Message.load``
             # is intentionally lax about the deserialized type
@@ -422,18 +465,30 @@ class ClientJobSubmitter:
 
             # Check for leader redirect
             if ack.leader_addr and redirects < max_redirects:
+                # Remember why the origin bounced us before we
+                # follow the hint — the subsequent hop may fail
+                # with a lower-level transport error and lose this
+                # context.
+                if ack.error:
+                    redirect_history.append(f"{target}: {ack.error}")
                 target = tuple(ack.leader_addr)
                 redirects += 1
                 continue
 
             # Check if this is a transient error that should be retried
             if ack.error and self._is_transient_error(ack.error):
-                return ack.error  # Transient error
+                return _prepend_redirect_history(redirect_history, ack.error)
 
-            # Permanent rejection - fail immediately
+            # Permanent rejection - fail immediately. The redirect
+            # trail (if any) is included so the caller sees the
+            # full causal chain, matching the transient-error
+            # branch.
+            if redirect_history:
+                trail = "; ".join(redirect_history)
+                raise RuntimeError(f"Job rejected: {trail}; {ack.error}")
             raise RuntimeError(f"Job rejected: {ack.error}")
 
-        return "max_redirects_exceeded"
+        return _prepend_redirect_history(redirect_history, "max_redirects_exceeded")
 
     def _is_transient_error(self, error: str) -> bool:
         """
