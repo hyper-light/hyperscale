@@ -250,7 +250,12 @@ class LocalLeaderElection:
         """Start the leader election process."""
         self._running = True
         self._election_wake_event = asyncio.Event()
-        self._election_task = asyncio.create_task(self._election_loop())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop ``start`` was called from rather than implicitly going
+        # through ``get_running_loop`` at task-creation time.
+        self._election_task = asyncio.get_running_loop().create_task(
+            self._election_loop()
+        )
     
     async def stop(self) -> None:
         """Stop the leader election process."""

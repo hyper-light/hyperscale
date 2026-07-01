@@ -462,18 +462,23 @@ class MercurySyncBaseServer(Generic[T]):
             self._close_startup_transports()
             raise
 
+        # Phase 6b: explicit ``self._loop.create_task`` so each task
+        # binds to the loop this server was started on rather than
+        # implicitly going through ``get_running_loop`` at task-creation
+        # time. ``self._loop`` is captured in ``start_server`` before
+        # these background tasks are spawned.
         if self._tcp_server_cleanup_task is None:
-            self._tcp_server_cleanup_task = asyncio.create_task(
+            self._tcp_server_cleanup_task = self._loop.create_task(
                 self._cleanup_tcp_server_tasks()
             )
 
         if self._udp_server_cleanup_task is None:
-            self._udp_server_cleanup_task = asyncio.create_task(
+            self._udp_server_cleanup_task = self._loop.create_task(
                 self._cleanup_udp_server_tasks()
             )
 
         if self._drop_stats_task is None:
-            self._drop_stats_task = asyncio.create_task(
+            self._drop_stats_task = self._loop.create_task(
                 self._log_drop_stats_periodically()
             )
 
@@ -1201,7 +1206,11 @@ class MercurySyncBaseServer(Generic[T]):
             self._tcp_drop_counter.increment_load_shed()
             return False
 
-        task = asyncio.ensure_future(coro)
+        # Phase 6b: explicit ``self._loop.create_task`` so the task
+        # binds to the loop this server was started on rather than
+        # implicitly going through ``get_running_loop`` at task-creation
+        # time.
+        task = self._loop.create_task(coro)
         task.add_done_callback(lambda t: self._on_tcp_task_done(t, priority))
         self._pending_tcp_server_responses.append(task)
         return True
@@ -1299,7 +1308,11 @@ class MercurySyncBaseServer(Generic[T]):
             )
             return True
 
-        task = asyncio.ensure_future(coro)
+        # Phase 6b: explicit ``self._loop.create_task`` so the task
+        # binds to the loop this server was started on rather than
+        # implicitly going through ``get_running_loop`` at task-creation
+        # time.
+        task = self._loop.create_task(coro)
         task.add_done_callback(
             lambda task: self._on_udp_task_done(
                 task,
@@ -1334,7 +1347,11 @@ class MercurySyncBaseServer(Generic[T]):
                 admission_group=admission_group,
             )
             return
-        task = asyncio.ensure_future(coro)
+        # Phase 6b: explicit ``self._loop.create_task`` so the deferred
+        # task binds to the loop this server was started on rather than
+        # implicitly going through ``get_running_loop`` at task-creation
+        # time.
+        task = self._loop.create_task(coro)
         task.add_done_callback(
             lambda completed_task: self._on_udp_task_done(
                 completed_task,

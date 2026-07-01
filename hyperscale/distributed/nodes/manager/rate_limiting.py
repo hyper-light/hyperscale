@@ -270,7 +270,11 @@ class ManagerRateLimitingCoordinator:
                         ),
                     )
 
-        self._cleanup_task = asyncio.create_task(cleanup_loop())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop ``start_cleanup_loop`` was called from rather than
+        # implicitly going through ``get_running_loop`` at task-creation
+        # time.
+        self._cleanup_task = asyncio.get_running_loop().create_task(cleanup_loop())
 
     async def stop_cleanup_loop(self) -> None:
         """Stop the cleanup loop."""

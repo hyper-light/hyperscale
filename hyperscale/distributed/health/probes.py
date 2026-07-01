@@ -247,7 +247,13 @@ class HealthProbe:
         if self._config.initial_delay_seconds > 0:
             await self._clock.sleep(self._config.initial_delay_seconds)
 
-        self._periodic_task = asyncio.create_task(self._periodic_loop())
+        # Phase 6b: ``loop.create_task`` instead of ``asyncio.create_task``
+        # so the task lands on the loop ``start_periodic`` was called from
+        # rather than implicitly going through ``get_running_loop`` at
+        # task-creation time.
+        self._periodic_task = asyncio.get_running_loop().create_task(
+            self._periodic_loop()
+        )
 
     async def stop_periodic(self) -> None:
         """Stop periodic probe checks."""

@@ -152,7 +152,12 @@ class WALWriter:
         self._state_change_task: asyncio.Task[None] | None = None
 
     def _create_background_task(self, coro, name: str) -> asyncio.Task:
-        task = asyncio.create_task(coro, name=name)
+        # Phase 6b: explicit ``self._loop.create_task`` instead of
+        # ``asyncio.create_task`` so the task lands on the loop this
+        # writer was started on rather than ``get_running_loop()`` of
+        # whoever called us. ``_loop`` is set in ``start()`` before
+        # the first background task is spawned.
+        task = self._loop.create_task(coro, name=name)
         task.add_done_callback(lambda t: self._handle_background_task_error(t, name))
         return task
 
@@ -169,8 +174,9 @@ class WALWriter:
             self._error = exception
 
         if self._logger is not None and self._loop is not None:
+            loop = self._loop
             self._loop.call_soon(
-                lambda: asyncio.create_task(
+                lambda: loop.create_task(
                     self._logger.log(
                         WALError(
                             message=f"Background task '{name}' failed: {exception}",

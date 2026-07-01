@@ -346,7 +346,12 @@ class HierarchicalFailureDetector:
 
         self._running = True
         self._global_wheel.start()
-        self._reconciliation_task = asyncio.create_task(self._reconciliation_loop())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop ``start`` was called from rather than implicitly going
+        # through ``get_running_loop`` at task-creation time.
+        self._reconciliation_task = asyncio.get_running_loop().create_task(
+            self._reconciliation_loop()
+        )
 
     async def stop(self) -> None:
         """Stop the failure detector."""
@@ -1162,7 +1167,11 @@ class HierarchicalFailureDetector:
             return
 
         coro = coro_func(*args)
-        task = asyncio.create_task(coro)
+        # Phase 6b: explicit ``loop.create_task`` so the fallback task
+        # binds to the loop ``_dispatch_async_work`` was called from
+        # rather than implicitly going through ``get_running_loop`` at
+        # task-creation time.
+        task = asyncio.get_running_loop().create_task(coro)
         self._pending_clear_tasks.add(task)
         task.add_done_callback(self._pending_clear_tasks.discard)
         if task.done():
@@ -1214,7 +1223,11 @@ class HierarchicalFailureDetector:
 
                 self._task_runner.run(_wrap)
                 return
-            task = asyncio.create_task(result)
+            # Phase 6b: explicit ``loop.create_task`` so the fallback
+            # task binds to the loop ``_dispatch_callback`` was called
+            # from rather than implicitly going through
+            # ``get_running_loop`` at task-creation time.
+            task = asyncio.get_running_loop().create_task(result)
             self._pending_clear_tasks.add(task)
             task.add_done_callback(self._pending_clear_tasks.discard)
             if task.done():

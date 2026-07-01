@@ -183,7 +183,12 @@ class OutOfBandHealthChannel:
             )
 
         self._running = True
-        self._receive_task = asyncio.create_task(self._receive_loop())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop the OOB channel was started on rather than implicitly
+        # going through ``get_running_loop`` at task-creation time.
+        self._receive_task = asyncio.get_running_loop().create_task(
+            self._receive_loop()
+        )
 
     async def stop(self) -> None:
         """Stop the OOB health channel."""

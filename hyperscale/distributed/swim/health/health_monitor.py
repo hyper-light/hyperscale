@@ -174,7 +174,12 @@ class EventLoopHealthMonitor:
             return
         
         self._running = True
-        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop ``start`` was called from rather than implicitly going
+        # through ``get_running_loop`` at task-creation time.
+        self._monitor_task = asyncio.get_running_loop().create_task(
+            self._monitor_loop()
+        )
     
     async def stop(self) -> None:
         """Stop the health monitor."""

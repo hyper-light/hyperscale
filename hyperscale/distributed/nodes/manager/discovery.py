@@ -226,7 +226,11 @@ class ManagerDiscoveryCoordinator:
 
         Runs periodic failure decay and cleanup.
         """
-        self._state._discovery_maintenance_task = asyncio.create_task(
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop ``start_maintenance_loop`` was called from rather than
+        # implicitly going through ``get_running_loop`` at task-creation
+        # time.
+        self._state._discovery_maintenance_task = asyncio.get_running_loop().create_task(
             self.maintenance_loop()
         )
 

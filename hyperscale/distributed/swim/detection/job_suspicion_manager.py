@@ -295,8 +295,14 @@ class JobSuspicionManager:
             self._per_job_counts[job_id] = self._per_job_counts.get(job_id, 0) + 1
             self._started_count += 1
 
-            # Start adaptive polling timer
-            suspicion._poll_task = asyncio.create_task(self._poll_suspicion(suspicion))
+            # Start adaptive polling timer.
+            # Phase 6b: explicit ``loop.create_task`` so the task binds
+            # to the loop the suspicion was started on rather than
+            # implicitly going through ``get_running_loop`` at task-
+            # creation time.
+            suspicion._poll_task = asyncio.get_running_loop().create_task(
+                self._poll_suspicion(suspicion)
+            )
 
             return suspicion
 

@@ -515,7 +515,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns:
             The created asyncio.Task with error callback attached.
         """
-        task = asyncio.create_task(coro, name=name)
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop ``_create_background_task`` was called from rather
+        # than implicitly going through ``get_running_loop`` at task-
+        # creation time.
+        task = asyncio.get_running_loop().create_task(coro, name=name)
         task.add_done_callback(lambda t: self._handle_background_task_error(t, name))
         return task
 
@@ -2128,7 +2132,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def start_cleanup(self) -> None:
         """Start the periodic cleanup task."""
         if self._cleanup_task is None or self._cleanup_task.done():
-            self._cleanup_task = asyncio.ensure_future(self._run_cleanup_loop())
+            # Phase 6b: explicit ``loop.create_task`` so the cleanup
+            # task binds to the loop ``start_cleanup`` was called from
+            # rather than implicitly going through ``get_running_loop``
+            # at task-creation time.
+            self._cleanup_task = asyncio.get_running_loop().create_task(
+                self._run_cleanup_loop()
+            )
 
     async def stop_cleanup(self) -> None:
         """Stop the periodic cleanup task."""
@@ -3469,9 +3479,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # CLAUDE.md forbids orphan coroutines: explicitly close
             # any input coro we couldn't wrap into a Task.
             tasks: list[asyncio.Task] = []
+            # Phase 6b: explicit ``loop.create_task`` so each wrapped
+            # task binds to the loop the gather helper was invoked on
+            # rather than implicitly going through ``get_running_loop``
+            # at task-creation time.
+            _loop = asyncio.get_running_loop()
             try:
                 for coro in coros:
-                    tasks.append(asyncio.ensure_future(coro))
+                    tasks.append(_loop.create_task(coro))
             except BaseException:
                 for unwrapped in coros[len(tasks):]:
                     unwrapped.close()

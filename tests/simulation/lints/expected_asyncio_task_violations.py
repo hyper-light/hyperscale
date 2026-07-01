@@ -46,27 +46,5 @@ EXPECTED_ASYNCIO_TASK_VIOLATIONS: frozenset[str] = frozenset(
         "hyperscale/distributed/taskex/run.py",
         "hyperscale/distributed/taskex/task_runner.py",
         "hyperscale/distributed/taskex/task.py",
-        # Phase 6b migration backlog — each entry shrinks per
-        # per-module commit. Ordered alphabetically by path.
-        "hyperscale/distributed/health/probes.py",
-        "hyperscale/distributed/jobs/gates/gate_job_timeout_tracker.py",
-        "hyperscale/distributed/jobs/workflow_dispatcher.py",
-        "hyperscale/distributed/leases/job_lease.py",
-        "hyperscale/distributed/ledger/wal/wal_writer.py",
-        "hyperscale/distributed/nodes/client/tracking.py",
-        "hyperscale/distributed/nodes/gate/orphan_job_coordinator.py",
-        "hyperscale/distributed/nodes/gate/server.py",
-        "hyperscale/distributed/nodes/manager/discovery.py",
-        "hyperscale/distributed/nodes/manager/rate_limiting.py",
-        "hyperscale/distributed/server/events/lamport_runner.py",
-        "hyperscale/distributed/server/server/mercury_sync_base_server.py",
-        "hyperscale/distributed/swim/detection/hierarchical_failure_detector.py",
-        "hyperscale/distributed/swim/detection/job_suspicion_manager.py",
-        "hyperscale/distributed/swim/detection/suspicion_manager.py",
-        "hyperscale/distributed/swim/health_aware_server.py",
-        "hyperscale/distributed/swim/health/federated_health_monitor.py",
-        "hyperscale/distributed/swim/health/health_monitor.py",
-        "hyperscale/distributed/swim/health/out_of_band_health_channel.py",
-        "hyperscale/distributed/swim/leadership/local_leader_election.py",
     }
 )

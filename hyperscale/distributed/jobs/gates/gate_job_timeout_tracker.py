@@ -133,7 +133,12 @@ class GateJobTimeoutTracker:
         if self._running:
             return
         self._running = True
-        self._check_task = asyncio.create_task(self._timeout_check_loop())
+        # Phase 6b: explicit ``loop.create_task`` keeps the task on the
+        # loop this tracker was started from rather than relying on
+        # ``get_running_loop`` resolution at task-creation time.
+        self._check_task = asyncio.get_running_loop().create_task(
+            self._timeout_check_loop()
+        )
 
     async def stop(self) -> None:
         """Stop the timeout checking loop."""

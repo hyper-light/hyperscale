@@ -1053,7 +1053,10 @@ class GateServer(HealthAwareServer):
         self._start_background_loops()
 
         # Discovery maintenance (AD-28)
-        self._discovery_maintenance_task = asyncio.create_task(
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop the gate server was started on rather than implicitly
+        # going through ``get_running_loop`` at task-creation time.
+        self._discovery_maintenance_task = asyncio.get_running_loop().create_task(
             self._discovery_maintenance_loop()
         )
 

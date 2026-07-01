@@ -169,7 +169,13 @@ class ClientJobTracker:
 
         poll_task: asyncio.Task | None = None
         if self._poll_gate_for_status:
-            poll_task = asyncio.create_task(poll_until_complete())
+            # Phase 6b: explicit ``loop.create_task`` so the task binds to
+            # the loop ``wait_for_job`` was called from rather than
+            # implicitly going through ``get_running_loop`` at task-
+            # creation time.
+            poll_task = asyncio.get_running_loop().create_task(
+                poll_until_complete()
+            )
 
         try:
             if timeout:

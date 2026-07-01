@@ -243,8 +243,14 @@ class SuspicionManager:
             if run:
                 self._timer_tokens[state.node] = f"{run.task_name}:{run.run_id}"
         else:
-            # Fallback to raw asyncio task
-            state._timer_task = asyncio.create_task(expire_suspicion())
+            # Fallback to raw asyncio task.
+            # Phase 6b: explicit ``loop.create_task`` so the task binds
+            # to the loop the suspicion was started on rather than
+            # implicitly going through ``get_running_loop`` at task-
+            # creation time.
+            state._timer_task = asyncio.get_running_loop().create_task(
+                expire_suspicion()
+            )
 
     async def _reschedule_timer(self, state: SuspicionState) -> None:
         """Reschedule timer with updated timeout (after new confirmation)."""
@@ -270,7 +276,13 @@ class SuspicionManager:
                 if run:
                     self._timer_tokens[state.node] = f"{run.task_name}:{run.run_id}"
             else:
-                state._timer_task = asyncio.create_task(expire_suspicion())
+                # Phase 6b: explicit ``loop.create_task`` so the task
+                # binds to the loop ``_reschedule_timer`` was called from
+                # rather than implicitly going through
+                # ``get_running_loop`` at task-creation time.
+                state._timer_task = asyncio.get_running_loop().create_task(
+                    expire_suspicion()
+                )
         else:
             # Schedule immediate expiration via task to maintain async contract
             async def expire_now():
@@ -283,8 +295,12 @@ class SuspicionManager:
             if self._task_runner:
                 self._task_runner.run(expire_now)
             else:
-                # Track fallback task for cleanup
-                task = asyncio.create_task(expire_now())
+                # Track fallback task for cleanup.
+                # Phase 6b: explicit ``loop.create_task`` so the task
+                # binds to the loop the reschedule path was invoked on
+                # rather than implicitly going through
+                # ``get_running_loop`` at task-creation time.
+                task = asyncio.get_running_loop().create_task(expire_now())
                 self._pending_fallback_tasks.add(task)
                 self._unmanaged_tasks_created += 1
 

@@ -180,7 +180,12 @@ class GateOrphanJobCoordinator:
             return
 
         self._running = True
-        self._check_loop_task = asyncio.create_task(self._orphan_check_loop())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to the
+        # loop ``start`` was called from rather than implicitly going
+        # through ``get_running_loop`` at task-creation time.
+        self._check_loop_task = asyncio.get_running_loop().create_task(
+            self._orphan_check_loop()
+        )
 
         await self._logger.log(
             ServerInfo(

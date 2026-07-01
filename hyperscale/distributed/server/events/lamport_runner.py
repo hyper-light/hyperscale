@@ -66,7 +66,10 @@ class LamportRunner:
 
     def run(self):
         self._running = True
-        self._run_task = asyncio.ensure_future(self._run())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop ``run`` was called from rather than implicitly going
+        # through ``get_running_loop`` at task-creation time.
+        self._run_task = asyncio.get_running_loop().create_task(self._run())
 
     async def _run(self):
         while self._running:

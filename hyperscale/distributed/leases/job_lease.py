@@ -318,7 +318,12 @@ class JobLeaseManager:
                             )
                     await _DEFAULT_CLOCK.sleep(self._cleanup_interval)
 
-        self._cleanup_task = asyncio.create_task(cleanup_loop())
+        # Phase 6b: ``loop.create_task`` so the task binds to the loop
+        # ``start_cleanup_task`` was called from rather than implicitly
+        # going through ``get_running_loop`` at task-creation time.
+        self._cleanup_task = asyncio.get_running_loop().create_task(
+            cleanup_loop()
+        )
 
     async def stop_cleanup_task(self) -> None:
         self._running = False

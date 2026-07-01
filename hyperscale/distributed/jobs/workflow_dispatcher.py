@@ -889,7 +889,13 @@ class WorkflowDispatcher:
             return  # Already running
 
         self._job_submissions[job_id] = submission
-        task = asyncio.create_task(self._job_dispatch_loop(job_id, submission))
+        # Phase 6b: explicit ``loop.create_task`` so the dispatch task
+        # binds to the loop ``start_job_dispatch`` was called from
+        # rather than implicitly going through ``get_running_loop`` at
+        # task-creation time.
+        task = asyncio.get_running_loop().create_task(
+            self._job_dispatch_loop(job_id, submission)
+        )
         self._job_dispatch_tasks[job_id] = task
 
     async def stop_job_dispatch(self, job_id: str) -> None:
@@ -993,9 +999,14 @@ class WorkflowDispatcher:
                 if positive_backoff_delays:
                     wait_timeout = min(wait_timeout, min(positive_backoff_delays))
 
-                # Wait for any event with a timeout for periodic checks
+                # Wait for any event with a timeout for periodic checks.
+                # Phase 6b: explicit ``loop.create_task`` so each wait
+                # task binds to the loop the dispatcher is running on
+                # rather than implicitly going through
+                # ``get_running_loop`` at task-creation time.
+                _loop = asyncio.get_running_loop()
                 tasks = [
-                    asyncio.create_task(coro)
+                    _loop.create_task(coro)
                     for coro in wait_coroutines
                 ]
                 try:
