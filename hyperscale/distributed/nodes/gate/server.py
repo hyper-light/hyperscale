@@ -235,6 +235,10 @@ class GateServer(HealthAwareServer):
         gate_peers: list[tuple[str, int]] | None = None,
         gate_udp_peers: list[tuple[str, int]] | None = None,
         lease_timeout: float = 30.0,
+        *,
+        clock: "Clock | None" = None,
+        random_source: "Random | None" = None,
+        transport_factory: "TransportFactory | None" = None,
     ):
         """
         Initialize the Gate server.
@@ -258,6 +262,9 @@ class GateServer(HealthAwareServer):
             env=env,
             dc_id=dc_id,
             node_role="gate",
+            clock=clock,
+            random_source=random_source,
+            transport_factory=transport_factory,
         )
 
         # Store reference to env

@@ -246,6 +246,10 @@ class ManagerServer(HealthAwareServer):
         max_workflow_retries: int = 3,
         workflow_timeout: float = 300.0,
         wal_data_dir: Path | None = None,
+        *,
+        clock: "Clock | None" = None,
+        random_source: "Random | None" = None,
+        transport_factory: "TransportFactory | None" = None,
     ) -> None:
         """
         Initialize manager server.
@@ -299,7 +303,11 @@ class ManagerServer(HealthAwareServer):
         self._idempotency_config = create_idempotency_config_from_env(env)
         self._idempotency_ledger: ManagerIdempotencyLedger[bytes] | None = None
 
-        # Initialize parent HealthAwareServer
+        # Initialize parent HealthAwareServer. The Phase 5/6 DI seams
+        # (``clock`` / ``random_source`` / ``transport_factory``) are
+        # forwarded through so SIM mode can inject a ``VirtualClock`` /
+        # ``SeededRandom`` / ``SimTransportFactory``; all default to
+        # ``None`` (REAL) and are keyword-only.
         super().__init__(
             host=host,
             tcp_port=tcp_port,
@@ -307,6 +315,9 @@ class ManagerServer(HealthAwareServer):
             env=env,
             dc_id=dc_id,
             node_role="manager",
+            clock=clock,
+            random_source=random_source,
+            transport_factory=transport_factory,
         )
 
         # Wire logger to modules

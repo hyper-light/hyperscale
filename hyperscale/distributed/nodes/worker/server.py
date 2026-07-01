@@ -101,6 +101,10 @@ class WorkerServer(HealthAwareServer):
         env: Env,
         dc_id: str = "default",
         seed_managers: list[tuple[str, int]] | None = None,
+        *,
+        clock: "Clock | None" = None,
+        random_source: "Random | None" = None,
+        transport_factory: "TransportFactory | None" = None,
     ) -> None:
         """
         Initialize worker server.
@@ -335,6 +339,9 @@ class WorkerServer(HealthAwareServer):
             dc_id=dc_id,
             node_role="worker",
             state_embedder=state_embedder,
+            clock=clock,
+            random_source=random_source,
+            transport_factory=transport_factory,
         )
 
         # Initialize components that need discovery service
