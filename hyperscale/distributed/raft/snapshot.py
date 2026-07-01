@@ -181,7 +181,10 @@ class SnapshotManager:
         if self._current_snapshot is None:
             return 0
 
-        removed = raft_log.compact(self._current_snapshot.last_included_index)
+        removed = raft_log.compact_through(
+            self._current_snapshot.last_included_index,
+            self._current_snapshot.last_included_term,
+        )
         return removed
 
     async def apply_snapshot(
@@ -206,7 +209,10 @@ class SnapshotManager:
                 return False
 
         self._current_snapshot = snapshot
-        raft_log.compact(snapshot.last_included_index)
+        raft_log.compact_through(
+            snapshot.last_included_index,
+            snapshot.last_included_term,
+        )
 
         await self._logger.log(RaftInfo(
             message=(

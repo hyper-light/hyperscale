@@ -5,10 +5,12 @@ Tests snapshot creation, application, log compaction,
 and InstallSnapshot message serialization.
 """
 
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.raft.models import RaftLogEntry
 from hyperscale.distributed.raft.raft_log import RaftLog
 from hyperscale.distributed.raft.snapshot import (
     InstallSnapshot,
@@ -37,9 +39,18 @@ def snapshot_manager(mock_logger):
 @pytest.fixture
 def populated_log():
     """Create a RaftLog with 10 entries at term 1."""
-    raft_log = RaftLog()
+    raft_log = RaftLog(job_id="job-1")
     for i in range(1, 11):
-        raft_log.append(term=1, command=f"cmd-{i}".encode(), command_type="TEST", job_id="job-1")
+        raft_log.append(
+            RaftLogEntry(
+                term=1,
+                index=i,
+                command=f"cmd-{i}".encode(),
+                command_type="TEST",
+                job_id="job-1",
+                timestamp=time.monotonic(),
+            )
+        )
     return raft_log
 
 
@@ -90,9 +101,18 @@ class TestSnapshotManager:
         assert snapshot_manager.current_snapshot is None
 
     def test_should_compact_below_threshold(self, snapshot_manager: SnapshotManager) -> None:
-        raft_log = RaftLog()
+        raft_log = RaftLog(job_id="j")
         for i in range(3):
-            raft_log.append(term=1, command=b"x", command_type="T", job_id="j")
+            raft_log.append(
+                RaftLogEntry(
+                    term=1,
+                    index=i + 1,
+                    command=b"x",
+                    command_type="T",
+                    job_id="j",
+                    timestamp=time.monotonic(),
+                )
+            )
         assert snapshot_manager.should_compact(raft_log) is False
 
     def test_should_compact_above_threshold(

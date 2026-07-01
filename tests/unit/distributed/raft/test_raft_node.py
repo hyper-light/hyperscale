@@ -81,6 +81,7 @@ def make_node(
         on_become_leader=None,
         on_lose_leadership=None,
         logger=logger_mock,
+        configured_cluster_size=len(members),
     )
     return node, send_mock, apply_mock
 
@@ -92,6 +93,31 @@ def make_single_node() -> tuple[RaftNode, AsyncMock, AsyncMock]:
         members={"solo"},
         member_addrs={"solo": ("127.0.0.1", 9001)},
     )
+
+
+async def propose_and_apply(
+    node: RaftNode, command: bytes, command_type: str
+) -> tuple[bool, int]:
+    """Propose a command while concurrently draining the apply loop.
+
+    ``RaftNode.propose`` blocks until the committed entry has been *applied*
+    to the state machine (its waiter is resolved inside
+    ``apply_committed_entries``). In production a background consensus loop
+    drives apply; in these unit tests nothing does, so we drive it inline here
+    to release the proposal waiter deterministically.
+    """
+
+    async def _drain_apply() -> None:
+        # Yield so ``propose`` runs its synchronous prep (append entry,
+        # advance commit_index, register the waiter) before we apply.
+        await asyncio.sleep(0)
+        await node.apply_committed_entries()
+
+    (result, _) = await asyncio.gather(
+        node.propose(command, command_type),
+        _drain_apply(),
+    )
+    return result
 
 
 # =============================================================================
@@ -328,7 +354,7 @@ class TestPropose:
         await node.start_election()
         assert node.is_leader()
 
-        success, index = await node.propose(b"cmd", "CREATE_JOB")
+        success, index = await propose_and_apply(node, b"cmd", "CREATE_JOB")
         assert success is True
         assert index == 1
 
@@ -344,8 +370,8 @@ class TestPropose:
         node, _, _ = make_single_node()
         await node.start_election()
 
-        _, index1 = await node.propose(b"a", "CREATE_JOB")
-        _, index2 = await node.propose(b"b", "CREATE_JOB")
+        _, index1 = await propose_and_apply(node, b"a", "CREATE_JOB")
+        _, index2 = await propose_and_apply(node, b"b", "CREATE_JOB")
         assert index1 == 1
         assert index2 == 2
 
@@ -481,7 +507,12 @@ class TestAppendEntriesResponse:
             {"solo": ("127.0.0.1", 9001), "node-2": ("127.0.0.1", 9002)},
         )
 
-        await node.propose(b"cmd", "NO_OP")
+        # ``propose`` blocks until the entry is applied, so run it in the
+        # background: it appends the entry and advances commit_index
+        # synchronously before awaiting its waiter.
+        propose_task = asyncio.create_task(node.propose(b"cmd", "NO_OP"))
+        await asyncio.sleep(0.01)
+
         response = AppendEntriesResponse(
             job_id="job-1",
             term=node.current_term,
@@ -492,6 +523,10 @@ class TestAppendEntriesResponse:
         await node.handle_append_entries_response(response)
         # Commit should advance since both nodes agree
         assert node.commit_index == 1
+
+        # Release the proposal waiter and clean up the background task.
+        await node.apply_committed_entries()
+        await propose_task
 
     @pytest.mark.asyncio
     async def test_steps_down_on_higher_term(self) -> None:
@@ -534,24 +569,25 @@ class TestApplyCommitted:
         node, _, apply_mock = make_single_node()
         await node.start_election()
 
-        await node.propose(b"cmd1", "CREATE_JOB")
-        await node.propose(b"cmd2", "CREATE_JOB")
+        # Propose two entries in the background: quorum is 1 (single node), so
+        # each proposal advances commit_index synchronously. They block on the
+        # apply waiter, which the explicit apply_committed_entries below drains.
+        propose_task_one = asyncio.create_task(node.propose(b"cmd1", "CREATE_JOB"))
+        propose_task_two = asyncio.create_task(node.propose(b"cmd2", "CREATE_JOB"))
+        await asyncio.sleep(0.01)
 
-        # Single-node: entries committed immediately when proposed
-        # But commit_index only advances via _advance_commit_index
-        # Force commit by simulating the commit advance
-        # In single-node, there are no followers, so match_index is empty
-        # But quorum is 1 (just leader), so commit should already advance
         applied = await node.apply_committed_entries()
         assert applied == 2
         assert apply_mock.call_count == 2
+
+        await asyncio.gather(propose_task_one, propose_task_two)
 
     @pytest.mark.asyncio
     async def test_apply_is_idempotent(self) -> None:
         node, _, apply_mock = make_single_node()
         await node.start_election()
 
-        await node.propose(b"cmd", "CREATE_JOB")
+        await propose_and_apply(node, b"cmd", "CREATE_JOB")
         await node.apply_committed_entries()
         apply_count_first = apply_mock.call_count
 
@@ -650,7 +686,7 @@ class TestDestroy:
     async def test_destroy_clears_state(self) -> None:
         node, _, _ = make_single_node()
         await node.start_election()
-        await node.propose(b"cmd", "CREATE_JOB")
+        await propose_and_apply(node, b"cmd", "CREATE_JOB")
 
         node.destroy()
         # All internal collections should be cleared

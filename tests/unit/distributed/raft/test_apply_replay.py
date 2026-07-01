@@ -108,6 +108,11 @@ def _make_entry(
     timestamp: float,
     **command_fields: object,
 ) -> RaftLogEntry:
+    # Production always builds the RaftCommand with its ``job_id`` populated
+    # (see raft_job_manager); apply handlers look the job up via
+    # ``command.job_id``. Mirror that here so cancellation/status handlers
+    # resolve the preloaded job instead of no-oping.
+    command_fields.setdefault("job_id", job_id)
     command = RaftCommand(command_type=command_type, **command_fields)
     return RaftLogEntry(
         term=1,
