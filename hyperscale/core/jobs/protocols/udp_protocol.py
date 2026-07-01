@@ -10,7 +10,6 @@ import time
 import uuid
 from collections import defaultdict, deque
 from typing import (
-    TYPE_CHECKING,
     Any,
     AsyncIterable,
     Awaitable,
@@ -25,16 +24,10 @@ from typing import (
     Union,
 )
 
-if TYPE_CHECKING:
-    # Type-only import (never loaded at runtime, so no core->distributed
-    # import cycle). The seam is duck-typed: only
-    # ``register_datagram_endpoint`` is called on the factory, which the
-    # single-process InProcessTransport and the multi-process
-    # CrossProcessTransport both provide.
-    from hyperscale.distributed.runtime.transport_factory import TransportFactory
-
 import cloudpickle
 import zstandard
+
+from hyperscale.core.runtime import TransportFactory
 
 from .constants import MAX_DECOMPRESSED_SIZE
 from hyperscale.core.engines.client.time_parser import TimeParser
@@ -78,7 +71,7 @@ class UDPProtocol(Generic[T, K]):
         env: Env,
         *,
         loop: asyncio.AbstractEventLoop | None = None,
-        transport_factory: "TransportFactory | None" = None,
+        transport_factory: TransportFactory | None = None,
     ) -> None:
         self._node_id_base = uuid.uuid4().int >> 64
         self.node_id: int | None = None

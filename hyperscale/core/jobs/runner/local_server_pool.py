@@ -9,18 +9,9 @@ import weakref
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing.context import SpawnContext
-from typing import TYPE_CHECKING, Dict, List
+from typing import Dict, List
 
-if TYPE_CHECKING:
-    # Type-only imports (never loaded at runtime, so no core->distributed
-    # import cycle). Both seams are duck-typed: the pool only calls
-    # ``spawn_process`` on the spawner, and the SIM executor entry only
-    # reads ``loop`` / ``transport`` off the child context — the harness
-    # ``ChildContext`` under ``tests/simulation/`` provides both.
-    from hyperscale.distributed.runtime.process_spawner import ProcessSpawner
-    from hyperscale.distributed.runtime.simulation_child_context import (
-        SimulationChildContext,
-    )
+from hyperscale.core.runtime import ProcessSpawner, SimulationChildContext
 
 
 # Module-level weak reference set for atexit cleanup
@@ -225,7 +216,7 @@ def run_thread(
 
 
 def run_sim_executor(
-    context: "SimulationChildContext",
+    context: SimulationChildContext,
     worker_index: int,
     leader_address: tuple[str, int],
     worker_address: tuple[str, int],
@@ -273,7 +264,7 @@ class LocalServerPool:
         pool_size: int,
         *,
         loop: asyncio.AbstractEventLoop | None = None,
-        process_spawner: "ProcessSpawner | None" = None,
+        process_spawner: ProcessSpawner | None = None,
     ) -> None:
         # Phase 6 SIM seam. ``process_spawner`` is ``None`` in REAL mode —
         # the pool fans its executors out through a ``ProcessPoolExecutor``
