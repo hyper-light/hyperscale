@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncIterable,
     Awaitable,
@@ -23,6 +24,14 @@ from typing import (
     TypeVar,
     Union,
 )
+
+if TYPE_CHECKING:
+    # Type-only import (never loaded at runtime, so no core->distributed
+    # import cycle). The seam is duck-typed: only
+    # ``register_datagram_endpoint`` is called on the factory, which the
+    # single-process InProcessTransport and the multi-process
+    # CrossProcessTransport both provide.
+    from hyperscale.distributed.runtime.transport_factory import TransportFactory
 
 import cloudpickle
 import zstandard
@@ -67,9 +76,25 @@ class UDPProtocol(Generic[T, K]):
         host: str,
         port: int,
         env: Env,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+        transport_factory: "TransportFactory | None" = None,
     ) -> None:
         self._node_id_base = uuid.uuid4().int >> 64
         self.node_id: int | None = None
+
+        # Phase 6 SIM seam. ``transport_factory`` is ``None`` in REAL
+        # mode — this server binds a real UDP socket and installs signal
+        # handlers exactly as before. Under SIM a transport factory (the
+        # multi-process ``CrossProcessTransport`` for a worker-pool
+        # executor, or the single-process ``InProcessTransport``) routes
+        # the datagram endpoint with no socket, no signal handlers, no
+        # ``run_in_executor``; ``loop`` pins the server to the caller's
+        # ``SimulationLoop``. Multi-process is preserved: each executor
+        # still runs in its own OS process — the factory only replaces
+        # the kernel-socket byte transit with the deterministic
+        # coordinator boundary.
+        self._transport_factory = transport_factory
 
         self._logger = Logger()
 
@@ -88,7 +113,10 @@ class UDPProtocol(Generic[T, K]):
         self._running = False
 
         self._transport: asyncio.DatagramTransport = None
-        self._loop: Union[asyncio.AbstractEventLoop, None] = None
+        # Under SIM the loop is injected so lazy ``get_event_loop`` never
+        # resolves the wrong (non-simulation) loop; REAL leaves it None
+        # and resolves lazily exactly as before.
+        self._loop: Union[asyncio.AbstractEventLoop, None] = loop
         self.queue: Dict[str, Deque[Tuple[str, int, float, Any]]] = defaultdict(deque)
         self._waiters: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self._pending_responses: Deque[asyncio.Task] = deque()
@@ -163,7 +191,12 @@ class UDPProtocol(Generic[T, K]):
         worker_socket: socket.socket | None = None,
         worker_server: asyncio.DatagramTransport | None = None,
     ):
-        if not self._abort_handle_created:
+        if self._loop is None:
+            self._loop = asyncio.get_event_loop()
+
+        # Signal handlers are process-global and need a real loop
+        # selector — skip under SIM (see start_server).
+        if self._transport_factory is None and not self._abort_handle_created:
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(
@@ -174,9 +207,6 @@ class UDPProtocol(Generic[T, K]):
                 )
 
             self._abort_handle_created = True
-
-        if self._loop is None:
-            self._loop = asyncio.get_event_loop()
 
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
@@ -305,7 +335,11 @@ class UDPProtocol(Generic[T, K]):
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
 
-        if not self._abort_handle_created:
+        # Signal handlers are process-global and rely on a real loop
+        # selector — banned and meaningless under SIM (the coordinator,
+        # not signals, drives shutdown). Skip when running under a
+        # transport factory.
+        if self._transport_factory is None and not self._abort_handle_created:
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(
@@ -392,6 +426,20 @@ class UDPProtocol(Generic[T, K]):
             self._server_ssl_context = self._create_udp_ssl_context(
                 cert_path=cert_path, key_path=key_path
             )
+
+        if self._transport_factory is not None:
+            # SIM: register the datagram endpoint with the transport
+            # factory (cross-process coordinator boundary, or in-process
+            # registry) instead of binding a real UDP socket.
+            # ``register_datagram_endpoint`` fires ``connection_made`` and
+            # returns the send transport. No socket, no ``run_in_executor``
+            # bind, no fileno cleanup loop (that cleanup polls a real
+            # socket, which does not exist here).
+            self._transport = self._transport_factory.register_datagram_endpoint(
+                (self.host, self.port), UDPSocketProtocol(self.read)
+            )
+            self.connected = True
+            return
 
         run_start = True
 

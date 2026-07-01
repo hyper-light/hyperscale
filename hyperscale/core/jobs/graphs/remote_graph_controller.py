@@ -76,8 +76,18 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         host: str,
         port: int,
         env: Env,
+        *,
+        loop: "asyncio.AbstractEventLoop | None" = None,
+        transport_factory=None,
     ) -> None:
-        super().__init__(host, port, env)
+        # Phase 6 SIM seams forwarded to the ``UDPProtocol`` base: under
+        # SIM each pool executor runs in its own process (multi-process
+        # preserved) on an injected ``SimulationLoop`` with the
+        # coordinator's ``CrossProcessTransport``; REAL passes neither and
+        # binds a real UDP socket as before.
+        super().__init__(
+            host, port, env, loop=loop, transport_factory=transport_factory
+        )
 
         self._workflows = WorkflowRunner(
             env,
