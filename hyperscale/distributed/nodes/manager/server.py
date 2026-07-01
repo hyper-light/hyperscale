@@ -9,6 +9,7 @@ import asyncio
 import traceback
 import cloudpickle
 from pathlib import Path
+from typing import NamedTuple
 
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.distributed.swim import HealthAwareServer, ManagerStateEmbedder
@@ -193,6 +194,27 @@ from hyperscale.distributed.health.extension_outcome import (
     ExtensionOutcomeEvent,
     ExtensionOutcomeKind,
 )
+
+
+class _ParsedCancelRequest(NamedTuple):
+    """Normalized fields extracted from a cancel request.
+
+    Both the AD-20 ``JobCancelRequest`` and the legacy ``CancelJob``
+    wire formats are parsed into this shape so the ``cancel_job``
+    handler consumes one consistent structure regardless of which
+    format the sender used. ``callback_addr`` and
+    ``unreachable_addrs`` are only ever populated by the newer
+    ``JobCancelRequest`` path; the legacy path leaves them at
+    ``None`` / empty.
+    """
+
+    job_id: str
+    fence_token: int
+    requester_id: str
+    timestamp: float
+    reason: str
+    callback_addr: tuple[str, int] | None
+    unreachable_addrs: frozenset[tuple[str, int]]
 
 
 class ManagerServer(HealthAwareServer):
@@ -4710,6 +4732,7 @@ class ManagerServer(HealthAwareServer):
     def _resolve_job_cancel_redirect_addr(
         self,
         job_id: str,
+        client_unreachable_addrs: frozenset[tuple[str, int]] = frozenset(),
     ) -> tuple[str, int] | None:
         """Resolve a non-self, live redirect target for job cancellation.
 
@@ -4719,29 +4742,33 @@ class ManagerServer(HealthAwareServer):
         the client to a manager already in its ``tried`` set, which the
         client surfaces as ``redirect cycles to already-tried target``.
 
-        Filter every candidate through ``_manager_tcp_addr_is_live`` so
-        we only redirect to peers we currently believe to be alive.
+        Filter every candidate through ``_manager_tcp_addr_is_live``
+        AND the client's reported ``client_unreachable_addrs`` so we
+        only redirect to peers *both* we and the client believe to be
+        alive. The client's set is strictly fresher after a leader
+        kill (it already failed to connect), so honoring it prevents
+        the redirect-cycle even while our own SWIM view still lags.
         Returning ``None`` lets the client classify the response as
         transient and round-robin to a live target instead of chasing
         a known-dead leader address.
         """
         self_addr = (self._host, self._tcp_port)
 
+        def is_redirectable(addr: tuple[str, int]) -> bool:
+            return (
+                addr != self_addr
+                and addr not in client_unreachable_addrs
+                and self._manager_tcp_addr_is_live(addr)
+            )
+
         job_leader_addr = self._leases.get_job_leader_addr(job_id)
         if job_leader_addr is not None:
             job_leader_addr = tuple(job_leader_addr)
-            if (
-                job_leader_addr != self_addr
-                and self._manager_tcp_addr_is_live(job_leader_addr)
-            ):
+            if is_redirectable(job_leader_addr):
                 return job_leader_addr
 
         dc_leader_addr = self._resolve_dc_leader_addr()
-        if (
-            dc_leader_addr is not None
-            and dc_leader_addr != self_addr
-            and self._manager_tcp_addr_is_live(dc_leader_addr)
-        ):
+        if dc_leader_addr is not None and is_redirectable(tuple(dc_leader_addr)):
             return dc_leader_addr
 
         return None
@@ -6497,26 +6524,50 @@ class ManagerServer(HealthAwareServer):
         self,
         data: bytes,
         addr: tuple[str, int],
-    ) -> tuple[str, int, str, float, str]:
-        """Parse cancel request from either JobCancelRequest or legacy CancelJob format."""
+    ) -> "_ParsedCancelRequest":
+        """Parse cancel request from either JobCancelRequest or
+        legacy CancelJob format into a ``_ParsedCancelRequest``.
+
+        ``callback_addr`` is the client's push address when the
+        JobCancelRequest carries it — used by the handler below to
+        seed the local ``_job_callbacks`` entry if the entry was
+        lost across a leader failover.
+
+        ``unreachable_addrs`` is the set of manager TCP addresses the
+        client has already proved unreachable this attempt. The
+        handler treats any address in this set as not-live for its
+        takeover / redirect decisions, closing the SWIM-lag window
+        after a leader kill.
+        """
         try:
             cancel_request = JobCancelRequest.load(data)
-            return (
-                cancel_request.job_id,
-                cancel_request.fence_token,
-                cancel_request.requester_id,
-                cancel_request.timestamp,
-                cancel_request.reason,
+            return _ParsedCancelRequest(
+                job_id=cancel_request.job_id,
+                fence_token=cancel_request.fence_token,
+                requester_id=cancel_request.requester_id,
+                timestamp=cancel_request.timestamp,
+                reason=cancel_request.reason,
+                callback_addr=(
+                    tuple(cancel_request.callback_addr)
+                    if cancel_request.callback_addr is not None
+                    else None
+                ),
+                unreachable_addrs=frozenset(
+                    tuple(unreachable)
+                    for unreachable in (cancel_request.unreachable_addrs or [])
+                ),
             )
         except Exception:
             # Normalize legacy CancelJob format to AD-20 fields
             cancel = CancelJob.load(data)
-            return (
-                cancel.job_id,
-                cancel.fence_token,
-                f"{addr[0]}:{addr[1]}",
-                self._clock.monotonic(),
-                "Legacy cancel request",
+            return _ParsedCancelRequest(
+                job_id=cancel.job_id,
+                fence_token=cancel.fence_token,
+                requester_id=f"{addr[0]}:{addr[1]}",
+                timestamp=self._clock.monotonic(),
+                reason="Legacy cancel request",
+                callback_addr=None,
+                unreachable_addrs=frozenset(),
             )
 
     async def _cancel_pending_workflows(
@@ -6587,42 +6638,44 @@ class ManagerServer(HealthAwareServer):
                         ),
                     )
 
-                    # Race close-out: when the worker reports
-                    # ``already_completed=True`` it means the
-                    # workflow finished BEFORE the cancel request
-                    # arrived, so the worker's cancel handler at
-                    # ``tcp_cancel.py:60`` returns the direct
-                    # response without invoking ``_cancel_workflow``
-                    # — and therefore never schedules the async
-                    # ``workflow_cancellation_complete`` push. Under
-                    # the vanilla flow the manager's pending
-                    # tracker would keep ``workflow_id`` in the set
-                    # forever (it's only decremented by the async
-                    # push handler at line ~7250), the zero-pending
-                    # branch that fires
-                    # ``_push_cancellation_complete_to_origin``
-                    # never activates, and the client's
-                    # ``await_job_cancellation`` times out. Under
-                    # leader-failover-during-cancel this happens
-                    # exactly when the workflow completes on the
-                    # worker between old-leader-kill and new-leader
-                    # -receives-cancel — the exact race
-                    # ``test_cancel_during_leader_failover``
-                    # surfaces intermittently. Synthesizing the
-                    # decrement here — with the same
-                    # decrement-and-maybe-fire semantics the async
-                    # handler uses — closes the race without
-                    # requiring the worker to emit a redundant
-                    # push. ``_finalize_workflow_cancellation`` is
-                    # the shared helper the async handler was
-                    # refactored to use.
-                    if workflow_response.already_completed:
-                        await self._finalize_workflow_cancellation(
-                            job_id=job_id,
-                            workflow_id=workflow_id,
-                            success=True,
-                            errors=[],
-                        )
+                    # Finalize the pending-cancellation tracker from
+                    # this direct RPC ack instead of depending solely
+                    # on the worker's fire-and-forget
+                    # ``workflow_cancellation_complete`` push. The ack
+                    # is definitive: ``success=True`` means the worker
+                    # has terminally cancelled (``already_completed
+                    # =False``) or already-terminated (``already
+                    # _completed=True``) the workflow. The async push
+                    # is fragile in exactly the scenario this handler
+                    # runs under — a leader-failover-during-cancel
+                    # leaves the network degraded (circuit breakers
+                    # open toward the killed leader) and the worker's
+                    # cached job-leader address stale, so the push is
+                    # readily lost or delivered to a manager that
+                    # isn't the job leader and can't forward it. When
+                    # that happens the pending tracker never drains,
+                    # the zero-pending branch that fires
+                    # ``_push_cancellation_complete_to_origin`` never
+                    # activates, and the client's
+                    # ``await_job_cancellation`` times out — the
+                    # residual failure ``test_cancel_during_leader
+                    # _failover`` surfaces intermittently even after
+                    # the ``already_completed`` and routing fixes.
+                    #
+                    # Finalizing here closes that window for BOTH
+                    # cases (actively-cancelled and already-completed).
+                    # ``_finalize_workflow_cancellation`` is idempotent
+                    # — keyed on the same sub-workflow token string the
+                    # tracker was seeded with — so if the worker's
+                    # async push does arrive afterward it finds the
+                    # entry already gone and no-ops. The push is thus
+                    # demoted from sole-trigger to redundant backstop.
+                    await self._finalize_workflow_cancellation(
+                        job_id=job_id,
+                        workflow_id=workflow_id,
+                        success=True,
+                        errors=[],
+                    )
                     return True, None
 
                 error_msg = (
@@ -6882,9 +6935,31 @@ class ManagerServer(HealthAwareServer):
                     retry_after_seconds=retry_after,
                 ).dump()
 
-            job_id, fence_token, requester_id, timestamp, reason = (
-                self._parse_cancel_request(data, addr)
-            )
+            parsed = self._parse_cancel_request(data, addr)
+            job_id = parsed.job_id
+            fence_token = parsed.fence_token
+            requester_id = parsed.requester_id
+            timestamp = parsed.timestamp
+            reason = parsed.reason
+            request_callback_addr = parsed.callback_addr
+            client_unreachable_addrs = parsed.unreachable_addrs
+
+            # Seed the local ``_job_callbacks`` entry from the
+            # request if we don't already have one. Under
+            # leader-failover-during-cancel the previous leader's
+            # ``_broadcast_job_leadership`` may not have reached us
+            # before it died, leaving ``_push_cancellation_complete_to_origin``
+            # unable to find a callback and silently no-op-ing.
+            # The request-carried callback is the client's own
+            # push address so seeding from it is definitively
+            # correct — no risk of racing against a stale value.
+            if (
+                request_callback_addr is not None
+                and self._manager_state.get_job_callback(job_id) is None
+            ):
+                self._manager_state.set_job_callback(
+                    job_id, request_callback_addr
+                )
 
             # ``get_job`` keys by token-string; ``job_id`` here is the
             # bare job id. ``get_job`` now accepts both forms (token
@@ -6915,10 +6990,27 @@ class ManagerServer(HealthAwareServer):
             if not self._leases.is_job_leader(job_id):
                 leader_addr = self._leases.get_job_leader_addr(job_id)
                 self_addr = (self._host, self._tcp_port)
+                # The cached job leader counts as dead when either our
+                # own liveness view says so OR the client reported it
+                # unreachable. The client's view is strictly fresher
+                # after a leader kill: it has already failed to
+                # connect, whereas our SWIM failure detector may lag
+                # Raft's DC-leader election by tens of seconds. Folding
+                # the client's ground truth in here is what lets a
+                # freshly-elected DC leader take over immediately
+                # instead of redirecting the client back to the dead
+                # prior leader it just tried.
+                cached_leader_not_live = (
+                    leader_addr is not None
+                    and (
+                        not self._manager_tcp_addr_is_live(leader_addr)
+                        or tuple(leader_addr) in client_unreachable_addrs
+                    )
+                )
                 cached_leader_is_actionable_self = (
                     leader_addr is None
                     or leader_addr == self_addr
-                    or not self._manager_tcp_addr_is_live(leader_addr)
+                    or cached_leader_not_live
                 )
                 if self.is_leader() and cached_leader_is_actionable_self:
                     # We are the DC leader and the cached job-leader
@@ -6948,7 +7040,9 @@ class ManagerServer(HealthAwareServer):
                     leader_addr = None
 
             if not self._leases.is_job_leader(job_id):
-                leader_addr = self._resolve_job_cancel_redirect_addr(job_id)
+                leader_addr = self._resolve_job_cancel_redirect_addr(
+                    job_id, client_unreachable_addrs
+                )
                 leader_hint = (
                     f"{leader_addr[0]}:{leader_addr[1]}"
                     if leader_addr

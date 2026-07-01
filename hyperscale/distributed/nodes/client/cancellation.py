@@ -220,6 +220,13 @@ class ClientCancellationManager:
                 timestamp=_DEFAULT_CLOCK.time(),
                 fence_token=0,
                 reason=reason,
+                # Piggyback the client's callback address so the
+                # receiving manager can seed its ``_job_callbacks``
+                # entry when it was lost across a leader failover —
+                # otherwise ``_push_cancellation_complete_to_origin``
+                # silently no-ops and the client hangs waiting for a
+                # push that will never fire.
+                callback_addr=self._targets.get_callback_addr(),
             )
 
             configured_targets = self._targets.get_targets_for_job(job_id)
@@ -232,6 +239,15 @@ class ClientCancellationManager:
             # index 0 by ``get_targets_for_job`` contract; preserve order.
             pending: list[tuple[str, int]] = list(configured_targets)
             tried: set[tuple[str, int]] = set()
+
+            # Managers this attempt has demonstrably failed to reach
+            # (connection refused / timeout). Threaded into every
+            # subsequent request so a freshly-elected DC leader can
+            # treat a cached job-leader in this set as genuinely dead
+            # and take over immediately, rather than redirecting the
+            # client back to an address it already proved unreachable
+            # while its own SWIM failure detector is still catching up.
+            unreachable: set[tuple[str, int]] = set()
 
             last_error: str | None = None
             retries_used = 0
@@ -247,6 +263,7 @@ class ClientCancellationManager:
                     timeout=timeout,
                     max_redirects=max_redirects,
                     tried=tried,
+                    unreachable=unreachable,
                 )
 
                 if isinstance(result, JobCancelResponse):
@@ -285,6 +302,7 @@ class ClientCancellationManager:
         timeout: float,
         max_redirects: int,
         tried: set[tuple[str, int]],
+        unreachable: set[tuple[str, int]],
     ) -> JobCancelResponse | str:
         """Send to ``initial_target``, follow leader redirects up to
         ``max_redirects``, return the response or a transient-error
@@ -298,11 +316,23 @@ class ClientCancellationManager:
         ``tried`` is mutated as the redirect chain visits new
         targets so the outer loop never falls back into a target the
         redirect path already consumed.
+
+        ``unreachable`` accumulates every target this attempt fails to
+        reach at the network level. It is stamped onto the request
+        before each send so the *next* manager the request lands on
+        learns which peers the client has already proved dead — the
+        signal a freshly-elected DC leader needs to take over job
+        leadership from a killed prior leader without waiting for its
+        own SWIM detector.
         """
         target = initial_target
         redirects_used = 0
 
         while True:
+            # Stamp the latest reachability ground truth onto the
+            # request so whichever manager processes it sees every
+            # peer the client has already failed to reach.
+            request.unreachable_addrs = list(unreachable)
             response_data, _ = await self._send_tcp(
                 target, "cancel_job", request.dump(), timeout=timeout
             )
@@ -310,7 +340,9 @@ class ClientCancellationManager:
             if isinstance(response_data, Exception):
                 # Network-level failure — connection refused,
                 # timeout, etc. Treat as transient; outer loop falls
-                # over to the next target.
+                # over to the next target. Record the dead target so
+                # subsequent requests carry it in ``unreachable_addrs``.
+                unreachable.add(target)
                 return f"{type(response_data).__name__}: {response_data}"
 
             if response_data == b"error":
