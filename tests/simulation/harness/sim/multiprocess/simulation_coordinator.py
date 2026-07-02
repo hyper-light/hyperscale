@@ -108,7 +108,16 @@ class SimulationCoordinator:
         try:
             return self._drive(spawn_context, connections, processes)
         finally:
+            # Children still alive here are blocked at their barrier
+            # waiting for a GRANT/STOP that will never come — on the
+            # normal path every child was STOPped and has exited, so
+            # this only fires when ``_drive`` raised. Joining a live
+            # child directly would block forever, swallowing the real
+            # exception into a permanent hang and leaking the whole
+            # process tree; kill first so the failure stays loud.
             for process in processes.values():
+                if process.is_alive():
+                    process.kill()
                 process.join()
 
     # -- internals ------------------------------------------------------

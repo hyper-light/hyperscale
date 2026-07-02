@@ -445,10 +445,31 @@ class SimulationLoop(base_events.BaseEventLoop):
     @staticmethod
     def _describe_handle(handle) -> str:
         """Best-effort human name for a queued ``Handle`` (for the
-        runaway-loop diagnostic)."""
+        runaway-loop diagnostic).
+
+        Task-step callbacks (``TaskStepMethWrapper``) are unwrapped to
+        the task's coroutine and its *current suspension point* — the
+        file:line where the spinning coroutine is parked — because
+        "three TaskStepMethWrappers" identifies nothing while
+        "``_retry_loop`` at dispatch.py:412" identifies the bug.
+        """
         callback = getattr(handle, "_callback", None)
         if callback is None:
             return repr(handle)
+
+        task = getattr(callback, "__self__", None)
+        get_coro = getattr(task, "get_coro", None)
+        if get_coro is not None:
+            coroutine = get_coro()
+            qualname = getattr(coroutine, "__qualname__", repr(coroutine))
+            frame = getattr(coroutine, "cr_frame", None)
+            if frame is not None:
+                return (
+                    f"{qualname} at "
+                    f"{frame.f_code.co_filename}:{frame.f_lineno}"
+                )
+            return qualname
+
         return getattr(callback, "__qualname__", repr(callback))
 
     def call_soon(

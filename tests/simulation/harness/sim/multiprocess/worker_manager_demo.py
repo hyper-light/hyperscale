@@ -57,6 +57,13 @@ def manager_entry(context, host, tcp_port, udp_port, datacenter_id) -> None:
             await asyncio.sleep(0.5)
         log.append(("worker-registered", round(context.loop.time(), 6)))
 
+        # Phase two: if the worker later disappears (fault-injection
+        # scenarios kill it), record when the manager's registry reflects
+        # the loss — SWIM suspicion + dead-worker reap end to end.
+        while manager._manager_state.get_worker_count() > 0:
+            await asyncio.sleep(0.5)
+        log.append(("worker-lost", round(context.loop.time(), 6)))
+
     context.loop.create_task(run())
 
 

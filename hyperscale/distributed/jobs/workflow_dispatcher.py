@@ -982,7 +982,7 @@ class WorkflowDispatcher:
                 # wait_for_cores() return in a tight loop while the real
                 # state is in-flight dispatch or retry backoff.
                 ready_events = [
-                    p.ready_event.wait()
+                    self._consume_ready_signal(p)
                     for p in job_pending
                     if not p.dispatch_in_progress
                 ]
@@ -1057,6 +1057,26 @@ class WorkflowDispatcher:
         """Wait for the dispatch trigger event."""
         await self._dispatch_trigger.wait()
         self._dispatch_trigger.clear()
+
+    async def _consume_ready_signal(self, pending: PendingWorkflow) -> None:
+        """Wait for a pending workflow's ready signal and CONSUME it.
+
+        The ready event is a wakeup edge, not readiness state —
+        readiness is re-derived from dependency/backoff state by
+        ``try_dispatch`` on every pass. Left set (the old behavior), a
+        pending workflow whose dispatch cannot proceed spins the
+        dispatch loop at a single instant: every ``wait()`` on the
+        still-set event completes immediately, ``try_dispatch`` no-ops
+        (no capacity — e.g. every worker just died), and the loop goes
+        around again without ever reaching its timeout. On a real
+        manager that is a silent 100%-CPU busy-spin; under SIM the
+        frozen virtual clock trips the runaway guard. Same
+        consume-on-wake contract as ``_wait_dispatch_trigger``; the
+        cleanup/cancellation paths that ``set()`` to unblock waiters
+        are unaffected (the loop wakes, consumes, and re-checks state).
+        """
+        await pending.ready_event.wait()
+        pending.ready_event.clear()
 
     def signal_dispatch(self) -> None:
         """
