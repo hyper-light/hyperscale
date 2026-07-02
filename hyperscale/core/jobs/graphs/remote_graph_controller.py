@@ -1,7 +1,6 @@
 import asyncio
 import os
 import statistics
-import time
 from collections import Counter, defaultdict
 from socket import socket
 from typing import Any, Dict, List, Set, Tuple, TypeVar
@@ -647,15 +646,18 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     )
                     return True
 
-            # Wait for the event with periodic UI updates
-            start_time = time.monotonic()
+            # Wait for the event with periodic UI updates. Loop time,
+            # not wall time — identical on a real loop, virtual under
+            # SIM, so both the timeout math and the UI-throttle branch
+            # follow the (deterministic) timeline instead of host load.
+            start_time = self._loop.time()
             last_update_time = start_time
 
             while not self._workers_ready_event.is_set():
                 # Calculate remaining timeout
                 remaining_timeout = None
                 if timeout is not None:
-                    elapsed = time.monotonic() - start_time
+                    elapsed = self._loop.time() - start_time
                     remaining_timeout = timeout - elapsed
                     if remaining_timeout <= 0:
                         await ctx.log_prepared(
@@ -675,7 +677,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     pass  # Expected - continue to update UI
 
                 # Update UI periodically (every second)
-                current_time = time.monotonic()
+                current_time = self._loop.time()
                 if current_time - last_update_time >= 1.0:
                     async with self._leader_lock:
                         acknowledged_count = len(self.acknowledged_starts)

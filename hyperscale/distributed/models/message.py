@@ -1,7 +1,6 @@
 import io
 import os
 import secrets
-import time
 import cloudpickle
 from typing import Self
 
@@ -35,12 +34,15 @@ MESSAGE_INCARNATION = secrets.token_bytes(8)
 
 
 def _generate_message_id() -> int:
-    """Generate a unique message ID using Snowflake algorithm."""
-    message_id = _message_id_generator.generate_sync()
-    while message_id is None:
-        time.sleep(0.001)
-        message_id = _message_id_generator.generate_sync()
-    return message_id
+    """Generate a unique message ID using Snowflake algorithm.
+
+    ``generate_sync`` is total and monotone (backwards realtime steps
+    and same-millisecond sequence exhaustion are absorbed by the
+    generator), so no retry is needed — the previous ``None``-retry
+    here spun a blocking ``time.sleep`` on the event-loop thread, which
+    under a frozen virtual clock could never terminate.
+    """
+    return _message_id_generator.generate_sync()
 
 
 class Message:

@@ -68,6 +68,7 @@ class ReplayGuard:
         '_stats_future',
         '_stats_accepted',
         '_stats_incarnation_changes',
+        '_stats_malformed',
     )
 
     def __init__(
@@ -105,6 +106,7 @@ class ReplayGuard:
         self._stats_future = 0
         self._stats_accepted = 0
         self._stats_incarnation_changes = 0
+        self._stats_malformed = 0
     
     def validate(self, shard_id: int, raise_on_error: bool = True) -> Tuple[bool, Optional[str]]:
         """
@@ -167,6 +169,18 @@ class ReplayGuard:
         raise_on_error: bool,
     ) -> Tuple[bool, Optional[str]]:
         """Core validation logic for timestamp and duplicate checking."""
+        # A message id that is not an int (a hostile or corrupted frame)
+        # must be REJECTED, not crash the receive path: ``Snowflake.parse``
+        # on a non-int raises ``TypeError``, which the read dispatch's
+        # ``except ReplayError`` would never catch — the whole datagram
+        # handler would die instead of dropping one bad message.
+        if type(shard_id) is not int:
+            self._stats_malformed += 1
+            error = f"Malformed message id: {type(shard_id).__name__}"
+            if raise_on_error:
+                raise ReplayError(error)
+            return (False, error)
+
         # Parse the Snowflake to extract timestamp
         snowflake = Snowflake.parse(shard_id, self._epoch)
         message_time_ms = snowflake.milliseconds
@@ -261,6 +275,7 @@ class ReplayGuard:
             'duplicates_rejected': self._stats_duplicates,
             'stale_rejected': self._stats_stale,
             'future_rejected': self._stats_future,
+            'malformed_rejected': self._stats_malformed,
             'incarnation_changes': self._stats_incarnation_changes,
             'tracked_ids': len(self._seen_ids),
             'tracked_incarnations': len(self._known_incarnations),
@@ -276,6 +291,7 @@ class ReplayGuard:
         self._stats_future = 0
         self._stats_accepted = 0
         self._stats_incarnation_changes = 0
+        self._stats_malformed = 0
 
     def clear(self) -> None:
         """Clear all tracked message IDs and incarnations."""

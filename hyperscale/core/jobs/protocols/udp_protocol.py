@@ -6,7 +6,6 @@ import pickle
 import signal
 import socket
 import ssl
-import time
 import uuid
 from collections import defaultdict, deque
 from typing import (
@@ -226,7 +225,10 @@ class UDPProtocol(Generic[T, K]):
             )
 
         instance_id: int | None = None
-        start_time = time.monotonic()
+        # Loop time, not wall time: identical on a real loop (loop.time
+        # IS the monotonic clock) and virtual under SIM, so the connect
+        # budget follows the simulated timeline instead of host load.
+        start_time = self._loop.time()
         attempt = 0
 
         # Connect retry with exponential backoff
@@ -237,7 +239,7 @@ class UDPProtocol(Generic[T, K]):
         max_interval = 5.0  # Cap retry interval
 
         while True:
-            elapsed = time.monotonic() - start_time
+            elapsed = self._loop.time() - start_time
             if elapsed >= self._max_connect_time:
                 raise TimeoutError(
                     f"Failed to connect to {address} after {self._max_connect_time}s ({attempt} attempts)"
@@ -280,7 +282,7 @@ class UDPProtocol(Generic[T, K]):
             except (Exception, asyncio.CancelledError, socket.error, OSError):
                 attempt += 1
                 # Don't sleep if we've exceeded the max time
-                remaining = self._max_connect_time - (time.monotonic() - start_time)
+                remaining = self._max_connect_time - (self._loop.time() - start_time)
                 if remaining > 0:
                     await asyncio.sleep(min(retry_interval, remaining))
 

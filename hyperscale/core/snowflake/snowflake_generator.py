@@ -1,17 +1,32 @@
 from time import time
-from typing import Optional
 
 from .constants import MAX_INSTANCE, MAX_SEQ
 from .snowflake import Snowflake
 
 
 class SnowflakeGenerator:
+    """Snowflake id generator: total and monotone.
+
+    ``generate`` always returns an id. The realtime clock is not
+    monotone — NTP slew can step it backwards — so the generator never
+    regresses its timestamp cursor: a backwards wall reading reuses the
+    latest cursor and keeps sequencing. A sequence exhausted within one
+    clock millisecond (virtual-time bursts decouple send rate from wall
+    time entirely) borrows the next logical millisecond instead of
+    failing. Ids are therefore strictly increasing and unique for the
+    lifetime of the generator, with no ``None`` escape hatch for
+    callers to (mis)handle — a ``None`` shard id on the wire parsed as
+    a Snowflake raises ``TypeError`` deep in the receive path, which is
+    exactly the class of sporadic, wall-clock-triggered failure this
+    guards against.
+    """
+
     def __init__(
         self,
         instance: int,
         *,
         seq: int = 0,
-        timestamp: Optional[int] = None,
+        timestamp: int | None = None,
     ):
         current = int(time() * 1000)
 
@@ -25,22 +40,27 @@ class SnowflakeGenerator:
 
     @classmethod
     def from_snowflake(cls, sf: Snowflake) -> "SnowflakeGenerator":
-        return cls(sf.instance, seq=sf.seq, epoch=sf.epoch, timestamp=sf.timestamp)
+        return cls(sf.instance, seq=sf.seq, timestamp=sf.timestamp)
 
     def __iter__(self):
         return self
 
-    def generate(self) -> Optional[int]:
+    def generate(self) -> int:
         current = int(time() * 1000)
+
+        # Never regress: a backwards realtime step reuses the latest
+        # cursor so ids stay unique and ordered.
+        if current < self._ts:
+            current = self._ts
 
         if self._ts == current:
             if self._seq == MAX_SEQ:
-                return None
-
-            self._seq += 1
-
-        elif self._ts > current:
-            return None
+                # Sequence exhausted within this millisecond: borrow the
+                # next logical millisecond rather than failing the send.
+                current += 1
+                self._seq = 0
+            else:
+                self._seq += 1
 
         else:
             self._seq = 0
