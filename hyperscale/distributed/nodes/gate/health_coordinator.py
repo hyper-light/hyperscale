@@ -791,7 +791,15 @@ class GateHealthCoordinator:
         elif degraded:
             worst_health = "degraded"
         else:
-            return ([], [], "unhealthy")
+            # Nothing usable. Distinguish "still coming up" from "down":
+            # any datacenter in its pre-first-heartbeat window makes the
+            # aggregate INITIALIZING (submissions rejected as transient,
+            # clients retry) rather than UNHEALTHY (jobs failed).
+            initializing = any(
+                status.health == DatacenterHealth.INITIALIZING.value
+                for status in dc_health.values()
+            )
+            return ([], [], "initializing" if initializing else "unhealthy")
 
         all_usable = healthy + busy + degraded
         primary = all_usable[:count]

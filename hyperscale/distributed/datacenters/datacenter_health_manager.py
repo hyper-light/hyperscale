@@ -180,8 +180,38 @@ class DatacenterHealthManager:
         if total_count == 0:
             return self._build_unhealthy_status(dc_id, 0, 0)
 
-        if not best_heartbeat or best_heartbeat.worker_count == 0:
+        # Managers are configured but not one has EVER sent a heartbeat:
+        # the datacenter is still coming up (AWAITING_INITIAL in the
+        # registration state machine), not broken. Classifying this as
+        # UNHEALTHY made warmup indistinguishable from outage — gates
+        # accepted jobs and insta-failed them during the first seconds
+        # of a cluster's life. Heartbeats that existed and went stale
+        # still classify UNHEALTHY below (real loss).
+        if not self._dc_manager_info.get(dc_id):
+            return self._build_initializing_status(dc_id)
+
+        if not best_heartbeat:
             return self._build_unhealthy_status(dc_id, alive_count, 0)
+
+        # Live managers, zero workers: no capacity right now, but the
+        # tier that accepts and queues work is up. Per the
+        # DatacenterHealth contract that is BUSY ("transient, will clear
+        # -> accept job (queued)") — the manager parks the job until a
+        # worker registers, and bucket priority still prefers HEALTHY
+        # datacenters for routing. Classifying it UNHEALTHY made worker
+        # warmup (and total worker loss with a live manager) terminal:
+        # gates accepted jobs on one selector's forgiving view, then
+        # insta-failed them on the dispatch path's strict one.
+        if best_heartbeat.worker_count == 0:
+            return DatacenterStatus(
+                dc_id=dc_id,
+                health=DatacenterHealth.BUSY.value,
+                available_capacity=0,
+                queue_depth=getattr(best_heartbeat, "queue_depth", 0),
+                manager_count=alive_count,
+                worker_count=0,
+                last_update=_DEFAULT_CLOCK.monotonic(),
+            )
 
         signals = self._extract_overload_signals(
             best_heartbeat, alive_count, total_count, dc_id
@@ -230,6 +260,22 @@ class DatacenterHealthManager:
             queue_depth=0,
             manager_count=manager_count,
             worker_count=worker_count,
+            last_update=_DEFAULT_CLOCK.monotonic(),
+        )
+
+    def _build_initializing_status(
+        self,
+        dc_id: str,
+    ) -> DatacenterStatus:
+        """Status for a configured datacenter no manager has ever
+        reported from — the pre-first-heartbeat warmup window."""
+        return DatacenterStatus(
+            dc_id=dc_id,
+            health=DatacenterHealth.INITIALIZING.value,
+            available_capacity=0,
+            queue_depth=0,
+            manager_count=0,
+            worker_count=0,
             last_update=_DEFAULT_CLOCK.monotonic(),
         )
 

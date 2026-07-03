@@ -94,8 +94,18 @@ class TestDatacenterHealthManager:
         status = health_mgr.get_datacenter_health("dc-1")
         assert status.health == DatacenterHealth.UNHEALTHY.value
 
-    def test_datacenter_unhealthy_no_workers(self) -> None:
-        """Test unhealthy classification when no workers."""
+    def test_datacenter_busy_when_managers_alive_but_no_workers(self) -> None:
+        """Live managers with zero workers classify BUSY, not UNHEALTHY.
+
+        Per the DatacenterHealth contract, BUSY means "transient, will
+        clear -> accept job (queued)": the tier that accepts and queues
+        work is up, capacity is momentarily zero (worker warmup, or
+        total worker loss with a live manager that will re-register
+        them). Classifying this UNHEALTHY made warmup indistinguishable
+        from outage — gates insta-failed accepted jobs during cluster
+        bring-up. Zero available capacity is still reported so routing
+        prefers datacenters with real capacity.
+        """
         health_mgr = DatacenterHealthManager()
 
         heartbeat = ManagerHeartbeat(
@@ -115,7 +125,20 @@ class TestDatacenterHealthManager:
         health_mgr.update_manager("dc-1", ("10.0.0.1", 8080), heartbeat)
 
         status = health_mgr.get_datacenter_health("dc-1")
-        assert status.health == DatacenterHealth.UNHEALTHY.value
+        assert status.health == DatacenterHealth.BUSY.value
+        assert status.available_capacity == 0
+        assert status.worker_count == 0
+
+    def test_datacenter_initializing_before_any_heartbeat(self) -> None:
+        """A configured datacenter no manager has ever reported from is
+        INITIALIZING (pre-first-heartbeat warmup), distinct from
+        UNHEALTHY (heartbeats existed and stopped, or a broken DC)."""
+        health_mgr = DatacenterHealthManager(
+            get_configured_managers=lambda dc_id: [("10.0.0.1", 8080)],
+        )
+
+        status = health_mgr.get_datacenter_health("dc-1")
+        assert status.health == DatacenterHealth.INITIALIZING.value
 
     def test_datacenter_busy(self) -> None:
         """Test busy classification when capacity utilization is 75%."""

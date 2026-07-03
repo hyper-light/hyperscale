@@ -22,6 +22,10 @@ from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
     SpilloverEvaluator,
 )
+from hyperscale.distributed.nodes.gate.models import TransientDispatchError
+from hyperscale.distributed.protocol.transient_errors import (
+    is_transient_rejection,
+)
 from hyperscale.distributed.protocol.version import (
     ProtocolVersion,
     CURRENT_PROTOCOL_VERSION,
@@ -892,10 +896,21 @@ class GateDispatchCoordinator:
         self,
         manager_addr: tuple[str, int],
         submission: JobSubmission,
-        max_retries: int = 2,
-        base_delay: float = 0.3,
+        max_retries: int = 9,
+        base_delay: float = 1.0,
     ) -> tuple[bool, str | None]:
-        """Try to dispatch job to a single manager with retries and circuit breaker."""
+        """Try to dispatch job to a single manager with retries and circuit breaker.
+
+        The retry budget must span a full datacenter leader election
+        (pre-vote ~2s + 5-7s jittered timeout, so ~9-10s worst case):
+        a gate front-running a warming or mid-failover manager gets
+        transient rejections ("Not DC leader", "no quorum", "not
+        accepting jobs") that resolve within that window — with the
+        old 3-attempt/~1s budget the gate gave up while the election
+        it was waiting on was still running, terminally failing the
+        job. Ten attempts at base 1.0s (full jitter, 5s cap) spans the
+        window with margin while staying bounded.
+        """
         if await self._circuit_breaker_manager.is_circuit_open(manager_addr):
             return (False, "Circuit breaker is OPEN")
 
@@ -905,6 +920,15 @@ class GateDispatchCoordinator:
             base_delay=base_delay,
             max_delay=5.0,
             jitter=JitterStrategy.FULL,
+            # Transient JobAck rejections (mid-election, warmup, load
+            # shedding) must retry alongside the transport errors the
+            # default whitelist covers.
+            retryable_exceptions=(
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                TransientDispatchError,
+            ),
         )
         executor = RetryExecutor(retry_config)
 
@@ -943,12 +967,26 @@ class GateDispatchCoordinator:
         manager_addr: tuple[str, int],
         circuit: "ErrorStats",
     ) -> tuple[bool, str | None]:
-        """Process dispatch acknowledgment from manager."""
+        """Process dispatch acknowledgment from manager.
+
+        Rejections in the shared transient vocabulary (mid-election
+        "Not DC leader", warmup "not accepting jobs", load shedding,
+        ...) RAISE so the surrounding ``RetryExecutor`` re-attempts
+        with backoff — the same classification the client submitter
+        applies to these acks. Returning them as terminal (the old
+        behavior) failed the whole job on the first rejection even
+        though the condition resolves in seconds; with a single
+        datacenter there is no fallback to hide that.
+        """
         if ack.accepted:
             circuit.record_success()
             return (True, None)
 
         circuit.record_failure()
+
+        if is_transient_rejection(ack.error):
+            raise TransientDispatchError(ack.error)
+
         return (False, ack.error)
 
     def _record_dc_manager_for_job(

@@ -24,6 +24,7 @@ import asyncio
 import os
 
 from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.nodes.gate.server import GateServer
 from hyperscale.distributed.nodes.manager.server import ManagerServer
 from hyperscale.distributed.nodes.worker.server import WorkerServer
 
@@ -35,15 +36,30 @@ def _env(**overrides) -> Env:
     return Env(MERCURY_SYNC_AUTH_SECRET=_AUTH_SECRET, **overrides)
 
 
-def manager_entry(context, host, tcp_port, udp_port, datacenter_id) -> None:
+def manager_entry(
+    context,
+    host,
+    tcp_port,
+    udp_port,
+    datacenter_id,
+    gate_tcp_address=None,
+    gate_udp_address=None,
+) -> None:
     """Manager child: start a real ``ManagerServer`` and record when the
-    first worker registers."""
+    first worker registers.
+
+    ``gate_tcp_address`` / ``gate_udp_address`` (optional) attach the
+    manager to a gate tier — the L3 topology; omitted, the manager runs
+    gateless (L1/L2) exactly as before.
+    """
     manager = ManagerServer(
         host,
         tcp_port,
         udp_port,
         _env(),
         dc_id=datacenter_id,
+        gate_addrs=[gate_tcp_address] if gate_tcp_address else None,
+        gate_udp_addrs=[gate_udp_address] if gate_udp_address else None,
         **context.sim_kwargs(),
     )
     log: list = []
@@ -65,6 +81,52 @@ def manager_entry(context, host, tcp_port, udp_port, datacenter_id) -> None:
         log.append(("worker-lost", round(context.loop.time(), 6)))
 
     context.loop.create_task(run())
+
+
+def gate_entry(
+    context,
+    host,
+    tcp_port,
+    udp_port,
+    datacenter_id,
+    manager_tcp_address,
+    manager_udp_address,
+) -> None:
+    """Gate child: a real ``GateServer`` fronting one datacenter.
+
+    Records the datacenter's health classification every time it
+    changes — the gate's view of the manager tier coming alive (and,
+    under fault scenarios, dying) on virtual time.
+    """
+    gate = GateServer(
+        host,
+        tcp_port,
+        udp_port,
+        _env(),
+        datacenter_managers={datacenter_id: [manager_tcp_address]},
+        datacenter_manager_udp={datacenter_id: [manager_udp_address]},
+        **context.sim_kwargs(),
+    )
+    log: list = []
+    context.set_result(log)
+
+    async def run() -> None:
+        await gate.start()
+        log.append(("gate-started", round(context.loop.time(), 6)))
+
+    async def watch_datacenter_health() -> None:
+        last_health: str | None = None
+        while True:
+            health = gate._classify_datacenter_health(datacenter_id).health
+            if health != last_health:
+                last_health = health
+                log.append(
+                    ("dc-health", health, round(context.loop.time(), 6))
+                )
+            await asyncio.sleep(0.5)
+
+    context.loop.create_task(run())
+    context.loop.create_task(watch_datacenter_health())
 
 
 def worker_entry(

@@ -11,33 +11,14 @@ from dataclasses import dataclass
 
 # Transient errors that should trigger retry logic (AD-21, AD-32)
 # Includes cluster state errors and load shedding/rate limiting patterns
-TRANSIENT_ERRORS = frozenset({
-    "syncing",
-    "not ready",
-    "election in progress",
-    "no leader",
-    "split brain",
-    "rate limit",
-    "overload",
-    "too many",
-    "server busy",
-    # Leader-redirect responses produced by a manager that knows it
-    # is not the leader but couldn't resolve the leader's address
-    # (e.g. cluster mid-election, peer heartbeats not yet arrived).
-    # The robust path is for the manager to populate ``leader_addr``
-    # from peer state — see ``ManagerServer._resolve_dc_leader_addr``.
-    # When the manager genuinely cannot resolve, this transient
-    # classification lets the client round-robin to another target.
-    "not dc leader",
-    "not job leader",
-    # Gate-forwarded cancel where no DC could confirm because manager
-    # leadership is mid-failover. The gate stamps its aggregate cancel
-    # error with ``GateCancellationHandler._CANCEL_RETRYABLE_MARKER``
-    # ("cancellation pending leader transition") so the client retries
-    # across its time budget until leadership reconverges. Keep this
-    # substring in sync with that marker.
-    "leader transition",
-})
+# The transient-rejection vocabulary is a protocol-level contract shared
+# by every hop that classifies JobAck rejections (client submitters AND
+# the gate's datacenter dispatch); it lives in
+# ``hyperscale.distributed.protocol.transient_errors`` and is re-exported
+# here for the existing client-side importers.
+from hyperscale.distributed.protocol.transient_errors import (
+    TRANSIENT_ERRORS as TRANSIENT_ERRORS,
+)
 
 
 @dataclass(slots=True)

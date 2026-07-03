@@ -643,11 +643,16 @@ class GateServer(HealthAwareServer):
                 )
             self._dc_manager_discovery[datacenter_id] = dc_discovery
 
-        # Peer discovery
+        # Peer discovery. A solo gate (no peers) is a valid topology —
+        # single-gate L3 deployments and the SIM scenarios — but
+        # DiscoveryConfig refuses an empty seed list unless dynamic
+        # registration is allowed, so fall back to it in that case
+        # (the same solo-node pattern ManagerDiscovery uses).
         peer_static_seeds = [f"{host}:{port}" for host, port in self._gate_peers]
         peer_discovery_config = env.get_discovery_config(
             node_role="gate",
             static_seeds=peer_static_seeds,
+            allow_dynamic_registration=not peer_static_seeds,
         )
         self._peer_discovery = DiscoveryService(peer_discovery_config)
         for host, port in self._gate_peers:
@@ -3978,7 +3983,15 @@ class GateServer(HealthAwareServer):
         healthy, busy, degraded = self._categorize_datacenters_by_health(dc_health)
         worst_health = self._determine_worst_health(healthy, busy, degraded)
         if worst_health is None:
-            return ([], [], "unhealthy")
+            # Nothing usable: a datacenter still in its pre-first-heartbeat
+            # window makes the aggregate INITIALIZING (transient, retried)
+            # rather than UNHEALTHY (terminal) — same rule as the
+            # health-coordinator selector.
+            initializing = any(
+                status.health == DatacenterHealth.INITIALIZING.value
+                for status in dc_health.values()
+            )
+            return ([], [], "initializing" if initializing else "unhealthy")
 
         all_usable = healthy + busy + degraded
         primary = all_usable[:count]

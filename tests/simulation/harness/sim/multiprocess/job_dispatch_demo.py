@@ -60,7 +60,8 @@ def _env() -> Env:
 
 
 def dispatch_client_entry(context, host, port, manager_tcp_address) -> None:
-    """Client child: submit ``SimPingWorkflow`` and await job completion.
+    """Client child: submit ``SimPingWorkflow`` directly to a manager
+    (L1/L2 topology) and await job completion.
 
     Submission retries on virtual time until the manager accepts (leader
     elected + worker registered with capacity); every rejection is
@@ -75,6 +76,29 @@ def dispatch_client_entry(context, host, port, manager_tcp_address) -> None:
     )
     log: list = []
     context.set_result(log)
+    _run_client_submission(context, client, log)
+
+
+def gate_dispatch_client_entry(context, host, port, gate_tcp_address) -> None:
+    """Client child: submit ``SimPingWorkflow`` through a GATE (the L3
+    topology) and await job completion — same production flow, routed
+    client -> gate -> datacenter manager -> worker."""
+    client = HyperscaleClient(
+        host=host,
+        port=port,
+        env=_env(),
+        gates=[gate_tcp_address],
+        **context.sim_kwargs(),
+    )
+    log: list = []
+    context.set_result(log)
+    _run_client_submission(context, client, log)
+
+
+def _run_client_submission(context, client, log: list) -> None:
+    """Shared submit -> watch -> await-completion flow for the client
+    entries; identical await ordering regardless of target tier so the
+    pinned schedules of existing scenarios stay byte-for-byte."""
 
     async def run() -> None:
         await client.start()

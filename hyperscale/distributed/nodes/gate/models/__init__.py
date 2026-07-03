@@ -9,6 +9,7 @@ from .gate_peer_state import GatePeerState, GatePeerTracking
 from .dc_health_state import DCHealthState, ManagerTracking
 from .job_forwarding_state import JobForwardingState, ForwardingMetrics
 from .lease_state import LeaseState, LeaseTracking
+from .transient_dispatch_error import TransientDispatchError
 
 __all__ = [
     "GatePeerState",
@@ -19,4 +20,5 @@ __all__ = [
     "ForwardingMetrics",
     "LeaseState",
     "LeaseTracking",
+    "TransientDispatchError",
 ]
