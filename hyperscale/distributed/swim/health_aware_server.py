@@ -169,8 +169,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     ):
         super().__init__(*args, **kwargs)
 
-        # Generate unique node identity
-        self._node_id = NodeId.generate(datacenter=dc_id, priority=priority)
+        # Topology-derived node identity: a pure function of placement
+        # (datacenter, priority, host, udp_port) — no RNG, no wall clock,
+        # so it is deterministic across runs and stable across restarts.
+        # ``self._host`` / ``self._udp_port`` were set by the base server
+        # in ``super().__init__`` above; the UDP address is the canonical
+        # SWIM identity (matches ``get_node_address`` and the incarnation
+        # store's ``host:udp_port`` key).
+        self._node_id = NodeId.generate(
+            datacenter=dc_id,
+            priority=priority,
+            host=self._host,
+            port=self._udp_port,
+        )
 
         # Store node role for role-aware failure detection (AD-35 Task 12.4.2)
         self._node_role: str = (

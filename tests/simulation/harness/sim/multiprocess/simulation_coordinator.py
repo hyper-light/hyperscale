@@ -23,6 +23,7 @@ every message it sends — is coherent with the rest of the simulation.
 
 import heapq
 import multiprocessing
+import os
 
 from .child_runtime import run_child_loop
 
@@ -101,6 +102,23 @@ class SimulationCoordinator:
         self._kill_schedule.append((at_time, process_id))
 
     def run(self) -> dict:
+        # Pin hash randomization for every spawned child. Python
+        # randomizes str/bytes hashing per process (PYTHONHASHSEED),
+        # which reorders ``set`` / ``dict`` iteration — so any production
+        # decision that iterates an unordered collection (e.g. routing
+        # over datacenter ids) would differ run-to-run, breaking replay.
+        # Hash randomization is an environmental non-determinism input
+        # exactly like the wall clock and the RNG seed; the coordinator
+        # already controls those (virtual clock, per-child seed) and must
+        # control this one too. ``spawn`` children read PYTHONHASHSEED at
+        # interpreter startup from the inherited environment, so setting
+        # it here — before any child is spawned — fixes their hashing.
+        # Forced (not ``setdefault``) so an ambient ``PYTHONHASHSEED=random``
+        # can't reintroduce non-determinism; the coordinator itself makes
+        # no hash-ordered decisions, so its own already-fixed seed is
+        # irrelevant.
+        os.environ["PYTHONHASHSEED"] = "0"
+
         spawn_context = multiprocessing.get_context("spawn")
         connections: dict = {}
         processes: dict = {}
