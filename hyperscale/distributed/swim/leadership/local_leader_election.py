@@ -633,10 +633,20 @@ class LocalLeaderElection:
             return
         
         self.state.renew_lease()
-        
+
+        # Monotonic per-beat sequence + authoritative lease grant (fixes
+        # 2/4 and 4/4): ``leader-heartbeat:{term}:{seq}:{lease_ms}>{addr}``.
+        # ``seq`` makes each beat unique on the wire and lets the follower
+        # apply beats monotonically; ``lease_ms`` is the lease length this
+        # leader grants, so followers honor the leader's duration rather
+        # than their own local config.
+        self.state.heartbeat_seq += 1
+        lease_ms = int(self.state.lease_duration * 1000)
         heartbeat_msg = (
             b'leader-heartbeat:' +
-            str(self.state.current_term).encode() + b'>' +
+            str(self.state.current_term).encode() + b':' +
+            str(self.state.heartbeat_seq).encode() + b':' +
+            str(lease_ms).encode() + b'>' +
             f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
         )
         await self._broadcast_message(heartbeat_msg)
@@ -730,10 +740,21 @@ class LocalLeaderElection:
                 await self._record_leader_change(old_leader, leader, 'elected')
             self._wake_election_loop()
 
-    async def handle_heartbeat(self, leader: tuple[str, int], term: int) -> None:
-        """Handle a leader-heartbeat message."""
+    async def handle_heartbeat(
+        self,
+        leader: tuple[str, int],
+        term: int,
+        heartbeat_seq: int = -1,
+        lease_duration: float | None = None,
+    ) -> None:
+        """Handle a leader-heartbeat message.
+
+        ``heartbeat_seq`` / ``lease_duration`` carry the monotonic beat
+        sequence and the authoritative lease grant (fixes 2/4, 4/4); a
+        sequence-less beat (``heartbeat_seq < 0``) still renews.
+        """
         old_leader = self.state.current_leader
-        self.state.update_heartbeat(leader, term)
+        self.state.update_heartbeat(leader, term, heartbeat_seq, lease_duration)
         # Record if this is first time seeing this leader
         if old_leader != leader and leader is not None:
             await self._record_leader_change(old_leader, leader, 'heartbeat')

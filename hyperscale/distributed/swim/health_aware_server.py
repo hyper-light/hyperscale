@@ -4947,7 +4947,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Returns 0 on parse failure but logs the error for monitoring.
         """
-        msg_parts = message.split(b":", maxsplit=1)
+        # ``maxsplit=2`` isolates the term as the second token, so the
+        # parse is robust to trailing fields on the message (e.g. a
+        # heartbeat's ``{term}:{seq}:{lease_ms}`` — fixes 2/4, 4/4).
+        # ``{prefix}:{term}`` still yields the term at index 1 unchanged.
+        msg_parts = message.split(b":", maxsplit=2)
         if len(msg_parts) > 1:
             try:
                 return int(msg_parts[1].decode())

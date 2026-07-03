@@ -55,6 +55,17 @@ class LeaderState:
     # Lease tracking
     leader_lease_start: float = 0.0
     lease_duration: float = 5.0  # Seconds
+
+    # Monotonic heartbeat sequence (fix 2/4). The leader increments
+    # ``heartbeat_seq`` on every beat it sends; a follower records the
+    # last ``applied_heartbeat_seq`` it accepted for the current
+    # ``leader_term`` and applies beats MONOTONICALLY. This makes every
+    # beat unique on the wire (a content-hash cache can never coalesce
+    # them — defense in depth beyond the dedup class-separation) and
+    # makes lease renewal idempotent and reorder/replay-safe by
+    # construction.
+    heartbeat_seq: int = 0
+    applied_heartbeat_seq: int = -1
     
     # Election state (bounded to prevent memory exhaustion)
     votes_received: set[tuple[str, int]] = field(default_factory=set)
@@ -186,6 +197,10 @@ class LeaderState:
         self.current_term = term
         self.leader_term = term
         self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
+        # Reset the outgoing beat counter for this leadership epoch; the
+        # first beat we send is seq 1 (fix 2/4).
+        self.heartbeat_seq = 0
+        self.applied_heartbeat_seq = -1
         self.current_leader = None  # We are the leader, set by caller
 
         # Clear vote sets to free memory - we're done with the election
@@ -218,17 +233,52 @@ class LeaderState:
         if leader != old_leader and self._on_leader_change:
             self._on_leader_change(leader)
     
-    def update_heartbeat(self, leader: tuple[str, int], term: int) -> None:
-        """Update lease on receiving leader heartbeat."""
-        if term >= self.leader_term:
-            self.current_leader = leader
-            self.leader_term = term
-            self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
-            self.last_heartbeat_time = _DEFAULT_CLOCK.monotonic()
-            self.abort_pre_vote()
-            
-            if self.role != 'follower':
-                self.become_follower(term, leader)
+    def update_heartbeat(
+        self,
+        leader: tuple[str, int],
+        term: int,
+        heartbeat_seq: int = -1,
+        lease_duration: float | None = None,
+    ) -> None:
+        """Renew the leader lease on receiving a heartbeat.
+
+        MONOTONE (fix 2/4): accept a beat only if it advances the
+        ``(term, seq)`` position — a newer term, or the same term with a
+        strictly greater sequence. An older-or-equal beat (reorder or
+        replay within a term) is ignored. AUTHORITATIVE lease (fix 4/4):
+        when the beat carries a ``lease_duration``, the leader's grant is
+        adopted, so leader and follower cannot disagree on the lease
+        length via divergent local config.
+
+        A beat without a sequence (``heartbeat_seq < 0``) bypasses the
+        monotone gate and always renews, preserving behavior for any
+        sequence-less sender.
+        """
+        if term < self.leader_term:
+            return  # stale term: a deposed leader's beat
+        if (
+            term == self.leader_term
+            and heartbeat_seq >= 0
+            and heartbeat_seq <= self.applied_heartbeat_seq
+        ):
+            return  # reordered / replayed beat within the current term
+
+        if term > self.leader_term:
+            # New leadership epoch — reset the applied-sequence watermark.
+            self.applied_heartbeat_seq = -1
+        if heartbeat_seq >= 0:
+            self.applied_heartbeat_seq = heartbeat_seq
+
+        self.current_leader = leader
+        self.leader_term = term
+        self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
+        self.last_heartbeat_time = _DEFAULT_CLOCK.monotonic()
+        if lease_duration is not None and lease_duration > 0:
+            self.lease_duration = lease_duration
+        self.abort_pre_vote()
+
+        if self.role != 'follower':
+            self.become_follower(term, leader)
     
     def renew_lease(self) -> None:
         """Renew leader lease (called by leader on heartbeat send)."""
