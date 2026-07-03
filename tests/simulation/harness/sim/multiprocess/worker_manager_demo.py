@@ -68,7 +68,14 @@ def manager_entry(context, host, tcp_port, udp_port, datacenter_id) -> None:
 
 
 def worker_entry(
-    context, host, tcp_port, udp_port, datacenter_id, seed_manager_address, total_cores
+    context,
+    host,
+    tcp_port,
+    udp_port,
+    datacenter_id,
+    seed_manager_address,
+    total_cores,
+    start_at=0.0,
 ) -> None:
     """Worker child: start a real ``WorkerServer`` against the seed
     manager and record start + healthy-manager milestones.
@@ -76,7 +83,9 @@ def worker_entry(
     ``WORKER_MAX_CORES`` pins the pool size so the executor children
     (spawned via the ``process_spawner`` seam at
     ``executor-<host>-<port>`` ids) are deterministic in number and
-    address.
+    address. ``start_at`` delays ``WorkerServer.start()`` to that
+    virtual instant — a worker joining an already-running cluster
+    (capacity returning after loss, retry targets appearing mid-job).
     """
     worker = WorkerServer(
         host,
@@ -116,5 +125,11 @@ def worker_entry(
                 )
             await asyncio.sleep(0.25)
 
-    context.loop.create_task(run())
+    # ``start_at=0.0`` keeps the original immediate-start scheduling
+    # (create_task during the setup drain) byte-identical; a positive
+    # start delays the whole startup sequence to that virtual instant.
+    if start_at > 0.0:
+        context.loop.call_at(start_at, lambda: context.loop.create_task(run()))
+    else:
+        context.loop.create_task(run())
     context.loop.create_task(watch_workflows())
