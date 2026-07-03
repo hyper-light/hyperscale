@@ -27,6 +27,28 @@ class BaseHandler(ABC):
     message_types: ClassVar[tuple[bytes, ...]] = ()
     """Message types this handler processes (e.g., (b'ack',))."""
 
+    dedup_eligible: ClassVar[bool] = False
+    """Whether the content-hash duplicate suppressor may DROP a repeat of
+    this message before it is handled.
+
+    The content-hash cache is flood control for EPIDEMIC DISSEMINATION —
+    the same gossip update arrives many times by design and reprocessing
+    it is wasteful. It is correct ONLY for messages whose handling is
+    idempotent by their own semantic identity (SWIM suspect/alive carry
+    incarnation numbers; reprocessing is a no-op).
+
+    It is CATEGORICALLY WRONG for control / RPC messages whose handling
+    has per-receipt effect: a ``leader-heartbeat`` means "renew the lease
+    NOW" on every receipt, a ``probe`` must be ACKed every time (a dropped
+    repeat → no ack → false suspicion), a vote must be counted. Dropping
+    those is a liveness bug.
+
+    So the DEFAULT is ``False`` — process every message. A handler opts
+    into dedup only when its processing is provably idempotent-dissemination.
+    This makes "never drop a control message" a structural property of the
+    handler taxonomy rather than a central denylist that the next new
+    control message would silently fall through."""
+
     def __init__(self, server: ServerInterface) -> None:
         """
         Initialize handler with server interface.

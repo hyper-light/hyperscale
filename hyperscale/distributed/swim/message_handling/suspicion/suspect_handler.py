@@ -27,6 +27,10 @@ class SuspectHandler(BaseHandler):
     """
 
     message_types: ClassVar[tuple[bytes, ...]] = (b"suspect",)
+    # Epidemic dissemination: the same suspicion is re-gossiped many
+    # times and reprocessing is idempotent (incarnation-guarded), so
+    # content-hash dedup is safe flood control here.
+    dedup_eligible: ClassVar[bool] = True
 
     def __init__(self, server: ServerInterface) -> None:
         super().__init__(server)

@@ -25,6 +25,9 @@ class AliveHandler(BaseHandler):
     """
 
     message_types: ClassVar[tuple[bytes, ...]] = (b"alive",)
+    # Epidemic dissemination: re-gossiped, incarnation-idempotent —
+    # content-hash dedup is safe flood control.
+    dedup_eligible: ClassVar[bool] = True
 
     def __init__(self, server: ServerInterface) -> None:
         super().__init__(server)

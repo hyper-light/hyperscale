@@ -70,6 +70,19 @@ class MessageDispatcher:
                 )
             self._handlers[msg_type] = handler
 
+    def is_dedup_eligible(self, message_type: bytes) -> bool:
+        """Whether the content-hash duplicate suppressor may drop a
+        repeat of ``message_type`` before dispatch.
+
+        Derived structurally from the registered handler's
+        ``dedup_eligible`` policy (see ``BaseHandler``). Unknown message
+        types are NOT dedup-eligible — the safe default is to process,
+        so a new or unrecognized control message is never silently
+        dropped.
+        """
+        handler = self._handlers.get(message_type)
+        return handler is not None and handler.dedup_eligible
+
     def unregister(self, message_type: bytes) -> bool:
         """
         Unregister a handler for a message type.

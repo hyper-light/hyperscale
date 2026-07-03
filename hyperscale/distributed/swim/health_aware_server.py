@@ -6328,8 +6328,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             )
             _t_pb_done = self._clock.monotonic()
 
-            # Check for duplicate messages
-            if self._is_duplicate_message(addr, data):
+            # Check for duplicate messages — but ONLY for message classes
+            # whose handler declares itself dedup-eligible (idempotent
+            # epidemic dissemination: suspect/alive/join/leave). Control
+            # / RPC messages (leadership heartbeats and votes, probes,
+            # acks) must be processed on EVERY receipt: a heartbeat renews
+            # a lease, a probe owes an ack, a vote is counted. Dropping
+            # them as content "duplicates" was a liveness bug — a
+            # byte-identical leader-heartbeat within a term got eaten, so
+            # a follower's lease renewed only once per term and then
+            # expired, churning DC leadership. The policy lives on the
+            # handlers (BaseHandler.dedup_eligible), so the taxonomy is
+            # structural, not a central denylist. The message-type prefix
+            # is the token before the first ':' or '>' (piggyback, if any,
+            # is appended after the target address).
+            msg_type_prefix = data.split(b">", 1)[0].split(b":", 1)[0]
+            if (
+                self._message_dispatcher.is_dedup_eligible(msg_type_prefix)
+                and self._is_duplicate_message(addr, data)
+            ):
                 if data.startswith(b"leave"):
                     await self._udp_logger.log(
                         ServerError(

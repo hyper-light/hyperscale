@@ -67,7 +67,19 @@ def _build_managers(
 
 
 def test_three_managers_form_quorum_under_sim():
-    """Three managers elect exactly one leader, agreed by all, with quorum."""
+    """Three managers converge on ONE leader and HOLD it — stable
+    across a window, not merely at a single snapshot.
+
+    The earlier version asserted leadership at one instant (t=60). That
+    passed *by luck* over a churning cluster: the DC leader oscillated
+    every election-timeout period (the leader's byte-identical
+    heartbeats were dropped by the SWIM content-hash duplicate
+    suppressor, so follower leases renewed once per term and then
+    expired → continuous re-election), and t=60 happened to land on a
+    converged instant. Sampling across a window makes the churn a
+    failure instead of a coin flip, and asserts the real property: a
+    single, agreed, STABLE leader.
+    """
     runtime = SimulationRuntime(seed=1)
     try:
         managers = _build_managers(runtime, _manager_cluster_config())
@@ -76,28 +88,45 @@ def test_three_managers_form_quorum_under_sim():
             # start() is non-blocking: it brings up listeners and spawns
             # the election / raft / probe background loops, then returns.
             await asyncio.gather(*[manager.start() for manager in managers])
-            # Advance virtual time to let the election converge.
-            await asyncio.sleep(60.0)
-            leader_indices = [
-                index
-                for index, manager in enumerate(managers)
-                if manager.is_leader()
-            ]
-            quorum = [manager._has_quorum_available() for manager in managers]
-            agreed_leader = {manager.get_current_leader() for manager in managers}
-            return leader_indices, quorum, agreed_leader
+            # Let the election converge, then SAMPLE leadership across a
+            # window so any oscillation is caught, not snapshot-hidden.
+            await asyncio.sleep(30.0)
+            samples = []
+            for _ in range(7):
+                await asyncio.sleep(5.0)
+                samples.append(
+                    (
+                        tuple(
+                            index
+                            for index, manager in enumerate(managers)
+                            if manager.is_leader()
+                        ),
+                        frozenset(
+                            manager.get_current_leader() for manager in managers
+                        ),
+                        all(manager._has_quorum_available() for manager in managers),
+                    )
+                )
+            return samples
 
-        leader_indices, quorum, agreed_leader = runtime.run(scenario())
+        samples = runtime.run(scenario())
 
-        # Exactly one manager considers itself leader.
-        assert len(leader_indices) == 1, (
-            f"expected exactly one leader, got indices {leader_indices}"
-        )
-        # Every manager has quorum available.
-        assert all(quorum), f"not all managers have quorum: {quorum}"
-        # All three managers agree on the same (single) leader address.
-        assert len(agreed_leader) == 1 and None not in agreed_leader, (
-            f"managers disagree on the leader: {agreed_leader}"
+        for leader_indices, agreed_leader, has_quorum in samples:
+            # Exactly one manager considers itself leader, at EVERY sample.
+            assert len(leader_indices) == 1, (
+                f"expected exactly one self-leader at every sample, "
+                f"got {leader_indices} in {samples}"
+            )
+            # All three agree on that single leader (no None), at every sample.
+            assert len(agreed_leader) == 1 and None not in agreed_leader, (
+                f"managers disagree on the leader: {agreed_leader} in {samples}"
+            )
+            assert has_quorum, f"not all managers have quorum in {samples}"
+
+        # The SAME leader across the whole window — stable, not churning.
+        distinct_leaders = {agreed for _, agreed, _ in samples}
+        assert len(distinct_leaders) == 1, (
+            f"DC leadership oscillated across the window: {samples}"
         )
     finally:
         runtime.close()

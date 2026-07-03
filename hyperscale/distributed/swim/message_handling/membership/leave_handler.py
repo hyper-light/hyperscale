@@ -29,6 +29,10 @@ class LeaveHandler(BaseHandler):
     """
 
     message_types: ClassVar[tuple[bytes, ...]] = (b"leave",)
+    # Membership dissemination: removing an absent member is idempotent,
+    # and leaves are re-gossiped — content-hash dedup is safe flood
+    # control (the receive path already logs duplicate leaves).
+    dedup_eligible: ClassVar[bool] = True
 
     def __init__(self, server: ServerInterface) -> None:
         super().__init__(server)

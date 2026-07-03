@@ -37,6 +37,9 @@ class JoinHandler(BaseHandler):
     """
 
     message_types: ClassVar[tuple[bytes, ...]] = (b"join",)
+    # Membership dissemination: adding a known member is idempotent, and
+    # joins are re-gossiped — content-hash dedup is safe flood control.
+    dedup_eligible: ClassVar[bool] = True
 
     def __init__(self, server: ServerInterface) -> None:
         super().__init__(server)
