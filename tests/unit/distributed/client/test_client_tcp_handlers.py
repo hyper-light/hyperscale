@@ -497,9 +497,12 @@ class TestWindowedStatsPushHandler:
         logger = Mock(spec=Logger)
         logger.log = AsyncMock()
 
-        # Mock rate limiter that denies
+        # Mock rate limiter that denies. ``handle`` awaits
+        # ``rate_limiter.check`` — it must be an AsyncMock, or the
+        # ``await`` raises and the handler returns b'error' instead of
+        # reaching the rate-limited path.
         rate_limiter = Mock()
-        rate_limiter.check = Mock(return_value=Mock(allowed=False))
+        rate_limiter.check = AsyncMock(return_value=Mock(allowed=False))
 
         handler = WindowedStatsPushHandler(state, logger, rate_limiter)
 
