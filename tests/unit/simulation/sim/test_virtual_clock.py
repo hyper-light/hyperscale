@@ -43,6 +43,33 @@ def test_monotonic_returns_loop_time(loop: SimulationLoop, clock: VirtualClock) 
     assert clock.monotonic() == loop.time()
 
 
+def test_monotonic_ns_tracks_virtual_time(
+    loop: SimulationLoop, clock: VirtualClock
+) -> None:
+    """``clock.monotonic_ns()`` returns integer nanoseconds derived from
+    the same virtual timeline as ``monotonic()``.
+
+    Id-generation sites (probe / gate-rejoin tokens) embed a nanosecond
+    timestamp; routing it through the clock seam keeps those ids
+    deterministic under replay instead of reading the wall clock.
+    """
+    assert clock.monotonic_ns() == int(loop.time() * 1_000_000_000)
+    assert isinstance(clock.monotonic_ns(), int)
+
+
+def test_monotonic_ns_advances_with_sleep(
+    loop: SimulationLoop, clock: VirtualClock
+) -> None:
+    """``monotonic_ns`` advances by the slept virtual interval in ns."""
+    async def scenario() -> tuple[int, int]:
+        start = clock.monotonic_ns()
+        await clock.sleep(2.0)
+        return start, clock.monotonic_ns()
+
+    start, end = loop.run_until_complete(scenario())
+    assert end - start == 2_000_000_000
+
+
 def test_time_returns_loop_time(loop: SimulationLoop, clock: VirtualClock) -> None:
     """``clock.time()`` mirrors ``loop.time()``.
 

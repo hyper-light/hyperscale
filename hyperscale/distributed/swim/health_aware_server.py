@@ -16,8 +16,6 @@ This server provides:
 import asyncio
 import collections
 import math
-import random
-import time
 from base64 import b64decode, b64encode
 from typing import Callable, Literal
 
@@ -232,6 +230,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._gossip_buffer = GossipBuffer()
         self._gossip_buffer.set_overflow_callback(self._on_gossip_overflow)
         self._probe_scheduler = ProbeScheduler()
+
+        # Monotonic per-node counter for probe request tokens. A probe
+        # request id needs UNIQUENESS (to correlate an ack with its
+        # probe), not unpredictability — the auth layer, not the token,
+        # provides forgery resistance. A counter gives deterministic
+        # uniqueness with zero coupling to the seeded protocol RNG, so
+        # generating request ids never perturbs probe scheduling / jitter
+        # (which draw from the same shared SIM stream). It also stays
+        # unique when two ids are built at the same virtual nanosecond.
+        self._probe_request_seq = 0
 
         # Health gossip buffer for O(log n) health state dissemination (Phase 6.1)
         self._health_gossip_buffer = HealthGossipBuffer(
@@ -5824,10 +5832,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
 
     def _build_indirect_probe_request_id(self) -> str:
-        """Build a request token for fencing indirect-probe responses."""
+        """Build a request token for fencing indirect-probe responses.
+
+        ``{node}-{monotonic_ns}-{seq}``: the timestamp routes through the
+        clock seam and the suffix is a monotonic per-node counter, so the
+        token is deterministic under replay AND unique even when two are
+        built at the same virtual nanosecond. Deliberately NOT random —
+        the previous ``random.getrandbits(32)`` gave unpredictability the
+        token doesn't need (correlation, not secrecy) and, once seeded,
+        would have drawn from the shared protocol RNG and perturbed probe
+        scheduling."""
+        self._probe_request_seq += 1
         return (
-            f"{self._node_id.short}-{time.monotonic_ns()}-"
-            f"{random.getrandbits(32):08x}"
+            f"{self._node_id.short}-{self._clock.monotonic_ns()}-"
+            f"{self._probe_request_seq:08x}"
         )
 
     def _build_direct_probe_request_id(self) -> str:

@@ -76,10 +76,11 @@ class RealClock:
     delegating frame.
     """
 
-    __slots__ = ("monotonic", "time", "sleep", "wait_for")
+    __slots__ = ("monotonic", "monotonic_ns", "time", "sleep", "wait_for")
 
     def __init__(self) -> None:
         self.monotonic = time.monotonic
+        self.monotonic_ns = time.monotonic_ns
         self.time = time.time
         self.sleep = asyncio.sleep
         self.wait_for = _wait_for_adapter

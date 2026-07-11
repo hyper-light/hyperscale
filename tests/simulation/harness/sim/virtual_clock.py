@@ -67,6 +67,17 @@ class VirtualClock:
         """Return current virtual time in seconds."""
         return self._loop.time()
 
+    def monotonic_ns(self) -> int:
+        """Return current virtual time in integer nanoseconds.
+
+        Derived from the same virtual timeline as ``monotonic`` so
+        id-generation sites that embed a nanosecond timestamp are
+        deterministic under replay. Two reads at the same virtual
+        instant return the same value — uniqueness of those ids comes
+        from their seeded random component, not from this clock.
+        """
+        return int(self._loop.time() * 1_000_000_000)
+
     def time(self) -> float:
         """Return current virtual wall time (same as monotonic in SIM).
 

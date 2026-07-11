@@ -39,17 +39,33 @@ class Clock(Protocol):
     ``RealClock`` implementation binds to the stdlib functions and
     Phase 6's ``VirtualClock`` will model a simulated timeline.
 
-    Methods kept deliberately minimal — Phase 5's exit criterion is
-    that no production module under ``hyperscale/distributed/`` calls
-    ``time.monotonic`` / ``time.time`` / ``asyncio.sleep`` /
-    ``asyncio.wait_for`` directly, so the Protocol must cover exactly
-    those four operations and nothing more.
+    Methods kept minimal — Phase 5's exit criterion is that no
+    production module under ``hyperscale/distributed/`` calls
+    ``time.monotonic`` / ``time.time`` / ``time.monotonic_ns`` /
+    ``asyncio.sleep`` / ``asyncio.wait_for`` directly, so the Protocol
+    covers exactly those operations and nothing more. ``monotonic_ns``
+    joined the original four once id-generation sites were found reading
+    ``time.monotonic_ns`` directly for token uniqueness — the same
+    determinism seam applies.
     """
 
     def monotonic(self) -> float:
         """Return monotonically-increasing seconds (the
         ``time.monotonic`` equivalent). Use for elapsed-time / timeout
         bookkeeping. Never use for absolute wall time."""
+        ...
+
+    def monotonic_ns(self) -> int:
+        """Return monotonically-increasing nanoseconds (the
+        ``time.monotonic_ns`` equivalent).
+
+        Added because id-generation sites (SWIM probe request tokens,
+        gate rejoin tokens) embed a high-resolution monotonic timestamp
+        for uniqueness, and ``time.monotonic_ns`` is as much a
+        SIM-swappable time read as ``monotonic`` — leaving it un-seamed
+        left those ids non-deterministic under replay. Integer
+        nanoseconds, not float seconds, so the low-order digits that
+        give the token its uniqueness survive."""
         ...
 
     def time(self) -> float:

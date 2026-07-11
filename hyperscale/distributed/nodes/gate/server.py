@@ -3067,7 +3067,12 @@ class GateServer(HealthAwareServer):
         tcp_addr: tuple[str, int],
     ) -> GateInfo | None:
         """Verify a configured gate peer is live at ``tcp_addr``."""
-        request_id = f"{self._node_id.full}:gate-rejoin:{time.monotonic_ns()}"
+        # ``self._clock.monotonic_ns`` — NOT ``time.monotonic_ns``: this
+        # module never imported ``time``, so the old form was a latent
+        # NameError that would have crashed the first gate rejoin. The
+        # clock seam both fixes that and makes the token deterministic
+        # under SIM replay.
+        request_id = f"{self._node_id.full}:gate-rejoin:{self._clock.monotonic_ns()}"
         request = PingRequest(request_id=request_id)
         try:
             response, _clock = await self._send_tcp(
