@@ -2,7 +2,6 @@ import asyncio
 import functools
 import shlex
 import signal
-import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import (
     Any,
@@ -18,6 +17,7 @@ from typing import (
 from hyperscale.distributed.env import Env
 from .models import RunStatus, ShellProcess, TaskRun, TaskType
 from .snowflake import SnowflakeGenerator
+from .snowflake.constants import MAX_INSTANCE
 from .task import Task
 from .util.time_parser import TimeParser
 
@@ -54,6 +54,15 @@ class TaskRunner:
             config = Env()
 
         self.instance_id = instance_id
+        # One monotone, clock-seamed snowflake generator for this runner,
+        # shared by every Task it builds so all task/run ids come from a
+        # single ordered stream (distinct generators with the same
+        # instance would collide at the same virtual millisecond). The
+        # instance field is masked to the snowflake's bit width; callers
+        # pass distinct ``instance_id``s for cross-process uniqueness.
+        self._id_generator = SnowflakeGenerator(
+            instance=self.instance_id & MAX_INSTANCE
+        )
         self.tasks: Dict[str, Task[Any]] = {}
         self.results: Dict[str, Any] = {}
         self._cleanup_interval = TimeParser(config.MERCURY_SYNC_CLEANUP_INTERVAL).time
@@ -89,7 +98,10 @@ class TaskRunner:
         self._cleanup_task = asyncio.ensure_future(self._cleanup())
 
     def create_task_id(self):
-        return uuid.uuid4().int >> 64
+        # Deterministic, monotone snowflake id from this runner's shared
+        # generator (was ``uuid.uuid4().int >> 64`` — random, so
+        # non-deterministic under SIM and non-ordered).
+        return self._id_generator.generate_sync()
 
     def skip_tasks(self, task_names: list[str]) -> None:
         """
@@ -178,6 +190,7 @@ class TaskRunner:
                 keep=keep,
                 max_age=max_age,
                 keep_policy=keep_policy,
+                id_generator=self._id_generator,
             )
 
             self.tasks[command_name] = task
@@ -246,6 +259,7 @@ class TaskRunner:
                 max_age=max_age,
                 keep_policy=keep_policy,
                 task_type=TaskType.SHELL,
+                id_generator=self._id_generator,
             )
 
             self.tasks[command_name] = task
