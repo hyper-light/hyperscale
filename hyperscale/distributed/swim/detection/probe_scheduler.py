@@ -8,8 +8,21 @@ Uses a lockless copy-on-write pattern for high performance:
 """
 
 import asyncio
-import random
 from dataclasses import dataclass, field
+
+from hyperscale.distributed.runtime import Random, RealRandom
+
+
+# Module-level RNG seam (Phase 6). SWIM probe order is a determinism
+# input: the sequence in which peers are probed drives which cross-DC
+# messages are emitted in which order, so an unseeded ``random.shuffle``
+# here made multi-DC replay non-deterministic. Routing the shuffle /
+# random-insert through this singleton lets ``swap_defaults`` rebind it
+# to the seeded SIM ``Random`` while production keeps ``RealRandom``.
+# The Random Protocol exposes no ``shuffle`` / ``randint``; ``sample``
+# (full-length permutation) and ``randrange`` are the seam-mirrored
+# equivalents.
+_DEFAULT_RANDOM: Random = RealRandom()
 
 
 @dataclass(slots=True)
@@ -72,9 +85,12 @@ class ProbeScheduler:
         if new_set == self._member_set:
             return
         
-        # Create new shuffled tuple
-        new_list = list(members)
-        random.shuffle(new_list)
+        # Create new shuffled tuple. ``sample(list, len(list))`` is a
+        # full-length permutation — the seam-mirrored equivalent of
+        # ``random.shuffle`` (the Random Protocol has no ``shuffle``),
+        # so probe order is seeded and deterministic under SIM.
+        source_list = list(members)
+        new_list = _DEFAULT_RANDOM.sample(source_list, len(source_list))
         new_members = tuple(new_list)
         
         # Atomic swap (single reference assignment under GIL)
@@ -148,10 +164,12 @@ class ProbeScheduler:
         if member in self._member_set:
             return
         
-        # Insert at random position for unpredictability
+        # Insert at random position for unpredictability. ``randint(0, n)``
+        # is inclusive of both ends, so the seam-mirrored equivalent is
+        # ``randrange(0, n + 1)`` (allowing insertion at the tail).
         new_list = list(self._members)
         if new_list:
-            insert_idx = random.randint(0, len(new_list))
+            insert_idx = _DEFAULT_RANDOM.randrange(0, len(new_list) + 1)
             new_list.insert(insert_idx, member)
         else:
             new_list.append(member)
