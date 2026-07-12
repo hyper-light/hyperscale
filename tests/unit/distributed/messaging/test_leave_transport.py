@@ -20,6 +20,12 @@ class RecordingDispatcher:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[str, int], bytes, int]] = []
 
+    def is_dedup_eligible(self, msg_type_prefix: bytes) -> bool:
+        # Mirrors the production taxonomy: leave IS dedup-eligible
+        # (idempotent dissemination); the ingress consults this before
+        # the duplicate check.
+        return msg_type_prefix in (b"suspect", b"alive", b"join", b"leave")
+
     async def dispatch(
         self,
         addr: tuple[str, int],

@@ -40,7 +40,13 @@ class MockLeaderElection:
     async def handle_elected(self, target: tuple[str, int], term: int) -> None:
         pass
 
-    async def handle_heartbeat(self, target: tuple[str, int], term: int) -> None:
+    async def handle_heartbeat(
+        self,
+        target: tuple[str, int],
+        term: int,
+        heartbeat_seq: int = 0,
+        lease_duration_seconds: float | None = None,
+    ) -> None:
         pass
 
     async def handle_stepdown(self, target: tuple[str, int], term: int) -> None:
