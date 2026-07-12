@@ -54,7 +54,7 @@ class JobStatusPushHandler:
 
             # Order-guarded: pushes race polls with no wire sequence;
             # the applier rejects backward/post-terminal transitions.
-            self._status_applier.apply_push(
+            push_outcome = self._status_applier.apply_push(
                 job,
                 push.status,
                 push.total_completed,
@@ -62,6 +62,19 @@ class JobStatusPushHandler:
                 push.overall_rate,
                 push.elapsed_seconds,
             )
+            if push_outcome.unknown_vocabulary and self._logger:
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Status push for job {push.job_id[:8]} "
+                            f"carried status {push.status!r} outside "
+                            "the lifecycle vocabulary; not applied"
+                        ),
+                        node_host="client",
+                        node_port=0,
+                        node_id="client",
+                    )
+                )
 
             # Call user callback if registered
             callback = self._state._job_callbacks.get(push.job_id)
@@ -137,7 +150,7 @@ class JobBatchPushHandler:
             if not job:
                 return b"ok"
 
-            self._status_applier.apply_push(
+            batch_outcome = self._status_applier.apply_push(
                 job,
                 push.status,
                 push.total_completed,
@@ -145,6 +158,19 @@ class JobBatchPushHandler:
                 push.overall_rate,
                 push.elapsed_seconds,
             )
+            if batch_outcome.unknown_vocabulary and self._logger:
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Batch push for job {push.job_id[:8]} "
+                            f"carried status {push.status!r} outside "
+                            "the lifecycle vocabulary; not applied"
+                        ),
+                        node_host="client",
+                        node_port=0,
+                        node_id="client",
+                    )
+                )
 
             progress_callback = self._state._progress_callbacks.get(push.job_id)
             if progress_callback:

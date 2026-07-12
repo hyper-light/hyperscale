@@ -24,6 +24,9 @@ Stats application rides the same freshness reasoning:
 
 from hyperscale.distributed.jobs.job_status_order import JobStatusOrder
 from hyperscale.distributed.models.client import ClientJobResult
+from hyperscale.distributed.nodes.client.status_apply_outcome import (
+    StatusApplyOutcome,
+)
 
 
 class JobStatusApplier:
@@ -39,12 +42,20 @@ class JobStatusApplier:
     def order(self) -> JobStatusOrder:
         return self._order
 
-    def apply_status(self, job: ClientJobResult, new_status: str) -> bool:
-        """Apply a bare status transition; returns whether it applied."""
+    def apply_status(
+        self, job: ClientJobResult, new_status: str
+    ) -> StatusApplyOutcome:
+        """Apply a bare status transition.
+
+        ``REJECTED_UNKNOWN`` (vocabulary this client cannot rank) must
+        be logged by async callers — see ``StatusApplyOutcome``.
+        """
+        if self._order.rank(new_status) is None:
+            return StatusApplyOutcome.REJECTED_UNKNOWN
         if not self._order.should_apply(job.status, new_status):
-            return False
+            return StatusApplyOutcome.REJECTED_STALE
         job.status = new_status
-        return True
+        return StatusApplyOutcome.APPLIED
 
     def apply_push(
         self,
@@ -54,17 +65,17 @@ class JobStatusApplier:
         total_failed: int,
         overall_rate: float,
         elapsed_seconds: float,
-    ) -> bool:
+    ) -> StatusApplyOutcome:
         """Apply a full status+stats update (push or poll response).
 
-        Returns whether the STATUS advanced. Stats apply under their
-        own monotonicity rules unless the job is already terminal
+        Returns the STATUS outcome. Stats apply under their own
+        monotonicity rules unless the job is already terminal
         (frozen).
         """
         if self._order.is_terminal(job.status):
-            return False
+            return StatusApplyOutcome.REJECTED_STALE
 
-        status_applied = self.apply_status(job, status)
+        status_outcome = self.apply_status(job, status)
 
         job.total_completed = max(job.total_completed, total_completed)
         job.total_failed = max(job.total_failed, total_failed)
@@ -73,4 +84,4 @@ class JobStatusApplier:
             job.elapsed_seconds = elapsed_seconds
             job.overall_rate = overall_rate
 
-        return status_applied
+        return status_outcome

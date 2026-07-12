@@ -130,8 +130,11 @@ class ClientJobTracker:
             error: Error message
         """
         job = self._state._jobs.get(job_id)
-        if job and self._status_applier.apply_status(
-            job, JobStatus.FAILED.value
+        if (
+            job
+            and self._status_applier.apply_status(
+                job, JobStatus.FAILED.value
+            ).applied
         ):
             job.error = error
 
@@ -219,7 +222,7 @@ class ClientJobTracker:
             # Poll responses race pushes with no wire sequence — the
             # applier's order guard is what stops a stale response from
             # regressing a fresher (or terminal) status.
-            self._status_applier.apply_push(
+            poll_outcome = self._status_applier.apply_push(
                 job,
                 remote_status.status,
                 remote_status.total_completed,
@@ -229,6 +232,19 @@ class ClientJobTracker:
                     remote_status, "elapsed_seconds", job.elapsed_seconds
                 ),
             )
+            if poll_outcome.unknown_vocabulary:
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Poll for job {job_id[:8]} returned status "
+                            f"{remote_status.status!r} outside the "
+                            "lifecycle vocabulary; not applied"
+                        ),
+                        node_host="client",
+                        node_port=0,
+                        node_id="client",
+                    )
+                )
 
             if remote_status.status in TERMINAL_STATUSES:
                 event = self._state._job_events.get(job_id)
