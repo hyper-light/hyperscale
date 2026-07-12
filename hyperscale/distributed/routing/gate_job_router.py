@@ -181,6 +181,27 @@ class GateJobRouter:
         if not eligible:
             return self._empty_decision(job_id, job_state)
 
+        # Step 2.5: apply the client's explicit placement constraint.
+        # ``datacenters=[...]`` on a submission is a CONSTRAINT, not a
+        # scoring hint: the job runs only in the listed datacenters.
+        # Previously the list was a 10% score nudge in steady state and
+        # ignored outright in bootstrap mode (and in the legacy
+        # selector), so a cold cluster could route a dc-east-pinned job
+        # to dc-west. Selection quality — buckets, scoring, hysteresis,
+        # fallback chain — still operates within the listed set. An
+        # unsatisfiable constraint yields an empty decision so the
+        # dispatch layer rejects loudly rather than silently running
+        # the job somewhere the client excluded.
+        if preferred_datacenters:
+            constrained = [
+                candidate
+                for candidate in eligible
+                if candidate.datacenter_id in preferred_datacenters
+            ]
+            if not constrained:
+                return self._empty_decision(job_id, job_state)
+            eligible = constrained
+
         # Step 3: Select primary bucket
         bucket_result = self._bucket_selector.select_bucket(eligible)
 

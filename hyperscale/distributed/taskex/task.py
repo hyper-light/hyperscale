@@ -23,25 +23,6 @@ from hyperscale.distributed.runtime import Clock, RealClock
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
-# Fallback id source for a ``Task`` built without an injected generator.
-# ``TaskRunner`` — the only constructor of ``Task`` today — injects its
-# own instance-scoped generator, so ids are cross-process-unique and
-# ordered; this module singleton is the last-resort for any standalone
-# construction. Built lazily so that if it is ever first used under SIM
-# it captures the swapped ``VirtualClock`` rather than the import-time
-# ``RealClock`` (mirrors the ``_DEFAULT_CLOCK`` swap contract).
-_DEFAULT_ID_GENERATOR: SnowflakeGenerator | None = None
-
-
-def _fallback_id_generator() -> SnowflakeGenerator:
-    """Return the process-wide fallback id generator, constructing it on
-    first use so it binds the current (possibly swapped) default clock."""
-    global _DEFAULT_ID_GENERATOR
-    if _DEFAULT_ID_GENERATOR is None:
-        _DEFAULT_ID_GENERATOR = SnowflakeGenerator(instance=0)
-    return _DEFAULT_ID_GENERATOR
-
-
 T = TypeVar("T")
 
 
@@ -61,13 +42,15 @@ class Task(Generic[T]):
         max_age: str | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
         task_type: TaskType = TaskType.CALLABLE,
-        id_generator: SnowflakeGenerator | None = None,
+        id_generator: SnowflakeGenerator,
     ) -> None:
-        # Shared, monotone, deterministic id source (see generate_id).
-        # Set before any id is drawn.
-        self._id_generator = (
-            id_generator if id_generator is not None else _fallback_id_generator()
-        )
+        # Shared, monotone, deterministic id source owned and injected
+        # by the constructing TaskRunner — required, so every Task in a
+        # runner draws from ONE ordered stream (separate generators with
+        # the same instance would collide at the same virtual
+        # millisecond, and a module-level fallback would be hidden
+        # mutable global state). Set before any id is drawn.
+        self._id_generator = id_generator
         self.task_id = self.generate_id()
         self.name: str = name
         self.args = args

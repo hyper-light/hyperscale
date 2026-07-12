@@ -768,20 +768,30 @@ class GateHealthCoordinator:
                 return ([], [], "initializing")
             return ([], [], "unhealthy")
 
+        # An explicit ``datacenters=[...]`` list on the submission is a
+        # placement CONSTRAINT (mirroring the AD-36 router): selection
+        # only considers the listed datacenters. This selector
+        # previously accepted ``preferred`` and never read it, so a
+        # dc-pinned job could silently run anywhere.
+        preferred_set = set(preferred) if preferred else None
+
+        def _in_scope(datacenter_id: str) -> bool:
+            return preferred_set is None or datacenter_id in preferred_set
+
         healthy = [
             dc
             for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.HEALTHY.value
+            if status.health == DatacenterHealth.HEALTHY.value and _in_scope(dc)
         ]
         busy = [
             dc
             for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.BUSY.value
+            if status.health == DatacenterHealth.BUSY.value and _in_scope(dc)
         ]
         degraded = [
             dc
             for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.DEGRADED.value
+            if status.health == DatacenterHealth.DEGRADED.value and _in_scope(dc)
         ]
 
         if healthy:
@@ -792,12 +802,16 @@ class GateHealthCoordinator:
             worst_health = "degraded"
         else:
             # Nothing usable. Distinguish "still coming up" from "down":
-            # any datacenter in its pre-first-heartbeat window makes the
-            # aggregate INITIALIZING (submissions rejected as transient,
-            # clients retry) rather than UNHEALTHY (jobs failed).
+            # any in-scope datacenter in its pre-first-heartbeat window
+            # makes the aggregate INITIALIZING (submissions rejected as
+            # transient, clients retry) rather than UNHEALTHY (jobs
+            # failed). Scoped to the constraint so a pinned job's
+            # rejection reflects the PINNED datacenters' state, not an
+            # unrelated datacenter that happens to be booting.
             initializing = any(
                 status.health == DatacenterHealth.INITIALIZING.value
-                for status in dc_health.values()
+                for dc, status in dc_health.items()
+                if _in_scope(dc)
             )
             return ([], [], "initializing" if initializing else "unhealthy")
 

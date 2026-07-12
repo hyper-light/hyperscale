@@ -496,10 +496,20 @@ class GateDispatchCoordinator:
                 )
             if not primary_dcs:
                 await self._release_job_lease(submission.job_id)
+                # A dc-pinned submission fails LOUDLY when its placement
+                # constraint is unsatisfiable — never silently runs in a
+                # datacenter the client excluded.
+                if submission.datacenters:
+                    constraint_error = (
+                        "No available datacenters among requested placement "
+                        f"constraint {sorted(submission.datacenters)}"
+                    )
+                else:
+                    constraint_error = "No available datacenters"
                 return JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error="No available datacenters",
+                    error=constraint_error,
                 )
 
             # Setup job tracking

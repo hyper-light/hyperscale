@@ -95,10 +95,34 @@ def gate_dispatch_client_entry(context, host, port, gate_tcp_address) -> None:
     _run_client_submission(context, client, log)
 
 
-def _run_client_submission(context, client, log: list) -> None:
+def pinned_gate_dispatch_client_entry(
+    context, host, port, gate_tcp_address, pinned_datacenters
+) -> None:
+    """Client child: submit through a gate with an explicit datacenter
+    placement CONSTRAINT (``datacenters=[...]``) — the job must run only
+    in the listed datacenters, regardless of what free selection would
+    have picked."""
+    client = HyperscaleClient(
+        host=host,
+        port=port,
+        env=_env(),
+        gates=[gate_tcp_address],
+        **context.sim_kwargs(),
+    )
+    log: list = []
+    context.set_result(log)
+    _run_client_submission(
+        context, client, log, datacenters=list(pinned_datacenters)
+    )
+
+
+def _run_client_submission(context, client, log: list, datacenters=None) -> None:
     """Shared submit -> watch -> await-completion flow for the client
     entries; identical await ordering regardless of target tier so the
-    pinned schedules of existing scenarios stay byte-for-byte."""
+    pinned schedules of existing scenarios stay byte-for-byte.
+    ``datacenters=None`` matches ``submit_job``'s own default, so
+    existing entries are unchanged; a list applies the placement
+    constraint."""
 
     async def run() -> None:
         await client.start()
@@ -110,6 +134,7 @@ def _run_client_submission(context, client, log: list) -> None:
                     workflows=[([], SimPingWorkflow())],
                     vus=2,
                     timeout_seconds=30.0,
+                    datacenters=datacenters,
                 )
             except Exception as submit_error:
                 # Production behavior: the manager rejects submissions

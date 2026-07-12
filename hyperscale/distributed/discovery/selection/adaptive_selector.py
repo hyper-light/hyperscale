@@ -17,6 +17,16 @@ from hyperscale.distributed.discovery.selection.ewma_tracker import (
     EWMAConfig,
 )
 from hyperscale.distributed.discovery.models.peer_info import PeerInfo
+from hyperscale.distributed.runtime import Random, RealRandom
+
+
+# Module-level RNG seam (Phase 6). When no explicit ``random_seed`` is
+# configured, random-selection mode draws from this singleton, which
+# ``swap_defaults`` rebinds to the seeded SIM ``Random`` — previously an
+# unseeded ``random.Random(None)`` made random-mode peer selection
+# non-deterministic under replay. An explicit seed still gets its own
+# independent ``random.Random(seed)`` stream.
+_DEFAULT_RANDOM: Random = RealRandom()
 
 
 @dataclass
@@ -117,13 +127,21 @@ class AdaptiveEWMASelector:
     _ewma: EWMATracker = field(init=False)
     """EWMA tracker for latency feedback."""
 
-    _random: random.Random = field(init=False, repr=False)
-    """Random number generator for random selection mode."""
+    _random: Random = field(init=False, repr=False)
+    """Random source for random selection mode (only ``sample`` is used).
+
+    Explicit ``random_seed`` -> an independent ``random.Random(seed)``
+    stream; no seed -> the module ``_DEFAULT_RANDOM`` seam so SIM replay
+    is deterministic and production keeps ``RealRandom``.
+    """
 
     def __post_init__(self) -> None:
         """Initialize EWMA tracker and RNG."""
         self._ewma = EWMATracker(config=self.ewma_config)
-        self._random = random.Random(self.power_of_two_config.random_seed)
+        if (seed := self.power_of_two_config.random_seed) is not None:
+            self._random = random.Random(seed)
+        else:
+            self._random = _DEFAULT_RANDOM
 
     def add_peer(self, peer_id: str, weight: float = 1.0) -> None:
         """

@@ -1,5 +1,4 @@
 import asyncio
-import uuid
 from collections import defaultdict
 import time
 from typing import (
@@ -23,9 +22,18 @@ T = TypeVar("T")
 
 class Task(Generic[T]):
     def __init__(
-        self, task: Callable[[], T]
+        self,
+        task: Callable[[], T],
+        id_generator: SnowflakeGenerator,
     ) -> None:
-        self.task_id = Task.create_id()
+        # Shared, monotone id source owned and injected by the
+        # constructing TaskRunner — required, so every Task in a runner
+        # draws from ONE ordered stream (separate generators with the
+        # same instance would collide at the same millisecond, and a
+        # module-level fallback would be hidden mutable global state).
+        # Set before any id is drawn.
+        self._id_generator = id_generator
+        self.task_id = self.create_id()
         self.name: str = task.name
         self.schedule: Optional[int | float] = task.schedule
         self.trigger: Literal["MANUAL", "ON_START"] = task.trigger
@@ -53,10 +61,13 @@ class Task(Generic[T]):
 
         return RunStatus.IDLE
     
-    @classmethod
-    def create_id(cls):
-        return uuid.uuid4().int >> 64
-    
+    def create_id(self) -> int:
+        # Snowflake id: monotone + totally ordered, so ``latest()`` /
+        # ``max(self._runs)`` and the count-eviction ``sorted(...)`` are
+        # correct (a random ``uuid4`` id broke that ordering — latest()
+        # could return a stale run and eviction could drop the newest).
+        return self._id_generator.generate()
+
 
     def get_run_status(self, run_id: str):
         if run := self._runs.get(run_id):
@@ -161,7 +172,7 @@ class Task(Generic[T]):
             timeout = self.timeout
 
         if run_id is None:
-            run_id = Task.create_id()
+            run_id = self.create_id()
             
         run = Run(run_id, self.call, timeout=timeout)
 
@@ -184,7 +195,7 @@ class Task(Generic[T]):
         **kwargs,
     ):
         if run_id is None:
-            run_id = Task.create_id()
+            run_id = self.create_id()
 
         if timeout is None:
             timeout = self.timeout
@@ -210,7 +221,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    Task.create_id(),
+                    self.create_id(),
                     self.call,
                     timeout=self.timeout,
                 )
@@ -228,7 +239,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    Task.create_id(),
+                    self.create_id(),
                     self.call,
                     timeout=self.timeout,
                 )

@@ -303,6 +303,12 @@ class HyperscaleClient(MercurySyncBaseServer):
     ) -> str:
         """Submit a job for execution (delegates to ClientJobSubmitter).
 
+        ``datacenters`` is a placement CONSTRAINT, not a hint: when
+        provided, the job runs only in the listed datacenters (the gate
+        still picks the best of them by health/score). If none of the
+        listed datacenters is available, the submission is rejected
+        with an explicit error — it never silently runs elsewhere.
+
         Phase H2: ``timeout_seconds=None`` (the default) lets the
         manager apply the AD-26/AD-34 override hierarchy:
         ``Workflow.timeout`` (when overridden in the workflow class)
