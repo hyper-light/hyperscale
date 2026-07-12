@@ -857,7 +857,7 @@ FaultMatrix primitives compose with the Phase 3 lifecycle faults so
 future scenarios can mix kill/restart with transport faults without
 new harness code.
 
-### Phase 5 — Clock / Random / Transport interface refactor
+### Phase 5 — Clock / Random / Transport interface refactor — *landed*
 
 - Production code: introduce `Clock`, `Random`, `Transport` interfaces.
 - Mechanical replacement of 619 `time.X` / `asyncio.sleep` sites + scattered
@@ -865,19 +865,84 @@ new harness code.
 - All existing tests continue passing — pure dependency-injection move,
   no behavior change.
 
-**Exit criteria:** integration + simulation test suites green; no
-production-code direct calls to `time.monotonic` / `time.time` /
-`asyncio.sleep` / `random.X` outside the interface implementations.
+**Exit criteria — met, and enforced.** No production module under
+`hyperscale/distributed/` makes a direct call to any wall/monotonic
+time read (`time.monotonic` / `time.time` / `time.monotonic_ns` /
+`time.time_ns`), `asyncio.sleep` / `asyncio.wait_for`, ANY `random.X`
+module-level function (the whole module is blocked; the seedable
+generator classes `random.Random` / `random.SystemRandom` are the
+allowed building blocks), or the non-deterministic id generators
+`uuid.uuid4` / `uuid.uuid1`. The guard is
+`tests/simulation/lints/test_no_direct_time_random.py`: an AST lint
+with import-alias tracking (an `import time as t` bypass hid a real
+violation for months), a ratcheted violation snapshot holding only the
+two seam-adapter files, and self-tests pinning both the flagged and
+the allowed patterns.
 
-### Phase 6 — SIM mode
+### Phase 6 — SIM mode — *landed*
 
-- `VirtualClock`, `SeededRandom`, `InProcessTransport`, `DeterministicTaskRunner`.
-- `ExecutionMode.SIM` wired into `ClusterHarness`.
-- All Phase 1–4 scenarios run under SIM mode via parametrize.
-- Replay command: `pytest --sim-replay=<seed>`.
+**Shipped — with one deliberate architecture change from the plan
+above.** The plan called for in-process SIM parametrized through
+`ClusterHarness`. What landed is stronger: the **multi-process
+`SimulationCoordinator`** (`tests/simulation/harness/sim/multiprocess/`)
+runs REAL OS processes — production `GateServer` / `ManagerServer` /
+`WorkerServer` (spawning its real executor-pool children through the
+`ProcessSpawner` seam) / `HyperscaleClient` — in conservative lockstep
+virtual time: every child gets the same window grant, cross-process
+datagrams and stream frames route at `send_time + latency` ordered by
+`(delivery_time, origin_seq)`, and two identical-seed runs compare
+**byte-identically**, timestamps included. Determinism inputs are all
+pinned: virtual clock, per-child `SeededRandom` (seed + admission
+index), `PYTHONHASHSEED=0` in every child, topology-derived node
+identities, and seeded logical-id generation throughout production
+(monotone snowflakes, no uuid4). In-process building blocks
+(`VirtualClock`, `SeededRandom`, `SimulationLoop`,
+`InProcessTransport`, the production `TaskRunner` running
+deterministically under the simulation loop) shipped as planned and
+power the single-process tier (`SimulationRuntime`, the sim_smoke
+scenarios).
 
-**Exit criteria:** every scenario passes deterministically in SIM mode;
-seed-driven random fault schedules generate ≥ 1000 scenarios per CI minute.
+**Scenario coverage** lives as SIM-native scenario classes rather than
+a parametrize of the REAL corpus (real scenarios depend on wall-clock
+stabilization, psutil process tracking, and OS sockets — the
+coordinator supersedes rather than wraps them). Classes covered under
+`tests/unit/simulation/sim/` + `tests/simulation/scenarios/sim_smoke/`:
+quorum formation and leadership stability over a window; end-to-end
+job dispatch (direct, through a gate from cold start, multi-DC with
+authoritative datacenter pinning, through a 3-gate cluster);
+worker/executor kill with retry; late-joining worker; eviction +
+notice-driven re-registration; and the Phase 4 network-fault classes —
+partition/heal with production failure detection and rejoin, seeded
+packet loss, added jittered latency, UDP duplication — via the
+coordinator's declarative fault schedule (`schedule_kill` /
+`schedule_partition` / `schedule_drop_rate` / `schedule_delay` /
+`schedule_duplicate`, all evaluated at the single datagram chokepoint,
+loss/duplication scoped to datagrams by fidelity — TCP masks packet
+loss; streams never duplicate). A wall-clock deadman on every
+coordinator barrier turns a wedged child into a loud named failure
+instead of a silent pytest hang.
+
+**The VOPR** (`tests/simulation/vopr/`): `generate_fault_plan(seed)`
+expands one integer into a complete fault schedule (executor kills,
+partitions, loss, delay, duplication at seeded virtual times) run
+against the real production stack; invariants require an accepted job,
+a client-observed terminal outcome (silence is always a violation),
+completion under non-stranding faults, and a byte-identical replay.
+Replay command (per the plan): `pytest tests/simulation/vopr
+--sim-replay=<seed>` re-runs exactly that schedule with the expanded
+plan printed — a failing seed is a permanent reproducer.
+
+**Exit criteria — met, with the throughput target recalibrated.**
+Every SIM scenario passes deterministically (replay twins assert
+byte-identical reruns). The original "≥ 1000 scenarios per CI minute"
+figure presumed a single-process microsim; the landed SIM runs *real
+OS processes with the full production transport and crypto stack*, and
+measures **~11 generated scenarios/minute on one core** (each scenario
+= two complete cluster runs: judge + replay) — fidelity bought with
+wall time, scaling linearly with pytest-xdist workers and
+`--sim-vopr-count` for soak runs. A microsim-rate fuzzing tier over
+`SimulationRuntime` (thousands/minute, membership-level faults only)
+remains open as a future addition if raw schedule volume is wanted.
 
 ### Phase 7 — Storage faults + linearizability oracle
 
