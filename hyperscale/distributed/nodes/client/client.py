@@ -39,7 +39,12 @@ from hyperscale.distributed.models import (
     GlobalJobStatus,
 )
 from hyperscale.distributed.env.env import Env
-from hyperscale.distributed.runtime import Clock, Random, TransportFactory
+from hyperscale.distributed.runtime import (
+    Clock,
+    Random,
+    RealClock,
+    TransportFactory,
+)
 from hyperscale.distributed.reliability.rate_limiting import (
     AdaptiveRateLimiter,
     AdaptiveRateLimitConfig,
@@ -49,6 +54,9 @@ from hyperscale.distributed.reliability.overload import HybridOverloadDetector
 # Import all client modules
 from hyperscale.distributed.idempotency.idempotency_key import (
     IdempotencyKeyGenerator,
+)
+from hyperscale.distributed.jobs.logical_id_generator import (
+    LogicalIdGenerator,
 )
 from hyperscale.distributed.nodes.client.config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
@@ -196,6 +204,10 @@ class HyperscaleClient(MercurySyncBaseServer):
             send_tcp_func=self.send_tcp,
             idempotency_key_generator=IdempotencyKeyGenerator(
                 client_id=f"{host}:{port}"
+            ),
+            logical_id_generator=LogicalIdGenerator(
+                scope=f"{host}-{port}",
+                clock=clock if clock is not None else RealClock(),
             ),
         )
         self._cancellation = ClientCancellationManager(

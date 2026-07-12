@@ -20,6 +20,10 @@ import pytest
 from hyperscale.distributed.idempotency.idempotency_key import (
     IdempotencyKeyGenerator,
 )
+from hyperscale.distributed.jobs.logical_id_generator import (
+    LogicalIdGenerator,
+)
+from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.nodes.client.submission import ClientJobSubmitter
 from hyperscale.distributed.nodes.client.cancellation import ClientCancellationManager
 from hyperscale.distributed.nodes.client.config import ClientConfig
@@ -81,6 +85,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         # Simple workflow
@@ -111,6 +116,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         status_callback = Mock()
@@ -165,6 +171,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         workflow = Mock()
@@ -208,6 +215,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         workflow = Mock()
@@ -241,6 +249,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         workflow = Mock()
@@ -278,6 +287,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         workflow = Mock()
@@ -302,6 +312,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         # Create huge workflow that exceeds 5MB
@@ -336,6 +347,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         workflow = Mock()
@@ -360,6 +372,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         # 100 workflows
@@ -394,6 +407,7 @@ class TestClientJobSubmitter:
             self.protocol,
             send_tcp,
             IdempotencyKeyGenerator(client_id="test-client"),
+            LogicalIdGenerator(scope="test-client", clock=RealClock()),
         )
 
         async def submit_job():

@@ -5,7 +5,6 @@ Handles job submission with retry logic, leader redirection, and protocol negoti
 """
 
 import asyncio
-import secrets
 from typing import Callable
 
 import cloudpickle
@@ -14,6 +13,9 @@ from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE
 from hyperscale.distributed.errors import MessageTooLargeError
 from hyperscale.distributed.idempotency.idempotency_key import (
     IdempotencyKeyGenerator,
+)
+from hyperscale.distributed.jobs.logical_id_generator import (
+    LogicalIdGenerator,
 )
 from hyperscale.distributed.models import (
     JobSubmission,
@@ -88,6 +90,7 @@ class ClientJobSubmitter:
         protocol,  # ClientProtocol
         send_tcp_func,  # Callable for sending TCP messages
         idempotency_key_generator: IdempotencyKeyGenerator,
+        logical_id_generator: LogicalIdGenerator,
     ) -> None:
         self._state = state
         self._config = config
@@ -97,6 +100,7 @@ class ClientJobSubmitter:
         self._protocol = protocol
         self._send_tcp = send_tcp_func
         self._idempotency_key_generator = idempotency_key_generator
+        self._logical_id_generator = logical_id_generator
 
     async def submit_job(
         self,
@@ -133,7 +137,13 @@ class ClientJobSubmitter:
             RuntimeError: If no managers/gates configured or submission fails
             MessageTooLargeError: If serialized workflows exceed 5MB
         """
-        job_id = f"job-{secrets.token_hex(8)}"
+        # Deterministic-unique (identity + monotonic ns + counter):
+        # job ids appear in every downstream message and WAL record, so
+        # wall-entropy ids would break SIM byte-identical replay — and
+        # the shared seeded Random is off-limits for ids (consuming
+        # draws reshuffles the protocol schedule). Uniqueness is the
+        # requirement; the AD-40 idempotency key carries anti-replay.
+        job_id = self._logical_id_generator.generate("job")
 
         # Extract reporter configs and generate workflow IDs
         workflows_with_ids, extracted_local_configs = self._prepare_workflows(workflows)
@@ -215,7 +225,7 @@ class ClientJobSubmitter:
         extracted_local_configs: list = []
 
         for dependencies, workflow_instance in workflows:
-            workflow_id = f"wf-{secrets.token_hex(8)}"
+            workflow_id = self._logical_id_generator.generate("wf")
             workflows_with_ids.append((workflow_id, dependencies, workflow_instance))
 
             # Extract reporter config from workflow if present
