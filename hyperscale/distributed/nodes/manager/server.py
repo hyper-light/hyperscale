@@ -6,6 +6,7 @@ All business logic is delegated to specialized coordinators.
 """
 
 import asyncio
+import hashlib
 import traceback
 import cloudpickle
 from pathlib import Path
@@ -148,6 +149,8 @@ from hyperscale.distributed.jobs import (
 )
 from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
 from hyperscale.distributed.ledger.wal import NodeWAL
+from hyperscale.distributed.ledger.job_ledger import JobLedger
+from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.logging.lsn import HybridLamportClock
 from hyperscale.distributed.jobs.timeout_strategy import (
     TimeoutStrategy,
@@ -291,6 +294,7 @@ class ManagerServer(HealthAwareServer):
         )
 
         self._node_wal: NodeWAL | None = None
+        self._job_ledger: JobLedger | None = None
 
         self._env: Env = env
         self._seed_gates: list[tuple[str, int]] = gate_addrs or []
@@ -842,13 +846,22 @@ class ManagerServer(HealthAwareServer):
         await self.start_server(init_context=self._env.get_swim_init_context())
 
         if self._config.wal_data_dir is not None:
-            # Reuse the shared HLC created in __init__ so Raft proposals and
-            # WAL writes are causally ordered against the same logical clock.
-            self._node_wal = await NodeWAL.open(
-                path=self._config.wal_data_dir / "wal",
-                clock=self._hlc,
+            # The full event-sourced job ledger (WAL + checkpoints +
+            # archive + recovery), sharing the HLC created in __init__
+            # so Raft proposals and job events are causally ordered
+            # against the same logical clock. Recovery replays the WAL
+            # on open: jobs this manager accepted survive a restart.
+            self._job_ledger = await JobLedger.open(
+                wal_path=self._config.wal_data_dir / "wal",
+                checkpoint_dir=self._config.wal_data_dir / "checkpoints",
+                archive_dir=self._config.wal_data_dir / "archive",
+                region_code=self._node_id.datacenter,
+                gate_id=self._node_id.short,
+                node_id=1,
                 logger=self._udp_logger,
+                clock=self._hlc,
             )
+            self._node_wal = self._job_ledger._wal
 
         ledger_base_dir = (
             self._config.wal_data_dir
@@ -983,7 +996,10 @@ class ManagerServer(HealthAwareServer):
         if self._idempotency_ledger is not None:
             await self._idempotency_ledger.close()
 
-        if self._node_wal is not None:
+        if self._job_ledger is not None:
+            await self._job_ledger.close()
+            self._node_wal = None
+        elif self._node_wal is not None:
             await self._node_wal.close()
 
         # Stop Raft consensus
@@ -5449,6 +5465,16 @@ class ManagerServer(HealthAwareServer):
             job.timestamp = job.completed_at
             elapsed_seconds = job.elapsed_seconds()
 
+            if self._job_ledger is not None:
+                await self._job_ledger.complete_job(
+                    job.job_id,
+                    final_status=JobStatus.TIMEOUT.value,
+                    total_completed=0,
+                    total_failed=0,
+                    duration_ms=int(elapsed_seconds * 1000),
+                    durability=DurabilityLevel.LOCAL,
+                )
+
             for workflow in job.workflows.values():
                 if workflow.status in terminal_workflow_statuses:
                     continue
@@ -7278,6 +7304,23 @@ class ManagerServer(HealthAwareServer):
 
             job.status = JobStatus.CANCELLED.value
             job.completed_at = self._clock.time()
+
+            if self._job_ledger is not None:
+                await self._job_ledger.request_cancellation(
+                    job_id,
+                    reason=reason,
+                    requestor_id=requester_id,
+                    durability=DurabilityLevel.LOCAL,
+                )
+                await self._job_ledger.complete_job(
+                    job_id,
+                    final_status=JobStatus.CANCELLED.value,
+                    total_completed=0,
+                    total_failed=0,
+                    duration_ms=int(job.elapsed_seconds() * 1000),
+                    durability=DurabilityLevel.LOCAL,
+                )
+
             await self._manager_state.increment_state_version()
 
             # Phase F3: emit FAILED outcomes for any still-in-flight
@@ -8674,6 +8717,34 @@ class ManagerServer(HealthAwareServer):
                 callback_addr=callback_addr,
             )
 
+            if self._job_ledger is not None:
+                # Durable acceptance record (AD-38 LOCAL tier: fsynced
+                # via group commit — a solo manager has no replicators,
+                # so LOCAL is the honest level). A restart after this
+                # point recovers the job instead of forgetting it.
+                _ledger_job_id, create_result = (
+                    await self._job_ledger.create_job(
+                        spec_hash=hashlib.sha256(
+                            submission.workflows
+                        ).digest(),
+                        assigned_datacenters=(self._node_id.datacenter,),
+                        requestor_id=f"{addr[0]}:{addr[1]}",
+                        durability=DurabilityLevel.LOCAL,
+                        job_id=submission.job_id,
+                    )
+                )
+                if not create_result.success:
+                    raise RuntimeError(
+                        "job ledger rejected acceptance record for "
+                        f"{submission.job_id}: {create_result.error}"
+                    )
+                await self._job_ledger.accept_job(
+                    submission.job_id,
+                    datacenter_id=self._node_id.datacenter,
+                    worker_count=len(self._worker_pool.iter_workers()),
+                    durability=DurabilityLevel.LOCAL,
+                )
+
             job_info.leader_node_id = self._node_id.full
             job_info.leader_addr = (self._host, self._tcp_port)
             job_info.fencing_token = 1
@@ -9727,6 +9798,20 @@ class ManagerServer(HealthAwareServer):
             workflow_results, errors, total_completed, total_failed = (
                 self._aggregate_workflow_results(job)
             )
+
+            if self._job_ledger is not None:
+                # Durable terminal record; idempotent (the ledger
+                # refuses a second terminal transition). The ledger's
+                # own lock nests inside job.lock with no reverse order
+                # anywhere, so this cannot deadlock.
+                await self._job_ledger.complete_job(
+                    job_id,
+                    final_status=final_status,
+                    total_completed=total_completed,
+                    total_failed=total_failed,
+                    duration_ms=int(elapsed_seconds * 1000),
+                    durability=DurabilityLevel.LOCAL,
+                )
 
         # Tier-1 terminal push to whoever registered the job callback.
         # The gate path below covers L3 deployments; without this push,

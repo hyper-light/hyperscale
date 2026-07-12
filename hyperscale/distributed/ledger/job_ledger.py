@@ -9,7 +9,7 @@ from hyperscale.logging.lsn import HybridLamportClock
 
 from .archive.job_archive_store import JobArchiveStore
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock, Filesystem, RealClock
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -91,9 +91,18 @@ class JobLedger:
         global_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
         completed_cache_size: int = DEFAULT_COMPLETED_CACHE_SIZE,
         logger: Logger | None = None,
+        clock: HybridLamportClock | None = None,
+        filesystem: Filesystem | None = None,
     ) -> JobLedger:
-        clock = HybridLamportClock(node_id=node_id)
-        wal = await NodeWAL.open(path=wal_path, clock=clock, logger=logger)
+        """``clock`` lets the owning node share its HLC so ledger
+        events are causally ordered against its other WAL/Raft writes;
+        ``filesystem`` is the Phase 7 storage seam (None binds each
+        component's module default)."""
+        if clock is None:
+            clock = HybridLamportClock(node_id=node_id)
+        wal = await NodeWAL.open(
+            path=wal_path, clock=clock, logger=logger, filesystem=filesystem
+        )
 
         pipeline = CommitPipeline(
             wal=wal,
@@ -102,10 +111,14 @@ class JobLedger:
             logger=logger,
         )
 
-        checkpoint_manager = CheckpointManager(checkpoint_dir=checkpoint_dir)
+        checkpoint_manager = CheckpointManager(
+            checkpoint_dir=checkpoint_dir, filesystem=filesystem
+        )
         await checkpoint_manager.initialize()
 
-        archive_store = JobArchiveStore(archive_dir=archive_dir)
+        archive_store = JobArchiveStore(
+            archive_dir=archive_dir, filesystem=filesystem
+        )
         await archive_store.initialize()
 
         job_id_generator = JobIdGenerator(
@@ -207,9 +220,14 @@ class JobLedger:
         assigned_datacenters: tuple[str, ...],
         requestor_id: str,
         durability: DurabilityLevel = DurabilityLevel.GLOBAL,
+        job_id: str | None = None,
     ) -> tuple[str, CommitResult]:
+        """``job_id`` records an externally-generated id (the client
+        generates job ids at submission); None generates one here (the
+        gate path)."""
         async with self._lock:
-            job_id = await self._job_id_generator.generate()
+            if job_id is None:
+                job_id = await self._job_id_generator.generate()
             fence_token = self._next_fence_token
             self._next_fence_token += 1
 
