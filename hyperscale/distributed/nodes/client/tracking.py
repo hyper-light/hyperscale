@@ -31,6 +31,7 @@ TERMINAL_STATUSES = frozenset(
         JobStatus.COMPLETED.value,
         JobStatus.FAILED.value,
         JobStatus.CANCELLED.value,
+        JobStatus.TIMEOUT.value,
     }
 )
 

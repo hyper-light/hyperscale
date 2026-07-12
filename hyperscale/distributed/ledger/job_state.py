@@ -6,8 +6,11 @@ import msgspec
 
 from hyperscale.logging.lsn import LSN
 
+# Both timeout spellings are live vocabulary: managers write
+# JobStatus.TIMEOUT.value ("timeout"), the gate timeout tracker records
+# "timed_out" — the gate-side normalizers accept both and so must we.
 TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"completed", "failed", "cancelled", "timed_out"}
+    {"completed", "failed", "cancelled", "timeout", "timed_out"}
 )
 
 

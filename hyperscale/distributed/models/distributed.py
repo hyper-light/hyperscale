@@ -45,6 +45,7 @@ class JobStatus(str, Enum):
     FAILED = "failed"  # Failed (may be retried)
     CANCELLED = "cancelled"  # User cancelled
     TIMEOUT = "timeout"  # Exceeded time limit
+    UNKNOWN = "unknown"  # Not known to this node (status queries only)
 
 
 class WorkflowStatus(str, Enum):
