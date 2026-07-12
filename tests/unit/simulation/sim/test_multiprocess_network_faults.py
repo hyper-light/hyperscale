@@ -102,7 +102,26 @@ def test_partition_detected_and_membership_recovers_after_heal():
         for entry in manager_log
         if entry[0] == "worker-count" and entry[1] == 1
     ][-1]
-    assert 20.0 < lost_time < 110.0, manager_log
+    # Assert the detector's DESIGN bound for a witness-less topology —
+    # not merely "inside the window": a generous window can hide
+    # multi-x detection drift. Traced decomposition (probe scripts in
+    # the Phase 7 series): in a 2-node cluster a suspicion can never
+    # gather a second confirmer, so Lifeguard runs the MAX leg of the
+    # AD-30 bracket — global_max_timeout (30s) x the bounded prob-OR
+    # composition of reliability multipliers (elevated LHM + low
+    # Vivaldi confidence composed to ~2.1x here) — then the
+    # unwitnessed-death gate adds k final confirm probes (~4s). Cut at
+    # 20, suspicion arms on the first missed round (~3-5s later),
+    # death lands ~71s after the cut. The ceiling guards the
+    # composition staying BOUNDED: pre-fix it compounded to 10-30x
+    # (see the AD-30 notes in hierarchical_failure_detector), which
+    # this assertion would catch as >85s.
+    detection_latency = lost_time - 20.0
+    assert 25.0 <= detection_latency <= 85.0, (
+        f"partition death latency {detection_latency}s is outside the "
+        "witness-less design bound (max-leg x bounded composition + "
+        f"gate probes): {manager_log}"
+    )
     assert recovered_time > 110.0, manager_log
 
 

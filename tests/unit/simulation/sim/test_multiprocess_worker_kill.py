@@ -74,7 +74,16 @@ def test_worker_kill_fails_job_and_manager_reaps_the_worker():
     lost = [entry for entry in manager_log if entry[0] == "worker-lost"]
     assert len(registered) == 1, manager_log
     assert len(lost) == 1, manager_log
-    assert _KILL_AT < lost[0][1] < _CEILING
+    # The failure detector's design bound: ~38s of sustained silence
+    # (LHM-stretched suspicion) before declaring death. Assert the
+    # BOUND, not merely "before the ceiling": at one intermediate tree
+    # state detection drifted to 2-3x this bound and a generous
+    # ceiling hid it. 20s floor guards against false-instant death.
+    detection_latency = lost[0][1] - _KILL_AT
+    assert 20.0 <= detection_latency <= 70.0, (
+        f"death detection latency {detection_latency}s is outside the "
+        f"design bound (~38s +/- margin): {manager_log}"
+    )
 
     # The in-flight job terminated loudly for the client — no silent hang.
     finished = [entry for entry in client_log if entry[0] == "job-finished"]
