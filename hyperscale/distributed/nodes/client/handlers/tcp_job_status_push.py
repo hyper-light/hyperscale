@@ -8,6 +8,9 @@ import asyncio
 
 from hyperscale.distributed.models import JobStatusPush, JobBatchPush
 from hyperscale.distributed.nodes.client.state import ClientState
+from hyperscale.distributed.nodes.client.status_application import (
+    JobStatusApplier,
+)
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
@@ -23,6 +26,7 @@ class JobStatusPushHandler:
     def __init__(self, state: ClientState, logger: Logger) -> None:
         self._state = state
         self._logger = logger
+        self._status_applier = JobStatusApplier()
 
     async def handle(
         self,
@@ -48,12 +52,16 @@ class JobStatusPushHandler:
             if not job:
                 return b"ok"  # Job not tracked, ignore
 
-            # Update job status
-            job.status = push.status
-            job.total_completed = push.total_completed
-            job.total_failed = push.total_failed
-            job.overall_rate = push.overall_rate
-            job.elapsed_seconds = push.elapsed_seconds
+            # Order-guarded: pushes race polls with no wire sequence;
+            # the applier rejects backward/post-terminal transitions.
+            self._status_applier.apply_push(
+                job,
+                push.status,
+                push.total_completed,
+                push.total_failed,
+                push.overall_rate,
+                push.elapsed_seconds,
+            )
 
             # Call user callback if registered
             callback = self._state._job_callbacks.get(push.job_id)
@@ -103,6 +111,7 @@ class JobBatchPushHandler:
     def __init__(self, state: ClientState, logger: Logger) -> None:
         self._state = state
         self._logger = logger
+        self._status_applier = JobStatusApplier()
 
     async def handle(
         self,
@@ -128,11 +137,14 @@ class JobBatchPushHandler:
             if not job:
                 return b"ok"
 
-            job.status = push.status
-            job.total_completed = push.total_completed
-            job.total_failed = push.total_failed
-            job.overall_rate = push.overall_rate
-            job.elapsed_seconds = push.elapsed_seconds
+            self._status_applier.apply_push(
+                job,
+                push.status,
+                push.total_completed,
+                push.total_failed,
+                push.overall_rate,
+                push.elapsed_seconds,
+            )
 
             progress_callback = self._state._progress_callbacks.get(push.job_id)
             if progress_callback:

@@ -8774,7 +8774,27 @@ class ManagerServer(HealthAwareServer):
                 and idempotency_key is not None
                 and self._idempotency_ledger is not None
             ):
-                await self._idempotency_ledger.reject(idempotency_key, error_ack)
+                try:
+                    await self._idempotency_ledger.reject(
+                        idempotency_key, error_ack
+                    )
+                except Exception as reject_error:
+                    # The ledger write itself failing (disk full is the
+                    # canonical case) must not raise INSIDE this error
+                    # handler — that degrades the structured JobAck to
+                    # the transport's raw error bytes. Log it; the
+                    # client still gets the real rejection.
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=(
+                                "Failed to record idempotency rejection "
+                                f"for {idempotency_key}: {reject_error}"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
             return error_ack
 
     @tcp.receive()

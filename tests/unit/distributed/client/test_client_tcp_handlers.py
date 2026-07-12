@@ -57,18 +57,18 @@ class TestJobStatusPushHandler:
         logger.log = AsyncMock()
 
         job_id = "job-123"
-        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
+        initial_result = ClientJobResult(job_id=job_id, status="submitted")
         state.initialize_job_tracking(job_id, initial_result)
 
         handler = JobStatusPushHandler(state, logger)
 
-        push = JobStatusPush(job_id=job_id, status="RUNNING", message="Status update")
+        push = JobStatusPush(job_id=job_id, status="running", message="Status update")
         data = push.dump()
 
         result = await handler.handle(("server", 8000), data, 100)
 
         assert result == b'ok'
-        assert state._jobs[job_id].status == "RUNNING"
+        assert state._jobs[job_id].status == "running"
 
     @pytest.mark.asyncio
     async def test_status_with_callback(self):
@@ -83,17 +83,17 @@ class TestJobStatusPushHandler:
         def status_callback(push):
             callback_called.append(push.status)
 
-        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
+        initial_result = ClientJobResult(job_id=job_id, status="submitted")
         state.initialize_job_tracking(job_id, initial_result, callback=status_callback)
 
         handler = JobStatusPushHandler(state, logger)
 
-        push = JobStatusPush(job_id=job_id, status="COMPLETED", message="Status update")
+        push = JobStatusPush(job_id=job_id, status="completed", message="Status update")
         data = push.dump()
 
         await handler.handle(("server", 8000), data, 100)
 
-        assert callback_called == ["COMPLETED"]
+        assert callback_called == ["completed"]
 
     @pytest.mark.asyncio
     async def test_error_handling_invalid_data(self):
@@ -121,12 +121,12 @@ class TestJobStatusPushHandler:
         def bad_callback(push):
             raise ValueError("Callback error")
 
-        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
+        initial_result = ClientJobResult(job_id=job_id, status="submitted")
         state.initialize_job_tracking(job_id, initial_result, callback=bad_callback)
 
         handler = JobStatusPushHandler(state, logger)
 
-        push = JobStatusPush(job_id=job_id, status="RUNNING", message="Status update")
+        push = JobStatusPush(job_id=job_id, status="running", message="Status update")
         data = push.dump()
 
         # Should not raise, should handle gracefully
@@ -147,14 +147,14 @@ class TestJobBatchPushHandler:
 
         job_ids = ["job-1", "job-2", "job-3"]
         for jid in job_ids:
-            initial_result = ClientJobResult(job_id=jid, status="PENDING")
+            initial_result = ClientJobResult(job_id=jid, status="submitted")
             state.initialize_job_tracking(jid, initial_result)
 
         handler = JobBatchPushHandler(state, logger)
 
         batch = JobBatchPush(
             job_id="batch-1",
-            status="RUNNING",
+            status="running",
         )
         data = batch.dump()
 
@@ -171,7 +171,7 @@ class TestJobBatchPushHandler:
 
         handler = JobBatchPushHandler(state, logger)
 
-        batch = JobBatchPush(job_id="empty-batch", status="PENDING")
+        batch = JobBatchPush(job_id="empty-batch", status="submitted")
         data = batch.dump()
 
         result = await handler.handle(("server", 8000), data, 100)
@@ -189,14 +189,14 @@ class TestJobBatchPushHandler:
         job_ids = [f"job-{i}" for i in range(1000)]
 
         for jid in job_ids:
-            initial_result = ClientJobResult(job_id=jid, status="PENDING")
+            initial_result = ClientJobResult(job_id=jid, status="submitted")
             state.initialize_job_tracking(jid, initial_result)
 
         handler = JobBatchPushHandler(state, logger)
 
         batch = JobBatchPush(
             job_id="large-batch",
-            status="RUNNING",
+            status="running",
             total_completed=1000,
         )
         data = batch.dump()
@@ -217,7 +217,7 @@ class TestJobFinalResultHandler:
         logger.log = AsyncMock()
 
         job_id = "final-job-123"
-        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
+        initial_result = ClientJobResult(job_id=job_id, status="submitted")
         state.initialize_job_tracking(job_id, initial_result)
 
         handler = JobFinalResultHandler(state, logger)
@@ -567,13 +567,13 @@ class TestHandlersConcurrency:
 
         job_ids = [f"concurrent-job-{i}" for i in range(10)]
         for jid in job_ids:
-            initial_result = ClientJobResult(job_id=jid, status="PENDING")
+            initial_result = ClientJobResult(job_id=jid, status="submitted")
             state.initialize_job_tracking(jid, initial_result)
 
         handler = JobStatusPushHandler(state, logger)
 
         async def send_status_update(job_id):
-            push = JobStatusPush(job_id=job_id, status="RUNNING", message="Status update")
+            push = JobStatusPush(job_id=job_id, status="running", message="Status update")
             data = push.dump()
             return await handler.handle(("server", 8000), data, 100)
 

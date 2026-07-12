@@ -18,6 +18,8 @@ from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
     worker_entry,
 )
 
+from tests.simulation.oracle import JobStatusOracle
+
 from .fault_plan import FaultPlan
 
 # Client-observed job states that count as a TERMINAL outcome. A
@@ -114,12 +116,33 @@ def check_invariants(plan: FaultPlan, results: dict) -> list[str]:
        under faults that can strand in-flight work (an executor kill).
        Silence — no terminal state ever seen — is always a violation.
     3. A fault-free schedule must COMPLETE the job (the baseline).
+    4. The observed history LINEARIZES (the JobStatusOracle): status
+       ranks never regress, terminals absorb, the finished result
+       agrees with the observed terminal, and results deliver
+       exactly once — under EVERY schedule, faulted or not.
     """
     violations: list[str] = []
     client_log = results.get("client") or []
 
+    violations.extend(
+        f"oracle: {violation}"
+        for violation in JobStatusOracle().check_client_log(client_log)
+    )
+
     submitted = [entry for entry in client_log if entry[0] == "job-submitted"]
     if not submitted:
+        # A manager that cannot persist its idempotency reservation
+        # (disk_full armed before submission) MUST reject — explicitly.
+        # Observed rejection is a legitimate loud outcome; silence is
+        # not.
+        rejected = [
+            entry for entry in client_log if entry[0] == "submit-rejected"
+        ]
+        disk_full_scheduled = any(
+            event[0] == "disk_full" for event in plan.events
+        )
+        if disk_full_scheduled and rejected:
+            return violations
         violations.append(f"job was never accepted: client log {client_log}")
         return violations
 

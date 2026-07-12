@@ -47,6 +47,9 @@ from hyperscale.distributed.reliability.rate_limiting import (
 from hyperscale.distributed.reliability.overload import HybridOverloadDetector
 
 # Import all client modules
+from hyperscale.distributed.idempotency.idempotency_key import (
+    IdempotencyKeyGenerator,
+)
 from hyperscale.distributed.nodes.client.config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
@@ -191,6 +194,9 @@ class HyperscaleClient(MercurySyncBaseServer):
             tracker=self._tracker,
             protocol=self._protocol,
             send_tcp_func=self.send_tcp,
+            idempotency_key_generator=IdempotencyKeyGenerator(
+                client_id=f"{host}:{port}"
+            ),
         )
         self._cancellation = ClientCancellationManager(
             state=self._state,

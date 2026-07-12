@@ -17,6 +17,9 @@ from unittest.mock import Mock, AsyncMock
 
 import pytest
 
+from hyperscale.distributed.idempotency.idempotency_key import (
+    IdempotencyKeyGenerator,
+)
 from hyperscale.distributed.nodes.client.submission import ClientJobSubmitter
 from hyperscale.distributed.nodes.client.cancellation import ClientCancellationManager
 from hyperscale.distributed.nodes.client.config import ClientConfig
@@ -77,6 +80,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         # Simple workflow
@@ -106,6 +110,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         status_callback = Mock()
@@ -159,6 +164,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         workflow = Mock()
@@ -201,6 +207,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         workflow = Mock()
@@ -233,6 +240,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         workflow = Mock()
@@ -269,6 +277,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         workflow = Mock()
@@ -292,6 +301,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         # Create huge workflow that exceeds 5MB
@@ -325,6 +335,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         workflow = Mock()
@@ -348,6 +359,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         # 100 workflows
@@ -381,6 +393,7 @@ class TestClientJobSubmitter:
             self.tracker,
             self.protocol,
             send_tcp,
+            IdempotencyKeyGenerator(client_id="test-client"),
         )
 
         async def submit_job():

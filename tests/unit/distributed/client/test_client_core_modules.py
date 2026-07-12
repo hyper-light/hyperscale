@@ -558,9 +558,9 @@ class TestClientJobTracker:
         job_id = "status-job"
         tracker.initialize_job_tracking(job_id)
 
-        tracker.update_job_status(job_id, "RUNNING")
+        tracker.update_job_status(job_id, "running")
 
-        assert state._jobs[job_id].status == "RUNNING"
+        assert state._jobs[job_id].status == "running"
 
     def test_update_job_status_completion(self):
         """Test job status update with completion event."""
@@ -571,7 +571,7 @@ class TestClientJobTracker:
         job_id = "complete-job"
         tracker.initialize_job_tracking(job_id)
 
-        tracker.update_job_status(job_id, "COMPLETED")
+        tracker.update_job_status(job_id, "completed")
 
         # Completion event should be set
         assert state._job_events[job_id].is_set()
@@ -604,14 +604,14 @@ class TestClientJobTracker:
 
         async def complete_job():
             await asyncio.sleep(0.01)
-            tracker.update_job_status(job_id, "COMPLETED")
+            tracker.update_job_status(job_id, "completed")
 
         await asyncio.gather(
             tracker.wait_for_job(job_id),
             complete_job(),
         )
 
-        assert state._jobs[job_id].status == "COMPLETED"
+        assert state._jobs[job_id].status == "completed"
 
     @pytest.mark.asyncio
     async def test_wait_for_job_timeout(self):
@@ -634,11 +634,11 @@ class TestClientJobTracker:
 
         job_id = "get-status-job"
         tracker.initialize_job_tracking(job_id)
-        tracker.update_job_status(job_id, "RUNNING")
+        tracker.update_job_status(job_id, "running")
 
         result = tracker.get_job_status(job_id)
 
-        assert result.status == "RUNNING"
+        assert result.status == "running"
 
     def test_get_job_status_nonexistent(self):
         """Test getting status of nonexistent job."""
@@ -659,12 +659,12 @@ class TestClientJobTracker:
         job_id = "multi-status-job"
         tracker.initialize_job_tracking(job_id)
 
-        tracker.update_job_status(job_id, "PENDING")
-        tracker.update_job_status(job_id, "RUNNING")
-        tracker.update_job_status(job_id, "COMPLETED")
+        tracker.update_job_status(job_id, "submitted")
+        tracker.update_job_status(job_id, "running")
+        tracker.update_job_status(job_id, "completed")
 
         # Should have final status
-        assert state._jobs[job_id].status == "COMPLETED"
+        assert state._jobs[job_id].status == "completed"
 
     @pytest.mark.asyncio
     async def test_concurrency_multiple_waiters(self):
@@ -681,7 +681,7 @@ class TestClientJobTracker:
 
         async def completer():
             await asyncio.sleep(0.02)
-            tracker.update_job_status(job_id, "COMPLETED")
+            tracker.update_job_status(job_id, "completed")
 
         results = await asyncio.gather(
             waiter(),

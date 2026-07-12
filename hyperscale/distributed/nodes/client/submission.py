@@ -12,6 +12,9 @@ import cloudpickle
 
 from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE
 from hyperscale.distributed.errors import MessageTooLargeError
+from hyperscale.distributed.idempotency.idempotency_key import (
+    IdempotencyKeyGenerator,
+)
 from hyperscale.distributed.models import (
     JobSubmission,
     JobAck,
@@ -84,6 +87,7 @@ class ClientJobSubmitter:
         tracker,  # ClientJobTracker
         protocol,  # ClientProtocol
         send_tcp_func,  # Callable for sending TCP messages
+        idempotency_key_generator: IdempotencyKeyGenerator,
     ) -> None:
         self._state = state
         self._config = config
@@ -92,6 +96,7 @@ class ClientJobSubmitter:
         self._tracker = tracker
         self._protocol = protocol
         self._send_tcp = send_tcp_func
+        self._idempotency_key_generator = idempotency_key_generator
 
     async def submit_job(
         self,
@@ -290,6 +295,11 @@ class ClientJobSubmitter:
             protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
             protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
             capabilities=self._protocol.get_client_capabilities_string(),
+            # AD-40: one key per LOGICAL submission — the retry loop
+            # reuses this message across managers/redirects, so a
+            # cross-manager retry of the same call cannot duplicate the
+            # job; the manager ledger dedups on it.
+            idempotency_key=str(self._idempotency_key_generator.generate()),
         )
 
     async def _submit_with_retry(

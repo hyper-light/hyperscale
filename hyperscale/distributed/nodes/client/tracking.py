@@ -20,6 +20,9 @@ from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.nodes.client.status_application import (
+    JobStatusApplier,
+)
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -55,6 +58,7 @@ class ClientJobTracker:
         self._state = state
         self._logger = logger
         self._poll_gate_for_status = poll_gate_for_status
+        self._status_applier = JobStatusApplier()
 
     def initialize_job_tracking(
         self,
@@ -97,7 +101,12 @@ class ClientJobTracker:
 
     def update_job_status(self, job_id: str, status: str) -> None:
         """
-        Update job status and signal completion event.
+        Update job status (order-guarded) and signal completion event.
+
+        The write flows through ``JobStatusApplier``: backward
+        transitions and post-terminal mutations are rejected, so e.g. a
+        local CANCELLED mark cannot overwrite an already-COMPLETED job
+        (AD-20: completed-after-cancel keeps COMPLETED).
 
         Args:
             job_id: Job identifier
@@ -105,7 +114,7 @@ class ClientJobTracker:
         """
         job = self._state._jobs.get(job_id)
         if job:
-            job.status = status
+            self._status_applier.apply_status(job, status)
 
         # Signal completion event
         event = self._state._job_events.get(job_id)
@@ -121,8 +130,9 @@ class ClientJobTracker:
             error: Error message
         """
         job = self._state._jobs.get(job_id)
-        if job:
-            job.status = JobStatus.FAILED.value
+        if job and self._status_applier.apply_status(
+            job, JobStatus.FAILED.value
+        ):
             job.error = error
 
         # Signal completion event
@@ -206,13 +216,19 @@ class ClientJobTracker:
             if not job:
                 return
 
-            job.status = remote_status.status
-            job.total_completed = remote_status.total_completed
-            job.total_failed = remote_status.total_failed
-            if hasattr(remote_status, "overall_rate"):
-                job.overall_rate = remote_status.overall_rate
-            if hasattr(remote_status, "elapsed_seconds"):
-                job.elapsed_seconds = remote_status.elapsed_seconds
+            # Poll responses race pushes with no wire sequence — the
+            # applier's order guard is what stops a stale response from
+            # regressing a fresher (or terminal) status.
+            self._status_applier.apply_push(
+                job,
+                remote_status.status,
+                remote_status.total_completed,
+                remote_status.total_failed,
+                getattr(remote_status, "overall_rate", job.overall_rate),
+                getattr(
+                    remote_status, "elapsed_seconds", job.elapsed_seconds
+                ),
+            )
 
             if remote_status.status in TERMINAL_STATUSES:
                 event = self._state._job_events.get(job_id)
