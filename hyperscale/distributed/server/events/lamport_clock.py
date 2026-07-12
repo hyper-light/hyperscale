@@ -15,6 +15,16 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TypeVar, Generic
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+# Wall-clock seam for the physical timestamps this module stamps
+# alongside logical versions (entity last-update times used for TTL
+# cleanup). Logical Lamport time stays on the integer counters; only the
+# physical ``monotonic`` reads route through here so age-based eviction
+# is deterministic under SIM. ``swap_defaults`` rebinds this singleton.
+_DEFAULT_CLOCK: Clock = RealClock()
+
 
 class LamportClock:
     """
@@ -200,8 +210,6 @@ class VersionedStateClock:
         Returns:
             The new version for this entity.
         """
-        import time as time_module
-
         async with self._lock:
             if version is None:
                 version = await self._clock.increment()
@@ -209,7 +217,7 @@ class VersionedStateClock:
                 # Ensure clock is at least at this version
                 await self._clock.ack(version)
 
-            self._entity_versions[entity_id] = (version, time_module.monotonic())
+            self._entity_versions[entity_id] = (version, _DEFAULT_CLOCK.monotonic())
             return version
 
     async def get_entity_version(self, entity_id: str) -> int | None:
@@ -300,9 +308,7 @@ class VersionedStateClock:
         Returns:
             List of removed entity IDs.
         """
-        import time as time_module
-
-        now = time_module.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         removed = []
 
         async with self._lock:
