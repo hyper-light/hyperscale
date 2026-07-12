@@ -181,6 +181,7 @@ class JobLedger:
                 fence_token=event.fence_token,
                 assigned_datacenters=event.assigned_datacenters,
                 created_hlc=event.hlc,
+                requestor_id=event.requestor_id,
             )
 
             if event.fence_token >= self._next_fence_token:
@@ -259,6 +260,7 @@ class JobLedger:
                     fence_token=fence_token,
                     assigned_datacenters=assigned_datacenters,
                     created_hlc=hlc,
+                    requestor_id=requestor_id,
                 )
                 self._publish_snapshot()
                 await self._wal.mark_applied(append_result.entry.lsn)

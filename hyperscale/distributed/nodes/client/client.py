@@ -473,23 +473,39 @@ class HyperscaleClient(MercurySyncBaseServer):
         self,
         job_id: str,
     ) -> GlobalJobStatus | None:
-        gate_addr = self._targets.get_gate_for_job(job_id)
-        if not gate_addr:
-            gate_addr = self._targets.get_next_gate()
-        if not gate_addr:
+        """Poll the job's gate — or, gateless (L2), its manager — for
+        authoritative status. The manager answers from live state or
+        its durable ledger, so this reads truth even across a manager
+        restart."""
+        poll_addr = self._targets.get_gate_for_job(job_id)
+        if not poll_addr:
+            poll_addr = self._targets.get_next_gate()
+        if not poll_addr:
+            poll_addr = self._targets.get_next_manager()
+        if not poll_addr:
             return None
 
         try:
             response_data, _ = await self.send_tcp(
-                gate_addr,
+                poll_addr,
                 "job_status",
                 job_id.encode(),
                 timeout=5.0,
             )
             if response_data and response_data != b"":
                 return GlobalJobStatus.load(response_data)
-        except Exception:
-            pass
+        except Exception as poll_error:
+            await self._logger.log(
+                ServerDebug(
+                    message=(
+                        f"Status poll to {poll_addr} for job "
+                        f"{job_id[:8]} failed: {poll_error}"
+                    ),
+                    node_host="client",
+                    node_port=0,
+                    node_id="client",
+                )
+            )
 
         return None
 

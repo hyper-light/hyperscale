@@ -28,6 +28,7 @@ from hyperscale.distributed.idempotency import (
 
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed.models import (
+    GlobalJobStatus,
     NodeInfo,
     NodeRole,
     ManagerInfo,
@@ -862,6 +863,7 @@ class ManagerServer(HealthAwareServer):
                 clock=self._hlc,
             )
             self._node_wal = self._job_ledger._wal
+            await self._fail_recovered_active_jobs()
 
         ledger_base_dir = (
             self._config.wal_data_dir
@@ -8722,13 +8724,21 @@ class ManagerServer(HealthAwareServer):
                 # via group commit — a solo manager has no replicators,
                 # so LOCAL is the honest level). A restart after this
                 # point recovers the job instead of forgetting it.
+                # The requestor contact is the client's CALLBACK
+                # listener when it registered one (where a restarted
+                # manager can reach it), else the submitting socket.
+                requestor_contact = (
+                    f"{callback_addr[0]}:{callback_addr[1]}"
+                    if callback_addr
+                    else f"{addr[0]}:{addr[1]}"
+                )
                 _ledger_job_id, create_result = (
                     await self._job_ledger.create_job(
                         spec_hash=hashlib.sha256(
                             submission.workflows
                         ).digest(),
                         assigned_datacenters=(self._node_id.datacenter,),
-                        requestor_id=f"{addr[0]}:{addr[1]}",
+                        requestor_id=requestor_contact,
                         durability=DurabilityLevel.LOCAL,
                         job_id=submission.job_id,
                     )
@@ -8867,6 +8877,71 @@ class ManagerServer(HealthAwareServer):
                         )
                     )
             return error_ack
+
+    @tcp.receive()
+    async def job_status(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Client status query — the gateless (L2) poll path.
+
+        Answers from live in-memory state first, then the durable
+        ledger (jobs recovered from a restart, terminal/archived
+        jobs), so a client polling after a manager restart reads the
+        truth instead of silence. Empty bytes = unknown job (the
+        client's poll treats that as no answer). Ledger-internal
+        statuses map onto the client vocabulary at this boundary.
+        """
+        ledger_status_vocabulary = {
+            "pending": JobStatus.SUBMITTED.value,
+            "cancelling": JobStatus.RUNNING.value,
+        }
+        try:
+            job_id = data.decode()
+
+            job = self._job_manager.get_job_by_id(job_id)
+            if job is not None:
+                total_completed, total_failed, overall_rate = (
+                    self._aggregate_job_progress(job)
+                )
+                return GlobalJobStatus(
+                    job_id=job_id,
+                    status=job.status,
+                    total_completed=total_completed,
+                    total_failed=total_failed,
+                    overall_rate=overall_rate,
+                    elapsed_seconds=job.elapsed_seconds(),
+                ).dump()
+
+            if self._job_ledger is not None:
+                job_state = self._job_ledger.get_job(job_id)
+                if job_state is None:
+                    job_state = await self._job_ledger.get_archived_job(
+                        job_id
+                    )
+                if job_state is not None:
+                    return GlobalJobStatus(
+                        job_id=job_id,
+                        status=ledger_status_vocabulary.get(
+                            job_state.status, job_state.status
+                        ),
+                        total_completed=job_state.completed_count,
+                        total_failed=job_state.failed_count,
+                    ).dump()
+
+            return b""
+        except Exception as query_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"job_status query failed: {query_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b""
 
     @tcp.receive()
     async def job_global_timeout(
@@ -9781,6 +9856,84 @@ class ManagerServer(HealthAwareServer):
     # =========================================================================
     # Job Completion
     # =========================================================================
+
+    async def _fail_recovered_active_jobs(self) -> None:
+        """Restart truth-telling for jobs recovered ACTIVE from the WAL.
+
+        A restarted manager has lost the in-flight state a resumed
+        dispatch would need (worker assignments, workflow progress,
+        callbacks), so pretending the job is still running is a silent
+        strand. Instead each recovered active job is transitioned to
+        FAILED durably, and the client's recorded callback contact gets
+        a best-effort final push — the durable record lands FIRST, so a
+        missed notification still leaves status queries truthful.
+        """
+        if self._job_ledger is None:
+            return
+
+        recovered_active = dict(self._job_ledger.get_all_jobs())
+        for job_id, job_state in recovered_active.items():
+            await self._job_ledger.complete_job(
+                job_id,
+                final_status=JobStatus.FAILED.value,
+                total_completed=job_state.completed_count,
+                total_failed=job_state.failed_count,
+                duration_ms=0,
+                durability=DurabilityLevel.LOCAL,
+            )
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        f"Recovered job {job_id} failed on restart: "
+                        "in-flight state was lost with the previous "
+                        "process"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            await self._notify_requestor_of_restart_failure(
+                job_id, job_state.requestor_id
+            )
+
+    async def _notify_requestor_of_restart_failure(
+        self,
+        job_id: str,
+        requestor_id: str,
+    ) -> None:
+        host, separator, port_text = requestor_id.rpartition(":")
+        if not separator or not port_text.isdigit():
+            return
+
+        push = JobStatusPush(
+            job_id=job_id,
+            status=JobStatus.FAILED.value,
+            message=(
+                "manager restarted; in-flight job state was lost"
+            ),
+            is_final=True,
+        )
+        try:
+            await self.send_tcp(
+                (host, int(port_text)),
+                "job_status_push",
+                push.dump(),
+                timeout=5.0,
+            )
+        except Exception as send_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Restart-failure notification for {job_id} to "
+                        f"{requestor_id} failed: {send_error} (the "
+                        "durable FAILED record is already committed)"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _handle_job_completion(self, job_id: str) -> None:
         """Handle job completion with notification and cleanup."""

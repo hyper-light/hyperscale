@@ -25,6 +25,11 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
     failed_count: int
     created_hlc: LSN
     last_hlc: LSN
+    # "host:port" of the submitter's callback listener — recorded so a
+    # RESTARTED manager can tell the client what happened to a
+    # recovered job. Trailing + defaulted: old array_like records and
+    # checkpoints decode cleanly.
+    requestor_id: str = ""
 
     @classmethod
     def create(
@@ -33,6 +38,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
         fence_token: int,
         assigned_datacenters: tuple[str, ...],
         created_hlc: LSN,
+        requestor_id: str = "",
     ) -> JobState:
         return cls(
             job_id=job_id,
@@ -45,6 +51,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             failed_count=0,
             created_hlc=created_hlc,
             last_hlc=created_hlc,
+            requestor_id=requestor_id,
         )
 
     def with_accepted(self, datacenter_id: str, hlc: LSN) -> JobState:
@@ -59,6 +66,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             failed_count=self.failed_count,
             created_hlc=self.created_hlc,
             last_hlc=hlc,
+            requestor_id=self.requestor_id,
         )
 
     def with_cancellation_requested(self, hlc: LSN) -> JobState:
@@ -73,6 +81,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             failed_count=self.failed_count,
             created_hlc=self.created_hlc,
             last_hlc=hlc,
+            requestor_id=self.requestor_id,
         )
 
     def with_completion(
@@ -93,6 +102,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             failed_count=total_failed,
             created_hlc=self.created_hlc,
             last_hlc=hlc,
+            requestor_id=self.requestor_id,
         )
 
     @property
@@ -121,6 +131,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             # already encodes the LSN NamedTuple inside Checkpoint.
             "created_hlc": list(self.created_hlc),
             "last_hlc": list(self.last_hlc),
+            "requestor_id": self.requestor_id,
         }
 
     @staticmethod
@@ -148,4 +159,5 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             failed_count=data.get("failed_count", 0),
             created_hlc=created_hlc,
             last_hlc=last_hlc,
+            requestor_id=data.get("requestor_id", ""),
         )
