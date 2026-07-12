@@ -253,6 +253,7 @@ class ManagerServer(HealthAwareServer):
         max_workflow_retries: int = 3,
         workflow_timeout: float = 300.0,
         wal_data_dir: Path | None = None,
+        incarnation_storage_dir: str | None = None,
         *,
         clock: "Clock | None" = None,
         random_source: "Random | None" = None,
@@ -316,6 +317,12 @@ class ManagerServer(HealthAwareServer):
         # forwarded through so SIM mode can inject a ``VirtualClock`` /
         # ``SeededRandom`` / ``SimTransportFactory``; all default to
         # ``None`` (REAL) and are keyword-only.
+        # Incarnation persistence rides the node's durable directory
+        # unless given its own: a restarted manager must rejoin ABOVE
+        # its previous incarnation or peers zombie-reject it.
+        if incarnation_storage_dir is None and wal_data_dir is not None:
+            incarnation_storage_dir = str(wal_data_dir / "incarnation")
+
         super().__init__(
             host=host,
             tcp_port=tcp_port,
@@ -326,6 +333,7 @@ class ManagerServer(HealthAwareServer):
             clock=clock,
             random_source=random_source,
             transport_factory=transport_factory,
+            incarnation_storage_dir=incarnation_storage_dir,
         )
 
         # Wire logger to modules
@@ -845,6 +853,10 @@ class ManagerServer(HealthAwareServer):
 
         # Start the underlying server
         await self.start_server(init_context=self._env.get_swim_init_context())
+
+        # Restore (or create) this node's persisted incarnation so a
+        # restarted manager rejoins above its pre-restart value.
+        await self.initialize_incarnation_store()
 
         if self._config.wal_data_dir is not None:
             # The full event-sourced job ledger (WAL + checkpoints +

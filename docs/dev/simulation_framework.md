@@ -944,12 +944,54 @@ wall time, scaling linearly with pytest-xdist workers and
 `SimulationRuntime` (thousands/minute, membership-level faults only)
 remains open as a future addition if raw schedule volume is wanted.
 
-### Phase 7 — Storage faults + linearizability oracle — *storage half landed*
+### Phase 7 — Storage faults + linearizability oracle — *landed*
 
 - `FaultMatrix.slow_disk / disk_full / fsync_reorder` (SIM-mode
   implementations). **Landed.**
 - Linearizability checker for the client-facing job-submission API.
-  *In progress — survey complete, recorder/checker next.*
+  **Landed** — see below.
+
+The oracle half (see `hyperscale/distributed/jobs/job_status_order.py`,
+`hyperscale/distributed/nodes/client/status_application.py`,
+`tests/simulation/oracle/`, `tests/unit/distributed/manager/
+test_manager_restart_truth.py`):
+
+- **JobStatusOrder** — the lifecycle spec as a monotone rank order
+  (forward skips legal, regressions never, terminals absorbing per
+  AD-20; both live timeout spellings rank terminal). **JobStatusApplier**
+  — the ONE chokepoint for every client-side status write, replacing
+  four blind-assignment sites (poll, two push handlers, local marks);
+  stats apply via max-counters and an elapsed-freshness gate; typed
+  outcomes (`StatusApplyOutcome`) distinguish stale rejections from
+  UNKNOWN VOCABULARY, which every async caller logs.
+- **JobStatusOracle** — judges client-observed milestone histories
+  (rank monotonicity, absorbing terminals, finished/observed
+  agreement, exactly-once result delivery); wired into the VOPR as
+  invariant 4 for every generated schedule.
+- **AD-40 idempotency keys live** — the client generates one key per
+  logical submission; the manager ledger dedups on it; disk_full
+  faults bite the reservation path and explicit rejection is the
+  accepted loud outcome.
+- **Durable job record + restart truth** — the manager runs the full
+  event-sourced JobLedger (create/accept/complete/timeout/cancel at
+  LOCAL durability on the shared HLC); recovered ACTIVE jobs
+  transition to durable FAILED and the recorded requestor contact
+  gets a best-effort final push; a new manager `job_status` endpoint
+  (and client gateless-poll fallback) reads truth across restarts.
+- **Incarnation persistence wired** — all three nodes accept
+  `incarnation_storage_dir` (the manager derives it from
+  `wal_data_dir`), `initialize_incarnation_store` runs at start, and
+  the `join_cluster` zombie-rejoin bump persists; a restarted node
+  rejoins STRICTLY ABOVE its pre-restart incarnation.
+- **Detection design bounds** — scenario tests assert failure-
+  detection latency bounds derived from the traced mechanism
+  (evidence-accelerated [20, 70]s; witness-less max-leg [25, 85]s),
+  never widened windows.
+
+Still open beyond Phase 7's mandate: full job RESUME from persisted
+submissions (requires persisting submission payloads), a coordinator
+process-restart primitive (would let the VOPR draw restart/
+fsync_reorder events), and seeded job ids.
 
 What landed (see `hyperscale/core/runtime/filesystem.py`,
 `tests/simulation/harness/sim/sim_filesystem.py`,

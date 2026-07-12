@@ -114,6 +114,7 @@ class WorkerServer(HealthAwareServer):
         random_source: Random | None = None,
         transport_factory: TransportFactory | None = None,
         process_spawner: ProcessSpawner | None = None,
+        incarnation_storage_dir: str | None = None,
     ) -> None:
         """
         Initialize worker server.
@@ -359,6 +360,7 @@ class WorkerServer(HealthAwareServer):
             clock=clock,
             random_source=random_source,
             transport_factory=transport_factory,
+            incarnation_storage_dir=incarnation_storage_dir,
         )
 
         # Initialize components that need discovery service
@@ -598,6 +600,10 @@ class WorkerServer(HealthAwareServer):
             self._workflow_executor.set_event_logger(self._event_logger)
         
         await self.start_server(init_context=self.env.get_swim_init_context())
+
+        # Restore (or create) this node's persisted incarnation so a
+        # restarted worker rejoins above its pre-restart value.
+        await self.initialize_incarnation_store()
 
         # Update node capabilities
         self._node_capabilities = self._lifecycle_manager.get_node_capabilities(

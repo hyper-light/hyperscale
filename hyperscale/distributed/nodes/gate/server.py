@@ -235,6 +235,7 @@ class GateServer(HealthAwareServer):
         gate_peers: list[tuple[str, int]] | None = None,
         gate_udp_peers: list[tuple[str, int]] | None = None,
         lease_timeout: float = 30.0,
+        incarnation_storage_dir: str | None = None,
         *,
         clock: "Clock | None" = None,
         random_source: "Random | None" = None,
@@ -265,6 +266,7 @@ class GateServer(HealthAwareServer):
             clock=clock,
             random_source=random_source,
             transport_factory=transport_factory,
+            incarnation_storage_dir=incarnation_storage_dir,
         )
 
         # Store reference to env
@@ -987,6 +989,10 @@ class GateServer(HealthAwareServer):
         """
         self._modular_state.initialize_locks()
         await self.start_server(init_context=self.env.get_swim_init_context())
+
+        # Restore (or create) this node's persisted incarnation so a
+        # restarted gate rejoins above its pre-restart value.
+        await self.initialize_incarnation_store()
 
         # Set node_id on trackers
         self._job_leadership_tracker.node_id = self._node_id.full

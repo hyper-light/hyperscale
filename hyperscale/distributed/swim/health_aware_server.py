@@ -3655,6 +3655,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         bump = self._incarnation_tracker.minimum_rejoin_incarnation_bump + 1
         await self._incarnation_tracker.bump_self_incarnation_by(bump)
         self_incarnation = self._incarnation_tracker.get_self_incarnation()
+        # Persist the bump: a node that claimed a rejoin incarnation and
+        # then crashed must restart AT OR ABOVE it, or peers holding the
+        # death record zombie-reject the next rejoin. No-op when
+        # incarnation persistence is not configured.
+        await self.persist_incarnation(self_incarnation)
         join_msg = (
             b"join>"
             + SWIM_VERSION_PREFIX
