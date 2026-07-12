@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Awaitable
@@ -18,10 +17,21 @@ from hyperscale.distributed.reliability.backpressure import (
 )
 from hyperscale.logging.hyperscale_logging_models import WALError
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import (
+    Clock,
+    Filesystem,
+    RealClock,
+    RealFilesystem,
+)
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
+
+# Module-level storage seam (Phase 7). The writer BORROWS this
+# (or an injected instance) — it never shuts the filesystem down.
+# ``swap_defaults`` rebinds it to the SIM filesystem so WAL commits
+# become deterministic and storage-faultable under replay.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -114,6 +124,7 @@ class WALWriter:
         "_pending_state_change",
         "_state_change_task",
         "_logger",
+        "_filesystem",
     )
 
     def __init__(
@@ -125,10 +136,15 @@ class WALWriter:
         ]
         | None = None,
         logger: Logger | None = None,
+        filesystem: Filesystem | None = None,
     ) -> None:
         self._path = path
         self._config = config or WALWriterConfig()
         self._logger = logger
+        # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
+        self._filesystem = (
+            filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
+        )
 
         queue_config = RobustQueueConfig(
             maxsize=self._config.queue_max_size,
@@ -430,11 +446,10 @@ class WALWriter:
         combined_data = b"".join(request.data for request in requests)
 
         try:
-            await loop.run_in_executor(
-                None,
-                self._sync_write_and_fsync,
-                combined_data,
-            )
+            # One durable unit per group commit through the storage
+            # seam — the same append+flush+fsync sequence as before, as
+            # a single job on the filesystem's own executor.
+            await self._filesystem.append_fsync(self._path, combined_data)
 
             self._metrics.total_written += len(requests)
             self._metrics.total_batches += 1
@@ -461,12 +476,6 @@ class WALWriter:
 
         finally:
             self._current_batch.clear()
-
-    def _sync_write_and_fsync(self, data: bytes) -> None:
-        with open(self._path, "ab", buffering=0) as file:
-            file.write(data)
-            file.flush()
-            os.fsync(file.fileno())
 
     async def _drain_remaining(self) -> None:
         while not self._queue.empty():
