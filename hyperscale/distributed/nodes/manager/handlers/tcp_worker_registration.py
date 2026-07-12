@@ -165,6 +165,10 @@ class WorkerRegistrationHandler:
             udp_addr = (registration.node.host, registration.node.udp_port)
             self._state._worker_addr_to_id[tcp_addr] = worker_id
             self._state._worker_addr_to_id[udp_addr] = worker_id
+            # (Re-)registration discharges any outstanding eviction
+            # notice obligation — the worker demonstrably knows where
+            # it stands now (two-sided deregistration).
+            self._state.clear_eviction_notice(worker_id)
 
             self._task_runner.run(
                 self._logger.log,

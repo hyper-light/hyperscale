@@ -25,6 +25,8 @@ from hyperscale.distributed.models import (
     ManagerInfo,
     ManagerHeartbeat,
     PendingTransfer,
+    WorkerEvictionNotice,
+    WorkerEvictionNoticeAck,
     WorkerState as WorkerStateEnum,
     WorkerStateSnapshot,
     WorkflowDispatch,
@@ -2226,6 +2228,73 @@ class WorkerServer(HealthAwareServer):
         """Handle workflow status query."""
         active_ids = list(self._active_workflows.keys())
         return ",".join(active_ids).encode("utf-8")
+
+    @tcp.receive()
+    async def eviction_notice(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        """Handle a manager's notice that it deregistered this worker.
+
+        Closes the one-sided-eviction gap: the manager forgot us but
+        kept acking our SWIM probes, so without this push we would
+        believe the relationship healthy forever and never re-register.
+        Mark the evicting manager unhealthy (feeding the existing
+        cluster-connection state machine) and schedule a targeted
+        re-registration with it; the ack tells the manager its notice
+        obligation is discharged.
+        """
+        notice = WorkerEvictionNotice.load(data)
+
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Manager {notice.manager_id[:8]}... deregistered this "
+                    f"worker (reason: {notice.reason}) — re-registering"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        await self._registry.mark_manager_unhealthy(notice.manager_id)
+        self._cluster_connection.update()
+        self._task_runner.run(
+            self._reregister_after_eviction,
+            (notice.manager_tcp_host, notice.manager_tcp_port),
+        )
+
+        return WorkerEvictionNoticeAck(
+            worker_id=self._node_id.full,
+            will_reregister=True,
+        ).dump()
+
+    async def _reregister_after_eviction(
+        self, manager_addr: tuple[str, int]
+    ) -> None:
+        """Targeted re-registration with a manager that evicted us.
+
+        Deliberately direct (not just the RECONNECTING rejoin loop):
+        in a multi-manager DC the other managers may still be healthy,
+        so the cluster connection never leaves CONNECTED and the rejoin
+        loop never runs — but this specific manager still needs a fresh
+        registration.
+        """
+        try:
+            await self._register_with_manager(manager_addr)
+        except Exception as register_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Post-eviction re-registration with manager at "
+                        f"{manager_addr} failed: {register_error} — the "
+                        f"manager's notice backstop will re-prompt"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     @tcp.handle("manager_register")
     async def handle_manager_register(

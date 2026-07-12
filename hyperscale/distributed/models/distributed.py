@@ -1421,6 +1421,46 @@ class HealthcheckExtensionResponse(Message):
     denial_reason_code: str = "none"
 
 
+@dataclass(slots=True)
+class WorkerEvictionNotice(Message):
+    """
+    Notification that a manager has deregistered (evicted) a worker.
+
+    Eviction was previously one-sided: the manager dropped the worker
+    from its registry and detached its SWIM membership, but the worker
+    — still receiving the manager's heartbeats — believed the
+    relationship was healthy and never re-registered, diverging
+    silently forever. This notice closes the loop: the manager pushes
+    it at deregistration time and re-sends it with backoff while the
+    obligation is outstanding; the worker responds by marking the
+    manager unhealthy and re-registering.
+
+    Sent from: Manager -> Worker
+    """
+
+    manager_id: str  # Evicting manager's node id (worker registry key)
+    manager_tcp_host: str  # Manager TCP host the worker should re-register with
+    manager_tcp_port: int  # Manager TCP port the worker should re-register with
+    worker_id: str  # The deregistered worker's node id
+    reason: str  # Why the worker was deregistered (e.g. "worker_failure")
+
+
+@dataclass(slots=True)
+class WorkerEvictionNoticeAck(Message):
+    """
+    Worker's acknowledgment of a WorkerEvictionNotice.
+
+    Receipt of this ack discharges the manager's notice obligation —
+    the worker now KNOWS it was deregistered (re-registration
+    independently discharges it too, covering a lost ack).
+
+    Sent from: Worker -> Manager
+    """
+
+    worker_id: str  # Acknowledging worker's node id
+    will_reregister: bool  # Whether the worker is scheduling re-registration
+
+
 # =============================================================================
 # Status Updates and Reporting
 # =============================================================================

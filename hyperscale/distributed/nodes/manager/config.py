@@ -46,6 +46,13 @@ class ManagerConfig:
     dead_peer_reap_interval_seconds: float = 120.0
     dead_gate_reap_interval_seconds: float = 120.0
 
+    # Worker eviction notice re-send pacing (two-sided deregistration).
+    # The base interval doubles per attempt up to the cap so a wedged
+    # worker that recovers minutes later still gets told promptly-ish
+    # without the manager hammering a dead address.
+    eviction_notice_base_interval_seconds: float = 5.0
+    eviction_notice_max_interval_seconds: float = 60.0
+
     # Orphan scan settings (from env)
     orphan_scan_interval_seconds: float = 30.0
     orphan_scan_worker_timeout_seconds: float = 10.0

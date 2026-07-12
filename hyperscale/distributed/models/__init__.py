@@ -73,6 +73,9 @@ from .distributed import (
     # Adaptive healthcheck extensions (AD-26)
     HealthcheckExtensionRequest as HealthcheckExtensionRequest,
     HealthcheckExtensionResponse as HealthcheckExtensionResponse,
+    # Worker eviction notification (two-sided deregistration)
+    WorkerEvictionNotice as WorkerEvictionNotice,
+    WorkerEvictionNoticeAck as WorkerEvictionNoticeAck,
     # Status updates
     StepStats as StepStats,
     WorkflowProgress as WorkflowProgress,

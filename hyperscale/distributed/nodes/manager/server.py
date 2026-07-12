@@ -78,6 +78,8 @@ from hyperscale.distributed.models import (
     CancelledWorkflowInfo,
     HealthcheckExtensionRequest,
     HealthcheckExtensionResponse,
+    WorkerEvictionNotice,
+    WorkerEvictionNoticeAck,
     WorkerDiscoveryBroadcast,
     ContextForward,
     ContextLayerSync,
@@ -164,6 +166,7 @@ from hyperscale.logging.hyperscale_logging_models import (
 
 from .config import create_manager_config_from_env
 from .state import ManagerState
+from .models import WorkerEvictionNoticeState
 from .registry import ManagerRegistry
 from .dispatch import ManagerDispatchCoordinator
 from .cancellation import ManagerCancellationCoordinator
@@ -1914,10 +1917,110 @@ class ManagerServer(HealthAwareServer):
         ):
             await self._fail_unfinished_workflows_with_no_workers()
 
-    def _detach_worker_membership(self, worker_id: str) -> None:
+    def _detach_worker_membership(
+        self, worker_id: str, reason: str = "worker_failure"
+    ) -> None:
         """Remove a dead worker from membership indexes immediately."""
-        self._registry.unregister_worker(worker_id)
+        self._deregister_worker_with_notice(worker_id, reason)
         self._manager_state._worker_lhm_scores.pop(worker_id, None)
+
+    def _deregister_worker_with_notice(self, worker_id: str, reason: str) -> None:
+        """Deregister a worker AND record the obligation to tell it so.
+
+        Deregistration was one-sided: the manager forgot the worker but
+        kept acking its SWIM probes, so a live (e.g. wedged-then-
+        recovered) worker never learned it was dropped and never
+        re-registered — silent permanent divergence. Every failure/reap
+        deregistration now records a notice obligation and pushes a
+        ``WorkerEvictionNotice`` immediately; ``_dead_node_reap_loop``
+        re-sends it with capped backoff until the worker acks or
+        re-registers (both discharge it). Plain re-registration
+        overwrites and sync mirrors deliberately do NOT come through
+        here — the worker is present in the first case, and the
+        deciding manager owns the obligation in the second.
+        """
+        registration = self._manager_state.get_worker(worker_id)
+        self._registry.unregister_worker(worker_id)
+        if registration is None:
+            return
+
+        now = self._clock.monotonic()
+        self._manager_state.record_eviction_notice(
+            WorkerEvictionNoticeState(
+                worker_id=worker_id,
+                worker_tcp_addr=(
+                    registration.node.host,
+                    registration.node.port,
+                ),
+                reason=reason,
+                evicted_at=now,
+                last_notice_at=now,
+            )
+        )
+        self._task_runner.run(self._send_eviction_notice, worker_id)
+
+    async def _send_eviction_notice(self, worker_id: str) -> None:
+        """Send one ``WorkerEvictionNotice`` for an outstanding obligation.
+
+        An ack discharges the obligation (the worker now KNOWS); a
+        failed or unanswered send leaves it outstanding for the
+        re-send pass in ``_dead_node_reap_loop``.
+        """
+        notice_state = self._manager_state.get_eviction_notice(worker_id)
+        if notice_state is None:
+            return
+
+        notice_state.last_notice_at = self._clock.monotonic()
+        notice_state.notice_count += 1
+
+        notice = WorkerEvictionNotice(
+            manager_id=self._node_id.full,
+            manager_tcp_host=self._host,
+            manager_tcp_port=self._tcp_port,
+            worker_id=worker_id,
+            reason=notice_state.reason,
+        )
+        try:
+            response, _clock = await self.send_tcp(
+                notice_state.worker_tcp_addr,
+                "eviction_notice",
+                notice.dump(),
+                timeout=self._config.tcp_timeout_standard_seconds,
+            )
+            if response and not isinstance(response, Exception):
+                ack = WorkerEvictionNoticeAck.load(response)
+                if ack.worker_id == worker_id:
+                    self._manager_state.clear_eviction_notice(worker_id)
+        except Exception as send_error:
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=(
+                        f"Eviction notice to worker {worker_id[:8]}... at "
+                        f"{notice_state.worker_tcp_addr} not delivered "
+                        f"(attempt {notice_state.notice_count}): {send_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    def _resend_eviction_notices(self, now: float) -> None:
+        """Re-send outstanding eviction notices on capped exponential
+        backoff — the state-based backstop for a worker that was wedged
+        through the initial push (the usual reason it was evicted) and
+        recovered later."""
+        base = self._config.eviction_notice_base_interval_seconds
+        cap = self._config.eviction_notice_max_interval_seconds
+        for notice_state in self._manager_state.iter_eviction_notices():
+            backoff = min(
+                base * (2 ** max(0, notice_state.notice_count - 1)),
+                cap,
+            )
+            if now - notice_state.last_notice_at >= backoff:
+                self._task_runner.run(
+                    self._send_eviction_notice, notice_state.worker_id
+                )
 
     def _get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
         """Return the registered node identity currently bound to ``addr``."""
@@ -2530,7 +2633,7 @@ class ManagerServer(HealthAwareServer):
             workers_to_reap.append(worker_id)
 
         for worker_id in workers_to_reap:
-            self._registry.unregister_worker(worker_id)
+            self._deregister_worker_with_notice(worker_id, "unhealthy_reaped")
 
     def _reap_dead_peers(self, now: float) -> None:
         peer_reap_threshold = now - self._config.dead_peer_reap_interval_seconds
@@ -2576,6 +2679,7 @@ class ManagerServer(HealthAwareServer):
                 self._reap_dead_peers(now)
                 self._reap_dead_gates(now)
                 self._cleanup_stale_dead_manager_tracking(now)
+                self._resend_eviction_notices(now)
 
             except asyncio.CancelledError:
                 break

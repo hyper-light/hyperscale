@@ -24,6 +24,15 @@ from hyperscale.distributed.swim.core import ErrorStats
 from hyperscale.distributed.protocol.version import NegotiatedCapabilities
 from hyperscale.distributed.slo import TimeWindowedTDigest
 
+from .models import WorkerEvictionNoticeState
+
+
+# Cap on outstanding worker-eviction notice obligations. Entries are
+# discharged on worker ack or re-registration; a worker that never
+# returns leaves one entry behind, so the map is bounded here (oldest
+# obligation dropped on overflow) to honor the no-leaks rule.
+_MAX_EVICTION_NOTICES = 256
+
 if TYPE_CHECKING:
     from hyperscale.core.state.context import Context
     from hyperscale.distributed.health.workflow_progress_snapshot import (
@@ -117,6 +126,14 @@ class ManagerState:
         # cross_dc_correlation. Worker entries are evicted when the
         # worker is removed from the registry.
         self._worker_lhm_scores: dict[str, int] = {}
+        # Outstanding worker-eviction notice obligations: the manager
+        # deregistered these workers via a failure/reap path and owes
+        # each an eviction notice until the worker acks it or
+        # re-registers (two-sided deregistration — without this a live
+        # evicted worker never learns and never re-registers). Bounded
+        # by _MAX_EVICTION_NOTICES; oldest obligation dropped on
+        # overflow.
+        self._evicted_worker_notices: dict[str, WorkerEvictionNoticeState] = {}
         # Phase H3 — per-workflow last-known progress snapshot used by
         # the AD-26 multi-witness extension decision (H5). Keyed by
         # ``workflow_id`` so leader transfer can preserve the entry
@@ -807,6 +824,44 @@ class ManagerState:
 
     def iter_worker_deadlines(self) -> list[tuple[str, float]]:
         return list(self._worker_deadlines.items())
+
+    # =========================================================================
+    # Worker Eviction Notice Accessors (two-sided deregistration)
+    # =========================================================================
+
+    def record_eviction_notice(
+        self, notice_state: WorkerEvictionNoticeState
+    ) -> None:
+        """Record the obligation to notify a deregistered worker.
+
+        Bounded: on overflow the oldest outstanding obligation is
+        dropped so a stream of never-returning workers cannot grow the
+        map without limit.
+        """
+        if (
+            notice_state.worker_id not in self._evicted_worker_notices
+            and len(self._evicted_worker_notices) >= _MAX_EVICTION_NOTICES
+        ):
+            oldest_worker_id = min(
+                self._evicted_worker_notices,
+                key=lambda worker_id: self._evicted_worker_notices[
+                    worker_id
+                ].evicted_at,
+            )
+            self._evicted_worker_notices.pop(oldest_worker_id, None)
+        self._evicted_worker_notices[notice_state.worker_id] = notice_state
+
+    def clear_eviction_notice(self, worker_id: str) -> None:
+        """Discharge the notice obligation (worker acked or re-registered)."""
+        self._evicted_worker_notices.pop(worker_id, None)
+
+    def get_eviction_notice(
+        self, worker_id: str
+    ) -> WorkerEvictionNoticeState | None:
+        return self._evicted_worker_notices.get(worker_id)
+
+    def iter_eviction_notices(self) -> list[WorkerEvictionNoticeState]:
+        return list(self._evicted_worker_notices.values())
 
     # =========================================================================
     # Manager Peer Health Accessors (5 direct accesses)

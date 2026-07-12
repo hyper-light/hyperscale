@@ -79,6 +79,9 @@ class ManagerRegistry:
         self._state._workers[worker_id] = registration
         self._state._worker_addr_to_id[tcp_addr] = worker_id
         self._state._worker_addr_to_id[udp_addr] = worker_id
+        # (Re-)registration discharges any outstanding eviction-notice
+        # obligation (two-sided deregistration).
+        self._state.clear_eviction_notice(worker_id)
 
         # Initialize circuit breaker for this worker
         if worker_id not in self._state._worker_circuits:
