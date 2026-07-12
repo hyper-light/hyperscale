@@ -24,6 +24,7 @@ every message it sends — is coherent with the rest of the simulation.
 import heapq
 import multiprocessing
 import os
+import random
 
 from .child_runtime import run_child_loop
 
@@ -69,6 +70,7 @@ class SimulationCoordinator:
         latency: float = 0.001,
         max_virtual_time: float | None = None,
         seed: int = 1,
+        barrier_timeout_seconds: float = 300.0,
     ) -> None:
         if latency <= 0.0:
             raise ValueError("latency must be strictly positive (lookahead)")
@@ -79,8 +81,27 @@ class SimulationCoordinator:
         # means unbounded (run to natural quiescence).
         self._max_virtual_time = max_virtual_time
         self._seed = seed
+        # Wall-clock deadman for every child pipe read. A child that
+        # wedges (spawn failure, import crash mid-handshake, a genuine
+        # deadlock) would otherwise block the coordinator's barrier
+        # ``recv`` FOREVER, hanging the whole test host with zero
+        # output. Virtual time bounds virtual runaways
+        # (``max_virtual_time``); this bounds WALL runaways — the run
+        # dies loudly naming the unresponsive child.
+        self._barrier_timeout_seconds = barrier_timeout_seconds
         self._specs: list[tuple] = []
         self._kill_schedule: list[tuple] = []
+        # Deterministic network-fault schedule (partition / drop /
+        # delay / duplicate), evaluated per datagram at enqueue time.
+        # Fault randomness (drop and duplicate draws, delay jitter)
+        # comes from a coordinator-owned generator derived from the run
+        # seed — independent of every child's stream, identical across
+        # replays of the same schedule.
+        self._partition_rules: list[tuple] = []
+        self._drop_rules: list[tuple] = []
+        self._delay_rules: list[tuple] = []
+        self._duplicate_rules: list[tuple] = []
+        self._fault_random = random.Random((seed << 16) ^ 0x5EEDFA17)
 
     def add_process(self, process_id, entry, *entry_args) -> None:
         """Register a child process present at simulation start.
@@ -100,6 +121,87 @@ class SimulationCoordinator:
         already-dead victim raises rather than silently no-oping.
         """
         self._kill_schedule.append((at_time, process_id))
+
+    def schedule_partition(
+        self,
+        process_a,
+        process_b,
+        at_time: float,
+        heal_time: float | None = None,
+        bidirectional: bool = True,
+    ) -> None:
+        """Partition two processes: datagrams SENT between them during
+        ``[at_time, heal_time)`` drop silently (the cable-cut model).
+
+        ``heal_time=None`` means the partition never heals.
+        ``bidirectional=False`` cuts only ``process_a -> process_b``
+        (asymmetric loss, the one-way-drop scenario class).
+        """
+        self._partition_rules.append(
+            (at_time, heal_time, process_a, process_b, bidirectional)
+        )
+
+    def schedule_drop_rate(
+        self,
+        src,
+        dst,
+        probability: float,
+        at_time: float = 0.0,
+        until_time: float | None = None,
+    ) -> None:
+        """Drop each matching DATAGRAM sent during the window with
+        ``probability`` — UDP packet-loss semantics (stream frames are
+        never dropped: real TCP masks packet loss via retransmission;
+        use ``schedule_partition`` for faults that break streams).
+        ``src`` / ``dst`` are process ids; ``None`` wildcards that
+        side. Draws come from the coordinator's seeded fault generator,
+        so the loss pattern replays identically. First matching rule
+        (declaration order) wins.
+        """
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError("drop probability must be within [0.0, 1.0]")
+        self._drop_rules.append((at_time, until_time, src, dst, probability))
+
+    def schedule_delay(
+        self,
+        src,
+        dst,
+        extra_seconds: float,
+        at_time: float = 0.0,
+        until_time: float | None = None,
+        jitter_seconds: float = 0.0,
+    ) -> None:
+        """Add ``extra_seconds`` (plus seeded uniform jitter up to
+        ``jitter_seconds``) to matching datagrams SENT during the
+        window. Strictly additive on top of the base ``latency`` so the
+        lookahead guarantee — delivery in a strictly later window —
+        always holds. First matching rule (declaration order) wins.
+        """
+        if extra_seconds < 0.0 or jitter_seconds < 0.0:
+            raise ValueError("delay and jitter must be non-negative")
+        self._delay_rules.append(
+            (at_time, until_time, src, dst, extra_seconds, jitter_seconds)
+        )
+
+    def schedule_duplicate(
+        self,
+        src,
+        dst,
+        probability: float,
+        at_time: float = 0.0,
+        until_time: float | None = None,
+    ) -> None:
+        """Duplicate matching DATAGRAMS sent during the window with
+        ``probability`` — the copy arrives one extra latency later (a
+        strictly later window), modeling UDP duplication (reliable
+        streams never deliver a frame twice, so stream traffic is
+        exempt). First matching rule (declaration order) wins.
+        """
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError("duplicate probability must be within [0.0, 1.0]")
+        self._duplicate_rules.append(
+            (at_time, until_time, src, dst, probability)
+        )
 
     def run(self) -> dict:
         # Pin hash randomization for every spawned child. Python
@@ -224,7 +326,7 @@ class SimulationCoordinator:
             outbound_batches: list = []
             for process_id, connection in granted:
                 tag, next_time, outbound, spawns, new_addresses = (
-                    connection.recv()
+                    self._recv(connection, process_id, "window report")
                 )
                 assert tag == "REPORT", tag
                 next_times[process_id] = next_time
@@ -258,7 +360,7 @@ class SimulationCoordinator:
         results: dict = {}
         for process_id, connection in connections.items():
             connection.send(("STOP",))
-            tag, result = connection.recv()
+            tag, result = self._recv(connection, process_id, "shutdown result")
             assert tag == "RESULT", tag
             results[process_id] = result
         return results
@@ -320,7 +422,7 @@ class SimulationCoordinator:
             next_batch: list = []
             for process_id, parent_connection in started:
                 tag, addresses, next_time, outbound, spawns = (
-                    parent_connection.recv()
+                    self._recv(parent_connection, process_id, "admission readiness")
                 )
                 assert tag == "READY", tag
                 next_times[process_id] = next_time
@@ -395,20 +497,138 @@ class SimulationCoordinator:
             )
         address_to_process[address] = process_id
 
+    def _recv(self, connection, process_id, phase: str):
+        """Barrier read with a wall-clock deadman.
+
+        A wedged child (spawn failure, import crash mid-handshake, a
+        genuine deadlock) must fail the run LOUDLY, naming itself —
+        never hang the coordinator's barrier forever with zero output.
+        ``run``'s ``finally`` kills the remaining tree on the raise.
+        """
+        if self._barrier_timeout_seconds is not None and not connection.poll(
+            self._barrier_timeout_seconds
+        ):
+            raise RuntimeError(
+                f"simulation child {process_id!r} unresponsive during "
+                f"{phase} for {self._barrier_timeout_seconds}s of wall "
+                "time — killing the run (wall-clock deadman)"
+            )
+        return connection.recv()
+
+    @staticmethod
+    def _window_matches(
+        at_time: float, until_time: float | None, send_time: float
+    ) -> bool:
+        return send_time >= at_time and (
+            until_time is None or send_time < until_time
+        )
+
+    @staticmethod
+    def _endpoint_matches(rule_endpoint, process_id) -> bool:
+        return rule_endpoint is None or rule_endpoint == process_id
+
     def _enqueue(
         self, pending, sequence, address_to_process, send_time, src, dst, data
     ) -> int:
         """Schedule one outbound datagram for delivery; return next seq.
 
         Drops silently when no process hosts ``dst`` (closed-port
-        semantics), matching real UDP.
+        semantics), matching real UDP. Applies the scheduled network
+        faults — every cross-process datagram passes through here, so
+        this is the single deterministic fault chokepoint: partitions
+        and drop rules discard, delay rules stretch the delivery time
+        (always additive, preserving the lookahead guarantee), and
+        duplicate rules enqueue a second copy one latency later. Fault
+        windows key on SEND time; probabilistic draws and jitter come
+        from the coordinator's seeded fault generator in enqueue order,
+        so the exact fault pattern replays byte-identically.
         """
         dst_process = address_to_process.get(dst)
         if dst_process is None:
             return sequence
-        delivery_time = round(send_time + self._latency, _TIME_QUANTUM)
+        src_process = address_to_process.get(src)
+
+        for at_time, heal_time, process_a, process_b, bidirectional in (
+            self._partition_rules
+        ):
+            if not self._window_matches(at_time, heal_time, send_time):
+                continue
+            cut = (src_process == process_a and dst_process == process_b) or (
+                bidirectional
+                and src_process == process_b
+                and dst_process == process_a
+            )
+            if cut:
+                return sequence
+
+        # Probabilistic loss and duplication model UDP semantics, so
+        # they apply to DATAGRAMS only: real packet loss is invisible
+        # above TCP (retransmission), and a reliable stream can never
+        # deliver a frame twice. Partitions (cable cuts) and delay
+        # (physical latency) apply to stream traffic too.
+        is_datagram = data[0] == "dgram"
+
+        if is_datagram:
+            for at_time, until_time, rule_src, rule_dst, probability in (
+                self._drop_rules
+            ):
+                if not self._window_matches(at_time, until_time, send_time):
+                    continue
+                if self._endpoint_matches(
+                    rule_src, src_process
+                ) and self._endpoint_matches(rule_dst, dst_process):
+                    if self._fault_random.random() < probability:
+                        return sequence
+                    break  # first matching rule decides
+
+        extra_delay = 0.0
+        for at_time, until_time, rule_src, rule_dst, extra, jitter in (
+            self._delay_rules
+        ):
+            if not self._window_matches(at_time, until_time, send_time):
+                continue
+            if self._endpoint_matches(
+                rule_src, src_process
+            ) and self._endpoint_matches(rule_dst, dst_process):
+                extra_delay = extra
+                if jitter > 0.0:
+                    extra_delay += self._fault_random.uniform(0.0, jitter)
+                break  # first matching rule decides
+
+        delivery_time = round(
+            send_time + self._latency + extra_delay, _TIME_QUANTUM
+        )
         heapq.heappush(
             pending,
             (delivery_time, sequence, dst_process, dst, src, data),
         )
-        return sequence + 1
+        sequence += 1
+
+        if is_datagram:
+            for at_time, until_time, rule_src, rule_dst, probability in (
+                self._duplicate_rules
+            ):
+                if not self._window_matches(at_time, until_time, send_time):
+                    continue
+                if self._endpoint_matches(
+                    rule_src, src_process
+                ) and self._endpoint_matches(rule_dst, dst_process):
+                    if self._fault_random.random() < probability:
+                        duplicate_time = round(
+                            delivery_time + self._latency, _TIME_QUANTUM
+                        )
+                        heapq.heappush(
+                            pending,
+                            (
+                                duplicate_time,
+                                sequence,
+                                dst_process,
+                                dst,
+                                src,
+                                data,
+                            ),
+                        )
+                        sequence += 1
+                    break  # first matching rule decides
+
+        return sequence
