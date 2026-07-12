@@ -1,0 +1,132 @@
+"""
+VOPR execution + invariants: run a generated ``FaultPlan`` against the
+real production stack under the deterministic coordinator, and judge
+the outcome.
+
+The topology is the canonical L2 job triangle — a real ``ManagerServer``,
+a real ``WorkerServer`` with its 2 executor-pool children, and a real
+``HyperscaleClient`` submitting a real workflow — so every generated
+schedule exercises production code end to end, not a model of it.
+"""
+
+from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
+from tests.simulation.harness.sim.multiprocess.job_dispatch_demo import (
+    dispatch_client_entry,
+)
+from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
+    manager_entry,
+    worker_entry,
+)
+
+from .fault_plan import FaultPlan
+
+# Client-observed job states that count as a TERMINAL outcome. A
+# generated schedule may legitimately push a job into failure/timeout
+# (an executor kill racing a partition), but it must never leave the
+# client in silence — every job reaches a terminal state the client
+# SEES, before the ceiling.
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "timeout", "cancelled"})
+
+
+def run_fault_plan(plan: FaultPlan) -> dict:
+    """Execute one generated schedule; returns the per-process logs."""
+    coordinator = SimulationCoordinator(
+        latency=0.01, max_virtual_time=plan.ceiling, seed=plan.seed
+    )
+    coordinator.add_process(
+        "manager", manager_entry, "sim-mgr", 9000, 9001, "sim-dc"
+    )
+    coordinator.add_process(
+        "worker",
+        worker_entry,
+        "sim-wkr",
+        9000,
+        9001,
+        "sim-dc",
+        ("sim-mgr", 9000),
+        2,
+    )
+    coordinator.add_process(
+        "client", dispatch_client_entry, "sim-cli", 9500, ("sim-mgr", 9000)
+    )
+
+    for event in plan.events:
+        if event[0] == "kill":
+            _tag, victim_id, at_time = event
+            coordinator.schedule_kill(victim_id, at_time)
+        elif event[0] == "partition":
+            _tag, process_a, process_b, at_time, heal_time = event
+            coordinator.schedule_partition(
+                process_a, process_b, at_time, heal_time=heal_time
+            )
+        elif event[0] == "drop":
+            _tag, src, dst, probability, at_time, until_time = event
+            coordinator.schedule_drop_rate(
+                src, dst, probability, at_time=at_time, until_time=until_time
+            )
+        elif event[0] == "delay":
+            _tag, src, dst, extra, jitter, at_time, until_time = event
+            coordinator.schedule_delay(
+                src,
+                dst,
+                extra,
+                at_time=at_time,
+                until_time=until_time,
+                jitter_seconds=jitter,
+            )
+        elif event[0] == "duplicate":
+            _tag, src, dst, probability, at_time, until_time = event
+            coordinator.schedule_duplicate(
+                src, dst, probability, at_time=at_time, until_time=until_time
+            )
+        else:
+            raise ValueError(f"unknown fault-plan event kind: {event[0]!r}")
+
+    return coordinator.run()
+
+
+def check_invariants(plan: FaultPlan, results: dict) -> list[str]:
+    """Judge one run; returns human-readable violations (empty = pass).
+
+    Invariants every generated schedule must satisfy:
+
+    1. The client SUBMITTED the job (the cluster became available).
+    2. The client observed a TERMINAL job state before the ceiling —
+       completion normally; explicit failure/timeout is acceptable only
+       under faults that can strand in-flight work (an executor kill).
+       Silence — no terminal state ever seen — is always a violation.
+    3. A fault-free schedule must COMPLETE the job (the baseline).
+    """
+    violations: list[str] = []
+    client_log = results.get("client") or []
+
+    submitted = [entry for entry in client_log if entry[0] == "job-submitted"]
+    if not submitted:
+        violations.append(f"job was never accepted: client log {client_log}")
+        return violations
+
+    finished = [entry for entry in client_log if entry[0] == "job-finished"]
+    terminal_statuses_seen = {
+        entry[1]
+        for entry in client_log
+        if entry[0] in ("status-seen", "job-finished")
+        and entry[1] in _TERMINAL_STATUSES
+    }
+
+    if not terminal_statuses_seen:
+        violations.append(
+            "client never observed a terminal job state (silent strand): "
+            f"{client_log}"
+        )
+
+    schedule_can_strand = any(
+        event[0] in ("kill", "partition") for event in plan.events
+    )
+    completed = bool(finished) and finished[0][1] == "completed"
+    if not completed and not schedule_can_strand:
+        violations.append(
+            "loss/delay/duplication-only schedule must complete the job: "
+            f"events={plan.events} client={client_log}"
+        )
+
+    return violations
