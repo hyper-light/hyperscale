@@ -3165,6 +3165,32 @@ class ManagerServer(HealthAwareServer):
                     if current_time <= deadline:
                         continue
 
+                    # A worker deadline is a property of ACTIVE work —
+                    # AD-26 extensions are granted against dispatched
+                    # workflows, and nothing else refreshes the stored
+                    # value once that work drains. If the worker has no
+                    # unfinished sub-workflows, the expired deadline is
+                    # vestigial: enforcing it suspected and then evicted
+                    # a healthy, SWIM-OK, idle worker ~30s+ after every
+                    # job completed (and the dead-node reaper then
+                    # deregistered it, flipping the DC to "busy" on an
+                    # idle cluster). Clear it and move on — the next
+                    # dispatch/extension writes a fresh deadline. Uses
+                    # the same unfinished-work query the eviction path
+                    # itself uses for reassignment, so "nothing left to
+                    # protect" and "nothing to reassign" stay one
+                    # definition.
+                    job_manager = self._job_manager
+                    has_active_work = bool(
+                        job_manager
+                        and job_manager.get_reassignable_sub_workflows_on_worker(
+                            worker_id
+                        )
+                    )
+                    if not has_active_work:
+                        self._manager_state.clear_worker_deadline(worker_id)
+                        continue
+
                     time_since_deadline = current_time - deadline
 
                     if time_since_deadline <= grace_period:
