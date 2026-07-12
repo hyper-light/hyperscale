@@ -19,11 +19,18 @@ from typing import TYPE_CHECKING
 
 import cloudpickle
 
+from hyperscale.distributed.runtime import Filesystem, RealFilesystem
+
 from .models import RaftLogEntry
 
 if TYPE_CHECKING:
     from hyperscale.distributed.ledger.wal import WALWriter
     from hyperscale.logging import Logger
+
+
+# Module-level storage seam (Phase 7): borrowed, never shut down here;
+# swap_defaults rebinds it under SIM.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 
 # Fixed-width header: crc32 (4) + total_length (4) + term (8) + index (8)
@@ -109,18 +116,24 @@ class RaftWAL:
         "_logger",
         "_closed",
         "_loop",
+        "_filesystem",
     )
 
     def __init__(
         self,
         path: Path,
         logger: "Logger",
+        filesystem: Filesystem | None = None,
     ) -> None:
         self._path = path
         self._logger = logger
         self._writer: "WALWriter | None" = None
         self._closed = False
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
+        self._filesystem = (
+            filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
+        )
 
     async def open(self) -> None:
         """Open the WAL file and start the writer."""
@@ -130,7 +143,9 @@ class RaftWAL:
         )
 
         self._loop = asyncio.get_running_loop()
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        await self._filesystem.mkdir(
+            self._path.parent, parents=True, exist_ok=True
+        )
 
         config = WALWriterConfig(
             batch_timeout_microseconds=500,
@@ -143,6 +158,7 @@ class RaftWAL:
             path=self._path,
             config=config,
             logger=self._logger,
+            filesystem=self._filesystem,
         )
         await self._writer.start()
         self._closed = False
@@ -197,19 +213,18 @@ class RaftWAL:
 
         Returns entries sorted by index.
         """
-        if not self._path.exists():
+        if not await self._filesystem.exists(self._path):
             return []
 
-        entries = await asyncio.get_running_loop().run_in_executor(
-            None, self._recover_sync
-        )
+        file_data = await self._filesystem.read_bytes(self._path)
+        entries = self._parse_recovered(file_data)
         entries.sort(key=lambda entry: entry.index)
         return entries
 
-    def _recover_sync(self) -> list[RaftLogEntry]:
-        """Synchronous recovery: read and validate all WAL entries."""
+    @staticmethod
+    def _parse_recovered(file_data: bytes) -> list[RaftLogEntry]:
+        """Parse and CRC-validate WAL bytes (truncation-safe)."""
         recovered: list[RaftLogEntry] = []
-        file_data = self._path.read_bytes()
         offset = 0
         file_size = len(file_data)
 

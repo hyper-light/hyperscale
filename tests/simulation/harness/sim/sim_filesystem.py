@@ -25,9 +25,29 @@ exact on read (``exists`` / ``list_directory``): the production
 components all ``mkdir`` before writing, and strictness here would
 test the model rather than the system. ``list_directory`` returns
 sorted paths — deterministic iteration everywhere.
+
+Fault knobs (Phase 7 — all deterministic):
+
+* ``set_slow_disk(delay_seconds)`` — every operation costs that much
+  VIRTUAL time (awaits the injected clock inside the op; the reason
+  the whole seam is async). Scenarios toggle it at chosen virtual
+  instants rather than passing time windows — they own the timeline.
+* ``set_disk_full(remaining_bytes)`` — a byte budget; writes that
+  exceed it raise ``OSError(ENOSPC)``, exactly the error shape the
+  production error paths handle.
+* ``set_fsync_reorder(seed)`` — arms reordering-crash semantics: a
+  subsequent ``crash()`` keeps a SEEDED SUBSET of each file's
+  un-fsynced volatile segments (out-of-order persistence — how
+  reordering devices tear, not a clean suffix) and truncates the last
+  surviving segment at a seeded offset (the torn tail). Durable
+  (fsynced) content is never touched — ``atomic_write`` /
+  ``append_fsync`` guarantees hold by construction.
 """
 
+import random
 from pathlib import Path
+
+from hyperscale.distributed.runtime import Clock
 
 
 class _SimFileState:
@@ -58,13 +78,14 @@ class SimFileHandle:
     the modes production consumers use: ``r`` (read), ``w`` (truncate +
     sequential write), ``a`` (append)."""
 
-    __slots__ = ("_state", "_mode", "_position", "_closed")
+    __slots__ = ("_state", "_mode", "_position", "_closed", "_filesystem")
 
-    def __init__(self, state: _SimFileState, mode: str) -> None:
+    def __init__(self, state: _SimFileState, mode: str, filesystem) -> None:
         self._state = state
         self._mode = mode
         self._position = 0
         self._closed = False
+        self._filesystem = filesystem
 
     @property
     def closed(self) -> bool:
@@ -80,11 +101,13 @@ class SimFileHandle:
         self._require_open()
         if "r" in self._mode and "+" not in self._mode:
             raise OSError("file not open for writing")
+        await self._filesystem._charge_operation(write_bytes=len(data))
         self._state.volatile_segments.append(bytes(data))
         return len(data)
 
     async def read(self, size: int = -1) -> bytes:
         self._require_open()
+        await self._filesystem._charge_operation()
         content = self._state.visible_content
         if size < 0:
             data = content[self._position :]
@@ -96,6 +119,7 @@ class SimFileHandle:
 
     async def readline(self) -> bytes:
         self._require_open()
+        await self._filesystem._charge_operation()
         content = self._state.visible_content
         newline_index = content.find(b"\n", self._position)
         if newline_index < 0:
@@ -133,38 +157,105 @@ class SimFilesystem:
 
     Per-process state (each simulation child owns its own instance —
     a node's disk is local to it). ``crash()`` is the scenario-facing
-    power-loss primitive; the Phase 7 fault knobs (slow disk, disk
-    full, fsync reordering) layer onto this durability model.
+    power-loss primitive; the fault knobs layer onto the durability
+    model (see the module docstring).
     """
 
-    __slots__ = ("_files", "_directories")
+    __slots__ = (
+        "_files",
+        "_directories",
+        "_clock",
+        "_slow_disk_delay",
+        "_disk_full_remaining",
+        "_fsync_reorder_random",
+    )
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock | None = None) -> None:
         self._files: dict[str, _SimFileState] = {}
         self._directories: set[str] = set()
+        self._clock = clock
+        self._slow_disk_delay = 0.0
+        self._disk_full_remaining: int | None = None
+        self._fsync_reorder_random: random.Random | None = None
 
-    # -- scenario-facing fault primitive ---------------------------------
+    # -- scenario-facing fault primitives --------------------------------
+
+    def set_slow_disk(self, delay_seconds: float) -> None:
+        """Every subsequent operation costs ``delay_seconds`` of
+        VIRTUAL time. Requires the clock injected at construction."""
+        if delay_seconds > 0.0 and self._clock is None:
+            raise ValueError(
+                "slow_disk needs a Clock: construct "
+                "SimFilesystem(clock=...) so operations can await "
+                "virtual time"
+            )
+        self._slow_disk_delay = delay_seconds
+
+    def clear_slow_disk(self) -> None:
+        self._slow_disk_delay = 0.0
+
+    def set_disk_full(self, remaining_bytes: int) -> None:
+        """Writes beyond ``remaining_bytes`` raise ``OSError(ENOSPC)``."""
+        self._disk_full_remaining = remaining_bytes
+
+    def clear_disk_full(self) -> None:
+        self._disk_full_remaining = None
+
+    def set_fsync_reorder(self, seed: int) -> None:
+        """Arm reordering-crash semantics for the next ``crash()``."""
+        self._fsync_reorder_random = random.Random(seed)
 
     def crash(self) -> None:
-        """Model power loss: every file loses its un-fsynced tail.
+        """Model power loss.
 
-        Files created but never fsynced collapse to empty durable
-        content (they existed as directory entries whose data never
-        reached the platter).
+        Default: every file loses its un-fsynced volatile tail (files
+        never fsynced collapse to empty — directory entries whose data
+        never reached the platter). With ``set_fsync_reorder`` armed: a
+        seeded SUBSET of each file's volatile segments survives
+        instead, and the last survivor is torn at a seeded byte offset
+        — the surviving junk becomes on-disk content the recovery
+        paths must tolerate. Durable content is never touched.
         """
+        reorder_random = self._fsync_reorder_random
         for state in self._files.values():
-            state.collapse_to_durable()
+            if reorder_random is None or not state.volatile_segments:
+                state.collapse_to_durable()
+                continue
+
+            surviving_segments = [
+                segment
+                for segment in state.volatile_segments
+                if reorder_random.random() < 0.5
+            ]
+            if surviving_segments:
+                last_segment = surviving_segments[-1]
+                torn_length = reorder_random.randrange(0, len(last_segment) + 1)
+                surviving_segments[-1] = last_segment[:torn_length]
+
+            state.durable_content += b"".join(surviving_segments)
+            state.volatile_segments.clear()
+
+    # -- fault application (internal) ------------------------------------
+
+    async def _charge_operation(self, write_bytes: int = 0) -> None:
+        if self._slow_disk_delay > 0.0:
+            await self._clock.sleep(self._slow_disk_delay)
+        if write_bytes > 0 and self._disk_full_remaining is not None:
+            if write_bytes > self._disk_full_remaining:
+                raise OSError(28, "No space left on device")
+            self._disk_full_remaining -= write_bytes
 
     # -- Filesystem protocol ---------------------------------------------
 
     async def open(self, path: str | Path, mode: str) -> SimFileHandle:
+        await self._charge_operation()
         key = str(path)
         state = self._files.get(key)
 
         if "r" in mode and "+" not in mode:
             if state is None:
                 raise FileNotFoundError(2, "No such file or directory", key)
-            return SimFileHandle(state, mode)
+            return SimFileHandle(state, mode, self)
 
         if state is None:
             state = _SimFileState()
@@ -174,7 +265,7 @@ class SimFilesystem:
             state.durable_content = b""
             state.volatile_segments.clear()
 
-        return SimFileHandle(state, mode)
+        return SimFileHandle(state, mode, self)
 
     async def write_flush(
         self,
@@ -184,15 +275,20 @@ class SimFilesystem:
         flush: bool = True,
         fsync: bool = False,
     ) -> int:
-        written = await handle.write(data)
+        # One durability unit = ONE charge (the handle path would
+        # double-charge), appended directly.
+        await self._charge_operation(write_bytes=len(data))
+        handle._state.volatile_segments.append(bytes(data))
         if fsync:
             handle._state.promote_volatile()
-        return written
+        return len(data)
 
     async def fsync(self, handle: SimFileHandle) -> None:
+        await self._charge_operation()
         handle._state.promote_volatile()
 
     async def file_size(self, path: str | Path) -> int:
+        await self._charge_operation()
         state = self._files.get(str(path))
         if state is None:
             raise FileNotFoundError(2, "No such file or directory", str(path))
@@ -205,6 +301,7 @@ class SimFilesystem:
         return None
 
     async def append_fsync(self, path: str | Path, data: bytes) -> None:
+        await self._charge_operation(write_bytes=len(data))
         key = str(path)
         state = self._files.get(key)
         if state is None:
@@ -215,6 +312,7 @@ class SimFilesystem:
         state.promote_volatile()
 
     async def atomic_write(self, path: str | Path, data: bytes) -> None:
+        await self._charge_operation(write_bytes=len(data))
         key = str(path)
         state = self._files.get(key)
         if state is None:
@@ -226,6 +324,7 @@ class SimFilesystem:
         state.volatile_segments.clear()
 
     async def read_bytes(self, path: str | Path) -> bytes:
+        await self._charge_operation()
         state = self._files.get(str(path))
         if state is None:
             raise FileNotFoundError(2, "No such file or directory", str(path))

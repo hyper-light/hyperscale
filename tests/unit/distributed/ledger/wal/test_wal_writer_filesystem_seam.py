@@ -28,6 +28,9 @@ class RecordingFilesystem:
         self.append_calls: list[tuple[Path, bytes]] = []
         self._fail_with = fail_with
 
+    async def mkdir(self, path, *, parents=False, exist_ok=False) -> None:
+        return None
+
     async def append_fsync(self, path, data: bytes) -> None:
         if self._fail_with is not None:
             raise self._fail_with

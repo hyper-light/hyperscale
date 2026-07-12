@@ -209,7 +209,9 @@ class WALWriter:
 
         self._loop = asyncio.get_running_loop()
         self._running = True
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        await self._filesystem.mkdir(
+            self._path.parent, parents=True, exist_ok=True
+        )
 
         self._writer_task = self._create_background_task(
             self._writer_loop(),

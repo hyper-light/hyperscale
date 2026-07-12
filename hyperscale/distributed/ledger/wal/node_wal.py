@@ -18,7 +18,21 @@ from ..events.event_type import JobEventType
 from .entry_state import WALEntryState, TransitionResult
 from .wal_entry import HEADER_SIZE, WALEntry
 from .wal_status_snapshot import WALStatusSnapshot
-from .wal_writer import WALWriter, WALWriterConfig, WriteRequest, WALBackpressureError
+from hyperscale.distributed.runtime import (
+    Filesystem,
+    RealFilesystem,
+)
+
+from .wal_writer import (
+    WALWriter,
+    WALWriterConfig,
+    WriteRequest,
+    WALBackpressureError,
+)
+
+# Module-level storage seam (Phase 7): borrowed, never shut down here;
+# swap_defaults rebinds it under SIM.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -57,6 +71,7 @@ class NodeWAL:
         "_pending_snapshot",
         "_state_lock",
         "_logger",
+        "_filesystem",
     )
 
     def __init__(
@@ -65,11 +80,21 @@ class NodeWAL:
         clock: HybridLamportClock,
         config: WALWriterConfig | None = None,
         logger: Logger | None = None,
+        filesystem: Filesystem | None = None,
     ) -> None:
         self._path = path
         self._clock = clock
         self._logger = logger
-        self._writer = WALWriter(path=path, config=config, logger=logger)
+        # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
+        self._filesystem = (
+            filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
+        )
+        self._writer = WALWriter(
+            path=path,
+            config=config,
+            logger=logger,
+            filesystem=self._filesystem,
+        )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pending_entries_internal: dict[int, WALEntry] = {}
         self._status_snapshot = WALStatusSnapshot.initial()
@@ -83,16 +108,25 @@ class NodeWAL:
         clock: HybridLamportClock,
         config: WALWriterConfig | None = None,
         logger: Logger | None = None,
+        filesystem: Filesystem | None = None,
     ) -> NodeWAL:
-        wal = cls(path=path, clock=clock, config=config, logger=logger)
+        wal = cls(
+            path=path,
+            clock=clock,
+            config=config,
+            logger=logger,
+            filesystem=filesystem,
+        )
         await wal._initialize()
         return wal
 
     async def _initialize(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        await self._filesystem.mkdir(
+            self._path.parent, parents=True, exist_ok=True
+        )
 
-        if self._path.exists():
+        if await self._filesystem.exists(self._path):
             await self._recover()
 
         await self._writer.start()
@@ -101,8 +135,10 @@ class NodeWAL:
         loop = self._loop
         assert loop is not None
 
-        recovery_result = await loop.run_in_executor(None, self._recover_sync)
-        recovered_entries, next_lsn, last_synced_lsn = recovery_result
+        data = await self._filesystem.read_bytes(self._path)
+        recovered_entries, next_lsn, last_synced_lsn = (
+            self._parse_recovery_frames(data)
+        )
 
         for entry in recovered_entries:
             await self._clock.witness(entry.hlc)
@@ -118,16 +154,13 @@ class NodeWAL:
         )
         self._pending_snapshot = MappingProxyType(dict(self._pending_entries_internal))
 
-    def _recover_sync(self) -> tuple[list[WALEntry], int, int]:
+    @staticmethod
+    def _parse_recovery_frames(
+        data: bytes,
+    ) -> tuple[list[WALEntry], int, int]:
         recovered_entries: list[WALEntry] = []
         next_lsn = 0
         last_synced_lsn = -1
-
-        if not self._path.exists():
-            return recovered_entries, next_lsn, last_synced_lsn
-
-        with open(self._path, "rb") as file:
-            data = file.read()
 
         offset = 0
         while offset < len(data):
@@ -331,19 +364,18 @@ class NodeWAL:
         loop = self._loop
         assert loop is not None
 
-        entries = await loop.run_in_executor(None, self._read_entries_sync, start_lsn)
+        if await self._filesystem.exists(self._path):
+            data = await self._filesystem.read_bytes(self._path)
+        else:
+            data = b""
+        entries = self._parse_entries_from(data, start_lsn)
 
         for entry in entries:
             yield entry
 
-    def _read_entries_sync(self, start_lsn: int) -> list[WALEntry]:
+    @staticmethod
+    def _parse_entries_from(data: bytes, start_lsn: int) -> list[WALEntry]:
         entries: list[WALEntry] = []
-
-        if not self._path.exists():
-            return entries
-
-        with open(self._path, "rb") as file:
-            data = file.read()
 
         offset = 0
         while offset < len(data):
