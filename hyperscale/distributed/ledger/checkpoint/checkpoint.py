@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import struct
-import tempfile
 import zlib
 from pathlib import Path
 from typing import Any
 
 import msgspec
 
+from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 from hyperscale.logging.lsn import LSN
 
 CHECKPOINT_MAGIC = b"HSCL"
 CHECKPOINT_VERSION = 1
 CHECKPOINT_HEADER_SIZE = 16
+
+# Module-level storage seam (Phase 7). The manager BORROWS this (or an
+# injected instance) — it never shuts the filesystem down.
+# ``swap_defaults`` rebinds it to the SIM filesystem so checkpoint
+# persistence becomes deterministic and storage-faultable under replay.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 
 class Checkpoint(msgspec.Struct, frozen=True):
@@ -27,34 +32,33 @@ class Checkpoint(msgspec.Struct, frozen=True):
 
 
 class CheckpointManager:
-    __slots__ = ("_checkpoint_dir", "_lock", "_latest_checkpoint", "_loop")
+    __slots__ = ("_checkpoint_dir", "_lock", "_latest_checkpoint", "_filesystem")
 
-    def __init__(self, checkpoint_dir: Path) -> None:
+    def __init__(
+        self,
+        checkpoint_dir: Path,
+        filesystem: Filesystem | None = None,
+    ) -> None:
         self._checkpoint_dir = checkpoint_dir
         self._lock = asyncio.Lock()
         self._latest_checkpoint: Checkpoint | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-    async def initialize(self) -> None:
-        self._loop = asyncio.get_running_loop()
-
-        await self._loop.run_in_executor(
-            None,
-            self._initialize_sync,
+        # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
+        self._filesystem = (
+            filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
         )
 
+    async def initialize(self) -> None:
+        await self._filesystem.mkdir(
+            self._checkpoint_dir, parents=True, exist_ok=True
+        )
         await self._load_latest()
 
-    def _initialize_sync(self) -> None:
-        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     async def _load_latest(self) -> None:
-        loop = self._loop
-        assert loop is not None
-
-        checkpoint_files = await loop.run_in_executor(
-            None,
-            self._list_checkpoint_files_sync,
+        checkpoint_files = sorted(
+            await self._filesystem.list_directory(
+                self._checkpoint_dir, "checkpoint_*.bin"
+            ),
+            reverse=True,
         )
 
         for checkpoint_file in checkpoint_files:
@@ -65,26 +69,12 @@ class CheckpointManager:
             except (ValueError, OSError):
                 continue
 
-    def _list_checkpoint_files_sync(self) -> list[Path]:
-        return sorted(
-            self._checkpoint_dir.glob("checkpoint_*.bin"),
-            reverse=True,
-        )
-
     async def _read_checkpoint(self, path: Path) -> Checkpoint:
-        loop = self._loop
-        assert loop is not None
+        data = await self._filesystem.read_bytes(path)
+        return self._decode_checkpoint(data)
 
-        return await loop.run_in_executor(
-            None,
-            self._read_checkpoint_sync,
-            path,
-        )
-
-    def _read_checkpoint_sync(self, path: Path) -> Checkpoint:
-        with open(path, "rb") as file:
-            data = file.read()
-
+    @staticmethod
+    def _decode_checkpoint(data: bytes) -> Checkpoint:
         if len(data) < CHECKPOINT_HEADER_SIZE:
             raise ValueError("Checkpoint file too small")
 
@@ -110,27 +100,9 @@ class CheckpointManager:
         return msgspec.msgpack.decode(payload, type=Checkpoint)
 
     async def save(self, checkpoint: Checkpoint) -> Path:
-        loop = self._loop
-        assert loop is not None
-
-        path = await loop.run_in_executor(
-            None,
-            self._save_sync,
-            checkpoint,
+        final_path = (
+            self._checkpoint_dir / f"checkpoint_{checkpoint.created_at_ms}.bin"
         )
-
-        async with self._lock:
-            if (
-                self._latest_checkpoint is None
-                or checkpoint.created_at_ms > self._latest_checkpoint.created_at_ms
-            ):
-                self._latest_checkpoint = checkpoint
-
-        return path
-
-    def _save_sync(self, checkpoint: Checkpoint) -> Path:
-        filename = f"checkpoint_{checkpoint.created_at_ms}.bin"
-        final_path = self._checkpoint_dir / filename
 
         payload = msgspec.msgpack.encode(checkpoint)
         crc = zlib.crc32(payload) & 0xFFFFFFFF
@@ -142,56 +114,34 @@ class CheckpointManager:
             + struct.pack(">I", crc)
         )
 
-        temp_fd, temp_path_str = tempfile.mkstemp(
-            dir=self._checkpoint_dir,
-            prefix=".tmp_checkpoint_",
-            suffix=".bin",
-        )
+        # The full crash-consistency sequence (temp file, flush, fsync,
+        # atomic rename, parent-directory fsync) that this class
+        # previously hand-rolled now lives behind the seam as one
+        # operation — same bytes, same durability, storage-faultable
+        # under SIM.
+        await self._filesystem.atomic_write(final_path, header + payload)
 
-        try:
-            with os.fdopen(temp_fd, "wb") as file:
-                file.write(header)
-                file.write(payload)
-                file.flush()
-                os.fsync(file.fileno())
+        async with self._lock:
+            if (
+                self._latest_checkpoint is None
+                or checkpoint.created_at_ms > self._latest_checkpoint.created_at_ms
+            ):
+                self._latest_checkpoint = checkpoint
 
-            os.rename(temp_path_str, final_path)
-
-            dir_fd = os.open(self._checkpoint_dir, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-
-            return final_path
-
-        except Exception:
-            try:
-                os.unlink(temp_path_str)
-            except OSError:
-                pass
-            raise
+        return final_path
 
     async def cleanup(self, keep_count: int = 3) -> int:
-        loop = self._loop
-        assert loop is not None
-
-        return await loop.run_in_executor(
-            None,
-            self._cleanup_sync,
-            keep_count,
-        )
-
-    def _cleanup_sync(self, keep_count: int) -> int:
         checkpoint_files = sorted(
-            self._checkpoint_dir.glob("checkpoint_*.bin"),
+            await self._filesystem.list_directory(
+                self._checkpoint_dir, "checkpoint_*.bin"
+            ),
             reverse=True,
         )
 
         removed_count = 0
         for checkpoint_file in checkpoint_files[keep_count:]:
             try:
-                checkpoint_file.unlink()
+                await self._filesystem.remove(checkpoint_file)
                 removed_count += 1
             except OSError:
                 pass

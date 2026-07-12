@@ -161,8 +161,14 @@ class RealFilesystem:
     ) -> list[Path]:
         return await self._run(self._list_directory_sync, path, pattern)
 
+    async def list_subdirectories(self, path: str | Path) -> list[Path]:
+        return await self._run(self._list_subdirectories_sync, path)
+
     async def remove(self, path: str | Path) -> None:
         await self._run(os.unlink, path)
+
+    async def remove_directory(self, path: str | Path) -> None:
+        await self._run(os.rmdir, path)
 
     # -- single-executor-job sync sequences ------------------------------
 
@@ -173,6 +179,12 @@ class RealFilesystem:
     @staticmethod
     def _list_directory_sync(path: str | Path, pattern: str) -> list[Path]:
         return sorted(Path(path).glob(pattern))
+
+    @staticmethod
+    def _list_subdirectories_sync(path: str | Path) -> list[Path]:
+        return sorted(
+            entry for entry in Path(path).iterdir() if entry.is_dir()
+        )
 
     @staticmethod
     def _fsync_directory_sync(path: str | Path) -> None:

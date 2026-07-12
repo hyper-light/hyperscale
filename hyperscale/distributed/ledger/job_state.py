@@ -110,25 +110,29 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             "cancelled": self.cancelled,
             "completed_count": self.completed_count,
             "failed_count": self.failed_count,
-            "created_hlc": self.created_hlc.to_int(),
-            "last_hlc": self.last_hlc.to_int(),
+            # HLCs serialize as their four components, NOT ``to_int()``:
+            # the packed form is a 128-bit integer and msgpack caps at
+            # 64 bits, so ``msgspec.msgpack.encode`` raised
+            # OverflowError for every real LSN (a nonzero logical_time
+            # shifts past bit 80). Component form matches how msgspec
+            # already encodes the LSN NamedTuple inside Checkpoint.
+            "created_hlc": list(self.created_hlc),
+            "last_hlc": list(self.last_hlc),
         }
+
+    @staticmethod
+    def _decode_hlc(raw: Any) -> LSN:
+        if isinstance(raw, (list, tuple)) and len(raw) == 4:
+            return LSN(*raw)
+        if isinstance(raw, int):
+            # Legacy packed-integer form (pre component-form records).
+            return LSN.from_int(raw)
+        return LSN(0, 0, 0, 0)
 
     @classmethod
     def from_dict(cls, job_id: str, data: dict[str, Any]) -> JobState:
-        created_hlc_raw = data.get("created_hlc", 0)
-        last_hlc_raw = data.get("last_hlc", 0)
-
-        created_hlc = (
-            LSN.from_int(created_hlc_raw)
-            if isinstance(created_hlc_raw, int)
-            else LSN(0, 0, 0, 0)
-        )
-        last_hlc = (
-            LSN.from_int(last_hlc_raw)
-            if isinstance(last_hlc_raw, int)
-            else LSN(0, 0, 0, 0)
-        )
+        created_hlc = cls._decode_hlc(data.get("created_hlc", 0))
+        last_hlc = cls._decode_hlc(data.get("last_hlc", 0))
 
         return cls(
             job_id=job_id,

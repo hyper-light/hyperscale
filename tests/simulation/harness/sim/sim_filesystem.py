@@ -239,11 +239,37 @@ class SimFilesystem:
             and Path(file_path).match(pattern)
         )
 
+    async def list_subdirectories(self, path: str | Path) -> list[Path]:
+        directory = Path(path)
+        return sorted(
+            {
+                Path(known_directory)
+                for known_directory in self._directories
+                if Path(known_directory).parent == directory
+            }
+        )
+
     async def remove(self, path: str | Path) -> None:
         key = str(path)
         if key not in self._files:
             raise FileNotFoundError(2, "No such file or directory", key)
         del self._files[key]
+
+    async def remove_directory(self, path: str | Path) -> None:
+        directory = Path(path)
+        key = str(directory)
+        if key not in self._directories:
+            raise FileNotFoundError(2, "No such file or directory", key)
+        has_children = any(
+            Path(file_path).parent == directory for file_path in self._files
+        ) or any(
+            Path(known_directory).parent == directory
+            for known_directory in self._directories
+            if known_directory != key
+        )
+        if has_children:
+            raise OSError(39, "Directory not empty", key)
+        self._directories.discard(key)
 
     def _register_parents(self, path: Path) -> None:
         for parent in path.parents:

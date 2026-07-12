@@ -1,31 +1,38 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import tempfile
 from pathlib import Path
 
 import msgspec
 
+from hyperscale.distributed.runtime import Filesystem, RealFilesystem
+
 from ..job_state import JobState
+
+# Module-level storage seam (Phase 7). The store BORROWS this (or an
+# injected instance) — it never shuts the filesystem down.
+# ``swap_defaults`` rebinds it to the SIM filesystem so archive
+# persistence becomes deterministic and storage-faultable under replay.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 
 class JobArchiveStore:
-    __slots__ = ("_archive_dir", "_loop")
+    __slots__ = ("_archive_dir", "_filesystem")
 
-    def __init__(self, archive_dir: Path) -> None:
+    def __init__(
+        self,
+        archive_dir: Path,
+        filesystem: Filesystem | None = None,
+    ) -> None:
         self._archive_dir = archive_dir
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-    async def initialize(self) -> None:
-        self._loop = asyncio.get_running_loop()
-        await self._loop.run_in_executor(
-            None,
-            self._initialize_sync,
+        # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
+        self._filesystem = (
+            filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
         )
 
-    def _initialize_sync(self) -> None:
-        self._archive_dir.mkdir(parents=True, exist_ok=True)
+    async def initialize(self) -> None:
+        await self._filesystem.mkdir(
+            self._archive_dir, parents=True, exist_ok=True
+        )
 
     def _get_archive_path(self, job_id: str) -> Path:
         parts = job_id.split("-")
@@ -38,83 +45,34 @@ class JobArchiveStore:
         return self._archive_dir / "unknown" / f"{job_id}.bin"
 
     async def write_if_absent(self, job_state: JobState) -> bool:
-        loop = self._loop
-        assert loop is not None
-
         archive_path = self._get_archive_path(job_state.job_id)
 
-        return await loop.run_in_executor(
-            None,
-            self._write_if_absent_sync,
-            job_state,
-            archive_path,
-        )
-
-    def _write_if_absent_sync(self, job_state: JobState, archive_path: Path) -> bool:
-        if archive_path.exists():
+        if await self._filesystem.exists(archive_path):
             return True
 
-        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        await self._filesystem.mkdir(
+            archive_path.parent, parents=True, exist_ok=True
+        )
 
         data = msgspec.msgpack.encode(job_state.to_dict())
 
-        temp_fd, temp_path_str = tempfile.mkstemp(
-            dir=archive_path.parent,
-            prefix=".tmp_",
-            suffix=".bin",
-        )
-
-        try:
-            with os.fdopen(temp_fd, "wb") as file:
-                file.write(data)
-                file.flush()
-                os.fsync(file.fileno())
-
-            os.rename(temp_path_str, archive_path)
-
-            dir_fd = os.open(archive_path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-
-            return True
-
-        except FileExistsError:
-            try:
-                os.unlink(temp_path_str)
-            except OSError:
-                pass
-            return True
-
-        except Exception:
-            try:
-                os.unlink(temp_path_str)
-            except OSError:
-                pass
-            raise
+        # The full crash-consistency sequence (temp file, flush, fsync,
+        # atomic rename, parent-directory fsync) this class previously
+        # hand-rolled now lives behind the seam as one operation.
+        # write-if-absent stays idempotent: a concurrent writer landing
+        # first is indistinguishable from us landing first — both leave
+        # the same complete record.
+        await self._filesystem.atomic_write(archive_path, data)
+        return True
 
     async def read(self, job_id: str) -> JobState | None:
-        loop = self._loop
-        assert loop is not None
-
         archive_path = self._get_archive_path(job_id)
 
-        return await loop.run_in_executor(
-            None,
-            self._read_sync,
-            job_id,
-            archive_path,
-        )
-
-    def _read_sync(self, job_id: str, archive_path: Path) -> JobState | None:
-        if not archive_path.exists():
+        if not await self._filesystem.exists(archive_path):
             return None
 
         try:
-            with open(archive_path, "rb") as file:
-                data = file.read()
-
+            data = await self._filesystem.read_bytes(archive_path)
             job_dict = msgspec.msgpack.decode(data)
             return JobState.from_dict(job_id, job_dict)
 
@@ -122,80 +80,55 @@ class JobArchiveStore:
             return None
 
     async def exists(self, job_id: str) -> bool:
-        loop = self._loop
-        assert loop is not None
-
-        archive_path = self._get_archive_path(job_id)
-
-        return await loop.run_in_executor(
-            None,
-            archive_path.exists,
-        )
+        return await self._filesystem.exists(self._get_archive_path(job_id))
 
     async def delete(self, job_id: str) -> bool:
-        loop = self._loop
-        assert loop is not None
-
         archive_path = self._get_archive_path(job_id)
 
-        return await loop.run_in_executor(
-            None,
-            self._delete_sync,
-            archive_path,
-        )
-
-    def _delete_sync(self, archive_path: Path) -> bool:
-        if not archive_path.exists():
+        if not await self._filesystem.exists(archive_path):
             return False
 
         try:
-            archive_path.unlink()
+            await self._filesystem.remove(archive_path)
             return True
         except OSError:
             return False
 
-    async def cleanup_older_than(self, max_age_ms: int, current_time_ms: int) -> int:
-        loop = self._loop
-        assert loop is not None
-
-        return await loop.run_in_executor(
-            None,
-            self._cleanup_older_than_sync,
-            max_age_ms,
-            current_time_ms,
-        )
-
-    def _cleanup_older_than_sync(self, max_age_ms: int, current_time_ms: int) -> int:
+    async def cleanup_older_than(
+        self, max_age_ms: int, current_time_ms: int
+    ) -> int:
         removed_count = 0
 
-        if not self._archive_dir.exists():
+        if not await self._filesystem.exists(self._archive_dir):
             return removed_count
 
-        for region_dir in self._archive_dir.iterdir():
-            if not region_dir.is_dir():
-                continue
-
-            for shard_dir in region_dir.iterdir():
-                if not shard_dir.is_dir():
-                    continue
-
+        for region_dir in await self._filesystem.list_subdirectories(
+            self._archive_dir
+        ):
+            for shard_dir in await self._filesystem.list_subdirectories(
+                region_dir
+            ):
                 try:
                     shard_timestamp = int(shard_dir.name) * 1000
-                    if current_time_ms - shard_timestamp > max_age_ms:
-                        for archive_file in shard_dir.iterdir():
-                            try:
-                                archive_file.unlink()
-                                removed_count += 1
-                            except OSError:
-                                pass
-
-                        try:
-                            shard_dir.rmdir()
-                        except OSError:
-                            pass
-
                 except ValueError:
                     continue
+
+                if current_time_ms - shard_timestamp <= max_age_ms:
+                    continue
+
+                for archive_file in await self._filesystem.list_directory(
+                    shard_dir, "*"
+                ):
+                    try:
+                        await self._filesystem.remove(archive_file)
+                        removed_count += 1
+                    except OSError:
+                        pass
+
+                try:
+                    await self._filesystem.remove_directory(shard_dir)
+                except OSError:
+                    pass
 
         return removed_count
 
