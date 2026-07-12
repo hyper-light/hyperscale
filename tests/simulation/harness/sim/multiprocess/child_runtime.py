@@ -46,6 +46,7 @@ from hyperscale.distributed.runtime import (
 from hyperscale.logging import LoggingConfig
 
 from ..seeded_random import SeededRandom
+from ..sim_filesystem import SimFilesystem
 from ..simulation_loop import SimulationLoop
 from ..virtual_clock import VirtualClock
 from .child_context import ChildContext, CrossProcessTransport
@@ -86,7 +87,11 @@ def run_child_loop(
     # entry's module graph is fully imported by the time we run (spawn
     # unpickled ``entry`` during bootstrap), so the swap covers it.
     defaults_snapshot = snapshot_defaults()
-    swap_defaults(clock=virtual_clock, random_source=seeded_random)
+    swap_defaults(
+        clock=virtual_clock,
+        random_source=seeded_random,
+        filesystem=SimFilesystem(),
+    )
 
     entry(context, *entry_args)
 

@@ -69,19 +69,32 @@ def test_operations_run_off_loop_on_the_dedicated_pool(filesystem, tmp_path):
 
 
 def test_threads_spawn_lazily_and_shutdown_joins_them(tmp_path):
-    """No threads at construction; workers exist after IO; a
-    ``shutdown(wait=True)`` joins them all — the no-leak contract."""
+    """No NEW threads at construction; workers exist after IO; a
+    ``shutdown(wait=True)`` joins them all — the no-leak contract.
+
+    Measured as a thread-identity DELTA against the pre-existing pool
+    threads: other tests in the same process legitimately leave the
+    module-default singletons' workers alive (process-lifetime
+    instances are never shut down by design), so absolute counts would
+    cross-talk between tests.
+    """
+    threads_before = set(_pool_threads())
     real_filesystem = RealFilesystem(max_workers=2)
-    assert not _pool_threads(), "construction must not spawn threads"
+    assert (
+        set(_pool_threads()) == threads_before
+    ), "construction must not spawn threads"
 
     async def do_io() -> None:
         await real_filesystem.atomic_write(tmp_path / "lazy.bin", b"x")
 
     _run(do_io())
-    assert _pool_threads(), "IO must have spawned pool workers"
+    spawned = set(_pool_threads()) - threads_before
+    assert spawned, "IO must have spawned pool workers"
 
     real_filesystem.shutdown(wait=True)
-    assert not _pool_threads(), "shutdown(wait=True) must join all workers"
+    assert not (
+        set(_pool_threads()) & spawned
+    ), "shutdown(wait=True) must join this instance's workers"
 
     # Idempotent: a second shutdown is a no-op, not an error.
     real_filesystem.shutdown(wait=True)

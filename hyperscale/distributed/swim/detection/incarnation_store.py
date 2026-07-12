@@ -19,10 +19,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import (
+    Clock,
+    Filesystem,
+    RealClock,
+    RealFilesystem,
+)
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
+
+# Module-level storage seam (Phase 7). The store BORROWS this (or an
+# injected instance) — it never shuts the filesystem down.
+# ``swap_defaults`` rebinds it to the SIM filesystem so incarnation
+# persistence becomes deterministic and storage-faultable under replay.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
@@ -68,6 +79,12 @@ class IncarnationStore:
     # Minimum incarnation bump on restart to ensure freshness
     restart_incarnation_bump: int = 10
 
+    # Storage seam (Phase 7): borrowed, never shut down here. All disk
+    # touches route through it — crash-safe atomic writes, off-loop by
+    # construction (the previous inline pathlib IO ran synchronously ON
+    # the event loop and skipped every fsync).
+    filesystem: Filesystem | None = None
+
     # Logger for debugging
     _logger: LoggerProtocol | None = None
     _node_host: str = ""
@@ -80,6 +97,8 @@ class IncarnationStore:
 
     def __post_init__(self):
         self._lock = asyncio.Lock()
+        if self.filesystem is None:
+            self.filesystem = _DEFAULT_FILESYSTEM
 
     def set_logger(
         self,
@@ -118,7 +137,9 @@ class IncarnationStore:
                 )
 
             try:
-                self.storage_directory.mkdir(parents=True, exist_ok=True)
+                await self.filesystem.mkdir(
+                    self.storage_directory, parents=True, exist_ok=True
+                )
             except OSError as error:
                 await self._log_warning(
                     f"Failed to create incarnation storage directory: {error}"
@@ -211,10 +232,12 @@ class IncarnationStore:
     async def _load_from_disk(self) -> IncarnationRecord | None:
         """Load incarnation record from disk."""
         try:
-            if not self._storage_path.exists():
+            if not await self.filesystem.exists(self._storage_path):
                 return None
 
-            content = self._storage_path.read_text(encoding="utf-8")
+            content = await self.filesystem.read_text(
+                self._storage_path, encoding="utf-8"
+            )
             data = json.loads(content)
 
             return IncarnationRecord(
@@ -230,7 +253,12 @@ class IncarnationStore:
         """
         Save incarnation record to disk atomically.
 
-        Uses write-to-temp-then-rename for crash safety.
+        ``Filesystem.atomic_write`` performs the FULL crash-consistency
+        sequence — temp file, flush, fsync, atomic rename, parent-
+        directory fsync — off the event loop. The previous inline
+        temp-then-rename skipped both fsyncs (a lost/torn-write window
+        on power failure that undermined the zombie-prevention
+        guarantee this store exists for) and blocked the loop.
         """
         try:
             data = {
@@ -239,9 +267,10 @@ class IncarnationStore:
                 "node_address": record.node_address,
             }
 
-            temp_path = self._storage_path.with_suffix(".tmp")
-            temp_path.write_text(json.dumps(data), encoding="utf-8")
-            temp_path.rename(self._storage_path)
+            await self.filesystem.atomic_write(
+                self._storage_path,
+                json.dumps(data).encode("utf-8"),
+            )
             return True
         except OSError as error:
             await self._log_warning(f"Failed to save incarnation to disk: {error}")

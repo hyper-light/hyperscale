@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 import struct
 from typing import Generic, TypeVar
@@ -15,10 +14,21 @@ from .idempotency_key import IdempotencyKey
 from .idempotency_status import IdempotencyStatus
 from .ledger_entry import IdempotencyLedgerEntry
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import (
+    Clock,
+    Filesystem,
+    RealClock,
+    RealFilesystem,
+)
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
+
+# Module-level storage seam (Phase 7). The ledger BORROWS this (or an
+# injected instance) — it never shuts the filesystem down.
+# ``swap_defaults`` rebinds it to the SIM filesystem so exactly-once
+# persistence becomes deterministic and storage-faultable under replay.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 T = TypeVar("T")
 
@@ -32,11 +42,16 @@ class ManagerIdempotencyLedger(Generic[T]):
         wal_path: str | Path,
         task_runner: Runner,
         logger: Logger,
+        filesystem: Filesystem | None = None,
     ) -> None:
         self._config = config
         self._wal_path = Path(wal_path)
         self._task_runner = task_runner
         self._logger = logger
+        # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
+        self._filesystem = (
+            filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
+        )
         self._index: dict[IdempotencyKey, IdempotencyLedgerEntry] = {}
         self._job_to_key: dict[str, IdempotencyKey] = {}
         self._lock = asyncio.Lock()
@@ -45,7 +60,9 @@ class ManagerIdempotencyLedger(Generic[T]):
 
     async def start(self) -> None:
         """Start the ledger and replay the WAL."""
-        self._wal_path.parent.mkdir(parents=True, exist_ok=True)
+        await self._filesystem.mkdir(
+            self._wal_path.parent, parents=True, exist_ok=True
+        )
         await self._replay_wal()
 
         if self._cleanup_token is None:
@@ -151,37 +168,68 @@ class ManagerIdempotencyLedger(Generic[T]):
     async def _persist_entry(self, entry: IdempotencyLedgerEntry) -> None:
         payload = entry.to_bytes()
         record = struct.pack(">I", len(payload)) + payload
-        await asyncio.to_thread(self._write_wal_record, record)
-
-    def _write_wal_record(self, record: bytes) -> None:
-        with self._wal_path.open("ab") as wal_file:
-            wal_file.write(record)
-            wal_file.flush()
-            os.fsync(wal_file.fileno())
+        # One durable unit per entry through the storage seam — the
+        # same append+flush+fsync sequence as before, off-loop on the
+        # filesystem's own executor.
+        await self._filesystem.append_fsync(self._wal_path, record)
 
     async def _replay_wal(self) -> None:
-        if not self._wal_path.exists():
+        if not await self._filesystem.exists(self._wal_path):
             return
 
-        data = await asyncio.to_thread(self._wal_path.read_bytes)
-        for entry in self._parse_wal_entries(data):
+        data = await self._filesystem.read_bytes(self._wal_path)
+        entries, torn_at_offset = self._parse_wal_entries(data)
+        for entry in entries:
             self._index[entry.idempotency_key] = entry
             self._job_to_key[entry.job_id] = entry.idempotency_key
 
-    def _parse_wal_entries(self, data: bytes) -> list[IdempotencyLedgerEntry]:
+        if torn_at_offset is not None:
+            await self._logger.log(
+                IdempotencyError(
+                    message=(
+                        "Idempotency WAL has a torn tail at byte "
+                        f"{torn_at_offset} of {len(data)} (crash debris "
+                        "from an interrupted append) — recovered "
+                        f"{len(entries)} complete entries and dropped "
+                        "the tail"
+                    ),
+                    component="manager-ledger",
+                )
+            )
+
+    def _parse_wal_entries(
+        self, data: bytes
+    ) -> tuple[list[IdempotencyLedgerEntry], int | None]:
+        """Parse length-prefixed entries; tolerate a torn tail.
+
+        A crash mid-``append_fsync`` legitimately leaves a partial
+        record at the end of the file. This previously RAISED, which
+        turned one crash into a permanent boot loop — every subsequent
+        ``start()`` re-hit the same debris. Now, like NodeWAL and
+        RaftWAL, parsing stops at the first incomplete or undecodable
+        frame: complete entries are recovered, the tail's byte offset
+        is returned so the caller can log the data loss loudly.
+        """
         entries: list[IdempotencyLedgerEntry] = []
         offset = 0
         while offset < len(data):
+            frame_start = offset
             if offset + 4 > len(data):
-                raise ValueError("Incomplete WAL entry length")
+                return entries, frame_start
             entry_len = struct.unpack_from(">I", data, offset)[0]
             offset += 4
             if offset + entry_len > len(data):
-                raise ValueError("Incomplete WAL entry payload")
+                return entries, frame_start
             entry_bytes = data[offset : offset + entry_len]
-            entries.append(IdempotencyLedgerEntry.from_bytes(entry_bytes))
+            try:
+                entries.append(IdempotencyLedgerEntry.from_bytes(entry_bytes))
+            except Exception:
+                # A complete-length frame with an undecodable payload —
+                # bit rot or a torn write that landed inside the frame.
+                # Nothing after it can be trusted without CRC resync.
+                return entries, frame_start
             offset += entry_len
-        return entries
+        return entries, None
 
     async def _cleanup_loop(self) -> None:
         while not self._closed:

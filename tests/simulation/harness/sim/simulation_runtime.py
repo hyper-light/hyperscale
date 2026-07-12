@@ -39,6 +39,7 @@ from hyperscale.distributed.runtime import (
 
 from .in_process_transport import InProcessTransport
 from .seeded_random import SeededRandom
+from .sim_filesystem import SimFilesystem
 from .sim_transport_factory import SimTransportFactory
 from .simulation_loop import SimulationLoop
 from .virtual_clock import VirtualClock
@@ -59,11 +60,16 @@ class SimulationRuntime:
         self.random = SeededRandom(seed)
         self.transport = InProcessTransport(self.loop)
         self.transport_factory = SimTransportFactory(self.transport)
+        self.filesystem = SimFilesystem()
 
         # Snapshot the process-default clock/random so ``close`` can
         # restore them; then point them at the SIM instances.
         self._defaults = snapshot_defaults()
-        swap_defaults(clock=self.clock, random_source=self.random)
+        swap_defaults(
+            clock=self.clock,
+            random_source=self.random,
+            filesystem=self.filesystem,
+        )
 
         # The SimulationLoop bans the real-I/O ops the async logger's
         # stream setup performs; SIM asserts on state, not log output.
