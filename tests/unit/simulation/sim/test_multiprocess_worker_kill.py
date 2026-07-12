@@ -9,6 +9,9 @@ once). No process the manager can reach holds the job anymore.
 From there every hop is unchanged production code on the manager: SWIM
 probes toward the dead worker go unanswered, suspicion escalates, the
 dead-worker reap empties the registry (the ``worker-lost`` milestone);
+the ceiling is sized generously past the detector's sustained-silence
+latency because detection timing MOVES when the topology changes (the
+WAL-enabled manager consumes different jitter draws);
 the in-flight job can never complete and terminates through the
 manager's timeout machinery, whose terminal push resolves the client's
 ``wait_for_job`` — the job fails loudly instead of hanging. The whole
@@ -24,7 +27,7 @@ from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
     worker_entry,
 )
 
-_CEILING = 90.0
+_CEILING = 150.0
 _KILL_AT = 19.0
 
 

@@ -31,7 +31,7 @@ from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
     worker_entry,
 )
 
-_PARTITION_CEILING = 160.0
+_PARTITION_CEILING = 220.0
 _NEVER = 100_000.0
 
 
@@ -45,10 +45,14 @@ def _run_partition_heal() -> dict:
     notice, whichever lands first. The cut must be LONG: the failure
     detector deliberately resists declaring death on transient loss
     (LHM growth stretches suspicion — the "no false DEAD under packet
-    loss" property), and under a sustained cut starting at t=20 the
-    deregistration lands at t=58; the heal at t=70 leaves margin on
-    both sides. ``evicting_manager_entry`` with a never-firing evict
-    time is reused purely for its worker-count transition watcher.
+    loss" property). Detection latency also MOVES when the topology
+    changes (the WAL-enabled manager consumes different jitter draws,
+    shifting probe schedules by tens of seconds), so the cut window is
+    sized generously: cut at t=20, heal at t=110 — roughly double the
+    detector's sustained-silence latency — with the ceiling leaving
+    equal room for the post-heal rejoin. ``evicting_manager_entry``
+    with a never-firing evict time is reused purely for its
+    worker-count transition watcher.
     """
     coordinator = SimulationCoordinator(
         latency=0.01, max_virtual_time=_PARTITION_CEILING, seed=53
@@ -72,7 +76,7 @@ def _run_partition_heal() -> dict:
         ("sim-mgr", 9000),
         2,
     )
-    coordinator.schedule_partition("manager", "worker", 20.0, heal_time=70.0)
+    coordinator.schedule_partition("manager", "worker", 20.0, heal_time=110.0)
     return coordinator.run()
 
 
@@ -98,8 +102,8 @@ def test_partition_detected_and_membership_recovers_after_heal():
         for entry in manager_log
         if entry[0] == "worker-count" and entry[1] == 1
     ][-1]
-    assert 20.0 < lost_time < 70.0, manager_log
-    assert recovered_time > 70.0, manager_log
+    assert 20.0 < lost_time < 110.0, manager_log
+    assert recovered_time > 110.0, manager_log
 
 
 def test_partition_heal_is_replay_deterministic():

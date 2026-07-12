@@ -33,8 +33,24 @@ def run_fault_plan(plan: FaultPlan) -> dict:
     coordinator = SimulationCoordinator(
         latency=0.01, max_virtual_time=plan.ceiling, seed=plan.seed
     )
+    # Storage events ride the manager's entry args (the knobs live on
+    # the CHILD's in-memory filesystem, so only the child can arm them);
+    # network/kill events go through coordinator scheduling below.
+    storage_fault_schedule = tuple(
+        event
+        for event in plan.events
+        if event[0] in ("slow_disk", "disk_full")
+    )
     coordinator.add_process(
-        "manager", manager_entry, "sim-mgr", 9000, 9001, "sim-dc"
+        "manager",
+        manager_entry,
+        "sim-mgr",
+        9000,
+        9001,
+        "sim-dc",
+        None,
+        None,
+        storage_fault_schedule,
     )
     coordinator.add_process(
         "worker",
@@ -79,6 +95,8 @@ def run_fault_plan(plan: FaultPlan) -> dict:
             coordinator.schedule_duplicate(
                 src, dst, probability, at_time=at_time, until_time=until_time
             )
+        elif event[0] in ("slow_disk", "disk_full"):
+            continue  # armed inside the manager child via its entry args
         else:
             raise ValueError(f"unknown fault-plan event kind: {event[0]!r}")
 
@@ -119,8 +137,12 @@ def check_invariants(plan: FaultPlan, results: dict) -> list[str]:
             f"{client_log}"
         )
 
+    # disk_full joins kill/partition: an exhausted manager WAL may
+    # legitimately fail the job, but never silently. slow_disk does NOT —
+    # bounded delays must be ridden out to completion.
     schedule_can_strand = any(
-        event[0] in ("kill", "partition") for event in plan.events
+        event[0] in ("kill", "partition", "disk_full")
+        for event in plan.events
     )
     completed = bool(finished) and finished[0][1] == "completed"
     if not completed and not schedule_can_strand:

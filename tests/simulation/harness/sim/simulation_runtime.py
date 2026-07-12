@@ -60,7 +60,7 @@ class SimulationRuntime:
         self.random = SeededRandom(seed)
         self.transport = InProcessTransport(self.loop)
         self.transport_factory = SimTransportFactory(self.transport)
-        self.filesystem = SimFilesystem()
+        self.filesystem = SimFilesystem(clock=self.clock)
 
         # Snapshot the process-default clock/random so ``close`` can
         # restore them; then point them at the SIM instances.

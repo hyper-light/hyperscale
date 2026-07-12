@@ -944,11 +944,55 @@ wall time, scaling linearly with pytest-xdist workers and
 `SimulationRuntime` (thousands/minute, membership-level faults only)
 remains open as a future addition if raw schedule volume is wanted.
 
-### Phase 7 — Storage faults + linearizability oracle
+### Phase 7 — Storage faults + linearizability oracle — *storage half landed*
 
 - `FaultMatrix.slow_disk / disk_full / fsync_reorder` (SIM-mode
-  implementations).
+  implementations). **Landed.**
 - Linearizability checker for the client-facing job-submission API.
+  *In progress — survey complete, recorder/checker next.*
+
+What landed (see `hyperscale/core/runtime/filesystem.py`,
+`tests/simulation/harness/sim/sim_filesystem.py`,
+`tests/unit/simulation/sim/test_storage_faults.py`,
+`tests/simulation/lints/test_no_direct_disk_io.py`):
+
+- **The `Filesystem` seam** — async-native Protocol in
+  `hyperscale/core/runtime`; `RealFilesystem` owns a dedicated,
+  lifecycle-managed thread pool (the executor hop lives INSIDE the
+  seam); `SimFilesystem` is pure in-memory with a durable/volatile
+  segment model (`crash()` = power loss). Every durability component
+  routes through it: WALWriter, NodeWAL + RaftWAL (write AND recovery
+  sides), the manager idempotency ledger, IncarnationStore,
+  CheckpointManager, JobArchiveStore, and LoggerStream (its hot path
+  via `write_flush` — one off-loop job per log line, hop count
+  preserved).
+- **Fault knobs** (deterministic, on `SimFilesystem`):
+  `set_slow_disk(seconds)` charges VIRTUAL time inside every op;
+  `set_disk_full(bytes)` raises `OSError(ENOSPC)` past a byte budget;
+  `set_fsync_reorder(seed)` makes `crash()` keep a seeded SUBSET of
+  un-fsynced segments and tear the last survivor (out-of-order
+  persistence). Durable content is untouched by construction.
+- **Crash/recovery scenarios** — NodeWAL and RaftWAL survive power
+  loss and recover truncation-safely past torn/CRC-fail debris; the
+  idempotency ledger round-trips a crash end to end.
+- **VOPR storage events** — generated plans draw `slow_disk` /
+  `disk_full` events; SIM managers always run `wal_data_dir` (the
+  in-memory disk), so every scenario exercises the production storage
+  stack; `disk_full` classifies as stranding-capable in the
+  invariants. `fsync_reorder` is exercised by the in-process
+  crash/recovery scenarios instead: it only manifests through a crash
+  + RESTART cycle, and the coordinator has no restart primitive.
+- **Ratchet lint** — `test_no_direct_disk_io.py` forbids raw
+  `open` / `os.*` disk calls / pathlib IO in `hyperscale/distributed`
+  + `hyperscale/logging`; three justified snapshot entries; the seven
+  seamed durability components are asserted clean structurally.
+- **Bugs found by this half**: WAL-writes crashing on 128-bit HLC
+  msgpack overflow; idempotency torn-tail boot loop; fsync-less +
+  loop-blocking incarnation saves; torn rotation metadata; a raw
+  `mkdir` in `WALWriter.start()`; and — via VOPR `disk_full` — the
+  finding that the manager's `NodeWAL` is opened but NEVER appended
+  to: job events are not persisted, which becomes the oracle slice's
+  restart-survival invariant.
 
 ## 19. Open questions
 

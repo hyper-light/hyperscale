@@ -23,6 +23,7 @@ entries by module + qualname.
 """
 
 import asyncio
+from pathlib import Path
 import os
 
 from hyperscale.distributed.env.env import Env
@@ -136,6 +137,7 @@ def multi_gate_manager_entry(
         dc_id=datacenter_id,
         gate_addrs=gate_tcp_addresses,
         gate_udp_addrs=gate_udp_addresses,
+        wal_data_dir=Path(f"/sim/{host}-{tcp_port}/ledger"),
         **context.sim_kwargs(),
     )
     log: list = []

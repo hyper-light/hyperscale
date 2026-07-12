@@ -432,13 +432,30 @@ class ChildContext:
     ``LocalServerPool`` above all — request further coordinator children.
     """
 
-    __slots__ = ("loop", "transport", "clock", "random", "_result")
+    __slots__ = (
+        "loop",
+        "transport",
+        "clock",
+        "random",
+        "filesystem",
+        "_result",
+    )
 
-    def __init__(self, loop, transport: CrossProcessTransport, clock, random_source) -> None:
+    def __init__(
+        self,
+        loop,
+        transport: CrossProcessTransport,
+        clock,
+        random_source,
+        filesystem=None,
+    ) -> None:
         self.loop = loop
         self.transport = transport
         self.clock = clock
         self.random = random_source
+        # This child's in-memory disk (SimFilesystem) — entries schedule
+        # storage-fault knob toggles on it at virtual instants.
+        self.filesystem = filesystem
         self._result = None
 
     def sim_kwargs(self) -> dict:

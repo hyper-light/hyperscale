@@ -77,7 +77,11 @@ def run_child_loop(
     transport = CrossProcessTransport(loop)
     virtual_clock = VirtualClock(loop)
     seeded_random = SeededRandom(seed)
-    context = ChildContext(loop, transport, virtual_clock, seeded_random)
+    # Clock-wired so the slow_disk fault can charge virtual time.
+    sim_filesystem = SimFilesystem(clock=virtual_clock)
+    context = ChildContext(
+        loop, transport, virtual_clock, seeded_random, sim_filesystem
+    )
 
     # The multi-process twin of ``SimulationRuntime``'s default swap:
     # production modules that read the process-default ``Clock`` /
@@ -90,7 +94,7 @@ def run_child_loop(
     swap_defaults(
         clock=virtual_clock,
         random_source=seeded_random,
-        filesystem=SimFilesystem(),
+        filesystem=sim_filesystem,
     )
 
     entry(context, *entry_args)

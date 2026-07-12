@@ -21,6 +21,7 @@ entries by module + qualname.
 """
 
 import asyncio
+from pathlib import Path
 import os
 
 from hyperscale.distributed.env.env import Env
@@ -36,6 +37,33 @@ def _env(**overrides) -> Env:
     return Env(MERCURY_SYNC_AUTH_SECRET=_AUTH_SECRET, **overrides)
 
 
+def apply_storage_fault_schedule(context, storage_fault_schedule) -> None:
+    """Arm this child's ``SimFilesystem`` knobs at virtual instants.
+
+    Schedule entries (all times virtual seconds):
+    ``("slow_disk", at_time, delay_seconds, until_time)`` — every
+    storage operation costs ``delay_seconds`` of virtual time inside
+    the window; ``("disk_full", at_time, remaining_bytes)`` — writes
+    beyond the byte budget raise ``OSError(ENOSPC)`` from then on.
+    """
+    filesystem = context.filesystem
+    for event in storage_fault_schedule:
+        kind = event[0]
+        if kind == "slow_disk":
+            _kind, at_time, delay_seconds, until_time = event
+            context.loop.call_at(
+                at_time, filesystem.set_slow_disk, delay_seconds
+            )
+            context.loop.call_at(until_time, filesystem.clear_slow_disk)
+        elif kind == "disk_full":
+            _kind, at_time, remaining_bytes = event
+            context.loop.call_at(
+                at_time, filesystem.set_disk_full, remaining_bytes
+            )
+        else:
+            raise ValueError(f"unknown storage fault kind: {kind}")
+
+
 def manager_entry(
     context,
     host,
@@ -44,6 +72,7 @@ def manager_entry(
     datacenter_id,
     gate_tcp_address=None,
     gate_udp_address=None,
+    storage_fault_schedule=(),
 ) -> None:
     """Manager child: start a real ``ManagerServer`` and record when the
     first worker registers.
@@ -51,7 +80,14 @@ def manager_entry(
     ``gate_tcp_address`` / ``gate_udp_address`` (optional) attach the
     manager to a gate tier — the L3 topology; omitted, the manager runs
     gateless (L1/L2) exactly as before.
+
+    The manager always runs with ``wal_data_dir`` enabled: under SIM the
+    path is this child's in-memory ``SimFilesystem``, so every scenario
+    exercises the production storage stack (NodeWAL group commits,
+    idempotency ledger, checkpoints) — the surface the storage-fault
+    schedule targets.
     """
+    apply_storage_fault_schedule(context, storage_fault_schedule)
     manager = ManagerServer(
         host,
         tcp_port,
@@ -60,6 +96,7 @@ def manager_entry(
         dc_id=datacenter_id,
         gate_addrs=[gate_tcp_address] if gate_tcp_address else None,
         gate_udp_addrs=[gate_udp_address] if gate_udp_address else None,
+        wal_data_dir=Path(f"/sim/{host}-{tcp_port}/ledger"),
         **context.sim_kwargs(),
     )
     log: list = []

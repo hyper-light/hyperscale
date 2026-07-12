@@ -77,7 +77,15 @@ def test_plan_generation_is_deterministic_and_covers_fault_kinds():
             fault_free_seen = True
         kinds_seen.update(event[0] for event in plan.events)
 
-    assert kinds_seen == {"kill", "partition", "drop", "delay", "duplicate"}
+    assert kinds_seen == {
+        "kill",
+        "partition",
+        "drop",
+        "delay",
+        "duplicate",
+        "slow_disk",
+        "disk_full",
+    }
     assert fault_free_seen
 
 
