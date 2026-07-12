@@ -21,8 +21,13 @@ boundary in CI.
 # The cross-layer seam Protocols live in ``hyperscale.core.runtime``
 # (the dependency-free interface layer — see its package docstring) and
 # are re-exported here so distributed-side consumers keep one import
-# home for everything runtime-related.
+# home for everything runtime-related. ``Filesystem`` / ``RealFilesystem``
+# (Phase 7 storage seam) live there too because ``hyperscale.logging``
+# — a bottom-layer package — consumes them as well.
+from hyperscale.core.runtime import FileHandle as FileHandle
+from hyperscale.core.runtime import Filesystem as Filesystem
 from hyperscale.core.runtime import ProcessSpawner as ProcessSpawner
+from hyperscale.core.runtime import RealFilesystem as RealFilesystem
 from hyperscale.core.runtime import (
     SimulationChildContext as SimulationChildContext,
 )

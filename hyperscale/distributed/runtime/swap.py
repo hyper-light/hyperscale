@@ -84,11 +84,18 @@ from __future__ import annotations
 import sys
 from typing import NamedTuple
 
+from hyperscale.core.runtime import Filesystem
+
 from .clock import Clock
 from .random_source import Random
 
 
-_PRODUCTION_PREFIX = "hyperscale.distributed"
+# ``hyperscale.logging`` joined the walk with the Phase 7 Filesystem
+# seam: the LoggerStream's disk writes live there (a bottom-layer
+# package that cannot import from ``hyperscale.distributed``), and its
+# module-level ``_DEFAULT_FILESYSTEM`` must be swappable exactly like
+# the distributed-side singletons.
+_PRODUCTION_PREFIXES = ("hyperscale.distributed", "hyperscale.logging")
 
 
 class _ModuleDefaults(NamedTuple):
@@ -97,11 +104,12 @@ class _ModuleDefaults(NamedTuple):
     module_name: str
     clock: Clock | None
     random_source: Random | None
+    filesystem: Filesystem | None
 
 
 def _iter_production_modules() -> list[tuple[str, object]]:
     """Return ``(module_name, module_object)`` for every loaded module
-    under ``hyperscale.distributed``. ``sys.modules`` mutates during
+    under the production prefixes. ``sys.modules`` mutates during
     iteration as side-effects of attribute access load lazy modules;
     snapshot the keys before iterating so the walk is stable.
     """
@@ -111,9 +119,9 @@ def _iter_production_modules() -> list[tuple[str, object]]:
         for name, mod in snapshot
         if (
             mod is not None
-            and (
-                name == _PRODUCTION_PREFIX
-                or name.startswith(_PRODUCTION_PREFIX + ".")
+            and any(
+                name == prefix or name.startswith(prefix + ".")
+                for prefix in _PRODUCTION_PREFIXES
             )
         )
     ]
@@ -123,11 +131,13 @@ def swap_defaults(
     *,
     clock: Clock | None = None,
     random_source: Random | None = None,
+    filesystem: Filesystem | None = None,
 ) -> list[str]:
-    """Rebind ``_DEFAULT_CLOCK`` / ``_DEFAULT_RANDOM`` on every loaded
-    ``hyperscale.distributed`` submodule that defines them.
+    """Rebind ``_DEFAULT_CLOCK`` / ``_DEFAULT_RANDOM`` /
+    ``_DEFAULT_FILESYSTEM`` on every loaded production submodule that
+    defines them.
 
-    Either argument may be ``None`` to leave that axis unchanged —
+    Any argument may be ``None`` to leave that axis unchanged —
     useful when SIM mode wants a virtual clock but the real random.
 
     Returns the list of module names that received at least one
@@ -143,6 +153,9 @@ def swap_defaults(
             rebound = True
         if random_source is not None and hasattr(mod, "_DEFAULT_RANDOM"):
             setattr(mod, "_DEFAULT_RANDOM", random_source)
+            rebound = True
+        if filesystem is not None and hasattr(mod, "_DEFAULT_FILESYSTEM"):
+            setattr(mod, "_DEFAULT_FILESYSTEM", filesystem)
             rebound = True
         if rebound:
             touched.append(name)
@@ -165,9 +178,14 @@ def snapshot_defaults() -> list[_ModuleDefaults]:
             module_name=name,
             clock=getattr(mod, "_DEFAULT_CLOCK", None),
             random_source=getattr(mod, "_DEFAULT_RANDOM", None),
+            filesystem=getattr(mod, "_DEFAULT_FILESYSTEM", None),
         )
         for name, mod in _iter_production_modules()
-        if hasattr(mod, "_DEFAULT_CLOCK") or hasattr(mod, "_DEFAULT_RANDOM")
+        if (
+            hasattr(mod, "_DEFAULT_CLOCK")
+            or hasattr(mod, "_DEFAULT_RANDOM")
+            or hasattr(mod, "_DEFAULT_FILESYSTEM")
+        )
     ]
 
 
@@ -191,3 +209,7 @@ def restore_defaults(snapshot: list[_ModuleDefaults]) -> None:
             setattr(mod, "_DEFAULT_CLOCK", entry.clock)
         if entry.random_source is not None and hasattr(mod, "_DEFAULT_RANDOM"):
             setattr(mod, "_DEFAULT_RANDOM", entry.random_source)
+        if entry.filesystem is not None and hasattr(
+            mod, "_DEFAULT_FILESYSTEM"
+        ):
+            setattr(mod, "_DEFAULT_FILESYSTEM", entry.filesystem)
