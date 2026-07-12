@@ -70,6 +70,12 @@ class SimFileHandle:
     def closed(self) -> bool:
         return self._closed
 
+    def tell(self) -> int:
+        return self._position
+
+    def close_sync(self) -> None:
+        self._closed = True
+
     async def write(self, data: bytes) -> int:
         self._require_open()
         if "r" in self._mode and "+" not in self._mode:
@@ -87,6 +93,16 @@ class SimFileHandle:
         data = content[self._position : self._position + size]
         self._position += len(data)
         return data
+
+    async def readline(self) -> bytes:
+        self._require_open()
+        content = self._state.visible_content
+        newline_index = content.find(b"\n", self._position)
+        if newline_index < 0:
+            return await self.read()
+        line = content[self._position : newline_index + 1]
+        self._position = newline_index + 1
+        return line
 
     async def seek(self, offset: int, whence: int = 0) -> int:
         self._require_open()
@@ -160,8 +176,27 @@ class SimFilesystem:
 
         return SimFileHandle(state, mode)
 
+    async def write_flush(
+        self,
+        handle: SimFileHandle,
+        data: bytes,
+        *,
+        flush: bool = True,
+        fsync: bool = False,
+    ) -> int:
+        written = await handle.write(data)
+        if fsync:
+            handle._state.promote_volatile()
+        return written
+
     async def fsync(self, handle: SimFileHandle) -> None:
         handle._state.promote_volatile()
+
+    async def file_size(self, path: str | Path) -> int:
+        state = self._files.get(str(path))
+        if state is None:
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return len(state.visible_content)
 
     async def fsync_directory(self, path: str | Path) -> None:
         # Directory entries (renames, creations) are modeled as

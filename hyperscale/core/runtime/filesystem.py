@@ -71,9 +71,20 @@ class FileHandle(Protocol):
     @property
     def closed(self) -> bool: ...
 
+    def tell(self) -> int: ...
+
+    def close_sync(self) -> None:
+        """Synchronous close for emergency teardown paths ONLY (e.g. a
+        logger ``abort()`` running outside any event loop). May block
+        briefly in the real implementation; everything else must use
+        ``close``."""
+        ...
+
     async def write(self, data: bytes) -> int: ...
 
     async def read(self, size: int = -1) -> bytes: ...
+
+    async def readline(self) -> bytes: ...
 
     async def seek(self, offset: int, whence: int = 0) -> int: ...
 
@@ -101,7 +112,25 @@ class Filesystem(Protocol):
 
     async def open(self, path: str | Path, mode: str) -> FileHandle: ...
 
+    async def write_flush(
+        self,
+        handle: FileHandle,
+        data: bytes,
+        *,
+        flush: bool = True,
+        fsync: bool = False,
+    ) -> int:
+        """One log-write durability unit: write + optional flush +
+        optional fsync as a SINGLE operation (one executor job in the
+        real implementation). Exists for the hot per-log-line path,
+        where splitting into three awaited calls would triple the
+        executor hops of a write path with a measured history of
+        nanosecond-level regressions mattering."""
+        ...
+
     async def fsync(self, handle: FileHandle) -> None: ...
+
+    async def file_size(self, path: str | Path) -> int: ...
 
     async def fsync_directory(self, path: str | Path) -> None: ...
 

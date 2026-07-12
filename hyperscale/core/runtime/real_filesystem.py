@@ -48,11 +48,20 @@ class RealFileHandle:
     def fileno(self) -> int:
         return self._file.fileno()
 
+    def tell(self) -> int:
+        return self._file.tell()
+
+    def close_sync(self) -> None:
+        self._file.close()
+
     async def write(self, data: bytes) -> int:
         return await self._run(self._file.write, data)
 
     async def read(self, size: int = -1) -> bytes:
         return await self._run(self._file.read, size)
+
+    async def readline(self) -> bytes:
+        return await self._run(self._file.readline)
 
     async def seek(self, offset: int, whence: int = 0) -> int:
         return await self._run(self._file.seek, offset, whence)
@@ -120,8 +129,23 @@ class RealFilesystem:
         opened = await self._run(open, path, mode)
         return RealFileHandle(opened, self._run)
 
+    async def write_flush(
+        self,
+        handle: RealFileHandle,
+        data: bytes,
+        *,
+        flush: bool = True,
+        fsync: bool = False,
+    ) -> int:
+        return await self._run(
+            self._write_flush_sync, handle._file, data, flush, fsync
+        )
+
     async def fsync(self, handle: RealFileHandle) -> None:
         await self._run(os.fsync, handle.fileno())
+
+    async def file_size(self, path: str | Path) -> int:
+        return await self._run(os.path.getsize, path)
 
     async def fsync_directory(self, path: str | Path) -> None:
         await self._run(self._fsync_directory_sync, path)
@@ -171,6 +195,17 @@ class RealFilesystem:
         await self._run(os.rmdir, path)
 
     # -- single-executor-job sync sequences ------------------------------
+
+    @staticmethod
+    def _write_flush_sync(
+        file, data: bytes, flush: bool, fsync: bool
+    ) -> int:
+        written = file.write(data)
+        if flush or fsync:
+            file.flush()
+        if fsync:
+            os.fsync(file.fileno())
+        return written
 
     @staticmethod
     def _mkdir_sync(path: str | Path, parents: bool, exist_ok: bool) -> None:
