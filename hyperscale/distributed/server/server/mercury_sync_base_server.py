@@ -973,7 +973,16 @@ class MercurySyncBaseServer(Generic[T]):
             async with self._tcp_semaphore:
                 transport: asyncio.Transport = self._tcp_client_transports.get(address)
                 if transport is None or transport.is_closing():
-                    transport = await self._connect_tcp_client(address)
+                    # The dial must sit INSIDE the request timeout: a
+                    # down/unroutable peer otherwise hangs the connect
+                    # forever — and it hangs holding _tcp_semaphore,
+                    # starving every other outbound TCP send. (Under
+                    # SIM an unroutable dial never completes at all;
+                    # in REAL mode it waits on the OS connect timeout.)
+                    transport = await self._clock.wait_for(
+                        self._connect_tcp_client(address),
+                        timeout=timeout,
+                    )
                     self._tcp_client_transports[address] = transport
 
                 clock = await self._udp_clock.increment()
