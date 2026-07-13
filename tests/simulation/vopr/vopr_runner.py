@@ -132,6 +132,20 @@ def check_invariants(plan: FaultPlan, results: dict) -> list[str]:
     violations: list[str] = []
     client_log = results.get("client") or []
 
+    # Determinism audit: a child whose deferred imports escaped the SIM
+    # swaps reports ("determinism-audit-unswapped", [module names]) in
+    # its result — a live wall-coupled nondeterminism source. EVERY
+    # process's result is checked, not just the client's.
+    for process_id, process_result in results.items():
+        if not isinstance(process_result, list):
+            continue
+        for entry in process_result:
+            if entry and entry[0] == "determinism-audit-unswapped":
+                violations.append(
+                    f"determinism audit: {process_id} has unswapped seam "
+                    f"singletons {entry[1]} — wall-coupled nondeterminism"
+                )
+
     violations.extend(
         f"oracle: {violation}"
         for violation in JobStatusOracle().check_client_log(client_log)
