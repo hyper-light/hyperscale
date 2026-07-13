@@ -28,6 +28,10 @@ from hyperscale.core.runtime import FileHandle as FileHandle
 from hyperscale.core.runtime import Filesystem as Filesystem
 from hyperscale.core.runtime import ProcessSpawner as ProcessSpawner
 from hyperscale.core.runtime import RealFilesystem as RealFilesystem
+from hyperscale.core.runtime import SystemResources as SystemResources
+from hyperscale.core.runtime import (
+    RealSystemResources as RealSystemResources,
+)
 from hyperscale.core.runtime import (
     SimulationChildContext as SimulationChildContext,
 )

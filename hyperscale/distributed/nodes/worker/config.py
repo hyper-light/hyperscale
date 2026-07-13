@@ -8,19 +8,23 @@ for timeouts, intervals, retry policies, and health monitoring.
 from __future__ import annotations
 
 import os
+
+from hyperscale.distributed.runtime import (
+    RealSystemResources,
+    SystemResources,
+)
+
+# Machine-telemetry seam: swap_defaults rebinds under SIM.
+_DEFAULT_SYSTEM_RESOURCES: SystemResources = RealSystemResources()
 from dataclasses import dataclass, field
 from pathlib import Path
 from hyperscale.distributed.env import Env, load_env
 
 
 def _get_os_cpus() -> int:
-    """Get OS CPU count."""
-    try:
-        import psutil
-
-        return psutil.cpu_count(logical=False) or os.cpu_count() or 1
-    except ImportError:
-        return os.cpu_count() or 1
+    """Get OS CPU count via the machine-telemetry seam (constant under
+    SIM, live in REAL mode)."""
+    return _DEFAULT_SYSTEM_RESOURCES.cpu_count(logical=False)
 
 
 def _default_env_value(name: str):

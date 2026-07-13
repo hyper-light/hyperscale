@@ -107,9 +107,14 @@ _FORBIDDEN_PATH_METHODS = frozenset(
     }
 )
 
-_SEAM_RECEIVER_NAMES = frozenset(
-    {"filesystem", "_filesystem", "_DEFAULT_FILESYSTEM"}
-)
+# Receiver-name convention: any terminal identifier ENDING in
+# "filesystem" (case-insensitive) is the seam — self._filesystem,
+# filesystem, _DEFAULT_FILESYSTEM, self._storage_filesystem.
+def _is_seam_receiver(terminal_name: str | None) -> bool:
+    return (
+        terminal_name is not None
+        and terminal_name.lower().endswith("filesystem")
+    )
 
 
 def _iter_python_files() -> list[Path]:
@@ -183,8 +188,7 @@ def _source_has_forbidden_disk_call(source: str) -> bool:
 
         # Pattern 3: pathlib-distinctive methods on non-seam receivers.
         if node.attr in _FORBIDDEN_PATH_METHODS:
-            terminal = _receiver_terminal_name(receiver)
-            if terminal in _SEAM_RECEIVER_NAMES:
+            if _is_seam_receiver(_receiver_terminal_name(receiver)):
                 continue
             # ``os.path.exists`` handled above; a bare module receiver
             # resolving to os/tempfile is not a pathlib method.
@@ -257,11 +261,12 @@ _FLAGGED_SNIPPETS: tuple[str, ...] = (
 )
 
 _ALLOWED_SNIPPETS: tuple[str, ...] = (
-    # The seam itself.
+    # The seam itself — any filesystem-suffixed receiver.
     "await self._filesystem.mkdir(p, parents=True, exist_ok=True)\n",
     "await self.filesystem.exists(p)\n",
     "await _DEFAULT_FILESYSTEM.read_bytes(p)\n",
     "await filesystem.atomic_write(p, data)\n",
+    "await self._storage_filesystem.remove(p)\n",
     # Method definitions named open are not calls.
     "class W:\n    async def open(self):\n        return None\n",
     # Non-disk os usage.

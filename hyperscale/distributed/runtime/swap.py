@@ -85,6 +85,7 @@ import sys
 from typing import NamedTuple
 
 from hyperscale.core.runtime import Filesystem
+from hyperscale.core.runtime import SystemResources
 
 from .clock import Clock
 from .random_source import Random
@@ -105,6 +106,7 @@ class _ModuleDefaults(NamedTuple):
     clock: Clock | None
     random_source: Random | None
     filesystem: Filesystem | None
+    system_resources: SystemResources | None
 
 
 def _iter_production_modules() -> list[tuple[str, object]]:
@@ -132,6 +134,7 @@ def swap_defaults(
     clock: Clock | None = None,
     random_source: Random | None = None,
     filesystem: Filesystem | None = None,
+    system_resources: SystemResources | None = None,
 ) -> list[str]:
     """Rebind ``_DEFAULT_CLOCK`` / ``_DEFAULT_RANDOM`` /
     ``_DEFAULT_FILESYSTEM`` on every loaded production submodule that
@@ -156,6 +159,10 @@ def swap_defaults(
             rebound = True
         if filesystem is not None and hasattr(mod, "_DEFAULT_FILESYSTEM"):
             setattr(mod, "_DEFAULT_FILESYSTEM", filesystem)
+        if system_resources is not None and hasattr(
+            mod, "_DEFAULT_SYSTEM_RESOURCES"
+        ):
+            setattr(mod, "_DEFAULT_SYSTEM_RESOURCES", system_resources)
             rebound = True
         if rebound:
             touched.append(name)
@@ -179,6 +186,7 @@ def snapshot_defaults() -> list[_ModuleDefaults]:
             clock=getattr(mod, "_DEFAULT_CLOCK", None),
             random_source=getattr(mod, "_DEFAULT_RANDOM", None),
             filesystem=getattr(mod, "_DEFAULT_FILESYSTEM", None),
+            system_resources=getattr(mod, "_DEFAULT_SYSTEM_RESOURCES", None),
         )
         for name, mod in _iter_production_modules()
         if (
@@ -213,3 +221,9 @@ def restore_defaults(snapshot: list[_ModuleDefaults]) -> None:
             mod, "_DEFAULT_FILESYSTEM"
         ):
             setattr(mod, "_DEFAULT_FILESYSTEM", entry.filesystem)
+        if entry.system_resources is not None and hasattr(
+            mod, "_DEFAULT_SYSTEM_RESOURCES"
+        ):
+            setattr(
+                mod, "_DEFAULT_SYSTEM_RESOURCES", entry.system_resources
+            )

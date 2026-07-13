@@ -32,6 +32,10 @@ from .filesystem import Filesystem as Filesystem
 from .process_spawner import ProcessSpawner as ProcessSpawner
 from .real_filesystem import RealFileHandle as RealFileHandle
 from .real_filesystem import RealFilesystem as RealFilesystem
+from .system_resources import SystemResources as SystemResources
+from .real_system_resources import (
+    RealSystemResources as RealSystemResources,
+)
 from .simulation_child_context import (
     SimulationChildContext as SimulationChildContext,
 )
