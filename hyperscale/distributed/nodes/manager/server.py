@@ -152,6 +152,11 @@ from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTrac
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
+from hyperscale.distributed.runtime import Filesystem, RealFilesystem
+
+# Module-level storage seam (Phase 7): borrowed, never shut down
+# here; swap_defaults rebinds it under SIM.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 from hyperscale.logging.lsn import HybridLamportClock
 from hyperscale.distributed.jobs.timeout_strategy import (
     TimeoutStrategy,
@@ -297,6 +302,12 @@ class ManagerServer(HealthAwareServer):
 
         self._node_wal: NodeWAL | None = None
         self._job_ledger: JobLedger | None = None
+        # Storage seam for submission-payload persistence (borrowed,
+        # never shut down here; swap_defaults rebinds it under SIM).
+        self._storage_filesystem: Filesystem = _DEFAULT_FILESYSTEM
+        # worker_id -> next monotonic instant an unknown-worker
+        # re-register nudge may be sent (rate limit).
+        self._unknown_worker_nudges: dict[str, float] = {}
 
         self._env: Env = env
         self._seed_gates: list[tuple[str, int]] = gate_addrs or []
@@ -875,7 +886,6 @@ class ManagerServer(HealthAwareServer):
                 clock=self._hlc,
             )
             self._node_wal = self._job_ledger._wal
-            await self._fail_recovered_active_jobs()
 
         ledger_base_dir = (
             self._config.wal_data_dir
@@ -991,6 +1001,16 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+        # Recovery LAST: resuming a recovered job re-runs the submit
+        # tail (dispatcher registration, Raft job group, leadership
+        # broadcast, dispatch) — machinery that only exists once the
+        # dispatcher is constructed, the Raft tick loop is rebound, and
+        # leader election has started. Running this in the ledger block
+        # (where recovery originally lived) silently no-opped dispatch
+        # (`_dispatch_job_workflows` guards on a dispatcher that was
+        # still None) and wedged start() via a pre-tick Raft job group.
+        await self._fail_recovered_active_jobs()
 
     async def stop(
         self,
@@ -2525,6 +2545,18 @@ class ManagerServer(HealthAwareServer):
         worker_id = heartbeat.node_id
         if self._manager_state.has_worker(worker_id):
             await self._worker_pool.process_heartbeat(worker_id, heartbeat)
+        elif heartbeat.tcp_host and heartbeat.tcp_port:
+            # A worker heartbeating a manager that does not know it is
+            # the RESTART signature from the manager's side: the worker
+            # registered with a previous generation, the down window
+            # was shorter than its death bound, so it never re-
+            # registered — and an idle worker has no failure path to
+            # trigger one. Nudge it through the existing eviction-
+            # notice channel (its handler does a targeted
+            # re-registration).
+            await self._nudge_unknown_heartbeating_worker(
+                worker_id, (heartbeat.tcp_host, heartbeat.tcp_port)
+            )
 
         # SWIM-confirm the worker so failure detection actually engages.
         # Without this, ``can_suspect_node`` (AD-29) blocks all attempts to
@@ -2565,6 +2597,65 @@ class ManagerServer(HealthAwareServer):
                 await self._process_extension_request_core(
                     request, worker_id, worker
                 )
+
+    async def _nudge_unknown_heartbeating_worker(
+        self,
+        worker_id: str,
+        worker_tcp_addr: tuple[str, int],
+    ) -> None:
+        """Ask an unknown-but-heartbeating worker to re-register.
+
+        Rate-limited per worker (one nudge per window) — heartbeats
+        arrive every probe round and re-registration takes a few
+        seconds. Best-effort: a failed send just waits for the next
+        heartbeat. The map is pruned on success and bounded by the
+        number of distinct heartbeating workers.
+        """
+        now = self._clock.monotonic()
+        next_allowed = self._unknown_worker_nudges.get(worker_id, 0.0)
+        if now < next_allowed:
+            return
+        self._unknown_worker_nudges[worker_id] = now + 10.0
+
+        notice = WorkerEvictionNotice(
+            manager_id=self._node_id.full,
+            manager_tcp_host=self._host,
+            manager_tcp_port=self._tcp_port,
+            worker_id=worker_id,
+            reason="unknown_worker_heartbeat (manager restarted?)",
+        )
+        try:
+            await self.send_tcp(
+                worker_tcp_addr,
+                "eviction_notice",
+                notice.dump(),
+                timeout=self._config.tcp_timeout_standard_seconds,
+            )
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        f"Nudged unknown heartbeating worker "
+                        f"{worker_id[:8]}... at {worker_tcp_addr} to "
+                        "re-register"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        except Exception as nudge_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Re-register nudge to {worker_id[:8]}... at "
+                        f"{worker_tcp_addr} failed: {nudge_error} (next "
+                        "heartbeat retries)"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _handle_manager_peer_heartbeat(
         self,
@@ -5488,6 +5579,7 @@ class ManagerServer(HealthAwareServer):
                     duration_ms=int(elapsed_seconds * 1000),
                     durability=DurabilityLevel.LOCAL,
                 )
+                await self._discard_persisted_submission(job.job_id)
 
             for workflow in job.workflows.values():
                 if workflow.status in terminal_workflow_statuses:
@@ -7334,6 +7426,7 @@ class ManagerServer(HealthAwareServer):
                     duration_ms=int(job.elapsed_seconds() * 1000),
                     durability=DurabilityLevel.LOCAL,
                 )
+                await self._discard_persisted_submission(job_id)
 
             await self._manager_state.increment_state_version()
 
@@ -8766,6 +8859,12 @@ class ManagerServer(HealthAwareServer):
                     worker_count=len(self._worker_pool.iter_workers()),
                     durability=DurabilityLevel.LOCAL,
                 )
+                # Persist the submission payload itself: the ledger
+                # records THAT the job exists; the payload is what a
+                # restarted manager needs to RESUME it rather than
+                # fail it. Crash between the two records degrades to
+                # the fail-loudly path — never silence.
+                await self._persist_submission_payload(submission)
 
             job_info.leader_node_id = self._node_id.full
             job_info.leader_addr = (self._host, self._tcp_port)
@@ -9869,22 +9968,138 @@ class ManagerServer(HealthAwareServer):
     # Job Completion
     # =========================================================================
 
-    async def _fail_recovered_active_jobs(self) -> None:
-        """Restart truth-telling for jobs recovered ACTIVE from the WAL.
+    async def _persist_submission_payload(
+        self, submission: JobSubmission
+    ) -> None:
+        """Durably store the submission payload for restart RESUME."""
+        submissions_dir = self._config.wal_data_dir / "submissions"
+        await self._storage_filesystem.mkdir(
+            submissions_dir, parents=True, exist_ok=True
+        )
+        await self._storage_filesystem.atomic_write(
+            submissions_dir / f"{submission.job_id}.bin",
+            submission.dump(),
+        )
 
-        A restarted manager has lost the in-flight state a resumed
-        dispatch would need (worker assignments, workflow progress,
-        callbacks), so pretending the job is still running is a silent
-        strand. Instead each recovered active job is transitioned to
-        FAILED durably, and the client's recorded callback contact gets
-        a best-effort final push — the durable record lands FIRST, so a
-        missed notification still leaves status queries truthful.
+    async def _discard_persisted_submission(self, job_id: str) -> None:
+        """Remove a terminal job's persisted submission payload —
+        terminal jobs must not resume on the next restart."""
+        if self._config.wal_data_dir is None:
+            return
+        submission_path = (
+            self._config.wal_data_dir / "submissions" / f"{job_id}.bin"
+        )
+        try:
+            if await self._storage_filesystem.exists(submission_path):
+                await self._storage_filesystem.remove(submission_path)
+        except OSError as remove_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Could not discard persisted submission for "
+                        f"{job_id}: {remove_error} (it will fail loudly "
+                        "on a future restart resume attempt)"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _resume_recovered_job(self, submission: JobSubmission) -> None:
+        """Re-activate a recovered ACTIVE job from its persisted
+        submission — the tail of the submit handler, minus quorum and
+        idempotency (both settled when the job was first accepted).
+
+        Workflow execution is AT-LEAST-ONCE across a manager restart: a
+        worker may still be running the pre-restart dispatch while this
+        re-dispatch runs fresh. The client-facing outcome stays
+        exactly-once (the ledger refuses a second terminal transition).
+        """
+        workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(
+            submission.workflows
+        )
+        callback_addr = (
+            tuple(submission.callback_addr)
+            if submission.callback_addr
+            else None
+        )
+
+        job_info = await self._job_manager.create_job(
+            submission=submission,
+            callback_addr=callback_addr,
+        )
+        job_info.leader_node_id = self._node_id.full
+        job_info.leader_addr = (self._host, self._tcp_port)
+        job_info.fencing_token = 1
+
+        self._manager_state.set_job_submission(submission.job_id, submission)
+
+        timeout_strategy = self._select_timeout_strategy(submission)
+        await timeout_strategy.start_tracking(
+            job_id=submission.job_id,
+            timeout_seconds=submission.timeout_seconds,
+            gate_addr=tuple(submission.origin_gate_addr)
+            if submission.origin_gate_addr
+            else None,
+        )
+        self._manager_state.set_job_timeout_strategy(
+            submission.job_id, timeout_strategy
+        )
+
+        self._leases.claim_job_leadership(
+            job_id=submission.job_id,
+            tcp_addr=(self._host, self._tcp_port),
+        )
+        self._leases.initialize_job_context(submission.job_id)
+        await self._raft.consensus.create_job_raft(submission.job_id)
+
+        if submission.callback_addr:
+            self._manager_state.set_job_callback(
+                submission.job_id, submission.callback_addr
+            )
+            self._manager_state.set_progress_callback(
+                submission.job_id, submission.callback_addr
+            )
+        if submission.origin_gate_addr:
+            self._manager_state.set_job_origin_gate(
+                submission.job_id, submission.origin_gate_addr
+            )
+
+        await self._manager_state.increment_state_version()
+
+        workflow_names = [workflow.name for _, _, workflow in workflows]
+        await self._broadcast_job_leadership(
+            submission.job_id,
+            len(workflows),
+            workflow_names,
+            callback_addr=submission.callback_addr,
+            origin_gate_addr=submission.origin_gate_addr,
+        )
+
+        # The dispatcher queues when no worker is registered yet (the
+        # late-joiner path) and dispatches as workers re-register.
+        await self._dispatch_job_workflows(submission, workflows)
+
+    async def _fail_recovered_active_jobs(self) -> None:
+        """Restart handling for jobs recovered ACTIVE from the WAL.
+
+        Jobs with a persisted submission payload RESUME: the job
+        re-activates under the same job id and re-dispatches (workflow
+        execution is at-least-once across the restart; the client
+        outcome stays exactly-once). Jobs without a payload — or whose
+        resume fails — transition to FAILED durably, and the client's
+        recorded callback contact gets a best-effort final push; the
+        durable record lands FIRST, so a missed notification still
+        leaves status queries truthful.
         """
         if self._job_ledger is None:
             return
 
         recovered_active = dict(self._job_ledger.get_all_jobs())
         for job_id, job_state in recovered_active.items():
+            if await self._try_resume_recovered_job(job_id):
+                continue
             await self._job_ledger.complete_job(
                 job_id,
                 final_status=JobStatus.FAILED.value,
@@ -9893,6 +10108,7 @@ class ManagerServer(HealthAwareServer):
                 duration_ms=0,
                 durability=DurabilityLevel.LOCAL,
             )
+            await self._discard_persisted_submission(job_id)
             await self._udp_logger.log(
                 ServerInfo(
                     message=(
@@ -9908,6 +10124,50 @@ class ManagerServer(HealthAwareServer):
             await self._notify_requestor_of_restart_failure(
                 job_id, job_state.requestor_id
             )
+
+    async def _try_resume_recovered_job(self, job_id: str) -> bool:
+        """Attempt payload-based resume; returns False to fall through
+        to the durable-FAIL path (payload missing or resume raised)."""
+        if self._config.wal_data_dir is None:
+            return False
+        submission_path = (
+            self._config.wal_data_dir / "submissions" / f"{job_id}.bin"
+        )
+        if not await self._storage_filesystem.exists(submission_path):
+            return False
+
+        try:
+            submission = JobSubmission.load(
+                await self._storage_filesystem.read_bytes(submission_path)
+            )
+            await self._resume_recovered_job(submission)
+        except Exception as resume_error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=(
+                        f"Resume of recovered job {job_id} failed: "
+                        f"{type(resume_error).__name__}: {resume_error} — "
+                        "falling back to durable FAILED"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    f"Recovered job {job_id} RESUMED from its persisted "
+                    "submission (workflows re-dispatched)"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return True
 
     async def _notify_requestor_of_restart_failure(
         self,
@@ -9977,6 +10237,7 @@ class ManagerServer(HealthAwareServer):
                     duration_ms=int(elapsed_seconds * 1000),
                     durability=DurabilityLevel.LOCAL,
                 )
+                await self._discard_persisted_submission(job_id)
 
         # Tier-1 terminal push to whoever registered the job callback.
         # The gate path below covers L3 deployments; without this push,

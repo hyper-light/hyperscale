@@ -66,6 +66,9 @@ async def _open_ledger(filesystem: SimFilesystem) -> JobLedger:
 def _bare_manager(ledger: JobLedger, send_recorder: list) -> ManagerServer:
     manager = object.__new__(ManagerServer)
     manager._job_ledger = ledger
+    # No wal_data_dir: the payload-resume path declines and recovery
+    # falls through to the durable-FAIL truth-telling these tests pin.
+    manager._config = SimpleNamespace(wal_data_dir=None)
     manager._job_manager = _NoJobManager()
     manager._udp_logger = _RecordingLogger()
     manager._node_id = SimpleNamespace(short="mgr-1", datacenter="dc-east")

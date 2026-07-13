@@ -7,14 +7,6 @@ All business logic is delegated to specialized modules.
 
 import asyncio
 
-try:
-    import psutil
-
-    HAS_PSUTIL = True
-except ImportError:
-    psutil = None
-    HAS_PSUTIL = False
-
 from hyperscale.distributed.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed.swim.health.graceful_degradation import DegradationLevel
 from hyperscale.distributed.env import Env
@@ -47,8 +39,15 @@ from hyperscale.distributed.runtime import (
     Clock,
     ProcessSpawner,
     Random,
+    RealSystemResources,
+    SystemResources,
     TransportFactory,
 )
+
+# Module-level machine-telemetry seam: borrowed; swap_defaults
+# rebinds it under SIM so registration payloads read a constant
+# machine instead of live psutil.
+_DEFAULT_SYSTEM_RESOURCES: SystemResources = RealSystemResources()
 from hyperscale.logging import Logger
 from hyperscale.logging.config import DurabilityMode
 from hyperscale.logging.hyperscale_logging_models import (
@@ -140,6 +139,12 @@ class WorkerServer(HealthAwareServer):
 
         # Centralized runtime state (single source of truth)
         self._worker_state: WorkerState = WorkerState(self._core_allocator)
+        # Manager UDP addr -> last SWIM incarnation observed. A jump of
+        # at least the tracker's rejoin bump is the RESTART signature
+        # (the manager's persisted incarnation store bumps on every
+        # boot): the new generation has an empty worker registry, so we
+        # must re-register even though we never declared it dead.
+        self._manager_incarnations_seen: dict[tuple[str, int], int] = {}
         self._stopping: bool = False
 
         self._resource_monitor: ProcessResourceMonitor = ProcessResourceMonitor()
@@ -956,6 +961,14 @@ class WorkerServer(HealthAwareServer):
         )
         self._lifecycle_manager.add_background_task(self._worker_pool_health_task)
 
+        self._manager_rejoin_watch_task = self._create_background_task(
+            self._run_manager_rejoin_watch_loop(),
+            "manager_rejoin_watch",
+        )
+        self._lifecycle_manager.add_background_task(
+            self._manager_rejoin_watch_task
+        )
+
         # Phase H4 — autonomous extension trigger. Scans active
         # workflows on a heartbeat-aligned cadence and invokes
         # ``request_extension`` for any workflow approaching its
@@ -1009,6 +1022,81 @@ class WorkerServer(HealthAwareServer):
                     level="debug",
                 )
                 await self._clock.sleep(1.0)
+
+    async def _run_manager_rejoin_watch_loop(self) -> None:
+        """Re-register when a manager RESTARTS under us.
+
+        A manager that restarts faster than the failure detector's
+        witness-less death bound (~60s+) is never declared dead: our
+        registration state stays CONNECTED while the new generation's
+        worker registry is EMPTY — a silent split that starves dispatch
+        until the job times out. The restart is detectable anyway: the
+        manager's persisted incarnation store makes every boot rejoin
+        with a jump of at least the tracker's rejoin bump, which we
+        observe passively through normal SWIM traffic. On a jump,
+        refresh every manager registration (idempotent — re-
+        registration overwrites).
+        """
+        while self._running:
+            try:
+                await self._check_manager_rejoins()
+                await self._clock.sleep(2.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as watch_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            "Manager rejoin watch iteration failed: "
+                            f"{watch_error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                await self._clock.sleep(2.0)
+
+    async def _check_manager_rejoins(self) -> None:
+        rejoin_bump = self._incarnation_tracker.minimum_rejoin_incarnation_bump
+        rejoined_managers: list[tuple[str, int]] = []
+
+        for manager in self._registry.get_known_manager_values():
+            if not manager.udp_host or not manager.udp_port:
+                continue
+            manager_udp_addr = (manager.udp_host, manager.udp_port)
+            current_incarnation = self._incarnation_tracker.get_node_incarnation(
+                manager_udp_addr
+            )
+            previous_incarnation = self._manager_incarnations_seen.get(
+                manager_udp_addr
+            )
+            self._manager_incarnations_seen[manager_udp_addr] = (
+                current_incarnation
+            )
+            if (
+                previous_incarnation is not None
+                and current_incarnation
+                >= previous_incarnation + rejoin_bump
+            ):
+                rejoined_managers.append(manager_udp_addr)
+
+        if not rejoined_managers:
+            return
+
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Manager(s) {rejoined_managers} rejoined with a "
+                    "restart-signature incarnation jump — refreshing "
+                    "registrations"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        await self.refresh_manager_registrations()
 
     async def _run_worker_pool_health_loop(self) -> None:
         """Fail active workflows when a local runner process exits mid-flight."""
@@ -1213,6 +1301,11 @@ class WorkerServer(HealthAwareServer):
         return WorkerHeartbeat(
             node_id=self._node_id.full,
             state=self._get_worker_state().value,
+            # The worker's TCP contact: a manager that does NOT know
+            # this worker (it restarted and lost its registry) uses it
+            # to send the re-register nudge.
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
             available_cores=self._core_allocator.available_cores,
             total_cores=self._core_allocator.total_cores,
             queue_depth=len(self._pending_workflows),
@@ -1687,16 +1780,19 @@ class WorkerServer(HealthAwareServer):
         return accepted, primary_manager_id
 
     def _get_memory_mb(self) -> int:
-        """Get total memory in MB."""
-        if not HAS_PSUTIL:
-            return 0
-        return int(psutil.virtual_memory().total / (1024 * 1024))
+        """Get total memory in MB (via the machine-telemetry seam —
+        constant under SIM, live psutil in REAL mode)."""
+        return int(
+            _DEFAULT_SYSTEM_RESOURCES.total_memory_bytes() / (1024 * 1024)
+        )
 
     def _get_available_memory_mb(self) -> int:
-        """Get available memory in MB."""
-        if not HAS_PSUTIL:
-            return 0
-        return int(psutil.virtual_memory().available / (1024 * 1024))
+        """Get available memory in MB (via the machine-telemetry
+        seam)."""
+        return int(
+            _DEFAULT_SYSTEM_RESOURCES.available_memory_bytes()
+            / (1024 * 1024)
+        )
 
     # =========================================================================
     # Callbacks
