@@ -988,10 +988,52 @@ test_manager_restart_truth.py`):
   (evidence-accelerated [20, 70]s; witness-less max-leg [25, 85]s),
   never widened windows.
 
-Still open beyond Phase 7's mandate: full job RESUME from persisted
-submissions (requires persisting submission payloads), a coordinator
-process-restart primitive (would let the VOPR draw restart/
-fsync_reorder events), and seeded job ids.
+The three follow-ups beyond Phase 7's mandate are also **landed**:
+
+- **Coordinator restart primitive** — `schedule_restart(process_id,
+  at_time, down_seconds=, fsync_reorder_seed=)`: power loss + reboot
+  with the durable disk carried across process generations. The victim
+  (at its window barrier) receives SNAPSHOT instead of GRANT, arms
+  fsync_reorder if the event carries a seed, `crash()`es its
+  SimFilesystem, returns the surviving durable state + its result, and
+  exits; the coordinator re-spawns the same spec at the down window's
+  end seeded with that disk. Survivors observe the death exactly like
+  a kill; the reboot joins exactly like a late joiner. Earlier
+  generations' results appear under `{process_id}.gen{n}`. Fully
+  deterministic (per-child seeds come from a monotone admission
+  counter so a reboot can never collide RNG streams).
+- **Job RESUME from persisted submissions** — the manager durably
+  stores each accepted submission payload (`atomic_write` under
+  `wal_data_dir/submissions/`, discarded at every terminal
+  chokepoint); on restart, recovery runs at the END of `start()` (the
+  submit tail it re-runs needs the dispatcher, the rebound Raft tick
+  loop, and leader election — running it in the ledger block silently
+  no-opped dispatch and wedged start), resumes each recovered ACTIVE
+  job under its original job id, and falls back to the durable-FAILED
+  truth-telling path when the payload is missing. Workflow execution
+  is at-least-once across the restart; the client outcome is
+  exactly-once. Three re-admission mechanisms close the worker-side
+  gaps: the TCP dial now sits INSIDE the request timeout (a dial to a
+  down manager previously hung forever HOLDING the TCP semaphore); the
+  worker watches for manager incarnation jumps ≥ the rejoin bump (the
+  restart signature, observable because incarnation persistence makes
+  every boot rejoin above its predecessor); and a manager receiving
+  heartbeats from a worker it does not know sends the existing
+  eviction-notice nudge (heartbeats now carry the worker's TCP
+  contact), which covers the IDLE-worker restart where no failure path
+  would ever trigger re-registration.
+- **Deterministic job/workflow ids** — `LogicalIdGenerator`
+  (identity + injected-Clock monotonic ns + monotone counter) replaces
+  `secrets.token_hex`: unique without consuming the shared protocol
+  RNG, deterministic under SIM.
+- **VOPR restart events** — plans draw `("restart", at, down,
+  fsync_reorder_seed)` against the manager; restart classifies as
+  stranding-capable (resume usually completes — verified on pure-
+  restart seeds including reorder debris — but a crash between the
+  ledger record and the payload write legitimately degrades to loud
+  FAILED). End-to-end scenario pins live in
+  `test_multiprocess_manager_restart.py`, including byte-identical
+  replay of both restart flavors.
 
 What landed (see `hyperscale/core/runtime/filesystem.py`,
 `tests/simulation/harness/sim/sim_filesystem.py`,
