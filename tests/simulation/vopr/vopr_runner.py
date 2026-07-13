@@ -97,6 +97,14 @@ def run_fault_plan(plan: FaultPlan) -> dict:
             coordinator.schedule_duplicate(
                 src, dst, probability, at_time=at_time, until_time=until_time
             )
+        elif event[0] == "restart":
+            _tag, at_time, down_seconds, fsync_reorder_seed = event
+            coordinator.schedule_restart(
+                "manager",
+                at_time,
+                down_seconds=down_seconds,
+                fsync_reorder_seed=fsync_reorder_seed,
+            )
         elif event[0] in ("slow_disk", "disk_full"):
             continue  # armed inside the manager child via its entry args
         else:
@@ -163,8 +171,12 @@ def check_invariants(plan: FaultPlan, results: dict) -> list[str]:
     # disk_full joins kill/partition: an exhausted manager WAL may
     # legitimately fail the job, but never silently. slow_disk does NOT —
     # bounded delays must be ridden out to completion.
+    # restart joins the stranding-capable set: resume usually
+    # completes the job across the reboot, but a crash landing between
+    # the ledger record and the submission-payload write legitimately
+    # degrades to the loud durable-FAILED path.
     schedule_can_strand = any(
-        event[0] in ("kill", "partition", "disk_full")
+        event[0] in ("kill", "partition", "disk_full", "restart")
         for event in plan.events
     )
     completed = bool(finished) and finished[0][1] == "completed"

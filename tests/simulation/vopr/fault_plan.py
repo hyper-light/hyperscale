@@ -53,6 +53,10 @@ class FaultPlan:
       checkpoints) charges virtual time per operation in the window
     * ``("disk_full", at_time, remaining_bytes)`` — the manager's disk
       accepts that many more bytes, then every write raises ENOSPC
+    * ``("restart", at_time, down_seconds, fsync_reorder_seed)`` — the
+      manager power-loses (optionally with reordering-crash torn
+      debris) and reboots from its surviving disk; recovered active
+      jobs RESUME from their persisted submissions
     """
 
     seed: int
@@ -102,6 +106,7 @@ def generate_fault_plan(seed: int) -> FaultPlan:
                 "duplicate",
                 "slow_disk",
                 "disk_full",
+                "restart",
             )
         )
         if event_kind == "kill":
@@ -177,7 +182,7 @@ def generate_fault_plan(seed: int) -> FaultPlan:
                     round(slow_start + plan_random.uniform(10.0, 30.0), 3),
                 )
             )
-        else:
+        elif event_kind == "disk_full":
             if any(event[0] == "disk_full" for event in plan.events):
                 continue  # one exhaustion point per schedule
             plan.events.append(
@@ -186,6 +191,22 @@ def generate_fault_plan(seed: int) -> FaultPlan:
                     round(plan_random.uniform(8.0, 20.0), 3),
                     plan_random.randrange(256, 2048),
                 )
+            )
+        else:
+            if any(event[0] == "restart" for event in plan.events):
+                continue  # one reboot per schedule
+            # at + down <= ~70 leaves ~30s of ceiling for the resumed
+            # generation to re-admit the worker and complete; half the
+            # reboots carry fsync_reorder torn-crash debris.
+            restart_at = round(plan_random.uniform(5.0, 25.0), 3)
+            down_seconds = round(plan_random.uniform(15.0, 45.0), 3)
+            fsync_reorder_seed = (
+                plan_random.randrange(1, 1_000_000)
+                if plan_random.random() < 0.5
+                else None
+            )
+            plan.events.append(
+                ("restart", restart_at, down_seconds, fsync_reorder_seed)
             )
 
     return plan

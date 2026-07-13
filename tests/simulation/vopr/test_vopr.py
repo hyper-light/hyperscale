@@ -85,6 +85,7 @@ def test_plan_generation_is_deterministic_and_covers_fault_kinds():
         "duplicate",
         "slow_disk",
         "disk_full",
+        "restart",
     }
     assert fault_free_seen
 
