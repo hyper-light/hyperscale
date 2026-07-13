@@ -47,13 +47,43 @@ from hyperscale.logging import LoggingConfig
 
 from ..seeded_random import SeededRandom
 from ..sim_filesystem import SimFilesystem
+from ..sim_system_resources import SimSystemResources
 from ..simulation_loop import SimulationLoop
 from ..virtual_clock import VirtualClock
 from .child_context import ChildContext, CrossProcessTransport
 
 
+def _audit_seam_bindings(virtual_clock, seeded_random, sim_filesystem) -> list:
+    """Names of loaded production modules whose seam singletons are
+    not the SIM instances — deferred imports that escaped the swaps."""
+    import sys as _sys
+
+    unswapped: list[str] = []
+    for name, module in list(_sys.modules.items()):
+        if module is None or not (
+            name.startswith("hyperscale.distributed")
+            or name.startswith("hyperscale.logging")
+        ):
+            continue
+        clock = getattr(module, "_DEFAULT_CLOCK", None)
+        if clock is not None and clock is not virtual_clock:
+            unswapped.append(f"{name}._DEFAULT_CLOCK")
+        random_source = getattr(module, "_DEFAULT_RANDOM", None)
+        if random_source is not None and random_source is not seeded_random:
+            unswapped.append(f"{name}._DEFAULT_RANDOM")
+        filesystem = getattr(module, "_DEFAULT_FILESYSTEM", None)
+        if filesystem is not None and filesystem is not sim_filesystem:
+            unswapped.append(f"{name}._DEFAULT_FILESYSTEM")
+    return sorted(unswapped)
+
+
 def run_child_loop(
-    conn, entry, entry_args, start_time: float = 0.0, seed: int = 1
+    conn,
+    entry,
+    entry_args,
+    start_time: float = 0.0,
+    seed: int = 1,
+    initial_disk: dict | None = None,
 ) -> None:
     """Run one simulation child until the coordinator sends ``STOP``.
 
@@ -79,6 +109,10 @@ def run_child_loop(
     seeded_random = SeededRandom(seed)
     # Clock-wired so the slow_disk fault can charge virtual time.
     sim_filesystem = SimFilesystem(clock=virtual_clock)
+    if initial_disk is not None:
+        # This generation rebooted over a prior generation's disk: the
+        # durable state that survived its power loss.
+        sim_filesystem.restore_durable(initial_disk)
     context = ChildContext(
         loop, transport, virtual_clock, seeded_random, sim_filesystem
     )
@@ -91,13 +125,32 @@ def run_child_loop(
     # entry's module graph is fully imported by the time we run (spawn
     # unpickled ``entry`` during bootstrap), so the swap covers it.
     defaults_snapshot = snapshot_defaults()
+    sim_system_resources = SimSystemResources()
     swap_defaults(
         clock=virtual_clock,
         random_source=seeded_random,
         filesystem=sim_filesystem,
+        # Constant machine telemetry: real psutil reads drift with host
+        # load (earlier runs included) and rode into registration
+        # payloads, diverging replay twins.
+        system_resources=sim_system_resources,
     )
 
     entry(context, *entry_args)
+
+    # Second swap pass: entry construction may FIRST-import production
+    # modules (deferred function-level imports) whose seam singletons
+    # were born AFTER the pre-entry swap and therefore still bind the
+    # REAL clock/random/filesystem/telemetry — silent wall coupling
+    # that diverges replay twins under host load. Rebinding again
+    # covers every module the construction pulled in; the exit audit
+    # below catches anything a REQUEST path defers even later.
+    swap_defaults(
+        clock=virtual_clock,
+        random_source=seeded_random,
+        filesystem=sim_filesystem,
+        system_resources=sim_system_resources,
+    )
 
     # Drain setup work at the joining instant, then announce readiness
     # with the addresses this process hosts (the coordinator's routing
@@ -117,8 +170,39 @@ def run_child_loop(
         while True:
             message = conn.recv()
             tag = message[0]
+            if tag == "SNAPSHOT":
+                # Coordinator-driven restart: power loss NOW. Arm the
+                # reordering-crash fault if the event carries a seed,
+                # collapse to durable, hand the surviving disk (and
+                # this generation's result) back, and exit.
+                fsync_reorder_seed = message[1]
+                if fsync_reorder_seed is not None:
+                    sim_filesystem.set_fsync_reorder(fsync_reorder_seed)
+                sim_filesystem.crash()
+                conn.send(
+                    (
+                        "SNAPSHOT_RESULT",
+                        sim_filesystem.dump_durable(),
+                        context.result,
+                    )
+                )
+                break
             if tag == "STOP":
-                conn.send(("RESULT", context.result))
+                unswapped = _audit_seam_bindings(
+                    virtual_clock, seeded_random, sim_filesystem
+                )
+                result = context.result
+                if unswapped:
+                    # LOUD: a deferred import escaped both swap passes —
+                    # its wall-bound defaults are a live nondeterminism
+                    # source. Surfacing it in the result makes replay
+                    # twins and scenario assertions fail WITH THE MODULE
+                    # NAMED instead of diverging mysteriously.
+                    result = (
+                        list(result) if isinstance(result, list) else [result]
+                    )
+                    result.append(("determinism-audit-unswapped", unswapped))
+                conn.send(("RESULT", result))
                 return
 
             _, deadline, inbound, process_events = message

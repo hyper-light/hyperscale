@@ -91,6 +91,20 @@ class SimulationCoordinator:
         self._barrier_timeout_seconds = barrier_timeout_seconds
         self._specs: list[tuple] = []
         self._kill_schedule: list[tuple] = []
+        # Restart schedule: (at_time, process_id, down_seconds,
+        # fsync_reorder_seed). Earlier generations' results are kept
+        # under ``{process_id}.gen{n}`` in the run results.
+        self._restart_schedule: list[tuple] = []
+        self._generation_results: dict = {}
+        # child process id -> the process that requested its spawn
+        # (executor pools). Restarting a parent with live spawned
+        # children is unsupported (no cascade) and raises.
+        self._spawned_by: dict = {}
+        # Monotone admission counter — the per-child seed index. NOT
+        # ``len(processes)``: a respawned generation overwrites its
+        # process entry, so dict size would repeat an index and hand
+        # two children identical RNG streams.
+        self._admission_counter = 0
         # Deterministic network-fault schedule (partition / drop /
         # delay / duplicate), evaluated per datagram at enqueue time.
         # Fault randomness (drop and duplicate draws, delay jitter)
@@ -121,6 +135,37 @@ class SimulationCoordinator:
         already-dead victim raises rather than silently no-oping.
         """
         self._kill_schedule.append((at_time, process_id))
+
+    def schedule_restart(
+        self,
+        process_id,
+        at_time: float,
+        *,
+        down_seconds: float = 1.0,
+        fsync_reorder_seed: int | None = None,
+    ) -> None:
+        """Schedule a power-loss + reboot of ``process_id`` at virtual
+        ``at_time``.
+
+        The victim's ``SimFilesystem`` collapses to durable content
+        (volatile writes lost — power loss, not clean shutdown), and a
+        NEW process generation re-spawns from the same entry/args at
+        ``at_time + down_seconds`` with that surviving disk. Survivors
+        observe the death exactly like a kill (silence + process-exit
+        event) and the reboot exactly like a late joiner.
+
+        ``fsync_reorder_seed`` arms the reordering-crash fault for the
+        power loss: a seeded SUBSET of each file's un-fsynced segments
+        survives (torn, out of order) instead of a clean truncation —
+        the disk the new generation boots from contains that debris.
+
+        Restarting a process with live spawned children (a worker with
+        its executor pool) raises — kill the children first or restart
+        a leaf; cascade restart is deliberately unsupported.
+        """
+        self._restart_schedule.append(
+            (at_time, process_id, down_seconds, fsync_reorder_seed)
+        )
 
     def schedule_partition(
         self,
@@ -245,6 +290,12 @@ class SimulationCoordinator:
     def _drive(self, spawn_context, connections: dict, processes: dict) -> dict:
         next_times: dict = {}
         address_to_process: dict = {}
+        # entry/args by process id — restarts respawn from the SAME
+        # spec. Mid-run spawns register during admission.
+        self._spec_registry = {
+            process_id: (entry, entry_args)
+            for process_id, entry, entry_args in self._specs
+        }
         pending: list = []  # heap: (delivery_time, seq, dst_process, dst_addr, src_addr, data)
         sequence = 0
 
@@ -265,6 +316,12 @@ class SimulationCoordinator:
         # Kills fire in (time, schedule order); stable sort keeps
         # same-instant kills in the order the scenario declared them.
         remaining_kills = sorted(self._kill_schedule, key=lambda kill: kill[0])
+        remaining_restarts = sorted(
+            self._restart_schedule, key=lambda restart: restart[0]
+        )
+        # (respawn_time, process_id, initial_disk) — restarts waiting
+        # out their down window.
+        pending_respawns: list = []
 
         # Lockstep.
         while True:
@@ -273,6 +330,10 @@ class SimulationCoordinator:
                 candidates.append(pending[0][0])
             if remaining_kills:
                 candidates.append(remaining_kills[0][0])
+            if remaining_restarts:
+                candidates.append(remaining_restarts[0][0])
+            if pending_respawns:
+                candidates.append(pending_respawns[0][0])
             if not candidates:
                 break
             target_time = min(candidates)
@@ -293,6 +354,30 @@ class SimulationCoordinator:
                     victim_id, connections, processes, next_times, address_to_process
                 )
                 kill_events.append((kill_time, victim_id, self._KILLED_EXITCODE))
+
+            # Restarts fire like kills (before granting) — the victim
+            # has run only windows ending strictly before the restart
+            # instant, and survivors observe the death identically. The
+            # reboot is queued for the down window's end.
+            while remaining_restarts and remaining_restarts[0][0] <= target_time:
+                restart_time, victim_id, down_seconds, fsync_reorder_seed = (
+                    remaining_restarts.pop(0)
+                )
+                initial_disk = self._snapshot_and_stop_child(
+                    victim_id,
+                    fsync_reorder_seed,
+                    connections,
+                    processes,
+                    next_times,
+                    address_to_process,
+                )
+                kill_events.append(
+                    (restart_time, victim_id, self._KILLED_EXITCODE)
+                )
+                heapq.heappush(
+                    pending_respawns,
+                    (restart_time + down_seconds, victim_id, initial_disk),
+                )
 
             # Snapshot the children granted this window — admission at
             # the barrier below grows ``connections``, and the new
@@ -333,6 +418,8 @@ class SimulationCoordinator:
                 for address in new_addresses:
                     self._merge_address(address_to_process, address, process_id)
                 outbound_batches.append(outbound)
+                for spawn in spawns:
+                    self._spawned_by[spawn[0]] = process_id
                 spawn_requests.extend(spawns)
 
             for outbound in outbound_batches:
@@ -341,6 +428,18 @@ class SimulationCoordinator:
                         pending, sequence, address_to_process,
                         send_time, src, dst, data,
                     )
+
+            # Reboots due at this window edge join exactly like late
+            # joiners — same admission path, plus the surviving disk.
+            respawn_requests: list = []
+            while pending_respawns and pending_respawns[0][0] <= target_time:
+                _respawn_time, process_id, initial_disk = heapq.heappop(
+                    pending_respawns
+                )
+                entry, entry_args = self._spec_registry[process_id]
+                respawn_requests.append(
+                    (process_id, entry, entry_args, initial_disk)
+                )
 
             # Admit requested children at the barrier, starting their
             # virtual clocks at the window edge every report agreed on.
@@ -352,7 +451,7 @@ class SimulationCoordinator:
                 address_to_process,
                 pending,
                 sequence,
-                spawn_requests,
+                respawn_requests + spawn_requests,
                 start_time=target_time,
             )
 
@@ -363,6 +462,14 @@ class SimulationCoordinator:
             tag, result = self._recv(connection, process_id, "shutdown result")
             assert tag == "RESULT", tag
             results[process_id] = result
+        # Earlier generations of restarted processes, in restart order:
+        # ``{process_id}.gen1`` is the first generation's result. The
+        # bare ``process_id`` key is always the LIVE (final) generation;
+        # a process still in its down window at shutdown has only its
+        # ``.genN`` entries.
+        for process_id, generation_results in self._generation_results.items():
+            for index, generation_result in enumerate(generation_results, 1):
+                results[f"{process_id}.gen{index}"] = generation_result
         return results
 
     def _admit(
@@ -399,20 +506,33 @@ class SimulationCoordinator:
 
         while batch:
             started = []
-            for process_id, entry, entry_args in batch:
+            for request in batch:
+                process_id, entry, entry_args = request[0], request[1], request[2]
+                initial_disk = request[3] if len(request) > 3 else None
                 if process_id in connections:
                     raise ValueError(
                         f"duplicate simulation process id: {process_id!r} — "
                         "process ids must be unique across the whole run"
                     )
+                self._spec_registry[process_id] = (entry, entry_args)
                 # Per-child seed: distinct per process, reproducible
-                # across replays (``len(processes)`` is the admission
-                # index, and admission order is deterministic).
-                child_seed = self._seed + len(processes)
+                # across replays (the admission counter is monotone and
+                # admission order is deterministic). A REBOOTED
+                # generation gets a fresh index — a new process,
+                # deterministically derived like any other.
+                child_seed = self._seed + self._admission_counter
+                self._admission_counter += 1
                 parent_connection, child_connection = spawn_context.Pipe()
                 process = spawn_context.Process(
                     target=run_child_loop,
-                    args=(child_connection, entry, entry_args, start_time, child_seed),
+                    args=(
+                        child_connection,
+                        entry,
+                        entry_args,
+                        start_time,
+                        child_seed,
+                        initial_disk,
+                    ),
                 )
                 process.start()
                 connections[process_id] = parent_connection
@@ -441,6 +561,65 @@ class SimulationCoordinator:
                 )
 
         return sequence
+
+    def _snapshot_and_stop_child(
+        self,
+        victim_id,
+        fsync_reorder_seed,
+        connections: dict,
+        processes: dict,
+        next_times: dict,
+        address_to_process: dict,
+    ) -> dict:
+        """Power-loss a child for restart: collect its crash-surviving
+        durable disk (and this generation's result), then remove it
+        from the simulation exactly like a kill.
+
+        The victim is blocked at the window barrier, so the SNAPSHOT
+        exchange cannot race any of its virtual execution.
+        """
+        live_children = sorted(
+            child_id
+            for child_id, parent_id in self._spawned_by.items()
+            if parent_id == victim_id and child_id in connections
+        )
+        if live_children:
+            raise ValueError(
+                f"cannot restart {victim_id!r}: it has live spawned "
+                f"children {live_children} — cascade restart is "
+                "unsupported (kill them first or restart a leaf)"
+            )
+
+        connection = connections.pop(victim_id, None)
+        if connection is None:
+            raise ValueError(
+                f"cannot restart unknown or already-dead process {victim_id!r}"
+            )
+
+        connection.send(("SNAPSHOT", fsync_reorder_seed))
+        tag, initial_disk, generation_result = self._recv(
+            connection, victim_id, "restart snapshot"
+        )
+        assert tag == "SNAPSHOT_RESULT", tag
+        self._generation_results.setdefault(victim_id, []).append(
+            generation_result
+        )
+        connection.close()
+        next_times.pop(victim_id, None)
+
+        victim_addresses = [
+            address
+            for address, process_id in address_to_process.items()
+            if process_id == victim_id
+        ]
+        for address in victim_addresses:
+            del address_to_process[address]
+
+        process = processes.pop(victim_id)
+        # The child exits after replying — join is deterministic.
+        process.join()
+
+        return initial_disk
 
     def _kill_child(
         self,

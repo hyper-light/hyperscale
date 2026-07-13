@@ -235,6 +235,28 @@ class SimFilesystem:
             state.durable_content += b"".join(surviving_segments)
             state.volatile_segments.clear()
 
+    # -- restart support: durable state across process generations -------
+
+    def dump_durable(self) -> dict:
+        """Serialize durable state (post-``crash()`` survivors) for a
+        coordinator-driven restart. Sorted for determinism."""
+        return {
+            "files": {
+                path: state.durable_content
+                for path, state in sorted(self._files.items())
+            },
+            "directories": sorted(self._directories),
+        }
+
+    def restore_durable(self, durable_state: dict) -> None:
+        """Seed this (fresh) filesystem with a prior generation's
+        durable state — the disk that survived the reboot."""
+        for path, content in durable_state["files"].items():
+            state = _SimFileState()
+            state.durable_content = content
+            self._files[path] = state
+        self._directories.update(durable_state["directories"])
+
     # -- fault application (internal) ------------------------------------
 
     async def _charge_operation(self, write_bytes: int = 0) -> None:
