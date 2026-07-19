@@ -833,9 +833,22 @@ class WorkerPool:
                 wait_timeout = min(5.0, remaining)
                 routing_ready_delay = self._next_dispatch_routing_ready_delay()
                 if routing_ready_delay is not None:
-                    if routing_ready_delay <= 0:
-                        continue
                     wait_timeout = min(wait_timeout, routing_ready_delay)
+
+                # Progress floor. A routing cooldown's remaining time can
+                # be a positive sub-quantum float artifact (observed:
+                # 1.6e-11s — ``suspended_until - now`` where the deadline
+                # was composed on a quantized clock): ``is_routable`` is
+                # still False, so selection keeps refusing the worker,
+                # and waiting on the artifact cannot advance a quantized
+                # virtual clock (the re-armed timer lands on the SAME
+                # instant — a hard allocator livelock under SIM, caught
+                # by the run_window spin guard) while on a real host it
+                # degenerates into a 100%-CPU micro-spin until the wall
+                # clock crawls past the boundary. Flooring the wait
+                # guarantees the clock moves every iteration; genuine
+                # cooldown waits (>= 0.25s base) are unaffected.
+                wait_timeout = max(wait_timeout, 0.001)
 
                 try:
                     await _DEFAULT_CLOCK.wait_for(

@@ -998,6 +998,20 @@ class WorkflowDispatcher:
                 ]
                 if positive_backoff_delays:
                     wait_timeout = min(wait_timeout, min(positive_backoff_delays))
+                # Progress floor. A retry-backoff remainder can be a
+                # positive sub-quantum float artifact (observed:
+                # 1.6e-11s from ``next_retry_delay - (now - last)``
+                # composed on a quantized clock). ``asyncio.wait`` with
+                # that timeout arms a timer on the SAME quantized
+                # instant: the wait fires immediately, the workflow is
+                # still inside its backoff, and the loop re-creates its
+                # waiter tasks forever at one frozen virtual instant —
+                # a dispatcher livelock under SIM (run_window spin
+                # guard) and a 100%-CPU micro-spin on a real host until
+                # the wall clock crawls past the boundary. Flooring the
+                # wait guarantees time advances; real backoff waits
+                # (>= 1s initial delay) are unaffected.
+                wait_timeout = max(wait_timeout, 0.001)
 
                 # Wait for any event with a timeout for periodic checks.
                 # Phase 6b: explicit ``loop.create_task`` so each wait

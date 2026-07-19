@@ -35,18 +35,23 @@ Probed timelines (seed 101):
   behavior: when an in-flight-reassignment path lands, the
   no-execution assertion is the one it flips.
 
-KNOWN BUG (skip-pinned reproducer below): submitting a job ~8s AFTER
-the rebooted worker re-registered drives the MANAGER's
-``WorkflowDispatcher`` into a zero-delay self-rescheduling loop —
-``_wait_dispatch_trigger`` / ``_consume_ready_signal`` — at virtual
-22.03 (100% CPU livelock in production; the harness spin guard aborts
-the child). A no-fault control with the same late submission completes
-cleanly at 20.6, and the immediate-submission variant (accepted 2.2s
-after re-registration) dispatches fine — the livelock needs BOTH the
-worker restart and the later submission.
+FIXED BUG (scenario 3 below pins the fix): submitting a job ~8s AFTER
+the rebooted worker re-registered used to drive the MANAGER's
+``WorkflowDispatcher`` into a zero-delay loop frozen at virtual
+22.029999999983676 (the harness spin guard aborted the child; on a
+real host, a 100%-CPU micro-spin). Root cause: retry-backoff and
+routing-cooldown REMAINDERS can be positive sub-quantum float
+artifacts (~1.6e-11s) of deadline arithmetic on a quantized clock —
+waiting on them re-arms a timer at the SAME virtual instant, so time
+never advances and the eligibility comparison never flips. Fixed with
+1ms progress floors at both wait chokepoints
+(``workflow_dispatcher._job_dispatch_loop`` wait timeout and
+``worker_pool.allocate_cores`` condition wait). Post-fix truth,
+probed: submit 20.04, dispatch retries pace through their backoff and
+land at 34.25, completion 34.603 — while a no-restart control
+completes at 20.6 and the immediate-submission variant at 14.77 (the
+schedules of every no-wait path are byte-identical to pre-fix).
 """
-
-import pytest
 
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.recovery_faults_demo import (
@@ -296,39 +301,62 @@ def test_inflight_worker_restart_is_replay_deterministic():
 
 
 # ---------------------------------------------------------------------------
-# Scenario 3 (KNOWN BUG, pinned as a reproducer): dispatcher livelock on
-# a submission landing well after the rebooted worker re-registered
+# Scenario 3 (FIXED BUG, pinned): a submission landing well after the
+# rebooted worker re-registered must dispatch — never livelock
 # ---------------------------------------------------------------------------
 
+_LATE_SUBMIT_AT = 20.0
+# Post-fix probe: submit 20.04, backoff-paced dispatch retries land at
+# 34.25, completion 34.603. Bound: acceptance + the full designed
+# backoff ladder (1+2+4+8s) + dispatch/drain slack — anything past it
+# would mean pacing regressed toward the old frozen-instant behavior.
+_LATE_COMPLETION_CEILING = 40.0
 
-@pytest.mark.skip(
-    reason=(
-        "KNOWN BUG (deterministic reproducer): restart the worker at "
-        "2.0 (down 10; executors killed same-instant), then submit the "
-        "job at t=20 — ~8s after gen-2 re-registered. The MANAGER's "
-        "WorkflowDispatcher enters a zero-delay self-rescheduling loop "
-        "(_wait_dispatch_trigger / _consume_ready_signal, "
-        "workflow_dispatcher.py:1058/1078) at virtual 22.03; the "
-        "harness spin guard aborts the child ('run_window spun 500001 "
-        "times without advancing'). In production this is a 100% CPU "
-        "livelock. Controls: the SAME late submission with no restart "
-        "completes at 20.6, and the immediate submission after the "
-        "restart (accepted 14.19, ~2.2s post-re-registration) "
-        "dispatches fine — the livelock needs the restart AND the "
-        "delayed submission. Reproduce: seed 101, worker restart 2.0 "
-        "down 10, client submit_at 20. Unskip when the dispatcher's "
-        "ready-signal consume path backs off instead of spinning."
-    )
-)
-def test_late_submission_after_worker_restart_must_not_livelock_dispatch():
-    results = _run_worker_restart(
+
+def _run_late_submission_after_worker_restart() -> dict:
+    return _run_worker_restart(
         _FRESH_RESTART_AT,
         _FRESH_DOWN_SECONDS,
         _FRESH_CEILING,
-        client_submit_at=20.0,
+        client_submit_at=_LATE_SUBMIT_AT,
     )
+
+
+def test_late_submission_after_worker_restart_must_not_livelock_dispatch():
+    """Regression pin for the dispatcher frozen-instant livelock
+    (formerly a deterministic reproducer: seed 101, worker restart at
+    2.0/down 10, submit at t=20 froze the manager at virtual
+    22.029999999983676 — sub-quantum backoff/cooldown remainders armed
+    same-instant timers forever; see the module docstring). With the
+    1ms progress floors the retry machinery paces honestly: the job
+    dispatches onto the rebooted pool and completes within the
+    designed backoff ladder."""
+    results = _run_late_submission_after_worker_restart()
     client_log = results["client"]
-    (_tag, final_status, _finished_time) = _finished(client_log)
+
+    submitted_time = _submitted_at(client_log)
+    assert _LATE_SUBMIT_AT <= submitted_time < _LATE_SUBMIT_AT + 1.0, (
+        client_log
+    )
+
+    (_tag, final_status, finished_time) = _finished(client_log)
     assert final_status == "completed", client_log
+    assert submitted_time < finished_time <= _LATE_COMPLETION_CEILING, (
+        f"late-submission completion at {finished_time} outside the "
+        f"backoff-ladder design bound (measured 34.603): {client_log}"
+    )
+
+    # The rebooted generation executed it.
+    generation_two_activations = _activation_times(results["worker"])
+    assert generation_two_activations, results["worker"]
+    assert generation_two_activations[0] > _LATE_SUBMIT_AT, results["worker"]
+
     _assert_oracle_clean(client_log)
     _assert_no_unswapped_imports(results)
+
+
+def test_late_submission_after_worker_restart_is_replay_deterministic():
+    assert (
+        _run_late_submission_after_worker_restart()
+        == _run_late_submission_after_worker_restart()
+    )
