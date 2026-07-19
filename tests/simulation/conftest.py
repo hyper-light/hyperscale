@@ -70,6 +70,42 @@ def pytest_collection_modifyitems(config, items) -> None:
         os.environ.setdefault("HYPERSCALE_SIM_CAPTURE_WARNING", capture_value)
 
 
+def pytest_addoption(parser) -> None:
+    """Shared deterministic-replay options for EVERY VOPR-style suite
+    under ``tests/simulation/`` (defined once here — pytest forbids two
+    conftests registering the same option).
+
+    ``--sim-replay=<seed>`` re-runs exactly the fault schedule that
+    integer generates in whichever suite you invoke — the suite is
+    selected by the TEST PATH, the seed by this flag:
+
+        pytest tests/simulation/vopr        --sim-replay=84
+        pytest tests/simulation/vopr_gates  --sim-replay=53
+        pytest tests/simulation/vopr_mdc    --sim-replay=17
+
+    ``--sim-vopr-count=<n>`` widens a suite's default sweep corpus for
+    soak runs (each suite documents its own default).
+    """
+    parser.addoption(
+        "--sim-replay",
+        action="store",
+        type=int,
+        default=None,
+        help=(
+            "Replay the generated fault schedule for this seed in the "
+            "invoked VOPR suite (runs it twice, asserts byte-identical "
+            "results + invariants, prints the expanded plan)"
+        ),
+    )
+    parser.addoption(
+        "--sim-vopr-count",
+        action="store",
+        type=int,
+        default=None,
+        help="Number of seeds the invoked suite's sweep covers",
+    )
+
+
 def pytest_configure(config) -> None:
     config.addinivalue_line(
         "markers", "simulation: distributed simulation harness scenarios"
