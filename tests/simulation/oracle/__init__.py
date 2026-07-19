@@ -1,13 +1,25 @@
 """
-The SIM linearizability oracle for the client-facing job API.
+The SIM oracles — the state checkers every suite's invariants build on.
 
-``JobStatusOracle`` (Phase 7) judges CLIENT-OBSERVED histories — the
-``("status-seen", status, t)`` / ``("job-finished", status, t)``
+``JobStatusOracle`` (Phase 7, G1) judges CLIENT-OBSERVED histories —
+the ``("status-seen", status, t)`` / ``("job-finished", status, t)``
 milestones the SIM client entries record — against the job-status
 lifecycle spec: monotone rank order, absorbing terminal states, and
 finished/observed coherence.
+
+``ClusterTraceOracle`` (G3) judges the MERGED cross-node milestone
+trace of one run — gate-leader exclusivity and convergence, per-job
+client/server terminal agreement, workflow execution counts,
+single-DC placement, datacenter-health convergence, and
+determinism-audit absence — catching silent wrongness that never
+reaches the client.
+
+``JobLogSplitter`` (K2) splits a prefixed multi-job client log into
+per-job unprefixed streams, each feedable to ``JobStatusOracle``.
 """
 
+from .cluster_trace_oracle import ClusterTraceOracle
+from .job_log_splitter import JobLogSplitter
 from .job_status_oracle import JobStatusOracle
 
-__all__ = ("JobStatusOracle",)
+__all__ = ("ClusterTraceOracle", "JobLogSplitter", "JobStatusOracle")
