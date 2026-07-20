@@ -384,3 +384,13 @@ class WorkerExtensionRequested(Entry, kw_only=True):
     estimated_completion_seconds: float
     active_workflow_count: int
     level: LogLevel = LogLevel.DEBUG
+
+
+class WorkerExtensionDecision(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    granted: bool
+    extension_seconds: float
+    denial_reason: str
+    level: LogLevel = LogLevel.DEBUG

@@ -407,11 +407,15 @@ def _run_partition_over_completion_push() -> dict:
     under the 30s heartbeat-staleness bound, so classification never
     flips.
 
-    Measured: the workflow RUNS to completion on dc-west's worker
-    (active 9.5 -> 16.25), but the manager's ``job_final_result`` send
-    is a SINGLE 5s-timeout attempt and the manager cleans the job up
-    even on failure — the completion is permanently lost, and the gate
-    resolves the job via AD-34 as ``timeout`` at 77.01."""
+    Measured (post notice-backoff): the workflow runs to completion on
+    dc-west's worker (active 9.5 -> 16.25); the manager's first
+    ``job_final_result`` send dies in the cut, the completion becomes
+    an OWED OBLIGATION (serialized payload, capped-exponential resend
+    on the reap-loop cadence), and the resend after heal delivers it —
+    the client observes ``completed`` at 65.06. Before the obligation
+    pattern the single 5s send was followed unconditionally by job
+    cleanup: the completion was lost FOREVER and the gate resolved the
+    job as a false ``timeout`` at 77.01 despite the successful run."""
     coordinator = SimulationCoordinator(
         latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
@@ -423,14 +427,16 @@ def _run_partition_over_completion_push() -> dict:
     return coordinator.run()
 
 
-def test_partition_over_completion_push_ends_loud_not_silent():
-    """The completion-delivery gap, pinned as TRUE current behavior: a
-    partition that swallows the manager's single completion send turns
-    a completed workflow into a client-observed ``timeout`` — loud and
-    linearizable, never silent, but NOT ``completed``. When
-    manager->gate completion delivery grows retries/redelivery (the
-    gate->client direction already has it), this is the test that
-    flips to asserting completion after heal."""
+def test_partition_over_completion_push_delivers_after_heal():
+    """The completion-notice OBLIGATION at work: a partition that
+    swallows the manager's first completion send must not lose the
+    completion — the owed notice (serialized payload, capped-
+    exponential resend on the reap-loop cadence) delivers after heal
+    and the client observes ``completed``. Design bound: heal (25) +
+    up to one reap-loop resend cycle + gate->client push/apply slack —
+    measured 65.06. Never the false ``timeout`` at 77.01 the
+    single-send behavior produced, and never past the AD-34 bound
+    (which remains the backstop if delivery ever regresses)."""
     results = _run_partition_over_completion_push()
     client_log = results["client-a"]
 
@@ -440,14 +446,23 @@ def test_partition_over_completion_push_ends_loud_not_silent():
         "worker-dc-west"
     ]
 
-    # ...but the client's outcome is the AD-34 timeout, inside its
-    # design bound.
     submitted_time = _submitted_at(client_log)
     (_tag, final_status, finished_time) = _finished(client_log)
-    assert final_status == "timeout", client_log
-    earliest = submitted_time + _JOB_TIMEOUT_SECONDS
-    latest = earliest + _TRACKER_TICK_SECONDS + _TERMINAL_SLACK_SECONDS
-    assert earliest <= finished_time <= latest, client_log
+    assert final_status == "completed", (
+        "the owed completion notice must deliver after heal — a "
+        f"timeout here means the obligation resend regressed: {client_log}"
+    )
+    ad34_backstop = (
+        submitted_time
+        + _JOB_TIMEOUT_SECONDS
+        + _TRACKER_TICK_SECONDS
+        + _TERMINAL_SLACK_SECONDS
+    )
+    assert _PUSH_CUT_HEAL < finished_time < ad34_backstop, client_log
+    assert abs(finished_time - 65.06) <= 2.0, (
+        f"post-heal delivery at {finished_time} drifted from the "
+        f"measured 65.06: {client_log}"
+    )
 
     # The window stayed under the staleness bound: dc-west must never
     # classify unhealthy, and both DCs end healthy.

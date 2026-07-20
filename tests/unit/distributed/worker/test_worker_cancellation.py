@@ -275,8 +275,14 @@ class TestWorkerCancellationHandlerWithRemoteManager:
         handler = WorkerCancellationHandler(state)
         handler.create_cancel_event("wf-1")
 
-        # Set up mock remote manager
+        # Set up mock remote manager. Cancellation is a TWO-step
+        # protocol: cancel_workflow SUBMITS to the executor nodes,
+        # await_workflow_cancellation waits for their terminal reports
+        # — awaiting without initiating returns an instant vacuous
+        # success while the executors keep running (the zombie-
+        # execution bug this contract pin guards against).
         remote_manager = MagicMock()
+        remote_manager.cancel_workflow = AsyncMock()
         remote_manager.await_workflow_cancellation = AsyncMock(return_value=(True, []))
         handler.set_remote_manager(remote_manager)
 
@@ -292,6 +298,7 @@ class TestWorkerCancellationHandlerWithRemoteManager:
 
         assert success is True
         assert errors == []
+        remote_manager.cancel_workflow.assert_awaited_once()
         remote_manager.await_workflow_cancellation.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -302,8 +309,10 @@ class TestWorkerCancellationHandlerWithRemoteManager:
         handler = WorkerCancellationHandler(state)
         handler.create_cancel_event("wf-1")
 
-        # Set up mock remote manager that times out
+        # Set up mock remote manager that times out (initiation
+        # succeeds; the terminal-report wait expires).
         remote_manager = MagicMock()
+        remote_manager.cancel_workflow = AsyncMock()
         remote_manager.await_workflow_cancellation = AsyncMock(
             return_value=(False, ["timeout"])
         )
@@ -332,6 +341,7 @@ class TestWorkerCancellationHandlerWithRemoteManager:
 
         # Set up mock remote manager that raises
         remote_manager = MagicMock()
+        remote_manager.cancel_workflow = AsyncMock()
         remote_manager.await_workflow_cancellation = AsyncMock(
             side_effect=RuntimeError("Remote error")
         )

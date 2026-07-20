@@ -12,6 +12,7 @@ from hyperscale.distributed.swim.health.graceful_degradation import DegradationL
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.models import (
+    HealthcheckExtensionResponse,
     NodeInfo,
     NodeRole,
     ManagerInfo,
@@ -53,6 +54,7 @@ from hyperscale.logging.config import DurabilityMode
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerWarning,
+    WorkerExtensionDecision,
     WorkerExtensionRequested,
     WorkerHealthcheckReceived,
     WorkerStarted,
@@ -299,6 +301,14 @@ class WorkerServer(HealthAwareServer):
         # so registering here covers all of them uniformly.
         self._worker_state.register_workflow_termination_callback(
             self._extension_trigger.forget_workflow
+        )
+        # A pending extension request for a workflow that terminated is
+        # moot on every termination path: clear the latch so the next
+        # heartbeat stops carrying it (otherwise it rides until the
+        # manager's decision push lands — an avoidable denial round)
+        # and the trigger is free to serve the remaining workflows.
+        self._worker_state.register_workflow_termination_callback(
+            self._clear_extension_request_for_workflow
         )
 
         # Debounced cores notification (AD-38 fix: single in-flight task, coalesced updates)
@@ -2122,6 +2132,13 @@ class WorkerServer(HealthAwareServer):
 
         return result
 
+    def _clear_extension_request_for_workflow(self, workflow_id: str) -> None:
+        """Termination-callback hook: drop a pending extension request
+        that belongs to the just-terminated workflow (leaves requests
+        for OTHER workflows untouched)."""
+        if self._worker_state._extension_workflow_id == workflow_id:
+            self.clear_extension_request()
+
     def _cleanup_workflow_state(self, workflow_id: str) -> None:
         """Cleanup workflow state on failure."""
         self._worker_state.remove_active_workflow(workflow_id)
@@ -2330,6 +2347,64 @@ class WorkerServer(HealthAwareServer):
         """Handle workflow status query."""
         active_ids = list(self._active_workflows.keys())
         return ",".join(active_ids).encode("utf-8")
+
+    @tcp.receive()
+    async def extension_response(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        """Receive the manager's AD-26 decision for a piggybacked
+        extension request and CLEAR the request latch.
+
+        This completes the latch lifecycle the design always intended
+        ("the worker clears after the response is processed"): without
+        it, ``clear_extension_request`` had zero callers, so the
+        dispatch-time latch froze its snapshot forever — every
+        heartbeat re-carried the same request (a perpetual ~1/s denial
+        stream that outlived the workflow AND the job), and the
+        autonomous lookahead ``ExtensionTrigger`` was permanently gated
+        dead by ``is_extension_pending``. With the latch cleared, the
+        trigger's own progress-advance guard (one re-request only when
+        a progress dimension moved) becomes the live pacing mechanism,
+        exactly as designed. Delivery is self-healing: if this response
+        is lost, the next heartbeat re-carries the request and the
+        manager re-responds.
+        """
+        try:
+            response = HealthcheckExtensionResponse.load(data)
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        "Discarding unparseable extension_response from "
+                        f"{addr}: {type(error).__name__}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b"error"
+
+        self.clear_extension_request()
+        if self._event_logger is not None:
+            self._task_runner.run(
+                self._event_logger.log,
+                WorkerExtensionDecision(
+                    message=(
+                        "Extension "
+                        + ("granted" if response.granted else "denied")
+                        + f" ({response.extension_seconds:.1f}s)"
+                    ),
+                    node_id=self._node_id.full,
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    granted=response.granted,
+                    extension_seconds=response.extension_seconds,
+                    denial_reason=response.denial_reason or "",
+                ),
+                "worker_events",
+            )
+        return b"ok"
 
     @tcp.receive()
     async def eviction_notice(

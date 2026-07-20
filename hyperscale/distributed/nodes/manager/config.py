@@ -53,6 +53,19 @@ class ManagerConfig:
     eviction_notice_base_interval_seconds: float = 5.0
     eviction_notice_max_interval_seconds: float = 60.0
 
+    # Completion-notice obligation re-send pacing (manager -> origin
+    # gate). A job's durable terminal OWES its gate a JobFinalResult
+    # until the gate acks: one un-retried send turned completed work
+    # into a client-observed timeout whenever a partition covered the
+    # completion instant. Same capped-exponential shape as eviction
+    # notices; the age ceiling bounds how long an obligation to a
+    # gone-forever gate is carried (the gate's own AD-34 tracker will
+    # have terminal-resolved the job long before this expires — a
+    # delivery after that is a no-op duplicate, not a correction).
+    completion_notice_base_interval_seconds: float = 5.0
+    completion_notice_max_interval_seconds: float = 60.0
+    completion_notice_max_age_seconds: float = 1800.0
+
     # Orphan scan settings (from env)
     orphan_scan_interval_seconds: float = 30.0
     orphan_scan_worker_timeout_seconds: float = 10.0

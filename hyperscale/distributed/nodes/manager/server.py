@@ -148,6 +148,9 @@ from hyperscale.distributed.jobs import (
     WindowedStatsCollector,
     WindowedStatsPush,
 )
+from hyperscale.distributed.jobs.completion_notice_obligation import (
+    CompletionNoticeObligation,
+)
 from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.distributed.ledger.job_ledger import JobLedger
@@ -308,6 +311,12 @@ class ManagerServer(HealthAwareServer):
         # worker_id -> next monotonic instant an unknown-worker
         # re-register nudge may be sent (rate limit).
         self._unknown_worker_nudges: dict[str, float] = {}
+        # job_id -> owed completion notice (self-contained serialized
+        # payload; resent on the reap-loop cadence until the origin
+        # gate acks — see CompletionNoticeObligation).
+        self._completion_notice_obligations: dict[
+            str, CompletionNoticeObligation
+        ] = {}
 
         self._env: Env = env
         self._seed_gates: list[tuple[str, int]] = gate_addrs or []
@@ -923,6 +932,16 @@ class ManagerServer(HealthAwareServer):
             on_dispatch_state_registered=self._replicate_job_state_for_dispatch,
             env=self.env,
             max_concurrent_dispatches=self._config.dispatch_max_concurrent_workers,
+        )
+        # THE dependency-completion edge. Without it, dependent
+        # workflows never dispatch: the dispatcher holds them pending on
+        # ``dependencies <= completed_dependencies`` and
+        # ``WorkflowDispatcher.mark_workflow_completed`` — the sole
+        # writer of ``completed_dependencies`` — is only reachable
+        # through this callback (measured: A executed, B stranded, the
+        # job died as an AD-34 timeout on every seed).
+        self._job_manager.set_on_workflow_completed(
+            self._handle_workflow_terminal_for_dispatch
         )
 
         self._worker_disseminator = WorkerDisseminator(
@@ -2594,9 +2613,40 @@ class ManagerServer(HealthAwareServer):
                     actions_completed=heartbeat.extension_actions_completed,
                     snapshot_time=heartbeat.extension_snapshot_time,
                 )
-                await self._process_extension_request_core(
+                response = await self._process_extension_request_core(
                     request, worker_id, worker
                 )
+                # Close the piggyback loop: push the decision back so
+                # the worker CLEARS its request latch (the TCP endpoint
+                # returns the response inline; the heartbeat path has
+                # no reply channel, and discarding the response left
+                # the latch frozen forever — the perpetual denial
+                # stream + dead autonomous trigger). Best-effort: a
+                # lost push self-heals because the still-latched worker
+                # re-carries the request on its next heartbeat and this
+                # branch re-responds.
+                try:
+                    await self.send_tcp(
+                        (worker.node.host, worker.node.port),
+                        "extension_response",
+                        response.dump(),
+                        timeout=self._config.tcp_timeout_standard_seconds,
+                    )
+                except Exception as send_error:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=(
+                                "Extension decision push to worker "
+                                f"{worker_id[:8]}... failed "
+                                f"({type(send_error).__name__}); the "
+                                "worker re-carries the request next "
+                                "heartbeat"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
 
     async def _nudge_unknown_heartbeating_worker(
         self,
@@ -2801,6 +2851,7 @@ class ManagerServer(HealthAwareServer):
                 self._reap_dead_gates(now)
                 self._cleanup_stale_dead_manager_tracking(now)
                 self._resend_eviction_notices(now)
+                self._resend_completion_notices(now)
 
             except asyncio.CancelledError:
                 break
@@ -4686,11 +4737,29 @@ class ManagerServer(HealthAwareServer):
     ) -> tuple[str, str, int]:
         """Resolve (job_id, workflow_class, fence_token) for a
         workflow_id. Returns ("", "", 0) when no matching job is
-        tracked locally."""
+        tracked locally.
+
+        Resolves BOTH id shapes on the wire: the bare parent workflow
+        id ("wf-0001"), and the full SUB-workflow tracking-token string
+        — ``WorkflowDispatch.workflow_id`` is ``str(sub_token)``, and
+        the worker echoes exactly that id in its AD-26 extension
+        requests. The sub-token shape used to miss here, which silently
+        disabled the whole H5 witness route for every dispatch-time
+        extension request (the legacy fallback records nothing in the
+        H7 ledger — measured: ExtensionLedger empty across entire
+        runs)."""
         for job in self._job_manager.iter_jobs():
             for wf_info in job.workflows.values():
                 if wf_info.token.workflow_id == workflow_id:
                     return job.job_id, wf_info.name, job.fencing_token
+
+            sub_workflow_info = job.sub_workflows.get(workflow_id)
+            if sub_workflow_info is not None:
+                parent_info = job.workflows.get(
+                    str(sub_workflow_info.parent_token)
+                )
+                if parent_info is not None:
+                    return job.job_id, parent_info.name, job.fencing_token
         return "", "", 0
 
     def _count_active_workflows(self) -> int:
@@ -5424,8 +5493,16 @@ class ManagerServer(HealthAwareServer):
                 if sub_wf.worker_id
             }
             if worker_id in job_worker_ids:
+                # ``record_worker_extension`` is on the TimeoutStrategy
+                # ABC itself — no capability check. The old
+                # ``hasattr(strategy, "record_extension")`` guard named
+                # a method NO strategy defines, so this call was
+                # unreachable and granted extensions never stretched
+                # the job's AD-34 effective timeout (measured: the hard
+                # timeout fired on the base budget with a 30s grant on
+                # the books).
                 strategy = self._manager_state.get_job_timeout_strategy(job.job_id)
-                if strategy and hasattr(strategy, "record_extension"):
+                if strategy:
                     await strategy.record_worker_extension(
                         job_id=job.job_id,
                         worker_id=worker_id,
@@ -6633,6 +6710,98 @@ class ManagerServer(HealthAwareServer):
         if not job:
             return False
         return job.workflows_completed + job.workflows_failed >= job.workflows_total
+
+    async def _handle_workflow_terminal_for_dispatch(
+        self, job_id: str, workflow_id: str
+    ) -> None:
+        """Route a workflow's terminal transition into the dispatcher's
+        dependency machinery (the ``JobManager.on_workflow_completed``
+        callback — fired for BOTH polarities, outside the job lock).
+
+        Success unblocks dependents (``mark_workflow_completed`` adds to
+        their ``completed_dependencies`` and signals ready). Failure
+        cascade-fails every transitive dependent in the dispatcher AND
+        mirrors that failure at the JOB level: a dependent that can
+        never dispatch must count toward ``workflows_failed`` so the job
+        reaches its terminal promptly and truthfully — otherwise it
+        strands until AD-34 declares a misleading ``timeout`` for work
+        that deterministically failed. The job-level mark re-fires this
+        callback for each dependent (transitive levels handled by
+        recursion); every step is idempotent — terminal workflows
+        refuse re-marking and the dispatcher's cascade re-exhausts
+        already-exhausted entries harmlessly.
+        """
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        async with job.lock:
+            terminal_status = next(
+                (
+                    workflow_info.status
+                    for workflow_info in job.workflows.values()
+                    if (workflow_info.token.workflow_id or "") == workflow_id
+                ),
+                None,
+            )
+        if terminal_status is None:
+            return
+
+        if terminal_status in (
+            WorkflowStatus.COMPLETED,
+            WorkflowStatus.AGGREGATED,
+        ):
+            await self._workflow_dispatcher.mark_workflow_completed(
+                job_id, workflow_id
+            )
+            return
+
+        cascade_failed_workflow_ids = (
+            await self._workflow_dispatcher.mark_workflow_failed(
+                job_id, workflow_id
+            )
+        )
+        for dependent_workflow_id in cascade_failed_workflow_ids:
+            await self._fail_undispatchable_dependent(
+                job_id, dependent_workflow_id, workflow_id
+            )
+        if cascade_failed_workflow_ids and self._is_job_complete(job_id):
+            await self._handle_job_completion(job_id)
+
+    async def _fail_undispatchable_dependent(
+        self,
+        job_id: str,
+        dependent_workflow_id: str,
+        failed_dependency_id: str,
+    ) -> None:
+        """Mark one cascade-failed dependent FAILED at the job level,
+        loudly. The dependent never dispatched, so no worker will ever
+        report a final result for it — without this mirror the job's
+        completion arithmetic never closes."""
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        async with job.lock:
+            dependent_token = next(
+                (
+                    token_str
+                    for token_str, workflow_info in job.workflows.items()
+                    if (workflow_info.token.workflow_id or "")
+                    == dependent_workflow_id
+                ),
+                None,
+            )
+        if dependent_token is None:
+            return
+
+        await self._job_manager.mark_workflow_failed(
+            dependent_token,
+            (
+                f"dependency {failed_dependency_id} failed — dependent "
+                "workflow can never dispatch"
+            ),
+        )
 
     def _workflow_final_result_ack(
         self,
@@ -8779,6 +8948,28 @@ class ManagerServer(HealthAwareServer):
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
+            # Capacity fencing: an ACTIVE leader with ZERO registered
+            # workers must reject, not accept-then-strand. Accepting
+            # without capacity guarantees the dispatch fails ~5s later
+            # (or strands to the AD-34 timeout) — the client's retry
+            # loop is BUILT for rejection-until-capacity ("the manager
+            # rejects submissions until it is leader with registered
+            # capacity"), so refusing here is the honest, retryable
+            # signal. Workers registered but busy is NOT a rejection:
+            # queueing behind busy capacity is legitimate.
+            if self._manager_state.get_worker_count() < 1:
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=(
+                        "No workers registered in this datacenter; "
+                        "rejecting job submission"
+                    ),
+                    leader_addr=None,
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
             if idempotency_key is not None and self._idempotency_ledger is not None:
                 found, entry = await self._idempotency_ledger.check_or_reserve(
                     idempotency_key,
@@ -10376,18 +10567,142 @@ class ManagerServer(HealthAwareServer):
             **self._data_plane_provenance(job_id),
         )
 
+        final_result_payload = final_result.dump()
+        delivered = await self._attempt_completion_notice_send(
+            job_id, origin_gate_addr, final_result_payload
+        )
+        if not delivered:
+            # The durable terminal OWES the gate this notice: register
+            # the obligation with the fully serialized payload (cleanup
+            # erases the source state immediately after this method
+            # returns) and let the resend loop carry it until the gate
+            # acks. One un-retried send here turned completed work into
+            # a client-observed timeout whenever a partition covered
+            # the completion instant.
+            self._register_completion_notice_obligation(
+                job_id, origin_gate_addr, final_result_payload
+            )
+
+    async def _attempt_completion_notice_send(
+        self,
+        job_id: str,
+        origin_gate_addr: tuple[str, int],
+        final_result_payload: bytes,
+    ) -> bool:
+        """One completion-notice send attempt. Returns True when the
+        gate ACCEPTED the notice (ok/duplicate/forwarded — duplicate
+        means an earlier attempt already landed, equally discharged)."""
         try:
             response = await self._send_to_peer(
-                origin_gate_addr, "job_final_result", final_result.dump(), timeout=5.0
+                origin_gate_addr,
+                "job_final_result",
+                final_result_payload,
+                timeout=5.0,
             )
             if isinstance(response, Exception):
                 raise response
             if response not in (b"ok", b"duplicate", b"forwarded", None):
                 raise RuntimeError(f"job_final_result rejected with {response!r}")
+            return True
         except Exception as send_error:
             await self._udp_logger.log(
                 ServerWarning(
-                    message=f"Failed to send job completion to gate: {send_error}",
+                    message=(
+                        f"Completion notice for {job_id[:8]}... to gate "
+                        f"{origin_gate_addr} failed: {send_error} (owed — "
+                        "resend loop carries it until acked)"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+
+    def _register_completion_notice_obligation(
+        self,
+        job_id: str,
+        origin_gate_addr: tuple[str, int],
+        final_result_payload: bytes,
+    ) -> None:
+        now = self._clock.monotonic()
+        self._completion_notice_obligations[job_id] = CompletionNoticeObligation(
+            job_id=job_id,
+            origin_gate_addr=origin_gate_addr,
+            payload=final_result_payload,
+            created_at=now,
+            last_attempt_at=now,
+            attempt_count=1,
+        )
+        if len(self._completion_notice_obligations) > 256:
+            evicted_job_id = next(iter(self._completion_notice_obligations))
+            del self._completion_notice_obligations[evicted_job_id]
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=(
+                        "Completion-notice obligation map overflow — "
+                        f"dropping oldest owed notice for {evicted_job_id[:8]}"
+                        "... (its durable terminal remains in the ledger)"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+
+    def _resend_completion_notices(self, now: float) -> None:
+        """Re-send owed completion notices on capped exponential
+        backoff (same reap-loop cadence as eviction notices). Age-
+        expired obligations are dropped LOUDLY — the gate's own AD-34
+        tracker terminal-resolved the job long before the ceiling, so
+        a delivery after that is a duplicate, not a correction."""
+        base = self._config.completion_notice_base_interval_seconds
+        cap = self._config.completion_notice_max_interval_seconds
+        max_age = self._config.completion_notice_max_age_seconds
+        for job_id, obligation in list(
+            self._completion_notice_obligations.items()
+        ):
+            if obligation.expired(now, max_age):
+                del self._completion_notice_obligations[job_id]
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=(
+                            f"Completion notice for {job_id[:8]}... to gate "
+                            f"{obligation.origin_gate_addr} still unacked "
+                            f"after {obligation.attempt_count} attempts over "
+                            f"{now - obligation.created_at:.0f}s — dropping "
+                            "(durable terminal remains in the ledger)"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
+                continue
+            if now >= obligation.next_attempt_due(base, cap):
+                obligation.last_attempt_at = now
+                obligation.attempt_count += 1
+                self._task_runner.run(
+                    self._resend_one_completion_notice, job_id
+                )
+
+    async def _resend_one_completion_notice(self, job_id: str) -> None:
+        obligation = self._completion_notice_obligations.get(job_id)
+        if obligation is None:
+            return
+        delivered = await self._attempt_completion_notice_send(
+            job_id, obligation.origin_gate_addr, obligation.payload
+        )
+        if delivered:
+            self._completion_notice_obligations.pop(job_id, None)
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        f"Owed completion notice for {job_id[:8]}... "
+                        f"delivered on attempt {obligation.attempt_count}"
+                    ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,

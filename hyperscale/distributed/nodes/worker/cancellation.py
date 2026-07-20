@@ -147,11 +147,25 @@ class WorkerCancellationHandler:
                 workflow_id
             ].status = WorkflowStatus.CANCELLED.value
 
-        # Cancel in RemoteGraphManager
+        # Cancel in RemoteGraphManager. TWO-step protocol by design:
+        # ``cancel_workflow`` SUBMITS cancellation to every node
+        # running the workflow, ``await_workflow_cancellation`` then
+        # waits for them all to report terminal status. Awaiting
+        # WITHOUT initiating (the previous behavior) hit the
+        # no-cancellation-initiated branch, which returns instant
+        # (True, []) — so the worker reported successful cancellation
+        # while its executors ran the workflow to natural completion
+        # (measured: a timed-out 100s workflow drained 55.5 virtual
+        # seconds AFTER the client observed the timeout terminal —
+        # zombie execution burning cores past the job's death).
         workflow_name = self._state._workflow_id_to_name.get(workflow_id)
         if workflow_name and self._remote_manager:
             run_id = hash(workflow_id) % (2**31)
             try:
+                await self._remote_manager.cancel_workflow(
+                    run_id,
+                    workflow_name,
+                )
                 (
                     success,
                     remote_errors,
