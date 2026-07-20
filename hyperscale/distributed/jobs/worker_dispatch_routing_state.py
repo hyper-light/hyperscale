@@ -8,6 +8,9 @@ allocator, not a declaration that the worker is dead.
 
 from dataclasses import dataclass, field
 
+from hyperscale.distributed.protocol.time_quantum import (
+    TIME_REMAINDER_EPSILON_SECONDS,
+)
 from hyperscale.distributed.runtime import Clock, RealClock
 
 
@@ -28,9 +31,19 @@ class WorkerDispatchRoutingState:
     last_error: str = ""
 
     def is_routable(self, now: float | None = None) -> bool:
-        """Return whether workflow dispatch should currently route to this worker."""
+        """Return whether workflow dispatch should currently route to
+        this worker.
+
+        A suspension whose remainder is at or below the protocol time
+        epsilon counts as LIFTED — this predicate must agree with
+        ``remaining_cooldown_seconds`` (which reports such remainders
+        as 0.0) or the allocator waits on a remainder the clock cannot
+        honor (the frozen-instant livelock class).
+        """
         current_time = _DEFAULT_CLOCK.monotonic() if now is None else now
-        return current_time >= self.suspended_until
+        return current_time >= (
+            self.suspended_until - TIME_REMAINDER_EPSILON_SECONDS
+        )
 
     def record_success(self, now: float | None = None) -> None:
         """Clear routing cooldown after a confirmed successful dispatch."""
@@ -69,6 +82,13 @@ class WorkerDispatchRoutingState:
         )
 
     def remaining_cooldown_seconds(self, now: float | None = None) -> float:
-        """Return remaining routing cooldown seconds."""
+        """Return remaining routing cooldown seconds.
+
+        Sub-epsilon remainders report as 0.0, mirroring
+        ``is_routable``'s lifted-at-epsilon contract.
+        """
         current_time = _DEFAULT_CLOCK.monotonic() if now is None else now
-        return max(0.0, self.suspended_until - current_time)
+        remaining = self.suspended_until - current_time
+        if remaining <= TIME_REMAINDER_EPSILON_SECONDS:
+            return 0.0
+        return remaining

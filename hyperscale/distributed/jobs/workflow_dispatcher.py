@@ -454,11 +454,11 @@ class WorkflowDispatcher:
             if pending.dispatch_attempts >= pending.max_dispatch_attempts:
                 continue  # Will be cleaned up by check_timeouts or explicit failure handling
 
-            # Check retry backoff - if we failed before, wait for backoff period
-            if pending.dispatch_attempts > 0:
-                time_since_last_attempt = now - pending.last_dispatch_attempt
-                if time_since_last_attempt < pending.next_retry_delay:
-                    continue  # Still in backoff period
+            # Retry backoff via the ONE deadline contract (sub-epsilon
+            # remainders count as expired — see PendingWorkflow's
+            # backoff helpers and protocol.time_quantum).
+            if not pending.is_retry_backoff_expired(now):
+                continue  # Still in backoff period
 
             # Check if all dependencies are satisfied
             if pending.dependencies <= pending.completed_dependencies:
@@ -950,6 +950,14 @@ class WorkflowDispatcher:
                     # Every tracked workflow has been accepted by a worker.
                     break
 
+                # Backoff expiry and remaining-time both route through
+                # the ``PendingWorkflow`` helpers — ONE deadline
+                # contract (sub-epsilon remainders are expiry, see
+                # ``protocol.time_quantum``), so the eligibility filter
+                # here, ``_get_ready_workflows``' scan, and the wait
+                # computed below can never disagree about a boundary
+                # instant (the disagreement was the frozen-instant
+                # livelock).
                 now = _DEFAULT_CLOCK.monotonic()
                 allocatable_pending = [
                     p
@@ -958,21 +966,18 @@ class WorkflowDispatcher:
                         not p.dispatch_in_progress
                         and p.dispatch_attempts < p.max_dispatch_attempts
                         and p.dependencies <= p.completed_dependencies
-                        and (
-                            p.dispatch_attempts == 0
-                            or now - p.last_dispatch_attempt >= p.next_retry_delay
-                        )
+                        and p.is_retry_backoff_expired(now)
                     )
                 ]
                 backoff_delays = [
-                    p.next_retry_delay - (now - p.last_dispatch_attempt)
+                    p.remaining_retry_backoff_seconds(now)
                     for p in job_pending
                     if (
                         not p.dispatch_in_progress
                         and p.dispatch_attempts > 0
                         and p.dispatch_attempts < p.max_dispatch_attempts
                         and p.dependencies <= p.completed_dependencies
-                        and now - p.last_dispatch_attempt < p.next_retry_delay
+                        and not p.is_retry_backoff_expired(now)
                     )
                 ]
 
@@ -998,19 +1003,17 @@ class WorkflowDispatcher:
                 ]
                 if positive_backoff_delays:
                     wait_timeout = min(wait_timeout, min(positive_backoff_delays))
-                # Progress floor. A retry-backoff remainder can be a
-                # positive sub-quantum float artifact (observed:
-                # 1.6e-11s from ``next_retry_delay - (now - last)``
-                # composed on a quantized clock). ``asyncio.wait`` with
-                # that timeout arms a timer on the SAME quantized
-                # instant: the wait fires immediately, the workflow is
-                # still inside its backoff, and the loop re-creates its
-                # waiter tasks forever at one frozen virtual instant —
-                # a dispatcher livelock under SIM (run_window spin
-                # guard) and a 100%-CPU micro-spin on a real host until
-                # the wall clock crawls past the boundary. Flooring the
-                # wait guarantees time advances; real backoff waits
-                # (>= 1s initial delay) are unaffected.
+                # Progress floor — defense in depth for the whole
+                # sub-quantum-wait class. The PRIMARY fix is the
+                # epsilon-expiry contract in the ``PendingWorkflow``
+                # backoff helpers (a remainder the clock cannot honor
+                # now counts as expiry, so it never reaches this wait);
+                # the floor keeps any OTHER collapsed timeout source —
+                # present or future — from arming a same-instant timer
+                # in a loop (a dispatcher livelock under SIM's
+                # quantized clock, a 100%-CPU micro-spin on a real
+                # host). Real backoff waits (>= 1s initial delay) are
+                # unaffected.
                 wait_timeout = max(wait_timeout, 0.001)
 
                 # Wait for any event with a timeout for periodic checks.

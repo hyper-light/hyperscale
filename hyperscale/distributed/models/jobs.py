@@ -38,6 +38,9 @@ from hyperscale.distributed.models.distributed import (
     WorkflowFinalResult,
     WorkflowStatus,
 )
+from hyperscale.distributed.protocol.time_quantum import (
+    TIME_REMAINDER_EPSILON_SECONDS,
+)
 
 from hyperscale.distributed.runtime import Clock, RealClock
 
@@ -494,6 +497,36 @@ class PendingWorkflow:
     next_retry_delay: float = 1.0  # Seconds until next retry allowed
     max_dispatch_attempts: int = 5  # Max retries before marking failed
     excluded_worker_ids: set[str] = field(default_factory=set)
+
+    def is_retry_backoff_expired(self, now: float) -> bool:
+        """Whether the retry backoff has elapsed at ``now``.
+
+        THE single expiry predicate for dispatch retry pacing — the
+        dispatch loop's eligibility filter and the ready-workflow scan
+        must agree with the waits computed from the same deadline, so
+        they all route through here. Remainders at or below the
+        protocol time epsilon count as EXPIRED: composed-float
+        deadlines leave positive sub-quantum remainders (observed
+        1.6e-11s) that are semantically due — treating them as pending
+        while waiting on them armed same-instant timers forever (the
+        dispatcher frozen-instant livelock).
+        """
+        if self.dispatch_attempts == 0:
+            return True
+        elapsed_since_attempt = now - self.last_dispatch_attempt
+        return elapsed_since_attempt >= (
+            self.next_retry_delay - TIME_REMAINDER_EPSILON_SECONDS
+        )
+
+    def remaining_retry_backoff_seconds(self, now: float) -> float:
+        """Remaining backoff at ``now``; sub-epsilon remainders are 0.0
+        so no caller ever schedules a wait the clock cannot honor."""
+        if self.dispatch_attempts == 0:
+            return 0.0
+        remaining = self.next_retry_delay - (now - self.last_dispatch_attempt)
+        if remaining <= TIME_REMAINDER_EPSILON_SECONDS:
+            return 0.0
+        return remaining
 
     def check_and_signal_ready(self) -> bool:
         """
