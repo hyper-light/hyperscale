@@ -29,6 +29,11 @@ class JobArchiveStore:
             filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
         )
 
+    @property
+    def archive_dir(self) -> Path:
+        """Root directory of the archive (diagnostic/logging surface)."""
+        return self._archive_dir
+
     async def initialize(self) -> None:
         await self._filesystem.mkdir(
             self._archive_dir, parents=True, exist_ok=True

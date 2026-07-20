@@ -261,6 +261,19 @@ class WALError(Entry, kw_only=True):
     level: LogLevel = LogLevel.ERROR
 
 
+class ArchiveInfo(Entry, kw_only=True):
+    path: str
+    job_id: str
+    level: LogLevel = LogLevel.INFO
+
+
+class ArchiveError(Entry, kw_only=True):
+    path: str
+    job_id: str
+    error_type: str
+    level: LogLevel = LogLevel.ERROR
+
+
 class WorkerStarted(Entry, kw_only=True):
     node_id: str
     node_host: str

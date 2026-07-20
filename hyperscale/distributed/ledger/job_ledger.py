@@ -5,6 +5,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Awaitable, Mapping
 
+from hyperscale.logging.hyperscale_logging_models import ArchiveError, ArchiveInfo
 from hyperscale.logging.lsn import HybridLamportClock
 
 from .archive.job_archive_store import JobArchiveStore
@@ -35,6 +36,13 @@ from .checkpoint.checkpoint import Checkpoint, CheckpointManager
 
 DEFAULT_COMPLETED_CACHE_SIZE = 10000
 
+# Terminal jobs whose archive record is still owed (the WAL terminal is
+# durable; only the cold-read copy is missing) are parked for healing.
+# The park is bounded: past this, the OLDEST owed record is dropped with
+# an error log — its durable truth stays in the WAL, exactly the
+# pre-isolation status quo for every archive failure.
+PENDING_ARCHIVE_LIMIT = 1024
+
 
 class JobLedger:
     __slots__ = (
@@ -50,6 +58,7 @@ class JobLedger:
         "_lock",
         "_next_fence_token",
         "_logger",
+        "_pending_archive_jobs",
     )
 
     def __init__(
@@ -77,6 +86,7 @@ class JobLedger:
         self._jobs_snapshot: Mapping[str, JobState] = MappingProxyType({})
         self._lock = asyncio.Lock()
         self._next_fence_token = 1
+        self._pending_archive_jobs: dict[str, JobState] = {}
 
     @classmethod
     async def open(
@@ -159,16 +169,113 @@ class JobLedger:
         self._publish_snapshot()
 
     async def _archive_terminal_jobs(self) -> None:
+        """Recovery's terminal sweep. Archive writes are ISOLATED here
+        for the same reason as ``complete_job``'s: this runs inside
+        ``open()`` at node boot, and an unprotected ENOSPC would wedge
+        the owning server's ``start()`` on a full disk — the cache is
+        the truthful read surface either way (rebuilt from the WAL),
+        the archive record stays owed until the disk heals."""
         terminal_job_ids: list[str] = []
 
         for job_id, job_state in self._jobs_internal.items():
             if job_state.is_terminal:
-                await self._archive_store.write_if_absent(job_state)
+                await self._archive_job_isolated(job_state)
                 self._completed_cache.put(job_id, job_state)
                 terminal_job_ids.append(job_id)
 
         for job_id in terminal_job_ids:
             del self._jobs_internal[job_id]
+
+    @property
+    def pending_archive_count(self) -> int:
+        """Terminal jobs whose archive record is still owed — their WAL
+        terminal is durable and reads serve from the completed cache;
+        only the cold-read archive copy is missing (disk failure at
+        write time, healed opportunistically)."""
+        return len(self._pending_archive_jobs)
+
+    async def _archive_job_isolated(self, terminal_job: JobState) -> bool:
+        """Write one terminal job's archive record, CONTAINED.
+
+        The archive is the ledger's cold-read copy of terminal state;
+        the WAL commit that precedes every call is the durable truth.
+        Pre-isolation, the first live archive failure (ENOSPC on the
+        236-byte terminal copy after the 86-byte WAL append had fit)
+        propagated out of the manager's completion handler: the
+        completed-cache put, snapshot publish, ``mark_applied``, the
+        tier-1 client push, and the gate notification all never ran —
+        durably-COMPLETED work was reported to the client as a timeout.
+
+        Failures are logged loudly and the job is PARKED; the park is
+        healed by the next successful archive write (evidence the disk
+        recovered) or a targeted ``get_archived_job``. The park is
+        process-lifetime only — after a reboot, recovery's terminal
+        sweep re-attempts every unarchived terminal it finds in the
+        WAL, so nothing is owed silently across generations.
+
+        Returns True when the record landed (or already existed).
+        """
+        try:
+            await self._archive_store.write_if_absent(terminal_job)
+        except Exception as archive_error:
+            already_parked = terminal_job.job_id in self._pending_archive_jobs
+            self._pending_archive_jobs[terminal_job.job_id] = terminal_job
+            if not already_parked and (
+                len(self._pending_archive_jobs) > PENDING_ARCHIVE_LIMIT
+            ):
+                evicted_job_id = next(iter(self._pending_archive_jobs))
+                del self._pending_archive_jobs[evicted_job_id]
+                await self._log_archive_error(
+                    evicted_job_id, "PendingArchiveOverflow"
+                )
+            await self._log_archive_error(
+                terminal_job.job_id, type(archive_error).__name__
+            )
+            return False
+
+        if self._pending_archive_jobs.pop(terminal_job.job_id, None) is not None:
+            await self._log_archive_healed(terminal_job.job_id)
+        return True
+
+    async def _heal_pending_archive_jobs(self) -> None:
+        """Retry every parked archive record, oldest first — called
+        only on fresh evidence the archive disk writes again (a
+        just-landed record). Stops at the first failure: the disk is
+        still bad and the rest would only churn."""
+        for job_id in list(self._pending_archive_jobs):
+            parked_job = self._pending_archive_jobs.get(job_id)
+            if parked_job is None:
+                continue
+            if not await self._archive_job_isolated(parked_job):
+                return
+
+    async def _log_archive_error(self, job_id: str, error_type: str) -> None:
+        if self._logger is not None:
+            await self._logger.log(
+                ArchiveError(
+                    message=(
+                        f"archive record for terminal job {job_id} not "
+                        f"written ({error_type}); WAL terminal is durable, "
+                        "record parked for healing"
+                    ),
+                    path=str(self._archive_store.archive_dir),
+                    job_id=job_id,
+                    error_type=error_type,
+                )
+            )
+
+    async def _log_archive_healed(self, job_id: str) -> None:
+        if self._logger is not None:
+            await self._logger.log(
+                ArchiveInfo(
+                    message=(
+                        f"parked archive record for terminal job {job_id} "
+                        "healed"
+                    ),
+                    path=str(self._archive_store.archive_dir),
+                    job_id=job_id,
+                )
+            )
 
     def _publish_snapshot(self) -> None:
         self._jobs_snapshot = MappingProxyType(dict(self._jobs_internal))
@@ -401,11 +508,17 @@ class JobLedger:
                     hlc=hlc,
                 )
 
-                await self._archive_store.write_if_absent(completed_job)
+                # Reads flip to the terminal the instant it is durable:
+                # the cache/snapshot transition must neither wait on nor
+                # abort with the archive leg — the archive is the
+                # COLD-READ copy, the WAL commit above is the truth.
                 self._completed_cache.put(job_id, completed_job)
                 del self._jobs_internal[job_id]
-
                 self._publish_snapshot()
+
+                if await self._archive_job_isolated(completed_job):
+                    await self._heal_pending_archive_jobs()
+
                 await self._wal.mark_applied(append_result.entry.lsn)
 
             return result
@@ -424,6 +537,10 @@ class JobLedger:
     async def get_archived_job(self, job_id: str) -> JobState | None:
         cached_job = self._completed_cache.get(job_id)
         if cached_job is not None:
+            if job_id in self._pending_archive_jobs:
+                # Targeted heal: the caller is reading exactly the
+                # terminal whose archive record is still owed.
+                await self._archive_job_isolated(cached_job)
             return cached_job
 
         archived_job = await self._archive_store.read(job_id)

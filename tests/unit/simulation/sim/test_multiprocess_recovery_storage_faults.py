@@ -262,14 +262,18 @@ _DISK_FULL_ARM_AT = 30.0
 # incarnation record inside the budget so recovery itself is clean.
 _DISK_FULL_BUDGET_BYTES = 512
 _DISK_FULL_SCHEDULE = (("disk_full", _DISK_FULL_ARM_AT, _DISK_FULL_BUDGET_BYTES),)
-# Probe-measured degraded completion: 64.253062 = baseline 62.618552
-# + 1.6345. Traced: the durable JobCompleted append fits the budget;
-# the archive copy ENOSPCs and aborts the handler before the client
-# push, and the client's 5s-cadence poll fallback recovers the
-# terminal at its next tick (the 64.21 poll). Ceiling = baseline + one
-# full poll interval + push/apply slack.
-_DISK_FULL_COMPLETION = 64.253062
-_DISK_FULL_COMPLETION_CEILING = 66.5
+# Probe-measured completion: 62.618552 — byte-identical to the
+# no-fault restart baseline. Traced: the durable JobCompleted append
+# fits the budget; the 236-byte archive copy ENOSPCs and is ISOLATED
+# (parked for healing, logged loudly — JobLedger._archive_job_isolated)
+# so the tier-1 client push runs and delivers at the baseline instant:
+# archive failure is invisible to the client. (Pre-isolation the
+# archive exception aborted the handler before the push and the 5s
+# gateless poll fallback rescued the terminal at 64.253062 — the fix
+# reclaimed that 1.63s and, in gate topologies where no manager poll
+# exists, the outcome itself.) Ceiling = baseline + push/apply slack.
+_DISK_FULL_COMPLETION = 62.618552
+_DISK_FULL_COMPLETION_CEILING = 63.7
 
 # Scenario 3: a THIRD restart after the degraded completion — if the
 # terminal record had not genuinely landed durably, gen-3 would replay
@@ -304,10 +308,11 @@ def test_disk_full_during_recovery_never_wedges_and_stays_truthful():
     budget — gen-2's recovery writes exactly one 76-byte incarnation
     record — and the ENOSPC lands on the completion leg instead: the
     86-byte durable JobCompleted append fits, the 236-byte archive
-    copy raises and aborts the handler before the tier-1 client push,
-    and the client's 5s gateless poll fallback delivers the LOUD,
-    exactly-once ``completed`` at 64.253062 (its 64.21 tick). Gen-2
-    boots at exactly 54.4 (disk_full charges bytes, not time) with no
+    copy raises and is ISOLATED (parked + logged, never aborting the
+    handler), so the tier-1 push delivers the exactly-once
+    ``completed`` at 62.618552 — the no-fault baseline instant; the
+    archive failure is invisible to the client. Gen-2 boots at exactly
+    54.4 (disk_full charges bytes, not time) with no
     ``manager-start-failed``.
     """
     results = _run_disk_full_during_recovery()
