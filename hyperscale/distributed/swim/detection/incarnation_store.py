@@ -36,7 +36,12 @@ _DEFAULT_CLOCK: Clock = RealClock()
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
-from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerDebug,
+    ServerError,
+    ServerInfo,
+    ServerWarning,
+)
 
 
 @dataclass(slots=True)
@@ -94,6 +99,16 @@ class IncarnationStore:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _current_record: IncarnationRecord | None = field(default=None, init=False)
     _initialized: bool = field(default=False, init=False)
+
+    # Persistence-degradation truth (the anti-swallow contract): the
+    # LIVE incarnation must advance regardless of disk health — protocol
+    # monotonicity cannot wait on storage — but a failed save means the
+    # PERSISTED value is stale, eroding the restart zombie-guard margin
+    # this store exists for. That state is tracked here, logged loudly
+    # on every transition, and exposed via ``persistence_degraded`` /
+    # ``get_stats`` instead of being silently absorbed.
+    _persist_failure_count: int = field(default=0, init=False)
+    _persistence_degraded: bool = field(default=False, init=False)
 
     def __post_init__(self):
         self._lock = asyncio.Lock()
@@ -186,6 +201,15 @@ class IncarnationStore:
                 return self._current_record.incarnation
             return 0
 
+    @property
+    def persistence_degraded(self) -> bool:
+        """True while the most recent save attempt failed: the LIVE
+        incarnation is ahead of the PERSISTED one, so a reboot in this
+        state starts from a stale value and the restart bump's
+        zombie-guard margin is eroded. Heals on the next successful
+        save (every accepted ``update_incarnation`` attempts one)."""
+        return self._persistence_degraded
+
     async def update_incarnation(self, new_incarnation: int) -> bool:
         """
         Update the persisted incarnation number.
@@ -193,11 +217,18 @@ class IncarnationStore:
         Only updates if the new value is higher than the current one.
         This ensures monotonicity of incarnation numbers.
 
+        The returned bool is the MONOTONICITY verdict only: the live
+        record always advances on acceptance, because protocol
+        correctness cannot wait on storage. Whether the accepted value
+        actually reached disk is tracked separately — a failed save
+        flips ``persistence_degraded`` and logs loudly rather than
+        silently reporting success.
+
         Args:
             new_incarnation: The new incarnation number.
 
         Returns:
-            True if updated, False if rejected (not higher).
+            True if accepted (higher), False if rejected (not higher).
         """
         async with self._lock:
             current = self._current_record.incarnation if self._current_record else 0
@@ -259,6 +290,13 @@ class IncarnationStore:
         temp-then-rename skipped both fsyncs (a lost/torn-write window
         on power failure that undermined the zombie-prevention
         guarantee this store exists for) and blocked the loop.
+
+        Failure is CONTAINED but never silent: the degraded transition
+        logs at ERROR with the eroded-zombie-guard consequence spelled
+        out, every repeat is counted, and recovery logs the heal — the
+        pre-fix behavior logged a WARNING per failure and reported
+        nothing to any caller or diagnostic surface while the persisted
+        value went stale under the advancing live incarnation.
         """
         try:
             data = {
@@ -271,40 +309,84 @@ class IncarnationStore:
                 self._storage_path,
                 json.dumps(data).encode("utf-8"),
             )
-            return True
         except OSError as error:
-            await self._log_warning(f"Failed to save incarnation to disk: {error}")
+            self._persist_failure_count += 1
+            if not self._persistence_degraded:
+                self._persistence_degraded = True
+                await self._log_error(
+                    f"Incarnation persistence DEGRADED: save of "
+                    f"incarnation {record.incarnation} failed "
+                    f"({type(error).__name__}: {error}); the live "
+                    "incarnation is now ahead of disk — a reboot in "
+                    "this state starts from a stale value and erodes "
+                    "the restart zombie-guard margin. Every accepted "
+                    "update retries; recovery will be logged."
+                )
+            else:
+                await self._log_warning(
+                    f"Incarnation save still failing "
+                    f"({type(error).__name__}); "
+                    f"{self._persist_failure_count} failures since "
+                    "degradation"
+                )
             return False
+
+        if self._persistence_degraded:
+            self._persistence_degraded = False
+            await self._log_info(
+                f"Incarnation persistence RECOVERED at incarnation "
+                f"{record.incarnation} after "
+                f"{self._persist_failure_count} failed save(s)"
+            )
+        return True
 
     async def _log_debug(self, message: str) -> None:
         """Log a debug message."""
         if self._logger:
-            try:
-                await self._logger.log(
-                    ServerDebug(
-                        message=f"[IncarnationStore] {message}",
-                        node_host=self._node_host,
-                        node_port=self._node_port,
-                        node_id=0,
-                    )
+            await self._logger.log(
+                ServerDebug(
+                    message=f"[IncarnationStore] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self.node_address,
                 )
-            except Exception:
-                pass
+            )
+
+    async def _log_info(self, message: str) -> None:
+        """Log an info message."""
+        if self._logger:
+            await self._logger.log(
+                ServerInfo(
+                    message=f"[IncarnationStore] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self.node_address,
+                )
+            )
 
     async def _log_warning(self, message: str) -> None:
         """Log a warning message."""
         if self._logger:
-            try:
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"[IncarnationStore] {message}",
-                        node_host=self._node_host,
-                        node_port=self._node_port,
-                        node_id=0,
-                    )
+            await self._logger.log(
+                ServerWarning(
+                    message=f"[IncarnationStore] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self.node_address,
                 )
-            except Exception:
-                pass
+            )
+
+    async def _log_error(self, message: str) -> None:
+        """Log an error message."""
+        if self._logger:
+            await self._logger.log(
+                ServerError(
+                    message=f"[IncarnationStore] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self.node_address,
+                )
+            )
 
     def get_stats(self) -> dict:
         """Get storage statistics."""
@@ -318,4 +400,6 @@ class IncarnationStore:
             else 0,
             "storage_path": str(self._storage_path),
             "restart_bump": self.restart_incarnation_bump,
+            "persistence_degraded": self._persistence_degraded,
+            "persist_failure_count": self._persist_failure_count,
         }
