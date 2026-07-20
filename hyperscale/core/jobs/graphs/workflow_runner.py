@@ -60,6 +60,21 @@ def guard_result(result: asyncio.Task):
         return err
 
 
+# Frozen-clock anchor tuning for the VU generator loops. The spin
+# threshold is the count of CONSECUTIVE generator iterations whose
+# ``loop.time()`` reading was bit-identical before a timed sleep is
+# injected: a real event loop can never hold one reading across ten
+# thousand yield+spawn iterations (each costs microseconds against
+# nanosecond-resolution clocks), so on real hosts the anchor never
+# fires and the generators keep their exact maximum-throughput
+# sleep(0) hot path; under a virtual (timer-driven) clock the reading
+# is frozen by construction whenever no timer is pending, the
+# threshold trips, and the 1ms anchor gives the clock a timer to
+# advance on instead of spinning at one instant forever.
+_FROZEN_CLOCK_SPINS: int = 10_000
+_FROZEN_CLOCK_ANCHOR_SECONDS: float = 0.001
+
+
 class WorkflowRunner:
     def __init__(
         self,
@@ -1088,6 +1103,18 @@ class WorkflowRunner:
         # (deterministic) under SIM. See _execute_test_workflow.
         loop = asyncio.get_event_loop()
         start = loop.time()
+        # Frozen-clock anchor (SIM liveness). ``sleep(0)`` re-queues at
+        # the SAME loop instant, so when nothing else has a pending
+        # timer a virtual clock never advances and this loop spins at
+        # one frozen instant forever (the executor SimulationConstraint
+        # abort; a real loop crawls past on wall time). Detection is a
+        # single int compare per iteration — the hot path gains NO
+        # awaits and NO time reads: only after ``_FROZEN_CLOCK_SPINS``
+        # CONSECUTIVE iterations with a bit-identical clock reading —
+        # impossible on any real clock at these iteration costs — does
+        # a 1ms timed sleep run to give the clock a timer to advance
+        # on. Throughput characteristics on a real loop are unchanged.
+        frozen_clock_spins = 0
         while elapsed < duration and self._running:
             try:
                 remaining = duration - elapsed
@@ -1116,7 +1143,16 @@ class WorkflowRunner:
             except Exception:
                 pass
 
+            previous_elapsed = elapsed
             elapsed = loop.time() - start
+            if elapsed == previous_elapsed:
+                frozen_clock_spins += 1
+                if frozen_clock_spins >= _FROZEN_CLOCK_SPINS:
+                    await asyncio.sleep(_FROZEN_CLOCK_ANCHOR_SECONDS)
+                    frozen_clock_spins = 0
+                    elapsed = loop.time() - start
+            else:
+                frozen_clock_spins = 0
 
         if self._monitors_enabled:
             await self._cpu_monitor.stop_background_monitor(
@@ -1141,6 +1177,10 @@ class WorkflowRunner:
         # (deterministic) under SIM. See _execute_test_workflow.
         loop = asyncio.get_event_loop()
         start = loop.time()
+        # Frozen-clock anchor — same SIM-liveness guard as
+        # ``_generate`` (a zero ``interval`` config degenerates this
+        # loop to the same sleep(0) spin); see the comment there.
+        frozen_clock_spins = 0
         while elapsed < duration and self._running:
             try:
                 remaining = duration - elapsed
@@ -1175,7 +1215,16 @@ class WorkflowRunner:
             except Exception:
                 pass
 
+            previous_elapsed = elapsed
             elapsed = loop.time() - start
+            if elapsed == previous_elapsed:
+                frozen_clock_spins += 1
+                if frozen_clock_spins >= _FROZEN_CLOCK_SPINS:
+                    await asyncio.sleep(_FROZEN_CLOCK_ANCHOR_SECONDS)
+                    frozen_clock_spins = 0
+                    elapsed = loop.time() - start
+            else:
+                frozen_clock_spins = 0
 
         if self._monitors_enabled:
             await self._cpu_monitor.stop_background_monitor(
