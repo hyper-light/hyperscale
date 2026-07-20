@@ -10,7 +10,9 @@ Production code reads ``await self._clock.sleep(t)`` and
 SIM:
 
 - ``monotonic()`` / ``time()`` → ``loop.time()`` which returns the
-  loop's virtual ``_virtual_now``.
+  loop's virtual ``_virtual_now`` (``time()`` adds the wall-skew
+  offset when a scenario arms one via ``set_wall_offset`` — the
+  D1/D2 clock-fault knob; zero by default).
 - ``sleep(t)`` delegates to ``asyncio.sleep(t)`` which internally
   calls ``loop.call_later(t, ...)``; since ``call_later`` computes
   ``when = self.time() + t``, the wake-up is registered against
@@ -42,6 +44,7 @@ of 50 ns isn't on any critical path. Keeping the methods regular
 """
 
 import asyncio
+import math
 
 from .simulation_loop import SimulationLoop
 
@@ -51,9 +54,11 @@ class VirtualClock:
 
     Construct with the ``SimulationLoop`` that owns the virtual
     timeline. Every read of ``monotonic()`` / ``time()`` returns the
-    loop's ``_virtual_now``. Every ``sleep`` / ``wait_for`` routes
-    through ``asyncio.sleep`` / ``asyncio.wait_for`` which the
-    custom loop schedules against virtual time.
+    loop's ``_virtual_now`` (``time()`` plus the armed wall offset —
+    zero by default, see ``set_wall_offset``). Every ``sleep`` /
+    ``wait_for`` routes through ``asyncio.sleep`` /
+    ``asyncio.wait_for`` which the custom loop schedules against
+    virtual time.
 
     The bound loop reference is required at construction (no global
     lookup) so a test that constructs multiple loops in sequence
@@ -62,6 +67,7 @@ class VirtualClock:
 
     def __init__(self, loop: SimulationLoop) -> None:
         self._loop = loop
+        self._wall_offset = 0.0
 
     def monotonic(self) -> float:
         """Return current virtual time in seconds."""
@@ -79,17 +85,44 @@ class VirtualClock:
         return int(self._loop.time() * 1_000_000_000)
 
     def time(self) -> float:
-        """Return current virtual wall time (same as monotonic in SIM).
+        """Return current virtual wall time.
 
-        SIM mode collapses ``time.monotonic`` and ``time.time``
-        because there's no meaningful distinction in virtual time
-        — both advance only when the loop chooses, and there's no
-        wall-clock drift to model. If a future scenario needs them
-        to differ (e.g., a clock-skew fault), that's a deliberate
-        FaultMatrix capability addition, not a free-floating
-        offset.
+        By default (offset zero) SIM collapses ``time.monotonic`` and
+        ``time.time`` — both advance only when the loop chooses, and
+        there is no drift to model. The deliberate exception is the
+        clock-skew fault: ``set_wall_offset`` shifts every subsequent
+        WALL read by the armed delta while ``monotonic()`` and every
+        timer stay on the loop's virtual timeline — exactly how a real
+        NTP step moves ``time.time`` but never ``CLOCK_MONOTONIC``.
         """
-        return self._loop.time()
+        return self._loop.time() + self._wall_offset
+
+    def set_wall_offset(self, delta_seconds: float) -> None:
+        """Skew this node's WALL clock by ``delta_seconds``.
+
+        Subsequent ``time()`` reads return ``loop.time() +
+        delta_seconds``; ``monotonic()`` / ``monotonic_ns()`` /
+        ``sleep`` / ``wait_for`` and every loop timer are UNTOUCHED —
+        the fault models an NTP step, and real steps move the wall
+        clock without ever moving ``CLOCK_MONOTONIC`` or armed timer
+        deadlines. Negative deltas (a backwards wall step) and mid-run
+        re-sets (repeated jumps) are both legal — both are things NTP
+        does. Lockstep coherence is unaffected: the loop's virtual
+        time stays global across processes; only this process's wall
+        READS shift, which is what makes the skew per-node.
+
+        The offset is absolute, not cumulative: arming ``+5`` then
+        ``-3`` leaves the wall clock 3 seconds BEHIND the virtual
+        timeline, not 2 ahead — each call models one step to a
+        definite skew, so a scenario's schedule reads as data.
+        """
+        if not math.isfinite(delta_seconds):
+            raise ValueError(
+                f"wall offset must be finite (got {delta_seconds!r}) — "
+                "a non-finite offset would poison every subsequent "
+                "wall read"
+            )
+        self._wall_offset = delta_seconds
 
     async def sleep(self, delay: float) -> None:
         """Sleep for ``delay`` virtual seconds.

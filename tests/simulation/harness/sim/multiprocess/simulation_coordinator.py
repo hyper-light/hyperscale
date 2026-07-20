@@ -95,6 +95,9 @@ class SimulationCoordinator:
         # fsync_reorder_seed). Earlier generations' results are kept
         # under ``{process_id}.gen{n}`` in the run results.
         self._restart_schedule: list[tuple] = []
+        # Pause schedule: (at_time, resume_time, process_id) —
+        # SIGSTOP-style freezes (see ``schedule_pause``).
+        self._pause_schedule: list[tuple] = []
         self._generation_results: dict = {}
         # child process id -> the process that requested its spawn
         # (executor pools). Restarting a parent with live spawned
@@ -115,6 +118,7 @@ class SimulationCoordinator:
         self._drop_rules: list[tuple] = []
         self._delay_rules: list[tuple] = []
         self._duplicate_rules: list[tuple] = []
+        self._corrupt_rules: list[tuple] = []
         self._fault_random = random.Random((seed << 16) ^ 0x5EEDFA17)
 
     def add_process(self, process_id, entry, *entry_args) -> None:
@@ -166,6 +170,74 @@ class SimulationCoordinator:
         self._restart_schedule.append(
             (at_time, process_id, down_seconds, fsync_reorder_seed)
         )
+
+    def schedule_pause(
+        self,
+        process_id,
+        at_time: float,
+        resume_time: float,
+    ) -> None:
+        """Schedule a SIGSTOP-style freeze of ``process_id`` for the
+        virtual window ``[at_time, resume_time)``.
+
+        During the freeze the victim executes NOTHING in global time:
+        it receives no window grants (it stays blocked at its barrier —
+        a real freeze, not a cooperative sleep), its due deliveries and
+        process-exit events are buffered in a per-victim queue instead
+        of delivered, and its next-event time is excluded from the
+        global ``min()`` so the rest of the cluster advances without it
+        — every other node observes pure silence, exactly like a
+        stopped process. At ``resume_time`` the victim is granted one
+        window at the current global time carrying EVERYTHING buffered:
+        it executes its entire frozen span inside that single window,
+        so all of its accumulated output reaches the world in a burst
+        at-or-after the resume instant — thawed-process semantics as
+        every survivor observes them. Determinism is free: the schedule
+        is data and the buffers fill in deterministic pop order.
+
+        Model note (the one divergence from a literal SIGSTOP): during
+        the catch-up window the victim's own timers fire at their
+        originally scheduled LOCAL virtual times — its clock sweeps the
+        frozen span rather than jumping over it — so the victim's own
+        clock READS during the sweep are pre-resume values. Every
+        schedule-visible effect (silence during the window, the burst
+        after it, detection/lease/fencing behavior at the survivors) is
+        freeze-faithful; a scenario that hinges on the victim's own
+        clock jumping (a thawed leader locally observing its lease
+        already expired) should pair the pause with per-node wall skew
+        (``VirtualClock.set_wall_offset``) or assert from the
+        survivors' side.
+
+        Interactions (each deliberate, none silent):
+
+        * Pausing a process that is dead at ``at_time`` — killed,
+          restarted-and-still-down, or never admitted — raises:
+          freezing a corpse is a scenario bug. A process id whose
+          RESTARTED generation is live again at ``at_time`` is a valid
+          victim (the pause freezes whichever incarnation is running).
+        * Overlapping pause windows on one victim raise at the second
+          activation. Back-to-back windows sharing an edge (resume at
+          T, next pause at T) compose into one continuous freeze.
+        * ``schedule_kill`` inside the window kills the frozen victim
+          without a thaw — SIGKILL of a stopped process. Its buffered
+          deliveries are discarded, its frozen span is never executed,
+          and it produces no RESULT (like any kill).
+        * ``schedule_restart`` inside the window power-losses the
+          frozen victim: the disk/result snapshot reflects execution up
+          to the freeze instant (a stopped process does no IO),
+          buffered deliveries die with the incarnation, and the
+          rebooted generation starts UN-paused.
+        * A pause window still open when the run ends (only reachable
+          via the ``max_virtual_time`` ceiling — an armed resume always
+          keeps the run alive otherwise) never thaws: the victim's
+          RESULT reflects execution up to the freeze instant.
+        """
+        if resume_time <= at_time:
+            raise ValueError(
+                "pause resume_time must be strictly after at_time "
+                f"(got at_time={at_time}, resume_time={resume_time})"
+            )
+        self._pause_schedule.append((at_time, resume_time, process_id))
 
     def schedule_partition(
         self,
@@ -248,6 +320,43 @@ class SimulationCoordinator:
             (at_time, until_time, src, dst, probability)
         )
 
+    def schedule_corrupt(
+        self,
+        src,
+        dst,
+        probability: float,
+        at_time: float = 0.0,
+        until_time: float | None = None,
+    ) -> None:
+        """Corrupt matching DATAGRAMS sent during the window with
+        ``probability``: one seeded byte of the payload is XOR-flipped
+        with a seeded non-zero mask and the frame is DELIVERED corrupt
+        — the on-wire bit-rot fault whose invariant is the receiver's
+        reject path (auth/parse must discard the frame whole; a flipped
+        datagram must be indistinguishable from loss at the protocol
+        level, never half-applied).
+
+        Streams are exempt: TCP checksums the wire, so a corrupted
+        segment is dropped by the kernel and retransmitted — on-wire
+        corruption NEVER reaches a production TCP reader as
+        delivered-corrupt bytes; its only observable is added latency,
+        which ``schedule_delay`` models. Delivering corrupt stream
+        frames would therefore exercise a non-production schedule.
+
+        Byte-index and mask draws come from the coordinator's seeded
+        fault generator, so WHICH byte flips (and to what) replays
+        identically. Zero-length datagrams pass through unchanged (no
+        bytes to rot). A drawn duplicate of a corrupted frame carries
+        the same corrupted bytes (the copy is enqueued after
+        corruption — one on-wire event, duplicated in the network).
+        First matching rule (declaration order) wins.
+        """
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError("corrupt probability must be within [0.0, 1.0]")
+        self._corrupt_rules.append(
+            (at_time, until_time, src, dst, probability)
+        )
+
     def run(self) -> dict:
         # Pin hash randomization for every spawned child. Python
         # randomizes str/bytes hashing per process (PYTHONHASHSEED),
@@ -322,10 +431,30 @@ class SimulationCoordinator:
         # (respawn_time, process_id, initial_disk) — restarts waiting
         # out their down window.
         pending_respawns: list = []
+        # Pause bookkeeping (``schedule_pause``): activations fire in
+        # (time, schedule order) like kills; armed thaws sit in a heap
+        # keyed (resume_time, arming order). Membership in the delivery
+        # buffer map IS the paused set — the two buffer maps are
+        # co-created and co-removed per victim.
+        remaining_pauses = sorted(
+            self._pause_schedule, key=lambda pause: pause[0]
+        )
+        pending_resumes: list = []
+        resume_sequence = 0
+        paused_delivery_buffers: dict = {}
+        paused_process_event_buffers: dict = {}
 
         # Lockstep.
         while True:
-            candidates = [t for t in next_times.values() if t is not None]
+            # A frozen victim's next-event time is excluded from the
+            # global minimum — time advances without it (its armed
+            # resume below keeps the run alive until the thaw).
+            candidates = [
+                next_time
+                for process_id, next_time in next_times.items()
+                if next_time is not None
+                and process_id not in paused_delivery_buffers
+            ]
             if pending:
                 candidates.append(pending[0][0])
             if remaining_kills:
@@ -334,6 +463,10 @@ class SimulationCoordinator:
                 candidates.append(remaining_restarts[0][0])
             if pending_respawns:
                 candidates.append(pending_respawns[0][0])
+            if remaining_pauses:
+                candidates.append(remaining_pauses[0][0])
+            if pending_resumes:
+                candidates.append(pending_resumes[0][0])
             if not candidates:
                 break
             target_time = min(candidates)
@@ -353,6 +486,13 @@ class SimulationCoordinator:
                 self._kill_child(
                     victim_id, connections, processes, next_times, address_to_process
                 )
+                # SIGKILL of a stopped process: the frozen span is
+                # never executed and its buffered traffic dies with it.
+                self._discard_pause_state(
+                    victim_id,
+                    paused_delivery_buffers,
+                    paused_process_event_buffers,
+                )
                 kill_events.append((kill_time, victim_id, self._KILLED_EXITCODE))
 
             # Restarts fire like kills (before granting) — the victim
@@ -371,6 +511,13 @@ class SimulationCoordinator:
                     next_times,
                     address_to_process,
                 )
+                # Power loss of a frozen victim: buffered traffic dies
+                # with the incarnation; the reboot starts un-paused.
+                self._discard_pause_state(
+                    victim_id,
+                    paused_delivery_buffers,
+                    paused_process_event_buffers,
+                )
                 kill_events.append(
                     (restart_time, victim_id, self._KILLED_EXITCODE)
                 )
@@ -379,10 +526,77 @@ class SimulationCoordinator:
                     (restart_time + down_seconds, victim_id, initial_disk),
                 )
 
+            # Thaws fire before pause activations so back-to-back pause
+            # windows sharing an edge compose into one continuous
+            # freeze (the activation re-buffers the thawed state below
+            # before any grant fires).
+            thawed_deliveries: dict = {}
+            thawed_process_events: dict = {}
+            while pending_resumes and pending_resumes[0][0] <= target_time:
+                _resume_time, _resume_seq, victim_id = heapq.heappop(
+                    pending_resumes
+                )
+                if victim_id not in paused_delivery_buffers:
+                    # The victim was killed or restarted during its
+                    # freeze; its pause state was discarded then (the
+                    # documented interaction) — this armed thaw is
+                    # stale bookkeeping, not a scenario event.
+                    continue
+                thawed_deliveries[victim_id] = paused_delivery_buffers.pop(
+                    victim_id
+                )
+                thawed_process_events[victim_id] = (
+                    paused_process_event_buffers.pop(victim_id)
+                )
+
+            while remaining_pauses and remaining_pauses[0][0] <= target_time:
+                _pause_time, resume_time, victim_id = remaining_pauses.pop(0)
+                if victim_id in thawed_deliveries:
+                    # Back-to-back windows sharing this instant: the
+                    # victim re-freezes before its thaw grant fires —
+                    # the windows compose into one continuous freeze.
+                    paused_delivery_buffers[victim_id] = (
+                        thawed_deliveries.pop(victim_id)
+                    )
+                    paused_process_event_buffers[victim_id] = (
+                        thawed_process_events.pop(victim_id)
+                    )
+                elif victim_id in paused_delivery_buffers:
+                    raise ValueError(
+                        f"cannot pause {victim_id!r}: it is already "
+                        "paused — overlapping pause windows on one "
+                        "victim are unsupported"
+                    )
+                elif victim_id not in connections:
+                    raise ValueError(
+                        "cannot pause unknown or already-dead process "
+                        f"{victim_id!r}"
+                    )
+                else:
+                    paused_delivery_buffers[victim_id] = []
+                    paused_process_event_buffers[victim_id] = []
+                heapq.heappush(
+                    pending_resumes, (resume_time, resume_sequence, victim_id)
+                )
+                resume_sequence += 1
+
+            # Frozen victims miss this window's GRANT, so they would
+            # miss its process-exit events too — buffer those alongside
+            # the deliveries and replay them at the thaw.
+            if kill_events:
+                for buffered_events in paused_process_event_buffers.values():
+                    buffered_events.extend(kill_events)
+
             # Snapshot the children granted this window — admission at
             # the barrier below grows ``connections``, and the new
-            # children receive their first grant next window.
-            granted = list(connections.items())
+            # children receive their first grant next window. Frozen
+            # victims are excluded: they stay blocked at their barrier,
+            # which is the freeze.
+            granted = [
+                (process_id, connection)
+                for process_id, connection in connections.items()
+                if process_id not in paused_delivery_buffers
+            ]
 
             due = {process_id: [] for process_id, _ in granted}
             while pending and pending[0][0] <= target_time:
@@ -390,15 +604,29 @@ class SimulationCoordinator:
                     heapq.heappop(pending)
                 )
                 # Deliveries already in flight toward a since-killed
-                # process drop silently — bytes to a dead host.
+                # process drop silently — bytes to a dead host. Toward
+                # a FROZEN process they buffer for the thaw grant
+                # instead: the host is alive, its NIC queue holds.
                 if dst_process in due:
                     due[dst_process].append(
                         (delivery_time, dst_addr, src_addr, data)
                     )
+                elif dst_process in paused_delivery_buffers:
+                    paused_delivery_buffers[dst_process].append(
+                        (delivery_time, dst_addr, src_addr, data)
+                    )
 
             for process_id, connection in granted:
+                # A victim thawing this window receives its whole
+                # buffered freeze — deliveries first (they predate this
+                # window's due set), then this window's due list; same
+                # concatenation for process-exit events.
+                inbound_deliveries = thawed_deliveries.pop(process_id, [])
+                inbound_deliveries.extend(due[process_id])
+                process_events = thawed_process_events.pop(process_id, [])
+                process_events.extend(kill_events)
                 connection.send(
-                    ("GRANT", target_time, due[process_id], kill_events)
+                    ("GRANT", target_time, inbound_deliveries, process_events)
                 )
 
             # Barrier: collect every report before advancing global time.
@@ -661,6 +889,23 @@ class SimulationCoordinator:
         process.join()
 
     @staticmethod
+    def _discard_pause_state(
+        victim_id,
+        paused_delivery_buffers: dict,
+        paused_process_event_buffers: dict,
+    ) -> None:
+        """Clear a dead victim's freeze state (no-op when not frozen).
+
+        A kill or restart landing inside a pause window discards the
+        buffered traffic — bytes held for a host that lost power — and
+        leaves the victim's armed thaw in the resume heap as a stale
+        entry the resume loop skips deterministically (the documented
+        kill/restart-during-pause semantics, not a silent no-op).
+        """
+        paused_delivery_buffers.pop(victim_id, None)
+        paused_process_event_buffers.pop(victim_id, None)
+
+    @staticmethod
     def _merge_address(address_to_process: dict, address, process_id) -> None:
         """Bind ``address`` to ``process_id`` in the route map.
 
@@ -715,12 +960,17 @@ class SimulationCoordinator:
         semantics), matching real UDP. Applies the scheduled network
         faults — every cross-process datagram passes through here, so
         this is the single deterministic fault chokepoint: partitions
-        and drop rules discard, delay rules stretch the delivery time
+        and drop rules discard, corrupt rules flip one seeded payload
+        byte of datagrams that survived the drop stage (the frame is
+        DELIVERED corrupt — the reject-path fault; streams exempt, see
+        ``schedule_corrupt``), delay rules stretch the delivery time
         (always additive, preserving the lookahead guarantee), and
         duplicate rules enqueue a second copy one latency later. Fault
         windows key on SEND time; probabilistic draws and jitter come
-        from the coordinator's seeded fault generator in enqueue order,
-        so the exact fault pattern replays byte-identically.
+        from the coordinator's seeded fault generator in enqueue order
+        (drop, then corrupt, then delay, then duplicate), so the exact
+        fault pattern — including WHICH byte flipped — replays
+        byte-identically.
         """
         dst_process = address_to_process.get(dst)
         if dst_process is None:
@@ -758,6 +1008,24 @@ class SimulationCoordinator:
                 ) and self._endpoint_matches(rule_dst, dst_process):
                     if self._fault_random.random() < probability:
                         return sequence
+                    break  # first matching rule decides
+
+        # On-wire bit rot applies to DATAGRAMS only (see
+        # ``schedule_corrupt``: TCP checksums turn stream corruption
+        # into retransmission latency, never delivered-corrupt bytes),
+        # and only to frames that survived the drop stage — a dropped
+        # frame has no wire bytes to rot.
+        if is_datagram:
+            for at_time, until_time, rule_src, rule_dst, probability in (
+                self._corrupt_rules
+            ):
+                if not self._window_matches(at_time, until_time, send_time):
+                    continue
+                if self._endpoint_matches(
+                    rule_src, src_process
+                ) and self._endpoint_matches(rule_dst, dst_process):
+                    if self._fault_random.random() < probability:
+                        data = self._flip_seeded_byte(data)
                     break  # first matching rule decides
 
         extra_delay = 0.0
@@ -811,3 +1079,25 @@ class SimulationCoordinator:
                     break  # first matching rule decides
 
         return sequence
+
+    def _flip_seeded_byte(self, data):
+        """Return the datagram tuple with one seeded payload byte
+        XOR-flipped.
+
+        The flip mask is drawn from ``[1, 255]`` so the byte always
+        CHANGES — an XOR with zero would be a "corruption" that
+        delivered the frame intact, silently weakening any assertion
+        built on it. A zero-length payload has no bytes to rot and
+        passes through unchanged (no index/mask draws consumed).
+        """
+        payload = data[1]
+        if not payload:
+            return data
+        corrupt_index = self._fault_random.randrange(len(payload))
+        flip_mask = self._fault_random.randrange(1, 256)
+        corrupted_payload = (
+            payload[:corrupt_index]
+            + bytes([payload[corrupt_index] ^ flip_mask])
+            + payload[corrupt_index + 1 :]
+        )
+        return ("dgram", corrupted_payload)

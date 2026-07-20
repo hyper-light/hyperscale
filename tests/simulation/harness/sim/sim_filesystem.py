@@ -42,6 +42,16 @@ Fault knobs (Phase 7 — all deterministic):
   surviving segment at a seeded offset (the torn tail). Durable
   (fsynced) content is never touched — ``atomic_write`` /
   ``append_fsync`` guarantees hold by construction.
+* ``set_read_corruption(seed, probability, path_glob)`` — runtime
+  bitrot surfacing at READ time: seeded byte flips in the bytes a
+  read RETURNS, stored state never mutated (the rot is in the read
+  path, and disarming restores clean reads).
+* ``set_misdirect(seed, probability)`` — kernel/FS misdirected IO: a
+  path-level write lands on a seeded SIBLING file, or a path-level
+  read is satisfied from one.
+* ``set_io_error(seed, probability, at_time, until_time)`` —
+  transient device errors: seeded draws inside the virtual-time
+  window raise ``OSError(EIO)`` from the operation.
 """
 
 import random
@@ -76,16 +86,27 @@ class _SimFileState:
 class SimFileHandle:
     """An open handle over a ``_SimFileState`` with mode semantics for
     the modes production consumers use: ``r`` (read), ``w`` (truncate +
-    sequential write), ``a`` (append)."""
+    sequential write), ``a`` (append). Carries its path so the
+    read-corruption knob can glob-match handle reads."""
 
-    __slots__ = ("_state", "_mode", "_position", "_closed", "_filesystem")
+    __slots__ = (
+        "_state",
+        "_mode",
+        "_position",
+        "_closed",
+        "_filesystem",
+        "_path",
+    )
 
-    def __init__(self, state: _SimFileState, mode: str, filesystem) -> None:
+    def __init__(
+        self, state: _SimFileState, mode: str, filesystem, path: str
+    ) -> None:
         self._state = state
         self._mode = mode
         self._position = 0
         self._closed = False
         self._filesystem = filesystem
+        self._path = path
 
     @property
     def closed(self) -> bool:
@@ -112,10 +133,10 @@ class SimFileHandle:
         if size < 0:
             data = content[self._position :]
             self._position = len(content)
-            return data
+            return self._filesystem._corrupt_read(self._path, data)
         data = content[self._position : self._position + size]
         self._position += len(data)
-        return data
+        return self._filesystem._corrupt_read(self._path, data)
 
     async def readline(self) -> bytes:
         self._require_open()
@@ -123,10 +144,11 @@ class SimFileHandle:
         content = self._state.visible_content
         newline_index = content.find(b"\n", self._position)
         if newline_index < 0:
+            # Delegates to ``read`` — read corruption applies there.
             return await self.read()
         line = content[self._position : newline_index + 1]
         self._position = newline_index + 1
-        return line
+        return self._filesystem._corrupt_read(self._path, line)
 
     async def seek(self, offset: int, whence: int = 0) -> int:
         self._require_open()
@@ -168,6 +190,15 @@ class SimFilesystem:
         "_slow_disk_delay",
         "_disk_full_remaining",
         "_fsync_reorder_random",
+        "_read_corruption_random",
+        "_read_corruption_probability",
+        "_read_corruption_glob",
+        "_misdirect_random",
+        "_misdirect_probability",
+        "_io_error_random",
+        "_io_error_probability",
+        "_io_error_at_time",
+        "_io_error_until_time",
     )
 
     def __init__(self, clock: Clock | None = None) -> None:
@@ -177,6 +208,15 @@ class SimFilesystem:
         self._slow_disk_delay = 0.0
         self._disk_full_remaining: int | None = None
         self._fsync_reorder_random: random.Random | None = None
+        self._read_corruption_random: random.Random | None = None
+        self._read_corruption_probability = 0.0
+        self._read_corruption_glob: str | None = None
+        self._misdirect_random: random.Random | None = None
+        self._misdirect_probability = 0.0
+        self._io_error_random: random.Random | None = None
+        self._io_error_probability = 0.0
+        self._io_error_at_time: float | None = None
+        self._io_error_until_time: float | None = None
 
     # -- scenario-facing fault primitives --------------------------------
 
@@ -204,6 +244,141 @@ class SimFilesystem:
     def set_fsync_reorder(self, seed: int) -> None:
         """Arm reordering-crash semantics for the next ``crash()``."""
         self._fsync_reorder_random = random.Random(seed)
+
+    def set_read_corruption(
+        self,
+        seed: int,
+        probability: float,
+        path_glob: str | None = None,
+    ) -> None:
+        """Arm runtime read corruption: bitrot surfacing at READ time.
+
+        Every subsequent read operation — ``read_bytes`` /
+        ``read_text`` / handle ``read`` / ``readline`` — whose path
+        matches ``path_glob`` (``None`` matches every path;
+        ``Path.match`` semantics, same as ``list_directory``) flips one
+        seeded byte of the RETURNED bytes with ``probability`` per
+        operation. Stored state is NEVER mutated: disarming via
+        ``clear_read_corruption`` restores clean reads, exactly like a
+        flaky read path (latent sector, bad cable, DRAM bit) over an
+        intact platter. Production analog: bitrot detected at read
+        time — the invariant this knob exists for is that a
+        CRC-failing read is a LOUD failure or a clean
+        recovery-truncation, never silently-applied wrong state.
+        Non-matching paths consume no RNG draws (scoping means the
+        knob does not touch them at all); every matching read consumes
+        exactly one probability draw, plus index/mask draws on a hit.
+        """
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(
+                "read corruption probability must be within [0.0, 1.0]"
+            )
+        self._read_corruption_random = random.Random(seed)
+        self._read_corruption_probability = probability
+        self._read_corruption_glob = path_glob
+
+    def clear_read_corruption(self) -> None:
+        self._read_corruption_random = None
+        self._read_corruption_probability = 0.0
+        self._read_corruption_glob = None
+
+    def set_misdirect(self, seed: int, probability: float) -> None:
+        """Arm misdirected IO: the kernel/FS wrote-or-read-the-wrong-
+        place fault class.
+
+        With ``probability`` per PATH-level operation, a write
+        (``append_fsync`` / ``atomic_write``) applies its content to a
+        seeded SIBLING file (same parent directory) instead of its
+        target — the target is untouched — and a ``read_bytes`` /
+        ``read_text`` is satisfied from a seeded sibling. Production
+        analog: firmware/kernel misdirected IO — a block written to or
+        fetched from the wrong location. The class is narrowed to
+        same-directory files because this layout is file-per-purpose
+        (WAL segments, submission files, incarnation store): sibling
+        confusion — one WAL segment's bytes landing in another — is the
+        production-possible shape; cross-directory confusion has no
+        single mechanism above the raw-sector layer. The invariant it
+        protects: foreign bytes are caught by record framing + CRC +
+        file-format headers, never interpreted as valid state.
+
+        Deliberate scoping, each production-justified:
+
+        * An operation whose target has no sibling proceeds correctly —
+          a lone file has no neighbor to hit (the probability draw is
+          still consumed, so the RNG stream is uniform per armed op).
+        * Handle-based sequential IO (``open``/``read``/``write`` on a
+          ``SimFileHandle``, ``write_flush``) is exempt: an open fd is
+          bound to its inode; misdirection strikes at the path/block
+          layer, which the path-level entry points model.
+        * A read of a MISSING target still raises ``FileNotFoundError``
+          (no draw consumed): path resolution fails before any device
+          IO — the namei stage is not misdirectable.
+        """
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(
+                "misdirect probability must be within [0.0, 1.0]"
+            )
+        self._misdirect_random = random.Random(seed)
+        self._misdirect_probability = probability
+
+    def clear_misdirect(self) -> None:
+        self._misdirect_random = None
+        self._misdirect_probability = 0.0
+
+    def set_io_error(
+        self,
+        seed: int,
+        probability: float,
+        at_time: float | None = None,
+        until_time: float | None = None,
+    ) -> None:
+        """Arm transient device IO errors (EIO).
+
+        Each subsequent operation inside the VIRTUAL-time window
+        ``[at_time, until_time)`` draws with ``probability`` and raises
+        ``OSError(5, "Input/output error")`` on a hit. ``None`` bounds
+        are unbounded on that side; both ``None`` means always armed. A
+        windowed schedule requires the clock injected at construction
+        (the same contract as ``set_slow_disk``). Production analog:
+        transient device/controller errors — the invariant this knob
+        exists for is that an EIO is retried or escalates LOUDLY, never
+        a silent skip. A failing operation has no effect: it lands no
+        bytes and consumes no disk-full budget (the write never reached
+        the platter). Draws are consumed only inside the window, so the
+        raise pattern is a deterministic function of (seed, operation
+        order, virtual time).
+        """
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(
+                "io_error probability must be within [0.0, 1.0]"
+            )
+        if (at_time is not None or until_time is not None) and (
+            self._clock is None
+        ):
+            raise ValueError(
+                "a windowed io_error needs a Clock: construct "
+                "SimFilesystem(clock=...) so the window can key on "
+                "virtual time"
+            )
+        if (
+            at_time is not None
+            and until_time is not None
+            and until_time <= at_time
+        ):
+            raise ValueError(
+                "io_error until_time must be strictly after at_time "
+                f"(got at_time={at_time}, until_time={until_time})"
+            )
+        self._io_error_random = random.Random(seed)
+        self._io_error_probability = probability
+        self._io_error_at_time = at_time
+        self._io_error_until_time = until_time
+
+    def clear_io_error(self) -> None:
+        self._io_error_random = None
+        self._io_error_probability = 0.0
+        self._io_error_at_time = None
+        self._io_error_until_time = None
 
     def crash(self) -> None:
         """Model power loss.
@@ -260,12 +435,96 @@ class SimFilesystem:
     # -- fault application (internal) ------------------------------------
 
     async def _charge_operation(self, write_bytes: int = 0) -> None:
+        # Stage order is deliberate: the latency cost is paid first (a
+        # failing device still made the caller wait), then the device
+        # can fail with EIO (before any budget accounting — a failed
+        # write never reached the platter), then the byte budget.
         if self._slow_disk_delay > 0.0:
             await self._clock.sleep(self._slow_disk_delay)
+        if self._io_error_random is not None and self._io_error_window_active():
+            if self._io_error_random.random() < self._io_error_probability:
+                raise OSError(5, "Input/output error")
         if write_bytes > 0 and self._disk_full_remaining is not None:
             if write_bytes > self._disk_full_remaining:
                 raise OSError(28, "No space left on device")
             self._disk_full_remaining -= write_bytes
+
+    def _io_error_window_active(self) -> bool:
+        """Whether virtual time is inside the armed EIO window.
+
+        Window-less arming (both bounds ``None``) is always active and
+        needs no clock; a windowed schedule reads the injected clock
+        (guaranteed present by ``set_io_error``'s validation).
+        """
+        if self._io_error_at_time is None and self._io_error_until_time is None:
+            return True
+        current_virtual_time = self._clock.monotonic()
+        if (
+            self._io_error_at_time is not None
+            and current_virtual_time < self._io_error_at_time
+        ):
+            return False
+        return (
+            self._io_error_until_time is None
+            or current_virtual_time < self._io_error_until_time
+        )
+
+    def _corrupt_read(self, path: str, data: bytes) -> bytes:
+        """Apply armed read corruption to bytes leaving a read op.
+
+        Returns ``data`` untouched when disarmed or when the path falls
+        outside the glob scope (no RNG draws consumed — scoping means
+        the knob does not see the operation). A matching read consumes
+        one probability draw; on a hit, one seeded byte of the RETURNED
+        copy is XOR-flipped with a seeded non-zero mask (the byte
+        always changes). Zero-length reads pass unchanged after the
+        draw — nothing to rot. Stored state is never mutated.
+        """
+        if self._read_corruption_random is None:
+            return data
+        if self._read_corruption_glob is not None and not Path(path).match(
+            self._read_corruption_glob
+        ):
+            return data
+        if (
+            self._read_corruption_random.random()
+            >= self._read_corruption_probability
+        ):
+            return data
+        if not data:
+            return data
+        corrupt_index = self._read_corruption_random.randrange(len(data))
+        flip_mask = self._read_corruption_random.randrange(1, 256)
+        return (
+            data[:corrupt_index]
+            + bytes([data[corrupt_index] ^ flip_mask])
+            + data[corrupt_index + 1 :]
+        )
+
+    def _draw_misdirect_sibling(self, path: str) -> str | None:
+        """Draw the misdirection target for one path-level operation.
+
+        Returns ``None`` when disarmed, when the per-op probability
+        draw misses, or when the target has no sibling file in its
+        parent directory (a lone file has no neighbor to hit — the
+        probability draw is still consumed so the stream stays uniform
+        per armed op). Sibling choice is seeded over the SORTED sibling
+        list — deterministic under replay.
+        """
+        if self._misdirect_random is None:
+            return None
+        if self._misdirect_random.random() >= self._misdirect_probability:
+            return None
+        parent_directory = Path(path).parent
+        sibling_paths = sorted(
+            candidate_path
+            for candidate_path in self._files
+            if candidate_path != path
+            and Path(candidate_path).parent == parent_directory
+        )
+        if not sibling_paths:
+            return None
+        return self._misdirect_random.choice(sibling_paths)
 
     # -- Filesystem protocol ---------------------------------------------
 
@@ -277,7 +536,7 @@ class SimFilesystem:
         if "r" in mode and "+" not in mode:
             if state is None:
                 raise FileNotFoundError(2, "No such file or directory", key)
-            return SimFileHandle(state, mode, self)
+            return SimFileHandle(state, mode, self, key)
 
         if state is None:
             state = _SimFileState()
@@ -287,7 +546,7 @@ class SimFilesystem:
             state.durable_content = b""
             state.volatile_segments.clear()
 
-        return SimFileHandle(state, mode, self)
+        return SimFileHandle(state, mode, self, key)
 
     async def write_flush(
         self,
@@ -325,32 +584,57 @@ class SimFilesystem:
     async def append_fsync(self, path: str | Path, data: bytes) -> None:
         await self._charge_operation(write_bytes=len(data))
         key = str(path)
+        # Misdirected IO (armed via ``set_misdirect``): the append —
+        # bytes AND durability barrier — lands on a seeded sibling; the
+        # intended path is untouched (and not created: its bytes went
+        # elsewhere).
+        misdirected_path = self._draw_misdirect_sibling(key)
+        if misdirected_path is not None:
+            key = misdirected_path
         state = self._files.get(key)
         if state is None:
             state = _SimFileState()
             self._files[key] = state
-            self._register_parents(Path(path))
+            self._register_parents(Path(key))
         state.volatile_segments.append(bytes(data))
         state.promote_volatile()
 
     async def atomic_write(self, path: str | Path, data: bytes) -> None:
         await self._charge_operation(write_bytes=len(data))
         key = str(path)
+        # Misdirected IO: the whole-file replacement clobbers a seeded
+        # sibling instead of its target (a rename landing on the wrong
+        # directory entry); the intended path is untouched.
+        misdirected_path = self._draw_misdirect_sibling(key)
+        if misdirected_path is not None:
+            key = misdirected_path
         state = self._files.get(key)
         if state is None:
             state = _SimFileState()
             self._files[key] = state
-            self._register_parents(Path(path))
+            self._register_parents(Path(key))
         # All-or-nothing: the complete new content, durable at once.
         state.durable_content = bytes(data)
         state.volatile_segments.clear()
 
     async def read_bytes(self, path: str | Path) -> bytes:
         await self._charge_operation()
-        state = self._files.get(str(path))
+        key = str(path)
+        state = self._files.get(key)
         if state is None:
-            raise FileNotFoundError(2, "No such file or directory", str(path))
-        return state.visible_content
+            # Path resolution fails before any device IO — the namei
+            # stage is not misdirectable, so a missing target is a
+            # plain FileNotFoundError even with misdirect armed.
+            raise FileNotFoundError(2, "No such file or directory", key)
+        # Misdirected IO: the fetch is satisfied from a seeded sibling.
+        misdirected_path = self._draw_misdirect_sibling(key)
+        if misdirected_path is not None:
+            key = misdirected_path
+            state = self._files[key]
+        # Read corruption composes after misdirection, matched against
+        # the path actually fetched — the rot lives on the physical
+        # blocks the device returned.
+        return self._corrupt_read(key, state.visible_content)
 
     async def read_text(
         self,
