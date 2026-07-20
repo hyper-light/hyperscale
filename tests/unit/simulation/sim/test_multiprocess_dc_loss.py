@@ -928,17 +928,25 @@ def test_concurrent_jobs_dc_loss_is_replay_deterministic():
 
 @pytest.mark.skip(
     reason=(
-        "KNOWN BUG (deterministic reproducer): with TWO in-flight jobs "
-        "co-placed in dc-west — one executing, one accepted but not "
-        "yet dispatched — killing the whole datacenter at t=9.6 drives "
-        "the GATE into a zero-delay self-rescheduling loop at "
-        "t=82.66 (right after both AD-34 global-timeout declarations "
-        "and the 5s dead-manager broadcast timeout): the harness spin "
-        "guard aborts with 'run_window spun 500001 times without "
-        "advancing'. In production this is a 100% CPU livelock. "
-        "Reproduce: the scenario below (seed 61, duration 20, two "
-        "unpinned clients, dc_loss(dc-west) at 9.6). Unskip once the "
-        "gate's post-timeout path backs off instead of spinning."
+        "KNOWN BUG, ROOT-CAUSED (deterministic reproducer): with TWO "
+        "in-flight jobs co-placed in dc-west — one executing, one "
+        "accepted but not yet dispatched — killing the whole "
+        "datacenter at t=9.6 spins the GATE at t=82.66357815979111. "
+        "Schedule-traced to JobSuspicionManager._poll_suspicion "
+        "(swim/detection/job_suspicion_manager.py:337, the gate's "
+        "job-suspicion of the dead dc-west manager started in the "
+        "AD-34 global-timeout / dead-manager broadcast aftermath): "
+        "JobSuspicion.time_remaining computes max(0, timeout - "
+        "elapsed) from composed floats, a positive SUB-QUANTUM "
+        "remainder (the b4bc1784 epsilon-expiry class) survives the "
+        "'remaining <= 0' expiry check, and sleep(min(poll_interval, "
+        "remaining)) re-arms call_at at the same quantized instant "
+        "forever — 100% CPU livelock in production. The fix is the "
+        "established two-line shape (TIME_REMAINDER_EPSILON_SECONDS "
+        "expiry predicate + the 1ms progress floor) in "
+        "swim/detection/job_suspicion_manager.py — a shared-SWIM-tier "
+        "file outside the gate-tier scope of this fix wave. Unskip "
+        "once that lands."
     )
 )
 def test_dc_loss_with_job_mid_dispatch_must_not_livelock_the_gate():

@@ -150,6 +150,7 @@ from hyperscale.distributed.idempotency import (
 )
 from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
+    DatacenterOverloadConfig,
     ManagerDispatcher,
     LeaseManager as DatacenterLeaseManager,
     CrossDCCorrelationDetector,
@@ -434,10 +435,29 @@ class GateServer(HealthAwareServer):
         self._job_stats_crdt: dict[str, JobStatsCRDT] = {}
         self._job_stats_crdt_lock = asyncio.Lock()
 
-        # Datacenter health manager (AD-16)
+        # Datacenter health manager (AD-16).
+        #
+        # Capacity saturation is NEVER unhealth at the gate: the default
+        # overload config mapped capacity utilization >= 0.95 to
+        # UNHEALTHY, so a datacenter whose cores were fully busy (a load
+        # generator's steady state — probed: any vus-2 workflow on the
+        # 2-core worker) fast-rejected ALL new submissions for the whole
+        # execution window, and a manager-side capacity misreport
+        # (traced: worker-heartbeat starvation zeroing available_cores)
+        # blinded submissions PERMANENTLY. Per the AD-16 contract
+        # "BUSY != UNHEALTHY" (and the manager's own accept semantics —
+        # workers-busy still accepts and queues), a full DC classifies
+        # BUSY/DEGRADED: routing deprioritizes it but submissions stay
+        # accepted. The busy/degraded capacity bands keep their
+        # defaults; only the capacity->UNHEALTHY edge is removed.
+        # Zero-worker / no-heartbeat unhealth is untouched (those are
+        # structural signals, not capacity).
         self._dc_health_manager = DatacenterHealthManager(
             heartbeat_timeout=30.0,
             get_configured_managers=lambda dc: self._datacenter_managers.get(dc, []),
+            overload_config=DatacenterOverloadConfig(
+                capacity_utilization_unhealthy_threshold=float("inf"),
+            ),
         )
         for datacenter_id in self._datacenter_managers.keys():
             self._dc_health_manager.add_datacenter(datacenter_id)
@@ -1163,6 +1183,8 @@ class GateServer(HealthAwareServer):
         self._task_runner.run(self._batch_stats_loop)
         self._task_runner.run(self._windowed_stats_push_loop)
         self._task_runner.run(self._dead_peer_reap_loop)
+        if self._gate_udp_peers:
+            self._task_runner.run(self._gate_peer_readmission_loop)
 
         run = self._task_runner.run(self._resource_sampling_loop)
         if run:
@@ -6477,6 +6499,88 @@ class GateServer(HealthAwareServer):
                 break
             except Exception as error:
                 await self.handle_exception(error, "dead_peer_reap_loop")
+
+    async def _gate_peer_readmission_loop(self) -> None:
+        """Re-admit configured gate peers evicted by false SWIM death.
+
+        A partition longer than the suspicion bound makes each side
+        declare the other DEAD: the tracker pins the peer at its death
+        incarnation, the probe scheduler drops it, and — because a
+        DEAD entry outranks ALIVE at the same incarnation — no amount
+        of post-heal traffic from the (never-restarted, never-bumped)
+        peer can revive it. The evicted peer never learns it was
+        declared dead, so the refutation path never fires and the
+        registries stay decayed forever (probed: every gate ends the
+        total-isolation scenario with active-peer count 1, and the
+        kill+partition composite leaves the survivors leaderless with
+        no quorum to re-elect).
+
+        This is the gate-tier analog of the worker tier's rejoin
+        machinery (manager-rejoin watch + eviction-notice nudge): on
+        the dead-peer check cadence, every CONFIGURED peer this gate
+        holds DEAD is liveness-verified over TCP (the same
+        ``receive_gate_ping`` proof ``authorize_rejoin_reset`` trusts
+        for inbound JOINs); on proof of life the peer is re-admitted
+        through the established rejoin composite and a fresh JOIN is
+        sent so a one-sidedly evicted peer re-admits US symmetrically.
+        A genuinely dead peer costs one short failed ping per tick and
+        nothing else.
+        """
+        while self._running:
+            try:
+                await self._clock.sleep(self._dead_peer_check_interval)
+                await self._readmit_partition_evicted_peers()
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self.handle_exception(error, "gate_peer_readmission_loop")
+
+    async def _readmit_partition_evicted_peers(self) -> None:
+        """TCP-verify each DEAD-marked configured peer; re-admit on proof."""
+        for peer_index, udp_addr in enumerate(self._gate_udp_peers):
+            if peer_index >= len(self._gate_peers):
+                continue
+
+            node_state = self._incarnation_tracker.get_node_state(udp_addr)
+            if node_state is not None and node_state.status != b"DEAD":
+                continue
+
+            tcp_addr = self._gate_peers[peer_index]
+            gate_info = await self._verify_gate_peer_rejoin(udp_addr, tcp_addr)
+            if gate_info is None:
+                continue
+
+            # The same composite the manager's gate_register rejoin
+            # branch runs: refresh identity, wipe the death record and
+            # seed OK at the rejoin incarnation (also re-gossips ALIVE
+            # so third parties supersede their stale DEAD entries),
+            # re-enrol in the probe rotation, and drive the canonical
+            # join pipeline (dead-addr clear, raft rejoin, peer
+            # recovery -> active-peer restoration + state sync).
+            await self._ingest_gate_peer_info(gate_info)
+            await self.reset_peer_for_rejoin(udp_addr)
+            self._probe_scheduler.add_member(udp_addr)
+            self._on_node_join(udp_addr)
+
+            # Announce OURSELVES to the recovered peer with a freshly
+            # bumped incarnation: if the eviction was mutual (or only
+            # on the peer's side), its zombie check needs a claim above
+            # the incarnation it recorded for our death — join_cluster
+            # bumps past the rejoin threshold by contract.
+            await self.join_cluster(udp_addr, seed_role="gate")
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        f"Re-admitted gate peer {tcp_addr[0]}:{tcp_addr[1]} "
+                        "after partition-driven eviction (TCP liveness "
+                        "proof + rejoin reset)"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _check_quorum_status(self) -> None:
         active_peer_count = self._modular_state.get_active_peer_count() + 1
