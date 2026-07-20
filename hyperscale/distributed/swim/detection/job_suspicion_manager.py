@@ -17,6 +17,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable
 
+from hyperscale.distributed.protocol.time_quantum import (
+    TIME_REMAINDER_EPSILON_SECONDS,
+)
 from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 
@@ -106,10 +109,22 @@ class JobSuspicion:
         return max(self.min_timeout, timeout)
 
     def time_remaining(self, n_members: int) -> float:
-        """Calculate time remaining before expiration."""
+        """Calculate time remaining before expiration.
+
+        Sub-epsilon remainders report as 0.0 (the protocol epsilon-
+        expiry contract, ``protocol.time_quantum``): the composed-float
+        remainder can be a positive sub-quantum artifact (observed
+        live: the gate's job-suspicion of a dead manager spun at one
+        frozen virtual instant because ``remaining <= 0`` said "not
+        yet" while ``sleep(min(interval, remaining))`` re-armed a timer
+        the quantized clock could not honor — the frozen-instant
+        livelock class)."""
         elapsed = _DEFAULT_CLOCK.monotonic() - self.start_time
         timeout = self.calculate_timeout(n_members)
-        return max(0, timeout - elapsed)
+        remaining = timeout - elapsed
+        if remaining <= TIME_REMAINDER_EPSILON_SECONDS:
+            return 0.0
+        return remaining
 
     def cancel(self) -> None:
         """Cancel this suspicion's timer."""
@@ -331,8 +346,11 @@ class JobSuspicionManager:
 
                 # Calculate adaptive sleep interval
                 poll_interval = self._calculate_poll_interval(remaining)
-                # Don't sleep longer than remaining time
-                sleep_time = min(poll_interval, remaining)
+                # Don't sleep longer than remaining time — floored so
+                # the clock always moves (defense in depth for the
+                # frozen-instant class; the epsilon contract in
+                # time_remaining is the primary guard).
+                sleep_time = max(min(poll_interval, remaining), 0.001)
 
                 await _DEFAULT_CLOCK.sleep(sleep_time)
 

@@ -33,7 +33,7 @@ anchors; see the per-scenario docstrings for the measured timelines):
   client-link heal) — the asymmetry is deliberate to pin.
 """
 
-import pytest
+
 
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.gate_cluster_demo import (
@@ -921,35 +921,26 @@ def test_concurrent_jobs_dc_loss_is_replay_deterministic():
 
 
 # ---------------------------------------------------------------------------
-# Scenario 9 (KNOWN BUG, pinned as a reproducer): gate livelock when a
-# DC dies with one job mid-execution and one mid-dispatch
+# Scenario 9 (FIXED BUG, pinned): gate must survive a DC dying with
+# one job mid-execution and one mid-dispatch — no livelock
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason=(
-        "KNOWN BUG, ROOT-CAUSED (deterministic reproducer): with TWO "
-        "in-flight jobs co-placed in dc-west — one executing, one "
-        "accepted but not yet dispatched — killing the whole "
-        "datacenter at t=9.6 spins the GATE at t=82.66357815979111. "
-        "Schedule-traced to JobSuspicionManager._poll_suspicion "
-        "(swim/detection/job_suspicion_manager.py:337, the gate's "
-        "job-suspicion of the dead dc-west manager started in the "
-        "AD-34 global-timeout / dead-manager broadcast aftermath): "
-        "JobSuspicion.time_remaining computes max(0, timeout - "
-        "elapsed) from composed floats, a positive SUB-QUANTUM "
-        "remainder (the b4bc1784 epsilon-expiry class) survives the "
-        "'remaining <= 0' expiry check, and sleep(min(poll_interval, "
-        "remaining)) re-arms call_at at the same quantized instant "
-        "forever — 100% CPU livelock in production. The fix is the "
-        "established two-line shape (TIME_REMAINDER_EPSILON_SECONDS "
-        "expiry predicate + the 1ms progress floor) in "
-        "swim/detection/job_suspicion_manager.py — a shared-SWIM-tier "
-        "file outside the gate-tier scope of this fix wave. Unskip "
-        "once that lands."
-    )
-)
 def test_dc_loss_with_job_mid_dispatch_must_not_livelock_the_gate():
+    """FIXED-BUG PIN: with TWO in-flight jobs co-placed in dc-west —
+    one executing, one accepted but not yet dispatched — killing the
+    whole datacenter at t=9.6 used to spin the GATE at one frozen
+    virtual instant (t=82.66357815979111, schedule-traced to
+    ``JobSuspicionManager._poll_suspicion``: ``time_remaining``'s
+    composed-float remainder produced a positive SUB-QUANTUM artifact
+    that survived the ``remaining <= 0`` expiry check while
+    ``sleep(min(interval, remaining))`` re-armed at the same quantized
+    instant — 100% CPU livelock in production). The epsilon-expiry
+    contract now applied in that file (sub-epsilon remainders ARE
+    expiry, plus the 1ms floor as defense in depth) lets the suspicion
+    expire and the run proceed: both clients reach LOUD terminals and
+    the run completes to its ceiling — this test living at all is the
+    regression pin."""
     coordinator = SimulationCoordinator(
         latency=0.01, max_virtual_time=_CONCURRENT_CEILING, seed=_SEED
     )
