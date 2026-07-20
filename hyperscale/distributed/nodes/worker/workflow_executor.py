@@ -324,11 +324,23 @@ class WorkerWorkflowExecutor:
             progress.status = WorkflowStatus.FAILED.value
 
         finally:
-            # Record completion for throughput tracking
-            elapsed = _DEFAULT_CLOCK.monotonic() - start_time
-            if self._backpressure_manager:
-                latency_ms = elapsed * 1000.0
-                self._backpressure_manager.record_workflow_latency(latency_ms)
+            # Workflow DURATION is deliberately NOT fed to the overload
+            # detector. It was recorded here as a "latency" sample, and
+            # the detector's absolute bounds (200/500/2000ms) classified
+            # any workflow longer than 2 SECONDS as an overloaded
+            # worker at drain — permanently, because a worker the
+            # manager stops routing to produces no further samples to
+            # de-escalate with (hysteresis needs consecutive better
+            # readings). One completed long workflow therefore poisoned
+            # its worker out of the pool forever: the manager's
+            # allocation bucket put it in UNHEALTHY and every later
+            # job's dispatch starved (measured live as the second-job
+            # dispatch failure and dependent-workflow stalls; a load
+            # generator runs minutes-long workflows BY DESIGN, so
+            # duration is a category error as a latency signal). The
+            # detector keeps its per-heartbeat CPU/memory resource
+            # signal; its latency paths stay dormant until a genuine
+            # per-operation latency source feeds them.
 
             # Free cores
             await self._core_allocator.free(dispatch.workflow_id)
