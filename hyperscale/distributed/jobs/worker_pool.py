@@ -143,6 +143,26 @@ class WorkerPool:
         async with self._registration_lock:
             node_id = registration.node.node_id
 
+            # Evict any DIFFERENT node_id currently holding this TCP
+            # address (mirrors the registry's same-addr eviction): a
+            # socket address is a singleton, so the previous entry is a
+            # dead generation whose SWIM death detection lagged the
+            # restart. Without this the pool accumulates one stale
+            # entry per restart cycle — and allocation could select
+            # the stale id (its cached cores look free), whose dispatch
+            # then dies on the registry miss while the retry loop
+            # re-picks it forever (measured: a fresh job accepted
+            # around a worker power-cycle stranded to the AD-34
+            # timeout against an idle, healthy gen-2).
+            new_addr = (registration.node.host, registration.node.port)
+            stale_node_id = self._addr_to_worker.get(new_addr)
+            if stale_node_id is not None and stale_node_id != node_id:
+                self._workers.pop(stale_node_id, None)
+                self._worker_health.pop(stale_node_id, None)
+                self._dispatch_routing.pop(stale_node_id, None)
+                self._drain_intents.pop(stale_node_id, None)
+                self._addr_to_worker.pop(new_addr, None)
+
             # Check if already registered
             if node_id in self._workers:
                 worker = self._workers[node_id]
@@ -484,15 +504,20 @@ class WorkerPool:
         if routing_decision in (RoutingDecision.DRAIN, RoutingDecision.EVICT):
             return False
 
-        # Check SWIM status if callback provided
+        # SWIM membership as a NEGATIVE gate only. SUSPECT/DEAD is
+        # definitive evidence against routing; "OK" is NOT definitive
+        # for it — SWIM death detection trails a crash by tens of
+        # seconds, so a just-died worker reads OK while its heartbeats
+        # have already stopped. Short-circuiting True on OK overrode
+        # the staleness/grace checks below and accepted work against
+        # down workers (measured: a power-cycled worker's job stranded
+        # to the AD-34 timeout because acceptance beat the reboot).
         if self._get_swim_status and worker.registration:
             addr = (
                 worker.registration.node.host,
                 worker.registration.node.udp_port or worker.registration.node.port,
             )
             swim_status = self._get_swim_status(addr)
-            if swim_status == "OK":
-                return True
             if swim_status in ("SUSPECT", "DEAD"):
                 return False
 

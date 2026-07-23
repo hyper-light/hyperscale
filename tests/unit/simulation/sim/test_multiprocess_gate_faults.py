@@ -43,13 +43,12 @@ skip-marked where the probes exposed gaps:
   never regress the observed status order.
 * long-horizon — 420 virtual seconds: kill inside live execution,
   partition + noise waves, then quiesce; the primary job completes;
-  the late client is ACCEPTED (the capacity axis of the gate overload
-  classifier no longer maps a saturated/zeroed capacity report to
-  UNHEALTHY) and ends in the loud AD-34 timeout — the completion
-  residual is the manager-tier worker-heartbeat starvation, its
-  aspirational skip-marked; and leadership HOLDS through the
-  kill+partition composite (post-heal re-admission restores quorum
-  before step-down matures — exactly one leader end to end).
+  the late client is ACCEPTED (gate BUSY!=UNHEALTHY overload config)
+  and its job COMPLETES at 316.24 (the manager-tier worker-heartbeat
+  starvation fell with the SWIM probe-cycle repairs — heartbeats
+  never stop, allocation never starves); leadership HOLDS through
+  the kill+partition composite (post-heal re-admission restores
+  quorum before step-down matures — exactly one leader end to end).
 * client restart — power-loss of the client (a leaf): the first job
   survives server-side, the successor generation is loud end to end
   and its fresh job COMPLETES (the second-job dispatch failure was
@@ -263,10 +262,16 @@ def test_kill_follower_gate_job_completes_and_leader_holds():
     assert flags == {_SUBMISSION_GATE: 0, _INITIAL_LEADER_GATE: 1}, flags
 
     # Membership truth: both survivors observed the death through
-    # production SWIM inside the witness-less design bound [25, 85]s
-    # after the kill (probed: ~70.0s and ~71.5s — the AD-30 max leg;
-    # see test_multiprocess_network_faults for the traced
-    # decomposition).
+    # production SWIM inside the EVIDENCE-ACCELERATED design bound
+    # [5, 30]s after the kill (probed: 11.5s on both survivors). The
+    # original pin sat on the witness-less max leg (~70s, bound
+    # [25, 85]) — but that slow leg was itself largely a BUG: direct
+    # probes and indirect-witness confirmations to one target clobbered
+    # each other's shared ack futures (pop-and-cancel in
+    # _probe_with_timeout), so witness evidence kept aborting and
+    # detection degraded to the no-witness maximum. With the shared/
+    # shielded ack futures, the two surviving gates witness for each
+    # other and the AD-30 accelerated leg applies.
     for surviving_gate in (_SUBMISSION_GATE, _INITIAL_LEADER_GATE):
         drop_times = [
             entry[2]
@@ -275,7 +280,7 @@ def test_kill_follower_gate_job_completes_and_leader_holds():
         ]
         assert drop_times, results[surviving_gate]
         detection_latency = drop_times[0] - _MID_EXECUTION_AT
-        assert 25.0 <= detection_latency <= 85.0, (
+        assert 5.0 <= detection_latency <= 30.0, (
             surviving_gate,
             detection_latency,
         )
@@ -563,26 +568,41 @@ def test_leader_total_isolation_majority_elects_and_islander_steps_down():
     )
     assert finish_time < 16.0, results["client"]
 
-    # Majority side: the new leader claims within the accelerated
-    # bound (probed t=20.5 — 10.5s after the cut; anything past +30
-    # means unreachable-leader acceleration regressed to the slow
-    # membership reap).
+    # Majority side: SOME majority gate claims leadership DURING the
+    # isolation within the accelerated bound (probed: gate-b at 20.5 —
+    # 10.5s after the cut; anything past +30 means unreachable-leader
+    # acceleration regressed to the slow membership reap). The FINAL
+    # holder may legitimately differ: when the healed islander returns,
+    # the reforming tier runs one reconciliation handoff (probed:
+    # gate-b steps down 102.5, gate-a claims 103.0 — strictly ordered,
+    # never overlapping), so the during-isolation claim and the final
+    # flag are asserted separately.
+    majority_claims_during_isolation = [
+        entry[2]
+        for gate_pid in (_FOLLOWER_GATE, _SUBMISSION_GATE)
+        for entry in results[gate_pid]
+        if entry[0] == "gate-leader" and entry[1] == 1 and entry[2] < 100.0
+    ]
+    assert majority_claims_during_isolation, results
+    assert 10.0 < min(majority_claims_during_isolation) <= 40.0, (
+        majority_claims_during_isolation
+    )
+
     majority_flags = _final_leader_flags(
         results, (_FOLLOWER_GATE, _SUBMISSION_GATE)
     )
     assert sum(majority_flags.values()) == 1, majority_flags
-    majority_winner = [
-        gate_pid for gate_pid, flag in majority_flags.items() if flag == 1
-    ][0]
-    claim_times = [
-        entry[2]
-        for entry in results[majority_winner]
-        if entry[0] == "gate-leader" and entry[1] == 1
-    ]
-    assert claim_times and 10.0 < claim_times[0] <= 40.0, (
-        majority_winner,
-        claim_times,
-    )
+
+    # Post-heal stability: whatever reconciliation the reforming tier
+    # ran, leadership must be QUIET once re-admission settles (probed:
+    # last transition at 103.0; re-admission completes 107.5-108.0).
+    for gate_pid in _GATE_PIDS:
+        late_leader_moves = [
+            entry
+            for entry in results[gate_pid]
+            if entry[0] == "gate-leader" and entry[2] > 110.0
+        ]
+        assert not late_leader_moves, (gate_pid, late_leader_moves)
 
     # The islanded ex-leader must NOT hold a leadership claim past
     # heal: it steps down as soon as connectivity returns (probed
@@ -928,16 +948,17 @@ def test_long_horizon_chaos_then_quiesce_holds_loud_invariants():
     )
     assert primary_finish < 16.0, results["client"]
 
-    # The post-quiesce client is ACCEPTED and LOUD: the first target
-    # (the killed gate) costs the silent 10s TCP timeout (no rejection
-    # milestone — cut targets fail silently, probed like the
-    # client-link-faults scenario), the next target accepts (probed
-    # t=310.12 at gate index 1), and the job ends in the explicit
-    # AD-34 global timeout (probed t=350.037 = submission + the 30s
-    # job budget + one tracker tick) because the RESIDUAL manager-tier
-    # gap (worker-heartbeat starvation -> allocation starves) blocks
-    # execution. Never silence, never a rejection stream, never a
-    # phantom completion — the worker provably never activates.
+    # The post-quiesce client COMPLETES — the full convergence
+    # invariant, live end to end: the first target (the killed gate)
+    # costs the silent 10s TCP timeout, the next target accepts
+    # (probed t=310.12 at gate index 1), dispatch reaches the worker,
+    # and the client observes ``completed`` at 316.24 (= acceptance +
+    # ~1s dispatch + workflow + push detour). Both halves of the old
+    # post-kill blinding are gone: the gate half (capacity->UNHEALTHY
+    # fast-reject) fell to the BUSY!=UNHEALTHY overload config, and
+    # the manager half (worker-heartbeat starvation -> allocation
+    # starves) fell to the SWIM probe-cycle repairs — the worker
+    # provably ACTIVATES for the late job.
     late_log = results["late-client"]
     assert not JobStatusOracle().check_client_log(late_log), late_log
     assert not [
@@ -961,13 +982,14 @@ def test_long_horizon_chaos_then_quiesce_holds_loud_invariants():
         entry for entry in late_log if entry[0] == "job-finished"
     ]
     assert len(late_finished) == 1, late_log
-    assert late_finished[0][1] == "timeout", late_log
-    late_terminal_earliest = late_submitted_time + _JOB_TIMEOUT
-    late_terminal_latest = late_terminal_earliest + 15.0 + 1.5
+    assert late_finished[0][1] == "completed", (
+        "the late job must COMPLETE (both blinding halves are fixed); "
+        f"a timeout here is a regression: {late_log}"
+    )
     assert (
-        late_terminal_earliest
-        <= late_finished[0][2]
-        <= late_terminal_latest
+        late_submitted_time
+        < late_finished[0][2]
+        <= late_submitted_time + 10.0
     ), late_log
     late_worker_activations = [
         entry
@@ -976,7 +998,10 @@ def test_long_horizon_chaos_then_quiesce_holds_loud_invariants():
         and entry[1] > 0
         and entry[2] > 300.0
     ]
-    assert not late_worker_activations, results["worker"]
+    assert late_worker_activations, (
+        "the late job completed so the worker must show its execution",
+        results["worker"],
+    )
 
     # Leadership tail — the composite CONVERGES: post-heal peer
     # re-admission (probed: both survivors back to each other at
@@ -996,12 +1021,20 @@ def test_long_horizon_chaos_then_quiesce_holds_loud_invariants():
         ]
         assert not late_leader_moves, (gate_pid, late_leader_moves)
 
-    # Membership tail: the survivors re-admit EACH OTHER after their
-    # partition heals (design bound: heal 60 + one 10s check tick +
-    # verification and jitter — probed 62.0 for both), while the
-    # KILLED gate is reaped on the witness-less bound and stays out
-    # (its readmission ping fails forever): both survivors end with
-    # exactly ONE active peer — each other.
+    # Membership tail. The KILLED gate is detected inside the
+    # evidence-accelerated bound and stays out (its readmission ping
+    # fails forever). The survivor pair rides its own partition wave
+    # [30, 60) with NO false deaths AT ALL: each survivor's direct
+    # probes to the other fail, but the indirect path through the
+    # MANAGER (a live common witness) confirms the peer alive —
+    # working witness confirmation is exactly what the shared/shielded
+    # ack-future repair restored (pre-repair, witness confirmations
+    # aborted on future clobbering, the pair mutually declared death
+    # during the cut, and re-admission had to heal it at ~62). Any
+    # transient false death under the NOISE wave must be undone by the
+    # re-admission watch within its design bound (10s check tick +
+    # TCP verify — observed: one blip at 113.0 healed at 115.0), and
+    # both survivors end with exactly ONE active peer — each other.
     for gate_pid in (_SUBMISSION_GATE, _INITIAL_LEADER_GATE):
         peer_entries = [
             entry
@@ -1009,41 +1042,81 @@ def test_long_horizon_chaos_then_quiesce_holds_loud_invariants():
             if entry[0] == "gate-peers"
         ]
         assert peer_entries[-1][1] == 1, (gate_pid, peer_entries)
-        readmission_increases = [
+
+        kill_detections = [
             entry
             for previous_entry, entry in zip(peer_entries, peer_entries[1:])
-            if entry[1] > previous_entry[1] and 60.0 < entry[2] <= 75.0
+            if entry[1] < previous_entry[1]
+            and _MID_EXECUTION_AT + 5.0 <= entry[2] <= _MID_EXECUTION_AT + 30.0
         ]
-        assert readmission_increases, (gate_pid, peer_entries)
+        assert kill_detections, (gate_pid, peer_entries)
+
+        # Every false death (partition-wave or noise-wave) heals inside
+        # the re-admission bound: a drop to zero peers is followed by a
+        # rise within max(heal, drop) + 12s (10s check tick + verify —
+        # probed: gate-c's wave-2 eviction at 37.5 re-admits at 62.5 =
+        # heal 60 + 2.5; the noise-wave blip at 113 re-admits at 115).
+        for index, entry in enumerate(peer_entries):
+            if entry[1] == 0 and entry[2] > 30.0:
+                recovery_deadline = max(60.0, entry[2]) + 12.0
+                recoveries = [
+                    later
+                    for later in peer_entries[index + 1 :]
+                    if later[1] >= 1 and later[2] <= recovery_deadline
+                ]
+                assert recoveries, (gate_pid, entry, peer_entries)
+
+    # AT MOST ONE survivor evicts the other during the partition wave
+    # — never both (mutual eviction was the old leaderless precursor).
+    # Mechanism asymmetry, pinned deliberately: a survivor holding TWO
+    # silent targets (the killed follower + the cut peer) crosses the
+    # AD-53 burst threshold, and the burst's candidate confirmation
+    # runs DIRECT-ONLY (no indirect-witness leg) — so gate-c evicts
+    # gate-b at 37.5 despite the live manager witness, while gate-b's
+    # ordinary probe path (one silent target, witness consulted via
+    # indirect probe) correctly holds gate-c alive. The re-admission
+    # watch repairs the one-sided eviction at heal+2.5. (Adding the
+    # indirect leg to AD-53 burst confirmation is a queued follow-up;
+    # this pin flips when it lands.)
+    survivors_with_wave_eviction = [
+        gate_pid
+        for gate_pid in (_SUBMISSION_GATE, _INITIAL_LEADER_GATE)
+        if any(
+            entry[1] == 0 and 30.0 <= entry[2] <= 60.0
+            for entry in results[gate_pid]
+            if entry[0] == "gate-peers"
+        )
+    ]
+    assert len(survivors_with_wave_eviction) <= 1, (
+        survivors_with_wave_eviction
+    )
 
 
 def test_long_horizon_chaos_is_replay_deterministic():
     assert _run_long_horizon_chaos_waves() == _run_long_horizon_chaos_waves()
 
 
-@pytest.mark.skip(reason="manager-tier worker-heartbeat starvation (traced): "
-                  "a gate kill leaves an unresolvable SUSPECT in the worker's "
-                  "SWIM tracker, its embedded heartbeats stop, WorkerPool "
-                  "liveness stales to an EVICT routing decision, and core "
-                  "allocation starves against an idle worker — the accepted "
-                  "late job times out instead of completing")
 def test_long_horizon_late_job_completes_after_quiesce():
-    """ASPIRATIONAL: a job submitted long after the chaos quiesces
-    should COMPLETE through the surviving tier. The ACCEPTANCE half is
-    fixed (the capacity axis of the gate overload classifier no longer
-    maps zero available cores to UNHEALTHY, so the late submission is
-    accepted at t=310.12 — pinned in the primary long-horizon test);
-    the accepted job still ends in the loud AD-34 ``timeout`` at
-    t=350.037 because the manager's WorkerPool holds the (idle,
-    healthy) worker at routing decision EVICT: the worker's
-    SWIM-embedded heartbeats — its only heartbeat carrier — stop
-    arriving whenever its incarnation tracker holds an unresolvable
-    SUSPECT for the killed gate (probed: last heartbeat processed
-    t=103.1, permanent starvation after), and stale liveness maps to
-    EVICT. Fixing that requires worker/manager-tier changes (heartbeat
-    carrier or liveness semantics), outside the gate tier."""
-    raise AssertionError("requires the worker/manager-tier heartbeat "
-                         "starvation fix")
+    """FIXED-BUG PIN (both halves of the post-kill blinding): a job
+    submitted long after the chaos quiesces COMPLETES through the
+    surviving tier. Half one — acceptance — fell to the gate-side
+    BUSY!=UNHEALTHY overload config (accepted t=310.12). Half two —
+    execution — was the manager-tier worker-heartbeat starvation: the
+    heartbeat carrier died with the node's SWIM probe cycle (a stray
+    ack-future cancellation read as shutdown), WorkerPool liveness
+    staled to EVICT, and allocation starved an idle healthy worker to
+    the loud AD-34 timeout at 350.037. With the probe cycle immortal
+    (shared+shielded ack futures; genuine-cancel discrimination) the
+    heartbeats never stop and the late job runs to ``completed`` at
+    316.24 — asserted with its execution evidence in the primary
+    long-horizon test; this test pins the end-to-end claim."""
+    results = _run_long_horizon_chaos_waves()
+    late_log = results["late-client"]
+    late_finished = [
+        entry for entry in late_log if entry[0] == "job-finished"
+    ]
+    assert len(late_finished) == 1, late_log
+    assert late_finished[0][1] == "completed", late_log
 
 
 def test_long_horizon_survivors_reelect_exactly_one_leader():

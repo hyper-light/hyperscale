@@ -181,25 +181,39 @@ def _run_fresh_job_after_worker_restart() -> dict:
 
 
 def test_job_submitted_after_worker_reboot_completes_on_new_pool():
-    """The rebooted worker generation must re-register and serve: the
-    client's retrying submission is only accepted once gen-2's
-    capacity is registered (strictly after the reboot instant), and
-    the job runs to completion on the RESPAWNED executor pool."""
+    """The rebooted worker generation must re-register and serve: a job
+    accepted AROUND the power cycle completes on the RESPAWNED pool.
+
+    Probed mechanism (post stale-pool-entry eviction + registry-miss
+    purge): the manager may legitimately ACCEPT while the worker is
+    still down — leader election completes ~9.2 and the sub-detection
+    gen-1 registration satisfies the capacity fence — because the
+    dispatch retry ladder carries the job across the reboot: attempt 1
+    (~9.2, down worker) burns its 5s send timeout, gen-2 re-registers
+    ~13.6 EVICTING gen-1's same-addr pool entry, and attempt 2 lands on
+    gen-2 (probed completion 14.67). Acceptance is therefore bounded by
+    the election, not the reboot; the load-bearing invariants are
+    prompt post-reboot completion and gen-2-only execution. (The
+    pre-fix pin asserted acceptance strictly after the reboot at
+    14.193 — an artifact of the JobAck serializing behind attempt 1's
+    5s send timeout on the shared TCP semaphore, not a capacity gate.)
+    """
     results = _run_fresh_job_after_worker_restart()
     client_log = results["client"]
 
-    # Acceptance strictly after the reboot: the manager held the
-    # (stale) gen-1 registration through the sub-detection down window,
-    # but leader election (~9.2) plus gen-2 re-registration gate the
-    # accept — probed 14.193062.
+    # Accepted once the manager is leader (~9.2) — never before, and
+    # never past the reboot + re-registration + one retry rung.
     submitted_time = _submitted_at(client_log)
-    assert _FRESH_REBOOT < submitted_time < _FRESH_REBOOT + 5.0, client_log
+    assert 9.0 < submitted_time < _FRESH_REBOOT + 5.0, client_log
 
     (_tag, final_status, finished_time) = _finished(client_log)
     assert final_status == "completed", client_log
-    assert submitted_time < finished_time < submitted_time + 5.0, (
-        "post-reboot completion must be prompt (measured 14.773062, "
-        f"+0.58 after acceptance): {client_log}"
+    # Completion promptly after gen-2 re-registration (~13.6): the
+    # retry ladder's next attempt + dispatch + 2s workflow + push
+    # (probed 14.67).
+    assert _FRESH_REBOOT < finished_time < _FRESH_REBOOT + 6.0, (
+        "post-reboot completion must be prompt (probed 14.67): "
+        f"{client_log}"
     )
 
     # The workflow ran on the REBOOTED generation, and only there.

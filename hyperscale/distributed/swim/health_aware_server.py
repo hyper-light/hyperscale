@@ -3741,7 +3741,26 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             try:
                 await self._run_probe_round()
             except asyncio.CancelledError:
-                break
+                # Exit ONLY on a genuine task cancellation (shutdown) —
+                # discriminated by the task's own cancelling count and
+                # the running flags. A CancelledError can also surface
+                # from a cancelled INNER awaitable (historically: a
+                # concurrent probe clobbering this round's shared ack
+                # future); treating that as shutdown silently killed
+                # the node's entire failure detector for the rest of
+                # its life. The probe cycle is the SWIM heartbeat of
+                # the node — it dies only when the node does.
+                current_task = asyncio.current_task()
+                genuinely_cancelled = (
+                    current_task is not None and current_task.cancelling() > 0
+                )
+                if (
+                    genuinely_cancelled
+                    or not self._running
+                    or not self._probe_scheduler._running
+                ):
+                    break
+                self._metrics.increment("probe_cycle_spurious_cancel")
             except Exception as e:
                 await self.handle_exception(e, "probe_cycle")
             await self._clock.sleep(protocol_period)
@@ -4215,16 +4234,26 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 break
 
             try:
-                # Cancel any stale pending probe to the same target, then
-                # install a fresh future for this attempt.
-                existing_future = self._pending_probe_acks.pop(target, None)
-                if existing_future and not existing_future.done():
-                    existing_future.cancel()
-
-                ack_future: asyncio.Future[bool] = (
-                    asyncio.get_event_loop().create_future()
-                )
-                self._pending_probe_acks[target] = ack_future
+                # SHARE any live pending future for this target instead
+                # of cancelling it. Concurrent probes to one target are
+                # legal (the AD-53 burst-confirmation batch races the
+                # main probe cycle on exactly the targets that are
+                # failing), and an ACK from the target proves liveness
+                # for every concurrent waiter identically. The previous
+                # pop-and-cancel here injected CancelledError into the
+                # OTHER waiter's ``wait_for`` — and the main probe
+                # cycle's shutdown handling read that stray cancel as
+                # "the server is stopping" and exited PERMANENTLY: the
+                # node silently lost its whole failure detector (and,
+                # on managers, the worker-heartbeat carrier), starving
+                # dispatch forever after (measured live: every long
+                # soak horizon lost SWIM at the first burst window).
+                existing_future = self._pending_probe_acks.get(target)
+                if existing_future is not None and not existing_future.done():
+                    ack_future: asyncio.Future[bool] = existing_future
+                else:
+                    ack_future = asyncio.get_event_loop().create_future()
+                    self._pending_probe_acks[target] = ack_future
                 self._pending_probe_start[target] = self._clock.monotonic()
                 request_id = self._build_direct_probe_request_id()
                 self._pending_probe_request_ids[target] = request_id
@@ -4237,15 +4266,37 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     break
 
                 try:
-                    await self._clock.wait_for(ack_future, timeout=attempt_window)
+                    # SHIELDED: ``wait_for`` cancels its inner awaitable
+                    # on timeout (and on waiter-task cancellation) — on
+                    # a SHARED ack future that cancellation would erupt
+                    # as CancelledError inside every OTHER concurrent
+                    # waiter's wait, aborting their probe rounds before
+                    # the failure path (indirect probe -> suspicion)
+                    # could run: death detection silently stopped
+                    # converging whenever the burst batch raced the
+                    # main cycle. The shield lets each waiter time out
+                    # independently while the future survives for the
+                    # rest.
+                    await self._clock.wait_for(
+                        asyncio.shield(ack_future), timeout=attempt_window
+                    )
                     self._metrics.increment("probes_received")
                     return True
                 except asyncio.TimeoutError:
                     pass
                 finally:
-                    self._pending_probe_acks.pop(target, None)
-                    self._pending_probe_start.pop(target, None)
-                    self._pending_probe_request_ids.pop(target, None)
+                    # Clean up only OUR OWN registration, and only once
+                    # the future is DONE: a still-pending shared future
+                    # has live waiters whose ACK must stay findable by
+                    # the ack handler (the next attempt reuses it, so
+                    # an orphaned pending entry self-heals).
+                    if (
+                        self._pending_probe_acks.get(target) is ack_future
+                        and ack_future.done()
+                    ):
+                        self._pending_probe_acks.pop(target, None)
+                        self._pending_probe_start.pop(target, None)
+                        self._pending_probe_request_ids.pop(target, None)
 
             except asyncio.CancelledError:
                 self._pending_probe_acks.pop(target, None)

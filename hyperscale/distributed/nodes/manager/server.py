@@ -4057,11 +4057,27 @@ class ManagerServer(HealthAwareServer):
     # Helper Methods
     # =========================================================================
 
-    def _get_swim_status_for_worker(self, worker_id: str) -> str:
-        """Get SWIM status for a worker."""
-        if self._manager_state.has_worker_unhealthy_since(worker_id):
-            return "unhealthy"
-        return "healthy"
+    def _get_swim_status_for_worker(
+        self, worker_udp_addr: tuple[str, int]
+    ) -> str | None:
+        """SWIM membership status for a worker, by UDP address.
+
+        The ``WorkerPool`` health check consults this with the worker's
+        UDP address and expects the SWIM tracker vocabulary
+        ("OK"/"SUSPECT"/"DEAD") — the previous implementation took a
+        worker_id string and returned "healthy"/"unhealthy", so the
+        pool's SWIM branch compared a tuple-keyed lookup's fallback
+        against words that could never match: dead code, and the pool
+        fell through to heartbeat staleness alone. Returns None for
+        nodes SWIM has no state for (never probed/confirmed), letting
+        the pool fall through to its explicit-health and grace-period
+        checks exactly as before.
+        """
+        node_state = self._incarnation_tracker.get_node_state(worker_udp_addr)
+        if node_state is None:
+            return None
+        status = node_state.status
+        return status.decode() if isinstance(status, bytes) else str(status)
 
     def _get_active_workflow_count(self) -> int:
         """Get count of active workflows."""
@@ -6007,9 +6023,19 @@ class ManagerServer(HealthAwareServer):
         """
         registration = self._registry.get_worker(worker_id)
         if registration is None:
+            # Self-healing chokepoint: the allocator handed us a worker
+            # the registry does not know — by definition a STALE pool
+            # entry (the registry is the registration truth). Purge it
+            # so the retry loop cannot re-select it; without this the
+            # stale pick repeated every attempt and the job stranded.
+            if await self._worker_pool.deregister_worker(worker_id):
+                await self._worker_pool.notify_cores_available()
             await self._udp_logger.log(
                 ServerWarning(
-                    message=f"Workflow dispatch: unknown worker {worker_id[:8]}...",
+                    message=(
+                        f"Workflow dispatch: unknown worker {worker_id[:8]}"
+                        "... — purged stale pool entry"
+                    ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
