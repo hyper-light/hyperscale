@@ -348,6 +348,27 @@ class WorkerState:
         self._workflow_start_times[workflow_id] = now
         self._workflow_timeout_seconds[workflow_id] = timeout_seconds
 
+    def extend_workflow_timeout(
+        self, workflow_id: str, extension_seconds: float
+    ) -> bool:
+        """Stretch an active workflow's LOCAL deadline by a granted
+        AD-26 extension.
+
+        The stuck-workflow enforcement loop compares elapsed against
+        ``_workflow_timeout_seconds`` — the dispatch-time value. A
+        manager-granted extension that stretches the job's AD-34
+        budget but not this local deadline leaves the worker
+        enforcing the UN-extended number and hard-cancelling the very
+        workflow the manager just granted more time (measured: grant
+        +30s at 15.5, local enforcement killed the workflow at
+        dispatch + the base 20s anyway). Returns False when the
+        workflow is no longer tracked (already drained — best-effort).
+        """
+        if workflow_id not in self._workflow_timeout_seconds:
+            return False
+        self._workflow_timeout_seconds[workflow_id] += extension_seconds
+        return True
+
     def get_workflow_timeout(self, workflow_id: str) -> float | None:
         """Return the per-workflow timeout in seconds, or None if not set.
 

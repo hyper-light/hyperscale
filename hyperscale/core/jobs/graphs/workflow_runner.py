@@ -175,9 +175,67 @@ class WorkflowRunner:
         to stop yielding new VUs. Already-spawned tasks complete normally, and the
         standard cleanup path runs without throwing exceptions.
 
+        NOTE: only the duration-governed (TEST) execution path consults
+        this flag. ACTION workflows run their step DAG with plain awaits
+        and finish at natural length regardless — the graceful phase of
+        cancellation is a no-op for them. ``hard_cancel`` is the
+        escalation that actually stops in-flight execution when the
+        graceful window expires.
+
         Thread-safe: GIL ensures atomic bool write.
         """
         self._running = False
+
+    def hard_cancel(self, run_id: int, workflow_name: str) -> bool:
+        """
+        Hard-stop a running workflow after its graceful window expired.
+
+        Cancels the run task (CancelledError propagates to whoever is
+        awaiting the run — the worker's executor already maps it to the
+        CANCELLED terminal), cancels every pending VU task, clears the
+        pacing state (the ``replace`` duplicate-policy cleanup, which
+        this mirrors), and — because the completion events are normally
+        set only at the END of natural execution — sets ``_is_cancelled``
+        and ``_is_stopped`` directly so ``await_cancellation`` observers
+        converge instead of waiting on an execution that will never
+        finish. Idempotent; returns True when a live run task was
+        actually cancelled.
+
+        Without this escalation, "cancelling" an ACTION workflow meant
+        waiting for it to complete: a hard-timed-out 100s workflow kept
+        its cores busy for the full 100s (measured: 55.5 virtual seconds
+        of zombie execution past the client's timeout terminal, with the
+        manager re-cancelling on a ~6s cadence the whole way).
+        """
+        self._running = False
+
+        cancelled_live_task = False
+        run_task = self._run_tasks.get(run_id, {}).get(workflow_name)
+        if run_task is not None and not run_task.done():
+            run_task.cancel()
+            cancelled_live_task = True
+
+        for pending_task in self._pending.get(run_id, {}).get(workflow_name, []):
+            cancel_and_release_task(pending_task)
+        if self._pending.get(run_id, {}).get(workflow_name):
+            self._pending[run_id][workflow_name].clear()
+
+        if run_id in self._active and workflow_name in self._active[run_id]:
+            self._active[run_id][workflow_name] = 0
+        if self._active_waiters.get(run_id, {}).get(workflow_name):
+            waiter = self._active_waiters[run_id][workflow_name]
+            if waiter is not None and not waiter.done():
+                waiter.cancel()
+            del self._active_waiters[run_id][workflow_name]
+        if self._running_workflows.get(run_id, {}).get(workflow_name):
+            del self._running_workflows[run_id][workflow_name]
+
+        if not self._is_stopped.is_set():
+            self._is_stopped.set()
+        if not self._is_cancelled.is_set():
+            self._is_cancelled.set()
+
+        return cancelled_live_task
 
     async def await_stop(self) -> None:
         return await self._is_stopped.wait()

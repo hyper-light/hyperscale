@@ -9,6 +9,7 @@ StatusString = Literal[
     "PENDING",
     "FAILED",
     "REJECTED",
+    "CANCELLED",
     "UNKNOWN",
     "QUEUED",
 ]
@@ -23,6 +24,10 @@ class WorkflowStatus(Enum):
     PENDING = "PENDING"
     FAILED = "FAILED"
     REJECTED = "REJECTED"
+    # Terminal outcome of a hard-cancelled run: the graceful window
+    # expired and the executor stopped in-flight work (distinct from
+    # FAILED — the workflow did not err, it was stopped by decision).
+    CANCELLED = "CANCELLED"
     UNKNOWN = "UNKNOWN"
 
     @classmethod
@@ -35,6 +40,7 @@ class WorkflowStatus(Enum):
             "PENDING": WorkflowStatus.PENDING,
             "FAILED": WorkflowStatus.FAILED,
             "REJECTED": WorkflowStatus.REJECTED,
+            "CANCELLED": WorkflowStatus.CANCELLED,
             "UNKNOWN": WorkflowStatus.UNKNOWN,
             "QUEUED": WorkflowStatus.QUEUED,
         }

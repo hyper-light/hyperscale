@@ -2385,6 +2385,20 @@ class WorkerServer(HealthAwareServer):
             )
             return b"error"
 
+        # A GRANT must stretch the workflow's LOCAL deadline too: the
+        # stuck-workflow enforcement loop compares elapsed against the
+        # dispatch-time timeout, and without this the worker
+        # hard-cancels the very workflow the manager just granted more
+        # time (the extension only stretched the manager-side AD-34
+        # budget). The latched workflow id names the workflow the
+        # request was for; best-effort if it already drained.
+        if response.granted and response.extension_seconds > 0:
+            granted_workflow_id = self._worker_state._extension_workflow_id
+            if granted_workflow_id:
+                self._worker_state.extend_workflow_timeout(
+                    granted_workflow_id, response.extension_seconds
+                )
+
         self.clear_extension_request()
         if self._event_logger is not None:
             self._task_runner.run(

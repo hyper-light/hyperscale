@@ -1324,6 +1324,29 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     ),
                     run_id,
                 )
+            except asyncio.CancelledError:
+                # Hard cancellation (the graceful window expired and
+                # ``hard_cancel`` cancelled the run task). The consumer
+                # waiting on ``push_results`` — the worker's
+                # execute_workflow — MUST still receive a terminal, or
+                # the workflow stays in its active set forever (the
+                # first hard-cancel iteration replaced zombie execution
+                # with a silent hang: cores freed, workflow never
+                # drained, client stats never settled). Report the
+                # CANCELLED terminal with the pre-run context, then
+                # re-raise to finish dying.
+                await self.push_results(
+                    node_id,
+                    WorkflowResults(
+                        job.workflow.name,
+                        None,
+                        job.context,
+                        None,
+                        WorkflowStatus.CANCELLED,
+                    ),
+                    run_id,
+                )
+                raise
             except Exception as err:
                 await ctx.log_prepared(
                     message=f"Workflow {job.workflow.name} run {run_id} failed with error: {err}",
@@ -1358,10 +1381,28 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         try:
 
             self._workflows.request_cancellation()
-            await asyncio.wait_for(
-                self._workflows.await_cancellation(),
-                timeout=timeout,
-            )
+            try:
+                await asyncio.wait_for(
+                    self._workflows.await_cancellation(),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                # The graceful window expired — for ACTION workflows the
+                # graceful flag is a no-op (only the TEST VU generators
+                # consult it), so without escalation "cancel" meant
+                # waiting out the workflow's natural length while its
+                # cores stayed busy. Hard-stop the run and wait briefly
+                # for the runner's forced convergence (hard_cancel sets
+                # the completion events itself, so this second wait is
+                # bounded by event delivery, not by execution). The
+                # runner keys its run state by the ORIGINAL run_id
+                # (``workflow_run_id`` is the taskex task id used for
+                # background-task bookkeeping, not a runner key).
+                self._workflows.hard_cancel(run_id, workflow_name)
+                await asyncio.wait_for(
+                    self._workflows.await_cancellation(),
+                    timeout=5.0,
+                )
 
             await self.send(
                 "receive_cancellation_update",

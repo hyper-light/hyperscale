@@ -162,9 +162,17 @@ class WorkerCancellationHandler:
         if workflow_name and self._remote_manager:
             run_id = hash(workflow_id) % (2**31)
             try:
+                # Graceful window "2s": by the time the worker cancels,
+                # the decision is already made (job timeout, eviction,
+                # explicit cancel) — a long graceful phase just extends
+                # zombie execution, and the executor's hard-stop
+                # escalation fires when this window expires. Must sit
+                # inside the 5s terminal-report wait below, or every
+                # cancel looks timed-out even when it worked.
                 await self._remote_manager.cancel_workflow(
                     run_id,
                     workflow_name,
+                    timeout="2s",
                 )
                 (
                     success,
