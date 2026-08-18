@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 from collections import deque
 from typing import Callable, Any
 
+from hyperscale.distributed.protocol.time_quantum import (
+    TIME_REMAINDER_EPSILON_SECONDS,
+)
 from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
@@ -335,13 +338,26 @@ class FlappingDetector:
         if not self._is_flapping:
             return (False, 0.0)
         
-        # Check time since last detection
+        # Check time since last detection. The cooldown remainder is a
+        # COMPOSED float (``cooldown - (now - last_detection)`` on a
+        # quantized clock), so it can be a positive sub-quantum artifact
+        # (observed live: 1.64e-11s at frozen virtual instant
+        # 39.376650491999996 — the chaos-suite gate-a livelock) even
+        # though the cooldown has semantically elapsed. Returning that
+        # artifact as a delay makes the election loop wait on a timer
+        # the quantized clock cannot honor: the wait expires at the SAME
+        # instant, this predicate re-evaluates the same remainder, and
+        # the loop spins forever — a hard livelock under deterministic
+        # simulation and a 100%-CPU micro-spin on a real host. The
+        # epsilon-expiry contract (``protocol/time_quantum.py``) applies:
+        # a remainder at or below the epsilon IS expiry.
         now = _DEFAULT_CLOCK.monotonic()
         time_since_detection = now - self._last_detection_time
-        
-        if time_since_detection < self._current_cooldown:
-            return (True, self._current_cooldown - time_since_detection)
-        
+        remaining_cooldown = self._current_cooldown - time_since_detection
+
+        if remaining_cooldown > TIME_REMAINDER_EPSILON_SECONDS:
+            return (True, remaining_cooldown)
+
         return (False, 0.0)
     
     def reset(self) -> None:

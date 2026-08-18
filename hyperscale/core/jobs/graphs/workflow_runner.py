@@ -1093,7 +1093,21 @@ class WorkflowRunner:
                 timeout=remaining,
             )
 
+            # STEP-NAME order everywhere downstream: ``asyncio.wait``
+            # returns id()-hashed SETS, and both the results list
+            # (serialized per-step result mapping — insertion order is
+            # wire bytes) and the per-step context dict are built by
+            # iterating them. Address order permutes across runs
+            # whenever one wait window completes >=2 steps (the chaos
+            # VOPR's replay-divergence flake); task names are the hook
+            # names — unique per set — so they are a total order.
             completed, pending = tasks
+            completed = sorted(
+                completed, key=lambda done_task: done_task.get_name()
+            )
+            pending = sorted(
+                pending, key=lambda pending_task: pending_task.get_name()
+            )
             results.extend(completed)
 
             for complete in completed:

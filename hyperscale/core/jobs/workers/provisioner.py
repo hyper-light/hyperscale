@@ -62,9 +62,16 @@ class Provisioner:
 
         Returns a list of node IDs that can be used. Does NOT mark them
         as unavailable - call allocate_nodes() to actually reserve them.
+
+        SORTED selection: this is the worker-selection primitive, and a
+        bare ``list(set)[:count]`` slices in the set's content-hash
+        order — which permutes whenever the id population changes (a
+        late-join replacement worker) and, before node ids were made
+        address-derived, permuted per RUN. Sorting makes which shard
+        runs which workflow a pure function of the registered
+        population.
         """
-        available_list = list(self._available_nodes)
-        return available_list[:count]
+        return sorted(self._available_nodes)[:count]
 
     def allocate_nodes(self, node_ids: List[int]) -> List[int]:
         """

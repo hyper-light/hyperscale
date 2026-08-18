@@ -1,6 +1,21 @@
 import asyncio
 import inspect
 import time
+
+# Runtime-default monotonic source — the SIM seam rebinding point
+# (contract of hyperscale.core.jobs.tasks.run). THE decisive reading is
+# _wait_for_workflow_completion's workflow-timeout ledger: it measured
+# the timeout in REAL seconds while polling on the (virtual) loop, so a
+# stuck workflow's execute_workflow returned after `timeout` WALL
+# seconds — at a host-speed-dependent VIRTUAL instant. That single
+# reading was the chaos VOPR's final replay-divergence mechanism (the
+# L2 zombie-drain fork, seeds 36/40/66: identical runs to the half-
+# millisecond for 550+ virtual seconds, then the drain landing 28-33
+# virtual seconds apart purely on wall speed). The workflow-timer
+# telemetry reads share the seam so elapsed values are deterministic
+# too. REAL mode keeps realtime.
+_DEFAULT_MONOTONIC_SOURCE = time.monotonic
+
 from collections import defaultdict, deque
 from typing import (
     Any,
@@ -540,8 +555,17 @@ class RemoteGraphManager:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
-                # Process completed tasks
-                for task in done:
+                # Process completed tasks in WORKFLOW-NAME order:
+                # ``done`` is a set of Task objects hashed by id(), so
+                # when >=2 workflows complete in one wake (a pause
+                # thaw, a delay-window flush, a worker kill timing out
+                # several at once) bare set iteration processes them in
+                # address order — permuting result/log/ready-signal
+                # ordering across otherwise identical runs (the chaos
+                # VOPR's replay-divergence flake).
+                for task in sorted(
+                    done, key=lambda done_task: running_tasks[done_task]
+                ):
                     workflow_name = running_tasks.pop(task)
                     pending = pending_workflows[workflow_name]
 
@@ -1009,7 +1033,7 @@ class RemoteGraphManager:
                     name="trace",
                 )
 
-                self._workflow_timers[workflow.name] = time.monotonic()
+                self._workflow_timers[workflow.name] = _DEFAULT_MONOTONIC_SOURCE()
 
                 # Register for event-driven completion tracking
                 completion_state = self._controller.register_workflow_completion(
@@ -1289,11 +1313,23 @@ class RemoteGraphManager:
         """
 
         timeout_error: Exception | None = None
-        start_time = time.monotonic()
+        start_time = _DEFAULT_MONOTONIC_SOURCE()
 
         while not completion_state.completion_event.is_set():
-            remaining_timeout = timeout - (time.monotonic() - start_time)
-            if remaining_timeout <= 0:
+            remaining_timeout = timeout - (_DEFAULT_MONOTONIC_SOURCE() - start_time)
+            # Epsilon expiry + progress floor (the frozen-instant
+            # contract; hyperscale.distributed.protocol.time_quantum
+            # documents the class — this is the core tier, which cannot
+            # import it, so the constant is local). The remainder is a
+            # COMPOSED float: at the timeout boundary it can be a
+            # positive sub-quantum artifact, and arming wait_for with
+            # min(poll, artifact) re-fires at the SAME quantized
+            # instant — this loop then spins forever (measured: the
+            # chaos VOPR's seed-40 worker at virtual 171.681, 500001
+            # same-instant wakeups). Sub-epsilon remainders ARE the
+            # timeout; real waits are floored at 1ms so the clock
+            # always advances.
+            if remaining_timeout <= 1e-6:
                 timeout_error = asyncio.TimeoutError(
                     f"Workflow {workflow_name} exceeded timeout of {timeout} seconds"
                 )
@@ -1303,7 +1339,10 @@ class RemoteGraphManager:
             try:
                 await asyncio.wait_for(
                     completion_state.completion_event.wait(),
-                    timeout=min(self._status_update_poll_interval, remaining_timeout),
+                    timeout=max(
+                        min(self._status_update_poll_interval, remaining_timeout),
+                        0.001,
+                    ),
                 )
             except asyncio.TimeoutError:
                 pass  # Expected - just check for status updates
@@ -1356,7 +1395,7 @@ class RemoteGraphManager:
                 break
 
             # Update UI with stats
-            elapsed = time.monotonic() - self._workflow_timers.get(workflow_name, time.monotonic())
+            elapsed = _DEFAULT_MONOTONIC_SOURCE() - self._workflow_timers.get(workflow_name, _DEFAULT_MONOTONIC_SOURCE())
             completed_count = update.completed_count
 
             await asyncio.gather(
@@ -1376,10 +1415,10 @@ class RemoteGraphManager:
             )
 
             if self._workflow_last_elapsed.get(workflow_name) is None:
-                self._workflow_last_elapsed[workflow_name] = time.monotonic()
+                self._workflow_last_elapsed[workflow_name] = _DEFAULT_MONOTONIC_SOURCE()
 
             last_sampled = (
-                time.monotonic() - self._workflow_last_elapsed[workflow_name]
+                _DEFAULT_MONOTONIC_SOURCE() - self._workflow_last_elapsed[workflow_name]
             )
 
             if last_sampled > 1:
@@ -1395,7 +1434,7 @@ class RemoteGraphManager:
                     workflow_slug, update.step_stats
                 )
 
-                self._workflow_last_elapsed[workflow_name] = time.monotonic()
+                self._workflow_last_elapsed[workflow_name] = _DEFAULT_MONOTONIC_SOURCE()
 
             # Store update for external consumers
             self._graph_updates[run_id][workflow_name].put_nowait(update)

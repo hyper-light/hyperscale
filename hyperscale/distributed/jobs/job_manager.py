@@ -1061,7 +1061,7 @@ class JobManager:
                 JobManagerError(
                     message=(
                         "[record_sub_workflow_result] FAILED: job not found "
-                        f"for token={token_str}, JobManager id={id(self)}, "
+                        f"for token={token_str}, manager={self._manager_id}, "
                         "_sub_workflow_to_job keys="
                         f"{list(self._sub_workflow_to_job.keys())[:10]}..."
                     ),

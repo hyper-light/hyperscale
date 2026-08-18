@@ -112,6 +112,9 @@ from .message_handling import (
 
 # Protocol version for SWIM (AD-25)
 # Used to detect incompatible nodes during join
+from hyperscale.distributed.protocol.time_quantum import (
+    TIME_REMAINDER_EPSILON_SECONDS,
+)
 from hyperscale.distributed.protocol.version import CURRENT_PROTOCOL_VERSION
 
 # SWIM protocol version prefix (included in join messages)
@@ -4230,7 +4233,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 return False
 
             remaining = deadline - self._clock.monotonic()
-            if remaining <= 0:
+            # Epsilon expiry (protocol.time_quantum): a positive
+            # SUB-QUANTUM remainder is the deadline, not a wait — a
+            # wait_for armed on it fires via call_soon at the SAME
+            # quantized instant (the clock never advances), and this
+            # retry loop then spins forever at one frozen instant
+            # (measured: the chaos suite's seed-5 L3 run flooded the
+            # queue with Timeout._on_timeout at virtual 39.38).
+            if remaining <= TIME_REMAINDER_EPSILON_SECONDS:
                 break
 
             try:
@@ -4262,7 +4272,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 await self.send(target, message, timeout=timeout)
 
                 attempt_window = min(timeout, deadline - self._clock.monotonic())
-                if attempt_window <= 0:
+                # Same epsilon contract as the loop head: never arm a
+                # wait the clock cannot honor.
+                if attempt_window <= TIME_REMAINDER_EPSILON_SECONDS:
                     break
 
                 try:

@@ -3,6 +3,19 @@ from time import time
 from .constants import MAX_INSTANCE, MAX_SEQ
 from .snowflake import Snowflake
 
+# Runtime-default time source (seconds, ``time.time`` semantics) — the
+# SIM seam rebinding point, mirror of the hook in
+# ``hyperscale/logging/snowflake``. This class mints the executor
+# protocols' shard ids, whose PARSED timestamps drive LWW context
+# ordering at the receive sites — with wall readings, the relative
+# order of two children's same-window updates flipped with host
+# scheduling (the chaos VOPR's residual 5/100 twin forks after the
+# instance component was made address-derived). Under SIM the swap
+# machinery rebinds this to the virtual clock's wall model; REAL mode
+# keeps the realtime default, and the never-regress cursor absorbs
+# backwards steps from either source.
+_DEFAULT_TIME_SOURCE = time
+
 
 class SnowflakeGenerator:
     """Snowflake id generator: total and monotone.
@@ -28,7 +41,7 @@ class SnowflakeGenerator:
         seq: int = 0,
         timestamp: int | None = None,
     ):
-        current = int(time() * 1000)
+        current = int(_DEFAULT_TIME_SOURCE() * 1000)
 
         timestamp = timestamp or current
 
@@ -46,7 +59,7 @@ class SnowflakeGenerator:
         return self
 
     def generate(self) -> int:
-        current = int(time() * 1000)
+        current = int(_DEFAULT_TIME_SOURCE() * 1000)
 
         # Never regress: a backwards realtime step reuses the latest
         # cursor so ids stay unique and ordered.

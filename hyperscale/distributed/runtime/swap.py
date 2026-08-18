@@ -96,7 +96,24 @@ from .random_source import Random
 # package that cannot import from ``hyperscale.distributed``), and its
 # module-level ``_DEFAULT_FILESYSTEM`` must be swappable exactly like
 # the distributed-side singletons.
-_PRODUCTION_PREFIXES = ("hyperscale.distributed", "hyperscale.logging")
+_PRODUCTION_PREFIXES = (
+    "hyperscale.distributed",
+    "hyperscale.logging",
+    # Narrow core inclusions: the executor-protocol snowflake generator
+    # and the replay guard that validates its timestamps — minting and
+    # freshness-judging MUST follow the same clock axis under SIM (see
+    # each hook's docstring). Deliberately NOT all of hyperscale.core.
+    "hyperscale.core.snowflake",
+    "hyperscale.core.jobs.protocols",
+    # The core TaskRunner's age-based cleanup and Run bookkeeping —
+    # its _DEFAULT_MONOTONIC_SOURCE must follow the clock's monotonic
+    # axis or max_age cleanup fires on REAL wall age at nondeterministic
+    # virtual instants (see run.py's hook docstring).
+    "hyperscale.core.jobs.tasks",
+    # The executor graph manager's workflow-timeout ledger (see its
+    # hook docstring — the final chaos-VOPR divergence mechanism).
+    "hyperscale.core.jobs.graphs",
+)
 
 
 class _ModuleDefaults(NamedTuple):
@@ -107,6 +124,8 @@ class _ModuleDefaults(NamedTuple):
     random_source: Random | None
     filesystem: Filesystem | None
     system_resources: SystemResources | None
+    time_source: object | None = None
+    monotonic_source: object | None = None
 
 
 def _iter_production_modules() -> list[tuple[str, object]]:
@@ -154,6 +173,16 @@ def swap_defaults(
         if clock is not None and hasattr(mod, "_DEFAULT_CLOCK"):
             setattr(mod, "_DEFAULT_CLOCK", clock)
             rebound = True
+        if clock is not None and hasattr(mod, "_DEFAULT_TIME_SOURCE"):
+            # Snowflake-style wall readings follow the clock axis: the
+            # virtual clock's ``time`` models the wall (including the
+            # skew knob), and the realtime default stays untouched in
+            # REAL mode.
+            setattr(mod, "_DEFAULT_TIME_SOURCE", clock.time)
+            rebound = True
+        if clock is not None and hasattr(mod, "_DEFAULT_MONOTONIC_SOURCE"):
+            setattr(mod, "_DEFAULT_MONOTONIC_SOURCE", clock.monotonic)
+            rebound = True
         if random_source is not None and hasattr(mod, "_DEFAULT_RANDOM"):
             setattr(mod, "_DEFAULT_RANDOM", random_source)
             rebound = True
@@ -187,12 +216,16 @@ def snapshot_defaults() -> list[_ModuleDefaults]:
             random_source=getattr(mod, "_DEFAULT_RANDOM", None),
             filesystem=getattr(mod, "_DEFAULT_FILESYSTEM", None),
             system_resources=getattr(mod, "_DEFAULT_SYSTEM_RESOURCES", None),
+            time_source=getattr(mod, "_DEFAULT_TIME_SOURCE", None),
+            monotonic_source=getattr(mod, "_DEFAULT_MONOTONIC_SOURCE", None),
         )
         for name, mod in _iter_production_modules()
         if (
             hasattr(mod, "_DEFAULT_CLOCK")
             or hasattr(mod, "_DEFAULT_RANDOM")
             or hasattr(mod, "_DEFAULT_FILESYSTEM")
+            or hasattr(mod, "_DEFAULT_TIME_SOURCE")
+            or hasattr(mod, "_DEFAULT_MONOTONIC_SOURCE")
         )
     ]
 
@@ -217,6 +250,14 @@ def restore_defaults(snapshot: list[_ModuleDefaults]) -> None:
             setattr(mod, "_DEFAULT_CLOCK", entry.clock)
         if entry.random_source is not None and hasattr(mod, "_DEFAULT_RANDOM"):
             setattr(mod, "_DEFAULT_RANDOM", entry.random_source)
+        if entry.time_source is not None and hasattr(
+            mod, "_DEFAULT_TIME_SOURCE"
+        ):
+            setattr(mod, "_DEFAULT_TIME_SOURCE", entry.time_source)
+        if entry.monotonic_source is not None and hasattr(
+            mod, "_DEFAULT_MONOTONIC_SOURCE"
+        ):
+            setattr(mod, "_DEFAULT_MONOTONIC_SOURCE", entry.monotonic_source)
         if entry.filesystem is not None and hasattr(
             mod, "_DEFAULT_FILESYSTEM"
         ):

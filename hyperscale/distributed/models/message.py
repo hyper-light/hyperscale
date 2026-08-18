@@ -24,9 +24,31 @@ def _generate_instance_id() -> int:
     return pid_component | random_component
 
 
-# Module-level Snowflake generator for message IDs
-# Uses combined PID + random incarnation for collision resistance
-_message_id_generator = SnowflakeGenerator(instance=_generate_instance_id())
+# Module-level Snowflake generator for message IDs — LAZY.
+#
+# Construction is deferred to first use for two determinism reasons
+# (both measured as chaos-VOPR twin forks):
+# * the taskex generator captures its clock AT CONSTRUCTION — a
+#   module-import-time instance is born BEFORE the SIM seam swap
+#   (spawn bootstrap imports the entry's whole module graph first)
+#   and keeps the REAL clock forever, so every message id embeds a
+#   wall-time cursor that differs run to run;
+# * the instance bits combine PID + secrets — random per run. Under
+#   SIM the swapped ``_DEFAULT_RANDOM`` supplies them
+#   deterministically; REAL mode keeps the PID+secrets nonce.
+_DEFAULT_RANDOM = None
+_message_id_generator: SnowflakeGenerator | None = None
+
+
+def _get_message_id_generator() -> SnowflakeGenerator:
+    global _message_id_generator
+    if _message_id_generator is None:
+        if _DEFAULT_RANDOM is not None:
+            instance = int(_DEFAULT_RANDOM.uniform(0.0, 1023.0))
+        else:
+            instance = _generate_instance_id()
+        _message_id_generator = SnowflakeGenerator(instance=instance)
+    return _message_id_generator
 
 # Incarnation nonce - random value generated at module load time
 # Used to detect messages from previous incarnations of this process
@@ -42,7 +64,7 @@ def _generate_message_id() -> int:
     here spun a blocking ``time.sleep`` on the event-loop thread, which
     under a frozen virtual clock could never terminate.
     """
-    return _message_id_generator.generate_sync()
+    return _get_message_id_generator().generate_sync()
 
 
 class Message:

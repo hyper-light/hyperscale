@@ -14,6 +14,11 @@ from typing import (
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 
 from .cancel import cancel
+
+# SIM seam — MUST share Run.start's monotonic axis (see run.py): age =
+# now - run.start is only meaningful when both readings come from the
+# same clock.
+_DEFAULT_MONOTONIC_SOURCE = time.monotonic
 from .models import RunStatus
 from .run import Run
 
@@ -150,7 +155,7 @@ class Task(Generic[T]):
 
     async def _execute_age_policy(self):
         removed_runs: List[Run] = []
-        current_time = time.monotonic()
+        current_time = _DEFAULT_MONOTONIC_SOURCE()
         for run_id, run in list(self._runs.items()):
             if current_time - run.start > self.max_age:
                 removed_runs.append(run)

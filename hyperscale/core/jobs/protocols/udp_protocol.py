@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+
+from hyperscale.core.jobs.protocols.node_id_derivation import (
+    derive_protocol_node_id,
+)
 import inspect
 import pickle
 import signal
 import socket
 import ssl
-import uuid
 from collections import defaultdict, deque
 from typing import (
     Any,
@@ -72,7 +75,7 @@ class UDPProtocol(Generic[T, K]):
         loop: asyncio.AbstractEventLoop | None = None,
         transport_factory: TransportFactory | None = None,
     ) -> None:
-        self._node_id_base = uuid.uuid4().int >> 64
+        self._node_id_base = derive_protocol_node_id(host, port)
         self.node_id: int | None = None
 
         # Phase 6 SIM seam. ``transport_factory`` is ``None`` in REAL
@@ -204,7 +207,7 @@ class UDPProtocol(Generic[T, K]):
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
 
         if self.node_id is None:
-            self.node_id = uuid.uuid4().int >> 64
+            self.node_id = derive_protocol_node_id(self.host, self.port)
 
         if self.id_generator is None:
             self.id_generator = SnowflakeGenerator(self.node_id)

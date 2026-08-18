@@ -1054,22 +1054,28 @@ class MercurySyncBaseServer(Generic[T]):
             case "all":
                 selection = nodes
 
+        # INPUT-ORDER partition (determinism): ``as_completed`` yields
+        # via an id()-hashed done-callback set, so two sends completing
+        # on one loop iteration tie-break by Task address — permuting
+        # the results/errors lists across otherwise identical runs.
+        # ``gather`` preserves input order and loses nothing: callers
+        # consume the aggregate, not arrival order.
         errors: list[Exception] = []
         results: list[R] = []
 
-        async for complete in asyncio.as_completed(
-            [
+        outcomes = await asyncio.gather(
+            *[
                 self.send_tcp(
                     addr,
                     data,
                     timeout=timeout,
                 )
                 for addr in selection
-            ]
-        ):
-            result = await complete
-
-            if isinstance(result, Error):
+            ],
+            return_exceptions=True,
+        )
+        for result in outcomes:
+            if isinstance(result, (Error, Exception)):
                 errors.append(result)
 
             else:
@@ -1193,22 +1199,28 @@ class MercurySyncBaseServer(Generic[T]):
             case "all":
                 selection = nodes
 
+        # INPUT-ORDER partition (determinism): ``as_completed`` yields
+        # via an id()-hashed done-callback set, so two sends completing
+        # on one loop iteration tie-break by Task address — permuting
+        # the results/errors lists across otherwise identical runs.
+        # ``gather`` preserves input order and loses nothing: callers
+        # consume the aggregate, not arrival order.
         errors: list[Exception] = []
         results: list[R] = []
 
-        async for complete in asyncio.as_completed(
-            [
+        outcomes = await asyncio.gather(
+            *[
                 self.send_udp(
                     addr,
                     data,
                     timeout=timeout,
                 )
                 for addr in selection
-            ]
-        ):
-            result = await complete
-
-            if isinstance(result, Error):
+            ],
+            return_exceptions=True,
+        )
+        for result in outcomes:
+            if isinstance(result, (Error, Exception)):
                 errors.append(result)
 
             else:

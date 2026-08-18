@@ -19,6 +19,18 @@ state for that sender. This prevents:
 """
 
 import time
+
+# Runtime-default time source — MUST follow the same clock axis as the
+# snowflake generator whose timestamps this guard validates
+# (hyperscale/core/snowflake/snowflake_generator.py). With the ids
+# minted from the virtual clock under SIM but freshness judged against
+# the realtime wall, every message read as ~epoch-aged and the guard
+# rejected ALL protocol traffic (executors never acked starts, workers
+# never registered, and the capacity fence refused every submission —
+# the chaos VOPR's seed-1 never-accepted regression). The SIM swap
+# rebinds this alongside the generator's; REAL mode keeps realtime for
+# both, so the guard's semantics are unchanged outside simulation.
+_DEFAULT_TIME_SOURCE = time.time
 from collections import OrderedDict
 from typing import Optional, Tuple
 
@@ -155,7 +167,7 @@ class ReplayGuard:
         Raises:
             ReplayError: If raise_on_error is True and the message is invalid
         """
-        current_time_ms = int(time.time() * 1000)
+        current_time_ms = int(_DEFAULT_TIME_SOURCE() * 1000)
 
         # Track this incarnation
         self._track_incarnation(sender_incarnation, current_time_ms)
@@ -186,7 +198,7 @@ class ReplayGuard:
         message_time_ms = snowflake.milliseconds
 
         # Get current time in milliseconds
-        current_time_ms = int(time.time() * 1000)
+        current_time_ms = int(_DEFAULT_TIME_SOURCE() * 1000)
 
         # Check for stale messages (too old)
         age_ms = current_time_ms - message_time_ms

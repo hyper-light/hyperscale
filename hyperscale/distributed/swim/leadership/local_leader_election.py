@@ -289,9 +289,21 @@ class LocalLeaderElection:
             self._election_wake_event.set()
 
     async def _wait_for_election_wake(self, timeout: float) -> None:
-        """Wait until either the election loop is woken or ``timeout`` elapses."""
+        """Wait until either the election loop is woken or ``timeout`` elapses.
+
+        Progress floor (the a85533ee chokepoint idiom): callers pass
+        COMPOSED-float remainders (flapping cooldowns, lease expiries,
+        election timeouts), and a positive sub-quantum artifact would arm
+        a timer the quantized clock cannot honor — the election loop
+        would re-evaluate the same instant forever (SIM livelock,
+        100%-CPU micro-spin on a real host). Flooring at 1ms guarantees
+        the clock moves every iteration; genuine election waits (>=
+        hundreds of ms) are unaffected — the floor binds only in the
+        artifact regime, which previously meant livelock.
+        """
         if timeout <= 0:
             return
+        timeout = max(timeout, 0.001)
 
         if self._election_wake_event is None:
             await self._clock.sleep(timeout)
