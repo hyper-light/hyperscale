@@ -638,30 +638,48 @@ def test_leader_total_isolation_is_replay_deterministic():
 
 
 def test_gate_peers_readmit_after_total_isolation_heals():
-    """After the partition-driven eviction heals, every gate's peer
-    registry re-admits the falsely evicted gates — the gate-tier analog
-    of the worker tier's rejoin machinery, driven by TCP liveness
-    proof + the rejoin-incarnation reset.
+    """The re-admission watch AND the originator-corrected suspicion
+    math, pinned together — the two sides of the isolation behave
+    asymmetrically ON PURPOSE:
 
-    Design bound per gate: re-admission completes AFTER the heal
-    (t=100) and within heal + one 10s dead-peer check tick + the 2s
-    TCP verification timeout + recovery jitter + the 0.5s milestone
-    sampler (probed: 107.5, 108.0, 107.5 for a/b/c). A count that
-    never returns to 2 means the watch regressed to the pre-fix
-    permanent decay; a return AFTER the bound means re-admission is
-    riding some slower path than the check cadence."""
+    * The MAJORITY gates (two independent observers) evict the
+      unreachable leader fast (leader-unreachability acceleration —
+      probed 26.0) and the re-admission watch restores it after the
+      heal via TCP liveness proof + the rejoin-incarnation reset.
+      Design bound: after heal (t=100) and within heal + one 10s
+      dead-peer check tick + the 2s TCP verification timeout +
+      recovery jitter + the 0.5s sampler (probed: 105.5 and 107.0).
+    * The ISLANDER never evicts anyone: its suspicions of the two
+      unreachable peers carry ZERO independent confirmations
+      (originator semantics — its own accusation is the suspicion,
+      not corroboration), so the bracket holds at the honest
+      no-corroboration maximum (probed 144.55s > the 90s window) and
+      the heal REFUTES the suspicions before expiry. Its peer count
+      holds at 2 for the entire run — no churn, no re-admission
+      needed. (Pre-fix, the islander's self-vote cut the bracket to
+      ~72s, it evicted both peers on zero external evidence at ~87,
+      and re-admission had to repair it.)
+    """
     results = _run_leader_total_isolation()
     _assert_no_unswapped_seams(results)
 
     heal_time = 100.0
     readmission_deadline = heal_time + 15.0
-    for gate_pid in _GATE_PIDS:
+    for gate_pid in (_FOLLOWER_GATE, _SUBMISSION_GATE):
         peer_counts = [
             entry
             for entry in results[gate_pid]
             if entry[0] == "gate-peers"
         ]
         assert peer_counts[-1][1] == 2, (gate_pid, peer_counts)
+        eviction_dips = [
+            entry for entry in peer_counts if entry[1] < 2 and entry[2] > 5.0
+        ]
+        assert eviction_dips, (
+            "majority gates must evict the unreachable leader",
+            gate_pid,
+            peer_counts,
+        )
         recovery_times = [
             entry[2]
             for entry in peer_counts
@@ -672,6 +690,20 @@ def test_gate_peers_readmit_after_total_isolation_heals():
             gate_pid,
             recovery_times,
         )
+
+    islander_counts = [
+        entry
+        for entry in results[_INITIAL_LEADER_GATE]
+        if entry[0] == "gate-peers"
+    ]
+    assert islander_counts[-1][1] == 2, islander_counts
+    islander_dips = [
+        entry for entry in islander_counts if entry[1] < 2 and entry[2] > 5.0
+    ]
+    assert not islander_dips, (
+        "the islander evicted on uncorroborated self-accusation — the "
+        f"originator-excluded suspicion math regressed: {islander_counts}"
+    )
 
 
 def _run_submission_blackout() -> dict:

@@ -2753,7 +2753,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
                 return False
 
-            if await self._confirm_peer_reachable_by_swim(node, incarnation):
+            confirmed_alive, _witness_consulted = (
+                await self._confirm_peer_reachable_by_swim(node, incarnation)
+            )
+            if confirmed_alive:
                 await self._clear_unwitnessed_suspicion_after_confirmation(
                     node,
                     incarnation,
@@ -4039,9 +4042,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation = node_state.incarnation if node_state else 0
         confirmation_started_at = self._clock.monotonic()
 
-        confirmed_alive = await self._confirm_peer_reachable_by_swim(
-            target,
-            incarnation,
+        confirmed_alive, witness_consulted = (
+            await self._confirm_peer_reachable_by_swim(
+                target,
+                incarnation,
+            )
         )
         if confirmed_alive:
             return True
@@ -4055,7 +4060,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if not self._running or self._is_target_already_suspect_or_dead(target):
             return False
 
-        self._record_burst_dead_confirmation(target, incarnation)
+        # The burst-dead proof — which short-circuits the expiry-time
+        # re-confirmation gate in _should_apply_unwitnessed_dead_
+        # transition — is recorded ONLY when the failed confirmation
+        # consulted an independent witness. With ZERO reachable proxies
+        # (every other member dead or unreachable — exactly a burst's
+        # signature when the OBSERVER is the partitioned one), the
+        # verdict is pure self-observation: the suspicion still starts
+        # (the target IS silent), but it must ride the witness-less
+        # AD-30 max bracket and re-confirm at expiry, which rides out
+        # partition heals. Measured before this guard: a survivor gate
+        # holding two silent targets (one killed, one cut) burst-evicted
+        # its LIVE peer 6.5s into a 30s partition wave; the ordinary
+        # path on the other side correctly held (the pinned one-sided-
+        # eviction asymmetry in the gates long-horizon scenario).
+        if witness_consulted:
+            self._record_burst_dead_confirmation(target, incarnation)
         await self.start_suspicion(target, incarnation, self_addr)
         self.queue_suspicion_update(target, incarnation)
         return False
@@ -4064,8 +4084,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self,
         target: tuple[str, int],
         incarnation: int,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """Run direct and indirect SWIM confirmation for ``target``.
+
+        Returns ``(alive, witness_consulted)``. The second element is
+        the EVIDENCE-QUALITY bit: True only when an indirect probe was
+        actually dispatched through at least one live proxy (or the
+        direct ACK arrived, which is definitive by itself). A failed
+        confirmation with ``witness_consulted=False`` is pure
+        self-observation — the observer cannot distinguish "target
+        dead" from "I am the partitioned one", and callers must not
+        treat it as corroborated death evidence (Lifeguard: repeated
+        misses from ONE observer are one datum, already embodied in
+        the suspicion itself).
 
         This helper intentionally stops before suspicion. Callers that
         need a membership transition must decide how to interpret the
@@ -4074,7 +4105,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         ordinary probe loop.
         """
         if not self._running:
-            return False
+            return (False, False)
 
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
@@ -4089,7 +4120,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 target,
                 success=True,
             )
-            return True
+            return (True, True)
 
         self._peer_probe_reliability.record_probe_outcome(target, success=False)
 
@@ -4097,7 +4128,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if indirect_sent:
             await self._clock.sleep(timeout)
             if not self._running:
-                return False
+                return (False, indirect_sent)
 
             probe = self._indirect_probe_manager.get_pending_probe(target)
             if probe and probe.is_completed():
@@ -4106,9 +4137,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     target,
                     success=True,
                 )
-                return True
+                return (True, True)
 
-        return False
+        return (False, indirect_sent)
 
     def _compute_direct_probe_budget(
         self,

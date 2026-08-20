@@ -536,7 +536,12 @@ class HierarchicalFailureDetector:
                 max_timeout=state_max_timeout,
                 n_members=self._get_current_n_members(),
                 required_confirmations=required_confirmations,
+                originator=from_node,
             )
+            # Deliberately NOT add_confirmation(from_node): the
+            # originator's evidence IS the suspicion (Lifeguard) — a
+            # self-vote satisfying required_confirmations=1 collapsed
+            # the bracket to min_timeout on zero independent evidence.
             state.add_confirmation(from_node)
 
             expiration = self._clock.monotonic() + state.calculate_timeout()

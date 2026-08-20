@@ -188,8 +188,9 @@ class TestHierarchicalHappyPath:
             result = await detector.confirm_global(node, 1, make_node(3))
 
             assert result is True
+            # Originator (node 2) implicit; node 3 is the counted vote.
             state = await detector.get_global_suspicion_state(node)
-            assert state.confirmation_count == 2
+            assert state.confirmation_count == 1
         finally:
             await detector.stop()
 
@@ -241,6 +242,14 @@ class TestHierarchicalHappyPath:
 
             assert state is not None
             assert state.required_confirmations == 1
+            # Originator semantics: the starting node's own vote does
+            # NOT accelerate — the bracket holds at max until an
+            # INDEPENDENT confirmer corroborates (pre-fix, self-start
+            # alone collapsed this to min: eviction on zero external
+            # evidence).
+            assert state.calculate_timeout() == pytest.approx(5.0)
+
+            await detector.confirm_global(node, 1, make_node(3))
             assert state.calculate_timeout() == pytest.approx(1.0)
         finally:
             await detector.stop()
@@ -259,8 +268,9 @@ class TestHierarchicalHappyPath:
             result = await detector.confirm_job(job_id, node, 1, make_node(3))
 
             assert result is True
+            # Originator (node 2) implicit; node 3 is the counted vote.
             state = detector.get_job_suspicion_state(job_id, node)
-            assert state.confirmation_count == 2
+            assert state.confirmation_count == 1
         finally:
             await detector.stop()
 
@@ -868,7 +878,9 @@ class TestHierarchicalConcurrency:
             # State should be consistent
             state = await detector.get_global_suspicion_state(node)
             assert state is not None
-            assert state.confirmation_count == 10
+            # Ten concurrent suspectors: the winner is the originator
+            # (implicit); the other nine count as confirmations.
+            assert state.confirmation_count == 9
         finally:
             await detector.stop()
 

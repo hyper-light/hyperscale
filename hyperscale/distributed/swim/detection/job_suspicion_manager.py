@@ -69,6 +69,10 @@ class JobSuspicion:
     start_time: float
     min_timeout: float
     max_timeout: float
+    # Originator exclusion — same Lifeguard contract as
+    # SuspicionState.originator: the suspecting node's own evidence is
+    # the suspicion itself; only OTHER nodes' confirmations accelerate.
+    originator: NodeAddress | None = None
     confirmers: set[NodeAddress] = field(default_factory=set)
     _logical_confirmation_count: int = 0
 
@@ -78,6 +82,9 @@ class JobSuspicion:
 
     def add_confirmation(self, from_node: NodeAddress) -> bool:
         """Add a confirmation from another node. Returns True if new."""
+        if from_node == self.originator:
+            return False
+
         if from_node in self.confirmers:
             return False
 
@@ -303,7 +310,9 @@ class JobSuspicionManager:
                 start_time=_DEFAULT_CLOCK.monotonic(),
                 min_timeout=min_timeout,
                 max_timeout=max_timeout,
+                originator=from_node,
             )
+            # Originator's vote is implicit (see the field docstring).
             suspicion.add_confirmation(from_node)
 
             self._suspicions[key] = suspicion

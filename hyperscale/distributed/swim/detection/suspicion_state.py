@@ -43,6 +43,17 @@ class SuspicionState:
     node: tuple[str, int]
     incarnation: int
     start_time: float
+    # The suspicion's ORIGINATOR (the node whose failed probes started
+    # it). Lifeguard/memberlist semantics: the originator's evidence is
+    # the suspicion itself — only OTHER members' confirmations shrink
+    # the timeout. Before this field, ``suspect_global`` seeded the
+    # state with the originator's own vote, and with a required target
+    # of 1 (small clusters) self-accusation instantly collapsed the
+    # bracket to min_timeout: a gate holding one cut peer evicted it
+    # 6.5s into a 30s partition wave (the chaos/gates one-sided-
+    # eviction asymmetry) instead of riding the honest max bracket
+    # past the heal.
+    originator: tuple[str, int] | None = None
     confirmers: set[tuple[str, int]] = field(default_factory=set)
     min_timeout: float = 1.0
     max_timeout: float = 10.0
@@ -67,6 +78,11 @@ class SuspicionState:
         If confirmers set is at max capacity, the confirmation is still
         counted for timeout calculation but the confirmer is not stored.
         """
+        # The originator's vote is implicit in the suspicion itself —
+        # never a counted confirmation (see the ``originator`` field).
+        if from_node == self.originator:
+            return False
+
         # Check if already confirmed
         if from_node in self.confirmers:
             return False

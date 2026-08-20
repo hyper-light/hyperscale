@@ -6268,9 +6268,11 @@ class ManagerServer(HealthAwareServer):
                 and node_state.status in (b"SUSPECT", b"DEAD")
             )
             if needs_fresh_liveness:
-                confirmed_alive = await self._confirm_peer_reachable_by_swim(
-                    worker_udp_addr,
-                    node_state.incarnation,
+                confirmed_alive, _witness_consulted = (
+                    await self._confirm_peer_reachable_by_swim(
+                        worker_udp_addr,
+                        node_state.incarnation,
+                    )
                 )
                 if not confirmed_alive:
                     return self._build_worker_registration_response(

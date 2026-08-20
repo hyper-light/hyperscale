@@ -211,7 +211,9 @@ class SuspicionManager:
                 min_timeout=self.min_timeout * lhm_multiplier,
                 max_timeout=self.max_timeout * lhm_multiplier,
                 n_members=self._get_n_members(),
+                originator=from_node,
             )
+            # Originator's vote is implicit (see SuspicionState.originator).
             state.add_confirmation(from_node)
             self.suspicions[node] = state
 
