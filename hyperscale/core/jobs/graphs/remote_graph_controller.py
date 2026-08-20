@@ -111,6 +111,13 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         self._run_workflow_run_id_map: NodeData[int] = defaultdict(
             lambda: defaultdict(dict)
         )
+        # (run_id, workflow_name) -> the schedule id its
+        # aggregate_status_updates repetition was started under, so the
+        # terminal stop targets ONLY that schedule (a name-wide stop
+        # would kill every concurrent workflow's aggregator; before
+        # targeted stops the schedule-control bug made stop a no-op and
+        # each completed workflow leaked a 20Hz aggregator forever).
+        self._aggregate_status_task_ids: Dict[tuple[int, str], int] = {}
 
         self._node_context: NodeContextSet = defaultdict(Context)
         self._statuses: NodeData[WorkflowStatus] = defaultdict(
@@ -429,6 +436,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 workflow.name,
                 run_id=task_id,
             )
+            self._aggregate_status_task_ids[(run_id, workflow.name)] = task_id
 
 
             self._stop_expected_nodes[run_id][workflow.name] = set(node_ids)
@@ -1523,8 +1531,18 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 WorkflowStatus.COMPLETED,
                 WorkflowStatus.REJECTED,
                 WorkflowStatus.FAILED,
+                WorkflowStatus.CANCELLED,
             ]:
-                self.tasks.stop("push_workflow_status_update")
+                # Stop THIS workflow's push schedule only: the schedule
+                # was started under the same task id run_workflow was
+                # (start_workflow's create_task_id), recorded in the
+                # run-id map.
+                schedule_id = self._run_workflow_run_id_map[run_id][
+                    workflow_name
+                ].get(self._node_id_base)
+                self.tasks.stop(
+                    "push_workflow_status_update", run_id=schedule_id
+                )
 
             await self.send(
                 "receive_status_update",
@@ -1565,8 +1583,12 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         """
         completion_state = self._workflow_completion_states.get(run_id, {}).get(workflow_name)
         if not completion_state:
-            # No completion state registered, stop the task
-            self.tasks.stop("aggregate_status_updates")
+            # No completion state registered — stop THIS workflow's
+            # aggregation schedule only.
+            schedule_id = self._aggregate_status_task_ids.pop(
+                (run_id, workflow_name), None
+            )
+            self.tasks.stop("aggregate_status_updates", run_id=schedule_id)
             return
 
         async with self._logger.context(

@@ -76,10 +76,14 @@ class TaskRunner:
     def stop(
         self,
         task_name: str,
+        run_id: Optional[str] = None,
     ):
+        """Stop a task's schedules — all of them, or only the schedule
+        started under ``run_id`` (concurrent runs must not stop each
+        other's schedules)."""
         task = self.tasks.get(task_name)
         if task:
-            task.stop()
+            task.stop(run_id=run_id)
 
     def get_task_status(self, task_name: str):
         if task := self.tasks.get(task_name):
