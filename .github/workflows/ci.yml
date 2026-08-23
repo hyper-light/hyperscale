@@ -96,6 +96,19 @@ jobs:
         # let two scenarios contend for the same machine-wide lock.
         run: uv run pytest tests/unit/simulation -q
 
+      - name: Upload simulation artifacts
+        # A failed scenario writes its dump — including the seed that
+        # replays the run exactly — under _artifacts/. On a hosted
+        # runner that directory dies with the job, which throws away
+        # the reproducer the suite exists to produce.
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-artifacts
+          path: tests/simulation/_artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
   vopr:
     name: VOPR campaigns
     # Wall-clock heavy: chaos schedules, gate tiers and soak horizons.
@@ -114,3 +127,15 @@ jobs:
         run: uv sync --all-extras --dev
       - name: Run VOPR and scenario suites
         run: uv run pytest tests/simulation --ignore=tests/simulation/lints -q
+
+      - name: Upload VOPR artifacts
+        # Same reasoning as the SIM tier, and it matters more here: a
+        # nightly chaos failure is the one run nobody watched, so its
+        # seed is the only way back to it.
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vopr-artifacts
+          path: tests/simulation/_artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
