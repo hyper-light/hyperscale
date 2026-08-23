@@ -106,6 +106,7 @@ class GateDispatchCoordinator:
         observed_latency_tracker: "ObservedLatencyTracker | None" = None,
         record_dispatch_failure: Callable[[str, str], None] | None = None,
         manager_dispatch_timeout_seconds: float = 5.0,
+        persist_accepted_job=None,
     ) -> None:
         self._manager_dispatch_timeout_seconds: float = (
             manager_dispatch_timeout_seconds
@@ -115,6 +116,11 @@ class GateDispatchCoordinator:
         self._task_runner: "TaskRunner" = task_runner
         self._job_manager: "GateJobManager" = job_manager
         self._job_timeout_tracker: "GateJobTimeoutTracker" = job_timeout_tracker
+        # Phase 8 gate durable tier: awaited with (submission,
+        # successful_dcs, fence_token) at the acceptance point so a
+        # restarted gate recovers its accepted jobs. None = volatile
+        # gate (the pre-Phase-8 behavior).
+        self._persist_accepted_job = persist_accepted_job
         self._dispatch_time_tracker: "DispatchTimeTracker" = dispatch_time_tracker
         self._circuit_breaker_manager: "CircuitBreakerManager" = circuit_breaker_manager
         self._job_lease_manager: JobLeaseManager = job_lease_manager
@@ -717,6 +723,19 @@ class GateDispatchCoordinator:
                 timeout_seconds=submission.timeout_seconds,
                 target_dcs=successful_dcs,
             )
+
+            if self._persist_accepted_job is not None:
+                # Durable acceptance: recorded only for jobs that
+                # actually reached a datacenter (the honest acceptance
+                # instant — a fully failed dispatch is already terminal
+                # above and needs no recovery). The fence token comes
+                # from the job manager: this method receives only
+                # (submission, target_dcs).
+                await self._persist_accepted_job(
+                    submission,
+                    successful_dcs,
+                    self._job_manager.get_fence_token(submission.job_id),
+                )
 
         self._increment_version()
         if successful_dcs:

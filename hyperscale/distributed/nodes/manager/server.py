@@ -8046,7 +8046,13 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             self._task_runner.run(
-                self._logger.log,
+                # ``_udp_logger`` is this class's logger; ``_logger``
+                # has never existed in its MRO, so evaluating this
+                # argument raised AttributeError and took the whole
+                # state_sync_request handler with it — peer state sync
+                # answered an error for every request that got past
+                # mTLS validation.
+                self._udp_logger.log,
                 ServerInfo(
                     message=f"State sync request from {request.requester_id[:8]}... role={request.requester_role} since_version={request.since_version}",
                     node_host=self._host,
@@ -10618,8 +10624,18 @@ class ManagerServer(HealthAwareServer):
         final_result_payload: bytes,
     ) -> bool:
         """One completion-notice send attempt. Returns True when the
-        gate ACCEPTED the notice (ok/duplicate/forwarded — duplicate
-        means an earlier attempt already landed, equally discharged)."""
+        gate ACCEPTED the notice.
+
+        Every reply that proves the terminal REACHED a gate discharges
+        the obligation: ``ok`` (this gate applied it), ``duplicate`` /
+        ``already_completed`` (a gate already holds the terminal — an
+        earlier attempt landed, or a peer delivered it), ``forwarded``
+        (a gate took ownership of delivery). ``already_completed`` was
+        missing from this set, so an obligation whose notice HAD been
+        applied kept resending on the backoff ladder until the 1800s
+        age ceiling dropped it loudly — measured on the gate durable-
+        restart scenario, where the recovered gate answers exactly
+        that."""
         try:
             response = await self._send_to_peer(
                 origin_gate_addr,
@@ -10629,7 +10645,13 @@ class ManagerServer(HealthAwareServer):
             )
             if isinstance(response, Exception):
                 raise response
-            if response not in (b"ok", b"duplicate", b"forwarded", None):
+            if response not in (
+                b"ok",
+                b"duplicate",
+                b"already_completed",
+                b"forwarded",
+                None,
+            ):
                 raise RuntimeError(f"job_final_result rejected with {response!r}")
             return True
         except Exception as send_error:

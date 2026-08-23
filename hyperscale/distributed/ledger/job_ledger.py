@@ -289,6 +289,7 @@ class JobLedger:
                 assigned_datacenters=event.assigned_datacenters,
                 created_hlc=event.hlc,
                 requestor_id=event.requestor_id,
+                timeout_seconds=event.timeout_seconds,
             )
 
             if event.fence_token >= self._next_fence_token:
@@ -329,6 +330,7 @@ class JobLedger:
         requestor_id: str,
         durability: DurabilityLevel = DurabilityLevel.GLOBAL,
         job_id: str | None = None,
+        timeout_seconds: float = 0.0,
     ) -> tuple[str, CommitResult]:
         """``job_id`` records an externally-generated id (the client
         generates job ids at submission); None generates one here (the
@@ -348,6 +350,7 @@ class JobLedger:
                 spec_hash=spec_hash,
                 assigned_datacenters=assigned_datacenters,
                 requestor_id=requestor_id,
+                timeout_seconds=timeout_seconds,
             )
 
             append_result = await self._wal.append(
@@ -368,6 +371,7 @@ class JobLedger:
                     assigned_datacenters=assigned_datacenters,
                     created_hlc=hlc,
                     requestor_id=requestor_id,
+                    timeout_seconds=timeout_seconds,
                 )
                 self._publish_snapshot()
                 await self._wal.mark_applied(append_result.entry.lsn)

@@ -459,9 +459,13 @@ def test_partition_over_completion_push_delivers_after_heal():
         + _TERMINAL_SLACK_SECONDS
     )
     assert _PUSH_CUT_HEAL < finished_time < ad34_backstop, client_log
-    assert abs(finished_time - 65.06) <= 2.0, (
+    # 60.04 (was 65.06): same one-timeout-window gain as the gate
+    # durable-restart pin — the gate's global-result push no longer
+    # waits out a 5s timeout on an unhandled wire action before the
+    # client's terminal is delivered.
+    assert abs(finished_time - 60.04) <= 2.0, (
         f"post-heal delivery at {finished_time} drifted from the "
-        f"measured 65.06: {client_log}"
+        f"measured 60.04: {client_log}"
     )
 
     # The window stayed under the staleness bound: dc-west must never

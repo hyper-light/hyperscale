@@ -5,6 +5,14 @@ from time import time
 
 from .lsn import LSN
 
+# Runtime-default time source — the SIM seam rebinding point (same
+# contract as the snowflake generators' hook: swap_defaults rebinds it
+# to the virtual clock's wall model). The HLC's embedded wall_clock
+# feeds recovery elapsed-budget math (a restarted node derives "how
+# long has this job been running" from now - created wall), so it must
+# follow the same axis as every other wall reading.
+_DEFAULT_TIME_SOURCE = time
+
 
 class HybridLamportClock:
     def __init__(
@@ -39,7 +47,7 @@ class HybridLamportClock:
 
     async def generate(self) -> LSN:
         async with self._lock:
-            current_wall_ms = int(time() * 1000) & LSN.MAX_WALL_CLOCK
+            current_wall_ms = int(_DEFAULT_TIME_SOURCE() * 1000) & LSN.MAX_WALL_CLOCK
 
             if current_wall_ms == self._last_wall_ms:
                 self._sequence += 1

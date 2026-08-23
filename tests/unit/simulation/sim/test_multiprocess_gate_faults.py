@@ -67,6 +67,9 @@ from tests.simulation.harness.sim.multiprocess.gate_cluster_demo import (
 from tests.simulation.harness.sim.multiprocess.gate_leader_watch_demo import (
     leader_watch_gate_tier_entry,
 )
+from tests.simulation.harness.sim.multiprocess.soak_job_demo import (
+    soak_gate_dispatch_client_entry,
+)
 from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
     worker_entry,
 )
@@ -441,14 +444,161 @@ def test_restart_submission_gate_is_replay_deterministic():
     assert _run_restart_submission_gate() == _run_restart_submission_gate()
 
 
-@pytest.mark.skip(reason="Phase 8: gate durable tier")
+_DURABLE_RESTART_AT = 9.0
+_DURABLE_DOWN_SECONDS = 8.0
+_DURABLE_GEN2_BOOT = _DURABLE_RESTART_AT + _DURABLE_DOWN_SECONDS
+_DURABLE_WORKFLOW_SECONDS = 20.0
+_DURABLE_CEILING = 120.0
+
+
+def _run_durable_gate_restart() -> dict:
+    """Power-cycle a SOLO gate mid-flight with the Phase 8 durable tier
+    armed (wal_data_dir on the gate), the client pinned to it.
+
+    SOLO is the load-bearing topology choice: with peer gates present,
+    gate-to-gate replication + the manager's completion-notice
+    failover ("forwarded" discharge) already mask a gate reboot — the
+    probe showed a peer resolving the job mid-downtime. A solo gate
+    has no peer to hide behind: pre-Phase-8 its reboot orphaned the
+    job FOREVER (the manager's completion hit "unknown job" on the
+    amnesiac gen-2 until the notice aged out, and the client
+    stranded); with the ledger, gen-2 replays the WAL, re-learns the
+    job, resumes AD-34 with the remaining budget, and ACCEPTS the owed
+    completion the manager's obligation machinery is still resending —
+    the two halves of the durable story meeting.
+
+    Probed timeline (seed 211): gate warm ~5.5, submit_at 8.0 accepted
+    8.14 (durable acceptance recorded), dispatch ~8.6, restart at 9.0
+    (down 8 — covers the job's ~9.9 completion instant, so the first
+    completion send dies with gen-1), gen-2 boots ~17 and recovers the
+    job from the WAL, the obligation resend delivers the final result
+    to gen-2, and the client observes ``completed``."""
+    coordinator = SimulationCoordinator(
+        latency=0.01, max_virtual_time=_DURABLE_CEILING, seed=_SEED
+    )
+    datacenter_managers = {"dc-1": [("sim-mgr", 9000)]}
+    datacenter_manager_udp = {"dc-1": [("sim-mgr", 9001)]}
+
+    coordinator.add_process(
+        _SUBMISSION_GATE,
+        leader_watch_gate_tier_entry,
+        _GATE_HOSTS[_SUBMISSION_GATE],
+        9000,
+        9001,
+        datacenter_managers,
+        datacenter_manager_udp,
+        [],
+        [],
+        f"/sim/{_GATE_HOSTS[_SUBMISSION_GATE]}-9000/gate-ledger",
+    )
+    coordinator.add_process(
+        "manager",
+        multi_gate_manager_entry,
+        "sim-mgr",
+        9000,
+        9001,
+        "dc-1",
+        [(_GATE_HOSTS[_SUBMISSION_GATE], 9000)],
+        [(_GATE_HOSTS[_SUBMISSION_GATE], 9001)],
+    )
+    coordinator.add_process(
+        "worker",
+        worker_entry,
+        "sim-wkr",
+        9000,
+        9001,
+        "dc-1",
+        ("sim-mgr", 9000),
+        2,
+    )
+    coordinator.add_process(
+        "client",
+        soak_gate_dispatch_client_entry,
+        "sim-cli",
+        9500,
+        (_GATE_HOSTS[_SUBMISSION_GATE], 9000),
+        _DURABLE_WORKFLOW_SECONDS,
+        60.0,
+        90.0,
+        8.0,
+        ["dc-1"],
+    )
+    coordinator.schedule_restart(
+        _SUBMISSION_GATE, _DURABLE_RESTART_AT, down_seconds=_DURABLE_DOWN_SECONDS
+    )
+    return coordinator.run()
+
+
 def test_restarted_gate_resumes_its_own_jobs_from_durable_state():
-    """ASPIRATIONAL: a restarted gate should recover its accepted jobs
-    from a durable ledger (as managers already do) and re-serve status
-    for them itself, instead of relying on peer-gate failover. Today a
-    rebooted gate has amnesia — no wal_data_dir / resume path exists
-    for the gate tier."""
-    raise AssertionError("requires the Phase 8 gate durable tier")
+    """FIXED-GAP PIN (Phase 8 gate durable tier): a restarted SOLO gate
+    recovers its accepted jobs from its own JobLedger — the same WAL +
+    checkpoint + archive composite the manager runs — and re-serves
+    them itself, with no peer to hide behind.
+
+    Measured chain (seed 211): submit 8.08 accepted on gen-1, which
+    durably records the acceptance at 8.891; power loss at 9.0 kills
+    gen-1 mid-flight (covering the job's natural completion instant,
+    so the manager's first completion send dies); gen-2 boots 19.04
+    and WAL replay re-learns the job (1 recovered) plus the client's
+    callback contact; the manager's completion-notice obligation
+    redelivers, gen-2 APPLIES it (handler ``ok`` at 24.931) and pushes
+    the terminal to the client, observed ``completed`` at 24.961; the
+    obligation's later resend gets ``already_completed`` and
+    discharges.
+
+    Pre-Phase-8 the same schedule stranded the job forever: the
+    amnesiac gen-2 answered "unknown job", the manager kept resending
+    until the 1800s age ceiling, and the client waited out its full
+    budget."""
+    results = _run_durable_gate_restart()
+    client_log = results["client"]
+
+    submitted = [entry for entry in client_log if entry[0] == "job-submitted"]
+    assert len(submitted) == 1, client_log
+    assert submitted[0][1] < _DURABLE_RESTART_AT, client_log
+
+    gen1_log = results[f"{_SUBMISSION_GATE}.gen1"]
+    assert any(entry[0] == "gate-started" for entry in gen1_log), gen1_log
+    gen2_log = results[_SUBMISSION_GATE]
+    gen2_starts = [entry for entry in gen2_log if entry[0] == "gate-started"]
+    assert len(gen2_starts) == 1, gen2_log
+    assert gen2_starts[0][1] >= _DURABLE_GEN2_BOOT, gen2_log
+
+    # The workflow ran ONCE and was undisturbed by the gate's power
+    # cycle (a gate is a coordinator, not an executor).
+    worker_log = results["worker"]
+    active_rises = [
+        entry
+        for entry in worker_log
+        if entry[0] == "workflows-active" and entry[1] > 0
+    ]
+    assert len(active_rises) == 1, worker_log
+
+    # THE claim: the client observes the loud terminal from the
+    # RECOVERED generation — after gen-2's boot, well inside the job's
+    # 60s AD-34 budget (a timeout here would mean recovery failed and
+    # the tracker resolved it instead).
+    finished = [entry for entry in client_log if entry[0] == "job-finished"]
+    assert len(finished) == 1, client_log
+    assert finished[0][1] == "completed", (
+        "the recovered gate must resolve the job it re-learned from "
+        f"its ledger: {client_log}"
+    )
+    assert _DURABLE_GEN2_BOOT < finished[0][2] < submitted[0][1] + 60.0, client_log
+    # 19.941 (was 24.961): the completion push used to send wire
+    # action "global_job_result", which NO endpoint implements, so
+    # every push burned its full 5s send timeout before the chain
+    # could continue. With the duplicate-definition merge the push
+    # uses the client's real receiver and the terminal lands one
+    # timeout window sooner.
+    assert abs(finished[0][2] - 19.941) <= 2.0, client_log
+
+    assert not JobStatusOracle().check_client_log(client_log), client_log
+    _assert_no_unswapped_seams(results)
+
+
+def test_durable_gate_restart_is_replay_deterministic():
+    assert _run_durable_gate_restart() == _run_durable_gate_restart()
 
 
 # =========================================================================

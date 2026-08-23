@@ -30,6 +30,11 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
     # recovered job. Trailing + defaulted: old array_like records and
     # checkpoints decode cleanly.
     requestor_id: str = ""
+    # Job-level timeout budget (seconds) — lets a restarted accepting
+    # node resume AD-34 tracking with the REMAINING budget (elapsed
+    # derived from created_hlc.wall_clock). Same trailing-defaulted
+    # compatibility contract as requestor_id.
+    timeout_seconds: float = 0.0
 
     @classmethod
     def create(
@@ -39,6 +44,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
         assigned_datacenters: tuple[str, ...],
         created_hlc: LSN,
         requestor_id: str = "",
+        timeout_seconds: float = 0.0,
     ) -> JobState:
         return cls(
             job_id=job_id,
@@ -52,6 +58,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             created_hlc=created_hlc,
             last_hlc=created_hlc,
             requestor_id=requestor_id,
+            timeout_seconds=timeout_seconds,
         )
 
     def with_accepted(self, datacenter_id: str, hlc: LSN) -> JobState:
@@ -67,6 +74,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             created_hlc=self.created_hlc,
             last_hlc=hlc,
             requestor_id=self.requestor_id,
+            timeout_seconds=self.timeout_seconds,
         )
 
     def with_cancellation_requested(self, hlc: LSN) -> JobState:
@@ -82,6 +90,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             created_hlc=self.created_hlc,
             last_hlc=hlc,
             requestor_id=self.requestor_id,
+            timeout_seconds=self.timeout_seconds,
         )
 
     def with_completion(
@@ -103,6 +112,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             created_hlc=self.created_hlc,
             last_hlc=hlc,
             requestor_id=self.requestor_id,
+            timeout_seconds=self.timeout_seconds,
         )
 
     @property

@@ -31,6 +31,7 @@ Module Structure:
 """
 
 import asyncio
+import hashlib
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -40,6 +41,8 @@ import cloudpickle
 
 from hyperscale.distributed.server import tcp
 from hyperscale.distributed.leases import JobLeaseManager
+from hyperscale.distributed.ledger import JobLedger
+from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
 from hyperscale.reporting.common.types import ReporterTypes
@@ -237,6 +240,7 @@ class GateServer(HealthAwareServer):
         gate_udp_peers: list[tuple[str, int]] | None = None,
         lease_timeout: float = 30.0,
         incarnation_storage_dir: str | None = None,
+        wal_data_dir: Path | None = None,
         *,
         clock: "Clock | None" = None,
         random_source: "Random | None" = None,
@@ -272,6 +276,15 @@ class GateServer(HealthAwareServer):
 
         # Store reference to env
         self.env = env
+
+        # Phase 8 gate durable tier: when a data dir is given, accepted
+        # jobs are persisted to a JobLedger (the same WAL + checkpoint +
+        # archive composite the manager runs) and recovered at start —
+        # a rebooted gate re-serves status and resumes AD-34 tracking
+        # for its own jobs instead of having amnesia. None = volatile
+        # gate (the pre-Phase-8 behavior, unchanged).
+        self._wal_data_dir = wal_data_dir
+        self._job_ledger: JobLedger | None = None
 
         # Create modular runtime state
         self._modular_state = GateRuntimeState()
@@ -760,6 +773,7 @@ class GateServer(HealthAwareServer):
             task_runner=self._task_runner,
             job_manager=self._job_manager,
             job_timeout_tracker=self._job_timeout_tracker,
+            persist_accepted_job=self._persist_accepted_job_durable,
             dispatch_time_tracker=self._dispatch_time_tracker,
             circuit_breaker_manager=self._circuit_breaker_manager,
             job_lease_manager=self._job_lease_manager,
@@ -1014,6 +1028,26 @@ class GateServer(HealthAwareServer):
         # restarted gate rejoins above its pre-restart value.
         await self.initialize_incarnation_store()
 
+        if self._wal_data_dir is not None:
+            # Phase 8 gate durable tier. The HLC is normally created in
+            # _init_coordinators; ensure it exists here (same guarded
+            # construction) so ledger events share the gate's clock.
+            if not hasattr(self, "_hlc"):
+                self._hlc = HybridLamportClock(
+                    node_id=hash(self._node_id.full) & 0xFFFF
+                )
+            self._job_ledger = await JobLedger.open(
+                wal_path=self._wal_data_dir / "wal",
+                checkpoint_dir=self._wal_data_dir / "checkpoints",
+                archive_dir=self._wal_data_dir / "archive",
+                region_code=self._node_id.datacenter,
+                gate_id=self._node_id.short,
+                node_id=1,
+                logger=self._udp_logger,
+                clock=self._hlc,
+            )
+            await self._recover_durable_jobs()
+
         # Set node_id on trackers
         self._job_leadership_tracker.node_id = self._node_id.full
         self._job_leadership_tracker.node_addr = (self._host, self._tcp_port)
@@ -1160,6 +1194,9 @@ class GateServer(HealthAwareServer):
 
         await self._dc_health_monitor.stop()
         await self._job_timeout_tracker.stop()
+
+        if self._job_ledger is not None:
+            await self._job_ledger.close()
 
         if self._orphan_job_coordinator is not None:
             await self._orphan_job_coordinator.stop()
@@ -2534,6 +2571,156 @@ class GateServer(HealthAwareServer):
         """
         await self.confirm_peer(peer_addr)
 
+    async def _persist_accepted_job_durable(
+        self,
+        submission: "JobSubmission",
+        successful_dcs: list[str],
+        fence_token: int,
+    ) -> None:
+        """Durably record an accepted job (Phase 8 gate durable tier).
+
+        Awaited from the dispatch coordinator at the acceptance point
+        (after at least one datacenter took the dispatch). LOCAL
+        durability, mirroring the manager's acceptance record: the
+        fsync'd WAL append IS the recovery guarantee; cross-node
+        replication is the peer-forwarding layer's job. No-op for
+        volatile gates.
+        """
+        if self._job_ledger is None:
+            return
+
+        callback_addr = submission.callback_addr or self._job_manager.get_callback(
+            submission.job_id
+        )
+        requestor_contact = (
+            f"{callback_addr[0]}:{callback_addr[1]}" if callback_addr else ""
+        )
+        _ledger_job_id, create_result = await self._job_ledger.create_job(
+            spec_hash=hashlib.sha256(submission.workflows).digest(),
+            assigned_datacenters=tuple(successful_dcs),
+            requestor_id=requestor_contact,
+            durability=DurabilityLevel.LOCAL,
+            job_id=submission.job_id,
+            timeout_seconds=submission.timeout_seconds,
+        )
+        if not create_result.success:
+            raise RuntimeError(
+                "gate job ledger rejected acceptance record for "
+                f"{submission.job_id}: {create_result.error}"
+            )
+
+    async def _record_job_terminal_durable(
+        self,
+        job_id: str,
+        final_status: str,
+        total_completed: int,
+        total_failed: int,
+        elapsed_seconds: float,
+    ) -> None:
+        """Durably record a job's terminal outcome (idempotent)."""
+        if self._job_ledger is None:
+            return
+        ledger_job = self._job_ledger.get_job(job_id)
+        if ledger_job is None or ledger_job.is_terminal:
+            return
+        await self._job_ledger.complete_job(
+            job_id,
+            final_status=final_status,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            duration_ms=int(elapsed_seconds * 1000),
+            durability=DurabilityLevel.LOCAL,
+        )
+
+    async def _recover_durable_jobs(self) -> None:
+        """Rebuild gate-side tracking for ledger-recovered jobs.
+
+        For every NON-terminal job the WAL replay produced, the gate
+        reconstructs enough state to (a) answer client status queries
+        (the poll path — push registrations are connection state and
+        die with the old process), (b) accept the completion the
+        owning manager still OWES it (the manager's completion-notice
+        obligation resends until this gate acks — the two halves of
+        the durable story), and (c) resume AD-34 global-timeout
+        tracking with the REMAINING budget, elapsed derived from the
+        created HLC's embedded wall clock against the same clock axis.
+        """
+        recovered_count = 0
+        current_lsn = await self._hlc.generate()
+        for job_state in self._job_ledger.get_all_jobs().values():
+            if job_state.is_terminal:
+                continue
+
+            elapsed_seconds = max(
+                (current_lsn.wall_clock - job_state.created_hlc.wall_clock)
+                / 1000.0,
+                0.0,
+            )
+            remaining_timeout = job_state.timeout_seconds - elapsed_seconds
+            if job_state.timeout_seconds <= 0.0:
+                # Pre-Phase-8 record with no budget persisted: track
+                # with a minimal grace so AD-34 resolves it loudly
+                # rather than stranding it silently.
+                remaining_timeout = 30.0
+            elif remaining_timeout <= 0.0:
+                # Budget expired while this gate was down: one tracker
+                # tick of grace lets a completion already in flight
+                # (the manager's owed notice) win the race before the
+                # loud timeout fires.
+                remaining_timeout = 1.0
+
+            job = GlobalJobStatus(
+                job_id=job_state.job_id,
+                status=JobStatus.RUNNING.value,
+                datacenters=[],
+                timestamp=self._clock.monotonic() - elapsed_seconds,
+                fence_token=job_state.fence_token,
+            )
+            self._job_manager.set_job(job_state.job_id, job)
+            self._job_manager.set_target_dcs(
+                job_state.job_id, set(job_state.assigned_datacenters)
+            )
+            self._job_manager.set_fence_token(
+                job_state.job_id, job_state.fence_token
+            )
+            # Restore the client's push registration from the persisted
+            # requestor contact — push registrations are connection
+            # state and die with the old process, but the terminal
+            # result the manager still owes this gate must reach the
+            # CLIENT, not just the gate (measured: without this, gen-2
+            # accepted the owed completion and pushed it into the void
+            # while the client waited out its full budget).
+            if job_state.requestor_id and ":" in job_state.requestor_id:
+                callback_host, _, callback_port_text = (
+                    job_state.requestor_id.rpartition(":")
+                )
+                try:
+                    self._job_manager.set_callback(
+                        job_state.job_id,
+                        (callback_host, int(callback_port_text)),
+                    )
+                except ValueError:
+                    pass
+            await self._job_timeout_tracker.start_tracking_job(
+                job_id=job_state.job_id,
+                timeout_seconds=remaining_timeout,
+                target_dcs=list(job_state.assigned_datacenters),
+            )
+            recovered_count += 1
+
+        if recovered_count:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        f"Gate durable tier recovered {recovered_count} "
+                        "in-flight job(s) from the ledger"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
     async def _complete_job(self, job_id: str, result: object) -> bool:
         """Complete a job and notify client."""
         if not isinstance(result, JobFinalResult):
@@ -2542,7 +2729,19 @@ class GateServer(HealthAwareServer):
         async with self._job_manager.lock_job(job_id):
             job = self._job_manager.get_job(job_id)
             if not job:
-                await self._logger.log(
+                # ``_udp_logger`` is the gate's logger; ``_logger`` has
+                # never existed on this class, so BOTH cold branches of
+                # this method (unknown job, duplicate terminal) raised
+                # AttributeError instead of returning their verdict.
+                # The handler's except turned that into ``b"error"``,
+                # which the manager's completion-notice obligation
+                # reads as "not delivered" — so a job whose terminal
+                # HAD been applied kept getting resent up the backoff
+                # ladder until the 1800s age ceiling dropped it loudly.
+                # Reached for the first time by the gate durable-tier
+                # restart scenario (the manager redelivers an owed
+                # notice to a recovered gate that already applied it).
+                await self._udp_logger.log(
                     ServerWarning(
                         message=(
                             "Final result received for unknown job "
@@ -2562,7 +2761,7 @@ class GateServer(HealthAwareServer):
                 JobStatus.TIMEOUT.value,
             }
             if job.status in terminal_statuses:
-                await self._logger.log(
+                await self._udp_logger.log(
                     ServerDebug(
                         message=(
                             "Duplicate final result for job "
@@ -2598,6 +2797,14 @@ class GateServer(HealthAwareServer):
                 previous_status,
                 global_result.status,
                 None,
+            )
+
+            await self._record_job_terminal_durable(
+                job_id,
+                final_status=global_result.status,
+                total_completed=global_result.total_completed,
+                total_failed=global_result.total_failed,
+                elapsed_seconds=global_result.elapsed_seconds,
             )
 
             self._task_runner.run(
@@ -2717,7 +2924,7 @@ class GateServer(HealthAwareServer):
             resolved_target_dcs,
             reason,
         )
-        await self._push_global_job_result(job_id, timeout_result)
+        await self._push_global_job_result(timeout_result)
         await self._job_timeout_tracker.stop_tracking(job_id)
 
     async def _mark_job_timeout(
@@ -2776,6 +2983,13 @@ class GateServer(HealthAwareServer):
 
             self._job_manager.set_job(job_id, job)
 
+        await self._record_job_terminal_durable(
+            job_id,
+            final_status=JobStatus.TIMEOUT.value,
+            total_completed=getattr(job, "total_completed", 0),
+            total_failed=getattr(job, "total_failed", 0),
+            elapsed_seconds=getattr(job, "elapsed_seconds", 0.0),
+        )
         await self._modular_state.increment_state_version()
         await self._send_immediate_update(job_id, "timeout", None)
         return job
@@ -2955,17 +3169,35 @@ class GateServer(HealthAwareServer):
             elapsed_seconds=elapsed_seconds,
         )
 
-    async def _push_global_job_result(
-        self,
-        job_id: str,
-        result: GlobalJobResult,
-    ) -> None:
+    async def _push_global_job_result(self, result: GlobalJobResult) -> None:
+        """Deliver the aggregated global result to the submitting client.
+
+        THE single definition. This method was defined twice in this
+        class — an early ``(self, job_id, result)`` form and a later
+        ``(self, result)`` form — and Python kept the later one, which
+        meant two silent defects at once:
+
+        * ``handle_global_timeout`` calls with ``(job_id, result)``,
+          so the AD-34 global-timeout push raised ``TypeError`` — the
+          loud terminal that exists for when everything else failed
+          never reached the client.
+        * the surviving body sent action ``"global_job_result"``,
+          which NO endpoint implements; the client's receiver is
+          ``receive_global_job_result`` (client.py), so the completion
+          path's pushes went nowhere either.
+
+        The merged body keeps the reachable wire action and the
+        client-update recording from the shadowed definition, plus the
+        ``_job_global_result_sent`` dedup bookkeeping the later one
+        added (read by the aggregation guard, cleared on job cleanup).
+        """
+        job_id = result.job_id
         callback = self._job_manager.get_callback(job_id)
         if not callback:
             await self._udp_logger.log(
                 ServerWarning(
                     message=(
-                        f"Global timeout result has no callback for job {job_id[:8]}..."
+                        f"Global result has no callback for job {job_id[:8]}..."
                     ),
                     node_host=self._host,
                     node_port=self._tcp_port,
@@ -2984,6 +3216,7 @@ class GateServer(HealthAwareServer):
             log_failure=False,
         )
         if delivered:
+            self._job_global_result_sent.add(job_id)
             return
 
         await self._udp_logger.log(
@@ -5766,32 +5999,6 @@ class GateServer(HealthAwareServer):
                     return None
 
         return self._build_global_job_result(result.job_id, per_dc_results, target_dcs)
-
-    async def _push_global_job_result(self, result: GlobalJobResult) -> None:
-        callback = self._job_manager.get_callback(result.job_id)
-        if not callback:
-            return
-
-        try:
-            await self.send_tcp(
-                callback,
-                "global_job_result",
-                result.dump(),
-                timeout=5.0,
-            )
-            self._job_global_result_sent.add(result.job_id)
-        except Exception as send_error:
-            await self._udp_logger.log(
-                ServerWarning(
-                    message=(
-                        "Failed to send global job result to client "
-                        f"{callback}: {send_error}"
-                    ),
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
 
     async def _maybe_push_global_job_result(self, result: JobFinalResult) -> None:
         global_result = await self._record_job_final_result(result)

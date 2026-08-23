@@ -49,11 +49,22 @@ def leader_watch_gate_tier_entry(
     datacenter_manager_udp,
     gate_tcp_peers=None,
     gate_udp_peers=None,
+    wal_data_dir=None,
 ) -> None:
     """Gate child: a real ``GateServer`` fronting one or more
     datacenters, optionally clustered with peer gates, recording
     datacenter health, active-peer count, and its own gate-leadership
-    flag on every change."""
+    flag on every change.
+
+    ``wal_data_dir`` (a path STRING under the child's SIM filesystem,
+    e.g. ``/sim/<host>-<port>/gate-ledger``) arms the Phase 8 gate
+    durable tier: accepted jobs persist to a JobLedger and a restarted
+    generation recovers them at start. The SIM filesystem survives a
+    ``schedule_restart`` power cycle exactly as the manager-restart
+    recipes rely on, so gen-2 replays gen-1's WAL.
+    """
+    from pathlib import Path
+
     gate = GateServer(
         host,
         tcp_port,
@@ -63,6 +74,7 @@ def leader_watch_gate_tier_entry(
         datacenter_manager_udp=datacenter_manager_udp,
         gate_peers=gate_tcp_peers,
         gate_udp_peers=gate_udp_peers,
+        wal_data_dir=Path(wal_data_dir) if wal_data_dir else None,
         **context.sim_kwargs(),
     )
     log: list = []
