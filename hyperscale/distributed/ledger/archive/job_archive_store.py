@@ -137,6 +137,3 @@ class JobArchiveStore:
 
         return removed_count
 
-    @property
-    def archive_dir(self) -> Path:
-        return self._archive_dir

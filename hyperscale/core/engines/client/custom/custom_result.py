@@ -35,4 +35,16 @@ class CustomResult(BaseModel):
     
     @property
     def successful(self) -> bool:
-        raise True
+        """Whether this result counts as a success.
+
+        Subclasses MUST define this: a custom engine owns the meaning
+        of success for its protocol (siblings use ``error is None`` or
+        a 2xx status). The body was ``raise True``, which raises
+        ``TypeError: exceptions must derive from BaseException`` —
+        and ``Results`` reads ``.successful`` for EVERY result, so a
+        custom-engine run died in the reporting pass rather than at
+        the point the contract was actually unmet.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement the 'successful' property"
+        )

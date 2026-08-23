@@ -29,6 +29,7 @@ It's about catching the swap mechanism itself regressing.
 """
 
 from __future__ import annotations
+from hyperscale.distributed.runtime.swap import _PRODUCTION_PREFIXES
 
 
 def test_swap_defaults_propagates_to_dataclass_default_factories() -> None:
@@ -136,7 +137,16 @@ def test_swap_defaults_covers_a_representative_module_set() -> None:
     # from each so we can assert breadth of coverage.
     subsystems: set[str] = set()
     for module_name in touched:
-        assert module_name.startswith("hyperscale.distributed."), module_name
+        # Assert against the swap module's OWN declared production
+        # surface rather than a hardcoded prefix: the seam
+        # legitimately covers hyperscale.logging (filesystem, HLC
+        # wall clock) and the narrow hyperscale.core id/time
+        # modules. Reading the prefixes from the module under test
+        # keeps one source of truth and still fails if a swap ever
+        # reaches outside the declared surface.
+        assert module_name.startswith(
+            tuple(f"{prefix}." for prefix in _PRODUCTION_PREFIXES)
+        ), module_name
         suffix = module_name[len("hyperscale.distributed."):]
         first = suffix.split(".", 1)[0]
         subsystems.add(first)

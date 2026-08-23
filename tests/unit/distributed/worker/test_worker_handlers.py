@@ -81,6 +81,19 @@ class MockServerForHandlers:
         self._job_fence_tokens = {}
 
         self._worker_state = MagicMock()
+        # The transfer counters are a lock-guarded ASYNC API on
+        # WorkerState. Only the stale-token one was mocked as async
+        # because only that call site used the API; the other four
+        # sites did ``self._server._transfer_metrics_X += 1``, which
+        # a MagicMock happily accepts — so these tests passed while
+        # production raised AttributeError (setter-less property) on
+        # the handler's first statement. Mock the whole API as async
+        # so the fixture can never again make the broken form look
+        # correct.
+        self._worker_state.increment_transfer_received = AsyncMock()
+        self._worker_state.increment_transfer_accepted = AsyncMock()
+        self._worker_state.increment_transfer_rejected_other = AsyncMock()
+        self._worker_state.increment_transfer_rejected_unknown_manager = AsyncMock()
         self._worker_state.increment_transfer_rejected_stale_token = AsyncMock()
         self._worker_state.update_workflow_fence_token = AsyncMock(return_value=True)
         self._worker_state.get_workflow_fence_token = AsyncMock(return_value=0)
@@ -378,7 +391,12 @@ class TestJobLeaderTransferHandler:
 
         ack = JobLeaderWorkerTransferAck.load(result)
         assert ack.accepted is False
-        assert mock_server._transfer_metrics_rejected_unknown_manager == 1
+        # Assert the API the handler must call. The old assertion
+        # read a counter on the MOCK SERVER, which the broken ``+=``
+        # form incremented happily — it passed while production
+        # raised AttributeError. Awaiting the state's lock-guarded
+        # increment is the real contract.
+        mock_server._worker_state.increment_transfer_rejected_unknown_manager.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_transfer_clears_orphan_status(self, mock_server):

@@ -73,7 +73,13 @@ class JobLeaderTransferHandler:
         Returns:
             Serialized JobLeaderWorkerTransferAck
         """
-        self._server._transfer_metrics_received += 1
+        # ``WorkerServer`` exposes these counters as SETTER-LESS
+        # properties (and two of them not at all), so ``+=`` through
+        # the server raised AttributeError on this handler's FIRST
+        # statement — the whole job-leader transfer endpoint was
+        # dead. ``WorkerState`` owns the fields and publishes the
+        # lock-guarded increment API this now uses.
+        await self._server._worker_state.increment_transfer_received()
         transfer_start_time = _DEFAULT_CLOCK.monotonic()
 
         try:
@@ -114,7 +120,7 @@ class JobLeaderTransferHandler:
                     )
 
                 # 8.6: Update metrics
-                self._server._transfer_metrics_accepted += 1
+                await self._server._worker_state.increment_transfer_accepted()
 
                 # 8.7: Detailed logging
                 await self._log_transfer_result(
@@ -137,7 +143,7 @@ class JobLeaderTransferHandler:
                 ).dump()
 
         except Exception as error:
-            self._server._transfer_metrics_rejected_other += 1
+            await self._server._worker_state.increment_transfer_rejected_other()
             return JobLeaderWorkerTransferAck(
                 job_id="unknown",
                 worker_id=self._server._node_id.full,
@@ -201,7 +207,7 @@ class JobLeaderTransferHandler:
             transfer.new_manager_id
         )
         if not manager_valid:
-            self._server._transfer_metrics_rejected_unknown_manager += 1
+            await self._server._worker_state.increment_transfer_rejected_unknown_manager()
             await self._server._udp_logger.log(
                 ServerWarning(
                     message=f"Rejected job leadership transfer for job {job_id[:8]}...: {manager_reason}",

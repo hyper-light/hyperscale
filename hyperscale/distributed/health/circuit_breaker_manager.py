@@ -94,10 +94,16 @@ class CircuitBreakerManager:
                 f"{addr[0]}:{addr[1]}": self.get_circuit_status(addr)
                 for addr in self._circuits.keys()
             },
+            # ``is_circuit_open`` is async; calling it here returned a
+            # COROUTINE (always truthy), so every known manager was
+            # reported open and every call leaked a "never awaited"
+            # warning. This is a sync method, so read the circuit state
+            # directly — exactly what the sibling ``get_circuit_status``
+            # above does.
             "open_circuits": [
                 f"{addr[0]}:{addr[1]}"
-                for addr in self._circuits.keys()
-                if self.is_circuit_open(addr)
+                for addr, circuit in self._circuits.items()
+                if circuit.circuit_state == CircuitState.OPEN
             ],
         }
 

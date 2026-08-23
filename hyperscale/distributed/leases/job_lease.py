@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Callable
 
 from hyperscale.distributed.runtime import Clock, RealClock
+import time  # used by the lease-expiry last-resort handler below
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
