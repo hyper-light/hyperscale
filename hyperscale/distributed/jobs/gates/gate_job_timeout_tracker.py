@@ -181,6 +181,44 @@ class GateJobTimeoutTracker:
                 timeout_fence_token=0,
             )
 
+    async def _reject_superseded_report(
+        self,
+        info: GateJobTrackingInfo,
+        job_id: str,
+        datacenter: str,
+        fence_token: int,
+    ) -> bool:
+        """Drop a report carrying a fence token this gate has already
+        moved past for that datacenter.
+
+        AD-34's global timeout decision is driven by
+        ``dc_last_progress``, and the tracker stored ``fence_token``
+        without ever comparing it -- so a straggling report from a
+        manager that has since lost leadership refreshed the progress
+        clock and pushed the timeout out on evidence from a node no
+        longer running the work. After a leadership transfer the old
+        leader's in-flight reports are exactly that.
+
+        Returns True when the report was rejected (and logged).
+        """
+        known_token = info.dc_fence_tokens.get(datacenter)
+        if known_token is None or fence_token >= known_token:
+            return False
+
+        await self._gate._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Ignored superseded report for job {job_id[:8]}... from "
+                    f"DC {datacenter}: fence {fence_token} is behind the "
+                    f"known fence {known_token}"
+                ),
+                node_host=self._gate._host,
+                node_port=self._gate._tcp_port,
+                node_id=self._gate._node_id.short,
+            )
+        )
+        return True
+
     async def record_progress(self, report: JobProgressReport) -> None:
         """
         Record progress from a DC (AD-34 Part 5).
@@ -191,6 +229,11 @@ class GateJobTimeoutTracker:
         async with self._lock:
             info = self._tracked_jobs.get(report.job_id)
             if not info:
+                return
+
+            if await self._reject_superseded_report(
+                info, report.job_id, report.datacenter, report.fence_token
+            ):
                 return
 
             # Update DC progress
@@ -225,6 +268,11 @@ class GateJobTimeoutTracker:
             if not info:
                 return
 
+            if await self._reject_superseded_report(
+                info, report.job_id, report.datacenter, report.fence_token
+            ):
+                return
+
             info.dc_status[report.datacenter] = "timed_out"
             info.dc_manager_addrs[report.datacenter] = (
                 report.manager_host,
@@ -250,6 +298,11 @@ class GateJobTimeoutTracker:
         async with self._lock:
             info = self._tracked_jobs.get(report.job_id)
             if not info:
+                return
+
+            if await self._reject_superseded_report(
+                info, report.job_id, report.datacenter, report.fence_token
+            ):
                 return
 
             info.dc_manager_addrs[report.datacenter] = (
