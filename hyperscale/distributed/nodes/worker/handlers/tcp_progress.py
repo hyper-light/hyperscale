@@ -11,7 +11,7 @@ from hyperscale.distributed.reliability import BackpressureLevel, BackpressureSi
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 if TYPE_CHECKING:
-    from ..server import WorkerServer
+    from hyperscale.distributed.nodes.worker.server import WorkerServer
 
 
 class WorkflowProgressHandler:

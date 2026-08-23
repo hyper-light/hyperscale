@@ -8,9 +8,8 @@ from hyperscale.distributed.reliability.backpressure import (
     BackpressureSignal,
 )
 
-from ..durability_level import DurabilityLevel
-from ..wal.entry_state import TransitionResult
-from ..wal.wal_entry import WALEntry
+from hyperscale.distributed.ledger.durability_level import DurabilityLevel
+from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
 
 from hyperscale.distributed.runtime import Clock, RealClock
 
@@ -20,7 +19,7 @@ _DEFAULT_CLOCK: Clock = RealClock()
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
 
-    from ..wal.node_wal import NodeWAL
+    from hyperscale.distributed.ledger.wal.node_wal import NodeWAL
 
 
 class CommitResult:

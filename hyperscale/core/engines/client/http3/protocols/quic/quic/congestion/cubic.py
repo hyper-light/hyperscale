@@ -1,6 +1,6 @@
 from typing import Any, Dict, Iterable
 
-from ..packet_builder import QuicSentPacket
+from hyperscale.core.engines.client.http3.protocols.quic.quic.packet_builder import QuicSentPacket
 from .base import (
     K_INITIAL_WINDOW,
     K_MINIMUM_WINDOW,

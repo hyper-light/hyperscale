@@ -7,7 +7,11 @@ processing. Using pre-allocated bytes for hot-path operations
 can provide significant performance improvements.
 
 Usage:
-    from ..core.constants import MSG_PROBE, MSG_ACK, STATUS_OK
+    from hyperscale.distributed.swim.core.constants import (
+        MSG_PROBE,
+        MSG_ACK,
+        STATUS_OK,
+    )
 """
 
 # =============================================================================

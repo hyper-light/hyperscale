@@ -6,11 +6,11 @@ from typing import TYPE_CHECKING
 
 from hyperscale.logging.lsn import LSN
 
-from ..events.event_type import JobEventType
+from hyperscale.distributed.ledger.events.event_type import JobEventType
 from .entry_state import WALEntryState
 
 if TYPE_CHECKING:
-    from ..events.job_event import JobEventUnion
+    from hyperscale.distributed.ledger.events.job_event import JobEventUnion
 
 HEADER_SIZE = 34
 HEADER_FORMAT = ">I I Q 16s B B"

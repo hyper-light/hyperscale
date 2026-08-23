@@ -6,7 +6,7 @@ import msgspec
 
 from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 
-from ..job_state import JobState
+from hyperscale.distributed.ledger.job_state import JobState
 
 # Module-level storage seam (Phase 7). The store BORROWS this (or an
 # injected instance) — it never shuts the filesystem down.

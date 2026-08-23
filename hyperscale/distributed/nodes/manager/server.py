@@ -3966,6 +3966,33 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
+    def _build_peer_worker_snapshots(self) -> list[WorkerStateSnapshot]:
+        """Serialize this manager's worker registry for a peer sync.
+
+        The exact inverse of ``_apply_peer_worker_snapshots``: it
+        rebuilds a ``NodeInfo`` plus ``WorkerRegistration`` from
+        ``node_id``/``host``/``tcp_port``/``udp_port``/``version`` and
+        the two core counts, so those are the fields that have to
+        round-trip. ``active_workflows`` is left empty because nothing
+        reads it on the receiving side; shipping it would be cost
+        without a consumer.
+        """
+        return [
+            WorkerStateSnapshot(
+                node_id=registration.node.node_id,
+                state=self._manager_state._worker_health_states.get(
+                    worker_id, WorkerState.HEALTHY.value
+                ),
+                total_cores=registration.total_cores,
+                available_cores=registration.available_cores,
+                version=registration.node.version,
+                host=registration.node.host,
+                tcp_port=registration.node.port,
+                udp_port=registration.node.udp_port or registration.node.port,
+            )
+            for worker_id, registration in self._manager_state.iter_workers()
+        ]
+
     def _apply_peer_worker_snapshots(
         self,
         worker_snapshots: list[WorkerStateSnapshot],
@@ -8089,10 +8116,10 @@ class ManagerServer(HealthAwareServer):
             snapshot = ManagerStateSnapshot(
                 node_id=self._node_id.full,
                 datacenter=self._config.datacenter_id,
-                is_leader=self._leadership_coordinator.is_leader(),
+                is_leader=self.is_leader(),
                 term=self._leader_election.state.current_term,
                 version=current_version,
-                workers=self._build_worker_snapshots(),
+                workers=self._build_peer_worker_snapshots(),
                 jobs=dict(self._manager_state._job_progress),
                 job_leaders=dict(self._manager_state._job_leaders),
                 job_leader_addrs=dict(self._manager_state._job_leader_addrs),
@@ -8102,7 +8129,6 @@ class ManagerServer(HealthAwareServer):
                     job.job_id: self._build_job_state_sync_message(job.job_id, job)
                     for job in self._job_manager.iter_jobs()
                 },
-                job_contexts=self._serialize_job_contexts(),
             )
 
             return StateSyncResponse(
@@ -9086,6 +9112,14 @@ class ManagerServer(HealthAwareServer):
                         job_id=submission.job_id,
                     )
                 )
+                # An invariant assertion, not a live error path: LOCAL
+                # is the fsync'd append itself, so it cannot fall
+                # short. Raising is only correct while this site
+                # requests LOCAL — above it, a shortfall means the
+                # record IS durable here and applied to ledger state,
+                # just not replicated, so the right response becomes a
+                # durability warning on ``level_achieved`` rather than
+                # aborting acceptance for a job that exists.
                 if not create_result.success:
                     raise RuntimeError(
                         "job ledger rejected acceptance record for "

@@ -18,6 +18,7 @@ from .durability_level import DurabilityLevel
 from .job_id import JobIdGenerator
 from .job_state import JobState
 from .job_ledger import JobLedger
+from .unsatisfiable_durability_error import UnsatisfiableDurabilityError
 
 from .events import (
     JobEventType,
@@ -65,6 +66,7 @@ __all__ = [
     "JobIdGenerator",
     "DurabilityLevel",
     "ConsistencyLevel",
+    "UnsatisfiableDurabilityError",
     "JobEventType",
     "JobEvent",
     "JobCreated",

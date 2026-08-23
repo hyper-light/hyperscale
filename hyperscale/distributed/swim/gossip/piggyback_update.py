@@ -6,8 +6,8 @@ import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..core.constants import DELIM_COLON, encode_int
-from ..core.types import UpdateType
+from hyperscale.distributed.swim.core.constants import DELIM_COLON, encode_int
+from hyperscale.distributed.swim.core.types import UpdateType
 
 from hyperscale.distributed.runtime import Clock, RealClock
 

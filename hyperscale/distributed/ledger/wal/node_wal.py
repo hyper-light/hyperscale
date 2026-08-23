@@ -14,7 +14,7 @@ from hyperscale.distributed.reliability.backpressure import (
     BackpressureSignal,
 )
 
-from ..events.event_type import JobEventType
+from hyperscale.distributed.ledger.events.event_type import JobEventType
 from .entry_state import WALEntryState, TransitionResult
 from .wal_entry import HEADER_SIZE, WALEntry
 from .wal_status_snapshot import WALStatusSnapshot

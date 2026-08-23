@@ -4,18 +4,18 @@ Local leader election with pre-voting and split-brain prevention.
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable, Any
+from typing import Callable, Awaitable
 
 from hyperscale.distributed.runtime import Clock, Random, RealClock, RealRandom
 from .leader_state import LeaderState
 from .leader_eligibility import LeaderEligibility
 from .flapping_detector import FlappingDetector
-from ..core.errors import ElectionError, ElectionTimeoutError, SplitBrainError, UnexpectedError, NotEligibleError
+from hyperscale.distributed.swim.core.errors import ElectionError, UnexpectedError, NotEligibleError
 
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
-from ..core.protocols import LoggerProtocol, TaskRunnerProtocol
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol, TaskRunnerProtocol
 
 
 _DEFAULT_CLOCK: Clock = RealClock()

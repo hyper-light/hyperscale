@@ -23,7 +23,7 @@ from hyperscale.distributed.runtime import Clock, RealClock
 _DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
-    from ..server import WorkerServer
+    from hyperscale.distributed.nodes.worker.server import WorkerServer
 
 
 class JobLeaderTransferHandler:

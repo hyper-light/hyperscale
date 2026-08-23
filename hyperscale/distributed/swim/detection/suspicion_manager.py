@@ -10,7 +10,7 @@ from hyperscale.distributed.runtime import Clock, RealClock
 from .suspicion_state import SuspicionState
 
 
-from ..core.protocols import LoggerProtocol
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 
 
 _DEFAULT_CLOCK: Clock = RealClock()

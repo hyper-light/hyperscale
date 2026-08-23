@@ -38,7 +38,7 @@ start *after* the readiness barrier (delayed starts, restarts) become
 routable at the window in which they registered.
 """
 
-from ..fake_tcp_transport import FakeTCPTransport
+from tests.simulation.harness.sim.fake_tcp_transport import FakeTCPTransport
 
 
 class _BufferingDatagramTransport:

@@ -156,8 +156,8 @@ class GateLeadershipCoordinator:
                 self._logger.log,
                 ServerDebug(
                     message=f"Failed to send leadership announcement to {peer_addr}: {error}",
-                    node_host=self._get_host(),
-                    node_port=self._get_tcp_port(),
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
                     node_id=self._get_node_id(),
                 ),
             )

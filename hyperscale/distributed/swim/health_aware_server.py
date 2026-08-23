@@ -1042,11 +1042,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             True if ping was sent successfully, False otherwise
         """
         try:
-            # Send a direct probe (which will include gossip updates)
-            await self._send_probe(peer_address)
-            return True
+            # Send a direct probe and report what it actually learned:
+            # this is a CONFIRMATION ping, so the caller wants to know
+            # whether the peer answered, not merely that a datagram
+            # left. (``_send_probe`` never existed on this class -- the
+            # phantom call raised AttributeError, and the bare
+            # ``return True`` below it confirmed every peer it was
+            # asked about, including dead ones.)
+            return await self._send_probe_and_wait(peer_address)
         except Exception as send_error:
-            await self._logger.log(
+            await self._udp_logger.log(
                 ServerDebug(
                     message=f"Confirmation ping to {peer_id} failed: {send_error}",
                     node_host=self._host,
@@ -1063,7 +1068,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Args:
             peer_id: Peer node ID that was confirmed
         """
-        await self._logger.log(
+        await self._udp_logger.log(
             ServerDebug(
                 message=f"RoleAwareConfirmationManager confirmed peer {peer_id}",
                 node_host=self._host,
@@ -1082,7 +1087,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             peer_id: Peer node ID that was removed
             reason: Reason for removal
         """
-        await self._logger.log(
+        await self._udp_logger.log(
             ServerDebug(
                 message=f"RoleAwareConfirmationManager removed peer {peer_id}: {reason}",
                 node_host=self._host,

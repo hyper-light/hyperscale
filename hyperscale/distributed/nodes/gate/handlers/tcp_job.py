@@ -49,7 +49,7 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
 )
 
-from ..state import GateRuntimeState
+from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 
 from hyperscale.distributed.runtime import Clock, RealClock
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from hyperscale.distributed.runtime import Clock, RealClock
 from .pending_indirect_probe import PendingIndirectProbe
-from ..core.protocols import LoggerProtocol
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 
 
 _DEFAULT_CLOCK: Clock = RealClock()

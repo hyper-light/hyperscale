@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from hyperscale.distributed.runtime import Clock, RealClock
-from ..core.types import LeaderRole
+from hyperscale.distributed.swim.core.types import LeaderRole
 
 
 _DEFAULT_CLOCK: Clock = RealClock()

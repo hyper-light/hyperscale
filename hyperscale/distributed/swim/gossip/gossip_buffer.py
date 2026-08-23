@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..core.types import UpdateType
+from hyperscale.distributed.swim.core.types import UpdateType
 from .piggyback_update import PiggybackUpdate
 
 from hyperscale.distributed.runtime import Clock, RealClock

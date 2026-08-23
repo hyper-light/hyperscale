@@ -14,7 +14,7 @@ from collections import deque
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
-from ..core.protocols import LoggerProtocol, TaskRunnerProtocol
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol, TaskRunnerProtocol
 
 from hyperscale.distributed.runtime import Clock, RealClock
 

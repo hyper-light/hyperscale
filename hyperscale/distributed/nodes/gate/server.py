@@ -2603,6 +2603,13 @@ class GateServer(HealthAwareServer):
             job_id=submission.job_id,
             timeout_seconds=submission.timeout_seconds,
         )
+        # An invariant assertion, not a live error path: LOCAL is the
+        # fsync'd append itself, so it cannot fall short. Raising is
+        # only correct while this site requests LOCAL — above it, a
+        # shortfall means the record IS durable here and applied to
+        # ledger state, just not replicated, so the right response
+        # becomes a durability warning on ``level_achieved`` rather
+        # than aborting acceptance for a job that exists.
         if not create_result.success:
             raise RuntimeError(
                 "gate job ledger rejected acceptance record for "
@@ -4273,7 +4280,7 @@ class GateServer(HealthAwareServer):
         candidates: list[DatacenterCandidate] = []
         for datacenter_id in datacenter_ids:
             status = self._classify_datacenter_health(datacenter_id)
-            slo_routing_factor = self._state.get_dc_slo_routing_factor(
+            slo_routing_factor = self._modular_state.get_dc_slo_routing_factor(
                 datacenter_id
             )
             candidates.append(

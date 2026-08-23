@@ -26,7 +26,7 @@ from hyperscale.distributed.models import (
 from hyperscale.logging.hyperscale_logging_models import ServerError, ServerInfo
 
 if TYPE_CHECKING:
-    from ..server import WorkerServer
+    from hyperscale.distributed.nodes.worker.server import WorkerServer
 
 
 class CancelJobWorkflowsHandler:

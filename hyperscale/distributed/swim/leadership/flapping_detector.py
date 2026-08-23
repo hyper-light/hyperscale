@@ -16,7 +16,7 @@ from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
-from ..core.protocols import LoggerProtocol
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 
 
 _DEFAULT_CLOCK: Clock = RealClock()

@@ -12,7 +12,7 @@ from hyperscale.distributed.models import (
 )
 
 if TYPE_CHECKING:
-    from ..server import WorkerServer
+    from hyperscale.distributed.nodes.worker.server import WorkerServer
 
 
 class StateSyncHandler:

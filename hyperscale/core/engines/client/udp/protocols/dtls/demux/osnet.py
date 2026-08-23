@@ -40,7 +40,7 @@ Exceptions:
 
 import socket
 from logging import getLogger
-from ..err import InvalidSocketError
+from hyperscale.core.engines.client.udp.protocols.dtls.err import InvalidSocketError
 
 _logger = getLogger(__name__)
 
