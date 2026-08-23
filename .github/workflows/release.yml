@@ -22,8 +22,14 @@ env:
   PYTHON_VERSION: "3.13"
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
+  # Publication is gated on the test tiers. Without this the only
+  # workflow in the repo published without running a single test.
+  tests:
+    uses: ./.github/workflows/ci.yml
+
   # This workflow contains a single job called "build"
   publish_to_pypi:
+    needs: [ "tests" ]
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
