@@ -6702,10 +6702,25 @@ class GateServer(HealthAwareServer):
 
                 self._log_health_transitions()
 
+                await self._checkpoint_ledger_if_due()
+
             except asyncio.CancelledError:
                 break
             except Exception as error:
                 await self.handle_exception(error, "dead_peer_reap_loop")
+
+    async def _checkpoint_ledger_if_due(self) -> None:
+        """AD-38's compaction cadence, driven by the reap loop's tick.
+
+        The ledger owns the policy and contains its own disk failures,
+        so this is a no-op when the durable tier is unconfigured and
+        two counter reads when a checkpoint is not yet due. Without a
+        caller the WAL never compacts: pending entries accumulate for
+        the process lifetime and a restarted gate replays its whole
+        history from LSN 0 instead of resuming from a snapshot.
+        """
+        if self._job_ledger is not None:
+            await self._job_ledger.maybe_checkpoint()
 
     async def _gate_peer_readmission_loop(self) -> None:
         """Re-admit configured gate peers evicted by false SWIM death.

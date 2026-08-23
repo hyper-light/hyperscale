@@ -5,7 +5,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Awaitable, Mapping
 
-from hyperscale.logging.hyperscale_logging_models import ArchiveError, ArchiveInfo
+from hyperscale.logging.hyperscale_logging_models import (
+    ArchiveError,
+    ArchiveInfo,
+    CheckpointError,
+    CheckpointInfo,
+)
 from hyperscale.logging.lsn import HybridLamportClock
 
 from .archive.job_archive_store import JobArchiveStore
@@ -28,6 +33,7 @@ from .events.job_event import (
     JobCompleted,
 )
 from .job_id import JobIdGenerator
+from .unsatisfiable_durability_error import UnsatisfiableDurabilityError
 from .job_state import JobState
 from .wal.node_wal import NodeWAL
 from .wal.wal_entry import WALEntry
@@ -43,8 +49,70 @@ DEFAULT_COMPLETED_CACHE_SIZE = 10000
 # pre-isolation status quo for every archive failure.
 PENDING_ARCHIVE_LIMIT = 1024
 
+# AD-38's compaction criterion, verbatim from architecture.md's control
+# plane requirements: "Compaction: WAL size bounded to 2x active job
+# state". Compaction only removes entries at or below a checkpoint's
+# LSN, so with no checkpoint ever taken the bound cannot hold at all --
+# pending entries accumulate for the process lifetime and recovery
+# replays from LSN 0. Checkpointing at this ratio is what makes the
+# stated bound true.
+WAL_TO_ACTIVE_STATE_RATIO = 2
+
+# A node with few or no active jobs still needs a floor: at 2x zero the
+# ratio would checkpoint on every single append, trading the unbounded
+# WAL for unbounded checkpoint writes.
+MIN_CHECKPOINT_WAL_ENTRIES = 64
+
+# The ratio alone leaves a LOW-rate node's small WAL un-checkpointed
+# indefinitely, so its recovery cost keeps climbing with uptime while
+# never crossing the floor. This is the age bound that holds
+# architecture.md's other durability criterion -- "Recovery: <30
+# seconds from crash to serving requests" -- for a node that only ever
+# runs a handful of jobs.
+CHECKPOINT_MAX_INTERVAL_SECONDS = 300.0
+
+# Checkpoints on a cadence means checkpoint FILES on a cadence, so
+# retention has to be live for the same reason the cadence does. Above
+# one because recovery walks them newest-first and skips undecodable
+# ones -- the older copies are the fallback for a checkpoint torn by a
+# crash mid-write.
+CHECKPOINT_RETENTION_COUNT = 3
+
 
 class JobLedger:
+    """The durable record of every job this node owns.
+
+    Apply contract
+    --------------
+
+    Each write path appends to the WAL, commits through the durability
+    pipeline, and then applies the event to in-memory state -- and the
+    apply is UNCONDITIONAL, including when the commit reports a level
+    below the one requested.
+
+    That is not a shortcut, it is the only way live and recovered
+    state can agree. The append is fsync'd before the commit runs, and
+    recovery replays every entry it finds: ``_apply_entry`` dispatches
+    purely on event type, while the WAL's applied and durability
+    states live only in memory and are never written back. So an entry
+    whose replication failed is replayed exactly like one whose
+    replication succeeded. Skipping the in-memory apply never undid
+    the durable write -- it only made reads say a job did not exist
+    while a restart said it did.
+
+    Compensating for a failed commit (appending an abandonment record)
+    would reintroduce the same class of divergence through a smaller
+    window, since that record can itself fail to land. Applying
+    unconditionally closes the window entirely: replay reproduces what
+    apply did because both act on the same durable record.
+
+    The commit result still carries the level actually achieved and
+    the error that capped it, which is what a caller needing more than
+    LOCAL durability acts on. A request the node cannot satisfy at all
+    is refused before anything is written -- see
+    ``_require_satisfiable_durability``.
+    """
+
     __slots__ = (
         "_clock",
         "_wal",
@@ -59,6 +127,11 @@ class JobLedger:
         "_next_fence_token",
         "_logger",
         "_pending_archive_jobs",
+        "_checkpoint_wal_ratio",
+        "_min_checkpoint_wal_entries",
+        "_checkpoint_max_interval_seconds",
+        "_checkpoint_retention_count",
+        "_last_checkpoint_at",
     )
 
     def __init__(
@@ -71,6 +144,10 @@ class JobLedger:
         archive_store: JobArchiveStore,
         completed_cache_size: int = DEFAULT_COMPLETED_CACHE_SIZE,
         logger: Logger | None = None,
+        checkpoint_wal_ratio: int = WAL_TO_ACTIVE_STATE_RATIO,
+        min_checkpoint_wal_entries: int = MIN_CHECKPOINT_WAL_ENTRIES,
+        checkpoint_max_interval_seconds: float = CHECKPOINT_MAX_INTERVAL_SECONDS,
+        checkpoint_retention_count: int = CHECKPOINT_RETENTION_COUNT,
     ) -> None:
         self._clock = clock
         self._wal = wal
@@ -87,6 +164,14 @@ class JobLedger:
         self._lock = asyncio.Lock()
         self._next_fence_token = 1
         self._pending_archive_jobs: dict[str, JobState] = {}
+        self._checkpoint_wal_ratio = checkpoint_wal_ratio
+        self._min_checkpoint_wal_entries = min_checkpoint_wal_entries
+        self._checkpoint_max_interval_seconds = checkpoint_max_interval_seconds
+        self._checkpoint_retention_count = checkpoint_retention_count
+        # A fresh ledger starts its interval now, so a node that boots
+        # and immediately appends one entry does not age-trigger on a
+        # clock read that predates its own existence.
+        self._last_checkpoint_at = _DEFAULT_CLOCK.time()
 
     @classmethod
     async def open(
@@ -103,6 +188,10 @@ class JobLedger:
         logger: Logger | None = None,
         clock: HybridLamportClock | None = None,
         filesystem: Filesystem | None = None,
+        checkpoint_wal_ratio: int = WAL_TO_ACTIVE_STATE_RATIO,
+        min_checkpoint_wal_entries: int = MIN_CHECKPOINT_WAL_ENTRIES,
+        checkpoint_max_interval_seconds: float = CHECKPOINT_MAX_INTERVAL_SECONDS,
+        checkpoint_retention_count: int = CHECKPOINT_RETENTION_COUNT,
     ) -> JobLedger:
         """``clock`` lets the owning node share its HLC so ledger
         events are causally ordered against its other WAL/Raft writes;
@@ -122,7 +211,7 @@ class JobLedger:
         )
 
         checkpoint_manager = CheckpointManager(
-            checkpoint_dir=checkpoint_dir, filesystem=filesystem
+            checkpoint_dir=checkpoint_dir, filesystem=filesystem, logger=logger
         )
         await checkpoint_manager.initialize()
 
@@ -145,6 +234,10 @@ class JobLedger:
             archive_store=archive_store,
             completed_cache_size=completed_cache_size,
             logger=logger,
+            checkpoint_wal_ratio=checkpoint_wal_ratio,
+            min_checkpoint_wal_entries=min_checkpoint_wal_entries,
+            checkpoint_max_interval_seconds=checkpoint_max_interval_seconds,
+            checkpoint_retention_count=checkpoint_retention_count,
         )
 
         await ledger._recover()
@@ -158,6 +251,10 @@ class JobLedger:
                 self._jobs_internal[job_id] = JobState.from_dict(job_id, job_dict)
 
             await self._clock.witness(checkpoint.hlc)
+            self._wal.restore_durability_watermarks(
+                regional_lsn=checkpoint.regional_lsn,
+                global_lsn=checkpoint.global_lsn,
+            )
             start_lsn = checkpoint.local_lsn + 1
         else:
             start_lsn = 0
@@ -323,18 +420,36 @@ class JobLedger:
                     hlc=event.hlc,
                 )
 
+    def _require_satisfiable_durability(self, durability: DurabilityLevel) -> None:
+        """Refuse an impossible durability request BEFORE anything is
+        written.
+
+        Every write path appends to the WAL first and only updates
+        in-memory state once the commit succeeds. A request above what
+        the configured replicators can reach can never succeed, so
+        letting it through would fsync an entry describing a job the
+        live node then refuses to track -- reads say it does not
+        exist, and a restart replays the entry and says it does.
+        Raising here is what keeps live and recovered state the same.
+        """
+        achievable = self._pipeline.max_achievable_durability
+        if durability > achievable:
+            raise UnsatisfiableDurabilityError(durability, achievable)
+
     async def create_job(
         self,
         spec_hash: bytes,
         assigned_datacenters: tuple[str, ...],
         requestor_id: str,
-        durability: DurabilityLevel = DurabilityLevel.GLOBAL,
+        durability: DurabilityLevel = DurabilityLevel.LOCAL,
         job_id: str | None = None,
         timeout_seconds: float = 0.0,
     ) -> tuple[str, CommitResult]:
         """``job_id`` records an externally-generated id (the client
         generates job ids at submission); None generates one here (the
         gate path)."""
+        self._require_satisfiable_durability(durability)
+
         async with self._lock:
             if job_id is None:
                 job_id = await self._job_id_generator.generate()
@@ -364,17 +479,20 @@ class JobLedger:
                 backpressure=append_result.backpressure,
             )
 
-            if result.success:
-                self._jobs_internal[job_id] = JobState.create(
-                    job_id=job_id,
-                    fence_token=fence_token,
-                    assigned_datacenters=assigned_datacenters,
-                    created_hlc=hlc,
-                    requestor_id=requestor_id,
-                    timeout_seconds=timeout_seconds,
-                )
-                self._publish_snapshot()
-                await self._wal.mark_applied(append_result.entry.lsn)
+            # Applied unconditionally -- see the class docstring's apply
+            # contract: the fsync'd append is replayed on recovery either
+            # way, so gating this on replication only splits live state
+            # from recovered state.
+            self._jobs_internal[job_id] = JobState.create(
+                job_id=job_id,
+                fence_token=fence_token,
+                assigned_datacenters=assigned_datacenters,
+                created_hlc=hlc,
+                requestor_id=requestor_id,
+                timeout_seconds=timeout_seconds,
+            )
+            self._publish_snapshot()
+            await self._wal.mark_applied(append_result.entry.lsn)
 
             return job_id, result
 
@@ -383,8 +501,10 @@ class JobLedger:
         job_id: str,
         datacenter_id: str,
         worker_count: int,
-        durability: DurabilityLevel = DurabilityLevel.REGIONAL,
+        durability: DurabilityLevel = DurabilityLevel.LOCAL,
     ) -> CommitResult | None:
+        self._require_satisfiable_durability(durability)
+
         async with self._lock:
             job = self._jobs_internal.get(job_id)
             if job is None:
@@ -411,13 +531,16 @@ class JobLedger:
                 backpressure=append_result.backpressure,
             )
 
-            if result.success:
-                self._jobs_internal[job_id] = job.with_accepted(
-                    datacenter_id=datacenter_id,
-                    hlc=hlc,
-                )
-                self._publish_snapshot()
-                await self._wal.mark_applied(append_result.entry.lsn)
+            # Applied unconditionally -- see the class docstring's apply
+            # contract: the fsync'd append is replayed on recovery either
+            # way, so gating this on replication only splits live state
+            # from recovered state.
+            self._jobs_internal[job_id] = job.with_accepted(
+                datacenter_id=datacenter_id,
+                hlc=hlc,
+            )
+            self._publish_snapshot()
+            await self._wal.mark_applied(append_result.entry.lsn)
 
             return result
 
@@ -426,8 +549,10 @@ class JobLedger:
         job_id: str,
         reason: str,
         requestor_id: str,
-        durability: DurabilityLevel = DurabilityLevel.GLOBAL,
+        durability: DurabilityLevel = DurabilityLevel.LOCAL,
     ) -> CommitResult | None:
+        self._require_satisfiable_durability(durability)
+
         async with self._lock:
             job = self._jobs_internal.get(job_id)
             if job is None:
@@ -457,10 +582,13 @@ class JobLedger:
                 backpressure=append_result.backpressure,
             )
 
-            if result.success:
-                self._jobs_internal[job_id] = job.with_cancellation_requested(hlc=hlc)
-                self._publish_snapshot()
-                await self._wal.mark_applied(append_result.entry.lsn)
+            # Applied unconditionally -- see the class docstring's apply
+            # contract: the fsync'd append is replayed on recovery either
+            # way, so gating this on replication only splits live state
+            # from recovered state.
+            self._jobs_internal[job_id] = job.with_cancellation_requested(hlc=hlc)
+            self._publish_snapshot()
+            await self._wal.mark_applied(append_result.entry.lsn)
 
             return result
 
@@ -471,8 +599,10 @@ class JobLedger:
         total_completed: int,
         total_failed: int,
         duration_ms: int,
-        durability: DurabilityLevel = DurabilityLevel.GLOBAL,
+        durability: DurabilityLevel = DurabilityLevel.LOCAL,
     ) -> CommitResult | None:
+        self._require_satisfiable_durability(durability)
+
         async with self._lock:
             job = self._jobs_internal.get(job_id)
             if job is None:
@@ -504,26 +634,29 @@ class JobLedger:
                 backpressure=append_result.backpressure,
             )
 
-            if result.success:
-                completed_job = job.with_completion(
-                    final_status=final_status,
-                    total_completed=total_completed,
-                    total_failed=total_failed,
-                    hlc=hlc,
-                )
+            # Applied unconditionally -- see the class docstring's apply
+            # contract: the fsync'd append is replayed on recovery either
+            # way, so gating this on replication only splits live state
+            # from recovered state.
+            completed_job = job.with_completion(
+                final_status=final_status,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                hlc=hlc,
+            )
 
-                # Reads flip to the terminal the instant it is durable:
-                # the cache/snapshot transition must neither wait on nor
-                # abort with the archive leg — the archive is the
-                # COLD-READ copy, the WAL commit above is the truth.
-                self._completed_cache.put(job_id, completed_job)
-                del self._jobs_internal[job_id]
-                self._publish_snapshot()
+            # Reads flip to the terminal the instant it is durable:
+            # the cache/snapshot transition must neither wait on nor
+            # abort with the archive leg — the archive is the
+            # COLD-READ copy, the WAL commit above is the truth.
+            self._completed_cache.put(job_id, completed_job)
+            del self._jobs_internal[job_id]
+            self._publish_snapshot()
 
-                if await self._archive_job_isolated(completed_job):
-                    await self._heal_pending_archive_jobs()
+            if await self._archive_job_isolated(completed_job):
+                await self._heal_pending_archive_jobs()
 
-                await self._wal.mark_applied(append_result.entry.lsn)
+            await self._wal.mark_applied(append_result.entry.lsn)
 
             return result
 
@@ -568,10 +701,16 @@ class JobLedger:
                 if not job.is_terminal
             }
 
+            # Each watermark reports the tier it actually reached.
+            # Stamping all three from the local fsync watermark made
+            # the persisted checkpoint assert cross-region durability
+            # for entries that never left the node -- the same lie the
+            # commit pipeline stopped telling, one layer down and
+            # written to disk.
             checkpoint = Checkpoint(
                 local_lsn=self._wal.last_synced_lsn,
-                regional_lsn=self._wal.last_synced_lsn,
-                global_lsn=self._wal.last_synced_lsn,
+                regional_lsn=self._wal.last_regional_lsn,
+                global_lsn=self._wal.last_global_lsn,
                 hlc=hlc,
                 job_states=job_states,
                 created_at_ms=int(_DEFAULT_CLOCK.time() * 1000),
@@ -579,8 +718,112 @@ class JobLedger:
 
             path = await self._checkpoint_manager.save(checkpoint)
             await self._wal.compact(up_to_lsn=checkpoint.local_lsn)
+            # Retention runs with every checkpoint, not on its own
+            # cadence: a checkpoint is the only thing that ADDS a file,
+            # so pruning here is what keeps the directory bounded no
+            # matter how often checkpoints are taken.
+            await self._checkpoint_manager.cleanup(
+                keep_count=self._checkpoint_retention_count
+            )
+            self._last_checkpoint_at = _DEFAULT_CLOCK.time()
 
             return path
+
+    def _checkpoint_is_due(self) -> bool:
+        """The AD-38 compaction trigger: pending WAL entries past 2x
+        active job state, or an un-checkpointed WAL older than the
+        interval.
+
+        Read without the lock deliberately. Both inputs are plain
+        counters and the decision is a heuristic -- ``checkpoint()``
+        re-acquires the lock and re-reads state before writing
+        anything, so a racing append only shifts WHEN the next
+        checkpoint happens, never what it contains.
+        """
+        pending_entries = self._wal.pending_count
+        if pending_entries == 0:
+            # Nothing to compact. An idle node never writes a
+            # checkpoint it would immediately re-derive on recovery.
+            return False
+
+        entry_threshold = max(
+            self._min_checkpoint_wal_entries,
+            self._checkpoint_wal_ratio * len(self._jobs_internal),
+        )
+        if pending_entries >= entry_threshold:
+            return True
+
+        elapsed = _DEFAULT_CLOCK.time() - self._last_checkpoint_at
+        return elapsed >= self._checkpoint_max_interval_seconds
+
+    async def maybe_checkpoint(self) -> Path | None:
+        """Checkpoint if one is due, CONTAINED. Returns the checkpoint
+        path when one was written, else ``None``.
+
+        Designed to be called from an owning node's existing periodic
+        loop: the not-due path reads two counters and returns, so the
+        cadence costs a cheap call per tick.
+
+        A checkpoint is pure optimization -- it bounds pending-entry
+        memory and shortens replay, and every entry it would have
+        compacted is still durable in the WAL. So a failing disk must
+        not take down the caller's loop the way an unprotected raise
+        would; the failure is logged loudly and the next tick retries
+        against the (larger) WAL. Only ``OSError`` is contained, since
+        that is the environmental failure this isolates -- anything
+        else is a defect and still propagates.
+        """
+        if not self._checkpoint_is_due():
+            return None
+
+        pending_before = self._wal.pending_count
+
+        try:
+            path = await self.checkpoint()
+        except OSError as checkpoint_error:
+            await self._log_checkpoint_error(
+                type(checkpoint_error).__name__, pending_before
+            )
+            return None
+
+        await self._log_checkpoint_taken(
+            path, pending_before - self._wal.pending_count
+        )
+        return path
+
+    async def _log_checkpoint_taken(self, path: Path, compacted: int) -> None:
+        if self._logger is not None:
+            await self._logger.log(
+                CheckpointInfo(
+                    message=(
+                        f"ledger checkpoint written at LSN "
+                        f"{self._wal.last_synced_lsn}; compacted "
+                        f"{compacted} WAL entries"
+                    ),
+                    path=str(path),
+                    checkpoint_lsn=self._wal.last_synced_lsn,
+                    compacted_entries=compacted,
+                    active_jobs=len(self._jobs_internal),
+                )
+            )
+
+    async def _log_checkpoint_error(
+        self, error_type: str, pending_entries: int
+    ) -> None:
+        if self._logger is not None:
+            await self._logger.log(
+                CheckpointError(
+                    message=(
+                        f"ledger checkpoint not written ({error_type}); "
+                        f"{pending_entries} WAL entries stay pending and "
+                        "recovery replays them -- durability is unaffected, "
+                        "replay cost and memory are not"
+                    ),
+                    path=str(self._checkpoint_manager.checkpoint_dir),
+                    error_type=error_type,
+                    pending_entries=pending_entries,
+                )
+            )
 
     async def close(self) -> None:
         await self._wal.close()

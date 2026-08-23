@@ -72,6 +72,8 @@ class NodeWAL:
         "_state_lock",
         "_logger",
         "_filesystem",
+        "_last_regional_lsn",
+        "_last_global_lsn",
     )
 
     def __init__(
@@ -100,6 +102,12 @@ class NodeWAL:
         self._status_snapshot = WALStatusSnapshot.initial()
         self._pending_snapshot: Mapping[int, WALEntry] = MappingProxyType({})
         self._state_lock = asyncio.Lock()
+        # Highest LSN that actually REACHED each replicated tier. Kept
+        # separately from entry state because compaction removes the
+        # entries: without these the only surviving record of what was
+        # replicated disappears the moment a checkpoint runs.
+        self._last_regional_lsn = 0
+        self._last_global_lsn = 0
 
     @classmethod
     async def open(
@@ -281,6 +289,7 @@ class NodeWAL:
             self._pending_snapshot = MappingProxyType(
                 dict(self._pending_entries_internal)
             )
+            self._last_regional_lsn = max(self._last_regional_lsn, lsn)
             return TransitionResult.SUCCESS
 
     async def mark_global(self, lsn: int) -> TransitionResult:
@@ -302,6 +311,7 @@ class NodeWAL:
             self._pending_snapshot = MappingProxyType(
                 dict(self._pending_entries_internal)
             )
+            self._last_global_lsn = max(self._last_global_lsn, lsn)
             return TransitionResult.SUCCESS
 
     async def mark_applied(self, lsn: int) -> TransitionResult:
@@ -420,6 +430,36 @@ class NodeWAL:
     @property
     def pending_count(self) -> int:
         return self._status_snapshot.pending_count
+
+    @property
+    def last_regional_lsn(self) -> int:
+        """Highest LSN that actually reached REGIONAL durability.
+
+        Zero on a WAL whose entries never replicated -- which is what a
+        deployment with no regional replicator configured must report,
+        rather than borrowing the local fsync watermark.
+        """
+        return self._last_regional_lsn
+
+    @property
+    def last_global_lsn(self) -> int:
+        """Highest LSN that actually reached GLOBAL durability."""
+        return self._last_global_lsn
+
+    def restore_durability_watermarks(
+        self, regional_lsn: int, global_lsn: int
+    ) -> None:
+        """Re-seed the replicated watermarks from a checkpoint at
+        recovery.
+
+        These live in memory, so a restart would otherwise reset them
+        to zero and the next checkpoint would report LESS replication
+        than the previous one had already recorded -- a monotonic
+        watermark moving backwards. Takes the max so replay can only
+        advance them.
+        """
+        self._last_regional_lsn = max(self._last_regional_lsn, regional_lsn)
+        self._last_global_lsn = max(self._last_global_lsn, global_lsn)
 
     @property
     def is_closed(self) -> bool:

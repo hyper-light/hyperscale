@@ -2852,6 +2852,7 @@ class ManagerServer(HealthAwareServer):
                 self._cleanup_stale_dead_manager_tracking(now)
                 self._resend_eviction_notices(now)
                 self._resend_completion_notices(now)
+                await self._checkpoint_ledger_if_due()
 
             except asyncio.CancelledError:
                 break
@@ -2864,6 +2865,18 @@ class ManagerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
+
+    async def _checkpoint_ledger_if_due(self) -> None:
+        """AD-38's compaction cadence, driven by the reap loop's tick.
+
+        The ledger owns the policy and contains its own disk failures,
+        so this is a no-op when the durable tier is unconfigured and
+        two counter reads when a checkpoint is not yet due. Without a
+        caller the WAL never compacts: pending entries accumulate for
+        the process lifetime and recovery replays from LSN 0.
+        """
+        if self._job_ledger is not None:
+            await self._job_ledger.maybe_checkpoint()
 
     def _get_manager_tracked_workflow_ids_for_worker(self, worker_id: str) -> set[str]:
         """Get workflow tokens that the manager thinks are running on a specific worker."""

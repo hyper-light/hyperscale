@@ -22,3 +22,5 @@ dev.yaml
 *.xml
 .ruff_cache/
 *.lock
+.DS_Store
+.scratch/

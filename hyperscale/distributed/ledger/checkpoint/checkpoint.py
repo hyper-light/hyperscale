@@ -4,12 +4,16 @@ import asyncio
 import struct
 import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import msgspec
 
 from hyperscale.distributed.runtime import Filesystem, RealFilesystem
+from hyperscale.logging.hyperscale_logging_models import CheckpointRetentionError
 from hyperscale.logging.lsn import LSN
+
+if TYPE_CHECKING:
+    from hyperscale.logging import Logger
 
 CHECKPOINT_MAGIC = b"HSCL"
 CHECKPOINT_VERSION = 1
@@ -32,16 +36,24 @@ class Checkpoint(msgspec.Struct, frozen=True):
 
 
 class CheckpointManager:
-    __slots__ = ("_checkpoint_dir", "_lock", "_latest_checkpoint", "_filesystem")
+    __slots__ = (
+        "_checkpoint_dir",
+        "_lock",
+        "_latest_checkpoint",
+        "_filesystem",
+        "_logger",
+    )
 
     def __init__(
         self,
         checkpoint_dir: Path,
         filesystem: Filesystem | None = None,
+        logger: Logger | None = None,
     ) -> None:
         self._checkpoint_dir = checkpoint_dir
         self._lock = asyncio.Lock()
         self._latest_checkpoint: Checkpoint | None = None
+        self._logger = logger
         # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
         self._filesystem = (
             filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
@@ -131,6 +143,20 @@ class CheckpointManager:
         return final_path
 
     async def cleanup(self, keep_count: int = 3) -> int:
+        """Prune all but the newest ``keep_count`` checkpoints.
+
+        Retention is above one on purpose: ``_load_latest`` walks the
+        files newest-first and skips any that fail to decode, so the
+        older copies are the recovery fallback for a checkpoint torn by
+        a crash mid-write. Pruning to one would make the newest file a
+        single point of failure for the whole ledger's recovery.
+
+        A delete that fails leaves a stale file behind and is retried by
+        the next cleanup, so it does not abort the remaining deletes --
+        but it IS logged, because silently failing deletes are how a
+        checkpoint directory grows without bound while every metric
+        says retention is working.
+        """
         checkpoint_files = sorted(
             await self._filesystem.list_directory(
                 self._checkpoint_dir, "checkpoint_*.bin"
@@ -143,10 +169,30 @@ class CheckpointManager:
             try:
                 await self._filesystem.remove(checkpoint_file)
                 removed_count += 1
-            except OSError:
-                pass
+            except OSError as removal_error:
+                await self._log_retention_error(checkpoint_file, removal_error)
 
         return removed_count
+
+    async def _log_retention_error(
+        self, checkpoint_file: Path, removal_error: OSError
+    ) -> None:
+        if self._logger is not None:
+            await self._logger.log(
+                CheckpointRetentionError(
+                    message=(
+                        f"stale checkpoint {checkpoint_file.name} not "
+                        f"removed ({type(removal_error).__name__}); it stays "
+                        "on disk and the next cleanup retries it"
+                    ),
+                    path=str(checkpoint_file),
+                    error_type=type(removal_error).__name__,
+                )
+            )
+
+    @property
+    def checkpoint_dir(self) -> Path:
+        return self._checkpoint_dir
 
     @property
     def latest(self) -> Checkpoint | None:

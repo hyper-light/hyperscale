@@ -261,6 +261,27 @@ class WALError(Entry, kw_only=True):
     level: LogLevel = LogLevel.ERROR
 
 
+class CheckpointInfo(Entry, kw_only=True):
+    path: str
+    checkpoint_lsn: int
+    compacted_entries: int
+    active_jobs: int
+    level: LogLevel = LogLevel.INFO
+
+
+class CheckpointError(Entry, kw_only=True):
+    path: str
+    error_type: str
+    pending_entries: int
+    level: LogLevel = LogLevel.ERROR
+
+
+class CheckpointRetentionError(Entry, kw_only=True):
+    path: str
+    error_type: str
+    level: LogLevel = LogLevel.ERROR
+
+
 class ArchiveInfo(Entry, kw_only=True):
     path: str
     job_id: str

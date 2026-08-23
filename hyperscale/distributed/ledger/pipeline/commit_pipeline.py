@@ -100,6 +100,23 @@ class CommitPipeline:
         self._global_timeout = global_timeout
         self._logger = logger
 
+    @property
+    def max_achievable_durability(self) -> DurabilityLevel:
+        """The highest level this pipeline is CONFIGURED to reach.
+
+        Escalation is strictly ordered -- an entry only becomes
+        globally durable after it is regionally durable -- so a global
+        replicator with no regional one behind it still tops out at
+        LOCAL. Callers use this to refuse an impossible request before
+        writing anything, rather than discovering it from a failed
+        commit after the append has already happened.
+        """
+        if self._regional_replicator is None:
+            return DurabilityLevel.LOCAL
+        if self._global_replicator is None:
+            return DurabilityLevel.REGIONAL
+        return DurabilityLevel.GLOBAL
+
     async def commit(
         self,
         entry: WALEntry,
@@ -116,6 +133,25 @@ class CommitPipeline:
             )
 
         if required_level >= DurabilityLevel.REGIONAL:
+            if self._regional_replicator is None:
+                # An absent replicator cannot satisfy a durability
+                # requirement. ``_replicate_regional`` used to return
+                # True in this case, so the entry advanced to REGIONAL
+                # (and on to GLOBAL) and the CommitResult REPORTED
+                # cross-region durability while nothing had left this
+                # node — the caller's ack, its WAL state transition and
+                # its operator-facing level were all a lie. Report the
+                # level actually achieved (LOCAL) and name the cause.
+                return CommitResult(
+                    entry=entry,
+                    level_achieved=level_achieved,
+                    error=RuntimeError(
+                        "REGIONAL durability requested but no regional "
+                        "replicator is configured; entry is LOCAL-durable "
+                        "only"
+                    ),
+                    backpressure=backpressure,
+                )
             try:
                 regional_success = await self._replicate_regional(entry)
                 if regional_success:
@@ -153,6 +189,18 @@ class CommitPipeline:
                 )
 
         if required_level >= DurabilityLevel.GLOBAL:
+            if self._global_replicator is None:
+                # Same contract as the regional branch above.
+                return CommitResult(
+                    entry=entry,
+                    level_achieved=level_achieved,
+                    error=RuntimeError(
+                        "GLOBAL durability requested but no global "
+                        "replicator is configured; entry is "
+                        f"{level_achieved.name}-durable only"
+                    ),
+                    backpressure=backpressure,
+                )
             try:
                 global_success = await self._replicate_global(entry)
                 if global_success:
@@ -196,18 +244,16 @@ class CommitPipeline:
         )
 
     async def _replicate_regional(self, entry: WALEntry) -> bool:
-        if self._regional_replicator is None:
-            return True
-
+        # ``commit`` gates on configuration before calling this, so a
+        # missing replicator can no longer be silently reported as a
+        # successful replication.
         return await _DEFAULT_CLOCK.wait_for(
             self._regional_replicator(entry),
             timeout=self._regional_timeout,
         )
 
     async def _replicate_global(self, entry: WALEntry) -> bool:
-        if self._global_replicator is None:
-            return True
-
+        # See ``_replicate_regional``.
         return await _DEFAULT_CLOCK.wait_for(
             self._global_replicator(entry),
             timeout=self._global_timeout,
