@@ -45,6 +45,41 @@ class RaftNode:
     Roles: follower, candidate, leader.
     Thread safety: All public methods acquire _lock.
     Memory: Call destroy() on job completion to release all state.
+
+    Volatility -- a deliberate decision, not an omission
+    ----------------------------------------------------
+
+    ``current_term``, ``voted_for``, and the log live only in memory:
+    a process restart loses all three. The Raft paper requires them
+    durable, and ``RaftWAL`` / ``SnapshotManager`` exist and are
+    tested -- they are deliberately NOT wired here, because AD-52's
+    formation protocol requires zero persistent storage on any node
+    ("no PVCs, no local files surviving restart"), and wiring
+    per-job Raft WALs would re-introduce exactly the local-disk
+    correctness dependency it forbids.
+
+    What the lost guarantees would have prevented, and what contains
+    the loss instead:
+
+    * **Double vote.** Node ids are address-derived, so a manager
+      that restarts mid-election rejoins under its old identity with
+      ``voted_for`` cleared and can vote twice in the same term --
+      two leaders for one job's group. The window is one election
+      round (restart + rejoin inside a seconds-scale timeout), and
+      the damage is bounded one layer up: every dispatch a job
+      leader issues carries a fence token that workers and gates
+      validate, so the elder of two leaders is fenced out at the
+      first boundary it touches.
+
+    * **Log loss.** A restarted member returns with an empty log.
+      Groups are per-job and die with the job; the durable record of
+      job state is the AD-38 ledger tier, not this log, so replay
+      correctness never depends on a Raft entry surviving a crash.
+
+    If a deployment mode ever genuinely needs restart-surviving
+    consensus, wire ``RaftWAL`` behind a constructor parameter and
+    persist term/vote BEFORE acking votes -- and reconcile that
+    decision with AD-52 first.
     """
 
     __slots__ = (
