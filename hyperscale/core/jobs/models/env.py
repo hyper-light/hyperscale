@@ -30,7 +30,10 @@ class Env(BaseModel):
     MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_SHUTDOWN_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "replace"
-    MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
+    # Secure by default: peer certificates are checked against the
+    # connected host. Set to "false" only for local certs without
+    # matching SAN entries.
+    MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "true"
     MERCURY_SYNC_MAX_CONNECT_TIME: StrictStr = "120s"  # Maximum time to wait for client connection
 
     @classmethod

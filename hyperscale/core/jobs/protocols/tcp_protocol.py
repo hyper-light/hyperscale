@@ -464,6 +464,17 @@ class TCPProtocol(Generic[T, K]):
                         lambda: MercurySyncTCPClientProtocol(self.read),
                         sock=tcp_socket,
                         ssl=self._client_ssl_context,
+                        # asyncio requires server_hostname whenever ssl
+                        # is used with a pre-connected socket -- without
+                        # it every TLS connect died with ValueError
+                        # before the handshake, hostname verification on
+                        # or off. With verification on, this is also the
+                        # name the peer certificate is checked against.
+                        server_hostname=(
+                            address[0]
+                            if self._client_ssl_context is not None
+                            else None
+                        ),
                     ),
                     timeout=attempt_timeout,
                 )

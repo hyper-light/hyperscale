@@ -26,6 +26,7 @@ from hyperscale.distributed.protocol.version import (
 from hyperscale.distributed.reliability import BackpressureLevel, BackpressureSignal
 from hyperscale.distributed.discovery.security import RoleValidator
 from hyperscale.distributed.discovery.security.role_validator import (
+    CertificateParseError,
     NodeRole as SecurityNodeRole,
 )
 from hyperscale.distributed.server.protocol.utils import get_peer_certificate_der
@@ -302,11 +303,35 @@ class GateManagerHandler:
             # Role-based mTLS validation (AD-28 Issue 1)
             cert_der = get_peer_certificate_der(transport)
             if cert_der is not None:
-                claims = RoleValidator.extract_claims_from_cert(
-                    cert_der,
-                    default_cluster=self._env.CLUSTER_ID,
-                    default_environment=self._env.ENVIRONMENT_ID,
-                )
+                try:
+                    claims = self._role_validator.extract_peer_claims(cert_der)
+                except CertificateParseError as parse_error:
+                    # Strict mode treats an unparseable certificate as
+                    # a validation failure, not a fallback to defaults
+                    # -- the defaults are this gate's own cluster and
+                    # environment, so defaulted claims would pass
+                    # validate_claims below (and parse to CLIENT, an
+                    # allowed edge into gates).
+                    self._task_runner.run(
+                        self._logger.log,
+                        ServerWarning(
+                            message=(
+                                f"Manager {heartbeat.node_id} rejected: "
+                                f"unparseable certificate in strict mode: {parse_error}"
+                            ),
+                            node_host=self._get_host(),
+                            node_port=self._get_tcp_port(),
+                            node_id=self._get_node_id().short,
+                        ),
+                    )
+                    return ManagerRegistrationResponse(
+                        accepted=False,
+                        gate_id=self._get_node_id().full,
+                        healthy_gates=[],
+                        error=f"Certificate validation failed: unparseable certificate: {parse_error}",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    ).dump()
 
                 validation_result = self._role_validator.validate_claims(claims)
                 if not validation_result.allowed:

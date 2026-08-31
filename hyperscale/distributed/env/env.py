@@ -28,7 +28,10 @@ class Env(BaseModel):
     MERCURY_SYNC_TCP_SERVER_BACKLOG: StrictInt = 4096
     MERCURY_SYNC_UDP_SERVER_RCVBUF: StrictInt = 4 * 1024 * 1024
     MERCURY_SYNC_VERIFY_SSL_CERT: Literal["REQUIRED", "OPTIONAL", "NONE"] = "REQUIRED"
-    MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
+    # Secure by default: peer certificates are checked against the
+    # connected host. Set to "false" only for local certs without
+    # matching SAN entries.
+    MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "true"
 
     # Monitor Settings (for CPU/Memory monitors in workers)
     MERCURY_SYNC_MONITOR_SAMPLE_WINDOW: StrictStr = "5s"

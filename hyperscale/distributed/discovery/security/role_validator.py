@@ -305,6 +305,37 @@ class RoleValidator:
             source_claims=claims,
         )
 
+    def extract_peer_claims(self, cert_der: bytes) -> CertificateClaims:
+        """Parse a peer certificate under THIS validator's configured
+        strictness and identity.
+
+        The static parser below is configuration-blind: its permissive
+        ``strict=False`` default meant every production call site had
+        to remember to thread the node's strict flag through — and none
+        did, so with ``mtls_strict_mode`` enabled a garbage certificate
+        still fell back to defaults. The defaults are this node's OWN
+        cluster and environment ids, so the defaulted claims passed
+        ``validate_claims`` — an unparseable certificate authenticated
+        as a well-configured CLIENT (FIX.md 1.1, scenario 41.23).
+
+        Strictness and the default identity are init-state
+        configuration; both nodes already construct their validator
+        with ``strict_mode`` wired from config. Routing the parse
+        through the instance makes it impossible for a call site to
+        disagree with that configuration.
+
+        Raises:
+            CertificateParseError: In strict mode, when the certificate
+                cannot be parsed or required claims are missing. Callers
+                treat this as a validation failure and reject the peer.
+        """
+        return self.extract_claims_from_cert(
+            cert_der,
+            default_cluster=self.cluster_id,
+            default_environment=self.environment_id,
+            strict=self.strict_mode,
+        )
+
     @staticmethod
     def extract_claims_from_cert(
         cert_der: bytes,

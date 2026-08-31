@@ -12,6 +12,7 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.protocol.version import CURRENT_PROTOCOL_VERSION
 from hyperscale.distributed.discovery.security.role_validator import (
+    CertificateParseError,
     RoleValidator,
 )
 from hyperscale.distributed.server.protocol.utils import get_peer_certificate_der
@@ -113,11 +114,34 @@ class WorkerRegistrationHandler:
             # Role-based mTLS validation (AD-28 Issue 1)
             cert_der = get_peer_certificate_der(transport)
             if cert_der is not None:
-                claims = RoleValidator.extract_claims_from_cert(
-                    cert_der,
-                    default_cluster=self._config.cluster_id,
-                    default_environment=self._config.environment_id,
-                )
+                try:
+                    claims = self._role_validator.extract_peer_claims(cert_der)
+                except CertificateParseError as parse_error:
+                    # Strict mode treats an unparseable certificate as
+                    # a validation failure, not a fallback to defaults
+                    # -- the defaults are this node's own cluster and
+                    # environment, so defaulted claims would pass
+                    # validate_claims below.
+                    self._task_runner.run(
+                        self._logger.log,
+                        ServerWarning(
+                            message=(
+                                f"Worker {registration.node.node_id} rejected: "
+                                f"unparseable certificate in strict mode: {parse_error}"
+                            ),
+                            node_host=self._config.host,
+                            node_port=self._config.tcp_port,
+                            node_id=self._node_id,
+                        ),
+                    )
+                    return RegistrationResponse(
+                        accepted=False,
+                        manager_id=self._node_id,
+                        healthy_managers=[],
+                        error=f"Certificate validation failed: unparseable certificate: {parse_error}",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    ).dump()
 
                 validation_result = self._role_validator.validate_claims(claims)
                 if not validation_result.allowed:

@@ -138,7 +138,10 @@ from hyperscale.distributed.protocol.version import (
     negotiate_capabilities,
     get_features_for_version,
 )
-from hyperscale.distributed.discovery.security.role_validator import RoleValidator
+from hyperscale.distributed.discovery.security.role_validator import (
+    CertificateParseError,
+    RoleValidator,
+)
 from hyperscale.distributed.server.protocol.utils import get_peer_certificate_der
 from hyperscale.distributed.nodes.manager.health import NodeStatus
 from hyperscale.distributed.jobs import (
@@ -6138,11 +6141,24 @@ class ManagerServer(HealthAwareServer):
         transport = self._tcp_server_request_transports.get(addr)
         cert_der = get_peer_certificate_der(transport) if transport else None
         if cert_der is not None:
-            claims = RoleValidator.extract_claims_from_cert(
-                cert_der,
-                default_cluster=self._config.cluster_id,
-                default_environment=self._config.environment_id,
-            )
+            try:
+                claims = self._role_validator.extract_peer_claims(cert_der)
+            except CertificateParseError as parse_error:
+                # Strict mode treats an unparseable certificate as a
+                # validation failure, not a fallback to defaults -- the
+                # defaults are this node's own cluster/environment, so
+                # defaulted claims would pass every check below.
+                reason = f"unparseable certificate in strict mode: {parse_error}"
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"{peer_label} {peer_id} rejected: {reason}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return f"Certificate validation failed: {reason}"
+
             if claims.cluster_id != self._config.cluster_id:
                 reason = f"Cluster mismatch: {claims.cluster_id} != {self._config.cluster_id}"
                 await self._udp_logger.log(

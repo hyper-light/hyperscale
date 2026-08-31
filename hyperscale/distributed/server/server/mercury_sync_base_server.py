@@ -918,6 +918,17 @@ class MercurySyncBaseServer(Generic[T]):
                     lambda: MercurySyncTCPProtocol(self),
                     sock=tcp_socket,
                     ssl=self._client_tcp_ssl_context,
+                    # asyncio requires server_hostname whenever ssl is
+                    # used with a pre-connected socket -- without it
+                    # every TLS connect died with ValueError before the
+                    # handshake, hostname verification on or off. With
+                    # verification on, this is also the name the peer
+                    # certificate is checked against.
+                    server_hostname=(
+                        address[0]
+                        if self._client_tcp_ssl_context is not None
+                        else None
+                    ),
                 )
 
                 self._tcp_client_transports[address] = client_transport
