@@ -45,7 +45,7 @@ WEAK_SECRETS = frozenset([
     "hyperscale",
     "hyperscalelocal",
     "hyperscale-local",
-    "hyperscale-dev-secret-change-in-prod",
+    "hyperscale-secret",
     "hyperscale-local-dev-secret",
     "secret",
     "password",

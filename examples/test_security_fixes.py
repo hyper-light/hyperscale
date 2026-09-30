@@ -309,7 +309,7 @@ def test_weak_secret_warning():
     try:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            env = Env(MERCURY_SYNC_AUTH_SECRET="hyperscale-dev-secret-change-in-prod")
+            env = Env(MERCURY_SYNC_AUTH_SECRET="hyperscale-secret")
             AESGCMFernet(env)
             
             # Should have warning
@@ -328,7 +328,7 @@ def test_weak_secret_error_production():
     os.environ['HYPERSCALE_ENV'] = 'production'
     
     try:
-        env = Env(MERCURY_SYNC_AUTH_SECRET="hyperscale-dev-secret-change-in-prod")
+        env = Env(MERCURY_SYNC_AUTH_SECRET="hyperscale-secret")
         AESGCMFernet(env)
         assert False, "Should have raised"
     except ValueError as e:

@@ -45,7 +45,7 @@ ENCRYPTION_CONTEXT = b"hyperscale-distributed-rewrite-encryption-v1"
 
 # List of known weak/default secrets that should be rejected
 WEAK_SECRETS = frozenset([
-    'hyperscale-dev-secret-change-in-prod',
+    'hyperscale-secret',
     'secret',
     'password',
     'changeme',

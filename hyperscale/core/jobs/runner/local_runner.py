@@ -70,7 +70,7 @@ class LocalRunner:
         if env is None:
             env = Env(
                 MERCURY_SYNC_AUTH_SECRET=os.getenv(
-                    "MERCURY_SYNC_AUTH_SECRET", "hyperscale-dev-secret-change-in-prod"
+                    "MERCURY_SYNC_AUTH_SECRET", "hyperscale-secret"
                 ),
             )
 
