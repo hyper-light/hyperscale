@@ -4434,6 +4434,11 @@ class ManagerServer(HealthAwareServer):
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
+            # AD-28: real isolation ids, not the model's "hyperscale"/
+            # "default" placeholders -- a gate validating isolation on
+            # this heartbeat must see the configured values.
+            cluster_id=self._config.cluster_id,
+            environment_id=self._config.environment_id,
             is_leader=self.is_leader(),
             term=self._leader_election.state.current_term,
             version=self._manager_state.state_version,
@@ -4454,6 +4459,20 @@ class ManagerServer(HealthAwareServer):
             overloaded_worker_count=health_state_counts.get("overloaded", 0),
             stressed_worker_count=health_state_counts.get("stressed", 0),
             busy_worker_count=health_state_counts.get("busy", 0),
+            # AD-19/AD-43 capacity piggyback, from the same sources the
+            # SWIM-embedded heartbeat already reports. The model's
+            # defaults (accepting=True, has_quorum=True, throughput=0)
+            # made every manager read "ready" at the gate regardless of
+            # its actual state: the gate's health coordinator feeds
+            # these two booleans straight into ManagerHealthState
+            # readiness, so a draining or quorum-less manager kept
+            # receiving jobs.
+            health_accepting_jobs=(
+                self._manager_state.manager_state_enum == ManagerStateEnum.ACTIVE
+            ),
+            health_has_quorum=self._has_quorum_available(),
+            health_throughput=self._get_dispatch_throughput(),
+            health_expected_throughput=self._get_expected_dispatch_throughput(),
             health_overload_state=self._manager_health_state_snapshot,
             # AD-19 addendum (Phase D): manager's own LHM + max worker LHM
             lhm_score=self._local_health.score,

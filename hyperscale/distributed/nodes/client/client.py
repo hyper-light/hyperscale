@@ -318,6 +318,8 @@ class HyperscaleClient(MercurySyncBaseServer):
         on_workflow_result: Callable[[WorkflowResultPush], None] | None = None,
         reporting_configs: list | None = None,
         on_reporter_result: Callable[[ReporterResultPush], None] | None = None,
+        retry_budget: int = 0,
+        retry_budget_per_workflow: int = 0,
     ) -> str:
         """Submit a job for execution (delegates to ClientJobSubmitter).
 
@@ -334,6 +336,11 @@ class HyperscaleClient(MercurySyncBaseServer):
         ``workflow.duration × HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER``
         (1.5 by default). Pass a positive number to force an explicit
         per-job override that the manager honors verbatim.
+
+        AD-44: ``retry_budget`` caps total workflow retries across the
+        job and ``retry_budget_per_workflow`` caps any single workflow;
+        0 (the default) applies the manager's configured defaults, and
+        the manager clamps explicit values to its configured maxima.
         """
         return await self._submitter.submit_job(
             workflows=workflows,
@@ -346,6 +353,8 @@ class HyperscaleClient(MercurySyncBaseServer):
             on_workflow_result=on_workflow_result,
             reporting_configs=reporting_configs,
             on_reporter_result=on_reporter_result,
+            retry_budget=retry_budget,
+            retry_budget_per_workflow=retry_budget_per_workflow,
         )
 
     async def wait_for_job(

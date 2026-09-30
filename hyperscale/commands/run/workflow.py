@@ -1,11 +1,7 @@
 import asyncio
-import functools
-import json
-import os
 import sys
 
 import cloudpickle
-import psutil
 
 try:
     import uvloop
@@ -20,51 +16,21 @@ from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow
 from hyperscale.logging import LoggingConfig, LogLevelName
 
-from .cli import (
-    CLI,
+from hyperscale.commands.cli import (
     AssertSet,
     ImportType,
     JsonFile,
+    command,
 )
 
-
-async def get_default_workers():
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        functools.partial(
-            psutil.cpu_count,
-            logical=False,
-        ),
-    )
+from .shared import get_default_workers, get_default_config
 
 
-def get_default_config():
-    config = HyperscaleConfig()
-    config_path = ".hyperscale.config.json"
-    if not os.path.exists(config_path):
-        with open(config_path, "w") as config_file:
-            json.dump(
-                config.model_dump(),
-                config_file,
-                indent=4,
-            )
-
-    else:
-        with open(config_path, "r") as config_file:
-            config_data = json.load(config_file)
-            config_data["logs_directory"] = os.path.join(
-                os.getcwd(),
-                "logs",
-            )
-
-            config = HyperscaleConfig(**config_data)
-
-    return config
 
 
-@CLI.command()
-async def run(
+
+@command()
+async def workflow(
     path: ImportType[Workflow],
     config: JsonFile[HyperscaleConfig] = get_default_config,
     log_level: AssertSet[LogLevelName] = "fatal",

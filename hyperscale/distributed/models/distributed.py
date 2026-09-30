@@ -938,6 +938,13 @@ class JobSubmission(Message):
     capabilities: str = ""  # Comma-separated feature list
     # Idempotency key (AD-40) - if provided, gate uses idempotency cache to prevent duplicate processing
     idempotency_key: str | None = None
+    # AD-44 retry budgets. 0 means "use the manager's configured
+    # default" (RetryBudgetManager.create_budget resolves 0 through
+    # retry_budget_default / retry_budget_per_workflow_default and caps
+    # at the configured maxima), so an old client that never sets these
+    # behaves exactly as before the fields existed.
+    retry_budget: int = 0  # Total retry budget for the job
+    retry_budget_per_workflow: int = 0  # Per-workflow retry cap
 
 
 @dataclass(slots=True)

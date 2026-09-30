@@ -114,6 +114,8 @@ class ClientJobSubmitter:
         on_workflow_result: Callable[[WorkflowResultPush], None] | None = None,
         reporting_configs: list | None = None,
         on_reporter_result: Callable[[ReporterResultPush], None] | None = None,
+        retry_budget: int = 0,
+        retry_budget_per_workflow: int = 0,
     ) -> str:
         """
         Submit a job for execution.
@@ -129,6 +131,8 @@ class ClientJobSubmitter:
             on_workflow_result: Callback for workflow completion results (optional)
             reporting_configs: List of ReporterConfig objects for result submission (optional)
             on_reporter_result: Callback for reporter submission results (optional)
+            retry_budget: AD-44 total retry cap for the job (0 = manager default)
+            retry_budget_per_workflow: AD-44 per-workflow retry cap (0 = manager default)
 
         Returns:
             job_id: Unique identifier for the submitted job
@@ -181,6 +185,8 @@ class ClientJobSubmitter:
             datacenter_count=datacenter_count,
             datacenters=datacenters or [],
             reporting_configs_bytes=reporting_configs_bytes,
+            retry_budget=retry_budget,
+            retry_budget_per_workflow=retry_budget_per_workflow,
         )
 
         # Initialize job tracking
@@ -271,6 +277,8 @@ class ClientJobSubmitter:
         datacenters: list[str],
         reporting_configs_bytes: bytes,
         timeout_seconds_explicit: bool = False,
+        retry_budget: int = 0,
+        retry_budget_per_workflow: int = 0,
     ) -> JobSubmission:
         """
         Build JobSubmission message with protocol version.
@@ -310,6 +318,9 @@ class ClientJobSubmitter:
             # cross-manager retry of the same call cannot duplicate the
             # job; the manager ledger dedups on it.
             idempotency_key=str(self._idempotency_key_generator.generate()),
+            # AD-44: 0 lets the manager's configured defaults apply.
+            retry_budget=retry_budget,
+            retry_budget_per_workflow=retry_budget_per_workflow,
         )
 
     async def _submit_with_retry(

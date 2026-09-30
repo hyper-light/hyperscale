@@ -18,8 +18,6 @@ import os
 import socket
 import sys
 import time
-import traceback
-import random
 import cloudpickle
 from dataclasses import dataclass
 from typing import Callable, Any
@@ -32,17 +30,11 @@ from hyperscale.distributed.nodes import WorkerServer, ManagerServer, GateServer
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.models import (
     JobSubmission,
-    JobAck,
-    WorkflowDispatch,
-    WorkflowProgress,
-    JobStatus,
-    WorkflowStatus,
 )
 
 # Import workflow components
 try:
     from hyperscale.graph import Workflow, step
-    from hyperscale.testing import URL, HTTPResponse
     WORKFLOW_AVAILABLE = True
 except ImportError:
     WORKFLOW_AVAILABLE = False
@@ -199,7 +191,7 @@ def create_env():
 
 async def create_worker(
     ports: NodePorts,
-    manager_addrs: list[tuple[str, int]] | None = None,
+    seed_managers: list[tuple[str, int]] | None = None,
     dc_id: str = "test-dc",
     total_cores: int = 4,
 ) -> WorkerServer:
@@ -211,7 +203,7 @@ async def create_worker(
         env=create_env(),
         dc_id=dc_id,
         total_cores=total_cores,
-        manager_addrs=manager_addrs or [],
+        seed_managers=seed_managers or [],
     )
     return worker
 
@@ -514,7 +506,7 @@ async def test_worker_registers_with_manager():
     manager = await create_manager(manager_ports)
     worker = await create_worker(
         worker_ports,
-        manager_addrs=[manager_ports.tcp_addr],
+        seed_managers=[manager_ports.tcp_addr],
     )
     
     try:
@@ -554,7 +546,7 @@ async def test_multiple_workers_single_manager():
             worker_ports = NodePorts()
             worker = await create_worker(
                 worker_ports,
-                manager_addrs=[manager_ports.tcp_addr],
+                seed_managers=[manager_ports.tcp_addr],
                 total_cores=2,
             )
             workers.append(worker)
@@ -726,7 +718,7 @@ async def test_workers_to_multiple_managers_state_sync():
         for ports in worker_ports_list:
             worker = await create_worker(
                 ports,
-                manager_addrs=all_manager_tcp,
+                seed_managers=all_manager_tcp,
                 total_cores=2,
             )
             workers.append(worker)
@@ -855,7 +847,7 @@ async def test_manager_detects_worker_failure():
     manager = await create_manager(manager_ports)
     worker = await create_worker(
         worker_ports,
-        manager_addrs=[manager_ports.tcp_addr],
+        seed_managers=[manager_ports.tcp_addr],
     )
     
     try:
@@ -902,7 +894,7 @@ async def test_worker_detects_manager_failure():
     # Worker knows about both managers
     worker = await create_worker(
         worker_ports,
-        manager_addrs=[manager1_ports.tcp_addr, manager2_ports.tcp_addr],
+        seed_managers=[manager1_ports.tcp_addr, manager2_ports.tcp_addr],
     )
     
     try:
@@ -1077,7 +1069,7 @@ async def test_job_submission_full_pipeline():
     )
     worker = await create_worker(
         worker_ports,
-        manager_addrs=[manager_ports.tcp_addr],
+        seed_managers=[manager_ports.tcp_addr],
         total_cores=4,
     )
     
@@ -1135,7 +1127,7 @@ async def test_multi_workflow_job():
     manager = await create_manager(manager_ports)
     worker = await create_worker(
         worker_ports,
-        manager_addrs=[manager_ports.tcp_addr],
+        seed_managers=[manager_ports.tcp_addr],
         total_cores=8,
     )
     
@@ -1284,7 +1276,7 @@ async def test_full_cluster():
         for ports in worker_ports:
             worker = await create_worker(
                 ports,
-                manager_addrs=all_manager_tcp,
+                seed_managers=all_manager_tcp,
                 total_cores=4,
             )
             workers.append(worker)
@@ -1326,7 +1318,7 @@ async def test_graceful_shutdown():
     manager = await create_manager(manager_ports)
     worker = await create_worker(
         worker_ports,
-        manager_addrs=[manager_ports.tcp_addr],
+        seed_managers=[manager_ports.tcp_addr],
     )
     
     try:

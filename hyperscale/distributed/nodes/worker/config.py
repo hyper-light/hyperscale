@@ -27,6 +27,31 @@ def _get_os_cpus() -> int:
     return _DEFAULT_SYSTEM_RESOURCES.cpu_count(logical=False)
 
 
+def _resolve_total_cores(env: Env, explicit_total_cores: int | None) -> int:
+    """Resolve the worker's executor core count.
+
+    Precedence: an explicit constructor value, then ``WORKER_MAX_CORES``
+    (unset or ``0`` means "auto"), then the physical core count. Values
+    below one are rejected instead of being coerced — a zero-core worker
+    would register but could never accept dispatch.
+    """
+    if explicit_total_cores is not None:
+        return _require_positive_core_count(explicit_total_cores, "total_cores")
+
+    if env.WORKER_MAX_CORES:
+        return _require_positive_core_count(env.WORKER_MAX_CORES, "WORKER_MAX_CORES")
+
+    return _get_os_cpus()
+
+
+def _require_positive_core_count(core_count: int, source_name: str) -> int:
+    """Return ``core_count`` or raise when it cannot host an executor."""
+    if core_count < 1:
+        raise ValueError(f"{source_name} must be at least 1, got {core_count}")
+
+    return core_count
+
+
 def _default_env_value(name: str):
     """Return the canonical distributed Env default for ``name``."""
     return getattr(Env(), name)
@@ -123,6 +148,7 @@ class WorkerConfig:
         tcp_port: int,
         udp_port: int,
         datacenter_id: str = "default",
+        total_cores: int | None = None,
     ) -> WorkerConfig:
         """
         Create worker configuration from Env object.
@@ -133,14 +159,17 @@ class WorkerConfig:
             tcp_port: Worker TCP port
             udp_port: Worker UDP port
             datacenter_id: Datacenter identifier
+            total_cores: Explicit executor core count for this worker.
+                ``None`` defers to ``WORKER_MAX_CORES`` and then to the
+                machine's physical core count.
 
         Returns:
             WorkerConfig instance
-        """
-        total_cores = getattr(env, "WORKER_MAX_CORES", None)
-        if not total_cores:
-            total_cores = _get_os_cpus()
 
+        Raises:
+            ValueError: ``total_cores`` is explicitly less than one — a
+                worker with no executor slots can never be dispatched to.
+        """
         default_env = Env()
 
         return cls(
@@ -148,7 +177,7 @@ class WorkerConfig:
             tcp_port=tcp_port,
             udp_port=udp_port,
             datacenter_id=datacenter_id,
-            total_cores=total_cores,
+            total_cores=_resolve_total_cores(env, total_cores),
             tcp_timeout_short_seconds=getattr(env, "WORKER_TCP_TIMEOUT_SHORT", 2.0),
             tcp_timeout_standard_seconds=getattr(
                 env, "WORKER_TCP_TIMEOUT_STANDARD", 5.0

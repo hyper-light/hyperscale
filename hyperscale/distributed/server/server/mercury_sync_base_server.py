@@ -156,6 +156,14 @@ class MercurySyncBaseServer(Generic[T]):
         self._loop: Union[asyncio.AbstractEventLoop, None] = None
         self._running = False
 
+        # Set at the end of both terminal paths (``shutdown`` / ``abort``)
+        # so ``wait`` returns only once the server is down. An Event
+        # rather than a bare future: setting it twice is harmless, it
+        # carries no result or exception that could go unretrieved, any
+        # number of waiters share it, and it binds to the running loop
+        # lazily (safe to construct before any loop exists).
+        self._stopped: asyncio.Event = asyncio.Event()
+
         self._tcp_events: Dict[str, Coroutine] = {}
         self._udp_events: Dict[str, Coroutine] = {}
 
@@ -2368,6 +2376,10 @@ class MercurySyncBaseServer(Generic[T]):
             )
         )
 
+    async def wait(self) -> None:
+        """Block until the server has stopped (``shutdown`` or ``abort``)."""
+        await self._stopped.wait()
+
     async def shutdown(self, drain_timeout: float = 5.0) -> None:
         self._running = False
 
@@ -2375,6 +2387,7 @@ class MercurySyncBaseServer(Generic[T]):
         # below owns the bounded drain/cancel/transport-close contract.
         self._wake_cleanup_loops()
         await self._await_quiescent(drain_timeout=drain_timeout)
+        self._stopped.set()
 
     def abort(self) -> None:
         self._running = False
@@ -2477,7 +2490,27 @@ class MercurySyncBaseServer(Generic[T]):
             if not pending.done():
                 pending.cancel()
 
-    async def abort_and_wait(self) -> None:
+        self._stopped.set()
+
+    async def abort_and_wait(
+        self,
+        timeout: int | None = None,
+    ):
+        if timeout:
+            try:
+                await asyncio.wait_for(
+                    self._abort_and_wait(),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                pass
+
+            return
+
+        await self._abort_and_wait()
+
+    async def _abort_and_wait(self) -> None:
         """Awaitable terminal abort — guarantees a dark instance on return.
 
         Calls the synchronous ``abort()`` (which flips ``_running``,

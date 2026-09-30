@@ -89,6 +89,7 @@ from .handlers import (
     WorkflowProgressHandler,
     StateSyncHandler,
 )
+from .cluster_connection import WorkerClusterConnection
 
 
 SERVER_SHUTDOWN_CANCELLATION_REASON = "server_shutdown"
@@ -110,6 +111,7 @@ class WorkerServer(HealthAwareServer):
         env: Env,
         dc_id: str = "default",
         seed_managers: list[tuple[str, int]] | None = None,
+        total_cores: int | None = None,
         *,
         clock: Clock | None = None,
         random_source: Random | None = None,
@@ -126,11 +128,20 @@ class WorkerServer(HealthAwareServer):
             udp_port: UDP port for SWIM healthchecks
             env: Environment configuration
             dc_id: Datacenter identifier
-            seed_managers: Initial manager addresses for registration
+            seed_managers: Initial manager addresses for registration.
+                Empty (the default) boots the worker standalone; it then
+                joins a manager when an operator join request names one.
+            total_cores: Executor core count. ``None`` defers to
+                ``WORKER_MAX_CORES`` and then the physical core count.
         """
         # Build config from env
         self._config: WorkerConfig = WorkerConfig.from_env(
-            env, host, tcp_port, udp_port, dc_id
+            env,
+            host,
+            tcp_port,
+            udp_port,
+            dc_id,
+            total_cores=total_cores,
         )
         self._env: Env = env
         self._seed_managers: list[tuple[str, int]] = seed_managers or []
@@ -187,13 +198,21 @@ class WorkerServer(HealthAwareServer):
             logger=None,
         )
 
-        # AD-28: Enhanced DNS Discovery
+        # AD-28: Enhanced DNS Discovery. A worker started without seed
+        # managers is a valid, first-class topology: it boots standalone
+        # and waits for an operator join request (``hyperscale join``)
+        # naming the manager to register with. DiscoveryConfig refuses
+        # an empty seed list unless dynamic registration is allowed, so
+        # fall back to it in that case (the same solo-node pattern
+        # ManagerDiscovery and GateServer use); managers learned at
+        # runtime are added through ``DiscoveryService.add_peer``.
         static_seeds: list[str] = [
             f"{host}:{port}" for host, port in self._seed_managers
         ]
         discovery_config = env.get_discovery_config(
             node_role="worker",
             static_seeds=static_seeds,
+            allow_dynamic_registration=not static_seeds,
         )
         self._discovery_service: DiscoveryService = DiscoveryService(discovery_config)
 
@@ -477,7 +496,6 @@ class WorkerServer(HealthAwareServer):
         # register-response processing) signals this component via
         # ``update()`` so the worker re-establishes connectivity
         # against its seed list when isolated.
-        from .cluster_connection import WorkerClusterConnection
         self._cluster_connection: WorkerClusterConnection = WorkerClusterConnection(
             seed_manager_tcp_addrs=self._seed_managers,
             register_with_manager=self._register_with_manager,
@@ -1737,6 +1755,14 @@ class WorkerServer(HealthAwareServer):
                 data,
                 timeout=timeout,
             )
+            # send_tcp reports transport failures (timeouts, refused
+            # connections, a peer that cannot decrypt us and never
+            # answers) as a returned Exception, not a raised one.
+            # Parsing it as a response turned every such failure into
+            # "TypeError: a bytes-like object is required".
+            if isinstance(response, Exception):
+                return response
+
             accepted, _ = await self._process_manager_registration_response(
                 response
             )

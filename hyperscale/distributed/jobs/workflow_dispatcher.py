@@ -196,8 +196,8 @@ class WorkflowDispatcher:
 
         await self._retry_budget_manager.create_budget(
             job_id=job_id,
-            total=getattr(submission, "retry_budget", 0),
-            per_workflow=getattr(submission, "retry_budget_per_workflow", 0),
+            total=submission.retry_budget,
+            per_workflow=submission.retry_budget_per_workflow,
         )
 
         # Build dependency graph
