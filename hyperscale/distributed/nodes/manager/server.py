@@ -10,7 +10,7 @@ import hashlib
 import traceback
 import cloudpickle
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
@@ -248,6 +248,9 @@ class _ParsedCancelRequest(NamedTuple):
     callback_addr: tuple[str, int] | None
     unreachable_addrs: frozenset[tuple[str, int]]
 
+
+if TYPE_CHECKING:
+    from hyperscale.distributed.runtime import Clock, Random, TransportFactory
 
 _TERMINAL_WORKFLOW_STATUS_VALUES = frozenset(
     status.value

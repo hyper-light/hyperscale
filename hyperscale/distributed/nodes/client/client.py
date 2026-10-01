@@ -42,6 +42,7 @@ from hyperscale.distributed.models import (
     GlobalJobStatus,
 )
 from hyperscale.distributed.env.env import Env
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
 from hyperscale.distributed.resources.resource_budget import ResourceBudget
 from hyperscale.distributed.runtime import (
     Clock,

@@ -31,6 +31,7 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
     ServerError,
     ServerInfo,
+    ServerWarning,
 )
 
 # Per-attempt bound on one worker_register round trip. Named so callers

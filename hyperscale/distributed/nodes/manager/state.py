@@ -440,6 +440,12 @@ class ManagerState:
         ]
         for wf_id in stale_workflow_ids:
             self._workflow_last_progress_snapshot.pop(wf_id, None)
+
+        progress_keys_to_remove = [
+            key for key in self._worker_job_last_progress if key[0] == worker_id
+        ]
+        for key in progress_keys_to_remove:
+            self._worker_job_last_progress.pop(key, None)
         self._dispatch_semaphores.pop(worker_id, None)
 
     def get_workflow_last_progress_snapshot(
@@ -464,12 +470,6 @@ class ManagerState:
     def clear_workflow_progress_snapshot(self, workflow_id: str) -> None:
         """Drop the per-workflow progress snapshot when the workflow terminates."""
         self._workflow_last_progress_snapshot.pop(workflow_id, None)
-
-        progress_keys_to_remove = [
-            key for key in self._worker_job_last_progress if key[0] == worker_id
-        ]
-        for key in progress_keys_to_remove:
-            self._worker_job_last_progress.pop(key, None)
 
     def get_quorum_metrics(self) -> dict[str, int]:
         """Get quorum-related metrics."""

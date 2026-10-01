@@ -17,7 +17,7 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
-from hyperscale.logging.hyperscale_logging_models import ServerDebug
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.nodes.client.status_application import (

@@ -78,6 +78,8 @@ from hyperscale.distributed.models import (
     GlobalJobStatus,
     ManagerDiscoveryBroadcast,
     ManagerHeartbeat,
+    JobAck,
+    JobLeaderGateTransfer,
     JobSubmission,
     JobStatus,
     JobStatusPush,
@@ -232,6 +234,7 @@ from .handlers import (
 
 if TYPE_CHECKING:
     from hyperscale.distributed.env import Env
+    from hyperscale.distributed.runtime import Clock, Random, TransportFactory
 
 
 class GateServer(HealthAwareServer):
