@@ -709,11 +709,10 @@ class GateDispatchCoordinator:
             job.status = JobStatus.FAILED.value
             job.failed_datacenters = len(failed_dcs)
             self._job_manager.set_job(submission.job_id, job)
-            await self._finalize_failed_job(
-                submission.job_id,
-                tuple(sorted(failed_dcs)),
-                "failed to dispatch to any datacenter",
-            )
+            # Not finalized: a dispatch that exhausted its retries on
+            # timeouts may still have reached a manager, which runs the
+            # job and supersedes this status. Only a certain failure
+            # (nothing was ever sent) takes the terminal path.
             self._task_runner.run(
                 self._logger.log,
                 ServerError(
