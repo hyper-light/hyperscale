@@ -23,6 +23,33 @@ class ResourceBudget:
     warning_grace_seconds: float
     kill_grace_seconds: float
 
+    def __post_init__(self) -> None:
+        if errors := self.validation_errors():
+            raise ValueError(f"invalid resource budget: {'; '.join(errors)}")
+
+    def validation_errors(self) -> list[str]:
+        """What makes this budget unenforceable (empty when it is valid).
+
+        A budget can arrive deserialized from a submission, which skips
+        ``__init__``, so a receiver checks it explicitly.
+        """
+        return [
+            message
+            for violated, message in (
+                (not self.max_cpu_percent > 0.0, "max_cpu_percent must be positive"),
+                (not self.max_memory_bytes > 0, "max_memory_bytes must be positive"),
+                (
+                    not 0.0 < self.warning_threshold <= self.kill_threshold,
+                    "thresholds must satisfy 0 < warning_threshold <= kill_threshold",
+                ),
+                (
+                    not (self.warning_grace_seconds >= 0.0 and self.kill_grace_seconds >= 0.0),
+                    "grace periods must not be negative",
+                ),
+            )
+            if violated
+        ]
+
     @classmethod
     def from_env(cls, env: "Env") -> ResourceBudget:
         """The default budget, for jobs that assign none."""

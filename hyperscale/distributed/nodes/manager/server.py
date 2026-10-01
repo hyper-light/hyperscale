@@ -6781,6 +6781,22 @@ class ManagerServer(HealthAwareServer):
                 backpressure_batch_only=False,
             ).dump()
 
+    def _resource_budget_rejection(self, submission: JobSubmission) -> str | None:
+        """Why this manager cannot enforce the job's own AD-41 budget, if
+        it cannot. A job that asked for limits is never run without them."""
+        if submission.resource_budget is None:
+            return None
+        if self._resource_enforcer is None:
+            return "resource budget requested, but resource guards are disabled on this manager"
+        if errors := submission.resource_budget.validation_errors():
+            return f"invalid resource budget: {'; '.join(errors)}"
+        return None
+
+    def _assign_resource_budget(self, submission: JobSubmission) -> None:
+        """Enforce the job's workflows against its own budget, when it set one."""
+        if self._resource_enforcer is not None and submission.resource_budget is not None:
+            self._resource_enforcer.assign_budget(submission.job_id, submission.resource_budget)
+
     def _track_led_workflow_resources(self, progress: WorkflowProgress) -> None:
         """AD-41: keep a led workflow's latest resource estimate until it ends."""
         if progress.status in _TERMINAL_WORKFLOW_STATUS_VALUES:
@@ -9349,6 +9365,16 @@ class ManagerServer(HealthAwareServer):
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
+            # AD-41: a job's own resource budget must be enforceable here
+            if (budget_error := self._resource_budget_rejection(submission)) is not None:
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=budget_error,
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
             # Negotiate capabilities
             client_caps_str = getattr(submission, "capabilities", "")
             client_features = (
@@ -9508,6 +9534,7 @@ class ManagerServer(HealthAwareServer):
 
             # Store submission for dispatch
             self._manager_state.set_job_submission(submission.job_id, submission)
+            self._assign_resource_budget(submission)
 
             # Start timeout tracking (AD-34)
             timeout_strategy = self._select_timeout_strategy(submission)
@@ -10734,6 +10761,7 @@ class ManagerServer(HealthAwareServer):
         job_info.fencing_token = 1
 
         self._manager_state.set_job_submission(submission.job_id, submission)
+        self._assign_resource_budget(submission)
 
         timeout_strategy = self._select_timeout_strategy(submission)
         await timeout_strategy.start_tracking(

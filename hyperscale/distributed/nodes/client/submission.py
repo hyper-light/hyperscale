@@ -17,6 +17,7 @@ from hyperscale.distributed.idempotency.idempotency_key import (
 from hyperscale.distributed.jobs.logical_id_generator import (
     LogicalIdGenerator,
 )
+from hyperscale.distributed.resources.resource_budget import ResourceBudget
 from hyperscale.distributed.models import (
     JobSubmission,
     JobAck,
@@ -116,6 +117,7 @@ class ClientJobSubmitter:
         on_reporter_result: Callable[[ReporterResultPush], None] | None = None,
         retry_budget: int = 0,
         retry_budget_per_workflow: int = 0,
+        resource_budget: ResourceBudget | None = None,
     ) -> str:
         """
         Submit a job for execution.
@@ -133,6 +135,8 @@ class ClientJobSubmitter:
             on_reporter_result: Callback for reporter submission results (optional)
             retry_budget: AD-44 total retry cap for the job (0 = manager default)
             retry_budget_per_workflow: AD-44 per-workflow retry cap (0 = manager default)
+            resource_budget: AD-41 limits each workflow is enforced against
+                (None = the manager's configured default)
 
         Returns:
             job_id: Unique identifier for the submitted job
@@ -187,6 +191,7 @@ class ClientJobSubmitter:
             reporting_configs_bytes=reporting_configs_bytes,
             retry_budget=retry_budget,
             retry_budget_per_workflow=retry_budget_per_workflow,
+            resource_budget=resource_budget,
         )
 
         # Initialize job tracking
@@ -279,6 +284,7 @@ class ClientJobSubmitter:
         timeout_seconds_explicit: bool = False,
         retry_budget: int = 0,
         retry_budget_per_workflow: int = 0,
+        resource_budget: ResourceBudget | None = None,
     ) -> JobSubmission:
         """
         Build JobSubmission message with protocol version.
@@ -321,6 +327,7 @@ class ClientJobSubmitter:
             # AD-44: 0 lets the manager's configured defaults apply.
             retry_budget=retry_budget,
             retry_budget_per_workflow=retry_budget_per_workflow,
+            resource_budget=resource_budget,
         )
 
     async def _submit_with_retry(

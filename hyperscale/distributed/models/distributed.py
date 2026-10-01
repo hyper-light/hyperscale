@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.resources.manager_resource_report import (
         ManagerResourceReport,
     )
+    from hyperscale.distributed.resources.resource_budget import ResourceBudget
 
 
 # =============================================================================
@@ -956,6 +957,9 @@ class JobSubmission(Message):
     # behaves exactly as before the fields existed.
     retry_budget: int = 0  # Total retry budget for the job
     retry_budget_per_workflow: int = 0  # Per-workflow retry cap
+    # AD-41: resource limits each of this job's workflows is enforced
+    # against; None applies the manager's configured default budget.
+    resource_budget: "ResourceBudget | None" = None
 
 
 @dataclass(slots=True)

@@ -42,6 +42,7 @@ from hyperscale.distributed.models import (
     GlobalJobStatus,
 )
 from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.resources.resource_budget import ResourceBudget
 from hyperscale.distributed.runtime import (
     Clock,
     Random,
@@ -333,6 +334,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         on_reporter_result: Callable[[ReporterResultPush], None] | None = None,
         retry_budget: int = 0,
         retry_budget_per_workflow: int = 0,
+        resource_budget: ResourceBudget | None = None,
     ) -> str:
         """Submit a job for execution (delegates to ClientJobSubmitter).
 
@@ -354,6 +356,11 @@ class HyperscaleClient(MercurySyncBaseServer):
         job and ``retry_budget_per_workflow`` caps any single workflow;
         0 (the default) applies the manager's configured defaults, and
         the manager clamps explicit values to its configured maxima.
+
+        AD-41: ``resource_budget`` sets the CPU/memory limits each of the
+        job's workflows is enforced against (None applies the manager's
+        configured default). A manager with resource guards disabled
+        rejects a job that sets one rather than run it unenforced.
         """
         return await self._submitter.submit_job(
             workflows=workflows,
@@ -368,6 +375,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             on_reporter_result=on_reporter_result,
             retry_budget=retry_budget,
             retry_budget_per_workflow=retry_budget_per_workflow,
+            resource_budget=resource_budget,
         )
 
     async def join_node(

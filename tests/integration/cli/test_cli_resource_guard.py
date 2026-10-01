@@ -10,6 +10,11 @@ graces is submitted; the manager must warn, then kill it — before the
 workflow's own duration would have ended it — and the job must end
 unsuccessfully rather than complete.
 
+A job can also carry its own budget: with the manager's default budget
+left generous, a job whose own CPU limit the workflow cannot stay under is
+killed the same way; and a manager with resource guards disabled rejects
+a job that sets a budget, explicitly, rather than run it unenforced.
+
 Bounds come from the configuration under test: the kill must land
 before the workflow's duration elapses (otherwise it was never killed);
 the client waits that duration plus the node boot bound.
@@ -25,6 +30,7 @@ import pytest
 
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client import HyperscaleClient
+from hyperscale.distributed.resources.resource_budget import ResourceBudget
 from hyperscale.graph import Workflow, step
 from tests.integration.cli.node_processes import (
     BOOT_TIMEOUT_SECONDS,
@@ -84,6 +90,17 @@ GUARD_ENVIRONMENT = {
     "RESOURCE_GUARD_WARNING_GRACE_SECONDS": str(WARNING_GRACE_SECONDS),
     "RESOURCE_GUARD_KILL_GRACE_SECONDS": str(KILL_GRACE_SECONDS),
 }
+GUARDS_DISABLED_ENVIRONMENT = {"RESOURCE_GUARD_ENABLED": "false"}
+# The same tight limits, carried by the job instead of the manager's env.
+JOB_BUDGET = ResourceBudget(
+    max_cpu_percent=CPU_BUDGET_PERCENT,
+    max_memory_bytes=Env().RESOURCE_GUARD_MAX_MEMORY_BYTES,
+    warning_threshold=Env().RESOURCE_GUARD_WARNING_THRESHOLD,
+    kill_threshold=Env().RESOURCE_GUARD_KILL_THRESHOLD,
+    warning_grace_seconds=WARNING_GRACE_SECONDS,
+    kill_grace_seconds=KILL_GRACE_SECONDS,
+)
+GUARDS_DISABLED_REJECTION = "resource guards are disabled"
 
 
 @pytest.fixture
@@ -91,11 +108,20 @@ def run_marker() -> str:
     return f"cli-guard-{time.monotonic_ns()}"
 
 
-async def test_over_budget_workflow_is_killed_before_it_would_finish(run_marker: str) -> None:
+@pytest.mark.parametrize(
+    ("manager_environment", "resource_budget"),
+    [(GUARD_ENVIRONMENT, None), ({}, JOB_BUDGET)],
+    ids=["manager_default_budget", "job_own_budget"],
+)
+async def test_over_budget_workflow_is_killed_before_it_would_finish(
+    run_marker: str,
+    manager_environment: dict[str, str],
+    resource_budget: ResourceBudget | None,
+) -> None:
     manager_start, worker_start, client_start = reserve_port_blocks(
         [NODE_BLOCK, worker_block(WORKER_CORES), CLIENT_BLOCK]
     )
-    manager = node_at("manager", manager_start, run_marker, environment=GUARD_ENVIRONMENT)
+    manager = node_at("manager", manager_start, run_marker, environment=manager_environment)
     worker = node_at(
         "worker",
         worker_start,
@@ -115,7 +141,9 @@ async def test_over_budget_workflow_is_killed_before_it_would_finish(run_marker:
         await client.start()
 
         submitted_at = time.monotonic()
-        job_id = await _submit_until_accepted(client, within=BOOT_TIMEOUT_SECONDS)
+        job_id = await _submit_until_accepted(
+            client, within=BOOT_TIMEOUT_SECONDS, resource_budget=resource_budget
+        )
         result = await client.wait_for_job(
             job_id, timeout=BURN_DURATION_SECONDS + BOOT_TIMEOUT_SECONDS
         )
@@ -139,17 +167,80 @@ async def test_over_budget_workflow_is_killed_before_it_would_finish(run_marker:
             await kill_remaining(nodes)
 
 
-async def _submit_until_accepted(client: HyperscaleClient, within: float) -> str:
+async def test_job_budget_is_rejected_when_guards_are_disabled(run_marker: str) -> None:
+    manager_start, worker_start, client_start = reserve_port_blocks(
+        [NODE_BLOCK, worker_block(WORKER_CORES), CLIENT_BLOCK]
+    )
+    manager = node_at("manager", manager_start, run_marker, environment=GUARDS_DISABLED_ENVIRONMENT)
+    worker = node_at(
+        "worker",
+        worker_start,
+        run_marker,
+        "--workers", str(WORKER_CORES),
+        "--managers", manager.address,
+    )
+    nodes = [manager, worker]
+    client = HyperscaleClient(
+        host=LOCALHOST,
+        port=client_start,
+        env=Env(),
+        managers=[(LOCALHOST, manager.tcp_port)],
+    )
+    try:
+        await boot(manager, worker)
+        await client.start()
+
+        rejection = await _rejection_once_capacity_exists(
+            client, within=BOOT_TIMEOUT_SECONDS, resource_budget=JOB_BUDGET
+        )
+        assert GUARDS_DISABLED_REJECTION in rejection, rejection
+    finally:
+        await client.stop()
+        try:
+            await stop_all(nodes, signal.SIGTERM, whole_group=False)
+        finally:
+            await kill_remaining(nodes)
+
+
+async def _submit_burn(client: HyperscaleClient, resource_budget: ResourceBudget | None) -> str:
+    return await client.submit_job(
+        workflows=[([], SimBurnWorkflow())],
+        vus=1,
+        timeout_seconds=float(BURN_DURATION_SECONDS + BOOT_TIMEOUT_SECONDS),
+        resource_budget=resource_budget,
+    )
+
+
+async def _submit_until_accepted(
+    client: HyperscaleClient,
+    within: float,
+    resource_budget: ResourceBudget | None = None,
+) -> str:
     """The manager rejects work until a worker registered capacity; retry."""
     deadline = time.monotonic() + within
     while True:
         try:
-            return await client.submit_job(
-                workflows=[([], SimBurnWorkflow())],
-                vus=1,
-                timeout_seconds=float(BURN_DURATION_SECONDS + BOOT_TIMEOUT_SECONDS),
-            )
+            return await _submit_burn(client, resource_budget)
         except Exception:
             if time.monotonic() >= deadline:
                 raise
             await asyncio.sleep(1.0)
+
+
+async def _rejection_once_capacity_exists(
+    client: HyperscaleClient,
+    within: float,
+    resource_budget: ResourceBudget,
+) -> str:
+    """The rejection the manager gives once it has capacity (earlier ones
+    are for missing capacity); fails if the job is ever accepted."""
+    deadline = time.monotonic() + within
+    while True:
+        try:
+            job_id = await _submit_burn(client, resource_budget)
+        except Exception as rejection:
+            if GUARDS_DISABLED_REJECTION in str(rejection) or time.monotonic() >= deadline:
+                return str(rejection)
+            await asyncio.sleep(1.0)
+            continue
+        raise AssertionError(f"job {job_id} with a budget was accepted with guards disabled")
