@@ -41,6 +41,7 @@ from tests.integration.cli.node_processes import (
     kill_remaining,
     node_at,
     reserve_port_blocks,
+    run_join,
     stop_all,
     worker_block,
 )
@@ -58,14 +59,6 @@ HEARTBEAT_BOUND_SECONDS = (
 )
 
 
-async def run_join(node: str, target: str, client_port: int) -> tuple[int, str]:
-    process = await asyncio.create_subprocess_exec(
-        HYPERSCALE, "join", "--node", node, "--target", target, "--port", str(client_port),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    output, _ = await asyncio.wait_for(process.communicate(), timeout=JOIN_REPLY_BOUND_SECONDS * 2)
-    return process.returncode, output.decode(errors="replace")
 
 
 CLIENT_BLOCK = 2  # `hyperscale join` client tcp + its udp (port + 1)

@@ -24,6 +24,15 @@ from hyperscale.distributed.datacenters import (
     CrossDCCorrelationDetector,
 )
 from hyperscale.distributed.capacity import DatacenterCapacityAggregator
+from hyperscale.distributed.resources.datacenter_resource_aggregator import (
+    DatacenterResourceAggregator,
+)
+from hyperscale.distributed.resources.datacenter_resource_view import (
+    DatacenterResourceView,
+)
+from hyperscale.distributed.slo.resource_aware_predictor import (
+    ResourceAwareSLOPredictor,
+)
 from hyperscale.distributed.swim.health import (
     FederatedHealthMonitor,
     DCHealthState,
@@ -89,6 +98,9 @@ class GateHealthCoordinator:
         capacity_aggregator: DatacenterCapacityAggregator | None = None,
         on_partition_healed: Callable[[list[str]], None] | None = None,
         on_partition_detected: Callable[[list[str]], None] | None = None,
+        *,
+        resource_aggregator: DatacenterResourceAggregator,
+        resource_predictor: ResourceAwareSLOPredictor,
     ) -> None:
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
@@ -115,6 +127,10 @@ class GateHealthCoordinator:
         self._capacity_aggregator: DatacenterCapacityAggregator | None = (
             capacity_aggregator
         )
+        # AD-41: per-datacenter resource pressure from managers' reports,
+        # folded into routing through the AD-42 resource-aware predictor.
+        self._resource_aggregator = resource_aggregator
+        self._resource_predictor = resource_predictor
         self._on_partition_healed: Callable[[list[str]], None] | None = (
             on_partition_healed
         )
@@ -183,6 +199,13 @@ class GateHealthCoordinator:
 
         if self._capacity_aggregator is not None:
             self._capacity_aggregator.record_heartbeat(heartbeat)
+
+        # Only the TCP status update carries a resource report; a SWIM
+        # heartbeat without one leaves the manager's last report in place.
+        if heartbeat.resource_report is not None:
+            self._resource_aggregator.record(
+                datacenter_id, resolved_manager_addr, heartbeat.resource_report
+            )
 
         self._record_manager_heartbeat(
             datacenter_id,
@@ -666,6 +689,25 @@ class GateHealthCoordinator:
                     ),
                 )
 
+    def datacenter_resource_view(self, datacenter_id: str) -> DatacenterResourceView | None:
+        """AD-41: the DC's current resource pressure (None until a manager
+        that knows the DC's capacity has reported)."""
+        return self._resource_aggregator.view(datacenter_id)
+
+    def _datacenter_routing_factor(self, datacenter_id: str) -> float:
+        """The DC's AD-42 SLO routing factor, adjusted by its AD-41 resource
+        pressure (AD-42 Part 9) when a fresh resource view exists."""
+        slo_routing_factor = self._state.get_dc_slo_routing_factor(datacenter_id)
+        if (view := self.datacenter_resource_view(datacenter_id)) is None:
+            return slo_routing_factor
+        return self._resource_predictor.predict_slo_risk(
+            cpu_pressure=view.cpu_pressure,
+            cpu_uncertainty=view.workload_cpu_uncertainty,
+            memory_pressure=view.memory_pressure,
+            memory_uncertainty=view.workload_memory_uncertainty,
+            current_slo_score=slo_routing_factor,
+        )
+
     def build_datacenter_candidates(
         self,
         datacenter_ids: list[str],
@@ -712,9 +754,7 @@ class GateHealthCoordinator:
                     total_cores = capacity.total_cores
                     queue_depth = capacity.pending_workflow_count
 
-            slo_routing_factor = self._state.get_dc_slo_routing_factor(
-                datacenter_id
-            )
+            slo_routing_factor = self._datacenter_routing_factor(datacenter_id)
             candidates.append(
                 DatacenterCandidate(
                     datacenter_id=datacenter_id,

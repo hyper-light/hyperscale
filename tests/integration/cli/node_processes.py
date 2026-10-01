@@ -22,6 +22,9 @@ from pathlib import Path
 
 import psutil
 
+from hyperscale.commands.join import default_join_timeout_seconds
+from hyperscale.distributed.env import Env
+
 HYPERSCALE = os.path.join(os.getcwd(), ".venv", "bin", "hyperscale")
 LOCALHOST = "127.0.0.1"
 
@@ -292,3 +295,19 @@ def node_at(
     environment: dict[str, str] | None = None,
 ) -> CommandNode:
     return CommandNode(role, block_start, block_start + 1, marker, *extra, environment=environment)
+
+
+async def run_join(node: str, target: str, client_port: int) -> tuple[int, str]:
+    """Run `hyperscale join --node NODE --target TARGET`; (returncode, output).
+
+    Bounded by twice the CLI's own join budget (one attempt plus its reply).
+    """
+    process = await asyncio.create_subprocess_exec(
+        HYPERSCALE, "join", "--node", node, "--target", target, "--port", str(client_port),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await asyncio.wait_for(
+        process.communicate(), timeout=default_join_timeout_seconds(Env()) * 2
+    )
+    return process.returncode, output.decode(errors="replace")

@@ -166,6 +166,8 @@ from hyperscale.distributed.raft import LedgerReplicator
 from hyperscale.distributed.resources.resource_budget import ResourceBudget
 from hyperscale.distributed.resources.resource_enforcer import ResourceEnforcer
 from hyperscale.distributed.resources.resource_violation_type import ResourceViolationType
+from hyperscale.distributed.resources.led_workflow_resources import LedWorkflowResources
+from hyperscale.distributed.resources.manager_resource_report import ManagerResourceReport
 from hyperscale.distributed.raft.models import LedgerProposal
 from hyperscale.distributed.raft.models.commands import ledger_append_command
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
@@ -593,6 +595,13 @@ class ManagerServer(HealthAwareServer):
             )
             if self._env.RESOURCE_GUARD_ENABLED
             else None
+        )
+        # AD-41: resource use of the workflows this manager leads, reported
+        # to gates for datacenter pressure.
+        self._led_workflow_resources = LedWorkflowResources(
+            clock=self._clock,
+            staleness_seconds=self._env.RESOURCE_VIEW_STALENESS_SECONDS,
+            leads_job=self._is_job_leader,
         )
 
         self._worker_pool = WorkerPool(
@@ -4645,6 +4654,7 @@ class ManagerServer(HealthAwareServer):
             slo_compliance_score=slo_summary.compliance_score,
             slo_routing_factor=slo_summary.routing_factor,
             slo_updated_at=slo_summary.updated_at,
+            resource_report=self._build_resource_report(),
         )
 
     async def _build_xprobe_response(
@@ -6093,6 +6103,7 @@ class ManagerServer(HealthAwareServer):
         self._task_runner.run(self._raft.consensus.destroy_job_raft, job_id)
         if self._resource_enforcer is not None:
             self._resource_enforcer.release_job(job_id)
+        self._led_workflow_resources.release_job(job_id)
         self._manager_state.clear_job_state(job_id)
 
         if self._workflow_dispatcher:
@@ -6725,7 +6736,12 @@ class ManagerServer(HealthAwareServer):
 
             stats_worker_id = worker_id or f"{addr[0]}:{addr[1]}"
             await self._stats.record_progress_update(stats_worker_id, progress)
-            await self._enforce_workflow_resources(progress, worker_id)
+            # AD-41: resources are the job leader's to account and judge;
+            # a non-leader that got this progress points the worker at
+            # the leader in its ack.
+            if self._is_job_leader(progress.job_id):
+                self._track_led_workflow_resources(progress)
+                await self._enforce_workflow_resources(progress, worker_id)
 
             # Get backpressure signal
             backpressure = self._stats.get_backpressure_signal()
@@ -6764,6 +6780,43 @@ class ManagerServer(HealthAwareServer):
                 backpressure_delay_ms=0,
                 backpressure_batch_only=False,
             ).dump()
+
+    def _track_led_workflow_resources(self, progress: WorkflowProgress) -> None:
+        """AD-41: keep a led workflow's latest resource estimate until it ends."""
+        if progress.status in _TERMINAL_WORKFLOW_STATUS_VALUES:
+            self._led_workflow_resources.release_workflow(progress.workflow_id)
+            return
+        self._led_workflow_resources.record(
+            workflow_id=progress.workflow_id,
+            job_id=progress.job_id,
+            cpu_percent=progress.total_cpu_percent,
+            cpu_uncertainty=progress.total_cpu_uncertainty,
+            memory_bytes=progress.total_memory_mb * _BYTES_PER_MEGABYTE,
+            memory_uncertainty=progress.total_memory_uncertainty_mb * _BYTES_PER_MEGABYTE,
+        )
+
+    def _build_resource_report(self) -> ManagerResourceReport:
+        """AD-41: this manager's led workload and the datacenter's worker
+        capacity: 100 per allotted core of every worker whose cores are the
+        datacenter's to use, busy or idle; each worker host's memory once,
+        however many workers share it. Both come from what each worker
+        registered: the pool's live core count is derived from free cores
+        and reads zero for a fully busy worker."""
+        registrations = [
+            worker.registration
+            for worker in self._worker_pool.iter_workers()
+            if worker.registration is not None
+            and self._worker_pool.counts_toward_capacity(worker.worker_id)
+        ]
+        host_memory_megabytes = {
+            registration.node.host: registration.memory_mb for registration in registrations
+        }
+        return ManagerResourceReport(
+            manager_metrics=self._last_resource_metrics,
+            workload=self._led_workflow_resources.totals(),
+            cpu_capacity_percent=100.0 * sum(registration.total_cores for registration in registrations),
+            memory_capacity_bytes=sum(host_memory_megabytes.values()) * _BYTES_PER_MEGABYTE,
+        )
 
     async def _enforce_workflow_resources(
         self,
@@ -11271,6 +11324,7 @@ class ManagerServer(HealthAwareServer):
         await self._raft.consensus.destroy_job_raft(job_id)
         if self._resource_enforcer is not None:
             self._resource_enforcer.release_job(job_id)
+        self._led_workflow_resources.release_job(job_id)
 
     async def _log_job_completion(
         self, job_id: str, final_status: str, total_completed: int, total_failed: int

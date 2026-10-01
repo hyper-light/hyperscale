@@ -512,14 +512,8 @@ class WorkerPool:
         # the staleness/grace checks below and accepted work against
         # down workers (measured: a power-cycled worker's job stranded
         # to the AD-34 timeout because acceptance beat the reboot).
-        if self._get_swim_status and worker.registration:
-            addr = (
-                worker.registration.node.host,
-                worker.registration.node.udp_port or worker.registration.node.port,
-            )
-            swim_status = self._get_swim_status(addr)
-            if swim_status in ("SUSPECT", "DEAD"):
-                return False
+        if self._swim_reports_down(worker):
+            return False
 
         # Check explicit health status
         if worker.health == WorkerState.HEALTHY:
@@ -531,6 +525,36 @@ class WorkerPool:
             return True
 
         return False
+
+    def counts_toward_capacity(self, node_id: str) -> bool:
+        """Whether a worker's cores are the datacenter's to use (AD-41).
+
+        Busy or idle alike -- unlike ``is_worker_healthy``, which asks
+        whether it can take new work now -- as long as it is not leaving
+        (drain intended, lifecycle DRAINING or OFFLINE), not judged dead or
+        stuck (routing EVICT), and not suspected or dead under SWIM. A
+        routing DRAIN only means "not ready for new work" (a saturated
+        worker reports exactly that), so its cores still count.
+        """
+        if (worker := self._workers.get(node_id)) is None:
+            return False
+        if self.is_worker_drain_intended(node_id):
+            return False
+        if worker.health in (WorkerState.DRAINING, WorkerState.OFFLINE):
+            return False
+        if self.get_worker_routing_decision(node_id) == RoutingDecision.EVICT:
+            return False
+        return not self._swim_reports_down(worker)
+
+    def _swim_reports_down(self, worker: WorkerStatus) -> bool:
+        """SWIM's negative verdict on a registered worker: SUSPECT or DEAD."""
+        if not (self._get_swim_status and worker.registration):
+            return False
+        addr = (
+            worker.registration.node.host,
+            worker.registration.node.udp_port or worker.registration.node.port,
+        )
+        return self._get_swim_status(addr) in ("SUSPECT", "DEAD")
 
     def get_healthy_worker_ids(self) -> list[str]:
         return [node_id for node_id in self._workers if self.is_worker_healthy(node_id)]

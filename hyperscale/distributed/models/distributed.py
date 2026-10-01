@@ -17,6 +17,12 @@ from .message import Message
 if TYPE_CHECKING:
     from hyperscale.core.jobs.workers.stage_priority import StagePriority
     from hyperscale.distributed.models.coordinates import NetworkCoordinate
+    from hyperscale.distributed.resources.datacenter_resource_view import (
+        DatacenterResourceView,
+    )
+    from hyperscale.distributed.resources.manager_resource_report import (
+        ManagerResourceReport,
+    )
 
 
 # =============================================================================
@@ -869,6 +875,11 @@ class ManagerHeartbeat(Message):
     slo_compliance_score: float = 1.0
     slo_routing_factor: float = 1.0
     slo_updated_at: float = 0.0
+    # AD-41: this manager's resource report for gates. Only the TCP
+    # status update to gates carries it (it would push the SWIM-embedded
+    # heartbeat further past the datagram budget); None elsewhere, and
+    # gates keep the last report a manager sent rather than clearing it.
+    resource_report: "ManagerResourceReport | None" = None
 
 
 # =============================================================================
@@ -3070,6 +3081,8 @@ class DatacenterInfo(Message):
     available_cores: int = 0  # Available cores in DC
     manager_count: int = 0  # Managers in DC
     worker_count: int = 0  # Workers in DC
+    # AD-41: the DC's resource pressure, when its managers have reported it
+    resources: "DatacenterResourceView | None" = None
 
 
 @dataclass(slots=True, kw_only=True)

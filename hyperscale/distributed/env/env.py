@@ -298,6 +298,10 @@ class Env(BaseModel):
     RESOURCE_GUARD_KILL_THRESHOLD: StrictFloat = 1.0
     RESOURCE_GUARD_WARNING_GRACE_SECONDS: StrictFloat = 10.0
     RESOURCE_GUARD_KILL_GRACE_SECONDS: StrictFloat = 2.0
+    # AD-41 resource views: a workflow's estimate (on its job leader) or a
+    # manager's report (on a gate) older than this no longer counts
+    # toward the datacenter's resource pressure (AD-41 "30s threshold").
+    RESOURCE_VIEW_STALENESS_SECONDS: StrictFloat = 30.0
 
     # Cancelled Workflow Cleanup Settings (Section 6)
     CANCELLED_WORKFLOW_TTL: StrictFloat = (
@@ -910,6 +914,7 @@ class Env(BaseModel):
             "RESOURCE_GUARD_KILL_THRESHOLD": float,
             "RESOURCE_GUARD_WARNING_GRACE_SECONDS": float,
             "RESOURCE_GUARD_KILL_GRACE_SECONDS": float,
+            "RESOURCE_VIEW_STALENESS_SECONDS": float,
             # Cancelled workflow cleanup settings (Section 6)
             "CANCELLED_WORKFLOW_TTL": float,
             "CANCELLED_WORKFLOW_CLEANUP_INTERVAL": float,

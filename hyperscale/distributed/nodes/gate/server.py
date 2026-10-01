@@ -193,6 +193,12 @@ from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
     SpilloverEvaluator,
 )
+from hyperscale.distributed.resources.datacenter_resource_aggregator import (
+    DatacenterResourceAggregator,
+)
+from hyperscale.distributed.slo.resource_aware_predictor import (
+    ResourceAwareSLOPredictor,
+)
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerWarning,
@@ -874,6 +880,11 @@ class GateServer(HealthAwareServer):
             capacity_aggregator=self._capacity_aggregator,
             on_partition_healed=self._on_partition_healed,
             on_partition_detected=self._on_partition_detected,
+            resource_aggregator=DatacenterResourceAggregator(
+                clock=self._clock,
+                staleness_seconds=self.env.RESOURCE_VIEW_STALENESS_SECONDS,
+            ),
+            resource_predictor=ResourceAwareSLOPredictor.from_env(self.env),
         )
 
         self._job_router = GateJobRouter(
@@ -2046,7 +2057,7 @@ class GateServer(HealthAwareServer):
                 status = self._classify_datacenter_health(dc_id)
 
                 leader_addr: tuple[str, int] | None = None
-                manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+                manager_statuses = self._modular_state.get_datacenter_manager_statuses(dc_id)
                 for manager_addr, heartbeat in manager_statuses.items():
                     if heartbeat.is_leader:
                         leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
@@ -2060,6 +2071,7 @@ class GateServer(HealthAwareServer):
                         available_cores=status.available_capacity,
                         manager_count=status.manager_count,
                         worker_count=status.worker_count,
+                        resources=self._health_coordinator.datacenter_resource_view(dc_id),
                     )
                 )
 
