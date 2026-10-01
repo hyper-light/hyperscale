@@ -569,18 +569,14 @@ class TestApplyCommitted:
         node, _, apply_mock = make_single_node()
         await node.start_election()
 
-        # Propose two entries in the background: quorum is 1 (single node), so
-        # each proposal advances commit_index synchronously. They block on the
-        # apply waiter, which the explicit apply_committed_entries below drains.
-        propose_task_one = asyncio.create_task(node.propose(b"cmd1", "CREATE_JOB"))
-        propose_task_two = asyncio.create_task(node.propose(b"cmd2", "CREATE_JOB"))
-        await asyncio.sleep(0.01)
-
-        applied = await node.apply_committed_entries()
-        assert applied == 2
+        # Quorum is 1 (single node): each proposal commits and applies
+        # inside propose, resolving without waiting for a tick's apply pass.
+        assert await node.propose(b"cmd1", "CREATE_JOB") == (True, 1)
+        assert await node.propose(b"cmd2", "CREATE_JOB") == (True, 2)
         assert apply_mock.call_count == 2
 
-        await asyncio.gather(propose_task_one, propose_task_two)
+        # Nothing is left for the tick's apply pass.
+        assert await node.apply_committed_entries() == 0
 
     @pytest.mark.asyncio
     async def test_apply_is_idempotent(self) -> None:

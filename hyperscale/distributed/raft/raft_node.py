@@ -176,7 +176,7 @@ class RaftNode:
             1,
             configured_cluster_size
             if configured_cluster_size is not None
-            else len(self._members) + 1,
+            else len(self._members | {self._node_id}),
         )
 
     # =========================================================================
@@ -424,10 +424,13 @@ class RaftNode:
         async with self._lock:
             if self._destroyed or self._role != "leader":
                 return
-            self._last_heartbeat_sent = _DEFAULT_CLOCK.monotonic()
-            for peer_id in self._members:
-                if peer_id == self._node_id:
-                    continue
+            await self._send_append_entries_to_followers()
+
+    async def _send_append_entries_to_followers(self) -> None:
+        """Send AppendEntries (entries or heartbeat) to every follower."""
+        self._last_heartbeat_sent = _DEFAULT_CLOCK.monotonic()
+        for peer_id in self._members:
+            if peer_id != self._node_id:
                 await self._send_append_entries_to(peer_id)
 
     async def _send_append_entries_to(self, peer_id: str) -> None:
@@ -498,6 +501,7 @@ class RaftNode:
                 self._commit_index = min(
                     request.leader_commit, self._log.last_index()
                 )
+                await self._apply_committed_locked()
 
             return self._append_response(
                 success=True, match_index=self._log.last_index()
@@ -567,6 +571,7 @@ class RaftNode:
                 self._next_index[response.follower_id] = response.match_index + 1
                 self._match_index[response.follower_id] = response.match_index
                 self._advance_commit_index()
+                await self._apply_committed_locked()
             else:
                 self._backtrack_next_index(response)
 
@@ -658,7 +663,12 @@ class RaftNode:
             index = self._log.append(entry)
             waiter = asyncio.get_running_loop().create_future()
             self._proposal_waiters[index] = waiter
+            # Commit is event-driven: a group that is its own majority
+            # commits and applies here, and a larger group replicates the
+            # entry now instead of on the next heartbeat tick.
             self._advance_commit_index()
+            await self._apply_committed_locked()
+            await self._send_append_entries_to_followers()
 
         try:
             committed = await _DEFAULT_CLOCK.wait_for(
@@ -685,18 +695,26 @@ class RaftNode:
         async with self._lock:
             if self._destroyed:
                 return 0
+            return await self._apply_committed_locked()
 
-            applied_count = 0
-            while self._last_applied < self._commit_index:
-                self._last_applied += 1
-                if entry := self._log.get(self._last_applied):
-                    await self._apply_command(entry)
-                    waiter = self._proposal_waiters.pop(self._last_applied, None)
-                    if waiter is not None and not waiter.done():
-                        waiter.set_result(True)
-                    applied_count += 1
+    async def _apply_committed_locked(self) -> int:
+        """Apply entries up to commit_index and resolve their proposals.
 
-            return applied_count
+        Called wherever commit_index advances, so a proposal resolves as
+        soon as it commits rather than on the next tick. Caller holds the
+        lock.
+        """
+        applied_count = 0
+        while self._last_applied < self._commit_index:
+            self._last_applied += 1
+            if entry := self._log.get(self._last_applied):
+                await self._apply_command(entry)
+                waiter = self._proposal_waiters.pop(self._last_applied, None)
+                if waiter is not None and not waiter.done():
+                    waiter.set_result(True)
+                applied_count += 1
+
+        return applied_count
 
     # =========================================================================
     # Membership

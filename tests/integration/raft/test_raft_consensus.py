@@ -169,6 +169,24 @@ def count_role(nodes: dict[str, RaftNode], role: str) -> int:
     return sum(1 for node in nodes.values() if node.role == role)
 
 
+async def propose_with_delivery(
+    network: MockNetwork,
+    leader: RaftNode,
+    command: bytes,
+) -> tuple[bool, int]:
+    """Propose on ``leader`` while the network delivers its replication.
+
+    ``propose`` resolves only once the entry commits, which needs the
+    followers' AppendEntries responses -- so delivery must run while the
+    proposal is pending.
+    """
+    proposal = asyncio.ensure_future(leader.propose(command, "CREATE_JOB"))
+    while not proposal.done():
+        await network.deliver_all_messages()
+        await asyncio.sleep(0)
+    return proposal.result()
+
+
 # =============================================================================
 # Tests
 # =============================================================================
@@ -199,16 +217,10 @@ async def test_log_replication() -> None:
     await network.deliver_all_messages()
     assert nodes["node-1"].is_leader()
 
-    # Propose a command
-    success, index = await nodes["node-1"].propose(b"command-1", "CREATE_JOB")
+    # Propose a command: it replicates and commits before resolving
+    success, index = await propose_with_delivery(network, nodes["node-1"], b"command-1")
     assert success is True
     assert index == 1
-
-    # Replicate to followers
-    await nodes["node-1"].replicate_to_followers()
-    await network.deliver_all_messages()
-    # Deliver AppendEntries responses
-    await network.deliver_all_messages()
 
     # Leader should have advanced commit
     assert nodes["node-1"].commit_index == 1
@@ -223,24 +235,19 @@ async def test_follower_applies_committed_entries() -> None:
     await network.deliver_all_messages()
     await network.deliver_all_messages()
 
-    await nodes["node-1"].propose(b"cmd-1", "CREATE_JOB")
-    await nodes["node-1"].replicate_to_followers()
-    await network.deliver_all_messages()
-    await network.deliver_all_messages()
+    await propose_with_delivery(network, nodes["node-1"], b"cmd-1")
 
     # Leader sends another heartbeat with updated commit index
     await nodes["node-1"].replicate_to_followers()
     await network.deliver_all_messages()
     await network.deliver_all_messages()
 
-    # Followers should now have commit_index = 1
+    # Followers apply the entry the moment they learn it committed: no
+    # separate apply pass is needed, and none finds anything left over
     for node_id in ["node-2", "node-3"]:
         assert nodes[node_id].commit_index == 1
-
-    # Apply on followers
-    for node_id in ["node-2", "node-3"]:
-        applied = await nodes[node_id].apply_committed_entries()
-        assert applied == 1
+        assert [entry.command for entry in network._applied_entries[node_id]] == [b"cmd-1"]
+        assert await nodes[node_id].apply_committed_entries() == 0
 
 
 async def test_multiple_proposals() -> None:
@@ -253,21 +260,17 @@ async def test_multiple_proposals() -> None:
 
     # Propose 5 commands
     for idx in range(5):
-        success, _ = await nodes["node-1"].propose(
-            f"cmd-{idx}".encode(), "CREATE_JOB"
+        success, _ = await propose_with_delivery(
+            network, nodes["node-1"], f"cmd-{idx}".encode()
         )
         assert success is True
 
-    # Replicate and deliver
-    await nodes["node-1"].replicate_to_followers()
-    await network.deliver_all_messages()
-    await network.deliver_all_messages()
-
     assert nodes["node-1"].commit_index == 5
 
-    # Apply on leader
-    applied = await nodes["node-1"].apply_committed_entries()
-    assert applied == 5
+    # The leader applied each entry in order as it committed
+    assert [entry.command for entry in network._applied_entries["node-1"]] == [
+        f"cmd-{idx}".encode() for idx in range(5)
+    ]
 
 
 async def test_step_down_on_higher_term() -> None:
@@ -346,9 +349,9 @@ async def test_single_node_consensus() -> None:
     assert success is True
     assert index == 1
 
-    # Single node commits immediately (quorum = 1)
-    applied = await nodes["solo"].apply_committed_entries()
-    assert applied == 1
+    # Single node commits and applies within the proposal (quorum = 1)
+    assert [entry.command for entry in network._applied_entries["solo"]] == [b"cmd"]
+    assert await nodes["solo"].apply_committed_entries() == 0
 
 
 if __name__ == "__main__":
