@@ -227,7 +227,34 @@ def run_child_loop(
                 )
             )
     finally:
+        _cancel_pending_tasks(loop)
         restore_defaults(defaults_snapshot)
         if not loop.is_closed():
             loop.close()
         asyncio.set_event_loop(None)
+
+
+def _cancel_pending_tasks(loop) -> None:
+    """Tear down like ``asyncio.run``: cancel every task still pending and
+    deliver the cancellations before the loop closes.
+
+    Closing the loop with tasks pending makes the garbage collector throw
+    ``GeneratorExit`` into each suspended coroutine. Cleanup on the way
+    out (``Queue.get`` cancelling its getter, a transport closing) then
+    touches the closed loop and raises an ordinary ``RuntimeError`` that
+    MASKS the ``GeneratorExit``; a background loop catching ``Exception``
+    retries, its next sleep raises again at once, and the child spins
+    forever instead of exiting (measured: a gate's windowed-stats loop,
+    over a million iterations, wedging every later coordinator step).
+    ``CancelledError`` is what production shutdown delivers, and no
+    ``except Exception`` catches it. One window at the CURRENT virtual
+    instant runs the cancellations without advancing time.
+    """
+    if loop.is_closed():
+        return
+    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    loop.run_window(loop.time())
