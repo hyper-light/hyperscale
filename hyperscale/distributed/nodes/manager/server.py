@@ -8712,8 +8712,11 @@ class ManagerServer(HealthAwareServer):
             )
 
             current_version = self._manager_state.state_version
+            # A manager still syncing its own state has none to vouch for
+            # (ManagerState has no INITIALIZING member: naming it raised on
+            # every full sync).
             is_ready = (
-                self._manager_state.manager_state_enum != ManagerStateEnum.INITIALIZING
+                self._manager_state.manager_state_enum != ManagerStateEnum.SYNCING
             )
 
             if request.since_version >= current_version:
@@ -8729,8 +8732,12 @@ class ManagerServer(HealthAwareServer):
                 is_leader=self.is_leader(),
                 term=self._leader_election.state.current_term,
                 version=current_version,
+                # Job state travels in ``job_states`` (consumed by the
+                # receiver); ``jobs`` read a ManagerState attribute that
+                # never existed, so every full snapshot raised and peers
+                # got responder_ready=False -- no peer sync, including the
+                # takeover's forced full sync, ever delivered state.
                 workers=self._build_peer_worker_snapshots(),
-                jobs=dict(self._manager_state._job_progress),
                 job_leaders=dict(self._manager_state._job_leaders),
                 job_leader_addrs=dict(self._manager_state._job_leader_addrs),
                 job_fence_tokens=dict(self._manager_state._job_fencing_tokens),
