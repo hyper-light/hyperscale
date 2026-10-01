@@ -227,7 +227,9 @@ class StickyConnectionManager(Generic[T]):
 
         # Check health
         peer_health = self._peer_health.get(binding.peer_id, PeerHealth.HEALTHY)
-        return peer_health < self.config.health_degradation_threshold
+        # PeerHealth orders HEALTHY highest; the threshold is the level at
+        # or below which a peer counts as unhealthy.
+        return peer_health > self.config.health_degradation_threshold
 
     def unbind(self, key: str) -> bool:
         """
@@ -266,7 +268,7 @@ class StickyConnectionManager(Generic[T]):
         # Check if we should evict
         if (
             self.config.evict_on_unhealthy
-            and health >= self.config.health_degradation_threshold
+            and health <= self.config.health_degradation_threshold
         ):
             return self.evict_peer_bindings(peer_id)
 
@@ -388,7 +390,7 @@ class StickyConnectionManager(Generic[T]):
         unhealthy_count = 0
 
         for binding in self._bindings.values():
-            if binding.health < self.config.health_degradation_threshold:
+            if binding.health > self.config.health_degradation_threshold:
                 healthy_count += 1
             else:
                 unhealthy_count += 1
