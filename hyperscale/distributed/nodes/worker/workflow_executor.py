@@ -488,7 +488,6 @@ class WorkerWorkflowExecutor:
             return
 
         while not cancel_event.is_set():
-            open('/private/tmp/claude-501/-Users-adalundhe-Projects-hyperscale/46360c3d-a86e-4bf8-b5b5-c784215ec6f0/scratchpad/monitor_trace.log', "a").write(f"ITER t={asyncio.get_running_loop().time():.3f} wf={progress.workflow_id[-12:]}\n")
             try:
                 # Wait for update from remote manager
                 workflow_status_update = await remote_manager.wait_for_workflow_update(
@@ -594,7 +593,6 @@ class WorkerWorkflowExecutor:
                 break
 
             except Exception as err:
-                open('/private/tmp/claude-501/-Users-adalundhe-Projects-hyperscale/46360c3d-a86e-4bf8-b5b5-c784215ec6f0/scratchpad/monitor_trace.log', "a").write(f"EXC t={asyncio.get_running_loop().time():.3f} {err!r}\n")
                 if self._logger:
                     await self._logger.log(
                         ServerError(
