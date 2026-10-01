@@ -295,6 +295,9 @@ class Env(BaseModel):
     RESOURCE_GUARD_MAX_CPU_PERCENT: StrictFloat = 800.0
     RESOURCE_GUARD_MAX_MEMORY_BYTES: StrictInt = 16 * 1024 * 1024 * 1024
     RESOURCE_GUARD_WARNING_THRESHOLD: StrictFloat = 0.8
+    # AD-41 THROTTLE: past this fraction of its budget a workflow's
+    # concurrency is cut back toward it (the spec's 85%).
+    RESOURCE_GUARD_THROTTLE_THRESHOLD: StrictFloat = 0.85
     RESOURCE_GUARD_KILL_THRESHOLD: StrictFloat = 1.0
     RESOURCE_GUARD_WARNING_GRACE_SECONDS: StrictFloat = 10.0
     RESOURCE_GUARD_KILL_GRACE_SECONDS: StrictFloat = 2.0
@@ -923,6 +926,7 @@ class Env(BaseModel):
             "RESOURCE_GUARD_MAX_CPU_PERCENT": float,
             "RESOURCE_GUARD_MAX_MEMORY_BYTES": int,
             "RESOURCE_GUARD_WARNING_THRESHOLD": float,
+            "RESOURCE_GUARD_THROTTLE_THRESHOLD": float,
             "RESOURCE_GUARD_KILL_THRESHOLD": float,
             "RESOURCE_GUARD_WARNING_GRACE_SECONDS": float,
             "RESOURCE_GUARD_KILL_GRACE_SECONDS": float,

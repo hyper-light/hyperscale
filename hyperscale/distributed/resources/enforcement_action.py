@@ -6,5 +6,6 @@ class EnforcementAction(Enum):
 
     NONE = "none"
     WARN = "warn"
+    THROTTLE_WORKFLOW = "throttle_workflow"
     KILL_WORKFLOW = "kill_workflow"
     EVICT_WORKER = "evict_worker"

@@ -177,6 +177,8 @@ from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 # here; swap_defaults rebinds it under SIM.
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 from hyperscale.distributed.health.systemic_failure import is_systemic_failure
+from hyperscale.distributed.resources.workflow_throttle_request import WorkflowThrottleRequest
+from hyperscale.distributed.resources.workflow_throttle_response import WorkflowThrottleResponse
 from hyperscale.distributed.hlc import (
     ClockFenceVerdict,
     ClockOffsetMonitor,
@@ -633,6 +635,8 @@ class ManagerServer(HealthAwareServer):
                 clock=self._clock,
                 default_budget=ResourceBudget.from_env(self._env),
                 on_warn=self._warn_resource_violation,
+                on_throttle_workflow=self._throttle_workflow_for_resources,
+                on_release_throttle=self._release_workflow_throttle,
                 on_kill_workflow=self._kill_workflow_for_resources,
                 on_evict_worker=self._evict_worker_for_resources,
             )
@@ -7002,6 +7006,72 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+    async def _throttle_workflow_for_resources(
+        self,
+        workflow_id: str,
+        worker_id: str,
+        job_id: str,
+        scale: float,
+    ) -> bool:
+        """Cut an over-budget workflow's concurrency to ``scale`` of its
+        operating point; True when its worker applied it."""
+        response = await self._send_workflow_throttle(workflow_id, worker_id, job_id, scale)
+        applied = response is not None and response.applied
+        outcome = (
+            f"concurrency cap {response.concurrency_cap}"
+            if applied
+            else f"not applied ({response.error if response is not None else 'no response'})"
+        )
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Resource throttle of workflow {workflow_id[:8]}... on worker "
+                    f"{worker_id[:8]}... to {scale:.3f} of its concurrency: {outcome}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return applied
+
+    async def _release_workflow_throttle(self, workflow_id: str, worker_id: str, job_id: str) -> bool:
+        """Restore a throttled workflow's concurrency. Done once the worker
+        answered at all -- a workflow no longer running there has nothing
+        left to release -- so only a lost exchange is retried."""
+        response = await self._send_workflow_throttle(workflow_id, worker_id, job_id, None)
+        if response is None:
+            return False
+        await self._udp_logger.log(
+            ServerInfo(
+                message=f"Resource throttle of workflow {workflow_id[:8]}... released",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return True
+
+    async def _send_workflow_throttle(
+        self,
+        workflow_id: str,
+        worker_id: str,
+        job_id: str,
+        scale: float | None,
+    ) -> WorkflowThrottleResponse | None:
+        """One throttle exchange with the workflow's worker; None when it
+        did not complete."""
+        if (worker := self._manager_state.get_worker(worker_id)) is None:
+            return None
+        response = await self._send_to_worker(
+            (worker.node.host, worker.node.port),
+            "throttle_workflow",
+            WorkflowThrottleRequest(job_id=job_id, workflow_id=workflow_id, scale=scale).dump(),
+        )
+        if not isinstance(response, bytes) or not response:
+            return None
+        return WorkflowThrottleResponse.load(response)
 
     async def _kill_workflow_for_resources(
         self,

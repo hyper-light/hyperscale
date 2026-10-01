@@ -96,6 +96,7 @@ JOB_BUDGET = ResourceBudget(
     max_cpu_percent=CPU_BUDGET_PERCENT,
     max_memory_bytes=Env().RESOURCE_GUARD_MAX_MEMORY_BYTES,
     warning_threshold=Env().RESOURCE_GUARD_WARNING_THRESHOLD,
+    throttle_threshold=Env().RESOURCE_GUARD_THROTTLE_THRESHOLD,
     kill_threshold=Env().RESOURCE_GUARD_KILL_THRESHOLD,
     warning_grace_seconds=WARNING_GRACE_SECONDS,
     kill_grace_seconds=KILL_GRACE_SECONDS,

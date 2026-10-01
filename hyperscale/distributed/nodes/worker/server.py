@@ -86,6 +86,7 @@ from .background_loops import WorkerBackgroundLoops
 from .handlers import (
     WorkflowDispatchHandler,
     WorkflowCancelHandler,
+    WorkflowThrottleHandler,
     CancelJobWorkflowsHandler,
     JobLeaderTransferHandler,
     WorkflowProgressHandler,
@@ -495,6 +496,7 @@ class WorkerServer(HealthAwareServer):
         # Initialize handlers
         self._dispatch_handler: WorkflowDispatchHandler = WorkflowDispatchHandler(self)
         self._cancel_handler: WorkflowCancelHandler = WorkflowCancelHandler(self)
+        self._throttle_handler: WorkflowThrottleHandler = WorkflowThrottleHandler(self)
         self._cancel_job_handler: CancelJobWorkflowsHandler = (
             CancelJobWorkflowsHandler(self)
         )
@@ -673,8 +675,9 @@ class WorkerServer(HealthAwareServer):
             self._config.progress_update_interval,
         )
 
-        # Set remote manager for cancellation
+        # Set remote manager for cancellation and AD-41 throttling
         self._cancellation_handler_impl.set_remote_manager(remote_manager)
+        self._throttle_handler.set_remote_manager(remote_manager)
 
         # Start remote manager
         await self._lifecycle_manager.start_remote_manager()
@@ -2404,6 +2407,13 @@ class WorkerServer(HealthAwareServer):
     ) -> bytes:
         """Handle workflow cancellation request."""
         return await self._cancel_handler.handle(addr, data, clock_time)
+
+    @tcp.receive()
+    async def throttle_workflow(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        """Handle an AD-41 workflow throttle or release request."""
+        return await self._throttle_handler.handle(addr, data, clock_time)
 
     @tcp.receive()
     async def cancel_job_workflows(

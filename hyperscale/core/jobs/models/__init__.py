@@ -9,6 +9,8 @@ from .pending_workflow_run import PendingWorkflowRun as PendingWorkflowRun
 from .received_receipt import ReceivedReceipt as ReceivedReceipt
 from .response import Response as Response
 from .workflow_cancellation import WorkflowCancellation as WorkflowCancellation
+from .workflow_throttle import WorkflowThrottle as WorkflowThrottle
+from .workflow_throttle_update import WorkflowThrottleUpdate as WorkflowThrottleUpdate
 from .workflow_cancellation_status import WorkflowCancellationStatus as WorkflowCancellationStatus
 from .workflow_cancellation_update import WorkflowCancellationUpdate as WorkflowCancellationUpdate
 from .workflow_completion_state import StepStatsType as StepStatsType

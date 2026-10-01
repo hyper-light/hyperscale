@@ -105,6 +105,11 @@ class WorkflowRunner:
         self._active: Dict[int, Dict[str, int]] = defaultdict(dict)
         self._active_waiters: Dict[int, Dict[str, asyncio.Future]] = defaultdict(dict)
         self._max_active: Dict[int, Dict[str, int]] = defaultdict(dict)
+        # AD-41 THROTTLE: the concurrency cap a throttled workflow had
+        # before its first throttle (restored on release), and which
+        # workflows run a concurrency-gated (TEST) spawn loop at all.
+        self._throttle_base_cap: Dict[int, Dict[str, int]] = defaultdict(dict)
+        self._concurrency_gated: Dict[int, set[str]] = defaultdict(set)
         self._run_tasks: Dict[int, Dict[str, asyncio.Future]] = defaultdict(dict)
         self._failed: Dict[int, Dict[str, List[asyncio.Task]]] = defaultdict(
             lambda: defaultdict(list)
@@ -236,6 +241,52 @@ class WorkflowRunner:
             self._is_cancelled.set()
 
         return cancelled_live_task
+
+    def throttle_workflow(self, run_id: int, workflow_name: str, scale: float) -> int | None:
+        """AD-41 THROTTLE: cut a running workflow's concurrency to ``scale``
+        of its current operating point (the lower of its cap and the steps
+        actually in flight), never below one; repeated throttles compound.
+
+        Returns the new cap, or None when the workflow runs no
+        concurrency-gated spawn loop (not running, or an ACTION workflow,
+        whose steps run once) -- there is nothing to throttle.
+        """
+        if not 0.0 < scale <= 1.0:
+            raise ValueError(f"throttle scale must be in (0, 1], got {scale}")
+        if workflow_name not in self._concurrency_gated.get(run_id, ()):
+            return None
+        caps = self._max_active[run_id]
+        self._throttle_base_cap[run_id].setdefault(workflow_name, caps[workflow_name])
+        in_flight = self._active.get(run_id, {}).get(workflow_name, 0)
+        operating_point = min(caps[workflow_name], in_flight) if in_flight > 0 else caps[workflow_name]
+        caps[workflow_name] = max(1, math.floor(operating_point * scale))
+        return caps[workflow_name]
+
+    def release_workflow_throttle(self, run_id: int, workflow_name: str) -> bool:
+        """Restore a throttled workflow's original cap and wake its spawn
+        loop if it is parked on the throttled one. False when it was not
+        throttled."""
+        base_cap = self._throttle_base_cap.get(run_id, {}).pop(workflow_name, None)
+        if base_cap is None:
+            return False
+        if workflow_name in self._concurrency_gated.get(run_id, ()):
+            self._max_active[run_id][workflow_name] = base_cap
+        # Wake it the way _spawn_vu does: resolve, then clear the slot so
+        # the spawn loop can park on the restored cap again.
+        waiter = self._active_waiters.get(run_id, {}).get(workflow_name)
+        if waiter is not None:
+            if not waiter.done():
+                waiter.set_result(None)
+            self._active_waiters[run_id][workflow_name] = None
+        return True
+
+    def _end_concurrency_gate(self, run_id: int, workflow_name: str) -> None:
+        self._concurrency_gated[run_id].discard(workflow_name)
+        if not self._concurrency_gated[run_id]:
+            del self._concurrency_gated[run_id]
+        self._throttle_base_cap.get(run_id, {}).pop(workflow_name, None)
+        if run_id in self._throttle_base_cap and not self._throttle_base_cap[run_id]:
+            del self._throttle_base_cap[run_id]
 
     async def await_stop(self) -> None:
         return await self._is_stopped.wait()
@@ -644,14 +695,18 @@ class WorkflowRunner:
                     name="debug",
                 )
 
-                results = await self._execute_test_workflow(
-                    run_id,
-                    workflow,
-                    traversal_order,
-                    hooks,
-                    context,
-                    config,
-                )
+                self._concurrency_gated[run_id].add(workflow.name)
+                try:
+                    results = await self._execute_test_workflow(
+                        run_id,
+                        workflow,
+                        traversal_order,
+                        hooks,
+                        context,
+                        config,
+                    )
+                finally:
+                    self._end_concurrency_gate(run_id, workflow.name)
 
             else:
                 await ctx.log_prepared(
@@ -1352,6 +1407,8 @@ class WorkflowRunner:
         self._active.clear()
         self._active_waiters.clear()
         self._max_active.clear()
+        self._throttle_base_cap.clear()
+        self._concurrency_gated.clear()
 
     async def close(self):
         async with self._logger.context(

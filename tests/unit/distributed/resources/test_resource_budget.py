@@ -17,6 +17,7 @@ VALID = ResourceBudget(
     max_cpu_percent=100.0,
     max_memory_bytes=1024,
     warning_threshold=0.8,
+    throttle_threshold=0.85,
     kill_threshold=1.0,
     warning_grace_seconds=1.0,
     kill_grace_seconds=0.0,
@@ -27,6 +28,9 @@ INVALID_OVERRIDES = [
     {"max_memory_bytes": 0},
     {"warning_threshold": 0.0},
     {"warning_threshold": 1.5},
+    {"throttle_threshold": 0.5},  # below the warning threshold
+    {"throttle_threshold": 1.5},  # above the kill threshold
+    {"throttle_threshold": float("nan")},
     {"kill_grace_seconds": -1.0},
     {"warning_grace_seconds": float("nan")},
 ]

@@ -32,6 +32,7 @@ BUDGET = ResourceBudget(
     max_cpu_percent=LIMIT_CPU,
     max_memory_bytes=LIMIT_MEMORY,
     warning_threshold=0.8,
+    throttle_threshold=0.85,
     kill_threshold=1.0,
     warning_grace_seconds=10.0,
     kill_grace_seconds=2.0,
@@ -51,14 +52,26 @@ class SteppedClock:
 
 
 class Recorder:
-    def __init__(self, kill_succeeds: bool = True) -> None:
+    def __init__(self, kill_succeeds: bool = True, throttle_succeeds: bool = True, release_succeeds: bool = True) -> None:
         self.kill_succeeds = kill_succeeds
+        self.throttle_succeeds = throttle_succeeds
+        self.release_succeeds = release_succeeds
         self.warnings: list[tuple] = []
+        self.throttles: list[tuple] = []
+        self.releases: list[tuple] = []
         self.kills: list[tuple] = []
         self.evictions: list[tuple] = []
 
     async def warn(self, workflow_id, worker_id, violation_type, value, limit) -> None:
         self.warnings.append((workflow_id, worker_id, violation_type, value, limit))
+
+    async def throttle(self, workflow_id, worker_id, job_id, scale) -> bool:
+        self.throttles.append((workflow_id, worker_id, job_id, scale))
+        return self.throttle_succeeds
+
+    async def release(self, workflow_id, worker_id, job_id) -> bool:
+        self.releases.append((workflow_id, worker_id, job_id))
+        return self.release_succeeds
 
     async def kill(self, workflow_id, worker_id, job_id, violation_type) -> bool:
         self.kills.append((workflow_id, worker_id, job_id, violation_type))
@@ -74,6 +87,8 @@ def _enforcer(recorder: Recorder, clock: SteppedClock) -> ResourceEnforcer:
         clock=clock,
         default_budget=BUDGET,
         on_warn=recorder.warn,
+        on_throttle_workflow=recorder.throttle,
+        on_release_throttle=recorder.release,
         on_kill_workflow=recorder.kill,
         on_evict_worker=recorder.evict,
     )
@@ -160,7 +175,10 @@ async def test_certain_violation_is_killed_after_the_warning_and_kill_grace() ->
 
 
 @pytest.mark.asyncio
-async def test_uncertain_violation_is_warned_but_never_killed() -> None:
+async def test_uncertain_violation_is_warned_and_throttled_but_never_killed() -> None:
+    """Over the limit but not certainly so: never killed -- the graduated
+    response it gets is the throttle, repeated every (stretched) warning
+    grace while it stays above the throttle line."""
     recorder, clock = Recorder(), SteppedClock()
     enforcer = _enforcer(recorder, clock)
     value = LIMIT_CPU * 1.05
@@ -168,9 +186,12 @@ async def test_uncertain_violation_is_warned_but_never_killed() -> None:
 
     actions = await _run(enforcer, clock, 120.0, 0.5, cpu=value, cpu_sigma=sigma)
 
-    assert [action for _, action in actions if action is not EnforcementAction.NONE] == [
-        EnforcementAction.WARN
-    ]
+    acted = [(elapsed, action) for elapsed, action in actions if action is not EnforcementAction.NONE]
+    assert acted[0][1] is EnforcementAction.WARN
+    assert {action for _, action in acted[1:]} == {EnforcementAction.THROTTLE_WORKFLOW}
+    interval = BUDGET.warning_grace_seconds * (1.0 + sigma / value)
+    times = [elapsed for elapsed, _ in acted]
+    assert all(later - earlier >= interval for earlier, later in zip(times, times[1:]))
     assert recorder.kills == []
 
 
@@ -240,6 +261,7 @@ async def test_job_budget_overrides_the_default_and_releases_cleanly() -> None:
             max_cpu_percent=100.0,
             max_memory_bytes=LIMIT_MEMORY,
             warning_threshold=0.8,
+            throttle_threshold=0.85,
             kill_threshold=1.0,
             warning_grace_seconds=10.0,
             kill_grace_seconds=2.0,
@@ -253,3 +275,108 @@ async def test_job_budget_overrides_the_default_and_releases_cleanly() -> None:
     enforcer.release_job("job-strict")
     assert enforcer.tracked_violation_count == 0
     assert await _check(enforcer, cpu=200.0, job_id="job-strict") is EnforcementAction.NONE
+
+
+# ------------------------------------------------------------------ THROTTLE
+
+
+@pytest.mark.asyncio
+async def test_sustained_throttle_zone_usage_is_throttled_toward_the_throttle_line() -> None:
+    recorder, clock = Recorder(), SteppedClock()
+    enforcer = _enforcer(recorder, clock)
+    value = LIMIT_CPU * 0.9
+
+    actions = await _run(enforcer, clock, 30.0, 0.5, cpu=value)
+
+    acted = [(elapsed, action) for elapsed, action in actions if action is not EnforcementAction.NONE]
+    assert acted == [
+        (BUDGET.warning_grace_seconds, EnforcementAction.WARN),
+        (2 * BUDGET.warning_grace_seconds, EnforcementAction.THROTTLE_WORKFLOW),
+        (3 * BUDGET.warning_grace_seconds, EnforcementAction.THROTTLE_WORKFLOW),
+    ]
+    expected_scale = (LIMIT_CPU * BUDGET.throttle_threshold) / value
+    assert [scale for *_, scale in recorder.throttles] == [expected_scale, expected_scale]
+    assert enforcer.throttled_workflow_count == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_between_warning_and_throttle_lines_is_only_warned() -> None:
+    recorder, clock = Recorder(), SteppedClock()
+    enforcer = _enforcer(recorder, clock)
+
+    await _run(enforcer, clock, 60.0, 0.5, cpu=LIMIT_CPU * 0.82)
+
+    assert len(recorder.warnings) == 1
+    assert recorder.throttles == [] and recorder.kills == []
+
+
+@pytest.mark.asyncio
+async def test_falling_back_under_the_warning_line_releases_the_throttle_once() -> None:
+    recorder, clock = Recorder(), SteppedClock()
+    enforcer = _enforcer(recorder, clock)
+    await _run(enforcer, clock, 20.0, 0.5, cpu=LIMIT_CPU * 0.9)
+    assert len(recorder.throttles) == 1
+
+    await _run(enforcer, clock, 5.0, 0.5, cpu=LIMIT_CPU * 0.5)
+
+    assert recorder.releases == [("wf-1", "worker-1", "job-1")]
+    assert enforcer.throttled_workflow_count == 0
+    assert enforcer.tracked_violation_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_lost_release_is_retried_until_the_worker_answers() -> None:
+    recorder, clock = Recorder(release_succeeds=False), SteppedClock()
+    enforcer = _enforcer(recorder, clock)
+    await _run(enforcer, clock, 20.0, 0.5, cpu=LIMIT_CPU * 0.9)
+
+    await _run(enforcer, clock, 1.0, 0.5, cpu=LIMIT_CPU * 0.5)
+    assert len(recorder.releases) == 3 and enforcer.throttled_workflow_count == 1
+
+    recorder.release_succeeds = True
+    await _check(enforcer, cpu=LIMIT_CPU * 0.5)
+    await _check(enforcer, cpu=LIMIT_CPU * 0.5)
+    assert len(recorder.releases) == 4 and enforcer.throttled_workflow_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_throttled_on_two_resources_is_released_only_when_both_recover() -> None:
+    recorder, clock = Recorder(), SteppedClock()
+    enforcer = _enforcer(recorder, clock)
+    over = {"cpu": LIMIT_CPU * 0.9, "memory": LIMIT_MEMORY * 0.9}
+    # CPU is checked first and returns early on action, so drive both
+    # resources' violations long enough that each is throttled.
+    await _run(enforcer, clock, 60.0, 0.5, **over)
+    assert enforcer.throttled_workflow_count == 1
+
+    await _run(enforcer, clock, 1.0, 0.5, cpu=LIMIT_CPU * 0.5, memory=LIMIT_MEMORY * 0.9)
+    assert recorder.releases == []
+
+    await _check(enforcer, cpu=LIMIT_CPU * 0.5, memory=LIMIT_MEMORY * 0.5)
+    assert len(recorder.releases) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unappliable_throttle_still_escalates_to_kill() -> None:
+    """An ACTION workflow has no concurrency to cut: its worker reports the
+    throttle unapplied, nothing is recorded as throttled, and a certain
+    violation is still killed."""
+    recorder, clock = Recorder(throttle_succeeds=False), SteppedClock()
+    enforcer = _enforcer(recorder, clock)
+
+    actions = await _run(enforcer, clock, 30.0, 0.5, cpu=LIMIT_CPU * 1.5)
+
+    assert EnforcementAction.KILL_WORKFLOW in [action for _, action in actions]
+    assert enforcer.throttled_workflow_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_finished_workflow_leaves_no_throttle_state() -> None:
+    recorder, clock = Recorder(), SteppedClock()
+    enforcer = _enforcer(recorder, clock)
+    await _run(enforcer, clock, 20.0, 0.5, cpu=LIMIT_CPU * 0.9)
+
+    enforcer.release_workflow("wf-1")
+
+    assert enforcer.throttled_workflow_count == 0 and enforcer.tracked_violation_count == 0
+    assert recorder.releases == []

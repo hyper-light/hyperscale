@@ -31,6 +31,7 @@ from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models import (
+    WorkflowThrottleUpdate,
     CancellationUpdate,
     InstanceRoleType,
     PendingWorkflowRun,
@@ -1499,6 +1500,17 @@ class RemoteGraphManager:
 
     def start_server_cleanup(self):
         self._controller.start_controller_cleanup()
+
+    async def throttle_workflow(
+        self,
+        run_id: int,
+        workflow: str,
+        scale: float | None,
+    ) -> list[WorkflowThrottleUpdate]:
+        """AD-41 THROTTLE: cut the running workflow's concurrency to
+        ``scale`` of its operating point on every node running it, or --
+        ``scale`` None -- restore it. Each node's answer."""
+        return await self._controller.submit_workflow_throttle(run_id, workflow, scale)
 
     async def cancel_workflow(
         self,

@@ -21,6 +21,8 @@ from hyperscale.core.jobs.models import (
     WorkflowCancellation,
     WorkflowCancellationStatus,
     WorkflowCancellationUpdate,
+    WorkflowThrottle,
+    WorkflowThrottleUpdate,
     WorkflowCompletionState,
     WorkflowJob,
     WorkflowResults,
@@ -463,6 +465,27 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 ]
             )
             return results
+
+    async def submit_workflow_throttle(
+        self,
+        run_id: int,
+        workflow_name: str,
+        scale: float | None,
+    ) -> list[WorkflowThrottleUpdate]:
+        """AD-41 THROTTLE: apply ``scale`` (None: release) to the workflow on
+        every node running it; each node's answer, in node order."""
+        running_nodes = [
+            node_id
+            for node_id, status in self._statuses[run_id][workflow_name].items()
+            if status == WorkflowStatus.RUNNING
+        ]
+        responses = await asyncio.gather(
+            *[
+                self.request_workflow_throttle(run_id, workflow_name, scale, node_id)
+                for node_id in running_nodes
+            ]
+        )
+        return [response.data for _, response in responses]
 
     async def submit_workflow_cancellation(
         self,
@@ -1083,6 +1106,46 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 ),
                 run_id=context.run_id,
             )
+
+    @send()
+    async def request_workflow_throttle(
+        self,
+        run_id: int,
+        workflow_name: str,
+        scale: float | None,
+        node_id: str,
+    ) -> Response[JobContext[WorkflowThrottleUpdate]]:
+        return await self.send(
+            "throttle_workflow",
+            JobContext(
+                data=WorkflowThrottle(workflow_name=workflow_name, scale=scale),
+                run_id=run_id,
+            ),
+            node_id=node_id,
+        )
+
+    @receive()
+    async def throttle_workflow(
+        self,
+        shard_id: int,
+        throttle: JobContext[WorkflowThrottle],
+    ) -> JobContext[WorkflowThrottleUpdate]:
+        """Apply a throttle or release to this node's run of the workflow."""
+        run_id = throttle.run_id
+        workflow_name = throttle.data.workflow_name
+        if throttle.data.scale is None:
+            update = WorkflowThrottleUpdate(
+                workflow_name=workflow_name,
+                applied=self._workflows.release_workflow_throttle(run_id, workflow_name),
+            )
+        else:
+            concurrency_cap = self._workflows.throttle_workflow(run_id, workflow_name, throttle.data.scale)
+            update = WorkflowThrottleUpdate(
+                workflow_name=workflow_name,
+                applied=concurrency_cap is not None,
+                concurrency_cap=concurrency_cap,
+            )
+        return JobContext(data=update, run_id=run_id)
 
     @receive()
     async def cancel_workflow(
