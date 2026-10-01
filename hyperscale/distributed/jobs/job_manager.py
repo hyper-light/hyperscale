@@ -480,6 +480,10 @@ class JobManager:
                         parent_token=parent_token,
                         cores_allocated=int(sub_workflow_snapshot["cores_allocated"]),
                         fence_token=int(sub_workflow_snapshot["fence_token"]),
+                        # The snapshot carries no start time; "now" over-
+                        # states remaining work, the safe side for AD-43's
+                        # wait estimate.
+                        dispatched_at=_DEFAULT_CLOCK.monotonic(),
                     )
                     job.sub_workflows[sub_workflow_token_str] = sub_workflow
                 else:
@@ -780,6 +784,7 @@ class JobManager:
                 parent_token=workflow_token,
                 cores_allocated=cores_allocated,
                 fence_token=fence_token,
+                dispatched_at=_DEFAULT_CLOCK.monotonic(),
             )
 
             # Register in both places
@@ -953,6 +958,7 @@ class JobManager:
                         token=reassignment_token,
                         parent_token=parent.token,
                         cores_allocated=removed_cores,
+                        dispatched_at=_DEFAULT_CLOCK.monotonic(),
                     )
                     if removed_context is not None:
                         new_sub_workflow.dispatched_context = removed_context

@@ -15,7 +15,8 @@ Key responsibilities:
 
 import asyncio
 import traceback
-from typing import Any, Callable, Coroutine
+from types import MappingProxyType
+from typing import Any, Callable, Coroutine, Mapping
 
 import cloudpickle
 import networkx
@@ -1224,6 +1225,10 @@ class WorkflowDispatcher:
         if job_id is None:
             return len(self._pending)
         return sum(1 for p in self._pending.values() if p.job_id == job_id)
+
+    def get_pending_workflows(self) -> Mapping[str, PendingWorkflow]:
+        """Read-only view of every tracked workflow (AD-43 capacity input)."""
+        return MappingProxyType(self._pending)
 
     def get_dispatched_count(self, job_id: str | None = None) -> int:
         """Get count of dispatched workflows (optionally filtered by job_id)."""

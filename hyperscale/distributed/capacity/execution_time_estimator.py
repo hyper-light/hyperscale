@@ -56,12 +56,12 @@ class ExecutionTimeEstimator:
 
     def get_pending_duration_sum(self) -> float:
         """
-        Sum duration for all pending workflows that are not dispatched.
+        Sum duration for all pending workflows that will still run.
         """
         return sum(
             TimeParser(pending.workflow.duration).time
             for pending in self._pending.values()
-            if not pending.dispatched
+            if pending.is_awaiting_dispatch
         )
 
     def get_active_remaining_sum(self) -> float:

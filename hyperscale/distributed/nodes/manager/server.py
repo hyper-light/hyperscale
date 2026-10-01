@@ -191,6 +191,7 @@ from .leases import ManagerLeaseCoordinator
 from .health import ManagerHealthMonitor, HealthcheckExtensionManager
 from .sync import ManagerStateSync
 from .leadership import ManagerLeadershipCoordinator
+from .capacity_reporter import ManagerCapacityReporter
 from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator
 from .discovery import ManagerDiscoveryCoordinator
@@ -611,6 +612,16 @@ class ManagerServer(HealthAwareServer):
 
         # WorkflowDispatcher (initialized in start())
         self._workflow_dispatcher: WorkflowDispatcher | None = None
+
+        # AD-43 heartbeat capacity inputs (pending backlog + active
+        # remaining work); the dispatcher is read through a getter because
+        # it is created in start().
+        self._capacity_reporter = ManagerCapacityReporter(
+            job_manager=self._job_manager,
+            get_workflow_dispatcher=lambda: self._workflow_dispatcher,
+            get_total_cores=self._get_total_cores,
+            node_id=self._node_id.full,
+        )
 
         # WorkflowLifecycleStateMachine (initialized in start())
         self._workflow_lifecycle_states: WorkflowLifecycleStateMachine | None = None
@@ -4475,6 +4486,9 @@ class ManagerServer(HealthAwareServer):
         # RPC. Returns SLOSummary.empty() (neutral baseline) when no
         # workflow latencies have been recorded yet.
         slo_summary = self._manager_state.get_slo_summary()
+        pending_workflow_count, pending_duration_seconds, active_remaining_seconds = (
+            self._capacity_reporter.snapshot()
+        )
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -4496,6 +4510,11 @@ class ManagerServer(HealthAwareServer):
             healthy_worker_count=len(self._registry.get_healthy_worker_ids()),
             available_cores=self._get_available_cores_for_healthy_workers(),
             total_cores=self._get_total_cores(),
+            # AD-43: the gate's wait-estimation inputs (were never set, so
+            # every heartbeat shipped zeros and spillover saw no backlog).
+            pending_workflow_count=pending_workflow_count,
+            pending_duration_seconds=pending_duration_seconds,
+            active_remaining_seconds=active_remaining_seconds,
             tcp_host=self._host,
             tcp_port=self._tcp_port,
             udp_host=self._host,

@@ -254,6 +254,11 @@ class SubWorkflowInfo:
     dispatched_context: bytes = b""
     dispatched_version: int = 0
     superseded: bool = False
+    # _DEFAULT_CLOCK.monotonic() when this sub-workflow began executing on
+    # its current worker (dispatch or reassignment) — the start AD-43's
+    # remaining-time estimate measures from. Local-only; never compared
+    # across nodes.
+    dispatched_at: float = 0.0
 
     @property
     def token_str(self) -> str:
@@ -527,6 +532,13 @@ class PendingWorkflow:
         if remaining <= TIME_REMAINDER_EPSILON_SECONDS:
             return 0.0
         return remaining
+
+    @property
+    def is_awaiting_dispatch(self) -> bool:
+        """Queued work that will still run: not dispatched and not exhausted
+        (a cascade-failed or retry-exhausted entry stays in the dispatcher's
+        map until job cleanup but will never execute)."""
+        return not self.dispatched and self.dispatch_attempts < self.max_dispatch_attempts
 
     def check_and_signal_ready(self) -> bool:
         """
