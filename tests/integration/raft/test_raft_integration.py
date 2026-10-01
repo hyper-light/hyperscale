@@ -210,7 +210,7 @@ class TestManagerRaftIntegration:
     async def test_send_raft_message_dispatches_tcp(
         self, manager_integration: ManagerRaftIntegration, mock_send_tcp: AsyncMock
     ) -> None:
-        """_send_raft_message routes message types to correct TCP method names."""
+        """_send_raft_message only enqueues; _exchange uses the correct TCP method name."""
         vote = RequestVote(
             job_id="job-1",
             term=1,
@@ -219,6 +219,11 @@ class TestManagerRaftIntegration:
             last_log_term=0,
         )
         await manager_integration._send_raft_message(("10.0.0.2", 8000), vote)
+        mock_send_tcp.assert_not_called()
+        assert manager_integration._outbox.pending_count == 1
+
+        mock_send_tcp.return_value = b""
+        await manager_integration._exchange(("10.0.0.2", 8000), vote)
         mock_send_tcp.assert_called_once()
         call_args = mock_send_tcp.call_args
         assert call_args[0][1] == "raft_request_vote"
@@ -312,7 +317,7 @@ class TestGateRaftIntegration:
     async def test_send_raft_message_uses_gate_prefix(
         self, gate_integration: GateRaftIntegration, mock_send_tcp: AsyncMock
     ) -> None:
-        """Gate _send_raft_message uses gate_raft_ prefixed method names."""
+        """Gate _exchange uses gate_raft_ prefixed method names."""
         vote = RequestVote(
             job_id="gate-job-1",
             term=1,
@@ -320,7 +325,8 @@ class TestGateRaftIntegration:
             last_log_index=0,
             last_log_term=0,
         )
-        await gate_integration._send_raft_message(("10.0.0.2", 9000), vote)
+        mock_send_tcp.return_value = (b"", 0)
+        await gate_integration._exchange(("10.0.0.2", 9000), vote)
         mock_send_tcp.assert_called_once()
         call_args = mock_send_tcp.call_args
         assert call_args[0][1] == "gate_raft_request_vote"
@@ -329,7 +335,7 @@ class TestGateRaftIntegration:
     async def test_send_append_entries_uses_gate_prefix(
         self, gate_integration: GateRaftIntegration, mock_send_tcp: AsyncMock
     ) -> None:
-        """Gate _send_raft_message uses gate_raft_append_entries method name."""
+        """Gate _exchange uses the gate_raft_append_entries method name."""
         append = AppendEntries(
             job_id="gate-job-1",
             term=1,
@@ -339,7 +345,8 @@ class TestGateRaftIntegration:
             entries=[],
             leader_commit=0,
         )
-        await gate_integration._send_raft_message(("10.0.0.2", 9000), append)
+        mock_send_tcp.return_value = (b"", 0)
+        await gate_integration._exchange(("10.0.0.2", 9000), append)
         mock_send_tcp.assert_called_once()
         call_args = mock_send_tcp.call_args
         assert call_args[0][1] == "gate_raft_append_entries"

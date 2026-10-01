@@ -13,7 +13,7 @@ Tests the full consensus lifecycle:
 import asyncio
 import time
 from collections import defaultdict
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from hyperscale.distributed.raft.models import (
     AppendEntries,
@@ -136,7 +136,7 @@ def create_cluster(
     nodes: dict[str, RaftNode] = {}
     for node_id in node_ids:
         logger_mock = MagicMock()
-        logger_mock.log = MagicMock(return_value=asyncio.coroutine(lambda: None)())
+        logger_mock.log = AsyncMock()
 
         node = RaftNode(
             job_id="job-1",

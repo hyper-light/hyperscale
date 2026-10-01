@@ -1,0 +1,316 @@
+"""
+Raft RPC exchange between manager peers (ManagerRaftIntegration + RaftPeerOutbox).
+
+The peer's Raft handler answers in the TCP reply, but the sender discarded
+``send_tcp``'s return value, so no vote or append ack ever reached a
+candidate or leader: measured, a 3-member group churned to term 23 in 5s
+without electing, and nothing could ever commit. Routing the reply inline
+would also have deadlocked — RaftNode sends while holding its lock and the
+response handler takes the same lock — and a slow peer would have stalled
+every job's tick.
+
+Pinned against real integrations, a real TaskRunner and an in-memory
+transport with send_tcp semantics: multi-member groups elect one leader,
+stop churning terms, commit, and replicate the commit to followers; a hung
+or unreachable peer does not stop a majority from committing; the outbox
+stays bounded under a stuck peer; forgotten peers' sender loops end; and
+shutdown leaves no sender tasks behind.
+"""
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.nodes.manager.raft_integration import ManagerRaftIntegration
+from hyperscale.distributed.raft import RaftPeerOutbox
+from hyperscale.distributed.raft.models import AppendEntries, RaftCommandType, RequestVote
+from hyperscale.distributed.raft.models.commands import RaftCommand
+from hyperscale.distributed.raft.raft_node import ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
+from hyperscale.distributed.taskex import TaskRunner
+
+JOB_ID = "job-1"
+HANDLERS = {
+    "raft_request_vote": "handle_request_vote",
+    "raft_append_entries": "handle_append_entries",
+}
+# Liveness ceiling for elections and commits: randomized timeouts make a
+# split vote possible on an instant transport, so allow several full
+# election rounds; a working group finishes in about one.
+ELECTION_ROUNDS_CEILING = 20
+LIVENESS_CEILING_SECONDS = ELECTION_TIMEOUT_MAX * ELECTION_ROUNDS_CEILING
+
+
+def _logger() -> MagicMock:
+    logger = MagicMock()
+    logger.log = AsyncMock()
+    return logger
+
+
+def _member_id(addr: tuple[str, int]) -> str:
+    return f"manager-{addr[1]}"
+
+
+class InMemoryCluster:
+    """N manager Raft integrations joined by a send_tcp-shaped transport."""
+
+    def __init__(self, member_count: int, task_runner: TaskRunner) -> None:
+        self.addresses = [("127.0.0.1", 9000 + index) for index in range(member_count)]
+        self.integrations: dict[tuple[str, int], ManagerRaftIntegration] = {}
+        self.hung_addresses: set[tuple[str, int]] = set()
+        self.unreachable_addresses: set[tuple[str, int]] = set()
+        self.release_hung = asyncio.Event()
+        self.logger = _logger()
+        for addr in self.addresses:
+            self.integrations[addr] = ManagerRaftIntegration(
+                node_id=_member_id(addr),
+                job_manager=MagicMock(),
+                leadership_tracker=MagicMock(),
+                logger=self.logger,
+                task_runner=task_runner,
+                send_tcp=self._send_tcp,
+                node_addr=addr,
+                configured_cluster_size=member_count,
+            )
+
+    async def _send_tcp(self, addr, method, data, timeout=None):
+        if addr in self.unreachable_addresses:
+            return ConnectionRefusedError(f"{addr} unreachable")
+        if addr in self.hung_addresses:
+            await self.release_hung.wait()
+            return asyncio.TimeoutError(f"{addr} timed out")
+        reply = await getattr(self.integrations[addr], HANDLERS[method])(data)
+        return reply if reply is not None else b""
+
+    async def start(self) -> None:
+        for addr, integration in self.integrations.items():
+            peers = [peer for peer in self.addresses if peer != addr]
+            integration.set_initial_membership(
+                {_member_id(peer) for peer in peers},
+                {_member_id(peer): peer for peer in peers},
+            )
+            await integration.consensus.create_job_raft(JOB_ID)
+            integration.start()
+
+    async def stop(self) -> None:
+        self.release_hung.set()
+        for integration in self.integrations.values():
+            await integration.stop()
+
+    def nodes(self, among: list[tuple[str, int]] | None = None):
+        return [self.integrations[addr].consensus.get_node(JOB_ID) for addr in among or self.addresses]
+
+    async def wait_for_leader(self, among: list[tuple[str, int]] | None = None) -> tuple[str, int]:
+        candidates = among or self.addresses
+        async with asyncio.timeout(LIVENESS_CEILING_SECONDS):
+            while True:
+                if leaders := [addr for addr in candidates if self.integrations[addr].consensus.get_node(JOB_ID).is_leader()]:
+                    return leaders[0]
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
+@pytest.fixture
+async def task_runner():
+    runner = TaskRunner(0, Env())
+    yield runner
+    await runner.shutdown()
+
+
+def _sender_loop_tasks() -> list[asyncio.Task]:
+    """Live asyncio tasks running an outbox sender loop (TaskRunner wraps
+    each run's call in ``Run._execute``, so match on the run's call)."""
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if not task.done()
+        and (frame := task.get_coro().cr_frame) is not None
+        and getattr(getattr(frame.f_locals.get("self"), "call", None), "__name__", "") == "_send_loop"
+    ]
+
+
+async def _propose(cluster: InMemoryCluster, leader: tuple[str, int]) -> tuple[bool, int]:
+    command = RaftCommand(command_type=RaftCommandType.NO_OP, job_id=JOB_ID)
+    return await cluster.integrations[leader].consensus.propose_command(JOB_ID, command)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("member_count", [3, 5])
+async def test_group_elects_one_leader_commits_and_followers_apply(
+    task_runner: TaskRunner,
+    member_count: int,
+) -> None:
+    cluster = InMemoryCluster(member_count, task_runner)
+    await cluster.start()
+    try:
+        leader = await cluster.wait_for_leader()
+        committed, index = await _propose(cluster, leader)
+
+        assert committed is True
+        async with asyncio.timeout(LIVENESS_CEILING_SECONDS):
+            while any(node.commit_index < index for node in cluster.nodes()):
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+        nodes = cluster.nodes()
+        assert sum(node.is_leader() for node in nodes) == 1
+        terms_after_commit = {node.current_term for node in nodes}
+        assert len(terms_after_commit) == 1
+
+        await asyncio.sleep(ELECTION_TIMEOUT_MAX * 2)
+        assert {node.current_term for node in cluster.nodes()} == terms_after_commit
+    finally:
+        await cluster.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["hung", "unreachable"])
+async def test_majority_commits_despite_a_failed_peer(task_runner: TaskRunner, failure: str) -> None:
+    cluster = InMemoryCluster(3, task_runner)
+    failed_peer = cluster.addresses[-1]
+    getattr(cluster, f"{failure}_addresses").add(failed_peer)
+    healthy = [addr for addr in cluster.addresses if addr != failed_peer]
+    await cluster.start()
+    try:
+        leader = await cluster.wait_for_leader(among=healthy)
+        committed, _ = await _propose(cluster, leader)
+
+        assert committed is True
+    finally:
+        await cluster.stop()
+
+
+@pytest.mark.asyncio
+async def test_unreachable_peer_is_logged_not_swallowed(task_runner: TaskRunner) -> None:
+    cluster = InMemoryCluster(3, task_runner)
+    cluster.unreachable_addresses.add(cluster.addresses[-1])
+    await cluster.start()
+    try:
+        await cluster.wait_for_leader(among=cluster.addresses[:-1])
+
+        logged = [call.args[0].message for call in cluster.logger.log.await_args_list]
+        assert any("got no response" in message and "9002" in message for message in logged)
+    finally:
+        await cluster.stop()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_leaves_no_sender_loops(task_runner: TaskRunner) -> None:
+    cluster = InMemoryCluster(3, task_runner)
+    cluster.hung_addresses.add(cluster.addresses[-1])
+    await cluster.start()
+    await cluster.wait_for_leader(among=cluster.addresses[:-1])
+    assert _sender_loop_tasks()
+
+    await cluster.stop()
+    await asyncio.sleep(0)
+
+    assert _sender_loop_tasks() == []
+    for integration in cluster.integrations.values():
+        assert integration._outbox.peer_count == 0
+        assert integration._outbox.pending_count == 0
+
+
+def _vote(job_id: str, term: int) -> RequestVote:
+    return RequestVote(job_id=job_id, term=term, candidate_id="manager-a", last_log_index=0, last_log_term=0)
+
+
+def _append(job_id: str, term: int) -> AppendEntries:
+    return AppendEntries(
+        job_id=job_id,
+        term=term,
+        leader_id="manager-a",
+        prev_log_index=0,
+        prev_log_term=0,
+        entries=[],
+        leader_commit=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_outbox_stays_bounded_behind_a_stuck_peer(task_runner: TaskRunner) -> None:
+    stuck = asyncio.Event()
+    delivered: list[object] = []
+
+    async def exchange(addr, request):
+        delivered.append(request)
+        await stuck.wait()
+
+    outbox = RaftPeerOutbox(exchange=exchange, task_runner=task_runner, logger=_logger(), node_id="manager-a")
+    job_ids = [f"job-{index}" for index in range(10)]
+    peer = ("127.0.0.1", 9001)
+    try:
+        for term in range(1, 1_001):
+            for job_id in job_ids:
+                outbox.enqueue(peer, _vote(job_id, term))
+                outbox.enqueue(peer, _append(job_id, term))
+            await asyncio.sleep(0)
+
+        assert outbox.pending_count <= len(job_ids) * 2
+        latest_pending_terms = {request.term for request in outbox._pending[peer].values()}
+        assert latest_pending_terms == {1_000}
+    finally:
+        stuck.set()
+        await outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_forgotten_peer_loop_ends_and_readded_peer_gets_a_fresh_loop(task_runner: TaskRunner) -> None:
+    delivered: list[tuple[tuple[str, int], int]] = []
+
+    async def exchange(addr, request):
+        delivered.append((addr, request.term))
+
+    outbox = RaftPeerOutbox(exchange=exchange, task_runner=task_runner, logger=_logger(), node_id="manager-a")
+    peer = ("127.0.0.1", 9001)
+    try:
+        outbox.enqueue(peer, _vote(JOB_ID, 1))
+        await asyncio.sleep(0.01)
+        outbox.forget_peer(peer)
+        await asyncio.sleep(0.01)
+        assert _sender_loop_tasks() == []
+
+        outbox.enqueue(peer, _vote(JOB_ID, 2))
+        await asyncio.sleep(0.01)
+
+        assert delivered == [(peer, 1), (peer, 2)]
+        assert len(_sender_loop_tasks()) == 1
+    finally:
+        await outbox.close()
+        await asyncio.sleep(0)
+        assert _sender_loop_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_failing_exchange_is_logged_and_the_loop_keeps_delivering(task_runner: TaskRunner) -> None:
+    logger = _logger()
+    delivered: list[int] = []
+
+    async def exchange(addr, request):
+        if request.term == 1:
+            raise ValueError("malformed reply")
+        delivered.append(request.term)
+
+    outbox = RaftPeerOutbox(exchange=exchange, task_runner=task_runner, logger=logger, node_id="manager-a")
+    peer = ("127.0.0.1", 9001)
+    try:
+        outbox.enqueue(peer, _vote(JOB_ID, 1))
+        await asyncio.sleep(0.01)
+        outbox.enqueue(peer, _vote(JOB_ID, 2))
+        await asyncio.sleep(0.01)
+
+        assert delivered == [2]
+        warning = logger.log.await_args_list[0].args[0]
+        assert "malformed reply" in warning.message
+    finally:
+        await outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_after_close_is_dropped(task_runner: TaskRunner) -> None:
+    outbox = RaftPeerOutbox(exchange=AsyncMock(), task_runner=task_runner, logger=_logger(), node_id="manager-a")
+    await outbox.close()
+
+    outbox.enqueue(("127.0.0.1", 9001), _vote(JOB_ID, 1))
+
+    assert outbox.pending_count == 0
+    assert outbox.peer_count == 0

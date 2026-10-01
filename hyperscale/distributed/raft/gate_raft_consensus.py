@@ -262,6 +262,10 @@ class GateRaftConsensus:
         for node in self._nodes.values():
             node.update_membership(self._members, self._member_addrs)
 
+    def member_address(self, node_id: str) -> tuple[str, int] | None:
+        """TCP address of a current member, or None if unknown."""
+        return self._member_addrs.get(node_id)
+
     def on_node_leave(self, node_id: str) -> None:
         """Handle a node leaving the cluster."""
         self._members.discard(node_id)

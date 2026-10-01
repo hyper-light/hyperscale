@@ -11,7 +11,8 @@ Wires Raft consensus into the manager server by providing:
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
-from hyperscale.distributed.raft import RaftConsensus, RaftJobManager
+from hyperscale.distributed.raft import RaftConsensus, RaftJobManager, RaftPeerOutbox
+from hyperscale.distributed.raft.logging_models import RaftDebug
 from hyperscale.distributed.raft.models import (
     AppendEntries,
     AppendEntriesResponse,
@@ -46,6 +47,7 @@ class ManagerRaftIntegration:
         "_node_id",
         "_node_addr",
         "_logger",
+        "_outbox",
     )
 
     def __init__(
@@ -68,6 +70,12 @@ class ManagerRaftIntegration:
         self._node_addr = node_addr if node_addr is not None else ("", 0)
         self._logger = logger
         self._send_tcp = send_tcp
+        self._outbox = RaftPeerOutbox(
+            exchange=self._exchange,
+            task_runner=task_runner,
+            logger=logger,
+            node_id=node_id,
+        )
 
         self._consensus = RaftConsensus(
             node_id=node_id,
@@ -108,6 +116,7 @@ class ManagerRaftIntegration:
     async def stop(self) -> None:
         """Stop all Raft instances and the tick loop."""
         await self._consensus.destroy_all()
+        await self._outbox.close()
 
     # =========================================================================
     # TCP Send Callback
@@ -116,22 +125,59 @@ class ManagerRaftIntegration:
     async def _send_raft_message(
         self,
         addr: tuple[str, int],
-        message: RequestVote | RequestVoteResponse | AppendEntries | AppendEntriesResponse,
+        message: RequestVote | AppendEntries,
     ) -> None:
-        """Send a Raft message to a peer via TCP."""
-        match message:
+        """Queue a Raft request for ``addr``; never awaits network I/O.
+
+        RaftNode calls this while holding its lock, so delivery and reply
+        routing happen on the outbox's per-peer sender loop instead.
+        """
+        self._outbox.enqueue(addr, message)
+
+    async def _exchange(
+        self,
+        addr: tuple[str, int],
+        request: RequestVote | AppendEntries,
+    ) -> None:
+        """Deliver one Raft request and route the peer's reply.
+
+        The peer's handler answers in the TCP reply, so that reply is the
+        RPC response: dropping it (as this path once did) meant no vote or
+        append ack ever reached a candidate or leader, and no multi-member
+        group could elect or commit. A transport failure or an empty
+        reply (peer at Raft capacity) is a lost message, which Raft
+        recovers from by rebuilding the RPC on the next tick.
+        """
+        match request:
             case RequestVote():
                 method = "raft_request_vote"
-            case RequestVoteResponse():
-                method = "raft_request_vote_response"
             case AppendEntries():
                 method = "raft_append_entries"
-            case AppendEntriesResponse():
-                method = "raft_append_entries_response"
-            case _:
-                return
 
-        await self._send_tcp(addr, method, message.dump())
+        reply = await self._send_tcp(addr, method, request.dump())
+        if isinstance(reply, Exception) or not reply:
+            await self._logger.log(
+                RaftDebug(
+                    message=(
+                        f"Raft {method} to {addr[0]}:{addr[1]} got no response "
+                        f"({reply!r}); rebuilt on the next tick"
+                    ),
+                    node_id=self._node_id,
+                    job_id=request.job_id,
+                    term=request.term,
+                )
+            )
+            return
+
+        match request:
+            case RequestVote():
+                await self._consensus.route_request_vote_response(
+                    RequestVoteResponse.load(reply)
+                )
+            case AppendEntries():
+                await self._consensus.route_append_entries_response(
+                    AppendEntriesResponse.load(reply)
+                )
 
     # =========================================================================
     # TCP Handler Routing
@@ -173,6 +219,8 @@ class ManagerRaftIntegration:
 
     def on_node_leave(self, node_id: str) -> None:
         """Route SWIM node dead to Raft consensus."""
+        if (addr := self._consensus.member_address(node_id)) is not None:
+            self._outbox.forget_peer(addr)
         self._consensus.on_node_leave(node_id)
 
     def set_initial_membership(
