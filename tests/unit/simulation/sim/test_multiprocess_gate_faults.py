@@ -11,10 +11,14 @@ sustained-load entry (6 virtual seconds of chained ACTION execution).
 
 Probed baseline (seed 211, no faults): gates discover both peers by
 t=0.5; gate-c wins the initial election at ~1.5 and holds leadership
-all run; DC healthy ~5.5; submission accepted t=5.53 at gate index 1
-(gate-b — the SUBMISSION gate every kill/restart scenario targets or
-deliberately spares); dispatch t=8.75; client-visible completion
-t=14.769 (dispatch + the full 6s duration + push); worker drain 20.25.
+all run; submission accepted t=8.38 at gate index 0 (gate-a — the
+SUBMISSION gate every kill/restart scenario targets or deliberately
+spares); 'running' seen t=8.88, worker active [8.5, 14.75];
+client-visible completion t=14.522 (dispatch + the full 6s duration +
+push). Re-probed 2026-10-01 on the clock-offset fencing base: the gate
+now answers warmup submissions with a transient "not ready" JobAck, so
+the client stays on its first-ranked gate (gate-a) instead of failing
+over to gate-b.
 
 Scenario families (mission points 1-5 + scope extension), each pinned
 to PROBED current behavior — loud truths, with aspirational invariants
@@ -57,6 +61,7 @@ skip-marked where the probes exposed gaps:
   (documented liveness gap).
 """
 
+from hyperscale.distributed.env import Env
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.gate_fault_client_demo import (
     multi_gate_load_client_entry,
@@ -84,17 +89,27 @@ _GATE_HOSTS = {
     "gate-c": "sim-gate-c",
 }
 
-# Probed baseline instants (seed 211): submission accepted ~5.53 at
-# gate index 1 (gate-b), dispatch ~8.75, client-visible completion
-# 14.769. A fault at t=12.0 provably lands INSIDE live execution.
+# Probed baseline instants (seed 211): submission accepted 8.38 at gate
+# index 0 (gate-a), 'running' 8.88, worker active [8.5, 14.75],
+# client-visible completion 14.522. A fault at t=12.0 provably lands
+# INSIDE live execution.
 _SEED = 211
-_SUBMISSION_GATE_INDEX = 1
-_SUBMISSION_GATE = "gate-b"
+_SUBMISSION_GATE_INDEX = 0
+_SUBMISSION_GATE = "gate-a"
 _INITIAL_LEADER_GATE = "gate-c"
-_FOLLOWER_GATE = "gate-a"
+_FOLLOWER_GATE = "gate-b"
 _MID_EXECUTION_AT = 12.0
 _WORKFLOW_DURATION = 6.0
 _JOB_TIMEOUT = 30.0
+_LATE_CLIENT_AT = 300.0
+_BASELINE_SUBMITTED_AT = 8.381971
+_BASELINE_RUNNING_AT = 8.881971
+_BASELINE_COMPLETION_AT = 14.521971
+# A fault that perturbed the job path costs at least one failure
+# detection/retry cycle -- no less than a SWIM probe interval -- so a
+# completion within one interval of the baseline is unperturbed.
+_UNPERTURBED_TOLERANCE_SECONDS = float(Env().SWIM_UDP_POLL_INTERVAL)
+_UNPERTURBED_COMPLETION_BOUND = _BASELINE_COMPLETION_AT + _UNPERTURBED_TOLERANCE_SECONDS
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "timeout", "cancelled"})
 
@@ -254,10 +269,10 @@ def test_kill_follower_gate_job_completes_and_leader_holds():
     )
     finish_time = _assert_clean_completed_client(client_log, "kill-follower")
     # A follower death is INVISIBLE to the job path: probed completion
-    # lands at the fault-free baseline instant (~14.77 — dispatch 8.75
-    # + 6s execution + push), so any drift past 16 means the kill
-    # perturbed a path it must not touch.
-    assert finish_time < 16.0, client_log
+    # lands at the fault-free baseline instant (14.522 — dispatch + 6s
+    # execution + push), so completion past the unperturbed bound means
+    # the kill perturbed a path it must not touch.
+    assert finish_time < _UNPERTURBED_COMPLETION_BOUND, client_log
 
     # The surviving gates hold leadership without churn: the initial
     # leader keeps its flag and nobody else ever claims it.
@@ -296,7 +311,7 @@ def test_kill_follower_is_replay_deterministic():
 def _run_kill_leader() -> dict:
     """Kill the initial gate LEADER (gate-c) at t=12: mid-execution
     leader loss — the survivors must re-elect exactly one leader and
-    the in-flight job (owned by gate-b) must complete undisturbed."""
+    the in-flight job (owned by gate-a) must complete undisturbed."""
     coordinator = _build_cluster(_SEED, 150.0, wait_timeout=100.0)
     coordinator.schedule_kill(_INITIAL_LEADER_GATE, _MID_EXECUTION_AT)
     return coordinator.run()
@@ -309,8 +324,8 @@ def test_kill_leader_gate_reelects_exactly_one_and_job_completes():
 
     finish_time = _assert_clean_completed_client(results["client"], "kill-leader")
     # Leader death must not perturb an in-flight job owned by another
-    # gate: probed completion at the baseline instant (~14.77).
-    assert finish_time < 16.0, results["client"]
+    # gate: probed completion at the baseline instant (14.522).
+    assert finish_time < _UNPERTURBED_COMPLETION_BOUND, results["client"]
 
     # Eventual convergence: EXACTLY one surviving gate ends as leader.
     flags = _final_leader_flags(results, (_FOLLOWER_GATE, _SUBMISSION_GATE))
@@ -342,8 +357,8 @@ def test_kill_leader_is_replay_deterministic():
 
 
 def _run_kill_submission_gate() -> dict:
-    """Kill the gate that ACCEPTED the job (gate-b, probed submit-target
-    index 1) at t=12, while the workflow is mid-run: the manager's
+    """Kill the gate that ACCEPTED the job (gate-a, probed submit-target
+    index 0) at t=12, while the workflow is mid-run: the manager's
     completion push hits a dead origin and must fail over to a
     surviving peer gate, which delivers the client-ready result."""
     coordinator = _build_cluster(_SEED, 150.0, wait_timeout=100.0)
@@ -368,12 +383,11 @@ def test_kill_submission_gate_result_arrives_via_surviving_gates():
         client_log, "kill-submission-gate"
     )
     # The completion push hits the DEAD origin gate, burns exactly one
-    # failover timeout, and a surviving peer gate delivers: probed
-    # finish at 19.789 = baseline 14.769 + the 5s dead-origin push
-    # timeout. Bound: after the baseline (the detour is real) but
-    # within one failover cycle (a second cycle means the first
-    # surviving peer failed too).
-    assert 16.0 < finish_time < 26.0, client_log
+    # failover timeout, and a surviving peer gate delivers: the
+    # baseline completion plus the 5s dead-origin push timeout. Bound:
+    # after the baseline (the detour is real) but within one failover
+    # cycle (a second cycle means the first surviving peer failed too).
+    assert _BASELINE_COMPLETION_AT < finish_time < 26.0, client_log
 
     flags = _final_leader_flags(results, (_FOLLOWER_GATE, _INITIAL_LEADER_GATE))
     assert sum(flags.values()) == 1, flags
@@ -428,11 +442,11 @@ def test_restart_submission_gate_client_still_observes_terminal():
         results["client"], "restart-submission-gate"
     )
     # Probed: identical loud outcome to the KILL of the same gate —
-    # completion at 19.789 via the peer-gate failover during the down
-    # window. The client never notices the difference between a dead
-    # and an amnesiac-rebooting origin gate; what it must never see is
-    # silence.
-    assert 16.0 < finish_time < 26.0, results["client"]
+    # completion after the baseline via the peer-gate failover during
+    # the down window. The client never notices the difference between
+    # a dead and an amnesiac-rebooting origin gate; what it must never
+    # see is silence.
+    assert _BASELINE_COMPLETION_AT < finish_time < 26.0, results["client"]
 
     # No split-brain across the reboot: at most one leader among ALL
     # three gates at the end, and exactly one somewhere.
@@ -444,7 +458,12 @@ def test_restart_submission_gate_is_replay_deterministic():
     assert _run_restart_submission_gate() == _run_restart_submission_gate()
 
 
-_DURABLE_RESTART_AT = 9.0
+# Midpoint of the probed window between the gate's accepted dispatch
+# (10.05) and the job's natural completion (11.14), seed 211: gen-1
+# dies after recording the acceptance and before the first completion
+# send. Re-probed 2026-10-01 after the gate's per-job Raft groups
+# shifted its dispatch-retry jitter (accept moved from 8.95 to 10.05).
+_DURABLE_RESTART_AT = 10.6
 _DURABLE_DOWN_SECONDS = 8.0
 _DURABLE_GEN2_BOOT = _DURABLE_RESTART_AT + _DURABLE_DOWN_SECONDS
 _DURABLE_WORKFLOW_SECONDS = 20.0
@@ -616,7 +635,7 @@ def _run_leader_peer_isolation() -> dict:
     SUSTAINED silence measured from suspicion, and leadership liveness
     still disseminates via the manager plane), so the tier rides it
     out with ZERO membership churn — no peer-count drop, no election,
-    no second leader — and the job (owned by gate-b, unpartitioned)
+    no second leader — and the job (owned by gate-a, unpartitioned)
     completes at the baseline instant."""
     coordinator = _build_cluster(_SEED, 180.0, wait_timeout=120.0)
     coordinator.schedule_partition(
@@ -635,7 +654,7 @@ def test_leader_peer_isolation_causes_no_false_deaths_or_churn():
     finish_time = _assert_clean_completed_client(
         results["client"], "leader-peer-isolation"
     )
-    assert finish_time < 16.0, results["client"]
+    assert finish_time < _UNPERTURBED_COMPLETION_BOUND, results["client"]
 
     # No false deaths: NO gate's active-peer count ever left 2 — the
     # heal-bounded cut must not evict anybody (probed: peer counts sit
@@ -716,7 +735,7 @@ def test_leader_total_isolation_majority_elects_and_islander_steps_down():
     finish_time = _assert_clean_completed_client(
         results["client"], "leader-total-isolation"
     )
-    assert finish_time < 16.0, results["client"]
+    assert finish_time < _UNPERTURBED_COMPLETION_BOUND, results["client"]
 
     # Majority side: SOME majority gate claims leadership DURING the
     # isolation within the accelerated bound (probed: gate-b at 20.5 —
@@ -910,22 +929,36 @@ def test_submission_blackout_is_replay_deterministic():
     assert _run_submission_blackout() == _run_submission_blackout()
 
 
+# Between the client-observed acceptance (8.382) and the gate's dispatch
+# to the manager, so the whole dispatch window lands inside the cut. With
+# dc-1 healthy at submission the dispatch follows acceptance within
+# milliseconds (probed: a cut from 8.385 or 8.39 catches it, one from
+# 8.441 -- the midpoint of acceptance and worker activation at 8.5 --
+# does not), so the baseline acceptance/running midpoint no longer lies
+# inside the window. Re-probed 2026-10-01 on the clock-offset fencing base.
+_DISPATCH_WINDOW_CUT_AT = 8.386
+_DISPATCH_WINDOW_HEAL_AT = 26.0
+
+
 def _run_dispatch_window_manager_partition() -> dict:
-    """Cut the ACCEPTING gate (gate-b) from the manager over [6, 26) —
-    the job is accepted at t=5.53, so the ENTIRE dispatch window lands
-    inside the cut.
+    """Cut the ACCEPTING gate (gate-a) from the manager from between the
+    baseline acceptance (8.382) and its dispatch (before 8.441) until
+    t=26 — so the ENTIRE dispatch window lands inside the cut.
 
     Probed invariant: an accepted job's dispatch is not a one-shot —
     the gate retries against the cut for its whole span and lands the
-    dispatch immediately after heal ('running' at t=27.03, worker
-    active [27.0, 38.5], completion at t=32.888 = post-heal dispatch +
+    dispatch immediately after heal ('running' at t=26.88, worker
+    active [26.75, 33.25], completion at t=32.853 = post-heal dispatch +
     the full 6s duration + push). No failure, no silence, no
     leadership disturbance. (Contrast, documented in the report: a
     SECOND job's dispatch dies in ~5.4s — the retry robustness exists
     only on this first-job path today.)"""
     coordinator = _build_cluster(_SEED, 150.0, wait_timeout=100.0)
     coordinator.schedule_partition(
-        _SUBMISSION_GATE, "manager", 6.0, heal_time=26.0
+        _SUBMISSION_GATE,
+        "manager",
+        _DISPATCH_WINDOW_CUT_AT,
+        heal_time=_DISPATCH_WINDOW_HEAL_AT,
     )
     return coordinator.run()
 
@@ -947,9 +980,9 @@ def test_dispatch_window_manager_partition_retries_across_the_cut():
         client_log
     )
     submitted = [entry for entry in client_log if entry[0] == "job-submitted"]
-    assert submitted and submitted[0][1] < 6.0, client_log
+    assert submitted and submitted[0][1] < _DISPATCH_WINDOW_CUT_AT, client_log
 
-    # Execution began only AFTER the heal (probed 'running' at 27.03):
+    # Execution began only AFTER the heal (probed 'running' at 26.88):
     # the dispatch rode the entire 20s cut on retries instead of
     # failing the accepted job.
     running_seen = [
@@ -960,7 +993,7 @@ def test_dispatch_window_manager_partition_retries_across_the_cut():
     assert running_seen and 26.0 < running_seen[0][2] <= 29.0, client_log
 
     # Completion = post-heal dispatch + the full duration + push
-    # (probed 32.888); past 36 would mean extra dispatch cycles.
+    # (probed 32.853); past 36 would mean extra dispatch cycles.
     assert 32.0 < finish_time < 36.0, client_log
 
     # The membership plane never flinched: single stable leader.
@@ -984,22 +1017,45 @@ def test_dispatch_window_manager_partition_is_replay_deterministic():
 # =========================================================================
 
 
+# Probed with the first-target cut and the client-link delay schedule in
+# place (no delivery cut): acceptance on gate-c (index 2) at 11.336 after
+# one 10s timeout against the cut gate-a (the first attempt starts inside
+# the cut; a heal anywhere before its timeout leaves the timeline
+# identical -- probed at 10.0 and 12.0), 'running' at 11.836, worker
+# active [11.5, 18.5]. Re-probed 2026-10-01 on the clock-offset fencing
+# base.
+_CLIENT_LINK_FIRST_CUT_HEAL_AT = 10.0
+_CLIENT_LINK_ACCEPTING_GATE = "gate-c"
+_CLIENT_LINK_ACCEPTED_AT = 11.336276
+_CLIENT_LINK_RUNNING_AT = 11.836276
+_CLIENT_LINK_DELIVERY_CUT_AT = (_CLIENT_LINK_ACCEPTED_AT + _CLIENT_LINK_RUNNING_AT) / 2
+_CLIENT_LINK_DELIVERY_HEAL_AT = 30.0
+
+
 def _run_client_link_faults() -> dict:
     """Client-tier connectivity faults, all three classes at once:
 
-    * client <-> gate-a cut over [0, 12): the FIRST submission target
+    * client <-> gate-a cut over [0, 10): the FIRST submission target
       is unreachable, so acceptance must converge through the retry
-      cycle onto a reachable gate;
-    * client <-> gate-b cut over [13, 26): the delivery window of the
-      accepting gate — status pushes are lost mid-flight and the poll
-      fallback must recover the terminal outcome after heal;
+      cycle onto a reachable gate (gate-c);
+    * client <-> gate-c cut from between acceptance and dispatch until
+      t=30: the whole delivery window of the accepting gate — status
+      pushes are lost mid-flight and a peer gate must deliver the
+      terminal outcome before the heal;
     * 50ms (+20ms seeded jitter) delay on every client link over
       [5, 45): late pushes race polls; the client's order guard (the
       oracle checks the observed history) must hold.
     """
     coordinator = _build_cluster(_SEED, 180.0, wait_timeout=120.0)
-    coordinator.schedule_partition("client", "gate-a", 0.0, heal_time=12.0)
-    coordinator.schedule_partition("client", "gate-b", 13.0, heal_time=26.0)
+    coordinator.schedule_partition(
+        "client", "gate-a", 0.0, heal_time=_CLIENT_LINK_FIRST_CUT_HEAL_AT
+    )
+    coordinator.schedule_partition(
+        "client",
+        _CLIENT_LINK_ACCEPTING_GATE,
+        _CLIENT_LINK_DELIVERY_CUT_AT,
+        heal_time=_CLIENT_LINK_DELIVERY_HEAL_AT,
+    )
     for gate_pid in _GATE_PIDS:
         coordinator.schedule_delay(
             "client",
@@ -1028,18 +1084,20 @@ def test_client_link_faults_converge_to_clean_completion():
     finish_time = _assert_clean_completed_client(client_log, "client-link-faults")
 
     # Acceptance converged through the retry cycle: the cut first
-    # target costs the silent 10s TCP timeout (no fast rejection —
-    # probed: ZERO submit-rejected milestones, unlike the warmup
-    # rejections of the fault-free baseline), then the next target
-    # accepts. Probed acceptance t=10.617 at gate index 1.
+    # target costs the silent 10s TCP timeout, then gate-c accepts --
+    # after the first cut and before the delivery-window cut.
+    submit_targets = [entry for entry in client_log if entry[0] == "submit-target"]
+    assert submit_targets and submit_targets[0][1] == _GATE_PIDS.index(_CLIENT_LINK_ACCEPTING_GATE), client_log
     submitted = [entry for entry in client_log if entry[0] == "job-submitted"]
-    assert submitted and 10.0 <= submitted[0][1] < 12.0, client_log
+    assert submitted and (
+        _CLIENT_LINK_FIRST_CUT_HEAL_AT <= submitted[0][1] < _CLIENT_LINK_DELIVERY_CUT_AT
+    ), client_log
 
-    # Delivery beat the delivery-window cut's HEAL (probed finish
-    # 22.078 < heal 26.0): the accepting gate's push failed into the
-    # cut and a peer gate delivered the client-ready result — the
-    # push-failover path, not the poll fallback, is what carried it.
-    assert finish_time < 26.0, client_log
+    # Delivery beat the delivery-window cut's HEAL: the accepting gate's
+    # push failed into the cut and a peer gate delivered the
+    # client-ready result — the push-failover path, not the poll
+    # fallback after heal, is what carried it.
+    assert finish_time < _CLIENT_LINK_DELIVERY_HEAL_AT, client_log
 
     flags = _final_leader_flags(results, _GATE_PIDS)
     assert sum(flags.values()) == 1, flags
@@ -1058,7 +1116,7 @@ def _run_long_horizon_chaos_waves() -> dict:
     """420 virtual seconds, three separated fault waves, then quiet:
 
     * wave 1 (t=12): the follower gate dies for good — INSIDE live
-      execution (probed window [8.75, 14.77] client-visible), so the
+      execution (probed window [8.5, 14.75] on the worker), so the
       kill provably intersects the running workflow;
     * wave 2 (t=30-60): the two surviving gates partition from each
       other — a heal-bounded cut the membership must ride out with
@@ -1096,7 +1154,7 @@ def _run_long_horizon_chaos_waves() -> dict:
     the correct truth for a genuinely dead peer.
     """
     coordinator = _build_cluster(
-        _SEED, 420.0, wait_timeout=100.0, late_client_at=300.0
+        _SEED, 420.0, wait_timeout=100.0, late_client_at=_LATE_CLIENT_AT
     )
     coordinator.schedule_kill(_FOLLOWER_GATE, _MID_EXECUTION_AT)
     coordinator.schedule_partition(
@@ -1128,14 +1186,15 @@ def test_long_horizon_chaos_then_quiesce_holds_loud_invariants():
     primary_finish = _assert_clean_completed_client(
         results["client"], "long-horizon primary"
     )
-    assert primary_finish < 16.0, results["client"]
+    assert primary_finish < _UNPERTURBED_COMPLETION_BOUND, results["client"]
 
     # The post-quiesce client COMPLETES — the full convergence
-    # invariant, live end to end: the first target (the killed gate)
-    # costs the silent 10s TCP timeout, the next target accepts
-    # (probed t=310.12 at gate index 1), dispatch reaches the worker,
-    # and the client observes ``completed`` at 316.24 (= acceptance +
-    # ~1s dispatch + workflow + push detour). Both halves of the old
+    # invariant, live end to end: a SURVIVING gate accepts (the client
+    # ranks its gates per job (AD-28), so the killed gate is tried first
+    # only for some job ids, at the cost of one silent 10s TCP timeout;
+    # probed: this job's first target is gate-c, accepted at 300.12),
+    # dispatch reaches the worker, and the client observes
+    # ``completed`` soon after (acceptance + dispatch + workflow + push). Both halves of the old
     # post-kill blinding are gone: the gate half (capacity->UNHEALTHY
     # fast-reject) fell to the BUSY!=UNHEALTHY overload config, and
     # the manager half (worker-heartbeat starvation -> allocation
@@ -1153,13 +1212,16 @@ def test_long_horizon_chaos_then_quiesce_holds_loud_invariants():
         entry for entry in late_log if entry[0] == "submit-target"
     ]
     assert late_submit_targets, late_log
-    assert late_submit_targets[0][1] == _SUBMISSION_GATE_INDEX, late_log
+    killed_gate_index = _GATE_PIDS.index(_FOLLOWER_GATE)
+    assert late_submit_targets[0][1] != killed_gate_index, late_log
     late_submitted = [
         entry for entry in late_log if entry[0] == "job-submitted"
     ]
     assert late_submitted, late_log
     late_submitted_time = late_submitted[0][1]
-    assert 310.0 <= late_submitted_time <= 312.0, late_log
+    # No later than one dead-target timeout (the killed gate ranked first)
+    # plus the acceptance slack after the late client starts.
+    assert _LATE_CLIENT_AT <= late_submitted_time <= _LATE_CLIENT_AT + 12.0, late_log
     late_finished = [
         entry for entry in late_log if entry[0] == "job-finished"
     ]
@@ -1178,7 +1240,7 @@ def test_long_horizon_chaos_then_quiesce_holds_loud_invariants():
         for entry in results["worker"]
         if entry[0] == "workflows-active"
         and entry[1] > 0
-        and entry[2] > 300.0
+        and entry[2] > _LATE_CLIENT_AT
     ]
     assert late_worker_activations, (
         "the late job completed so the worker must show its execution",

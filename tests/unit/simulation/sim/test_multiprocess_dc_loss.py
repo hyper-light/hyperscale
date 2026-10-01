@@ -208,7 +208,12 @@ def _final_health(gate_log: list) -> dict[str, str]:
 # Scenario 1: total loss of the job's OWN datacenter mid-execution
 # ---------------------------------------------------------------------------
 
-_LOSS_AT = 9.8
+# Midpoint of dc-west's probed execution window [8.25, 9.25] (seed 61):
+# inside live execution with margin on both sides. Re-probed 2026-10-01
+# after the gate began answering warmup submissions with a transient
+# "not ready" JobAck (the client now stays on the gate and is accepted
+# at 2.85 instead of failing over: dispatch moved from 12.25 to 8.25).
+_LOSS_AT = 8.75
 _LOSS_CEILING = 140.0
 
 
@@ -297,7 +302,12 @@ def test_dc_loss_strand_is_replay_deterministic():
 # Scenario 2: manager power-loss restart inside one DC, mid-execution
 # ---------------------------------------------------------------------------
 
-_RESTART_AT = 9.8
+# Midpoint of dc-west's probed execution window [8.25, 9.25] (seed 61):
+# inside live execution with margin on both sides. Re-probed 2026-10-01
+# after the gate began answering warmup submissions with a transient
+# "not ready" JobAck (the client now stays on the gate and is accepted
+# at 2.85 instead of failing over: dispatch moved from 12.25 to 8.25).
+_RESTART_AT = 8.75
 _RESTART_DOWN_SECONDS = 30.0
 _RESTART_CEILING = 160.0
 
@@ -397,7 +407,12 @@ def test_manager_restart_mid_execution_is_replay_deterministic():
 # Scenario 3: gate<->DC partition covering the completion push
 # ---------------------------------------------------------------------------
 
-_PUSH_CUT_AT = 9.8
+# Midpoint of dc-west's probed execution window [8.25, 9.25] (seed 61):
+# inside live execution with margin on both sides. Re-probed 2026-10-01
+# after the gate began answering warmup submissions with a transient
+# "not ready" JobAck (the client now stays on the gate and is accepted
+# at 2.85 instead of failing over: dispatch moved from 12.25 to 8.25).
+_PUSH_CUT_AT = 8.75
 _PUSH_CUT_HEAL = 25.0
 
 
@@ -638,17 +653,19 @@ def test_slow_disk_execution_is_replay_deterministic():
 # Scenario 6: disk-full manager — loud dispatch-time failure
 # ---------------------------------------------------------------------------
 
-_DISK_FULL_SCHEDULE = (("disk_full", 8.0, 1024),)
-_DISK_FULL_ARM_AT = 8.0
+# Between acceptance (2.85) and dc-west's dispatch-time WAL appends
+# (just before 8.0 -- the old 8.0 arm missed them; re-probed 2026-10-01).
+_DISK_FULL_ARM_AT = 5.5
+_DISK_FULL_SCHEDULE = (("disk_full", _DISK_FULL_ARM_AT, 1024),)
 
 
 def _run_disk_full_dispatch_failure() -> dict:
-    """dc-west's manager disk accepts 1024 further bytes from t=8, then
-    every write raises ENOSPC — armed after submission (~2.1, so the
-    job is durably accepted) but before dispatch (~9.5), so the
+    """dc-west's manager disk accepts 1024 further bytes from t=5.5,
+    then every write raises ENOSPC — armed after submission (2.85, so
+    the job is durably accepted) but before dispatch (~8.0), so the
     dispatch-time WAL appends exhaust it mid-job.
 
-    Measured: the client observes a LOUD ``failed`` at 9.464 — ~0.2s
+    Measured: the client observes a LOUD ``failed`` at 8.017 — right
     after the dispatch attempt hit ENOSPC. Neither worker ever runs
     the workflow (no silent cross-DC re-route of a dispatch-time
     storage failure), and the disk-full manager keeps classifying
@@ -823,6 +840,10 @@ def test_chaos_then_quiesce_two_jobs_is_replay_deterministic():
 _CONCURRENT_DURATION_SECONDS = 20.0
 _CONCURRENT_KILL_AT = 13.0
 _CONCURRENT_CEILING = 160.0
+# Both jobs in the datacenter that dies: the scenario's premise, pinned
+# (free selection co-placed them only while dc-east was still
+# initializing, and the gate no longer places around an initializing DC).
+_CONCURRENT_PLACEMENT = ["dc-west"]
 
 
 def _run_concurrent_jobs_dc_loss_after_completion() -> dict:
@@ -854,7 +875,7 @@ def _run_concurrent_jobs_dc_loss_after_completion() -> dict:
         _JOB_TIMEOUT_SECONDS,
         140.0,
         0.0,
-        None,
+        _CONCURRENT_PLACEMENT,
     )
     coordinator.add_process(
         "client-b",
@@ -866,7 +887,7 @@ def _run_concurrent_jobs_dc_loss_after_completion() -> dict:
         _JOB_TIMEOUT_SECONDS,
         140.0,
         0.0,
-        None,
+        _CONCURRENT_PLACEMENT,
     )
     for victim_id in _DC_VICTIMS["dc-west"]:
         coordinator.schedule_kill(victim_id, _CONCURRENT_KILL_AT)

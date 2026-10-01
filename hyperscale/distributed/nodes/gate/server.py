@@ -1499,7 +1499,18 @@ class GateServer(HealthAwareServer):
             return await self._job_handler.handle_submission(
                 addr, data, self._modular_state.get_active_peer_count()
             )
-        return b"error"
+        # The listener is up before start() builds the handlers. Answer
+        # with a transient rejection the client retries (protocol
+        # transient vocabulary: "not ready") -- a bare b"error" is not a
+        # JobAck, so clients failed to decode it (UnpicklingError) and
+        # could not tell "starting" from "broken".
+        return JobAck(
+            job_id=JobSubmission.load(data).job_id,
+            accepted=False,
+            error="Gate is not ready: still starting, not accepting jobs",
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+        ).dump()
 
     @tcp.receive()
     async def receive_job_status_request(
@@ -4664,6 +4675,35 @@ class GateServer(HealthAwareServer):
         count: int,
         preferred: list[str] | None = None,
         job_id: str | None = None,
+    ) -> tuple[list[str], list[str], str]:
+        """The datacenters to place a job in: its primaries, fallbacks and
+        their worst health bucket.
+
+        While a datacenter the job could use has not reported yet, a
+        selection short of ``count`` is refused as "initializing" (the
+        client retries): placing the job in fewer datacenters than it
+        asked for, because one was still starting, would silently shrink
+        it.
+        """
+        primary, fallback, worst_health = self._route_datacenters(count, preferred, job_id)
+        if len(primary) < count and self._has_initializing_datacenter(preferred):
+            return ([], [], "initializing")
+        return (primary, fallback, worst_health)
+
+    def _has_initializing_datacenter(self, preferred: list[str] | None) -> bool:
+        """Whether a datacenter in the job's scope has not reported yet."""
+        in_scope = set(preferred) if preferred else None
+        return any(
+            status.health == DatacenterHealth.INITIALIZING.value
+            for datacenter_id, status in self._get_all_datacenter_health().items()
+            if in_scope is None or datacenter_id in in_scope
+        )
+
+    def _route_datacenters(
+        self,
+        count: int,
+        preferred: list[str] | None,
+        job_id: str | None,
     ) -> tuple[list[str], list[str], str]:
         if job_id is None:
             return self._legacy_select_datacenters(count, preferred)
