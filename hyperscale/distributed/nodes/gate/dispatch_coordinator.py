@@ -1026,6 +1026,10 @@ class GateDispatchCoordinator:
                 operation_name=f"dispatch_to_manager_{manager_addr}",
             )
             return result
+        except TransientDispatchError as exception:
+            # The manager kept answering "retry" for the whole budget: it
+            # is reachable, so this is not a circuit failure.
+            return (False, str(exception))
         except Exception as exception:
             circuit.record_failure()
             return (False, str(exception))
@@ -1046,12 +1050,15 @@ class GateDispatchCoordinator:
         behavior) failed the whole job on the first rejection even
         though the condition resolves in seconds; with a single
         datacenter there is no fallback to hide that.
+
+        Any answer proves the manager reachable, so no rejection is a
+        circuit failure: counting them opened the breaker on a manager
+        that was merely electing, and every job dispatched to it next --
+        a pinned one has nowhere else to go -- failed without a send.
         """
         if ack.accepted:
             circuit.record_success()
             return (True, None)
-
-        circuit.record_failure()
 
         if is_transient_rejection(ack.error):
             raise TransientDispatchError(ack.error)
