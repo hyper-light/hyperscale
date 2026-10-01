@@ -524,6 +524,7 @@ class ManagerServer(HealthAwareServer):
             get_term_fn=lambda: self._leader_election.state.current_term
             if hasattr(self, "_leader_election")
             else 0,
+            step_down_fn=self._step_down_from_cluster_leadership,
         )
 
         # Discovery coordinator
@@ -889,7 +890,7 @@ class ManagerServer(HealthAwareServer):
             get_udp_host=lambda: self._host,
             get_udp_port=lambda: self._udp_port,
             get_health_accepting_jobs=self._is_accepting_jobs,
-            get_health_has_quorum=self._has_quorum_available,
+            get_health_has_quorum=self._leadership.has_quorum,
             get_health_throughput=self._get_dispatch_throughput,
             get_health_expected_throughput=self._get_expected_dispatch_throughput,
             get_health_overload_state=self._get_manager_health_state_snapshot,
@@ -924,27 +925,6 @@ class ManagerServer(HealthAwareServer):
             version=self._manager_state.state_version,
             udp_port=self._udp_port,
         )
-
-    @property
-    def _quorum_size(self) -> int:
-        """Required quorum size based on **configured** cluster size (AD-3).
-
-        Per AD-3, quorum is derived from the CONFIGURED manager peer
-        count, not the runtime ``_active_manager_peers`` count. The
-        active set is for *monitoring* whether quorum is achievable
-        right now; it must not feed the quorum threshold itself.
-        Doing the latter is the canonical split-brain bug: a manager
-        whose peers are all temporarily down (network partition,
-        kill+restart window) sees ``active_peer_count == 0`` and
-        computes ``quorum = 1`` — i.e. itself — and self-elects. Two
-        partitioned-from-each-other managers both elect themselves
-        and the cluster has multiple leaders simultaneously.
-
-        Configured size = ``len(self._manager_udp_peers) + 1``: every
-        manager from the static seed list plus this node itself.
-        """
-        configured_managers = len(self._manager_udp_peers) + 1
-        return (configured_managers // 2) + 1
 
     def _get_election_member_count(self) -> int:
         """Configured manager cluster size for SWIM-tier leader election.
@@ -2354,7 +2334,7 @@ class ManagerServer(HealthAwareServer):
         )
 
         await self._handle_job_leader_failure(tcp_addr)
-        await self._check_quorum_status()
+        await self._leadership.check_quorum_status()
 
     async def _handle_manager_peer_recovery(
         self,
@@ -2743,29 +2723,8 @@ class ManagerServer(HealthAwareServer):
                 )
             )
 
-    async def _check_quorum_status(self) -> None:
-        has_quorum = self._leadership.has_quorum()
-
-        if has_quorum:
-            self._manager_state.reset_quorum_failures()
-            return
-
-        failure_count = self._manager_state.increment_quorum_failures()
-
-        if not self.is_leader():
-            return
-
-        max_quorum_failures = 3
-        if failure_count >= max_quorum_failures:
-            await self._udp_logger.log(
-                ServerWarning(
-                    message=f"Lost quorum for {failure_count} consecutive checks, stepping down",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            self._task_runner.run(self._leader_election._step_down)
+    def _step_down_from_cluster_leadership(self) -> None:
+        self._task_runner.run(self._leader_election._step_down)
 
     def _should_backup_orphan_scan(self) -> bool:
         if self.is_leader():
@@ -3931,7 +3890,7 @@ class ManagerServer(HealthAwareServer):
     ) -> bool:
         peer_addrs = list(self._manager_state.get_active_manager_peers())
         if not peer_addrs:
-            return not require_quorum or self._quorum_size <= 1
+            return not require_quorum or self._leadership.get_quorum_size() <= 1
 
         async def send_sync(peer_addr: tuple[str, int]) -> bool:
             try:
@@ -3960,7 +3919,7 @@ class ManagerServer(HealthAwareServer):
         results = await asyncio.gather(*(send_sync(peer_addr) for peer_addr in peer_addrs))
         replicated_count = 1 + sum(1 for accepted in results if accepted)
         if require_quorum:
-            return replicated_count >= self._quorum_size
+            return replicated_count >= self._leadership.get_quorum_size()
 
         return True
 
@@ -4615,11 +4574,6 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
-    def _has_quorum_available(self) -> bool:
-        """Check if quorum is available."""
-        active_count = self._manager_state.get_active_peer_count()
-        return active_count >= self._quorum_size
-
     def _get_dispatch_throughput(self) -> float:
         """Get current dispatch throughput."""
         current_time = self._clock.monotonic()
@@ -4757,7 +4711,7 @@ class ManagerServer(HealthAwareServer):
             # readiness, so a draining or quorum-less manager kept
             # receiving jobs.
             health_accepting_jobs=self._is_accepting_jobs(),
-            health_has_quorum=self._has_quorum_available(),
+            health_has_quorum=self._leadership.has_quorum(),
             health_throughput=self._get_dispatch_throughput(),
             health_expected_throughput=self._get_expected_dispatch_throughput(),
             health_overload_state=self._manager_health_state_snapshot,
@@ -4836,7 +4790,7 @@ class ManagerServer(HealthAwareServer):
         if (
             healthy_managers < quorum_size
             or heartbeat.healthy_worker_count < worker_quorum
-            or not self._has_quorum_available()
+            or not self._leadership.has_quorum()
         ):
             return DatacenterHealth.DEGRADED
 
@@ -4866,7 +4820,7 @@ class ManagerServer(HealthAwareServer):
             return "manager quorum unavailable"
         if heartbeat.healthy_worker_count < heartbeat.worker_count // 2 + 1:
             return "worker quorum unavailable"
-        if not self._has_quorum_available():
+        if not self._leadership.has_quorum():
             return "manager leadership quorum unavailable"
         if self._manager_health_state_snapshot == "overloaded":
             return "manager overloaded"
@@ -9655,7 +9609,7 @@ class ManagerServer(HealthAwareServer):
             # valid leader lease for a short window, but accepting a
             # new job in that state creates a partition-side write that
             # cannot be safely replicated or fenced.
-            if not self._has_quorum_available():
+            if not self._leadership.has_quorum():
                 return JobAck(
                     job_id=submission.job_id,
                     accepted=False,

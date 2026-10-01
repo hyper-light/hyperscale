@@ -16,6 +16,11 @@ if TYPE_CHECKING:
     from hyperscale.logging import Logger
 
 
+# Consecutive lost-quorum checks before a leader steps down: one missed
+# check is a probe hiccup, several in a row are a partition.
+MAX_CONSECUTIVE_QUORUM_FAILURES = 3
+
+
 class ManagerLeadershipCoordinator:
     """
     Coordinates manager leadership and election.
@@ -36,6 +41,7 @@ class ManagerLeadershipCoordinator:
         task_runner: "TaskRunner",
         is_leader_fn: Callable[[], bool],
         get_term_fn: Callable[[], int],
+        step_down_fn: Callable[[], None],
     ) -> None:
         self._state: "ManagerState" = state
         self._config: "ManagerConfig" = config
@@ -44,6 +50,7 @@ class ManagerLeadershipCoordinator:
         self._task_runner: "TaskRunner" = task_runner
         self._is_leader: Callable[[], bool] = is_leader_fn
         self._get_term: Callable[[], int] = get_term_fn
+        self._step_down: Callable[[], None] = step_down_fn
         self._on_become_leader_callbacks: list[Callable[[], None]] = []
         self._on_lose_leadership_callbacks: list[Callable[[], None]] = []
 
@@ -127,14 +134,36 @@ class ManagerLeadershipCoordinator:
                 )
 
     def has_quorum(self) -> bool:
-        """
-        Check if manager cluster has quorum.
+        """Whether the managers this node can reach (itself included) are a
+        quorum of the configured cluster.
 
-        Returns:
-            True if quorum is available
+        ``get_active_peer_count`` already counts this node; adding it again
+        let an isolated manager of three believe it held quorum.
         """
-        active_count = self._state.get_active_peer_count() + 1  # plus self
-        return active_count >= self.get_quorum_size()
+        return self._state.get_active_peer_count() >= self.get_quorum_size()
+
+    async def check_quorum_status(self) -> None:
+        """One lost-quorum check: reset the failure streak while quorum
+        holds; a leader that has lacked quorum for
+        ``MAX_CONSECUTIVE_QUORUM_FAILURES`` checks steps down (AD-3: a
+        leader must not keep acting on a minority view)."""
+        if self.has_quorum():
+            self._state.reset_quorum_failures()
+            return
+
+        failure_count = self._state.increment_quorum_failures()
+        if not self._is_leader() or failure_count < MAX_CONSECUTIVE_QUORUM_FAILURES:
+            return
+
+        await self._logger.log(
+            ServerWarning(
+                message=f"Lost quorum for {failure_count} consecutive checks, stepping down",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            )
+        )
+        self._step_down()
 
     def get_quorum_size(self) -> int:
         """Quorum size from **configured** cluster size (AD-3).
