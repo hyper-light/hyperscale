@@ -8560,16 +8560,17 @@ class ManagerServer(HealthAwareServer):
                             )
                         )
 
-            # Track this workflow as complete
+            # Track this workflow as complete. The finalize pushes the
+            # job's cancellation completion to its origin exactly once,
+            # when the last pending workflow drains; the coordinator's
+            # handle_workflow_cancelled, also called here, found the set
+            # already drained and notified the client a second time.
             await self._finalize_workflow_cancellation(
                 job_id=job_id,
                 workflow_id=workflow_id,
                 success=completion.success,
                 errors=list(completion.errors or []),
             )
-
-            # Also delegate to cancellation coordinator for additional handling
-            await self._cancellation.handle_workflow_cancelled(completion)
 
             return b"OK"
 
