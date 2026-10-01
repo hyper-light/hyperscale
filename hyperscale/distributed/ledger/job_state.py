@@ -4,7 +4,7 @@ from typing import Any
 
 import msgspec
 
-from hyperscale.logging.lsn import LSN
+from hyperscale.distributed.hlc.hlc_timestamp import HLCTimestamp
 
 # Both timeout spellings are live vocabulary: managers write
 # JobStatus.TIMEOUT.value ("timeout"), the gate timeout tracker records
@@ -23,8 +23,8 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
     cancelled: bool
     completed_count: int
     failed_count: int
-    created_hlc: LSN
-    last_hlc: LSN
+    created_hlc: HLCTimestamp
+    last_hlc: HLCTimestamp
     # "host:port" of the submitter's callback listener — recorded so a
     # RESTARTED manager can tell the client what happened to a
     # recovered job. Trailing + defaulted: old array_like records and
@@ -32,12 +32,12 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
     requestor_id: str = ""
     # Job-level timeout budget (seconds) — lets a restarted accepting
     # node resume AD-34 tracking with the REMAINING budget (elapsed
-    # derived from created_hlc.wall_clock). Same trailing-defaulted
+    # derived from created_hlc.wall_ms). Same trailing-defaulted
     # compatibility contract as requestor_id.
     timeout_seconds: float = 0.0
     # HLC of the most recent JobProgressReported — AD-38's JobTimedOut
     # carries it so a timeout records how long the job had been silent.
-    last_progress_hlc: LSN | None = None
+    last_progress_hlc: HLCTimestamp | None = None
     # Datacenters that confirmed cancellation (JobCancellationAcked).
     cancellation_acked_datacenters: frozenset[str] = frozenset()
 
@@ -47,7 +47,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
         job_id: str,
         fence_token: int,
         assigned_datacenters: tuple[str, ...],
-        created_hlc: LSN,
+        created_hlc: HLCTimestamp,
         requestor_id: str = "",
         timeout_seconds: float = 0.0,
     ) -> JobState:
@@ -69,7 +69,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
     # Transitions copy the record with ``msgspec.structs.replace`` so every
     # field they do not name carries forward; hand-listing fields silently
     # reset any field added later.
-    def with_accepted(self, datacenter_id: str, hlc: LSN) -> JobState:
+    def with_accepted(self, datacenter_id: str, hlc: HLCTimestamp) -> JobState:
         return msgspec.structs.replace(
             self,
             status="running",
@@ -77,7 +77,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             last_hlc=hlc,
         )
 
-    def with_cancellation_requested(self, hlc: LSN) -> JobState:
+    def with_cancellation_requested(self, hlc: HLCTimestamp) -> JobState:
         return msgspec.structs.replace(
             self,
             status="cancelling",
@@ -90,7 +90,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
         final_status: str,
         total_completed: int,
         total_failed: int,
-        hlc: LSN,
+        hlc: HLCTimestamp,
     ) -> JobState:
         return msgspec.structs.replace(
             self,
@@ -104,7 +104,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
         self,
         completed_count: int,
         failed_count: int,
-        hlc: LSN,
+        hlc: HLCTimestamp,
     ) -> JobState:
         return msgspec.structs.replace(
             self,
@@ -114,7 +114,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             last_progress_hlc=hlc,
         )
 
-    def with_cancellation_acked(self, datacenter_id: str, hlc: LSN) -> JobState:
+    def with_cancellation_acked(self, datacenter_id: str, hlc: HLCTimestamp) -> JobState:
         return msgspec.structs.replace(
             self,
             cancellation_acked_datacenters=(
@@ -141,12 +141,10 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             "cancelled": self.cancelled,
             "completed_count": self.completed_count,
             "failed_count": self.failed_count,
-            # HLCs serialize as their four components, NOT ``to_int()``:
-            # the packed form is a 128-bit integer and msgpack caps at
-            # 64 bits, so ``msgspec.msgpack.encode`` raised
-            # OverflowError for every real LSN (a nonzero logical_time
-            # shifts past bit 80). Component form matches how msgspec
-            # already encodes the LSN NamedTuple inside Checkpoint.
+            # HLCs serialize as their three components (wall_ms, logical,
+            # node_id) -- the form msgspec gives the HLCTimestamp
+            # NamedTuple inside Checkpoint; a packed integer would exceed
+            # msgpack's 64 bits.
             "created_hlc": list(self.created_hlc),
             "last_hlc": list(self.last_hlc),
             "requestor_id": self.requestor_id,
@@ -166,13 +164,15 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
         }
 
     @staticmethod
-    def _decode_hlc(raw: Any) -> LSN:
-        if isinstance(raw, (list, tuple)) and len(raw) == 4:
-            return LSN(*raw)
-        if isinstance(raw, int):
-            # Legacy packed-integer form (pre component-form records).
-            return LSN.from_int(raw)
-        return LSN(0, 0, 0, 0)
+    def _decode_hlc(raw: Any) -> HLCTimestamp:
+        """An HLC from its three-component form. Anything else is not a
+        record this format wrote (older formats are versioned out before
+        reaching here), so it is refused rather than read as time zero --
+        a zero HLC would make every elapsed-time computation on the job
+        wrong without a trace."""
+        if isinstance(raw, (list, tuple)) and len(raw) == 3:
+            return HLCTimestamp(*raw)
+        raise ValueError(f"unrecognized HLC encoding: {raw!r}")
 
     @classmethod
     def from_dict(cls, job_id: str, data: dict[str, Any]) -> JobState:

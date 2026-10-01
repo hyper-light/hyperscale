@@ -10,10 +10,10 @@ Covers:
 6. Edge cases: empty log, out-of-range access
 """
 
-import time
 
 import pytest
 
+from hyperscale.distributed.hlc import HLCTimestamp
 from hyperscale.distributed.raft.models import RaftLogEntry
 from hyperscale.distributed.raft.raft_log import RaftLog
 
@@ -31,7 +31,7 @@ def make_entry(term: int, index: int, command_type: str = "NO_OP") -> RaftLogEnt
         command=b"",
         command_type=command_type,
         job_id="test-job",
-        timestamp=time.monotonic(),
+        hlc=HLCTimestamp(wall_ms=0, logical=index, node_id=1),
     )
 
 

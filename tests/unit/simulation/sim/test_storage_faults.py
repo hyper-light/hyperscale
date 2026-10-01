@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from hyperscale.distributed.hlc import HLCTimestamp
 from hyperscale.distributed.idempotency.idempotency_config import (
     IdempotencyConfig,
 )
@@ -36,12 +37,12 @@ from hyperscale.distributed.ledger.wal.node_wal import NodeWAL
 from hyperscale.distributed.ledger.wal.wal_entry import JobEventType
 from hyperscale.distributed.raft.models import RaftLogEntry
 from hyperscale.distributed.raft.raft_wal import RaftWAL
-from hyperscale.logging.lsn import HybridLamportClock
 from tests.simulation.harness.sim import (
     SimFilesystem,
     SimulationLoop,
     VirtualClock,
 )
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 class _StubRunner:
@@ -161,7 +162,7 @@ async def test_durable_content_survives_reorder_crash_untouched():
 @pytest.mark.asyncio
 async def test_node_wal_survives_crash_and_tolerates_torn_tail():
     filesystem = SimFilesystem()
-    clock = HybridLamportClock(node_id=1)
+    clock = new_hybrid_logical_clock()
     wal_path = Path("/ledger/node.wal")
 
     wal = await NodeWAL.open(wal_path, clock, filesystem=filesystem)
@@ -175,7 +176,7 @@ async def test_node_wal_survives_crash_and_tolerates_torn_tail():
     await filesystem.append_fsync(wal_path, struct.pack(">I", 0) + b"\xff\xff")
 
     recovered = await NodeWAL.open(
-        wal_path, HybridLamportClock(node_id=1), filesystem=filesystem
+        wal_path, new_hybrid_logical_clock(), filesystem=filesystem
     )
     recovered_entries = [entry async for entry in recovered.iter_from(0)]
     assert len(recovered_entries) == 2
@@ -198,7 +199,7 @@ async def test_raft_wal_survives_crash_and_stops_at_corruption():
             command=command,
             command_type="stats_update",
             job_id="job-1",
-            timestamp=float(index),
+            hlc=HLCTimestamp(wall_ms=index, logical=0, node_id=1),
         )
 
     wal = RaftWAL(wal_path, _RecordingLogger(), filesystem=filesystem)

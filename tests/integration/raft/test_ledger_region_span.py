@@ -31,7 +31,7 @@ from hyperscale.distributed.raft.models.gate_commands import gate_ledger_append_
 from hyperscale.distributed.raft.raft_node import ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.taskex import TaskRunner
-from hyperscale.logging.lsn import HybridLamportClock
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 JOB_ID = "job-1"
 LIVENESS_CEILING_SECONDS = ELECTION_TIMEOUT_MAX * 20
@@ -63,6 +63,7 @@ class GateLedgerCluster:
         for addr in self.addresses:
             send_tcp = self._sender(addr)
             self.integrations[addr] = GateRaftIntegration(
+                clock=new_hybrid_logical_clock(),
                 ledger_replica=self.replicas[addr],
                 cluster_size=lambda: len(self.addresses),
                 proposal_timeout_seconds=LIVENESS_CEILING_SECONDS,
@@ -152,7 +153,7 @@ class GateLedgerCluster:
 async def _job_created_entry() -> WALEntry:
     event = JobCreated(
         job_id=JOB_ID,
-        hlc=await HybridLamportClock(node_id=1).generate(),
+        hlc=new_hybrid_logical_clock().now(),
         fence_token=1,
         spec_hash=b"spec",
         assigned_datacenters=("dc-east",),

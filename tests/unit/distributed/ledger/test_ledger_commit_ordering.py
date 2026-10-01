@@ -28,6 +28,7 @@ from hyperscale.distributed.ledger.job_commit_sequencer import JobCommitSequence
 from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
 from tests.simulation.harness.sim import SimFilesystem
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 LEDGER_PATHS = {
     "wal_path": Path("/node/ledger/wal"),
@@ -35,7 +36,7 @@ LEDGER_PATHS = {
     "archive_dir": Path("/node/ledger/archive"),
     "region_code": "dc-east",
     "gate_id": "gate-1",
-    "node_id": 1,
+    "clock": new_hybrid_logical_clock(),
 }
 REGIONAL = DurabilityLevel.REGIONAL
 # Failure-detection ceiling: every awaited step here completes in a few

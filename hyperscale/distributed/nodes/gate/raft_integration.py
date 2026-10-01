@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
-    from hyperscale.logging.lsn import HybridLamportClock
+    from hyperscale.distributed.hlc.hybrid_logical_clock import HybridLogicalClock
 
 
 class GateRaftIntegration:
@@ -61,8 +61,8 @@ class GateRaftIntegration:
         send_tcp: Callable[..., Awaitable[bytes | Exception | None]],
         on_job_raft_leader: Callable[[str], None] | None = None,
         on_job_raft_lose_leader: Callable[[str], None] | None = None,
-        clock: "HybridLamportClock | None" = None,
         *,
+        clock: "HybridLogicalClock",
         ledger_replica: "JobLedgerReplica",
         cluster_size: Callable[[], int],
         proposal_timeout_seconds: float,

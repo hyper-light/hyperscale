@@ -29,6 +29,7 @@ from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.distributed.ledger.events.event_type import JobEventType
 from hyperscale.distributed.ledger.job_ledger import JobLedger
 from tests.simulation.harness.sim import SimFilesystem
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 LOCAL = DurabilityLevel.LOCAL
 
@@ -40,7 +41,7 @@ async def _open_ledger(filesystem: SimFilesystem) -> JobLedger:
         archive_dir=Path("/manager/ledger/archive"),
         region_code="dc-east",
         gate_id="mgr-1",
-        node_id=1,
+        clock=new_hybrid_logical_clock(),
         filesystem=filesystem,
     )
 

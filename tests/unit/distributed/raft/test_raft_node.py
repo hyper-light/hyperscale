@@ -11,11 +11,11 @@ Covers:
 """
 
 import asyncio
-import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.hlc import HLCTimestamp
 from hyperscale.distributed.raft.models import (
     AppendEntries,
     AppendEntriesResponse,
@@ -28,6 +28,7 @@ from hyperscale.distributed.raft.raft_node import (
     ELECTION_TIMEOUT_MIN,
     RaftNode,
 )
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 # =============================================================================
@@ -43,7 +44,7 @@ def make_entry(term: int, index: int, job_id: str = "job-1") -> RaftLogEntry:
         command=b"test-data",
         command_type="NO_OP",
         job_id=job_id,
-        timestamp=time.monotonic(),
+        hlc=HLCTimestamp(wall_ms=0, logical=index, node_id=1),
     )
 
 
@@ -82,6 +83,7 @@ def make_node(
         on_lose_leadership=None,
         logger=logger_mock,
         configured_cluster_size=len(members),
+        clock=new_hybrid_logical_clock(),
     )
     return node, send_mock, apply_mock
 

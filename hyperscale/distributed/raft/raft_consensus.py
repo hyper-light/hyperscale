@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
-    from hyperscale.logging.lsn import HybridLamportClock
+    from hyperscale.distributed.hlc.hybrid_logical_clock import HybridLogicalClock
 
 
 class RaftConsensus:
@@ -73,8 +73,8 @@ class RaftConsensus:
         on_become_leader: Callable[[str], None] | None = None,
         on_lose_leadership: Callable[[str], None] | None = None,
         manager_state: "ManagerState | None" = None,
-        clock: "HybridLamportClock | None" = None,
         *,
+        clock: "HybridLogicalClock",
         ledger_replica: "JobLedgerReplica",
     ) -> None:
         self._node_id = node_id

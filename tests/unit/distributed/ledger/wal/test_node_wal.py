@@ -8,7 +8,8 @@ import pytest
 from hyperscale.distributed.ledger.events.event_type import JobEventType
 from hyperscale.distributed.ledger.wal import NodeWAL, WALEntryState
 from hyperscale.distributed.ledger.wal.wal_writer import WALWriterConfig
-from hyperscale.logging.lsn import HybridLamportClock
+from hyperscale.distributed.hlc import HybridLogicalClock
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 @pytest.fixture
@@ -20,7 +21,7 @@ def temp_wal_directory():
 
 @pytest.fixture
 def clock():
-    return HybridLamportClock(node_id=1)
+    return new_hybrid_logical_clock()
 
 
 class TestNodeWALBasicOperations:
@@ -28,7 +29,7 @@ class TestNodeWALBasicOperations:
     async def test_open_creates_new_wal(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
 
@@ -45,7 +46,7 @@ class TestNodeWALBasicOperations:
     async def test_append_single_entry(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -68,7 +69,7 @@ class TestNodeWALBasicOperations:
     async def test_append_multiple_entries(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -97,7 +98,7 @@ class TestNodeWALRecovery:
     async def test_recovery_reads_all_entries(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
 
@@ -123,7 +124,7 @@ class TestNodeWALRecovery:
     async def test_recovery_handles_empty_file(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal_path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,7 +141,7 @@ class TestNodeWALRecovery:
     async def test_recovery_continues_lsn_sequence(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
 
@@ -168,7 +169,7 @@ class TestNodeWALStateTransitions:
     async def test_mark_regional(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -190,7 +191,7 @@ class TestNodeWALStateTransitions:
     async def test_mark_global(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -213,7 +214,7 @@ class TestNodeWALStateTransitions:
     async def test_mark_applied(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -236,7 +237,7 @@ class TestNodeWALStateTransitions:
     async def test_compact_removes_applied_entries(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -264,7 +265,7 @@ class TestNodeWALConcurrency:
     async def test_concurrent_appends(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -300,7 +301,7 @@ class TestNodeWALConcurrency:
     async def test_concurrent_appends_and_state_transitions(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -347,7 +348,7 @@ class TestNodeWALConcurrency:
     async def test_high_concurrency_stress(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         config = WALWriterConfig(batch_max_entries=100)
@@ -380,7 +381,7 @@ class TestNodeWALEdgeCases:
     async def test_append_after_close_raises(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -397,7 +398,7 @@ class TestNodeWALEdgeCases:
     async def test_double_close_is_safe(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -411,7 +412,7 @@ class TestNodeWALEdgeCases:
     async def test_iter_from_reads_entries(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -436,7 +437,7 @@ class TestNodeWALEdgeCases:
     async def test_large_payload(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -464,7 +465,7 @@ class TestNodeWALEdgeCases:
     async def test_mark_nonexistent_lsn_is_safe(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -479,7 +480,7 @@ class TestNodeWALEdgeCases:
     async def test_compact_with_no_applied_entries(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -503,7 +504,7 @@ class TestNodeWALDurability:
     async def test_entries_survive_crash_simulation(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -536,7 +537,7 @@ class TestNodeWALBackpressure:
     async def test_append_returns_backpressure_info(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -556,7 +557,7 @@ class TestNodeWALBackpressure:
     async def test_wal_exposes_backpressure_level(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -571,7 +572,7 @@ class TestNodeWALBackpressure:
     async def test_wal_exposes_queue_state(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -586,7 +587,7 @@ class TestNodeWALBackpressure:
     async def test_wal_exposes_metrics(
         self,
         temp_wal_directory: str,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)

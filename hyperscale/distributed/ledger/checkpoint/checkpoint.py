@@ -10,14 +10,20 @@ import msgspec
 
 from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 from hyperscale.logging.hyperscale_logging_models import CheckpointRetentionError
-from hyperscale.logging.lsn import LSN
+from hyperscale.distributed.ledger.storage_format import (
+    StorageFormat,
+    UnrecognizedStorageFormatError,
+    set_aside_unrecognized,
+)
+from hyperscale.distributed.hlc.hlc_timestamp import HLCTimestamp
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
 
-CHECKPOINT_MAGIC = b"HSCL"
-CHECKPOINT_VERSION = 1
-CHECKPOINT_HEADER_SIZE = 16
+# Version 2: HLC fields are AD-39 hybrid logical clock timestamps.
+CHECKPOINT_FORMAT = StorageFormat(b"HSCL", 2)
+# Format header, then payload length and CRC32.
+CHECKPOINT_HEADER_SIZE = CHECKPOINT_FORMAT.header_size + 8
 
 # Module-level storage seam (Phase 7). The manager BORROWS this (or an
 # injected instance) — it never shuts the filesystem down.
@@ -30,7 +36,7 @@ class Checkpoint(msgspec.Struct, frozen=True):
     local_lsn: int
     regional_lsn: int
     global_lsn: int
-    hlc: LSN
+    hlc: HLCTimestamp
     job_states: dict[str, dict[str, Any]]
     created_at_ms: int
     # The ledger's next fence token. Compaction drops the JOB_CREATED
@@ -78,13 +84,25 @@ class CheckpointManager:
             reverse=True,
         )
 
+        # Newest first; a checkpoint that cannot be used is set aside,
+        # loudly, and the next older one is tried.
         for checkpoint_file in checkpoint_files:
+            data = await self._filesystem.read_bytes(checkpoint_file)
             try:
-                checkpoint = await self._read_checkpoint(checkpoint_file)
-                self._latest_checkpoint = checkpoint
+                self._latest_checkpoint = self._decode_checkpoint(data)
                 return
-            except (ValueError, OSError):
-                continue
+            except UnrecognizedStorageFormatError as format_error:
+                reason = format_error.reason
+            except (ValueError, msgspec.DecodeError) as corruption:
+                reason = f"damaged checkpoint: {corruption}"
+            await self._set_aside(checkpoint_file, data, reason)
+
+    async def _set_aside(self, path: Path, data: bytes, reason: str) -> None:
+        """Preserve an unreadable checkpoint's bytes and free its path --
+        or, with no logger to report it through, refuse outright."""
+        if self._logger is None:
+            raise UnrecognizedStorageFormatError(reason)
+        await set_aside_unrecognized(self._filesystem, path, data, reason, self._logger)
 
     async def _read_checkpoint(self, path: Path) -> Checkpoint:
         data = await self._filesystem.read_bytes(path)
@@ -92,19 +110,13 @@ class CheckpointManager:
 
     @staticmethod
     def _decode_checkpoint(data: bytes) -> Checkpoint:
+        CHECKPOINT_FORMAT.validate(data)
         if len(data) < CHECKPOINT_HEADER_SIZE:
             raise ValueError("Checkpoint file too small")
 
-        magic = data[:4]
-        if magic != CHECKPOINT_MAGIC:
-            raise ValueError(f"Invalid checkpoint magic: {magic}")
-
-        version = struct.unpack(">I", data[4:8])[0]
-        if version != CHECKPOINT_VERSION:
-            raise ValueError(f"Unsupported checkpoint version: {version}")
-
-        data_length = struct.unpack(">I", data[8:12])[0]
-        stored_crc = struct.unpack(">I", data[12:16])[0]
+        format_end = CHECKPOINT_FORMAT.header_size
+        data_length = struct.unpack(">I", data[format_end : format_end + 4])[0]
+        stored_crc = struct.unpack(">I", data[format_end + 4 : format_end + 8])[0]
 
         payload = data[CHECKPOINT_HEADER_SIZE : CHECKPOINT_HEADER_SIZE + data_length]
         if len(payload) < data_length:
@@ -125,8 +137,7 @@ class CheckpointManager:
         crc = zlib.crc32(payload) & 0xFFFFFFFF
 
         header = (
-            CHECKPOINT_MAGIC
-            + struct.pack(">I", CHECKPOINT_VERSION)
+            CHECKPOINT_FORMAT.header
             + struct.pack(">I", len(payload))
             + struct.pack(">I", crc)
         )

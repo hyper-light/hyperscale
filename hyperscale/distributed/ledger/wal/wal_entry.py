@@ -4,7 +4,7 @@ import struct
 import zlib
 from typing import TYPE_CHECKING
 
-from hyperscale.logging.lsn import LSN
+from hyperscale.distributed.hlc.hlc_timestamp import HLCTimestamp
 
 from hyperscale.distributed.ledger.events.event_type import JobEventType
 from .entry_state import WALEntryState
@@ -41,7 +41,7 @@ class WALEntry:
     def __init__(
         self,
         lsn: int,
-        hlc: LSN,
+        hlc: HLCTimestamp,
         state: WALEntryState,
         event_type: JobEventType,
         payload: bytes,
@@ -58,7 +58,7 @@ class WALEntry:
         return self._lsn
 
     @property
-    def hlc(self) -> LSN:
+    def hlc(self) -> HLCTimestamp:
         return self._hlc
 
     @property
@@ -115,7 +115,7 @@ class WALEntry:
             body[:30],
         )
 
-        hlc = LSN.from_bytes(hlc_bytes)
+        hlc = HLCTimestamp.from_bytes(hlc_bytes)
         state = WALEntryState(state_val)
         event_type = JobEventType(type_val)
         payload = body[30:]

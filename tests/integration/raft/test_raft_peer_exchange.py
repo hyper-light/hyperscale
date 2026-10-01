@@ -30,6 +30,7 @@ from hyperscale.distributed.raft.models import AppendEntries, RaftCommandType, R
 from hyperscale.distributed.raft.models.commands import RaftCommand
 from hyperscale.distributed.raft.raft_node import ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
 from hyperscale.distributed.taskex import TaskRunner
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 JOB_ID = "job-1"
 HANDLERS = {
@@ -71,6 +72,7 @@ class InMemoryCluster:
         self.logger = _logger()
         for addr in self.addresses:
             self.integrations[addr] = ManagerRaftIntegration(
+                clock=new_hybrid_logical_clock(),
                 ledger_replica=JobLedgerReplica(),
                 node_id=_member_id(addr),
                 job_manager=MagicMock(),

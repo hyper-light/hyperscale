@@ -15,7 +15,7 @@ from hyperscale.distributed.ledger.archive.job_archive_store import (
     JobArchiveStore,
 )
 from hyperscale.distributed.ledger.job_state import JobState
-from hyperscale.logging.lsn import LSN
+from hyperscale.distributed.hlc import HLCTimestamp
 from tests.simulation.harness.sim import SimFilesystem
 
 
@@ -27,7 +27,7 @@ def filesystem():
 
 
 def _job_state(job_id: str) -> JobState:
-    hlc = LSN(logical_time=1, node_id=1, sequence=0, wall_clock=1000)
+    hlc = HLCTimestamp(wall_ms=1000, logical=0, node_id=1)
     return JobState.create(
         job_id=job_id,
         fence_token=1,

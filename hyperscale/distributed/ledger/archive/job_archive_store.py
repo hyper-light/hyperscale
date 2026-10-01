@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import msgspec
 
 from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 
 from hyperscale.distributed.ledger.job_state import JobState
+from hyperscale.distributed.ledger.storage_format import (
+    StorageFormat,
+    UnrecognizedStorageFormatError,
+    set_aside_unrecognized,
+)
+
+if TYPE_CHECKING:
+    from hyperscale.logging import Logger
+
+# Archived job records (AD-39 HLC components).
+ARCHIVE_FORMAT = StorageFormat(b"HSJA", 1)
 
 # Module-level storage seam (Phase 7). The store BORROWS this (or an
 # injected instance) — it never shuts the filesystem down.
@@ -16,14 +28,16 @@ _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 
 class JobArchiveStore:
-    __slots__ = ("_archive_dir", "_filesystem")
+    __slots__ = ("_archive_dir", "_filesystem", "_logger")
 
     def __init__(
         self,
         archive_dir: Path,
         filesystem: Filesystem | None = None,
+        logger: "Logger | None" = None,
     ) -> None:
         self._archive_dir = archive_dir
+        self._logger = logger
         # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
         self._filesystem = (
             filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
@@ -59,7 +73,7 @@ class JobArchiveStore:
             archive_path.parent, parents=True, exist_ok=True
         )
 
-        data = msgspec.msgpack.encode(job_state.to_dict())
+        data = ARCHIVE_FORMAT.encode(msgspec.msgpack.encode(job_state.to_dict()))
 
         # The full crash-consistency sequence (temp file, flush, fsync,
         # atomic rename, parent-directory fsync) this class previously
@@ -76,13 +90,24 @@ class JobArchiveStore:
         if not await self._filesystem.exists(archive_path):
             return None
 
+        data = await self._filesystem.read_bytes(archive_path)
         try:
-            data = await self._filesystem.read_bytes(archive_path)
-            job_dict = msgspec.msgpack.decode(data)
-            return JobState.from_dict(job_id, job_dict)
+            return JobState.from_dict(job_id, msgspec.msgpack.decode(ARCHIVE_FORMAT.decode(data)))
+        except UnrecognizedStorageFormatError as format_error:
+            reason = format_error.reason
+        except (msgspec.DecodeError, ValueError, KeyError, TypeError) as corruption:
+            reason = f"damaged archive record: {corruption!r}"
+        # Set aside, the path is free: the job reads as unarchived, and
+        # the next archival of it (recovery's terminal sweep) lands.
+        await self._set_aside(archive_path, data, reason)
+        return None
 
-        except (OSError, msgspec.DecodeError):
-            return None
+    async def _set_aside(self, path: Path, data: bytes, reason: str) -> None:
+        """Preserve an unreadable record's bytes and free its path -- or,
+        with no logger to report it through, refuse outright."""
+        if self._logger is None:
+            raise UnrecognizedStorageFormatError(reason)
+        await set_aside_unrecognized(self._filesystem, path, data, reason, self._logger)
 
     async def exists(self, job_id: str) -> bool:
         return await self._filesystem.exists(self._get_archive_path(job_id))

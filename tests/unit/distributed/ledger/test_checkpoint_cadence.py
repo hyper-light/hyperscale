@@ -37,6 +37,7 @@ from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.wal.node_wal import NodeWAL
 from hyperscale.distributed.runtime import RealClock
 from tests.simulation.harness.sim import SimFilesystem
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 WAL_PATH = Path("/node/ledger/wal")
 CHECKPOINT_DIR = Path("/node/ledger/checkpoints")
@@ -78,7 +79,7 @@ async def _open_ledger(
         archive_dir=ARCHIVE_DIR,
         region_code="dc-east",
         gate_id="gate-1",
-        node_id=1,
+        clock=new_hybrid_logical_clock(),
         filesystem=filesystem,
         **checkpoint_policy,
     )

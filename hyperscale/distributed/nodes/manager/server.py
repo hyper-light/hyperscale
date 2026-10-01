@@ -176,7 +176,7 @@ from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 # Module-level storage seam (Phase 7): borrowed, never shut down
 # here; swap_defaults rebinds it under SIM.
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
-from hyperscale.logging.lsn import HybridLamportClock
+from hyperscale.distributed.hlc import HybridLogicalClock, hlc_node_id
 from hyperscale.distributed.jobs.timeout_strategy import (
     TimeoutStrategy,
     LocalAuthorityTimeout,
@@ -536,13 +536,17 @@ class ManagerServer(HealthAwareServer):
             task_runner=self._task_runner,
         )
 
-        # Shared HybridLamportClock (AD-38). Used by Raft so that
+        # Shared hybrid logical clock (AD-38/AD-39). Used by Raft so that
         # RaftLogEntry.timestamp is a replicated, wall-clock-derived value -- this
         # is what state-machine apply handlers read for any time-related state
         # so all followers converge byte-equal. The same clock instance is
         # reused for the WAL on start() so HLC ordering is coherent across
-        # subsystems.
-        self._hlc = HybridLamportClock(node_id=hash(self._node_id.full) & 0xFFFF)
+        # subsystems. Its node id derives from the restart-stable node id.
+        self._hlc = HybridLogicalClock(
+            node_id=hlc_node_id(self._node_id.full),
+            clock=self._clock,
+            max_offset_ms=self._env.HLC_MAX_CLOCK_OFFSET_MS,
+        )
 
         # Raft consensus integration
         self._raft_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
@@ -969,7 +973,6 @@ class ManagerServer(HealthAwareServer):
                 archive_dir=self._config.wal_data_dir / "archive",
                 region_code=self._node_id.datacenter,
                 gate_id=self._node_id.short,
-                node_id=1,
                 regional_replicator=self._ledger_replicator.replicate,
                 logger=self._udp_logger,
                 clock=self._hlc,

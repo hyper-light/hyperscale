@@ -22,8 +22,9 @@ What's NOT on the Protocol:
 * ``perf_counter`` — used for measurement, not control-flow scheduling.
   The few production sites that need it can keep raw ``time.perf_counter``;
   it doesn't affect SIM correctness.
-* Logical clocks — ``LamportClock`` / ``HybridLamportClock`` track
-  causality, not wall time, and stay on their existing APIs.
+* Logical clocks — ``LamportClock`` tracks causality, not wall time,
+  and stays on its existing API. ``HybridLogicalClock`` (AD-39) reads
+  its physical component from an injected ``Clock``.
 """
 
 from typing import Awaitable, Protocol, TypeVar

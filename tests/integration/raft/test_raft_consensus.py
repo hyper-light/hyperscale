@@ -22,6 +22,7 @@ from hyperscale.distributed.raft.models import (
     RequestVoteResponse,
 )
 from hyperscale.distributed.raft.raft_node import RaftNode
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 class MockNetwork:
@@ -139,6 +140,7 @@ def create_cluster(
         logger_mock.log = AsyncMock()
 
         node = RaftNode(
+            clock=new_hybrid_logical_clock(),
             job_id="job-1",
             node_id=node_id,
             members=members,

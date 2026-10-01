@@ -7,7 +7,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, AsyncIterator, Mapping
 
-from hyperscale.logging.lsn import HybridLamportClock
+from hyperscale.distributed.hlc.hybrid_logical_clock import HybridLogicalClock
 from hyperscale.distributed.reliability.robust_queue import QueuePutResult, QueueState
 from hyperscale.distributed.reliability.backpressure import (
     BackpressureLevel,
@@ -16,6 +16,11 @@ from hyperscale.distributed.reliability.backpressure import (
 
 from hyperscale.distributed.ledger.events.event_type import JobEventType
 from .entry_state import WALEntryState, TransitionResult
+from hyperscale.distributed.ledger.storage_format import (
+    StorageFormat,
+    UnrecognizedStorageFormatError,
+    set_aside_unrecognized,
+)
 from .wal_entry import HEADER_SIZE, WALEntry
 from .wal_status_snapshot import WALStatusSnapshot
 from hyperscale.distributed.runtime import (
@@ -33,6 +38,12 @@ from .wal_writer import (
 # Module-level storage seam (Phase 7): borrowed, never shut down here;
 # swap_defaults rebinds it under SIM.
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
+
+
+# Every WAL file begins with this header (AD-39 HLC entry layout). Files
+# without it -- earlier layouts, other programs, corruption -- are never
+# read as entries.
+WAL_FORMAT = StorageFormat(b"HSWL", 1)
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -79,7 +90,7 @@ class NodeWAL:
     def __init__(
         self,
         path: Path,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
         config: WALWriterConfig | None = None,
         logger: Logger | None = None,
         filesystem: Filesystem | None = None,
@@ -113,7 +124,7 @@ class NodeWAL:
     async def open(
         cls,
         path: Path,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
         config: WALWriterConfig | None = None,
         logger: Logger | None = None,
         filesystem: Filesystem | None = None,
@@ -135,21 +146,46 @@ class NodeWAL:
         )
 
         if await self._filesystem.exists(self._path):
-            await self._recover()
+            data = await self._filesystem.read_bytes(self._path)
+            if await self._accept_existing_file(data):
+                self._recover(data)
+
+        # A new WAL starts with its format header, before any entry.
+        if not await self._filesystem.exists(self._path):
+            await self._filesystem.append_fsync(self._path, WAL_FORMAT.header)
 
         await self._writer.start()
 
-    async def _recover(self) -> None:
-        loop = self._loop
-        assert loop is not None
+    async def _accept_existing_file(self, data: bytes) -> bool:
+        """Whether the file on disk is a WAL in this format to recover.
 
-        data = await self._filesystem.read_bytes(self._path)
-        recovered_entries, next_lsn, last_synced_lsn = (
-            self._parse_recovery_frames(data)
-        )
+        A torn header (a crash while creating the file, before any entry
+        could follow) is rewritten whole. Anything else unrecognized is
+        set aside, loudly, and the WAL starts empty -- or, with no logger
+        to report it through, refused outright: never read as if it were
+        a WAL this node wrote.
+        """
+        if WAL_FORMAT.is_torn_header(data):
+            await self._filesystem.atomic_write(self._path, WAL_FORMAT.header)
+            return False
+        try:
+            WAL_FORMAT.validate(data)
+        except UnrecognizedStorageFormatError as format_error:
+            if self._logger is None:
+                raise
+            await set_aside_unrecognized(
+                self._filesystem, self._path, data, format_error.reason, self._logger
+            )
+            return False
+        return True
+
+    def _recover(self, data: bytes) -> None:
+        recovered_entries = self._parse_frames(WAL_FORMAT.decode(data))
+        next_lsn = max((entry.lsn + 1 for entry in recovered_entries), default=0)
+        last_synced_lsn = recovered_entries[-1].lsn if recovered_entries else -1
 
         for entry in recovered_entries:
-            await self._clock.witness(entry.hlc)
+            self._clock.witness(entry.hlc)
 
             if entry.state < WALEntryState.APPLIED:
                 self._pending_entries_internal[entry.lsn] = entry
@@ -163,46 +199,22 @@ class NodeWAL:
         self._pending_snapshot = MappingProxyType(dict(self._pending_entries_internal))
 
     @staticmethod
-    def _parse_recovery_frames(
-        data: bytes,
-    ) -> tuple[list[WALEntry], int, int]:
-        recovered_entries: list[WALEntry] = []
-        next_lsn = 0
-        last_synced_lsn = -1
-
+    def _parse_frames(frames: bytes) -> list[WALEntry]:
+        """The entries in the bytes after the format header, up to the
+        first torn or corrupt frame (a crash mid-append leaves at most
+        one, at the tail)."""
+        entries: list[WALEntry] = []
         offset = 0
-        while offset < len(data):
-            if offset + HEADER_SIZE > len(data):
+        while offset + HEADER_SIZE <= len(frames):
+            total_length = struct.unpack(">I", frames[offset + 4 : offset + 8])[0]
+            if total_length < HEADER_SIZE or offset + total_length > len(frames):
                 break
-
-            header_data = data[offset : offset + HEADER_SIZE]
-            total_length = struct.unpack(">I", header_data[4:8])[0]
-            payload_length = total_length - HEADER_SIZE
-
-            if payload_length < 0:
-                break
-
-            if offset + total_length > len(data):
-                break
-
-            full_entry = data[offset : offset + total_length]
-
             try:
-                entry = WALEntry.from_bytes(full_entry)
-                recovered_entries.append(entry)
-
-                if entry.lsn >= next_lsn:
-                    next_lsn = entry.lsn + 1
-
+                entries.append(WALEntry.from_bytes(frames[offset : offset + total_length]))
             except ValueError:
                 break
-
             offset += total_length
-
-        if recovered_entries:
-            last_synced_lsn = recovered_entries[-1].lsn
-
-        return recovered_entries, next_lsn, last_synced_lsn
+        return entries
 
     async def append(
         self,
@@ -218,7 +230,7 @@ class NodeWAL:
         loop = self._loop
         assert loop is not None
 
-        hlc = await self._clock.generate()
+        hlc = self._clock.now()
 
         async with self._state_lock:
             lsn = self._status_snapshot.next_lsn
@@ -374,46 +386,10 @@ class NodeWAL:
         loop = self._loop
         assert loop is not None
 
-        if await self._filesystem.exists(self._path):
-            data = await self._filesystem.read_bytes(self._path)
-        else:
-            data = b""
-        entries = self._parse_entries_from(data, start_lsn)
-
-        for entry in entries:
-            yield entry
-
-    @staticmethod
-    def _parse_entries_from(data: bytes, start_lsn: int) -> list[WALEntry]:
-        entries: list[WALEntry] = []
-
-        offset = 0
-        while offset < len(data):
-            if offset + HEADER_SIZE > len(data):
-                break
-
-            header_data = data[offset : offset + HEADER_SIZE]
-            total_length = struct.unpack(">I", header_data[4:8])[0]
-            payload_length = total_length - HEADER_SIZE
-
-            if payload_length < 0:
-                break
-
-            if offset + total_length > len(data):
-                break
-
-            full_entry = data[offset : offset + total_length]
-
-            try:
-                entry = WALEntry.from_bytes(full_entry)
-                if entry.lsn >= start_lsn:
-                    entries.append(entry)
-            except ValueError:
-                break
-
-            offset += total_length
-
-        return entries
+        data = await self._filesystem.read_bytes(self._path)
+        for entry in self._parse_frames(WAL_FORMAT.decode(data)):
+            if entry.lsn >= start_lsn:
+                yield entry
 
     @property
     def status(self) -> WALStatusSnapshot:

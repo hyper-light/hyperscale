@@ -36,6 +36,7 @@ from hyperscale.distributed.models.distributed import (
 )
 from hyperscale.distributed.nodes.manager.server import ManagerServer
 from tests.simulation.harness.sim import SimFilesystem
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 class _RecordingLogger:
@@ -64,7 +65,7 @@ async def _open_ledger(filesystem: SimFilesystem) -> JobLedger:
         archive_dir=Path("/manager/ledger/archive"),
         region_code="dc-east",
         gate_id="mgr-1",
-        node_id=1,
+        clock=new_hybrid_logical_clock(),
         regional_replicator=_committed_regionally,
         filesystem=filesystem,
     )

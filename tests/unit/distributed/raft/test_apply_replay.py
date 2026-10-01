@@ -31,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock
 import cloudpickle
 import pytest
 
+from hyperscale.distributed.hlc import HLCTimestamp
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
 from hyperscale.distributed.jobs.job_manager import JobManager
@@ -122,7 +123,7 @@ def _make_entry(
         command=cloudpickle.dumps(command),
         command_type=command_type.value,
         job_id=job_id,
-        timestamp=timestamp,
+        hlc=HLCTimestamp(wall_ms=round(timestamp * 1000), logical=0, node_id=1),
     )
 
 

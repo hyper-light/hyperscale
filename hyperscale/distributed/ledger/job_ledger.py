@@ -13,7 +13,8 @@ from hyperscale.logging.hyperscale_logging_models import (
     CheckpointError,
     CheckpointInfo,
 )
-from hyperscale.logging.lsn import LSN, HybridLamportClock
+from hyperscale.distributed.hlc.hlc_timestamp import HLCTimestamp
+from hyperscale.distributed.hlc.hybrid_logical_clock import HybridLogicalClock
 
 from .archive.job_archive_store import JobArchiveStore
 
@@ -163,7 +164,7 @@ class JobLedger:
 
     def __init__(
         self,
-        clock: HybridLamportClock,
+        clock: HybridLogicalClock,
         wal: NodeWAL,
         pipeline: CommitPipeline,
         checkpoint_manager: CheckpointManager,
@@ -210,26 +211,23 @@ class JobLedger:
         archive_dir: Path,
         region_code: str,
         gate_id: str,
-        node_id: int,
+        clock: HybridLogicalClock,
         regional_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
         global_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
         regional_timeout_seconds: float = REGIONAL_TIMEOUT_SECONDS,
         global_timeout_seconds: float = GLOBAL_TIMEOUT_SECONDS,
         completed_cache_size: int = DEFAULT_COMPLETED_CACHE_SIZE,
         logger: Logger | None = None,
-        clock: HybridLamportClock | None = None,
         filesystem: Filesystem | None = None,
         checkpoint_wal_ratio: int = WAL_TO_ACTIVE_STATE_RATIO,
         min_checkpoint_wal_entries: int = MIN_CHECKPOINT_WAL_ENTRIES,
         checkpoint_max_interval_seconds: float = CHECKPOINT_MAX_INTERVAL_SECONDS,
         checkpoint_retention_count: int = CHECKPOINT_RETENTION_COUNT,
     ) -> JobLedger:
-        """``clock`` lets the owning node share its HLC so ledger
-        events are causally ordered against its other WAL/Raft writes;
+        """``clock`` is the owning node's HLC, so ledger events are
+        causally ordered against its other WAL/Raft writes;
         ``filesystem`` is the Phase 7 storage seam (None binds each
         component's module default)."""
-        if clock is None:
-            clock = HybridLamportClock(node_id=node_id)
         wal = await NodeWAL.open(
             path=wal_path, clock=clock, logger=logger, filesystem=filesystem
         )
@@ -249,7 +247,7 @@ class JobLedger:
         await checkpoint_manager.initialize()
 
         archive_store = JobArchiveStore(
-            archive_dir=archive_dir, filesystem=filesystem
+            archive_dir=archive_dir, filesystem=filesystem, logger=logger
         )
         await archive_store.initialize()
 
@@ -293,7 +291,7 @@ class JobLedger:
                 *(job.fence_token + 1 for job in self._jobs_internal.values()),
             )
 
-            await self._clock.witness(checkpoint.hlc)
+            self._clock.witness(checkpoint.hlc)
             self._wal.restore_durability_watermarks(
                 regional_lsn=checkpoint.regional_lsn,
                 global_lsn=checkpoint.global_lsn,
@@ -462,7 +460,7 @@ class JobLedger:
             fence_token = self._next_fence_token
             self._next_fence_token += 1
 
-            hlc = await self._clock.generate()
+            hlc = self._clock.now()
 
             event = JobCreated(
                 job_id=job_id,
@@ -508,7 +506,7 @@ class JobLedger:
             if job is None:
                 return None
 
-            hlc = await self._clock.generate()
+            hlc = self._clock.now()
 
             event = JobAccepted(
                 job_id=job_id,
@@ -546,7 +544,7 @@ class JobLedger:
             if job.is_cancelled:
                 return None
 
-            hlc = await self._clock.generate()
+            hlc = self._clock.now()
 
             event = JobCancellationRequested(
                 job_id=job_id,
@@ -592,7 +590,7 @@ class JobLedger:
             if (job.completed_count, job.failed_count) == (completed_count, failed_count):
                 return None
 
-            hlc = await self._clock.generate()
+            hlc = self._clock.now()
             append_result = await self._append(
                 JobEventType.JOB_PROGRESS_REPORTED,
                 JobProgressReported(
@@ -632,7 +630,7 @@ class JobLedger:
             if datacenter_id in job.cancellation_acked_datacenters:
                 return None
 
-            hlc = await self._clock.generate()
+            hlc = self._clock.now()
             append_result = await self._append(
                 JobEventType.JOB_CANCELLATION_ACKED,
                 JobCancellationAcked(
@@ -747,7 +745,7 @@ class JobLedger:
         total_completed: int,
         total_failed: int,
         durability: DurabilityLevel,
-        build_event: Callable[[JobState, LSN], msgspec.Struct],
+        build_event: Callable[[JobState, HLCTimestamp], msgspec.Struct],
     ) -> CommitResult | None:
         """Shared terminal transition for complete / fail / time out.
 
@@ -761,7 +759,7 @@ class JobLedger:
             if job is None or job.is_terminal:
                 return None
 
-            hlc = await self._clock.generate()
+            hlc = self._clock.now()
             append_result = await self._append(event_type, build_event(job, hlc))
 
             # Applied unconditionally -- see the class docstring's apply
@@ -908,7 +906,7 @@ class JobLedger:
 
     async def checkpoint(self) -> Path:
         async with self._lock:
-            hlc = await self._clock.generate()
+            hlc = self._clock.now()
 
             job_states = {
                 job_id: job.to_dict()

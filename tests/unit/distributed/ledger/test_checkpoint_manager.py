@@ -4,13 +4,16 @@ CheckpointManager: durability + recovery through the Phase 7 seam.
 Pins:
 
 * save -> fresh-manager initialize round-trip (newest checkpoint wins);
-* a corrupted checkpoint (CRC mismatch) is SKIPPED at load and an
-  older valid one is recovered instead — the reason the CRC exists;
+* a corrupted checkpoint (CRC mismatch) is SKIPPED at load -- set aside
+  with its bytes preserved, and reported -- and an older valid one is
+  recovered instead -- the reason the CRC exists;
 * cleanup retains the newest ``keep_count``;
 * the atomic_write durability claim, testable only under SIM: a save
   followed by power loss (``SimFilesystem.crash()``) must still be
   fully readable — atomic_write is crash-durable BY CONSTRUCTION.
 """
+
+import pathlib
 
 import pytest
 
@@ -19,8 +22,17 @@ from hyperscale.distributed.ledger.checkpoint.checkpoint import (
     Checkpoint,
     CheckpointManager,
 )
-from hyperscale.logging.lsn import LSN
+from hyperscale.distributed.hlc import HLCTimestamp
+from hyperscale.logging.hyperscale_logging_models import StorageFormatUnrecognized
 from tests.simulation.harness.sim import SimFilesystem
+
+
+class RecordingLogger:
+    def __init__(self) -> None:
+        self.entries: list = []
+
+    async def log(self, entry) -> None:
+        self.entries.append(entry)
 
 
 @pytest.fixture
@@ -35,7 +47,7 @@ def _checkpoint(created_at_ms: int, local_lsn: int) -> Checkpoint:
         local_lsn=local_lsn,
         regional_lsn=local_lsn,
         global_lsn=local_lsn,
-        hlc=LSN(logical_time=1, node_id=1, sequence=0, wall_clock=created_at_ms),
+        hlc=HLCTimestamp(wall_ms=created_at_ms, logical=0, node_id=1),
         job_states={"job-1": {"status": "completed"}},
         created_at_ms=created_at_ms,
     )
@@ -75,10 +87,15 @@ async def test_corrupted_checkpoint_is_skipped_for_older_valid_one(
     corrupted[-1] ^= 0xFF
     newest_path.write_bytes(bytes(corrupted))
 
-    recovered = CheckpointManager(checkpoint_dir, filesystem=filesystem)
+    logger = RecordingLogger()
+    recovered = CheckpointManager(checkpoint_dir, filesystem=filesystem, logger=logger)
     await recovered.initialize()
     assert recovered.has_checkpoint
     assert recovered.latest.created_at_ms == 1000
+    (report,) = logger.entries
+    assert (type(report), report.path) == (StorageFormatUnrecognized, str(newest_path))
+    assert not newest_path.exists()
+    assert pathlib.Path(report.set_aside_path).read_bytes() == bytes(corrupted)
 
 
 @pytest.mark.asyncio

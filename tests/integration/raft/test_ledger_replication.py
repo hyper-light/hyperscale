@@ -29,7 +29,7 @@ from hyperscale.distributed.raft.models import LedgerProposal
 from hyperscale.distributed.raft.raft_node import ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.taskex import TaskRunner
-from hyperscale.logging.lsn import HybridLamportClock
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 JOB_ID = "job-1"
 # Liveness ceiling: a working group elects and commits within about one
@@ -57,6 +57,7 @@ class LedgerCluster:
         logger.log = AsyncMock()
         for addr in self.addresses:
             self.integrations[addr] = ManagerRaftIntegration(
+                clock=new_hybrid_logical_clock(),
                 ledger_replica=self.replicas[addr],
                 node_id=_member_id(addr),
                 job_manager=MagicMock(),
@@ -129,7 +130,7 @@ async def task_runner():
 async def _job_created_entry() -> WALEntry:
     event = JobCreated(
         job_id=JOB_ID,
-        hlc=await HybridLamportClock(node_id=1).generate(),
+        hlc=new_hybrid_logical_clock().now(),
         fence_token=1,
         spec_hash=b"spec",
         assigned_datacenters=("dc-east",),

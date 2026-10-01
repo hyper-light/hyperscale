@@ -188,7 +188,7 @@ from hyperscale.distributed.routing import (
     GateJobRouter,
 )
 from hyperscale.distributed.swim.coordinates import CoordinateTracker
-from hyperscale.logging.lsn import HybridLamportClock
+from hyperscale.distributed.hlc import HybridLogicalClock, hlc_node_id
 from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
     SpilloverEvaluator,
@@ -467,6 +467,15 @@ class GateServer(HealthAwareServer):
             max_window_age_ms=env.STATS_MAX_WINDOW_AGE_MS,
         )
         self._stats_push_interval_ms: float = env.STATS_PUSH_INTERVAL_MS
+
+        # Shared hybrid logical clock (AD-38/AD-39): Raft entry timestamps
+        # and the durable ledger's events are ordered on this one clock.
+        # Its node id derives from the restart-stable node id.
+        self._hlc = HybridLogicalClock(
+            node_id=hlc_node_id(self._node_id.full),
+            clock=self._clock,
+            max_offset_ms=env.HLC_MAX_CLOCK_OFFSET_MS,
+        )
 
         # Job submissions
         self._job_submissions: dict[str, JobSubmission] = {}
@@ -944,12 +953,6 @@ class GateServer(HealthAwareServer):
             orphan_grace_period_seconds=self._orphan_grace_period,
         )
 
-        # Shared HybridLamportClock (AD-38). Wired into Raft so RaftLogEntry.timestamp
-        # carries a replicated wall-clock-derived value. Apply handlers consume
-        # entry.timestamp directly, producing byte-equal state across followers.
-        if not hasattr(self, "_hlc"):
-            self._hlc = HybridLamportClock(node_id=hash(self._node_id.full) & 0xFFFF)
-
         # Raft consensus integration. Members are keyed by full gate node
         # id (iter_known_gates); the self id must use the same form, or a
         # follower knows its leader by an id it cannot resolve.
@@ -1120,20 +1123,14 @@ class GateServer(HealthAwareServer):
         await self.initialize_incarnation_store()
 
         if self._wal_data_dir is not None:
-            # Phase 8 gate durable tier. The HLC is normally created in
-            # _init_coordinators; ensure it exists here (same guarded
-            # construction) so ledger events share the gate's clock.
-            if not hasattr(self, "_hlc"):
-                self._hlc = HybridLamportClock(
-                    node_id=hash(self._node_id.full) & 0xFFFF
-                )
+            # Phase 8 gate durable tier; ledger events share the gate's
+            # clock.
             self._job_ledger = await JobLedger.open(
                 wal_path=self._wal_data_dir / "wal",
                 checkpoint_dir=self._wal_data_dir / "checkpoints",
                 archive_dir=self._wal_data_dir / "archive",
                 region_code=self._node_id.datacenter,
                 gate_id=self._node_id.short,
-                node_id=1,
                 regional_replicator=self._replicate_ledger_regional,
                 global_replicator=self._replicate_ledger_global,
                 # GLOBAL gets REGIONAL's budget: a commit turn waits on it,
@@ -3011,13 +3008,13 @@ class GateServer(HealthAwareServer):
         created HLC's embedded wall clock against the same clock axis.
         """
         recovered_count = 0
-        current_lsn = await self._hlc.generate()
+        current_wall_ms = self._hlc.now().wall_ms
         for job_state in self._job_ledger.get_all_jobs().values():
             if job_state.is_terminal:
                 continue
 
             elapsed_seconds = max(
-                (current_lsn.wall_clock - job_state.created_hlc.wall_clock)
+                (current_wall_ms - job_state.created_hlc.wall_ms)
                 / 1000.0,
                 0.0,
             )

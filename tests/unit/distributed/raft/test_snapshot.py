@@ -5,11 +5,11 @@ Tests snapshot creation, application, log compaction,
 and InstallSnapshot message serialization.
 """
 
-import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.hlc import HLCTimestamp
 from hyperscale.distributed.raft.models import RaftLogEntry
 from hyperscale.distributed.raft.raft_log import RaftLog
 from hyperscale.distributed.raft.snapshot import (
@@ -48,7 +48,7 @@ def populated_log():
                 command=f"cmd-{i}".encode(),
                 command_type="TEST",
                 job_id="job-1",
-                timestamp=time.monotonic(),
+                hlc=HLCTimestamp(wall_ms=0, logical=i, node_id=1),
             )
         )
     return raft_log
@@ -110,7 +110,7 @@ class TestSnapshotManager:
                     command=b"x",
                     command_type="T",
                     job_id="j",
-                    timestamp=time.monotonic(),
+                    hlc=HLCTimestamp(wall_ms=0, logical=i + 1, node_id=1),
                 )
             )
         assert snapshot_manager.should_compact(raft_log) is False

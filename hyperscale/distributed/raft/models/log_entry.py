@@ -7,6 +7,8 @@ serialized command payload, and metadata.
 
 from dataclasses import dataclass
 
+from hyperscale.distributed.hlc.hlc_timestamp import HLCTimestamp
+
 
 @dataclass(slots=True)
 class RaftLogEntry:
@@ -23,7 +25,10 @@ class RaftLogEntry:
         command_type: String identifier for dispatch (supports both
             RaftCommandType and GateRaftCommandType since both are str enums).
         job_id: The job this entry belongs to.
-        timestamp: Monotonic timestamp when the entry was created.
+        hlc: The leader's hybrid logical clock timestamp at proposal
+            (AD-39): replicated with the entry, so every member applies
+            the same time, and checked against the offset bound by
+            followers before they append.
     """
 
     term: int
@@ -31,4 +36,9 @@ class RaftLogEntry:
     command: bytes
     command_type: str
     job_id: str
-    timestamp: float
+    hlc: HLCTimestamp
+
+    @property
+    def timestamp(self) -> float:
+        """The entry's replicated wall-clock time, in Unix seconds."""
+        return self.hlc.seconds

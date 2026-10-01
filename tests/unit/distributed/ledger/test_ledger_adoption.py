@@ -24,6 +24,7 @@ from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
 from tests.simulation.harness.sim import SimFilesystem
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 def _paths(node: str) -> dict:
@@ -33,7 +34,7 @@ def _paths(node: str) -> dict:
         "archive_dir": Path(f"/{node}/ledger/archive"),
         "region_code": "dc-east",
         "gate_id": node,
-        "node_id": 1,
+        "clock": new_hybrid_logical_clock(),
     }
 
 

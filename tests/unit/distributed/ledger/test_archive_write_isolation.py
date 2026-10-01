@@ -31,6 +31,7 @@ from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.job_state import JobState
 from tests.simulation.harness.sim import SimFilesystem
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 class FlakyArchiveStore(JobArchiveStore):
@@ -72,9 +73,8 @@ async def _open_ledger_with_archive(
         CommitPipeline,
     )
     from hyperscale.distributed.ledger.wal.node_wal import NodeWAL
-    from hyperscale.logging.lsn import HybridLamportClock
 
-    clock = HybridLamportClock(node_id=1)
+    clock = new_hybrid_logical_clock()
     wal = await NodeWAL.open(
         path=Path("/manager/ledger/wal"), clock=clock, filesystem=filesystem
     )

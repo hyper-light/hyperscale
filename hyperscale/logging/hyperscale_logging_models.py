@@ -295,6 +295,13 @@ class ArchiveError(Entry, kw_only=True):
     level: LogLevel = LogLevel.ERROR
 
 
+class StorageFormatUnrecognized(Entry, kw_only=True):
+    path: str
+    set_aside_path: str
+    reason: str
+    level: LogLevel = LogLevel.ERROR
+
+
 class WorkerStarted(Entry, kw_only=True):
     node_id: str
     node_host: str

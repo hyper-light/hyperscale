@@ -19,7 +19,9 @@ from .models import (
     RequestVote,
     RequestVoteResponse,
 )
+from .logging_models import RaftWarning
 from .raft_log import RaftLog
+from hyperscale.distributed.hlc.clock_offset_exceeded_error import ClockOffsetExceededError
 
 from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
 
@@ -28,8 +30,8 @@ _DEFAULT_CLOCK: Clock = RealClock()
 _DEFAULT_RANDOM: Random = RealRandom()
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.hlc.hybrid_logical_clock import HybridLogicalClock
     from hyperscale.logging import Logger
-    from hyperscale.logging.lsn import HybridLamportClock
 
 
 # Raft timing constants (seconds)
@@ -132,9 +134,10 @@ class RaftNode:
         on_become_leader: Callable[[], None] | None,
         on_lose_leadership: Callable[[], None] | None,
         logger: "Logger",
-        clock: "HybridLamportClock | None" = None,
         configured_cluster_size: int | None = None,
         proposal_timeout_seconds: float = 5.0,
+        *,
+        clock: "HybridLogicalClock",
     ) -> None:
         self._job_id = job_id
         self._node_id = node_id
@@ -493,8 +496,23 @@ class RaftNode:
                     conflict_index=conflict[1],
                 )
 
+            # AD-39: refuse entries stamped further ahead of this node's
+            # clock than the offset bound -- they never reach this log, so
+            # a skewed leader cannot commit through this member.
+            if (offset_error := self._first_offset_violation(request.entries)) is not None:
+                await self._logger.log(RaftWarning(
+                    message=f"Refused AppendEntries from {request.leader_id}: {offset_error}",
+                    node_id=self._node_id,
+                    job_id=self._job_id,
+                ))
+                return self._append_response(
+                    success=False, match_index=0, clock_offset_rejected=True
+                )
+
             # Append new entries (truncating conflicts)
             self._apply_entries_from_leader(request.entries)
+            for entry in request.entries:
+                self._clock.receive(entry.hlc)
 
             # Advance commit index
             if request.leader_commit > self._commit_index:
@@ -545,6 +563,7 @@ class RaftNode:
         match_index: int,
         conflict_term: int | None = None,
         conflict_index: int | None = None,
+        clock_offset_rejected: bool = False,
     ) -> AppendEntriesResponse:
         return AppendEntriesResponse(
             job_id=self._job_id,
@@ -554,7 +573,18 @@ class RaftNode:
             match_index=match_index,
             conflict_term=conflict_term,
             conflict_index=conflict_index,
+            clock_offset_rejected=clock_offset_rejected,
         )
+
+    def _first_offset_violation(
+        self, entries: list[RaftLogEntry]
+    ) -> ClockOffsetExceededError | None:
+        for entry in entries:
+            try:
+                self._clock.check(entry.hlc)
+            except ClockOffsetExceededError as offset_error:
+                return offset_error
+        return None
 
     async def handle_append_entries_response(self, response: AppendEntriesResponse) -> None:
         """Handle response from a follower."""
@@ -572,6 +602,18 @@ class RaftNode:
                 self._match_index[response.follower_id] = response.match_index
                 self._advance_commit_index()
                 await self._apply_committed_locked()
+            elif getattr(response, "clock_offset_rejected", False):
+                # Not a log conflict: this leader's clock is ahead of the
+                # follower's beyond the bound. Its log stays put; the entries
+                # are re-sent (and refused) until the clocks agree.
+                await self._logger.log(RaftWarning(
+                    message=(
+                        f"{response.follower_id} refused entries: this leader's clock is "
+                        "beyond the HLC offset bound of its own"
+                    ),
+                    node_id=self._node_id,
+                    job_id=self._job_id,
+                ))
             else:
                 self._backtrack_next_index(response)
 
@@ -629,13 +671,10 @@ class RaftNode:
         """
         Propose a new command (leader only).
 
-        The entry timestamp is minted from the shared HybridLamportClock when
-        one is supplied; this gives all followers an identical wall-clock-derived
-        seconds value when the entry is replicated, so apply handlers can use
-        ``entry.timestamp`` as a deterministic time source. When no clock is
-        configured, the timestamp falls back to the leader's monotonic clock --
-        still replicated (single-source), but not comparable to wall-clock
-        consumers; production paths always supply a clock.
+        The entry's HLC is minted from the node's shared HybridLogicalClock;
+        it is replicated with the entry, so every follower reads the same
+        wall-clock-derived ``entry.timestamp`` and apply handlers can use it
+        as a deterministic time source (AD-38/AD-39).
 
         Returns:
             (success, index) -- success is False if not leader or log at capacity.
@@ -646,19 +685,13 @@ class RaftNode:
             if self._log.is_at_capacity:
                 return False, 0
 
-            if self._clock is not None:
-                lsn = await self._clock.generate()
-                entry_timestamp = lsn.wall_clock / 1000.0
-            else:
-                entry_timestamp = _DEFAULT_CLOCK.monotonic()
-
             entry = RaftLogEntry(
                 term=self._current_term,
                 index=self._log.last_index() + 1,
                 command=command,
                 command_type=command_type,
                 job_id=self._job_id,
-                timestamp=entry_timestamp,
+                hlc=self._clock.now(),
             )
             index = self._log.append(entry)
             waiter = asyncio.get_running_loop().create_future()

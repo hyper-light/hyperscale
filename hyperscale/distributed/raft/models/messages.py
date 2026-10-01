@@ -80,3 +80,7 @@ class AppendEntriesResponse(Message):
     match_index: int = 0
     conflict_term: int | None = None
     conflict_index: int | None = None
+    # AD-39: the follower refused the entries because their HLC is
+    # further ahead of its clock than the offset bound -- not a log
+    # conflict, so the leader must not backtrack on it.
+    clock_offset_rejected: bool = False

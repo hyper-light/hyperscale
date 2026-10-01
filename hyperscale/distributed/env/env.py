@@ -303,6 +303,12 @@ class Env(BaseModel):
     # toward the datacenter's resource pressure (AD-41 "30s threshold").
     RESOURCE_VIEW_STALENESS_SECONDS: StrictFloat = 30.0
 
+    # AD-39 hybrid logical clock offset bound (epsilon): a timestamp more
+    # than this far ahead of a node's physical clock is refused rather
+    # than adopted. 500ms is CockroachDB's default --max-offset, sized
+    # for NTP-disciplined clocks.
+    HLC_MAX_CLOCK_OFFSET_MS: StrictInt = 500
+
     # Cancelled Workflow Cleanup Settings (Section 6)
     CANCELLED_WORKFLOW_TTL: StrictFloat = (
         3600.0  # Seconds to retain cancelled workflow info (1 hour)
@@ -915,6 +921,7 @@ class Env(BaseModel):
             "RESOURCE_GUARD_WARNING_GRACE_SECONDS": float,
             "RESOURCE_GUARD_KILL_GRACE_SECONDS": float,
             "RESOURCE_VIEW_STALENESS_SECONDS": float,
+            "HLC_MAX_CLOCK_OFFSET_MS": int,
             # Cancelled workflow cleanup settings (Section 6)
             "CANCELLED_WORKFLOW_TTL": float,
             "CANCELLED_WORKFLOW_CLEANUP_INTERVAL": float,

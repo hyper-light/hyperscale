@@ -5,7 +5,7 @@ from typing import Any
 
 import msgspec
 
-from hyperscale.logging.lsn import LSN
+from hyperscale.distributed.hlc.hlc_timestamp import HLCTimestamp
 
 from .event_type import JobEventType
 
@@ -19,7 +19,7 @@ class JobEvent(msgspec.Struct, frozen=True, array_like=True):
 
     event_type: JobEventType
     job_id: str
-    hlc: LSN
+    hlc: HLCTimestamp
     fence_token: int
 
     def to_bytes(self) -> bytes:
@@ -32,7 +32,7 @@ class JobEvent(msgspec.Struct, frozen=True, array_like=True):
 
 class JobCreated(msgspec.Struct, frozen=True, array_like=True):
     job_id: str
-    hlc: LSN
+    hlc: HLCTimestamp
     fence_token: int
     spec_hash: bytes
     assigned_datacenters: tuple[str, ...]
@@ -55,7 +55,7 @@ class JobCreated(msgspec.Struct, frozen=True, array_like=True):
 
 class JobAccepted(msgspec.Struct, frozen=True, array_like=True):
     job_id: str
-    hlc: LSN
+    hlc: HLCTimestamp
     fence_token: int
     datacenter_id: str
     worker_count: int
@@ -72,7 +72,7 @@ class JobAccepted(msgspec.Struct, frozen=True, array_like=True):
 
 class JobProgressReported(msgspec.Struct, frozen=True, array_like=True):
     job_id: str
-    hlc: LSN
+    hlc: HLCTimestamp
     fence_token: int
     datacenter_id: str
     completed_count: int
@@ -90,7 +90,7 @@ class JobProgressReported(msgspec.Struct, frozen=True, array_like=True):
 
 class JobCancellationRequested(msgspec.Struct, frozen=True, array_like=True):
     job_id: str
-    hlc: LSN
+    hlc: HLCTimestamp
     fence_token: int
     reason: str
     requestor_id: str
@@ -107,7 +107,7 @@ class JobCancellationRequested(msgspec.Struct, frozen=True, array_like=True):
 
 class JobCancellationAcked(msgspec.Struct, frozen=True, array_like=True):
     job_id: str
-    hlc: LSN
+    hlc: HLCTimestamp
     fence_token: int
     datacenter_id: str
     workflows_cancelled: int
@@ -124,7 +124,7 @@ class JobCancellationAcked(msgspec.Struct, frozen=True, array_like=True):
 
 class JobCompleted(msgspec.Struct, frozen=True, array_like=True):
     job_id: str
-    hlc: LSN
+    hlc: HLCTimestamp
     fence_token: int
     final_status: str
     total_completed: int
@@ -143,7 +143,7 @@ class JobCompleted(msgspec.Struct, frozen=True, array_like=True):
 
 class JobFailed(msgspec.Struct, frozen=True, array_like=True):
     job_id: str
-    hlc: LSN
+    hlc: HLCTimestamp
     fence_token: int
     error_message: str
     failed_datacenter: str
@@ -166,10 +166,10 @@ class JobFailed(msgspec.Struct, frozen=True, array_like=True):
 
 class JobTimedOut(msgspec.Struct, frozen=True, array_like=True):
     job_id: str
-    hlc: LSN
+    hlc: HLCTimestamp
     fence_token: int
     timeout_type: str
-    last_progress_hlc: LSN | None
+    last_progress_hlc: HLCTimestamp | None
 
     event_type: JobEventType = JobEventType.JOB_TIMED_OUT
     # Terminal tallies — same contract as JobFailed's.

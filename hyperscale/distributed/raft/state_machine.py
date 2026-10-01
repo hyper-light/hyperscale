@@ -7,7 +7,7 @@ Each command type maps to exactly one handler.
 
 Determinism contract: handlers MUST source any time-related state from
 ``entry.timestamp`` (the leader-set, log-replicated wall-clock seconds value
-minted from the shared ``HybridLamportClock`` at proposal time, AD-38). They
+minted from the shared ``HybridLogicalClock`` at proposal time, AD-38/39). They
 MUST NOT call ``time.monotonic()`` / ``time.time()`` / random / etc.
 inside handlers; doing so produces follower-divergent state and breaks Raft
 safety. The replay test in tests/unit/distributed/raft/test_apply_replay.py

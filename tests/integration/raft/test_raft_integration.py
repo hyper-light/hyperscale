@@ -22,6 +22,7 @@ from hyperscale.distributed.raft.models import (
     RequestVote,
     RequestVoteResponse,
 )
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 # =========================================================================
@@ -80,6 +81,7 @@ def manager_integration(
     mock_send_tcp,
 ):
     return ManagerRaftIntegration(
+        clock=new_hybrid_logical_clock(),
         ledger_replica=JobLedgerReplica(),
         node_id="node-1",
         job_manager=mock_job_manager,
@@ -100,6 +102,7 @@ def gate_integration(
     mock_send_tcp,
 ):
     return GateRaftIntegration(
+        clock=new_hybrid_logical_clock(),
         ledger_replica=JobLedgerReplica(),
         cluster_size=lambda: 3,
         proposal_timeout_seconds=5.0,
@@ -449,6 +452,7 @@ class TestManagerRaftLeaderCallbacks:
         """on_job_raft_leader callback is forwarded to RaftConsensus."""
         callback = MagicMock()
         integration = ManagerRaftIntegration(
+            clock=new_hybrid_logical_clock(),
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -471,6 +475,7 @@ class TestManagerRaftLeaderCallbacks:
         """on_job_raft_lose_leader callback is forwarded to RaftConsensus."""
         callback = MagicMock()
         integration = ManagerRaftIntegration(
+            clock=new_hybrid_logical_clock(),
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -498,6 +503,7 @@ class TestManagerRaftLeaderCallbacks:
             invoked_jobs.append(job_id)
 
         integration = ManagerRaftIntegration(
+            clock=new_hybrid_logical_clock(),
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -539,6 +545,7 @@ class TestGateRaftLeaderCallbacks:
         """on_job_raft_leader callback is forwarded to GateRaftConsensus."""
         callback = MagicMock()
         integration = GateRaftIntegration(
+            clock=new_hybrid_logical_clock(),
             ledger_replica=JobLedgerReplica(),
             cluster_size=lambda: 3,
             proposal_timeout_seconds=5.0,
@@ -565,6 +572,7 @@ class TestGateRaftLeaderCallbacks:
         """on_job_raft_lose_leader callback is forwarded to GateRaftConsensus."""
         callback = MagicMock()
         integration = GateRaftIntegration(
+            clock=new_hybrid_logical_clock(),
             ledger_replica=JobLedgerReplica(),
             cluster_size=lambda: 3,
             proposal_timeout_seconds=5.0,
@@ -596,6 +604,7 @@ class TestGateRaftLeaderCallbacks:
             invoked_jobs.append(job_id)
 
         integration = GateRaftIntegration(
+            clock=new_hybrid_logical_clock(),
             ledger_replica=JobLedgerReplica(),
             cluster_size=lambda: 3,
             proposal_timeout_seconds=5.0,
