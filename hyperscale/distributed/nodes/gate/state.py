@@ -7,7 +7,8 @@ datacenter health, leases, and metrics.
 
 import asyncio
 from collections import defaultdict
-from typing import Callable
+from types import MappingProxyType
+from typing import Callable, Mapping
 
 from hyperscale.distributed.models import (
     GateHeartbeat,
@@ -264,6 +265,12 @@ class GateRuntimeState:
                 self._datacenter_manager_status[datacenter_id] = {}
             self._datacenter_manager_status[datacenter_id][manager_addr] = heartbeat
             self._manager_last_status[manager_addr] = timestamp
+
+    def get_datacenter_manager_statuses(
+        self, datacenter_id: str
+    ) -> Mapping[tuple[str, int], ManagerHeartbeat]:
+        """Latest heartbeat per manager in a datacenter (read-only view)."""
+        return MappingProxyType(self._datacenter_manager_status.get(datacenter_id, {}))
 
     def get_manager_status(
         self, datacenter_id: str, manager_addr: tuple[str, int]

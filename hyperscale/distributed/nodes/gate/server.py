@@ -195,6 +195,7 @@ from .leadership_coordinator import GateLeadershipCoordinator
 from .peer_coordinator import GatePeerCoordinator
 from .health_coordinator import GateHealthCoordinator
 from .orphan_job_coordinator import GateOrphanJobCoordinator
+from .datacenter_manager_selector import DatacenterManagerSelector
 from .raft_integration import GateRaftIntegration
 from .replication_coordinator import GateJobReplicationCoordinator
 from .config import GateConfig, create_gate_config
@@ -656,29 +657,31 @@ class GateServer(HealthAwareServer):
         for datacenter_id in self._datacenter_managers.keys():
             self._cross_dc_correlation.add_datacenter(datacenter_id)
 
-        # Discovery services (AD-28)
-        self._dc_manager_discovery: dict[str, DiscoveryService] = {}
+        # Discovery services (AD-28): one per datacenter, owned by the
+        # selector that orders dispatch candidates (known leader first,
+        # then rendezvous + EWMA). Created on demand so datacenters that
+        # join at runtime are covered; peers keyed by "host:port".
+        self._manager_selector = DatacenterManagerSelector(
+            create_discovery=lambda: DiscoveryService(
+                env.get_discovery_config(
+                    node_role="gate",
+                    static_seeds=[],
+                    allow_dynamic_registration=True,
+                )
+            ),
+            get_manager_heartbeats=self._modular_state.get_datacenter_manager_statuses,
+        )
+        self._dc_manager_discovery: dict[str, DiscoveryService] = (
+            self._manager_selector.discovery_by_datacenter
+        )
         self._discovery_failure_decay_interval: float = (
             env.DISCOVERY_FAILURE_DECAY_INTERVAL
         )
         self._discovery_maintenance_task: asyncio.Task | None = None
 
         for datacenter_id, manager_addrs in self._datacenter_managers.items():
-            static_seeds = [f"{host}:{port}" for host, port in manager_addrs]
-            dc_discovery_config = env.get_discovery_config(
-                node_role="gate",
-                static_seeds=static_seeds,
-            )
-            dc_discovery = DiscoveryService(dc_discovery_config)
-            for host, port in manager_addrs:
-                dc_discovery.add_peer(
-                    peer_id=f"{host}:{port}",
-                    host=host,
-                    port=port,
-                    role="manager",
-                    datacenter_id=datacenter_id,
-                )
-            self._dc_manager_discovery[datacenter_id] = dc_discovery
+            for manager_addr in manager_addrs:
+                self._manager_selector.track_manager(datacenter_id, manager_addr)
 
         # Peer discovery. A solo gate (no peers) is a valid topology —
         # single-gate L3 deployments and the SIM scenarios — but
@@ -799,6 +802,7 @@ class GateServer(HealthAwareServer):
             capacity_aggregator=self._capacity_aggregator,
             spillover_evaluator=self._spillover_evaluator,
             observed_latency_tracker=self._observed_latency_tracker,
+            manager_selector=self._manager_selector,
             record_dispatch_failure=lambda job_id,
             datacenter_id: self._job_router.record_dispatch_failure(
                 job_id,
@@ -837,7 +841,7 @@ class GateServer(HealthAwareServer):
             dc_health_manager=self._dc_health_manager,
             dc_health_monitor=self._dc_health_monitor,
             cross_dc_correlation=self._cross_dc_correlation,
-            dc_manager_discovery=self._dc_manager_discovery,
+            track_manager=self._manager_selector.track_manager,
             versioned_clock=self._versioned_clock,
             manager_dispatcher=self._manager_dispatcher,
             manager_health_config=self._manager_health_config,
@@ -6699,8 +6703,7 @@ class GateServer(HealthAwareServer):
             )
 
     def _decay_discovery_failures(self) -> None:
-        for dc_discovery in self._dc_manager_discovery.values():
-            dc_discovery.decay_failures()
+        self._manager_selector.decay_failures()
         self._peer_discovery.decay_failures()
 
     def _get_stale_manager_addrs(self, stale_cutoff: float) -> list[tuple[str, int]]:
@@ -6712,6 +6715,7 @@ class GateServer(HealthAwareServer):
 
     async def _cleanup_stale_manager(self, manager_addr: tuple[str, int]) -> None:
         self._manager_last_status.pop(manager_addr, None)
+        self._manager_selector.forget_manager(manager_addr)
         await self._clear_manager_backpressure(manager_addr)
         self._manager_negotiated_caps.pop(manager_addr, None)
         await self._circuit_breaker_manager.remove_circuit(manager_addr)

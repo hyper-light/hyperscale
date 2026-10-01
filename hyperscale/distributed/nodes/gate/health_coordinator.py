@@ -33,7 +33,6 @@ from hyperscale.distributed.reliability import (
     BackpressureLevel,
     BackpressureSignal,
 )
-from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
 
@@ -77,7 +76,7 @@ class GateHealthCoordinator:
         dc_health_manager: DatacenterHealthManager,
         dc_health_monitor: FederatedHealthMonitor,
         cross_dc_correlation: CrossDCCorrelationDetector,
-        dc_manager_discovery: dict[str, DiscoveryService],
+        track_manager: Callable[[str, tuple[str, int]], None],
         versioned_clock: "VersionedStateClock",
         manager_dispatcher: "ManagerDispatcher",
         manager_health_config: "ManagerHealthConfig",
@@ -97,7 +96,7 @@ class GateHealthCoordinator:
         self._dc_health_manager: DatacenterHealthManager = dc_health_manager
         self._dc_health_monitor: FederatedHealthMonitor = dc_health_monitor
         self._cross_dc_correlation: CrossDCCorrelationDetector = cross_dc_correlation
-        self._dc_manager_discovery: dict[str, DiscoveryService] = dc_manager_discovery
+        self._track_manager: Callable[[str, tuple[str, int]], None] = track_manager
         self._versioned_clock: "VersionedStateClock" = versioned_clock
         self._manager_dispatcher: "ManagerDispatcher" = manager_dispatcher
         self._manager_health_config: "ManagerHealthConfig" = manager_health_config
@@ -293,17 +292,9 @@ class GateHealthCoordinator:
         manager_addr: tuple[str, int],
         node_id: str,
     ) -> None:
-        discovery = self._dc_manager_discovery.get(datacenter_id)
-        if discovery is None:
-            return
-        peer_id = node_id or f"{manager_addr[0]}:{manager_addr[1]}"
-        discovery.add_peer(
-            peer_id=peer_id,
-            host=manager_addr[0],
-            port=manager_addr[1],
-            role="manager",
-            datacenter_id=datacenter_id,
-        )
+        # One discovery peer per manager, keyed by address — keying it by
+        # node id here too put every manager in discovery twice.
+        self._track_manager(datacenter_id, manager_addr)
 
     async def _update_manager_health_state(
         self,

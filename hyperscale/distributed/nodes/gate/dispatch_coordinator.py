@@ -22,6 +22,9 @@ from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
     SpilloverEvaluator,
 )
+from hyperscale.distributed.nodes.gate.datacenter_manager_selector import (
+    DatacenterManagerSelector,
+)
 from hyperscale.distributed.nodes.gate.models import TransientDispatchError
 from hyperscale.distributed.protocol.transient_errors import (
     is_transient_rejection,
@@ -107,10 +110,15 @@ class GateDispatchCoordinator:
         record_dispatch_failure: Callable[[str, str], None] | None = None,
         manager_dispatch_timeout_seconds: float = 5.0,
         persist_accepted_job=None,
+        *,
+        manager_selector: DatacenterManagerSelector,
     ) -> None:
         self._manager_dispatch_timeout_seconds: float = (
             manager_dispatch_timeout_seconds
         )
+        # AD-28: orders a datacenter's managers for dispatch (known leader
+        # first, then rendezvous + EWMA) and learns from dispatch outcomes.
+        self._manager_selector: DatacenterManagerSelector = manager_selector
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
         self._task_runner: "TaskRunner" = task_runner
@@ -872,19 +880,32 @@ class GateDispatchCoordinator:
         submission: JobSubmission,
     ) -> tuple[bool, str | None, tuple[str, int] | None]:
         """Try to dispatch job to a single datacenter, iterating through managers."""
-        managers = self._datacenter_managers.get(datacenter, [])
+        managers = self._manager_selector.ordered_managers(
+            datacenter,
+            job_id,
+            self._datacenter_managers.get(datacenter, []),
+        )
 
         for manager_addr in managers:
+            dispatch_started = _DEFAULT_CLOCK.monotonic()
             success, error = await self._try_dispatch_to_manager(
                 manager_addr, submission
             )
             if success:
+                # Time to an accepted dispatch (transient retries included):
+                # the responsiveness the gate actually gets from this manager.
+                self._manager_selector.record_success(
+                    datacenter,
+                    manager_addr,
+                    (_DEFAULT_CLOCK.monotonic() - dispatch_started) * 1000.0,
+                )
                 self._task_runner.run(
                     self._confirm_manager_for_dc, datacenter, manager_addr
                 )
                 self._record_forward_throughput_event()
                 return (True, None, manager_addr)
             else:
+                self._manager_selector.record_failure(datacenter, manager_addr)
                 self._task_runner.run(
                     self._suspect_manager_for_dc, datacenter, manager_addr
                 )
