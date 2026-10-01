@@ -359,9 +359,16 @@ class AdaptiveRateLimiter:
         self,
         overload_detector: HybridOverloadDetector | None = None,
         config: AdaptiveRateLimitConfig | None = None,
+        detector_sampled_externally: bool = False,
     ):
         self._detector = overload_detector or HybridOverloadDetector()
         self._config = config or AdaptiveRateLimitConfig()
+        # True when the node's resource sampler owns the detector's
+        # samples: checks read the state it settled on. Sampling it here
+        # with no readings (zero CPU and memory) per request counted toward
+        # its de-escalation hysteresis and talked an overloaded node out
+        # of its stressed limits.
+        self._detector_sampled_externally = detector_sampled_externally
 
         # Per-client, per-operation sliding window counters
         # Structure: {client_id: {operation: SlidingWindowCounter}}
@@ -394,6 +401,11 @@ class AdaptiveRateLimiter:
         self._async_lock = asyncio.Lock()
         self._counter_creation_lock = asyncio.Lock()
 
+    def _overload_state(self) -> OverloadState:
+        if self._detector_sampled_externally:
+            return self._detector.current_state
+        return self._detector.get_state()
+
     async def check(
         self,
         client_id: str,
@@ -422,7 +434,7 @@ class AdaptiveRateLimiter:
         self._total_requests += 1
         self._client_last_activity[client_id] = _DEFAULT_CLOCK.monotonic()
 
-        state = self._detector.get_state()
+        state = self._overload_state()
 
         if priority == RequestPriority.CRITICAL:
             self._allowed_requests += 1
@@ -702,7 +714,7 @@ class AdaptiveRateLimiter:
             "shed_rate": self._shed_requests / total,
             "shed_by_state": dict(self._shed_by_state),
             "active_clients": active_clients,
-            "current_state": self._detector.get_state().value,
+            "current_state": self._overload_state().value,
         }
 
     def reset_metrics(self) -> None:
@@ -956,6 +968,7 @@ class ServerRateLimiter:
         inactive_cleanup_seconds: float = 300.0,  # 5 minutes
         overload_detector: HybridOverloadDetector | None = None,
         adaptive_config: AdaptiveRateLimitConfig | None = None,
+        detector_sampled_externally: bool = False,
     ):
         self._inactive_cleanup_seconds = inactive_cleanup_seconds
 
@@ -996,6 +1009,7 @@ class ServerRateLimiter:
         self._adaptive = AdaptiveRateLimiter(
             overload_detector=overload_detector,
             config=adaptive_config,
+            detector_sampled_externally=detector_sampled_externally,
         )
 
         # Track for backward compatibility metrics

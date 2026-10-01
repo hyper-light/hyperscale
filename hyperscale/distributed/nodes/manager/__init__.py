@@ -28,7 +28,6 @@ from .leadership import ManagerLeadershipCoordinator
 from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator, ProgressState, BackpressureLevel
 from .discovery import ManagerDiscoveryCoordinator
-from .rate_limiting import ManagerRateLimitingCoordinator
 from .version_skew import ManagerVersionSkewHandler
 
 __all__ = [
@@ -61,7 +60,6 @@ __all__ = [
     "NodeStatus",
     "JobSuspicion",
     # AD-24 Rate Limiting
-    "ManagerRateLimitingCoordinator",
     # AD-25 Version Skew Handling
     "ManagerVersionSkewHandler",
 ]

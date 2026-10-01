@@ -396,7 +396,13 @@ class GateServer(HealthAwareServer):
         )
 
         # Rate limiting (AD-24)
-        self._rate_limiter = ServerRateLimiter(inactive_cleanup_seconds=300.0)
+        # Health-gated (AD-24): limits tighten with the overload state the
+        # node's resource sampler settles on.
+        self._rate_limiter = ServerRateLimiter(
+            inactive_cleanup_seconds=300.0,
+            overload_detector=self._overload_detector,
+            detector_sampled_externally=True,
+        )
 
         # Protocol version (AD-25)
         self._node_capabilities = NodeCapabilities.current(node_version=f"gate-{dc_id}")
