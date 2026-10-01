@@ -79,6 +79,25 @@ def dispatch_client_entry(context, host, port, manager_tcp_address) -> None:
     _run_client_submission(context, client, log)
 
 
+def multi_manager_client_entry(
+    context, host, port, manager_tcp_addresses
+) -> None:
+    """Client child: submit ``SimPingWorkflow`` to a peered manager tier
+    (several managers in one datacenter, no gate) and await completion —
+    the client ranks the managers itself (AD-28) and follows leader
+    redirects."""
+    client = HyperscaleClient(
+        host=host,
+        port=port,
+        env=_env(),
+        managers=list(manager_tcp_addresses),
+        **context.sim_kwargs(),
+    )
+    log: list = []
+    context.set_result(log)
+    _run_client_submission(context, client, log)
+
+
 def gate_dispatch_client_entry(context, host, port, gate_tcp_address) -> None:
     """Client child: submit ``SimPingWorkflow`` through a GATE (the L3
     topology) and await job completion — same production flow, routed

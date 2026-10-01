@@ -236,15 +236,16 @@ class RaftConsensus:
     # =========================================================================
 
     async def route_request_vote(self, message) -> object | None:
-        """Route a RequestVote to the correct job's RaftNode."""
-        node = self._nodes.get(message.job_id)
-        if node is None:
-            created = await self.create_job_raft(message.job_id)
-            if not created:
-                return None
-            node = self._nodes.get(message.job_id)
-            if node is None:
-                return None
+        """Route a RequestVote to the correct job's RaftNode.
+
+        Groups are never created by an incoming RPC: members create them
+        when they start tracking a live job and destroy them at job
+        cleanup, so a lagging peer's RPC cannot resurrect a destroyed
+        group (which would then elect and heartbeat forever). An RPC for
+        an unknown group gets no response -- a lost message to Raft.
+        """
+        if (node := self._nodes.get(message.job_id)) is None:
+            return None
         return await node.handle_request_vote(message)
 
     async def route_request_vote_response(self, message) -> None:
@@ -253,15 +254,10 @@ class RaftConsensus:
             await node.handle_request_vote_response(message)
 
     async def route_append_entries(self, message) -> object | None:
-        """Route an AppendEntries to the correct job's RaftNode."""
-        node = self._nodes.get(message.job_id)
-        if node is None:
-            created = await self.create_job_raft(message.job_id)
-            if not created:
-                return None
-            node = self._nodes.get(message.job_id)
-            if node is None:
-                return None
+        """Route an AppendEntries to the correct job's RaftNode (see
+        ``route_request_vote`` for why unknown groups are not created)."""
+        if (node := self._nodes.get(message.job_id)) is None:
+            return None
         return await node.handle_append_entries(message)
 
     async def route_append_entries_response(self, message) -> None:

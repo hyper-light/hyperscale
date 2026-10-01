@@ -157,6 +157,7 @@ from hyperscale.distributed.jobs.completion_notice_obligation import (
     CompletionNoticeObligation,
 )
 from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
+from hyperscale.distributed.jobs.job_status_order import JobStatusOrder
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
@@ -3381,11 +3382,15 @@ class ManagerServer(HealthAwareServer):
 
         Runs at JOB_CLEANUP_INTERVAL (default 60s).
         Jobs are eligible for cleanup when:
-        - Status is COMPLETED or FAILED
+        - Status is terminal (completed, failed, cancelled or timed out)
         - More than JOB_RETENTION_SECONDS have elapsed since completion
         """
         cleanup_interval = self._config.job_cleanup_interval_seconds
         retention_seconds = self._config.job_retention_seconds
+        # TIMEOUT used to be missing from a hand-written terminal set, so
+        # every timed-out job (completed_at stamped, status TIMEOUT) was
+        # retained forever.
+        status_order = JobStatusOrder()
 
         while self._running:
             try:
@@ -3397,11 +3402,7 @@ class ManagerServer(HealthAwareServer):
                 jobs_cleaned = 0
 
                 for job in list(self._job_manager.iter_jobs()):
-                    is_terminal = job.status in (
-                        JobStatus.COMPLETED.value,
-                        JobStatus.FAILED.value,
-                        JobStatus.CANCELLED.value,
-                    )
+                    is_terminal = status_order.is_terminal(job.status)
                     if not is_terminal or job.completed_at <= 0:
                         continue
                     time_since_completion = current_time - job.completed_at
@@ -5989,6 +5990,7 @@ class ManagerServer(HealthAwareServer):
         and notifies relevant systems.
         """
         self._task_runner.run(self._job_manager.complete_job, job_id)
+        self._task_runner.run(self._raft.consensus.destroy_job_raft, job_id)
         self._manager_state.clear_job_state(job_id)
 
         if self._workflow_dispatcher:
@@ -9876,6 +9878,16 @@ class ManagerServer(HealthAwareServer):
             replace_existing=sync_msg.replace_existing,
         )
 
+        # Members that learn a live job by state sync rather than the
+        # leadership announcement (e.g. after a restart) join its Raft
+        # group here; RPCs no longer create groups on arrival. A terminal
+        # job takes no further ledger entries, so its group goes now
+        # rather than heartbeating until the retention sweep.
+        if JobStatusOrder().is_terminal(job.status):
+            await self._raft.consensus.destroy_job_raft(sync_msg.job_id)
+        else:
+            await self._raft.consensus.create_job_raft(sync_msg.job_id)
+
         if sync_msg.context_snapshot and sync_msg.layer_version >= job.layer_version:
             async with job.lock:
                 for workflow_name, values in sync_msg.context_snapshot.items():
@@ -10974,12 +10986,20 @@ class ManagerServer(HealthAwareServer):
             )
 
     async def _cleanup_job_state(self, job_id: str) -> None:
+        # Tell peers the job is terminal BEFORE dropping it: the periodic
+        # peer sync only covers jobs this manager still holds, so without
+        # this followers kept the job non-terminal forever -- never
+        # eligible for their retention sweep, its Raft group never
+        # destroyed, and a takeover candidate for a finished job.
+        if (job := self._job_manager.get_job_by_id(job_id)) is not None:
+            await self._sync_job_state_to_peers(job_id, job)
         self._leases.clear_job_leases(job_id)
         self._worker_health_monitor.cleanup_job_progress(job_id)
         self._worker_health_monitor.clear_job_suspicions(job_id)
         self._manager_state.clear_job_state(job_id)
         job_token = self._job_manager.create_job_token(job_id)
         await self._job_manager.remove_job(job_token)
+        await self._raft.consensus.destroy_job_raft(job_id)
 
     async def _log_job_completion(
         self, job_id: str, final_status: str, total_completed: int, total_failed: int

@@ -396,6 +396,13 @@ class JobManager:
             if replace_existing or job.status not in terminal_statuses:
                 job.status = status
 
+            # Followers never ran the leader's terminal path, so without
+            # this stamp a hydrated terminal job kept completed_at == 0 and
+            # the retention sweep (which requires completed_at > 0) never
+            # removed it.
+            if job.status in terminal_statuses and job.completed_at <= 0:
+                job.completed_at = timestamp
+
             if replace_existing:
                 job.workflows_total = workflows_total
                 job.workflows_completed = workflows_completed
