@@ -72,6 +72,7 @@ class GateOrphanJobCoordinator:
 
     __slots__ = (
         "_state",
+        "_finalize_failed_job",
         "_logger",
         "_task_runner",
         "_job_hash_ring",
@@ -119,6 +120,8 @@ class GateOrphanJobCoordinator:
         orphan_timeout_seconds: float = 300.0,
         takeover_jitter_min_seconds: float = 0.5,
         takeover_jitter_max_seconds: float = 2.0,
+        *,
+        finalize_failed_job: Callable[[str, tuple[str, ...], str], Awaitable[None]],
     ) -> None:
         """
         Initialize the orphan job coordinator.
@@ -145,6 +148,7 @@ class GateOrphanJobCoordinator:
             takeover_jitter_max_seconds: Maximum random jitter before takeover
         """
         self._state = state
+        self._finalize_failed_job = finalize_failed_job
         self._logger = logger
         self._task_runner = task_runner
         self._job_hash_ring = job_hash_ring
@@ -503,6 +507,11 @@ class GateOrphanJobCoordinator:
             job.elapsed_seconds = _DEFAULT_CLOCK.monotonic() - job.timestamp
         self._job_manager.set_job(job_id, job)
         self._clear_orphaned_job(job_id)
+        await self._finalize_failed_job(
+            job_id,
+            (),
+            f"orphaned for {time_orphaned:.1f}s without takeover",
+        )
 
         await self._logger.log(
             ServerWarning(

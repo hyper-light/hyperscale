@@ -31,6 +31,7 @@ Module Structure:
 """
 
 import asyncio
+import dataclasses
 import hashlib
 import statistics
 from collections import defaultdict
@@ -41,7 +42,17 @@ import cloudpickle
 
 from hyperscale.distributed.server import tcp
 from hyperscale.distributed.leases import JobLeaseManager
+from hyperscale.distributed.jobs.job_status_order import JobStatusOrder
 from hyperscale.distributed.ledger import JobLedger
+from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
+from hyperscale.distributed.ledger.pipeline.commit_pipeline import (
+    REGIONAL_TIMEOUT_SECONDS,
+    CommitResult,
+)
+from hyperscale.distributed.raft import LedgerReplicator
+from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
+from hyperscale.distributed.raft.models import LedgerPlacementQuery, LedgerProposal
+from hyperscale.distributed.raft.models.gate_commands import gate_ledger_append_command
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
@@ -191,6 +202,7 @@ from hyperscale.logging.hyperscale_logging_models import (
 from .stats_coordinator import GateStatsCoordinator
 from .cancellation_coordinator import GateCancellationCoordinator
 from .dispatch_coordinator import GateDispatchCoordinator
+from .ledger_region_span import LedgerRegionSpan
 from .leadership_coordinator import GateLeadershipCoordinator
 from .peer_coordinator import GatePeerCoordinator
 from .health_coordinator import GateHealthCoordinator
@@ -288,6 +300,11 @@ class GateServer(HealthAwareServer):
         # gate (the pre-Phase-8 behavior, unchanged).
         self._wal_data_dir = wal_data_dir
         self._job_ledger: JobLedger | None = None
+        # AD-38 replication of the ledger; built with the Raft integration
+        # in _init_coordinators (ledger writes only happen after start).
+        self._ledger_replicator: LedgerReplicator | None = None
+        self._ledger_region_span: LedgerRegionSpan | None = None
+        self._ledger_tier_spans_regions: bool | None = None
 
         # Create modular runtime state
         self._modular_state = GateRuntimeState()
@@ -571,7 +588,9 @@ class GateServer(HealthAwareServer):
 
         # Configuration
         self._lease_timeout = lease_timeout
-        self._job_max_age: float = 3600.0
+        # Terminal-job retention (was a literal 3600.0, the same value
+        # as this setting's default; now configurable like the manager's).
+        self._job_max_age: float = env.FAILED_JOB_MAX_AGE
         self._job_cleanup_interval: float = env.GATE_JOB_CLEANUP_INTERVAL
         self._rate_limit_cleanup_interval: float = env.GATE_RATE_LIMIT_CLEANUP_INTERVAL
         self._batch_stats_interval: float = env.GATE_BATCH_STATS_INTERVAL
@@ -803,6 +822,7 @@ class GateServer(HealthAwareServer):
             spillover_evaluator=self._spillover_evaluator,
             observed_latency_tracker=self._observed_latency_tracker,
             manager_selector=self._manager_selector,
+            finalize_failed_job=self._finalize_failed_job,
             record_dispatch_failure=lambda job_id,
             datacenter_id: self._job_router.record_dispatch_failure(
                 job_id,
@@ -888,6 +908,7 @@ class GateServer(HealthAwareServer):
             forward_status_push_to_peers=self._forward_job_status_push_to_peers,
             state_repair_callback=self._repair_orphan_job_state,
             commit_takeover_callback=self._commit_gate_job_leadership_takeover,
+            finalize_failed_job=self._finalize_failed_job,
             is_cluster_leader=self.is_leader,
             orphan_check_interval_seconds=self._orphan_check_interval,
             orphan_grace_period_seconds=self._orphan_grace_period,
@@ -899,9 +920,16 @@ class GateServer(HealthAwareServer):
         if not hasattr(self, "_hlc"):
             self._hlc = HybridLamportClock(node_id=hash(self._node_id.full) & 0xFFFF)
 
-        # Raft consensus integration
+        # Raft consensus integration. Members are keyed by full gate node
+        # id (iter_known_gates); the self id must use the same form, or a
+        # follower knows its leader by an id it cannot resolve.
+        self._ledger_replica = JobLedgerReplica()
         self._raft = GateRaftIntegration(
-            node_id=self._node_id.short,
+            ledger_replica=self._ledger_replica,
+            cluster_size=self._configured_gate_count,
+            # The gate's quorum timeout -- the bound its replica 2PC uses.
+            proposal_timeout_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
+            node_id=self._node_id.full,
             job_manager=self._job_manager,
             leadership_tracker=self._job_leadership_tracker,
             gate_state=self._modular_state,
@@ -911,6 +939,32 @@ class GateServer(HealthAwareServer):
             on_job_raft_leader=self._on_job_raft_leader,
             on_job_raft_lose_leader=self._on_job_raft_lose_leader,
             clock=self._hlc,
+        )
+        # A forwarded proposal or placement query waits out the group
+        # leader's proposal timeout plus one short transit.
+        ledger_rpc_timeout = (
+            float(self.env.GATE_TCP_TIMEOUT_STANDARD) + self._tcp_timeout_short
+        )
+        self._ledger_replicator = LedgerReplicator(
+            consensus=self._raft.consensus,
+            build_command=gate_ledger_append_command,
+            node_id=self._node_id.full,
+            send_tcp=self._send_to_gate_peer,
+            forward_method="gate_raft_ledger_proposal",
+            forward_timeout_seconds=ledger_rpc_timeout,
+            clock=self._clock,
+            logger=self._udp_logger,
+        )
+        self._ledger_region_span = LedgerRegionSpan(
+            consensus=self._raft.consensus,
+            node_id=self._node_id.full,
+            region_of=self._gate_region_of,
+            tier_regions=self._gate_tier_regions,
+            send_tcp=self._send_to_gate_peer,
+            query_method="gate_raft_ledger_placement",
+            query_timeout_seconds=ledger_rpc_timeout,
+            clock=self._clock,
+            logger=self._udp_logger,
         )
 
     def _init_handlers(self) -> None:
@@ -1050,6 +1104,11 @@ class GateServer(HealthAwareServer):
                 region_code=self._node_id.datacenter,
                 gate_id=self._node_id.short,
                 node_id=1,
+                regional_replicator=self._replicate_ledger_regional,
+                global_replicator=self._replicate_ledger_global,
+                # GLOBAL gets REGIONAL's budget: a commit turn waits on it,
+                # and a job's later ledger writes queue behind that turn.
+                global_timeout_seconds=REGIONAL_TIMEOUT_SECONDS,
                 logger=self._udp_logger,
                 clock=self._hlc,
             )
@@ -2587,11 +2646,9 @@ class GateServer(HealthAwareServer):
         """Durably record an accepted job (Phase 8 gate durable tier).
 
         Awaited from the dispatch coordinator at the acceptance point
-        (after at least one datacenter took the dispatch). LOCAL
-        durability, mirroring the manager's acceptance record: the
-        fsync'd WAL append IS the recovery guarantee; cross-node
-        replication is the peer-forwarding layer's job. No-op for
-        volatile gates.
+        (after at least one datacenter took the dispatch), at the gate
+        tier's AD-38 level for job creation (GLOBAL where the tier spans
+        regions). No-op for volatile gates.
         """
         if self._job_ledger is None:
             return
@@ -2606,22 +2663,14 @@ class GateServer(HealthAwareServer):
             spec_hash=hashlib.sha256(submission.workflows).digest(),
             assigned_datacenters=tuple(successful_dcs),
             requestor_id=requestor_contact,
-            durability=DurabilityLevel.LOCAL,
+            durability=await self._ledger_target_durability(),
             job_id=submission.job_id,
             timeout_seconds=submission.timeout_seconds,
         )
-        # An invariant assertion, not a live error path: LOCAL is the
-        # fsync'd append itself, so it cannot fall short. Raising is
-        # only correct while this site requests LOCAL — above it, a
-        # shortfall means the record IS durable here and applied to
-        # ledger state, just not replicated, so the right response
-        # becomes a durability warning on ``level_achieved`` rather
-        # than aborting acceptance for a job that exists.
-        if not create_result.success:
-            raise RuntimeError(
-                "gate job ledger rejected acceptance record for "
-                f"{submission.job_id}: {create_result.error}"
-            )
+        # A shortfall means the record IS durable here and applied to
+        # ledger state, just not replicated that far: a durability
+        # warning, not a reason to abort acceptance of a job that exists.
+        await self._log_ledger_shortfall("JobCreated", submission.job_id, create_result)
 
     async def _record_cancellation_durable(
         self,
@@ -2639,18 +2688,109 @@ class GateServer(HealthAwareServer):
         if self._job_ledger is None:
             return
 
-        await self._job_ledger.request_cancellation(
+        durability = await self._ledger_target_durability()
+        await self._log_ledger_shortfall(
+            "JobCancellationRequested",
             job_id,
-            reason=reason,
-            requestor_id=requester_id,
-            durability=DurabilityLevel.LOCAL,
+            await self._job_ledger.request_cancellation(
+                job_id,
+                reason=reason,
+                requestor_id=requester_id,
+                durability=durability,
+            ),
         )
         for datacenter_id, workflows_cancelled in confirmed_datacenters:
-            await self._job_ledger.acknowledge_cancellation(
+            await self._log_ledger_shortfall(
+                "JobCancellationAcked",
                 job_id,
-                datacenter_id=datacenter_id,
-                workflows_cancelled=workflows_cancelled,
-                durability=DurabilityLevel.LOCAL,
+                await self._job_ledger.acknowledge_cancellation(
+                    job_id,
+                    datacenter_id=datacenter_id,
+                    workflows_cancelled=workflows_cancelled,
+                    durability=durability,
+                ),
+            )
+
+    async def _finalize_terminal_job(
+        self,
+        job_id: str,
+        final_status: str,
+        total_completed: int,
+        total_failed: int,
+        elapsed_seconds: float,
+        reason: str = "",
+        failed_datacenters: tuple[str, ...] = (),
+    ) -> None:
+        """Every terminal transition's single exit: record the AD-38
+        terminal, then tell peer gates the job is terminal (which also
+        retires its per-job Raft group everywhere). Order matters: the
+        terminal record commits through that group first."""
+        await self._record_job_terminal_durable(
+            job_id,
+            final_status=final_status,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            elapsed_seconds=elapsed_seconds,
+            reason=reason,
+            failed_datacenters=failed_datacenters,
+        )
+        await self._replicate_terminal_status(job_id)
+
+    async def _finalize_failed_job(
+        self,
+        job_id: str,
+        failed_datacenters: tuple[str, ...],
+        reason: str,
+    ) -> None:
+        """Terminal hook for coordinator-side FAILED transitions."""
+        job = self._job_manager.get_job(job_id)
+        await self._finalize_terminal_job(
+            job_id,
+            final_status=JobStatus.FAILED.value,
+            total_completed=getattr(job, "total_completed", 0),
+            total_failed=getattr(job, "total_failed", 0),
+            elapsed_seconds=getattr(job, "elapsed_seconds", 0.0),
+            reason=reason,
+            failed_datacenters=failed_datacenters,
+        )
+
+    async def _replicate_terminal_status(self, job_id: str) -> None:
+        """Re-commit the job's replica to peer gates with its terminal status.
+
+        Peers learned the job through the committed replica and never
+        heard it end: their copy stayed SUBMITTED forever, so their
+        cleanup sweep (terminal jobs only) never removed it and its Raft
+        group never retired. The replica protocol orders updates by
+        ``sequence``, so the terminal status goes out one sequence above
+        the committed replica, reusing the protocol that created it.
+        """
+        if self._replication_coordinator is None:
+            return
+        committed = self._replication_coordinator.get_committed_replica(job_id)
+        job = self._job_manager.get_job(job_id)
+        if committed is None or job is None or committed.status_seed == job.status:
+            return
+
+        replicated = await self._replication_coordinator.replicate_with_quorum(
+            replica=dataclasses.replace(
+                committed,
+                sequence=committed.sequence + 1,
+                status_seed=job.status,
+            ),
+            peer_addrs=list(self._modular_state.get_active_peers_list()),
+            quorum_size=self._quorum_size(),
+        )
+        if not replicated:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Terminal status {job.status} for job {job_id[:8]}... "
+                        "did not reach a quorum of peer gates"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
             )
 
     async def _record_job_terminal_durable(
@@ -2676,36 +2816,138 @@ class GateServer(HealthAwareServer):
             return
 
         duration_ms = int(elapsed_seconds * 1000)
+        durability = await self._ledger_target_durability()
         if final_status in (JobStatus.TIMEOUT.value, "timed_out"):
-            await self._job_ledger.time_out_job(
+            await self._log_ledger_shortfall(
+                "JobTimedOut",
                 job_id,
-                timeout_type=reason or final_status,
-                total_completed=total_completed,
-                total_failed=total_failed,
-                duration_ms=duration_ms,
-                durability=DurabilityLevel.LOCAL,
+                await self._job_ledger.time_out_job(
+                    job_id,
+                    timeout_type=reason or final_status,
+                    total_completed=total_completed,
+                    total_failed=total_failed,
+                    duration_ms=duration_ms,
+                    durability=durability,
+                ),
             )
             return
 
         if final_status == JobStatus.FAILED.value:
-            await self._job_ledger.fail_job(
+            await self._log_ledger_shortfall(
+                "JobFailed",
                 job_id,
-                error_message=reason or "job failed",
-                failed_datacenter=",".join(failed_datacenters),
-                total_completed=total_completed,
-                total_failed=total_failed,
-                duration_ms=duration_ms,
-                durability=DurabilityLevel.LOCAL,
+                await self._job_ledger.fail_job(
+                    job_id,
+                    error_message=reason or "job failed",
+                    failed_datacenter=",".join(failed_datacenters),
+                    total_completed=total_completed,
+                    total_failed=total_failed,
+                    duration_ms=duration_ms,
+                    durability=durability,
+                ),
             )
             return
 
-        await self._job_ledger.complete_job(
+        await self._log_ledger_shortfall(
+            "JobCompleted",
             job_id,
-            final_status=final_status,
-            total_completed=total_completed,
-            total_failed=total_failed,
-            duration_ms=duration_ms,
-            durability=DurabilityLevel.LOCAL,
+            await self._job_ledger.complete_job(
+                job_id,
+                final_status=final_status,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                duration_ms=duration_ms,
+                durability=durability,
+            ),
+        )
+
+    async def _replicate_ledger_regional(self, entry: WALEntry) -> bool:
+        """Ledger REGIONAL replicator: commit in the job's gate group."""
+        if self._ledger_replicator is None:
+            return False
+        return await self._ledger_replicator.replicate(entry)
+
+    async def _replicate_ledger_global(self, entry: WALEntry) -> bool:
+        """Ledger GLOBAL replicator: holders span two regions."""
+        if self._ledger_region_span is None:
+            return False
+        return await self._ledger_region_span.replicate(entry)
+
+    async def _ledger_target_durability(self) -> DurabilityLevel:
+        """AD-38 level for the gate's job records: GLOBAL where the gate
+        tier spans two or more regions, else REGIONAL (GLOBAL cannot be
+        met by a single-region tier). Logs each change of that answer
+        once rather than one shortfall per job."""
+        spans_regions = (
+            self._ledger_region_span is not None
+            and self._ledger_region_span.tier_spans_regions()
+        )
+        if spans_regions != self._ledger_tier_spans_regions:
+            self._ledger_tier_spans_regions = spans_regions
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        "Gate ledger records are GLOBAL: the gate tier spans "
+                        f"regions {sorted(self._gate_tier_regions())}"
+                        if spans_regions
+                        else "Gate ledger records are REGIONAL: GLOBAL needs gates "
+                        f"in two regions, the tier spans {sorted(self._gate_tier_regions())}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        return DurabilityLevel.GLOBAL if spans_regions else DurabilityLevel.REGIONAL
+
+    def _gate_region_of(self, gate_id: str) -> str | None:
+        """Region (datacenter identity) of a gate by its full node id."""
+        if gate_id == self._node_id.full:
+            return self._node_id.datacenter
+        gate_info = self._modular_state.get_known_gate(gate_id)
+        return gate_info.datacenter if gate_info is not None else None
+
+    def _gate_tier_regions(self) -> set[str]:
+        """Regions this gate knows the gate tier to span (itself included)."""
+        return {self._node_id.datacenter} | {
+            gate_info.datacenter for _, gate_info in self._modular_state.iter_known_gates()
+        }
+
+    async def _send_to_gate_peer(
+        self,
+        addr: tuple[str, int],
+        method: str,
+        data: bytes,
+        timeout: float,
+    ) -> bytes | Exception | None:
+        """send_tcp returning only the reply (or the transport error)."""
+        response, _clock = await self.send_tcp(addr, method, data, timeout=timeout)
+        return response
+
+    async def _log_ledger_shortfall(
+        self,
+        event_name: str,
+        job_id: str,
+        result: CommitResult | None,
+    ) -> None:
+        """Log a job-ledger record that fell short of its requested level.
+
+        The record is durable here and applied either way (the ledger's
+        apply contract); ``None`` means the ledger appended nothing
+        (unknown or already terminal job), which is not a shortfall.
+        """
+        if result is None or result.success:
+            return
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Gate job ledger {event_name} for {job_id[:8]}... is "
+                    f"{result.level_achieved.name}-durable only: {result.error}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
         )
 
     async def _recover_durable_jobs(self) -> None:
@@ -2875,7 +3117,7 @@ class GateServer(HealthAwareServer):
                 None,
             )
 
-            await self._record_job_terminal_durable(
+            await self._finalize_terminal_job(
                 job_id,
                 final_status=global_result.status,
                 total_completed=global_result.total_completed,
@@ -3069,7 +3311,7 @@ class GateServer(HealthAwareServer):
 
             self._job_manager.set_job(job_id, job)
 
-        await self._record_job_terminal_durable(
+        await self._finalize_terminal_job(
             job_id,
             final_status=JobStatus.TIMEOUT.value,
             total_completed=getattr(job, "total_completed", 0),
@@ -3716,10 +3958,19 @@ class GateServer(HealthAwareServer):
             metadata=replica.target_dc_count,
         )
 
+        # Every gate (leader and peers) runs this at commit, so this is
+        # where each joins the job's Raft group -- and leaves it once the
+        # replicated status is terminal (no ledger entries follow it).
+        if JobStatusOrder().is_terminal(replica.status_seed):
+            await self._raft.consensus.destroy_job_raft(replica.job_id)
+        else:
+            await self._raft.consensus.create_job_raft(replica.job_id)
+
         await self._modular_state.increment_state_version()
 
     async def _drop_committed_replica(self, job_id: str) -> None:
         """Remove all replicated state for ``job_id`` (failed-commit cleanup)."""
+        await self._raft.consensus.destroy_job_raft(job_id)
         self._job_manager.delete_job(job_id)
         self._modular_state._job_workflow_ids.pop(job_id, None)
         self._modular_state._job_submissions.pop(job_id, None)
@@ -3835,6 +4086,7 @@ class GateServer(HealthAwareServer):
         if not committed:
             return None
 
+        await self._adopt_replicated_ledger_history(job_id)
         self._task_runner.run(
             self._notify_managers_gate_job_leader_transfer,
             job_id,
@@ -3843,6 +4095,46 @@ class GateServer(HealthAwareServer):
             target_dcs,
         )
         return next_fence_token
+
+    async def _adopt_replicated_ledger_history(self, job_id: str) -> None:
+        """AD-38: take over the job's ledger record along with the job.
+
+        The previous leader gate's ledger held the job; this gate mirrored
+        its replicated entries through the job's gate group. Without
+        adopting them this ledger does not know the job, and its terminal
+        would append nothing anywhere.
+        """
+        if self._job_ledger is None:
+            return
+
+        if self._ledger_replica.job_state(job_id) is None:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Taking over job {job_id[:8]}... with no replicated "
+                        "JobCreated; its ledger record cannot be adopted"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        adopted = await self._job_ledger.adopt_replicated_history(
+            job_id, self._ledger_replica.history(job_id)
+        )
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    f"Adopted {adopted} replicated ledger events for taken-over "
+                    f"job {job_id[:8]}..."
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     async def _notify_managers_gate_job_leader_transfer(
         self,
@@ -6498,16 +6790,14 @@ class GateServer(HealthAwareServer):
                 await self.handle_exception(error, "lease_cleanup_loop")
 
     def _get_expired_terminal_jobs(self, now: float) -> list[str]:
-        terminal_states = {
-            JobStatus.COMPLETED.value,
-            JobStatus.FAILED.value,
-            JobStatus.CANCELLED.value,
-            JobStatus.TIMEOUT.value,
-        }
+        # Shared terminal predicate: it also knows the gate timeout
+        # tracker's ``timed_out`` spelling, which a hand-written set of
+        # the four enum values missed.
+        status_order = JobStatusOrder()
 
         jobs_to_remove = []
         for job_id, job in list(self._job_manager.items()):
-            if job.status not in terminal_states:
+            if not status_order.is_terminal(job.status):
                 continue
             age = now - getattr(job, "timestamp", now)
             if age > self._job_max_age:
@@ -6523,6 +6813,7 @@ class GateServer(HealthAwareServer):
                 task.cancel()
 
     async def _cleanup_single_job(self, job_id: str) -> None:
+        await self._raft.consensus.destroy_job_raft(job_id)
         self._job_manager.delete_job(job_id)
         workflow_timeout_tokens: dict[str, str] | None = None
         async with self._workflow_dc_results_lock:
@@ -7027,6 +7318,32 @@ class GateServer(HealthAwareServer):
         if self._raft is not None:
             await self._raft.handle_request_vote_response(data)
         return b""
+
+    @tcp.receive()
+    async def gate_raft_ledger_proposal(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Propose a peer's forwarded AD-38 ledger entry (if Raft leader)."""
+        if self._ledger_replicator is None:
+            return b""
+        result = await self._ledger_replicator.handle_forwarded(LedgerProposal.load(data))
+        return result.dump()
+
+    @tcp.receive()
+    async def gate_raft_ledger_placement(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Answer which gates hold a ledger entry (AD-38 GLOBAL check)."""
+        if self._ledger_region_span is None:
+            return b""
+        result = await self._ledger_region_span.handle_query(LedgerPlacementQuery.load(data))
+        return result.dump()
 
     @tcp.receive()
     async def gate_raft_append_entries(

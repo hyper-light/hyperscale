@@ -12,6 +12,8 @@ from typing import Any
 
 from hyperscale.distributed.models import GlobalJobStatus, JobFinalResult, JobSubmission, WorkflowResultPush
 
+from hyperscale.distributed.ledger.events.event_type import JobEventType
+
 from .gate_command_types import GateRaftCommandType
 
 
@@ -74,3 +76,21 @@ class GateRaftCommand:
     event_type: str | None = None
     node_id: str | None = None
     node_addr: tuple[str, int] | None = None
+
+    # AD-38 ledger replication (ledger_append): the WAL entry's event
+    ledger_event_type: JobEventType | None = None
+    ledger_payload: bytes | None = None
+
+
+def gate_ledger_append_command(
+    job_id: str,
+    event_type: JobEventType,
+    payload: bytes,
+) -> GateRaftCommand:
+    """A gate group's LEDGER_APPEND for one job-ledger WAL entry."""
+    return GateRaftCommand(
+        command_type=GateRaftCommandType.LEDGER_APPEND,
+        job_id=job_id,
+        ledger_event_type=event_type,
+        ledger_payload=payload,
+    )

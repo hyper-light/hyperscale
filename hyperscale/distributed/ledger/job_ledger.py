@@ -49,7 +49,12 @@ from .unsatisfiable_durability_error import UnsatisfiableDurabilityError
 from .job_state import JobState
 from .wal.node_wal import NodeWAL, WALAppendResult
 from .wal.wal_entry import WALEntry
-from .pipeline.commit_pipeline import CommitPipeline, CommitResult
+from .pipeline.commit_pipeline import (
+    GLOBAL_TIMEOUT_SECONDS,
+    REGIONAL_TIMEOUT_SECONDS,
+    CommitPipeline,
+    CommitResult,
+)
 from .checkpoint.checkpoint import Checkpoint, CheckpointManager
 
 DEFAULT_COMPLETED_CACHE_SIZE = 10000
@@ -208,6 +213,8 @@ class JobLedger:
         node_id: int,
         regional_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
         global_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
+        regional_timeout_seconds: float = REGIONAL_TIMEOUT_SECONDS,
+        global_timeout_seconds: float = GLOBAL_TIMEOUT_SECONDS,
         completed_cache_size: int = DEFAULT_COMPLETED_CACHE_SIZE,
         logger: Logger | None = None,
         clock: HybridLamportClock | None = None,
@@ -231,6 +238,8 @@ class JobLedger:
             wal=wal,
             regional_replicator=regional_replicator,
             global_replicator=global_replicator,
+            regional_timeout=regional_timeout_seconds,
+            global_timeout=global_timeout_seconds,
             logger=logger,
         )
 

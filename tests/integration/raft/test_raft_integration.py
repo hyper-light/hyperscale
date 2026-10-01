@@ -100,6 +100,9 @@ def gate_integration(
     mock_send_tcp,
 ):
     return GateRaftIntegration(
+        ledger_replica=JobLedgerReplica(),
+        cluster_size=lambda: 3,
+        proposal_timeout_seconds=5.0,
         node_id="node-1",
         job_manager=mock_gate_job_manager,
         leadership_tracker=leadership_tracker,
@@ -536,6 +539,9 @@ class TestGateRaftLeaderCallbacks:
         """on_job_raft_leader callback is forwarded to GateRaftConsensus."""
         callback = MagicMock()
         integration = GateRaftIntegration(
+            ledger_replica=JobLedgerReplica(),
+            cluster_size=lambda: 3,
+            proposal_timeout_seconds=5.0,
             node_id="gate-1",
             job_manager=mock_gate_job_manager,
             leadership_tracker=leadership_tracker,
@@ -559,6 +565,9 @@ class TestGateRaftLeaderCallbacks:
         """on_job_raft_lose_leader callback is forwarded to GateRaftConsensus."""
         callback = MagicMock()
         integration = GateRaftIntegration(
+            ledger_replica=JobLedgerReplica(),
+            cluster_size=lambda: 3,
+            proposal_timeout_seconds=5.0,
             node_id="gate-1",
             job_manager=mock_gate_job_manager,
             leadership_tracker=leadership_tracker,
@@ -587,6 +596,9 @@ class TestGateRaftLeaderCallbacks:
             invoked_jobs.append(job_id)
 
         integration = GateRaftIntegration(
+            ledger_replica=JobLedgerReplica(),
+            cluster_size=lambda: 3,
+            proposal_timeout_seconds=5.0,
             node_id="gate-1",
             job_manager=mock_gate_job_manager,
             leadership_tracker=leadership_tracker,

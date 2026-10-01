@@ -16,6 +16,11 @@ from hyperscale.distributed.runtime import Clock, RealClock
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
+# Bounds on each replication stage (AD-38 latency targets: REGIONAL
+# 2-10ms, GLOBAL 50-300ms, with headroom for a leader election).
+REGIONAL_TIMEOUT_SECONDS = 10.0
+GLOBAL_TIMEOUT_SECONDS = 300.0
+
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
 
@@ -88,8 +93,8 @@ class CommitPipeline:
         wal: NodeWAL,
         regional_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
         global_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
-        regional_timeout: float = 10.0,
-        global_timeout: float = 300.0,
+        regional_timeout: float = REGIONAL_TIMEOUT_SECONDS,
+        global_timeout: float = GLOBAL_TIMEOUT_SECONDS,
         logger: Logger | None = None,
     ) -> None:
         self._wal = wal

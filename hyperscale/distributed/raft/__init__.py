@@ -9,6 +9,7 @@ from .gate_raft_consensus import GateRaftConsensus
 from .gate_raft_job_manager import GateRaftJobManager
 from .gate_state_machine import GateStateMachine
 from .raft_consensus import RaftConsensus
+from .ledger_replicator import LedgerReplicator
 from .raft_job_manager import RaftJobManager
 from .raft_log import RaftLog
 from .raft_node import RaftNode
@@ -25,6 +26,7 @@ __all__ = [
     "GateStateMachine",
     "InstallSnapshot",
     "InstallSnapshotResponse",
+    "LedgerReplicator",
     "RaftConsensus",
     "RaftJobManager",
     "RaftLog",

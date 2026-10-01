@@ -60,5 +60,8 @@ class GateRaftCommandType(str, Enum):
     # Membership events (1 method)
     GATE_MEMBERSHIP_EVENT = "gate_membership_event"
 
+    # AD-38: one job-ledger WAL entry replicated to the job's gate group
+    LEDGER_APPEND = "ledger_append"
+
     # Raft control
     NO_OP = "no_op"

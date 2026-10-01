@@ -23,6 +23,7 @@ from .models.gate_commands import GateRaftCommand
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.gates.gate_job_manager import GateJobManager
     from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
+    from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.logging import Logger
 
@@ -40,6 +41,7 @@ class GateStateMachine:
         "_job_manager",
         "_leadership_tracker",
         "_gate_state",
+        "_ledger_replica",
         "_logger",
         "_node_id",
         "_handlers",
@@ -52,10 +54,13 @@ class GateStateMachine:
         gate_state: "GateRuntimeState",
         logger: "Logger",
         node_id: str,
+        *,
+        ledger_replica: "JobLedgerReplica",
     ) -> None:
         self._job_manager = job_manager
         self._leadership_tracker = leadership_tracker
         self._gate_state = gate_state
+        self._ledger_replica = ledger_replica
         self._logger = logger
         self._node_id = node_id
         self._handlers: dict[str, object] = {
@@ -80,6 +85,7 @@ class GateStateMachine:
             GateRaftCommandType.SET_WORKFLOW_DC_RESULT: self._apply_set_workflow_dc_result,
             GateRaftCommandType.GATE_MEMBERSHIP_EVENT: self._apply_gate_membership_event,
             GateRaftCommandType.NO_OP: self._apply_no_op,
+            GateRaftCommandType.LEDGER_APPEND: self._apply_ledger_append,
         }
 
     async def apply(self, entry: RaftLogEntry) -> None:
@@ -100,20 +106,21 @@ class GateStateMachine:
             ))
             return
 
-        command = self._deserialize(entry)
+        command = await self._deserialize(entry)
         if command is None:
             return
 
         await handler(command, entry)
 
-    def _deserialize(self, entry: RaftLogEntry) -> GateRaftCommand | None:
+    async def _deserialize(self, entry: RaftLogEntry) -> GateRaftCommand | None:
         """Deserialize command bytes. Returns None on failure."""
         if not entry.command:
             return None
         try:
             return cloudpickle.loads(entry.command)
         except Exception as error:
-            self._logger.log(RaftError(
+            # Awaited: this log call was never awaited, dropping the error.
+            await self._logger.log(RaftError(
                 message=f"Failed to deserialize gate command: {error}",
                 node_id=self._node_id,
                 job_id=entry.job_id,
@@ -314,6 +321,32 @@ class GateStateMachine:
     # =========================================================================
     # Raft Control
     # =========================================================================
+
+    async def _apply_ledger_append(self, command: GateRaftCommand, entry: RaftLogEntry) -> None:
+        """Apply LEDGER_APPEND: mirror one committed job-ledger event.
+
+        Logged and skipped when unreplayable rather than raised: the Raft
+        log is immutable, and an exception would stop the tick loop that
+        drives every job's group.
+        """
+        try:
+            self._ledger_replica.apply(
+                entry.job_id, command.ledger_event_type, command.ledger_payload
+            )
+        except Exception as error:
+            await self._logger.log(RaftError(
+                message=(
+                    f"Unreplayable ledger entry {entry.index} "
+                    f"({command.ledger_event_type}): {error!r}"
+                ),
+                node_id=self._node_id,
+                job_id=entry.job_id,
+                term=entry.term,
+            ))
+
+    def release_job(self, job_id: str) -> None:
+        """Drop per-job state held for ``job_id``'s (destroyed) group."""
+        self._ledger_replica.release(job_id)
 
     async def _apply_no_op(self, command: GateRaftCommand, entry: RaftLogEntry) -> None:
         """Apply NO_OP: no state change. Used for leadership confirmation."""

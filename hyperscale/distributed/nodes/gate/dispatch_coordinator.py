@@ -112,7 +112,12 @@ class GateDispatchCoordinator:
         persist_accepted_job=None,
         *,
         manager_selector: DatacenterManagerSelector,
+        finalize_failed_job: Callable[[str, tuple[str, ...], str], Awaitable[None]],
     ) -> None:
+        # Every terminal transition goes through the gate's terminal hook:
+        # the AD-38 terminal record (these two FAILED paths never wrote
+        # one) and the terminal status replicated to peer gates.
+        self._finalize_failed_job = finalize_failed_job
         self._manager_dispatch_timeout_seconds: float = (
             manager_dispatch_timeout_seconds
         )
@@ -644,6 +649,11 @@ class GateDispatchCoordinator:
             job.failed_datacenters = len(target_dcs)
             self._job_manager.set_job(submission.job_id, job)
             self._quorum_circuit.record_error()
+            await self._finalize_failed_job(
+                submission.job_id,
+                tuple(sorted(target_dcs)),
+                "every target datacenter is unhealthy",
+            )
 
             if self._record_dispatch_failure:
                 for datacenter_id in target_dcs:
@@ -699,6 +709,11 @@ class GateDispatchCoordinator:
             job.status = JobStatus.FAILED.value
             job.failed_datacenters = len(failed_dcs)
             self._job_manager.set_job(submission.job_id, job)
+            await self._finalize_failed_job(
+                submission.job_id,
+                tuple(sorted(failed_dcs)),
+                "failed to dispatch to any datacenter",
+            )
             self._task_runner.run(
                 self._logger.log,
                 ServerError(

@@ -578,6 +578,31 @@ class RaftNode:
         else:
             self._next_index[response.follower_id] = max(1, current - 1)
 
+    def last_index_where(self, matches: Callable[[RaftLogEntry], bool]) -> int | None:
+        """Newest log index whose entry satisfies ``matches`` (None if none).
+
+        Scans newest-first: per-job logs are short, and callers look for
+        an entry they appended recently.
+        """
+        for index in range(self._log.last_index(), self._log.snapshot_index, -1):
+            if (entry := self._log.get(index)) is not None and matches(entry):
+                return index
+        return None
+
+    def members_holding(self, index: int) -> set[str] | None:
+        """Members known to hold log ``index`` (leader only; None otherwise).
+
+        The leader always holds its own entries; a follower counts once
+        its acknowledged match index reaches ``index``. This is what a
+        placement rule beyond a bare majority (e.g. AD-38 GLOBAL: copies
+        in more than one region) is judged against.
+        """
+        if self._destroyed or self._role != "leader" or index > self._log.last_index():
+            return None
+        return {self._node_id} | {
+            member for member, match in self._match_index.items() if match >= index
+        }
+
     def _advance_commit_index(self) -> None:
         """Advance commit_index to highest index replicated on a majority (Section 5.3/5.4)."""
         for candidate_index in range(self._log.last_index(), self._commit_index, -1):

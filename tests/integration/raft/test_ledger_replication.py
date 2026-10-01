@@ -1,5 +1,5 @@
 """
-AD-38 REGIONAL: ManagerLedgerReplicator committing job-ledger entries
+AD-38 REGIONAL: LedgerReplicator committing job-ledger entries
 through the job's per-job Raft group.
 
 Pinned against real ManagerRaftIntegrations (real RaftNodes, outbox and
@@ -22,7 +22,8 @@ from hyperscale.distributed.ledger.events.job_event import JobCreated
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.ledger.wal.entry_state import WALEntryState
 from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
-from hyperscale.distributed.nodes.manager.ledger_replicator import ManagerLedgerReplicator
+from hyperscale.distributed.raft import LedgerReplicator
+from hyperscale.distributed.raft.models.commands import ledger_append_command
 from hyperscale.distributed.nodes.manager.raft_integration import ManagerRaftIntegration
 from hyperscale.distributed.raft.models import LedgerProposal
 from hyperscale.distributed.raft.raft_node import ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
@@ -51,7 +52,7 @@ class LedgerCluster:
         self.forwarded: list[tuple[str, int]] = []
         self.replicas = {addr: JobLedgerReplica() for addr in self.addresses}
         self.integrations: dict[tuple[str, int], ManagerRaftIntegration] = {}
-        self.replicators: dict[tuple[str, int], ManagerLedgerReplicator] = {}
+        self.replicators: dict[tuple[str, int], LedgerReplicator] = {}
         logger = MagicMock()
         logger.log = AsyncMock()
         for addr in self.addresses:
@@ -66,10 +67,12 @@ class LedgerCluster:
                 node_addr=addr,
                 configured_cluster_size=len(self.addresses),
             )
-            self.replicators[addr] = ManagerLedgerReplicator(
+            self.replicators[addr] = LedgerReplicator(
                 consensus=self.integrations[addr].consensus,
+                build_command=ledger_append_command,
                 node_id=_member_id(addr),
                 send_tcp=self._send_tcp,
+                forward_method="raft_ledger_proposal",
                 forward_timeout_seconds=LIVENESS_CEILING_SECONDS,
                 clock=RealClock(),
                 logger=logger,

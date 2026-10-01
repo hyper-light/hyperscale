@@ -85,3 +85,17 @@ class RaftCommand:
     ledger_event_type: JobEventType | None = None
     ledger_payload: bytes | None = None
     node_addr: tuple[str, int] | None = None
+
+
+def ledger_append_command(
+    job_id: str,
+    event_type: JobEventType,
+    payload: bytes,
+) -> RaftCommand:
+    """A manager group's LEDGER_APPEND for one job-ledger WAL entry."""
+    return RaftCommand(
+        command_type=RaftCommandType.LEDGER_APPEND,
+        job_id=job_id,
+        ledger_event_type=event_type,
+        ledger_payload=payload,
+    )

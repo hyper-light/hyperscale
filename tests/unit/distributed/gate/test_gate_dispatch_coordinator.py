@@ -204,6 +204,7 @@ class TestCheckRateAndLoadHappyPath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -246,6 +247,7 @@ class TestCheckRateAndLoadNegativePath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -286,6 +288,7 @@ class TestCheckRateAndLoadNegativePath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -334,6 +337,7 @@ class TestCheckProtocolVersionHappyPath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -379,6 +383,7 @@ class TestCheckProtocolVersionNegativePath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -431,6 +436,7 @@ class TestCheckCircuitAndQuorumHappyPath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -472,6 +478,7 @@ class TestCheckCircuitAndQuorumNegativePath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -513,6 +520,7 @@ class TestCheckCircuitAndQuorumNegativePath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -565,6 +573,7 @@ class TestSubmitJobHappyPath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -615,6 +624,7 @@ class TestSubmitJobNegativePath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -655,6 +665,7 @@ class TestSubmitJobNegativePath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -695,6 +706,7 @@ class TestSubmitJobNegativePath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -749,6 +761,7 @@ class TestSetupJobTrackingHappyPath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -794,6 +807,7 @@ class TestSetupJobTrackingHappyPath:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -845,6 +859,7 @@ class TestConcurrency:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -900,6 +915,7 @@ class TestEdgeCases:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -945,6 +961,7 @@ class TestEdgeCases:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -987,6 +1004,7 @@ class TestEdgeCases:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),
@@ -1025,6 +1043,7 @@ class TestEdgeCases:
         coordinator = GateDispatchCoordinator(
             state=state,
             manager_selector=make_manager_selector(state),
+            finalize_failed_job=AsyncMock(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_timeout_tracker=MagicMock(),

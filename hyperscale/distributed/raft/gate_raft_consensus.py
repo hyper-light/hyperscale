@@ -25,6 +25,7 @@ _DEFAULT_CLOCK: Clock = RealClock()
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.gates.gate_job_manager import GateJobManager
     from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
+    from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
@@ -51,6 +52,8 @@ class GateRaftConsensus:
         "_member_addrs",
         "_nodes",
         "_max_instances",
+        "_cluster_size",
+        "_proposal_timeout_seconds",
         "_tick_running",
         "_on_become_leader",
         "_on_lose_leadership",
@@ -69,11 +72,16 @@ class GateRaftConsensus:
         on_become_leader: Callable[[str], None] | None = None,
         on_lose_leadership: Callable[[str], None] | None = None,
         clock: "HybridLamportClock | None" = None,
+        *,
+        ledger_replica: "JobLedgerReplica",
+        cluster_size: Callable[[], int],
+        proposal_timeout_seconds: float,
     ) -> None:
         self._node_id = node_id
         self._job_manager = job_manager
         self._state_machine = GateStateMachine(
             job_manager, leadership_tracker, gate_state, logger, node_id,
+            ledger_replica=ledger_replica,
         )
         self._logger = logger
         self._task_runner = task_runner
@@ -84,6 +92,12 @@ class GateRaftConsensus:
         self._member_addrs: dict[str, tuple[str, int]] = {}
         self._nodes: dict[str, RaftNode] = {}
         self._max_instances = max_instances
+        # The gate tier's static cohort at group creation. Fixing each
+        # group's quorum from whichever peers happened to be known (the
+        # RaftNode default) let an early group run on too small a
+        # majority -- two disjoint majorities, two leaders.
+        self._cluster_size = cluster_size
+        self._proposal_timeout_seconds = proposal_timeout_seconds
         self._tick_running = False
 
         self._on_become_leader = on_become_leader
@@ -168,6 +182,8 @@ class GateRaftConsensus:
             on_lose_leadership=self._make_lose_leadership_callback(job_id),
             logger=self._logger,
             clock=self._clock,
+            configured_cluster_size=self._cluster_size(),
+            proposal_timeout_seconds=self._proposal_timeout_seconds,
         )
         self._nodes[job_id] = node
 
@@ -184,6 +200,7 @@ class GateRaftConsensus:
         if node is None:
             return
         node.destroy()
+        self._state_machine.release_job(job_id)
 
         await self._logger.log(RaftInfo(
             message=f"Destroyed gate Raft instance for job {job_id}",

@@ -1,38 +1,50 @@
 """
-AD-38 REGIONAL replication of a manager's job ledger through per-job Raft.
+AD-38 replication of a node's job ledger through the job's per-job Raft group.
 """
 
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 import msgspec
 
 from hyperscale.distributed.ledger.events.event_type import JobEventType
-from hyperscale.distributed.raft.logging_models import RaftDebug
-from hyperscale.distributed.raft.models import (
-    LedgerProposal,
-    LedgerProposalResult,
-    RaftCommandType,
-)
-from hyperscale.distributed.raft.models.commands import RaftCommand
-from hyperscale.distributed.raft.raft_node import HEARTBEAT_INTERVAL
+
+from .logging_models import RaftDebug
+from .models import LedgerProposal, LedgerProposalResult
+from .raft_node import HEARTBEAT_INTERVAL, RaftNode
 
 if TYPE_CHECKING:
     from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
-    from hyperscale.distributed.raft import RaftConsensus
     from hyperscale.distributed.runtime import Clock
     from hyperscale.logging import Logger
 
 
-class ManagerLedgerReplicator:
-    """Makes a job-ledger WAL entry REGIONAL by committing it in the job's group.
+LedgerCommand = TypeVar("LedgerCommand")
 
-    REGIONAL means a majority of the datacenter's managers hold the entry:
-    exactly a Raft commit in the job's per-job group, whose members mirror
-    committed entries into their ``JobLedgerReplica``. Only the group's
-    Raft leader can append, and that member need not be the job's leader
-    (AD-31 job leadership is SWIM-coordinated), so a non-leader forwards
-    the entry to the group's leader.
+
+class JobGroupConsensus(Protocol[LedgerCommand]):
+    """The per-job group operations replication needs (manager and gate
+    consensus coordinators both provide them)."""
+
+    async def create_job_raft(self, job_id: str) -> bool: ...
+
+    def get_node(self, job_id: str) -> RaftNode | None: ...
+
+    async def propose_command(self, job_id: str, command: LedgerCommand) -> tuple[bool, int]: ...
+
+    def member_address(self, node_id: str) -> tuple[str, int] | None: ...
+
+
+class LedgerReplicator(Generic[LedgerCommand]):
+    """Commits a job-ledger WAL entry in the job's per-job Raft group.
+
+    A commit means a majority of the group's members hold the entry, and
+    every member mirrors committed entries into its ``JobLedgerReplica``.
+    For a manager that is AD-38 REGIONAL (the datacenter's managers); for
+    a gate it is the gate tier's majority. Only the group's Raft leader
+    can append, and that member need not be the job's leader (job
+    leadership is SWIM-coordinated), so a non-leader forwards the entry
+    to the group's leader over ``forward_method``.
 
     Retries until committed: an attempt can fail without an answer (no
     leader yet, leader lost, transport timeout after the leader appended),
@@ -45,8 +57,10 @@ class ManagerLedgerReplicator:
 
     __slots__ = (
         "_consensus",
+        "_build_command",
         "_node_id",
         "_send_tcp",
+        "_forward_method",
         "_forward_timeout_seconds",
         "_clock",
         "_logger",
@@ -54,16 +68,20 @@ class ManagerLedgerReplicator:
 
     def __init__(
         self,
-        consensus: "RaftConsensus",
+        consensus: JobGroupConsensus[LedgerCommand],
+        build_command: Callable[[str, JobEventType, bytes], LedgerCommand],
         node_id: str,
         send_tcp: Callable[..., Awaitable[bytes | Exception | None]],
+        forward_method: str,
         forward_timeout_seconds: float,
         clock: "Clock",
         logger: "Logger",
     ) -> None:
         self._consensus = consensus
+        self._build_command = build_command
         self._node_id = node_id
         self._send_tcp = send_tcp
+        self._forward_method = forward_method
         self._forward_timeout_seconds = forward_timeout_seconds
         self._clock = clock
         self._logger = logger
@@ -91,7 +109,7 @@ class ManagerLedgerReplicator:
 
         committed, index = await self._consensus.propose_command(
             proposal.job_id,
-            _ledger_command(
+            self._build_command(
                 proposal.job_id, JobEventType(proposal.event_type), proposal.payload
             ),
         )
@@ -120,7 +138,7 @@ class ManagerLedgerReplicator:
     async def _propose_via(self, leader_id: str, job_id: str, entry: "WALEntry") -> bool:
         if leader_id == self._node_id:
             committed, _ = await self._consensus.propose_command(
-                job_id, _ledger_command(job_id, entry.event_type, entry.payload)
+                job_id, self._build_command(job_id, entry.event_type, entry.payload)
             )
             return committed
 
@@ -129,7 +147,7 @@ class ManagerLedgerReplicator:
 
         response = await self._send_tcp(
             leader_addr,
-            "raft_ledger_proposal",
+            self._forward_method,
             LedgerProposal(
                 job_id=job_id,
                 event_type=int(entry.event_type),
@@ -152,17 +170,9 @@ class ManagerLedgerReplicator:
     async def _log_attempt(self, job_id: str, outcome: str) -> None:
         await self._logger.log(
             RaftDebug(
-                message=f"Ledger REGIONAL attempt not committed: {outcome}; retrying",
+                message=f"Ledger replication attempt not committed: {outcome}; retrying",
                 node_id=self._node_id,
                 job_id=job_id,
             )
         )
 
-
-def _ledger_command(job_id: str, event_type: JobEventType, payload: bytes) -> RaftCommand:
-    return RaftCommand(
-        command_type=RaftCommandType.LEDGER_APPEND,
-        job_id=job_id,
-        ledger_event_type=event_type,
-        ledger_payload=payload,
-    )

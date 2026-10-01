@@ -162,7 +162,9 @@ from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.ledger.pipeline.commit_pipeline import CommitResult
+from hyperscale.distributed.raft import LedgerReplicator
 from hyperscale.distributed.raft.models import LedgerProposal
+from hyperscale.distributed.raft.models.commands import ledger_append_command
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 
@@ -199,7 +201,6 @@ from .capacity_reporter import ManagerCapacityReporter
 from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator
 from .discovery import ManagerDiscoveryCoordinator
-from .ledger_replicator import ManagerLedgerReplicator
 from .load_shedding import ManagerLoadShedder
 
 from .workflow_lifecycle import ManagerWorkflowLifecycle
@@ -551,10 +552,12 @@ class ManagerServer(HealthAwareServer):
         )
         # A forwarded proposal waits out the group leader's proposal
         # timeout, plus one short transit for the request and its reply.
-        self._ledger_replicator = ManagerLedgerReplicator(
+        self._ledger_replicator = LedgerReplicator(
             consensus=self._raft.consensus,
+            build_command=ledger_append_command,
             node_id=self._node_id.full,
             send_tcp=self._send_to_peer,
+            forward_method="raft_ledger_proposal",
             forward_timeout_seconds=(
                 self._config.quorum_timeout_seconds
                 + self._config.tcp_timeout_short_seconds

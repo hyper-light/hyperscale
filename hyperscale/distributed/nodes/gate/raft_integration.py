@@ -21,6 +21,7 @@ from hyperscale.distributed.raft.models import (
 )
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
     from hyperscale.distributed.jobs.gates.gate_job_manager import GateJobManager
     from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
@@ -61,6 +62,10 @@ class GateRaftIntegration:
         on_job_raft_leader: Callable[[str], None] | None = None,
         on_job_raft_lose_leader: Callable[[str], None] | None = None,
         clock: "HybridLamportClock | None" = None,
+        *,
+        ledger_replica: "JobLedgerReplica",
+        cluster_size: Callable[[], int],
+        proposal_timeout_seconds: float,
     ) -> None:
         self._node_id = node_id
         self._logger = logger
@@ -83,6 +88,9 @@ class GateRaftIntegration:
             on_become_leader=on_job_raft_leader,
             on_lose_leadership=on_job_raft_lose_leader,
             clock=clock,
+            ledger_replica=ledger_replica,
+            cluster_size=cluster_size,
+            proposal_timeout_seconds=proposal_timeout_seconds,
         )
 
         self._raft_job_manager = GateRaftJobManager(

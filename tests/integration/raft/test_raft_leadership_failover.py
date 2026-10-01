@@ -265,6 +265,9 @@ class TestGateRaftLeaderTakeover:
             received_job_ids.append(job_id)
 
         integration = GateRaftIntegration(
+            ledger_replica=JobLedgerReplica(),
+            cluster_size=lambda: 3,
+            proposal_timeout_seconds=5.0,
             node_id="gate-1",
             job_manager=mock_gate_job_manager,
             leadership_tracker=leadership_tracker,
@@ -289,6 +292,9 @@ class TestGateRaftLeaderTakeover:
     ) -> None:
         """on_node_leave removes the dead gate from all gate Raft groups."""
         integration = GateRaftIntegration(
+            ledger_replica=JobLedgerReplica(),
+            cluster_size=lambda: 3,
+            proposal_timeout_seconds=5.0,
             node_id="gate-1",
             job_manager=mock_gate_job_manager,
             leadership_tracker=leadership_tracker,
@@ -319,6 +325,9 @@ class TestGateRaftLeaderTakeover:
     ) -> None:
         """Gate Raft proposals fail when not the per-job Raft leader."""
         integration = GateRaftIntegration(
+            ledger_replica=JobLedgerReplica(),
+            cluster_size=lambda: 3,
+            proposal_timeout_seconds=5.0,
             node_id="gate-1",
             job_manager=mock_gate_job_manager,
             leadership_tracker=leadership_tracker,
