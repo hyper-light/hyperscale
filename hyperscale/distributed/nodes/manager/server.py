@@ -705,6 +705,8 @@ class ManagerServer(HealthAwareServer):
             task_runner=self._task_runner,
             stats_buffer=self._stats_buffer,
             windowed_stats=self._windowed_stats,
+            clock=self._clock,
+            get_healthy_worker_count=lambda: len(self._registry.get_healthy_worker_ids()),
             send_to_callback=self._send_to_client,
         )
 
@@ -888,8 +890,8 @@ class ManagerServer(HealthAwareServer):
             get_udp_port=lambda: self._udp_port,
             get_health_accepting_jobs=self._is_accepting_jobs,
             get_health_has_quorum=self._leadership.has_quorum,
-            get_health_throughput=self._get_dispatch_throughput,
-            get_health_expected_throughput=self._get_expected_dispatch_throughput,
+            get_health_throughput=self._stats.get_dispatch_throughput,
+            get_health_expected_throughput=self._stats.get_expected_throughput,
             get_health_overload_state=self._get_manager_health_state_snapshot,
             get_current_gate_leader_id=lambda: self._manager_state.current_gate_leader_id,
             get_current_gate_leader_host=lambda: (
@@ -4571,28 +4573,6 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
-    def _get_dispatch_throughput(self) -> float:
-        """Get current dispatch throughput."""
-        current_time = self._clock.monotonic()
-        interval_start = self._manager_state.dispatch_throughput_interval_start
-        elapsed = current_time - interval_start
-
-        if elapsed <= 0 or interval_start <= 0:
-            return self._manager_state.dispatch_throughput_last_value
-
-        if elapsed >= self._config.throughput_interval_seconds:
-            return self._manager_state.dispatch_throughput_last_value
-
-        return self._manager_state.dispatch_throughput_count / elapsed
-
-    def _get_expected_dispatch_throughput(self) -> float:
-        """Get expected dispatch throughput."""
-        worker_count = len(self._registry.get_healthy_worker_ids())
-        if worker_count == 0:
-            return 0.0
-        # Assume 1 workflow per second per worker as baseline
-        return float(worker_count)
-
     def _get_known_gates_for_heartbeat(self) -> list[GateInfo]:
         """Get known gates for heartbeat embedding."""
         return self._manager_state.get_known_gate_values()
@@ -4709,8 +4689,8 @@ class ManagerServer(HealthAwareServer):
             # receiving jobs.
             health_accepting_jobs=self._is_accepting_jobs(),
             health_has_quorum=self._leadership.has_quorum(),
-            health_throughput=self._get_dispatch_throughput(),
-            health_expected_throughput=self._get_expected_dispatch_throughput(),
+            health_throughput=self._stats.get_dispatch_throughput(),
+            health_expected_throughput=self._stats.get_expected_throughput(),
             health_overload_state=self._manager_health_state_snapshot,
             # AD-19 addendum (Phase D): manager's own LHM + max worker LHM
             lhm_score=self._local_health.score,
@@ -6366,6 +6346,7 @@ class ManagerServer(HealthAwareServer):
                 ack = WorkflowDispatchAck.load(response)
                 if bool(getattr(ack, "accepted", True)):
                     await self._record_worker_dispatch_success(worker_id)
+                    await self._stats.record_dispatch()
                     return True
                 error = getattr(ack, "error", None)
                 if self._is_dispatch_readiness_rejection(error):

@@ -16,10 +16,7 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
-from hyperscale.distributed.runtime import Clock, RealClock
-
-
-_DEFAULT_CLOCK: Clock = RealClock()
+from hyperscale.distributed.runtime import Clock
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs import WindowedStatsCollector
@@ -78,6 +75,8 @@ class ManagerStatsCoordinator:
         task_runner: "TaskRunner",
         stats_buffer: StatsBuffer,
         windowed_stats: "WindowedStatsCollector",
+        clock: Clock,
+        get_healthy_worker_count: Callable[[], int],
         send_to_callback: SendFunc | None = None,
     ) -> None:
         self._state: "ManagerState" = state
@@ -86,9 +85,11 @@ class ManagerStatsCoordinator:
         self._node_id: str = node_id
         self._task_runner: "TaskRunner" = task_runner
         self._send_to_callback: SendFunc | None = send_to_callback
+        self._clock: Clock = clock
+        self._get_healthy_worker_count: Callable[[], int] = get_healthy_worker_count
 
         self._progress_state: ProgressState = ProgressState.NORMAL
-        self._progress_state_since: float = _DEFAULT_CLOCK.monotonic()
+        self._progress_state_since: float = clock.monotonic()
 
         # AD-23: Stats buffer tracking for backpressure
         self._stats_buffer: StatsBuffer = stats_buffer
@@ -96,13 +97,16 @@ class ManagerStatsCoordinator:
         self._windowed_stats: "WindowedStatsCollector" = windowed_stats
 
     async def record_dispatch(self) -> None:
-        """Record a workflow dispatch for throughput tracking."""
+        """Record a workflow dispatch a worker accepted, for throughput
+        tracking (AD-19): the manager's advertised dispatch throughput is
+        these over the current interval."""
         await self._state.increment_dispatch_throughput_count()
 
     async def refresh_dispatch_throughput(self) -> float:
         """Refresh throughput counters for the current interval."""
         return await self._state.update_dispatch_throughput(
-            self._config.throughput_interval_seconds
+            self._config.throughput_interval_seconds,
+            now=self._clock.monotonic(),
         )
 
     def get_dispatch_throughput(self) -> float:
@@ -112,7 +116,7 @@ class ManagerStatsCoordinator:
         Returns:
             Dispatches per second over the current interval
         """
-        now = _DEFAULT_CLOCK.monotonic()
+        now = self._clock.monotonic()
         interval_start = self._state._dispatch_throughput_interval_start
         interval_seconds = self._config.throughput_interval_seconds
 
@@ -127,19 +131,11 @@ class ManagerStatsCoordinator:
         return count / elapsed
 
     def get_expected_throughput(self) -> float:
-        """
-        Get expected dispatch throughput based on worker capacity.
-
-        Returns:
-            Expected dispatches per second (0.0 if no workers)
-        """
-        # Simple calculation based on healthy worker count
-        # Full implementation would consider actual capacity
-        healthy_count = len(self._state._workers) - len(
-            self._state._worker_unhealthy_since
-        )
-        # Return 0.0 if no workers (system is idle, not stuck)
-        return float(healthy_count)
+        """Expected dispatch throughput from worker capacity (AD-19): one
+        workflow per second per healthy worker -- the baseline the
+        manager has always advertised. 0.0 with no healthy workers (idle,
+        not stuck)."""
+        return float(self._get_healthy_worker_count())
 
     def get_progress_state(self) -> ProgressState:
         """
@@ -161,7 +157,7 @@ class ManagerStatsCoordinator:
             return ProgressState.NORMAL
 
         ratio = actual / expected
-        now = _DEFAULT_CLOCK.monotonic()
+        now = self._clock.monotonic()
 
         if ratio >= self._config.progress_normal_ratio:
             new_state = ProgressState.NORMAL
@@ -195,7 +191,7 @@ class ManagerStatsCoordinator:
         Returns:
             Duration in seconds
         """
-        return _DEFAULT_CLOCK.monotonic() - self._progress_state_since
+        return self._clock.monotonic() - self._progress_state_since
 
     def should_apply_backpressure(self) -> bool:
         """

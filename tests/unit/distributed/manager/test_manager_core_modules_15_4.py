@@ -20,6 +20,8 @@ Each test class validates:
 
 import asyncio
 import pytest
+
+from hyperscale.distributed.runtime import RealClock
 import time
 from unittest.mock import MagicMock, AsyncMock
 
@@ -1023,6 +1025,8 @@ class TestManagerStatsCoordinatorHappyPath:
             task_runner=mock_task_runner,
             stats_buffer=stats_buffer,
             windowed_stats=windowed_stats,
+            clock=RealClock(),
+            get_healthy_worker_count=lambda: len(manager_state._workers),
         )
 
         assert manager_state._dispatch_throughput_count == 0
@@ -1056,6 +1060,8 @@ class TestManagerStatsCoordinatorProgressState:
             task_runner=mock_task_runner,
             stats_buffer=stats_buffer,
             windowed_stats=windowed_stats,
+            clock=RealClock(),
+            get_healthy_worker_count=lambda: len(manager_state._workers),
         )
 
         # With no workers and no dispatches, should be NORMAL
@@ -1084,6 +1090,8 @@ class TestManagerStatsCoordinatorBackpressure:
             task_runner=mock_task_runner,
             stats_buffer=stats_buffer,
             windowed_stats=windowed_stats,
+            clock=RealClock(),
+            get_healthy_worker_count=lambda: len(manager_state._workers),
         )
 
         # Initially no backpressure
@@ -1119,6 +1127,8 @@ class TestManagerStatsCoordinatorBackpressure:
             task_runner=mock_task_runner,
             stats_buffer=stats_buffer,
             windowed_stats=windowed_stats,
+            clock=RealClock(),
+            get_healthy_worker_count=lambda: len(manager_state._workers),
         )
 
         assert stats.should_apply_backpressure() is False
@@ -1150,6 +1160,8 @@ class TestManagerStatsCoordinatorMetrics:
             task_runner=mock_task_runner,
             stats_buffer=stats_buffer,
             windowed_stats=windowed_stats,
+            clock=RealClock(),
+            get_healthy_worker_count=lambda: len(manager_state._workers),
         )
 
         await stats.record_dispatch()
