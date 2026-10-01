@@ -85,6 +85,20 @@ _CONTROL_HANDLERS: frozenset[str] = frozenset(
         "join_ack",
         # Operator-driven cluster join (hyperscale join)
         "node_join",
+        # Per-job Raft consensus (manager and gate tiers): its volume is
+        # set by the protocol (one coalesced request per group per peer
+        # per heartbeat), and losing it costs elections, not just data
+        "raft_request_vote",
+        "raft_request_vote_response",
+        "raft_append_entries",
+        "raft_append_entries_response",
+        "raft_ledger_proposal",
+        "gate_raft_request_vote",
+        "gate_raft_request_vote_response",
+        "gate_raft_append_entries",
+        "gate_raft_append_entries_response",
+        "gate_raft_ledger_proposal",
+        "gate_raft_ledger_placement",
     }
 )
 

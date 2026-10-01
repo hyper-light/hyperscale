@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
+    RateLimitResponse,
     WorkflowFinalResult,
     WorkflowFinalResultAck,
     WorkflowProgress,
@@ -112,6 +113,10 @@ class WorkerProgressReporter:
         self._pending_results: deque[PendingResult] = deque(
             maxlen=self.MAX_PENDING_RESULTS
         )
+        # AD-24: manager address -> monotonic instant its rate-limit
+        # refusal expires. Bounded by the managers that refused; an entry
+        # is dropped the first time it is consulted after expiring.
+        self._refused_until: dict[tuple[str, int], float] = {}
 
     async def send_progress_direct(
         self,
@@ -160,15 +165,15 @@ class WorkerProgressReporter:
         executor = RetryExecutor(retry_config)
 
         async def attempt_send() -> None:
+            if self._is_refusing(manager_addr):
+                return
             response, _ = await send_tcp(
                 manager_addr,
                 "workflow_progress",
                 progress.dump(),
                 timeout=1.0,
             )
-            if response and isinstance(response, bytes) and response != b"error":
-                self._process_ack(response, progress.workflow_id)
-            else:
+            if not self._accept_response(manager_addr, response, progress.workflow_id):
                 raise ConnectionError("Invalid or error response from manager")
 
         try:
@@ -276,6 +281,8 @@ class WorkerProgressReporter:
             True if send succeeded
         """
         circuit = self._registry.get_or_create_circuit_by_addr(manager_addr)
+        if self._is_refusing(manager_addr):
+            return True
 
         try:
             response, _ = await send_tcp(
@@ -285,8 +292,7 @@ class WorkerProgressReporter:
                 timeout=1.0,
             )
 
-            if response and isinstance(response, bytes) and response != b"error":
-                self._process_ack(response, workflow_id)
+            if self._accept_response(manager_addr, response, workflow_id):
                 circuit.record_success()
                 return True
 
@@ -333,6 +339,8 @@ class WorkerProgressReporter:
 
                 manager_addr = (manager.tcp_host, manager.tcp_port)
                 circuit = self._registry.get_or_create_circuit(manager_id)
+                if self._is_refusing(manager_addr):
+                    continue
 
                 try:
                     response, _ = await send_tcp(
@@ -342,12 +350,9 @@ class WorkerProgressReporter:
                         timeout=1.0,
                     )
 
-                    if (
-                        response
-                        and isinstance(response, bytes)
-                        and response != b"error"
+                    if self._accept_response(
+                        manager_addr, response, progress.workflow_id
                     ):
-                        self._process_ack(response, progress.workflow_id)
                         circuit.record_success()
                     else:
                         circuit.record_error()
@@ -688,6 +693,48 @@ class WorkerProgressReporter:
                     node_id=node_id_short,
                 )
             )
+
+    def _is_refusing(self, manager_addr: tuple[str, int]) -> bool:
+        """Whether ``manager_addr`` asked (AD-24) not to be sent progress yet.
+
+        Skipping a send in that window loses nothing: progress snapshots
+        are cumulative, so the next one sent supersedes the skipped one.
+        """
+        if (refused_until := self._refused_until.get(manager_addr)) is None:
+            return False
+        if _DEFAULT_CLOCK.monotonic() < refused_until:
+            return True
+        del self._refused_until[manager_addr]
+        return False
+
+    def _accept_response(
+        self,
+        manager_addr: tuple[str, int],
+        response: bytes | Exception | None,
+        workflow_id: str,
+    ) -> bool:
+        """Apply a manager's answer to a progress update.
+
+        True for an answer from a live manager: an ack (processed) or an
+        AD-24 rate-limit refusal, which is backpressure -- honored by not
+        sending to that manager until its retry-after passes -- not a
+        failure to fail over from. False for no answer or an error.
+        """
+        if not response or not isinstance(response, bytes) or response == b"error":
+            return False
+
+        try:
+            refusal = RateLimitResponse.load(response)
+        except Exception:
+            refusal = None
+        if isinstance(refusal, RateLimitResponse):
+            self._refused_until[manager_addr] = (
+                _DEFAULT_CLOCK.monotonic() + refusal.retry_after_seconds
+            )
+            return True
+
+        self._process_ack(response, workflow_id)
+        return True
 
     def _process_ack(
         self,

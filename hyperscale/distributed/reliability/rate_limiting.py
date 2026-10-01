@@ -896,6 +896,19 @@ class RateLimitConfig:
         )
 
 
+# The AD-24 operation whose per-client budget a transport request draws
+# from, by TCP handler. A handler not listed draws from a budget named for
+# itself (the default limits), so no handler's volume consumes another's.
+HANDLER_RATE_LIMIT_OPERATIONS: dict[str, str] = {
+    "workflow_progress": "progress_update",
+    "receive_job_progress": "progress_update",
+    "receive_job_progress_report": "progress_update",
+    "worker_heartbeat": "heartbeat",
+    "manager_status_update": "heartbeat",
+    "windowed_stats_push": "stats_update",
+}
+
+
 @dataclass(slots=True)
 class RateLimitResult:
     """Result of a rate limit check."""
@@ -1020,6 +1033,26 @@ class ServerRateLimiter:
             raise RateLimitExceeded(f"Rate limit exceeded for {addr[0]}:{addr[1]}")
 
         return result.allowed
+
+    async def check_handler(
+        self,
+        addr: tuple[str, int],
+        handler_name: str,
+        priority: RequestPriority,
+    ) -> RateLimitResult:
+        """Admit one transport request from ``addr`` for ``handler_name``.
+
+        The request draws from the peer's budget for the handler's AD-24
+        operation at ``priority``, the handler's AD-37 class: CONTROL
+        traffic (SWIM, cancellation, leadership, consensus) is never
+        limited, and a burst on one handler cannot exhaust another's
+        budget.
+        """
+        return await self._adaptive.check(
+            f"{addr[0]}:{addr[1]}",
+            HANDLER_RATE_LIMIT_OPERATIONS.get(handler_name, handler_name),
+            priority,
+        )
 
     def check_sync(self, addr: tuple[str, int]) -> bool:
         """Synchronous rate-limit fast-path for transport-layer callers.

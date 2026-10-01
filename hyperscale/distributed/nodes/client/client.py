@@ -173,9 +173,11 @@ class HyperscaleClient(MercurySyncBaseServer):
         )
         self._state = ClientState()
 
-        # Initialize rate limiter for progress updates (AD-24)
+        # Rate limiter for inbound windowed-stats pushes (AD-24); named apart
+        # from the base server's transport limiter (``_rate_limiter``), which
+        # admits every inbound TCP request
         # Uses AdaptiveRateLimiter with operation limits: (300, 10.0) = 30/s
-        self._rate_limiter = AdaptiveRateLimiter(
+        self._progress_rate_limiter = AdaptiveRateLimiter(
             overload_detector=HybridOverloadDetector(),
             config=AdaptiveRateLimitConfig(),
         )
@@ -282,7 +284,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._windowed_stats_push_handler = WindowedStatsPushHandler(
             state=self._state,
             logger=self._logger,
-            rate_limiter=self._rate_limiter,
+            rate_limiter=self._progress_rate_limiter,
         )
         self._cancellation_complete_handler = CancellationCompleteHandler(
             state=self._state,

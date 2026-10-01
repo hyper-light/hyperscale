@@ -32,6 +32,7 @@ from hyperscale.distributed.encryption import AESGCMFernet
 from hyperscale.distributed.models import (
     Error,
     Message,
+    RateLimitResponse,
 )
 from hyperscale.distributed.runtime import (
     Clock,
@@ -58,6 +59,9 @@ from hyperscale.distributed.server.protocol import (
 )
 from hyperscale.distributed.server.protocol.security import MessageSizeError
 from hyperscale.distributed.reliability import ServerRateLimiter
+from hyperscale.distributed.reliability.load_shedding import (
+    classify_handler_to_priority,
+)
 from hyperscale.distributed.server.events import LamportClock
 from hyperscale.distributed.server.hooks.task import (
     TaskCall,
@@ -1761,6 +1765,53 @@ class MercurySyncBaseServer(Generic[T]):
             except asyncio.QueueFull:
                 self._tcp_drop_counter.increment_load_shed()
 
+    async def _admit_tcp_request(
+        self,
+        peername: tuple[str, int],
+        handler_name: bytes,
+    ) -> RateLimitResponse | None:
+        """AD-24 admission for one TCP request; the 429 to send if refused."""
+        decoded_handler_name = handler_name.decode(errors="replace")
+        admission = await self._rate_limiter.check_handler(
+            peername,
+            decoded_handler_name,
+            classify_handler_to_priority(decoded_handler_name),
+        )
+        if admission.allowed:
+            return None
+
+        self._tcp_drop_counter.increment_rate_limited()
+        return RateLimitResponse(
+            operation=decoded_handler_name,
+            retry_after_seconds=admission.retry_after_seconds,
+            tokens_remaining=admission.tokens_remaining,
+        )
+
+    def _write_tcp_response(
+        self,
+        transport: asyncio.Transport,
+        handler_name: bytes,
+        clock_time: int,
+        response: bytes,
+    ) -> None:
+        """Frame and write a response correlated to ``handler_name``.
+
+        Format: address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes),
+        compressed, encrypted, and length-prefixed for the TCP stream.
+        """
+        response_payload = self._encryptor.encrypt(
+            self._compressor.compress(
+                self._tcp_addr_slug
+                + b"<"
+                + handler_name
+                + b"<"
+                + clock_time.to_bytes(64)
+                + len(response).to_bytes(4, "big")
+                + response,
+            )
+        )
+        transport.write(frame_message(response_payload))
+
     async def process_tcp_server_request(
         self,
         data: bytes,
@@ -1771,10 +1822,6 @@ class MercurySyncBaseServer(Generic[T]):
         handler_name = b""
 
         try:
-            if peername is not None and not await self._rate_limiter.check(peername):
-                self._tcp_drop_counter.increment_rate_limited()
-                return
-
             # Message size validation
             if len(data) > MAX_MESSAGE_SIZE:
                 self._tcp_drop_counter.increment_message_too_large()
@@ -1810,6 +1857,15 @@ class MercurySyncBaseServer(Generic[T]):
             payload = rest[68 : 68 + data_len]
 
             next_time = await self._tcp_clock.update(clock_time)
+
+            if peername is not None and (
+                rate_limited := await self._admit_tcp_request(peername, handler_name)
+            ) is not None:
+                # Answer instead of dropping: a silent drop left the sender
+                # to time out, and its timeout closes the connection it
+                # shares with every other in-flight request to this node.
+                self._write_tcp_response(transport, handler_name, next_time, rate_limited.dump())
+                return
 
             try:
                 addr = parse_address(address_bytes)
@@ -1863,23 +1919,7 @@ class MercurySyncBaseServer(Generic[T]):
             if handler_name == b"":
                 handler_name = b"error"
 
-            # Build response with clock before length-prefixed data
-            # Format: address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
-            response_len = len(response).to_bytes(4, "big")
-            response_payload = self._encryptor.encrypt(
-                self._compressor.compress(
-                    self._tcp_addr_slug
-                    + b"<"
-                    + handler_name
-                    + b"<"
-                    + next_time.to_bytes(64)
-                    + response_len
-                    + response,
-                )
-            )
-
-            # Frame with length prefix for proper TCP stream handling
-            transport.write(frame_message(response_payload))
+            self._write_tcp_response(transport, handler_name, next_time, response)
 
         except Exception as e:
             self._tcp_drop_counter.increment_malformed_message()
