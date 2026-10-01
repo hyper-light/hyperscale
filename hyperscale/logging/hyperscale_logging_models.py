@@ -302,6 +302,19 @@ class StorageFormatUnrecognized(Entry, kw_only=True):
     level: LogLevel = LogLevel.ERROR
 
 
+class SystemicEvictionHeld(Entry, kw_only=True):
+    node_id: str
+    held_count: int
+    population: int
+    level: LogLevel = LogLevel.WARN
+
+
+class SystemicEvictionReleased(Entry, kw_only=True):
+    node_id: str
+    population: int
+    level: LogLevel = LogLevel.INFO
+
+
 class ClockFenced(Entry, kw_only=True):
     node_id: str
     peers_beyond: int

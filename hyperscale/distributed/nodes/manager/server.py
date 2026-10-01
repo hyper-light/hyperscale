@@ -176,6 +176,7 @@ from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 # Module-level storage seam (Phase 7): borrowed, never shut down
 # here; swap_defaults rebinds it under SIM.
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
+from hyperscale.distributed.health.systemic_failure import is_systemic_failure
 from hyperscale.distributed.hlc import (
     ClockFenceVerdict,
     ClockOffsetMonitor,
@@ -194,6 +195,8 @@ from hyperscale.distributed.workflow import (
     WorkflowStateMachine as WorkflowLifecycleStateMachine,
 )
 from hyperscale.logging.hyperscale_logging_models import (
+    SystemicEvictionHeld,
+    SystemicEvictionReleased,
     ServerInfo,
     ServerWarning,
     ServerError,
@@ -540,6 +543,8 @@ class ManagerServer(HealthAwareServer):
         self._previous_manager_health_state: str = "healthy"
         self._manager_health_state_lock: asyncio.Lock = asyncio.Lock()
         self._workflow_reassignment_lock: asyncio.Lock = asyncio.Lock()
+        # AD-19: true while deadline evictions are held as systemic.
+        self._systemic_eviction_hold = False
         self._load_shedder = ManagerLoadShedder(
             config=self._config,
             logger=self._udp_logger,
@@ -3668,44 +3673,7 @@ class ManagerServer(HealthAwareServer):
                 current_time = self._clock.monotonic()
                 grace_period = self._worker_health_manager.base_deadline
 
-                deadlines_snapshot = self._manager_state.iter_worker_deadlines()
-
-                for worker_id, deadline in deadlines_snapshot:
-                    if current_time <= deadline:
-                        continue
-
-                    # A worker deadline is a property of ACTIVE work —
-                    # AD-26 extensions are granted against dispatched
-                    # workflows, and nothing else refreshes the stored
-                    # value once that work drains. If the worker has no
-                    # unfinished sub-workflows, the expired deadline is
-                    # vestigial: enforcing it suspected and then evicted
-                    # a healthy, SWIM-OK, idle worker ~30s+ after every
-                    # job completed (and the dead-node reaper then
-                    # deregistered it, flipping the DC to "busy" on an
-                    # idle cluster). Clear it and move on — the next
-                    # dispatch/extension writes a fresh deadline. Uses
-                    # the same unfinished-work query the eviction path
-                    # itself uses for reassignment, so "nothing left to
-                    # protect" and "nothing to reassign" stay one
-                    # definition.
-                    job_manager = self._job_manager
-                    has_active_work = bool(
-                        job_manager
-                        and job_manager.get_reassignable_sub_workflows_on_worker(
-                            worker_id
-                        )
-                    )
-                    if not has_active_work:
-                        self._manager_state.clear_worker_deadline(worker_id)
-                        continue
-
-                    time_since_deadline = current_time - deadline
-
-                    if time_since_deadline <= grace_period:
-                        await self._suspect_worker_deadline_expired(worker_id)
-                    else:
-                        await self._evict_worker_deadline_expired(worker_id)
+                await self._enforce_worker_deadlines(current_time, grace_period)
 
             except asyncio.CancelledError:
                 break
@@ -3718,6 +3686,98 @@ class ManagerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
+
+    async def _enforce_worker_deadlines(self, current_time: float, grace_period: float) -> None:
+        """One enforcement pass: suspect workers within the grace period,
+        evict those beyond it -- unless that many evictions at once look
+        systemic (AD-19), in which case every eviction is held."""
+        lateness = self._expired_worker_deadlines(current_time)
+        for worker_id, seconds_late in lateness.items():
+            if seconds_late <= grace_period:
+                await self._suspect_worker_deadline_expired(worker_id)
+
+        eviction_candidates = [
+            worker_id for worker_id, seconds_late in lateness.items() if seconds_late > grace_period
+        ]
+        population = self._manager_state.get_worker_count()
+        if is_systemic_failure(len(eviction_candidates), population):
+            await self._hold_systemic_evictions(eviction_candidates, population)
+            return
+
+        await self._release_systemic_eviction_hold(population)
+        for worker_id in eviction_candidates:
+            await self._evict_worker_deadline_expired(worker_id)
+
+    async def _hold_systemic_evictions(self, held_worker_ids: list[str], population: int) -> None:
+        """Keep the would-be evictions suspected instead: more than half the
+        workers missing their deadlines together points at this manager's
+        own view (its network, its loop), and evicting them would strand
+        their work for nothing. Jobs stay bounded by their timeouts."""
+        for worker_id in held_worker_ids:
+            await self._suspect_worker_deadline_expired(worker_id)
+        if self._systemic_eviction_hold:
+            return
+        self._systemic_eviction_hold = True
+        await self._udp_logger.log(
+            SystemicEvictionHeld(
+                message=(
+                    f"Holding eviction of {len(held_worker_ids)}/{population} workers past their "
+                    "deadlines: a failure that wide looks systemic"
+                ),
+                node_id=self._node_id.short,
+                held_count=len(held_worker_ids),
+                population=population,
+            )
+        )
+
+    async def _release_systemic_eviction_hold(self, population: int) -> None:
+        if not self._systemic_eviction_hold:
+            return
+        self._systemic_eviction_hold = False
+        await self._udp_logger.log(
+            SystemicEvictionReleased(
+                message=f"Systemic eviction hold released ({population} workers)",
+                node_id=self._node_id.short,
+                population=population,
+            )
+        )
+
+    def _expired_worker_deadlines(self, current_time: float) -> dict[str, float]:
+        """Seconds past its deadline, per worker whose deadline expired with
+        work still on it; expired deadlines with no work left are cleared."""
+        lateness: dict[str, float] = {}
+        for worker_id, deadline in self._manager_state.iter_worker_deadlines():
+            if current_time <= deadline:
+                continue
+
+            # A worker deadline is a property of ACTIVE work —
+            # AD-26 extensions are granted against dispatched
+            # workflows, and nothing else refreshes the stored
+            # value once that work drains. If the worker has no
+            # unfinished sub-workflows, the expired deadline is
+            # vestigial: enforcing it suspected and then evicted
+            # a healthy, SWIM-OK, idle worker ~30s+ after every
+            # job completed (and the dead-node reaper then
+            # deregistered it, flipping the DC to "busy" on an
+            # idle cluster). Clear it and move on — the next
+            # dispatch/extension writes a fresh deadline. Uses
+            # the same unfinished-work query the eviction path
+            # itself uses for reassignment, so "nothing left to
+            # protect" and "nothing to reassign" stay one
+            # definition.
+            job_manager = self._job_manager
+            has_active_work = bool(
+                job_manager
+                and job_manager.get_reassignable_sub_workflows_on_worker(
+                    worker_id
+                )
+            )
+            if not has_active_work:
+                self._manager_state.clear_worker_deadline(worker_id)
+                continue
+
+            lateness[worker_id] = current_time - deadline
+        return lateness
 
     def _build_job_state_sync_message(
         self,
