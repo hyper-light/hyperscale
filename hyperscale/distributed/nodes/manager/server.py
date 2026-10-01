@@ -2503,7 +2503,7 @@ class ManagerServer(HealthAwareServer):
         ]
 
         for job_id in jobs_to_takeover:
-            old_leader_id = self._manager_state.get_job_leader(job_id)
+            old_leader_id = self._leases.get_job_leader(job_id)
             taken_over = await self._take_over_job_leadership_as_cluster_leader(
                 job_id,
                 old_leader_id,
@@ -2542,7 +2542,7 @@ class ManagerServer(HealthAwareServer):
             return False
 
         await self._sync_state_from_manager_peers(force_full=True)
-        current_leader_id = self._manager_state.get_job_leader(job_id)
+        current_leader_id = self._leases.get_job_leader(job_id)
         if current_leader_id == self._node_id.full and self._leases.is_job_leader(job_id):
             return True
         if (
@@ -3766,7 +3766,7 @@ class ManagerServer(HealthAwareServer):
         callback_addr = self._get_job_callback_addr(job_id)
         effective_leader_id = (
             leader_id
-            or self._manager_state.get_job_leader(job_id)
+            or self._leases.get_job_leader(job_id)
             or (job.leader_node_id if job is not None else None)
             or self._node_id.full
         )
@@ -4322,7 +4322,7 @@ class ManagerServer(HealthAwareServer):
             ]
 
             for job_id in jobs_to_takeover:
-                old_leader_id = self._manager_state.get_job_leader(job_id)
+                old_leader_id = self._leases.get_job_leader(job_id)
                 await self._take_over_job_leadership_as_cluster_leader(
                     job_id,
                     old_leader_id,
@@ -8066,7 +8066,7 @@ class ManagerServer(HealthAwareServer):
             # designed to track DC leadership, so reconverging it to the
             # current Raft leader is correct, not a theft.
             if not self._leases.is_job_leader(job_id) and self.is_leader():
-                old_leader_id = self._manager_state.get_job_leader(job_id)
+                old_leader_id = self._leases.get_job_leader(job_id)
                 taken_over = await self._take_over_job_leadership_as_cluster_leader(
                     job_id,
                     old_leader_id,
@@ -10277,7 +10277,7 @@ class ManagerServer(HealthAwareServer):
         leader_id = sync_msg.leader_id
         fencing_token = sync_msg.fencing_token
         current_fencing_token = self._leases.get_fence_token(sync_msg.job_id)
-        current_leader_id = self._manager_state.get_job_leader(sync_msg.job_id)
+        current_leader_id = self._leases.get_job_leader(sync_msg.job_id)
         current_leader_addr = self._manager_state.get_job_leader_addr(sync_msg.job_id)
         if (
             current_leader_id is not None
@@ -10368,7 +10368,7 @@ class ManagerServer(HealthAwareServer):
             sync_msg = JobStateSyncMessage.load(data)
 
             # Only accept from actual job leader
-            current_leader = self._manager_state.get_job_leader(sync_msg.job_id)
+            current_leader = self._leases.get_job_leader(sync_msg.job_id)
             current_fencing_token = self._leases.get_fence_token(sync_msg.job_id)
             if (
                 current_leader
@@ -10780,7 +10780,7 @@ class ManagerServer(HealthAwareServer):
 
     def _is_job_leader(self, job_id: str) -> bool:
         """Check if this manager is the leader for a job."""
-        leader_id = self._manager_state.get_job_leader(job_id)
+        leader_id = self._leases.get_job_leader(job_id)
         return leader_id == self._node_id.full
 
     async def _apply_context_updates(

@@ -444,49 +444,6 @@ class TestManagerLeaseCoordinatorHappyPath:
         assert result is False
         assert leases.get_job_leader("job-123") == "manager-2"
 
-    def test_release_job_leadership(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
-    ):
-        """Can release job leadership."""
-        leases = ManagerLeaseCoordinator(
-            state=manager_state,
-            config=manager_config,
-            logger=mock_logger,
-            node_id="manager-1",
-            task_runner=mock_task_runner,
-        )
-
-        leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
-        leases.release_job_leadership("job-123")
-
-        assert leases.is_job_leader("job-123") is False
-        assert leases.get_job_leader("job-123") is None
-
-    def test_transfer_job_leadership(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
-    ):
-        """Can transfer job leadership."""
-        leases = ManagerLeaseCoordinator(
-            state=manager_state,
-            config=manager_config,
-            logger=mock_logger,
-            node_id="manager-1",
-            task_runner=mock_task_runner,
-        )
-
-        leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
-
-        result = leases.transfer_job_leadership(
-            "job-123",
-            "manager-2",
-            ("127.0.0.2", 8000),
-        )
-
-        assert result is True
-        assert leases.get_job_leader("job-123") == "manager-2"
-        assert leases.get_job_leader_addr("job-123") == ("127.0.0.2", 8000)
-
-
 class TestManagerLeaseCoordinatorFencing:
     """Tests for fencing token management."""
 

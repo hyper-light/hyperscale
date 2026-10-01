@@ -152,61 +152,6 @@ class ManagerLeaseCoordinator:
             layer_version=layer_version,
         )
 
-    def release_job_leadership(self, job_id: str) -> None:
-        """
-        Release leadership for a job.
-
-        Args:
-            job_id: Job ID to release
-        """
-        if self._state.release_job_leadership_if_owner(job_id, self._node_id):
-
-            self._task_runner.run(
-                self._logger.log,
-                ServerDebug(
-                    message=f"Released leadership for job {job_id[:8]}...",
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
-
-    def transfer_job_leadership(
-        self,
-        job_id: str,
-        new_leader_id: str,
-        new_leader_addr: tuple[str, int],
-    ) -> bool:
-        """
-        Transfer job leadership to another manager.
-
-        Only succeeds if we are the current leader.
-
-        Args:
-            job_id: Job ID to transfer
-            new_leader_id: New leader node ID
-            new_leader_addr: New leader TCP address
-
-        Returns:
-            True if transfer successful
-        """
-        if self._state._job_leaders.get(job_id) != self._node_id:
-            return False
-
-        self._state._job_leaders[job_id] = new_leader_id
-        self._state._job_leader_addrs[job_id] = new_leader_addr
-
-        self._task_runner.run(
-            self._logger.log,
-            ServerDebug(
-                message=f"Transferred leadership for job {job_id[:8]}... to {new_leader_id[:8]}...",
-                node_host=self._config.host,
-                node_port=self._config.tcp_port,
-                node_id=self._node_id,
-            ),
-        )
-        return True
-
     def get_fence_token(self, job_id: str) -> int:
         """
         Get current fencing token for a job.
@@ -225,18 +170,6 @@ class ManagerLeaseCoordinator:
             new_value = current + 1
             self._state._job_fencing_tokens[job_id] = new_value
             return new_value
-
-    def set_fence_token(self, job_id: str, value: int) -> None:
-        """
-        Set fencing token for a job to a specific value.
-
-        Used during job initialization or explicit token assignment.
-
-        Args:
-            job_id: Job ID
-            value: Token value to set
-        """
-        self._state._job_fencing_tokens[job_id] = value
 
     def update_fence_token_if_higher(self, job_id: str, new_token: int) -> bool:
         """
