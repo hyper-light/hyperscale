@@ -68,3 +68,13 @@ def resolve_auth_secret(acm_secret: str | None) -> str:
 
     return os.getenv(AUTH_SECRET_ENVAR) or Env().MERCURY_SYNC_AUTH_SECRET
     
+
+def node_env(**explicit_values) -> Env:
+    """The ``Env`` a ``hyperscale run worker|manager|gate`` node runs with.
+
+    Every setting is read from the process environment (and a ``.env``
+    file), with the command's explicit flags taking precedence -- building
+    ``Env`` from the flags alone silently ignored every other setting an
+    operator exported (resource guards, timeouts, intervals).
+    """
+    return load_env(Env, override=Env(**explicit_values))

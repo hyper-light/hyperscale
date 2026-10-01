@@ -2,12 +2,11 @@ import asyncio
 from hyperscale.commands.cli import JsonFile, command, AssertSet
 from hyperscale.distributed.nodes import GateServer
 from hyperscale.core.engines.client.time_parser import TimeParser
-from hyperscale.distributed.env import Env as HyperscaleEnv
 
 from hyperscale.core.jobs.models import HyperscaleConfig
 from hyperscale.logging import LoggingConfig, LogLevelName
 
-from .shared import get_default_config, resolve_auth_secret
+from .shared import get_default_config, node_env, resolve_auth_secret
 from .shutdown_signals import ShutdownSignals
 
 
@@ -47,9 +46,9 @@ async def gate(
         log_output="stderr",
     )
 
-    env = HyperscaleEnv(
-         MERCURY_SYNC_AUTH_SECRET=resolve_auth_secret(acm_secret),
-         MERCURY_SYNC_LOG_LEVEL=log_level.data,
+    env = node_env(
+        MERCURY_SYNC_AUTH_SECRET=resolve_auth_secret(acm_secret),
+        MERCURY_SYNC_LOG_LEVEL=log_level.data,
     )
 
     start_timeout_sec = TimeParser(boot_timeout).time
