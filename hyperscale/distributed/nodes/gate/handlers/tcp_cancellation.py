@@ -8,7 +8,7 @@ Handles cancellation requests:
 """
 
 import asyncio
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
     CancelAck,
@@ -71,6 +71,9 @@ class GateCancellationHandler:
         check_rate_limit: Callable[[str, str], tuple[bool, float]],
         send_tcp: Callable,
         get_available_datacenters: Callable[[], list[str]],
+        record_cancellation: Callable[
+            [str, str, str, list[tuple[str, int]]], Awaitable[None]
+        ],
     ) -> None:
         """
         Initialize the cancellation handler.
@@ -87,6 +90,10 @@ class GateCancellationHandler:
             check_rate_limit: Callback to check rate limit
             send_tcp: Callback to send TCP messages
             get_available_datacenters: Callback to get available DCs
+            record_cancellation: Durably records a confirmed cancel as
+                (job_id, reason, requester_id, [(datacenter, cancelled)])
+                — AD-38 JobCancellationRequested + one JobCancellationAcked
+                per confirming datacenter
         """
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
@@ -98,6 +105,9 @@ class GateCancellationHandler:
         self._get_node_id: Callable[[], "NodeId"] = get_node_id
         self._get_host: Callable[[], str] = get_host
         self._get_tcp_port: Callable[[], int] = get_tcp_port
+        self._record_cancellation: Callable[
+            [str, str, str, list[tuple[str, int]]], Awaitable[None]
+        ] = record_cancellation
         self._check_rate_limit: Callable[[str, str], tuple[bool, float]] = (
             check_rate_limit
         )
@@ -240,6 +250,7 @@ class GateCancellationHandler:
             cancelled_workflows = 0
             errors: list[str] = []
             any_dc_confirmed = False
+            confirmed_datacenters: list[tuple[str, int]] = []
 
             for dc in self._get_available_datacenters():
                 managers = self._datacenter_managers.get(dc, [])
@@ -258,6 +269,8 @@ class GateCancellationHandler:
                 )
                 cancelled_workflows += dc_cancelled_count
                 any_dc_confirmed = any_dc_confirmed or dc_confirmed
+                if dc_confirmed:
+                    confirmed_datacenters.append((dc, dc_cancelled_count))
                 if dc_error:
                     errors.append(f"DC {dc}: {dc_error}")
 
@@ -268,6 +281,9 @@ class GateCancellationHandler:
             # false success to the client and desyncs the gate's view
             # from the managers that are still running the workflows.
             if any_dc_confirmed:
+                await self._record_cancellation(
+                    job_id, reason, requester_id, confirmed_datacenters
+                )
                 job.status = JobStatus.CANCELLED.value
                 await self._state.increment_state_version()
 

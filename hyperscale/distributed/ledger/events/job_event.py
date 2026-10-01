@@ -149,6 +149,12 @@ class JobFailed(msgspec.Struct, frozen=True, array_like=True):
     failed_datacenter: str
 
     event_type: JobEventType = JobEventType.JOB_FAILED
+    # Terminal tallies, so a failed job's record is as complete as a
+    # JobCompleted one. Trailing + defaulted: array_like decode of an
+    # older record fills them in.
+    total_completed: int = 0
+    total_failed: int = 0
+    duration_ms: int = 0
 
     def to_bytes(self) -> bytes:
         return msgspec.msgpack.encode(self)
@@ -166,6 +172,10 @@ class JobTimedOut(msgspec.Struct, frozen=True, array_like=True):
     last_progress_hlc: LSN | None
 
     event_type: JobEventType = JobEventType.JOB_TIMED_OUT
+    # Terminal tallies — same contract as JobFailed's.
+    total_completed: int = 0
+    total_failed: int = 0
+    duration_ms: int = 0
 
     def to_bytes(self) -> bytes:
         return msgspec.msgpack.encode(self)

@@ -5,13 +5,15 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Awaitable, Mapping
 
+import msgspec
+
 from hyperscale.logging.hyperscale_logging_models import (
     ArchiveError,
     ArchiveInfo,
     CheckpointError,
     CheckpointInfo,
 )
-from hyperscale.logging.lsn import HybridLamportClock
+from hyperscale.logging.lsn import LSN, HybridLamportClock
 
 from .archive.job_archive_store import JobArchiveStore
 
@@ -29,13 +31,22 @@ from .events.event_type import JobEventType
 from .events.job_event import (
     JobCreated,
     JobAccepted,
+    JobCancellationAcked,
     JobCancellationRequested,
     JobCompleted,
+    JobFailed,
+    JobProgressReported,
+    JobTimedOut,
+)
+from .job_event_applier import (
+    JOB_FAILED_STATUS,
+    JOB_TIMED_OUT_STATUS,
+    JobEventApplier,
 )
 from .job_id import JobIdGenerator
 from .unsatisfiable_durability_error import UnsatisfiableDurabilityError
 from .job_state import JobState
-from .wal.node_wal import NodeWAL
+from .wal.node_wal import NodeWAL, WALAppendResult
 from .wal.wal_entry import WALEntry
 from .pipeline.commit_pipeline import CommitPipeline, CommitResult
 from .checkpoint.checkpoint import Checkpoint, CheckpointManager
@@ -125,6 +136,7 @@ class JobLedger:
         "_jobs_snapshot",
         "_lock",
         "_next_fence_token",
+        "_event_applier",
         "_logger",
         "_pending_archive_jobs",
         "_checkpoint_wal_ratio",
@@ -163,6 +175,7 @@ class JobLedger:
         self._jobs_snapshot: Mapping[str, JobState] = MappingProxyType({})
         self._lock = asyncio.Lock()
         self._next_fence_token = 1
+        self._event_applier = JobEventApplier()
         self._pending_archive_jobs: dict[str, JobState] = {}
         self._checkpoint_wal_ratio = checkpoint_wal_ratio
         self._min_checkpoint_wal_entries = min_checkpoint_wal_entries
@@ -249,6 +262,16 @@ class JobLedger:
         if checkpoint is not None:
             for job_id, job_dict in checkpoint.job_states.items():
                 self._jobs_internal[job_id] = JobState.from_dict(job_id, job_dict)
+
+            # Compaction dropped the JOB_CREATED entries replay would
+            # advance the fence counter from; resume above everything the
+            # checkpoint knows about (its own counter, or — for a
+            # checkpoint predating that field — its jobs' tokens).
+            self._next_fence_token = max(
+                self._next_fence_token,
+                checkpoint.next_fence_token,
+                *(job.fence_token + 1 for job in self._jobs_internal.values()),
+            )
 
             await self._clock.witness(checkpoint.hlc)
             self._wal.restore_durability_watermarks(
@@ -378,47 +401,9 @@ class JobLedger:
         self._jobs_snapshot = MappingProxyType(dict(self._jobs_internal))
 
     def _apply_entry(self, entry: WALEntry) -> None:
-        if entry.event_type == JobEventType.JOB_CREATED:
-            event = JobCreated.from_bytes(entry.payload)
-            self._jobs_internal[event.job_id] = JobState.create(
-                job_id=event.job_id,
-                fence_token=event.fence_token,
-                assigned_datacenters=event.assigned_datacenters,
-                created_hlc=event.hlc,
-                requestor_id=event.requestor_id,
-                timeout_seconds=event.timeout_seconds,
-            )
-
-            if event.fence_token >= self._next_fence_token:
-                self._next_fence_token = event.fence_token + 1
-
-        elif entry.event_type == JobEventType.JOB_ACCEPTED:
-            event = JobAccepted.from_bytes(entry.payload)
-            job = self._jobs_internal.get(event.job_id)
-            if job:
-                self._jobs_internal[event.job_id] = job.with_accepted(
-                    datacenter_id=event.datacenter_id,
-                    hlc=event.hlc,
-                )
-
-        elif entry.event_type == JobEventType.JOB_CANCELLATION_REQUESTED:
-            event = JobCancellationRequested.from_bytes(entry.payload)
-            job = self._jobs_internal.get(event.job_id)
-            if job:
-                self._jobs_internal[event.job_id] = job.with_cancellation_requested(
-                    hlc=event.hlc,
-                )
-
-        elif entry.event_type == JobEventType.JOB_COMPLETED:
-            event = JobCompleted.from_bytes(entry.payload)
-            job = self._jobs_internal.get(event.job_id)
-            if job:
-                self._jobs_internal[event.job_id] = job.with_completion(
-                    final_status=event.final_status,
-                    total_completed=event.total_completed,
-                    total_failed=event.total_failed,
-                    hlc=event.hlc,
-                )
+        fence_token = self._event_applier.apply(entry, self._jobs_internal)
+        if fence_token >= self._next_fence_token:
+            self._next_fence_token = fence_token + 1
 
     def _require_satisfiable_durability(self, durability: DurabilityLevel) -> None:
         """Refuse an impossible durability request BEFORE anything is
@@ -592,6 +577,93 @@ class JobLedger:
 
             return result
 
+    async def report_progress(
+        self,
+        job_id: str,
+        datacenter_id: str,
+        completed_count: int,
+        failed_count: int,
+        durability: DurabilityLevel = DurabilityLevel.LOCAL,
+    ) -> CommitResult | None:
+        """Record a job's aggregated workflow tallies (AD-38, LOCAL tier).
+
+        Called when the tallies change (a workflow reaches a terminal
+        state), so WAL growth is bounded by workflow count, not by the
+        raw progress-update rate. Unchanged tallies append nothing.
+        """
+        self._require_satisfiable_durability(durability)
+
+        async with self._lock:
+            job = self._jobs_internal.get(job_id)
+            if job is None or job.is_terminal:
+                return None
+
+            if (job.completed_count, job.failed_count) == (completed_count, failed_count):
+                return None
+
+            hlc = await self._clock.generate()
+            append_result, result = await self._append_and_commit(
+                JobEventType.JOB_PROGRESS_REPORTED,
+                JobProgressReported(
+                    job_id=job_id,
+                    hlc=hlc,
+                    fence_token=job.fence_token,
+                    datacenter_id=datacenter_id,
+                    completed_count=completed_count,
+                    failed_count=failed_count,
+                ),
+                durability,
+            )
+            await self._apply_live(
+                job_id,
+                job.with_progress(completed_count, failed_count, hlc),
+                append_result,
+            )
+
+            return result
+
+    async def acknowledge_cancellation(
+        self,
+        job_id: str,
+        datacenter_id: str,
+        workflows_cancelled: int,
+        durability: DurabilityLevel = DurabilityLevel.LOCAL,
+    ) -> CommitResult | None:
+        """Record that ``datacenter_id`` confirmed the job's cancellation.
+
+        Only a job with a recorded cancellation request can be acked, and
+        each datacenter acks once — repeats append nothing.
+        """
+        self._require_satisfiable_durability(durability)
+
+        async with self._lock:
+            job = self._jobs_internal.get(job_id)
+            if job is None or job.is_terminal or not job.is_cancelled:
+                return None
+
+            if datacenter_id in job.cancellation_acked_datacenters:
+                return None
+
+            hlc = await self._clock.generate()
+            append_result, result = await self._append_and_commit(
+                JobEventType.JOB_CANCELLATION_ACKED,
+                JobCancellationAcked(
+                    job_id=job_id,
+                    hlc=hlc,
+                    fence_token=job.fence_token,
+                    datacenter_id=datacenter_id,
+                    workflows_cancelled=workflows_cancelled,
+                ),
+                durability,
+            )
+            await self._apply_live(
+                job_id,
+                job.with_cancellation_acked(datacenter_id, hlc),
+                append_result,
+            )
+
+            return result
+
     async def complete_job(
         self,
         job_id: str,
@@ -601,19 +673,14 @@ class JobLedger:
         duration_ms: int,
         durability: DurabilityLevel = DurabilityLevel.LOCAL,
     ) -> CommitResult | None:
-        self._require_satisfiable_durability(durability)
-
-        async with self._lock:
-            job = self._jobs_internal.get(job_id)
-            if job is None:
-                return None
-
-            if job.is_terminal:
-                return None
-
-            hlc = await self._clock.generate()
-
-            event = JobCompleted(
+        return await self._record_terminal(
+            job_id,
+            JobEventType.JOB_COMPLETED,
+            final_status,
+            total_completed,
+            total_failed,
+            durability,
+            lambda job, hlc: JobCompleted(
                 job_id=job_id,
                 hlc=hlc,
                 fence_token=job.fence_token,
@@ -621,24 +688,106 @@ class JobLedger:
                 total_completed=total_completed,
                 total_failed=total_failed,
                 duration_ms=duration_ms,
-            )
+            ),
+        )
 
-            append_result = await self._wal.append(
-                event_type=JobEventType.JOB_COMPLETED,
-                payload=event.to_bytes(),
-            )
+    async def fail_job(
+        self,
+        job_id: str,
+        error_message: str,
+        failed_datacenter: str,
+        total_completed: int,
+        total_failed: int,
+        duration_ms: int,
+        durability: DurabilityLevel = DurabilityLevel.LOCAL,
+    ) -> CommitResult | None:
+        """Record a job's terminal failure (AD-38 ``JobFailed``)."""
+        return await self._record_terminal(
+            job_id,
+            JobEventType.JOB_FAILED,
+            JOB_FAILED_STATUS,
+            total_completed,
+            total_failed,
+            durability,
+            lambda job, hlc: JobFailed(
+                job_id=job_id,
+                hlc=hlc,
+                fence_token=job.fence_token,
+                error_message=error_message,
+                failed_datacenter=failed_datacenter,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                duration_ms=duration_ms,
+            ),
+        )
 
-            result = await self._pipeline.commit(
-                append_result.entry,
+    async def time_out_job(
+        self,
+        job_id: str,
+        timeout_type: str,
+        total_completed: int,
+        total_failed: int,
+        duration_ms: int,
+        durability: DurabilityLevel = DurabilityLevel.LOCAL,
+    ) -> CommitResult | None:
+        """Record a job's terminal timeout (AD-38 ``JobTimedOut``).
+
+        ``last_progress_hlc`` comes from the ledger's own progress record,
+        so the event states how long the job had been silent.
+        """
+        return await self._record_terminal(
+            job_id,
+            JobEventType.JOB_TIMED_OUT,
+            JOB_TIMED_OUT_STATUS,
+            total_completed,
+            total_failed,
+            durability,
+            lambda job, hlc: JobTimedOut(
+                job_id=job_id,
+                hlc=hlc,
+                fence_token=job.fence_token,
+                timeout_type=timeout_type,
+                last_progress_hlc=job.last_progress_hlc,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                duration_ms=duration_ms,
+            ),
+        )
+
+    async def _record_terminal(
+        self,
+        job_id: str,
+        event_type: JobEventType,
+        final_status: str,
+        total_completed: int,
+        total_failed: int,
+        durability: DurabilityLevel,
+        build_event: Callable[[JobState, LSN], msgspec.Struct],
+    ) -> CommitResult | None:
+        """Shared terminal transition for complete / fail / time out.
+
+        A job reaches exactly one terminal: the first terminal event wins
+        and later ones (from any of the three paths) append nothing.
+        """
+        self._require_satisfiable_durability(durability)
+
+        async with self._lock:
+            job = self._jobs_internal.get(job_id)
+            if job is None or job.is_terminal:
+                return None
+
+            hlc = await self._clock.generate()
+            append_result, result = await self._append_and_commit(
+                event_type,
+                build_event(job, hlc),
                 durability,
-                backpressure=append_result.backpressure,
             )
 
             # Applied unconditionally -- see the class docstring's apply
             # contract: the fsync'd append is replayed on recovery either
             # way, so gating this on replication only splits live state
             # from recovered state.
-            completed_job = job.with_completion(
+            terminal_job = job.with_completion(
                 final_status=final_status,
                 total_completed=total_completed,
                 total_failed=total_failed,
@@ -649,16 +798,44 @@ class JobLedger:
             # the cache/snapshot transition must neither wait on nor
             # abort with the archive leg — the archive is the
             # COLD-READ copy, the WAL commit above is the truth.
-            self._completed_cache.put(job_id, completed_job)
+            self._completed_cache.put(job_id, terminal_job)
             del self._jobs_internal[job_id]
             self._publish_snapshot()
 
-            if await self._archive_job_isolated(completed_job):
+            if await self._archive_job_isolated(terminal_job):
                 await self._heal_pending_archive_jobs()
 
             await self._wal.mark_applied(append_result.entry.lsn)
 
             return result
+
+    async def _append_and_commit(
+        self,
+        event_type: JobEventType,
+        event: msgspec.Struct,
+        durability: DurabilityLevel,
+    ) -> tuple[WALAppendResult, CommitResult]:
+        append_result = await self._wal.append(
+            event_type=event_type,
+            payload=event.to_bytes(),
+        )
+        result = await self._pipeline.commit(
+            append_result.entry,
+            durability,
+            backpressure=append_result.backpressure,
+        )
+        return append_result, result
+
+    async def _apply_live(
+        self,
+        job_id: str,
+        job: JobState,
+        append_result: WALAppendResult,
+    ) -> None:
+        # Applied unconditionally -- the class docstring's apply contract.
+        self._jobs_internal[job_id] = job
+        self._publish_snapshot()
+        await self._wal.mark_applied(append_result.entry.lsn)
 
     def get_job(
         self,
@@ -714,6 +891,7 @@ class JobLedger:
                 hlc=hlc,
                 job_states=job_states,
                 created_at_ms=int(_DEFAULT_CLOCK.time() * 1000),
+                next_fence_token=self._next_fence_token,
             )
 
             path = await self._checkpoint_manager.save(checkpoint)

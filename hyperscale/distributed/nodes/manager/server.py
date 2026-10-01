@@ -5770,11 +5770,11 @@ class ManagerServer(HealthAwareServer):
             elapsed_seconds = job.elapsed_seconds()
 
             if self._job_ledger is not None:
-                await self._job_ledger.complete_job(
+                await self._job_ledger.time_out_job(
                     job.job_id,
-                    final_status=JobStatus.TIMEOUT.value,
-                    total_completed=0,
-                    total_failed=0,
+                    timeout_type=reason,
+                    total_completed=job.workflows_completed,
+                    total_failed=job.workflows_failed,
                     duration_ms=int(elapsed_seconds * 1000),
                     durability=DurabilityLevel.LOCAL,
                 )
@@ -6891,8 +6891,22 @@ class ManagerServer(HealthAwareServer):
                 ),
                 None,
             )
+            workflows_completed = job.workflows_completed
+            workflows_failed = job.workflows_failed
         if terminal_status is None:
             return
+
+        if self._job_ledger is not None:
+            # AD-38 JobProgressReported at LOCAL durability: tallies only
+            # change on a workflow terminal, so this bounds WAL growth by
+            # workflow count; unchanged tallies append nothing.
+            await self._job_ledger.report_progress(
+                job_id,
+                datacenter_id=self._node_id.datacenter,
+                completed_count=workflows_completed,
+                failed_count=workflows_failed,
+                durability=DurabilityLevel.LOCAL,
+            )
 
         if terminal_status in (
             WorkflowStatus.COMPLETED,
@@ -7734,11 +7748,20 @@ class ManagerServer(HealthAwareServer):
                     requestor_id=requester_id,
                     durability=DurabilityLevel.LOCAL,
                 )
+                # This datacenter has now cancelled what it was running:
+                # its pending workflows and the running ones the workers
+                # confirmed (AD-38 JobCancellationAcked).
+                await self._job_ledger.acknowledge_cancellation(
+                    job_id,
+                    datacenter_id=self._node_id.datacenter,
+                    workflows_cancelled=len(pending_cancelled) + len(running_cancelled),
+                    durability=DurabilityLevel.LOCAL,
+                )
                 await self._job_ledger.complete_job(
                     job_id,
                     final_status=JobStatus.CANCELLED.value,
-                    total_completed=0,
-                    total_failed=0,
+                    total_completed=job.workflows_completed,
+                    total_failed=job.workflows_failed,
                     duration_ms=int(job.elapsed_seconds() * 1000),
                     durability=DurabilityLevel.LOCAL,
                 )
@@ -10461,9 +10484,13 @@ class ManagerServer(HealthAwareServer):
         for job_id, job_state in recovered_active.items():
             if await self._try_resume_recovered_job(job_id):
                 continue
-            await self._job_ledger.complete_job(
+            await self._job_ledger.fail_job(
                 job_id,
-                final_status=JobStatus.FAILED.value,
+                error_message=(
+                    "manager restarted and the job could not be resumed "
+                    "(no persisted submission, or its resume failed)"
+                ),
+                failed_datacenter=self._node_id.datacenter,
                 total_completed=job_state.completed_count,
                 total_failed=job_state.failed_count,
                 duration_ms=0,
@@ -10590,13 +10617,13 @@ class ManagerServer(HealthAwareServer):
                 # refuses a second terminal transition). The ledger's
                 # own lock nests inside job.lock with no reverse order
                 # anywhere, so this cannot deadlock.
-                await self._job_ledger.complete_job(
+                await self._record_job_outcome_durable(
                     job_id,
                     final_status=final_status,
+                    errors=errors,
                     total_completed=total_completed,
                     total_failed=total_failed,
                     duration_ms=int(elapsed_seconds * 1000),
-                    durability=DurabilityLevel.LOCAL,
                 )
                 await self._discard_persisted_submission(job_id)
 
@@ -10624,6 +10651,38 @@ class ManagerServer(HealthAwareServer):
             total_completed,
             total_failed,
             elapsed_seconds,
+        )
+
+    async def _record_job_outcome_durable(
+        self,
+        job_id: str,
+        final_status: str,
+        errors: list[str],
+        total_completed: int,
+        total_failed: int,
+        duration_ms: int,
+    ) -> None:
+        """Record a finished job's terminal as AD-38 ``JobFailed`` when every
+        workflow failed, ``JobCompleted`` otherwise."""
+        if final_status == JobStatus.FAILED.value:
+            await self._job_ledger.fail_job(
+                job_id,
+                error_message="; ".join(errors) or "every workflow failed",
+                failed_datacenter=self._node_id.datacenter,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                duration_ms=duration_ms,
+                durability=DurabilityLevel.LOCAL,
+            )
+            return
+
+        await self._job_ledger.complete_job(
+            job_id,
+            final_status=final_status,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            duration_ms=duration_ms,
+            durability=DurabilityLevel.LOCAL,
         )
 
     def _determine_final_job_status(self, job: JobInfo) -> str:

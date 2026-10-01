@@ -85,6 +85,16 @@ class MockGateJobManager:
         return self.callbacks.get(job_id)
 
 
+async def record_cancellation_noop(
+    job_id: str,
+    reason: str,
+    requester_id: str,
+    confirmed_datacenters: list[tuple[str, int]],
+) -> None:
+    """Stand-in for the gate's durable cancellation recorder (the ledger
+    is not under test here)."""
+
+
 def create_mock_handler(
     state: GateRuntimeState = None,
     job_manager: MockGateJobManager = None,
@@ -132,6 +142,7 @@ def create_mock_handler(
         check_rate_limit=mock_check_rate_limit,
         send_tcp=mock_send_tcp,
         get_available_datacenters=lambda: available_dcs,
+        record_cancellation=record_cancellation_noop,
     )
 
 
@@ -433,6 +444,7 @@ class TestHandleCancelJobFailureModes:
             check_rate_limit=mock_check_rate_limit,
             send_tcp=failing_send,
             get_available_datacenters=lambda: ["dc-east"],
+            record_cancellation=record_cancellation_noop,
         )
 
         cancel_request = CancelJob(

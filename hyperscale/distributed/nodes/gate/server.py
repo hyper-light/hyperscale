@@ -992,6 +992,7 @@ class GateServer(HealthAwareServer):
             check_rate_limit=self._check_rate_limit_for_operation,
             send_tcp=self._send_tcp,
             get_available_datacenters=self._get_available_datacenters,
+            record_cancellation=self._record_cancellation_durable,
         )
 
         self._state_sync_handler = GateStateSyncHandler(
@@ -2618,6 +2619,36 @@ class GateServer(HealthAwareServer):
                 f"{submission.job_id}: {create_result.error}"
             )
 
+    async def _record_cancellation_durable(
+        self,
+        job_id: str,
+        reason: str,
+        requester_id: str,
+        confirmed_datacenters: list[tuple[str, int]],
+    ) -> None:
+        """Durably record a cancel the datacenters confirmed (AD-38).
+
+        One ``JobCancellationRequested`` (the ledger ignores a repeat from
+        a client retry) and one ``JobCancellationAcked`` per confirming
+        datacenter (each datacenter acks once).
+        """
+        if self._job_ledger is None:
+            return
+
+        await self._job_ledger.request_cancellation(
+            job_id,
+            reason=reason,
+            requestor_id=requester_id,
+            durability=DurabilityLevel.LOCAL,
+        )
+        for datacenter_id, workflows_cancelled in confirmed_datacenters:
+            await self._job_ledger.acknowledge_cancellation(
+                job_id,
+                datacenter_id=datacenter_id,
+                workflows_cancelled=workflows_cancelled,
+                durability=DurabilityLevel.LOCAL,
+            )
+
     async def _record_job_terminal_durable(
         self,
         job_id: str,
@@ -2625,19 +2656,51 @@ class GateServer(HealthAwareServer):
         total_completed: int,
         total_failed: int,
         elapsed_seconds: float,
+        reason: str = "",
+        failed_datacenters: tuple[str, ...] = (),
     ) -> None:
-        """Durably record a job's terminal outcome (idempotent)."""
+        """Durably record a job's terminal outcome (idempotent).
+
+        Timeouts and failures get their AD-38 event types (``JobTimedOut``
+        with the timeout reason, ``JobFailed`` naming the failed
+        datacenters); everything else is ``JobCompleted``.
+        """
         if self._job_ledger is None:
             return
         ledger_job = self._job_ledger.get_job(job_id)
         if ledger_job is None or ledger_job.is_terminal:
             return
+
+        duration_ms = int(elapsed_seconds * 1000)
+        if final_status in (JobStatus.TIMEOUT.value, "timed_out"):
+            await self._job_ledger.time_out_job(
+                job_id,
+                timeout_type=reason or final_status,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                duration_ms=duration_ms,
+                durability=DurabilityLevel.LOCAL,
+            )
+            return
+
+        if final_status == JobStatus.FAILED.value:
+            await self._job_ledger.fail_job(
+                job_id,
+                error_message=reason or "job failed",
+                failed_datacenter=",".join(failed_datacenters),
+                total_completed=total_completed,
+                total_failed=total_failed,
+                duration_ms=duration_ms,
+                durability=DurabilityLevel.LOCAL,
+            )
+            return
+
         await self._job_ledger.complete_job(
             job_id,
             final_status=final_status,
             total_completed=total_completed,
             total_failed=total_failed,
-            duration_ms=int(elapsed_seconds * 1000),
+            duration_ms=duration_ms,
             durability=DurabilityLevel.LOCAL,
         )
 
@@ -2814,6 +2877,16 @@ class GateServer(HealthAwareServer):
                 total_completed=global_result.total_completed,
                 total_failed=global_result.total_failed,
                 elapsed_seconds=global_result.elapsed_seconds,
+                reason="; ".join(global_result.errors),
+                failed_datacenters=tuple(
+                    sorted(
+                        datacenter_id
+                        for datacenter_id, datacenter_status in (
+                            global_result.per_datacenter_statuses.items()
+                        )
+                        if datacenter_status == JobStatus.FAILED.value
+                    )
+                ),
             )
 
             self._task_runner.run(
@@ -2998,6 +3071,7 @@ class GateServer(HealthAwareServer):
             total_completed=getattr(job, "total_completed", 0),
             total_failed=getattr(job, "total_failed", 0),
             elapsed_seconds=getattr(job, "elapsed_seconds", 0.0),
+            reason=reason,
         )
         await self._modular_state.increment_state_version()
         await self._send_immediate_update(job_id, "timeout", None)

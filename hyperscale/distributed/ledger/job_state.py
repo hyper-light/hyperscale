@@ -35,6 +35,11 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
     # derived from created_hlc.wall_clock). Same trailing-defaulted
     # compatibility contract as requestor_id.
     timeout_seconds: float = 0.0
+    # HLC of the most recent JobProgressReported — AD-38's JobTimedOut
+    # carries it so a timeout records how long the job had been silent.
+    last_progress_hlc: LSN | None = None
+    # Datacenters that confirmed cancellation (JobCancellationAcked).
+    cancellation_acked_datacenters: frozenset[str] = frozenset()
 
     @classmethod
     def create(
@@ -61,36 +66,23 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             timeout_seconds=timeout_seconds,
         )
 
+    # Transitions copy the record with ``msgspec.structs.replace`` so every
+    # field they do not name carries forward; hand-listing fields silently
+    # reset any field added later.
     def with_accepted(self, datacenter_id: str, hlc: LSN) -> JobState:
-        return JobState(
-            job_id=self.job_id,
+        return msgspec.structs.replace(
+            self,
             status="running",
-            fence_token=self.fence_token,
-            assigned_datacenters=self.assigned_datacenters,
             accepted_datacenters=self.accepted_datacenters | {datacenter_id},
-            cancelled=self.cancelled,
-            completed_count=self.completed_count,
-            failed_count=self.failed_count,
-            created_hlc=self.created_hlc,
             last_hlc=hlc,
-            requestor_id=self.requestor_id,
-            timeout_seconds=self.timeout_seconds,
         )
 
     def with_cancellation_requested(self, hlc: LSN) -> JobState:
-        return JobState(
-            job_id=self.job_id,
+        return msgspec.structs.replace(
+            self,
             status="cancelling",
-            fence_token=self.fence_token,
-            assigned_datacenters=self.assigned_datacenters,
-            accepted_datacenters=self.accepted_datacenters,
             cancelled=True,
-            completed_count=self.completed_count,
-            failed_count=self.failed_count,
-            created_hlc=self.created_hlc,
             last_hlc=hlc,
-            requestor_id=self.requestor_id,
-            timeout_seconds=self.timeout_seconds,
         )
 
     def with_completion(
@@ -100,19 +92,35 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
         total_failed: int,
         hlc: LSN,
     ) -> JobState:
-        return JobState(
-            job_id=self.job_id,
+        return msgspec.structs.replace(
+            self,
             status=final_status,
-            fence_token=self.fence_token,
-            assigned_datacenters=self.assigned_datacenters,
-            accepted_datacenters=self.accepted_datacenters,
-            cancelled=self.cancelled,
             completed_count=total_completed,
             failed_count=total_failed,
-            created_hlc=self.created_hlc,
             last_hlc=hlc,
-            requestor_id=self.requestor_id,
-            timeout_seconds=self.timeout_seconds,
+        )
+
+    def with_progress(
+        self,
+        completed_count: int,
+        failed_count: int,
+        hlc: LSN,
+    ) -> JobState:
+        return msgspec.structs.replace(
+            self,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            last_hlc=hlc,
+            last_progress_hlc=hlc,
+        )
+
+    def with_cancellation_acked(self, datacenter_id: str, hlc: LSN) -> JobState:
+        return msgspec.structs.replace(
+            self,
+            cancellation_acked_datacenters=(
+                self.cancellation_acked_datacenters | {datacenter_id}
+            ),
+            last_hlc=hlc,
         )
 
     @property
@@ -142,6 +150,19 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             "created_hlc": list(self.created_hlc),
             "last_hlc": list(self.last_hlc),
             "requestor_id": self.requestor_id,
+            # Checkpoints persist ACTIVE jobs through this dict: a field
+            # missing here is silently reset by a checkpoint + restart
+            # (timeout_seconds used to be — the restarted node then
+            # resumed AD-34 tracking with a zero budget).
+            "timeout_seconds": self.timeout_seconds,
+            "last_progress_hlc": (
+                list(self.last_progress_hlc)
+                if self.last_progress_hlc is not None
+                else None
+            ),
+            "cancellation_acked_datacenters": list(
+                self.cancellation_acked_datacenters
+            ),
         }
 
     @staticmethod
@@ -170,4 +191,13 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             created_hlc=created_hlc,
             last_hlc=last_hlc,
             requestor_id=data.get("requestor_id", ""),
+            timeout_seconds=data.get("timeout_seconds", 0.0),
+            last_progress_hlc=(
+                cls._decode_hlc(raw_progress_hlc)
+                if (raw_progress_hlc := data.get("last_progress_hlc")) is not None
+                else None
+            ),
+            cancellation_acked_datacenters=frozenset(
+                data.get("cancellation_acked_datacenters", [])
+            ),
         )
