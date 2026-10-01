@@ -28,7 +28,7 @@ class ManagerLocalView:
     worker_aggregate_memory_bytes: int = 0
     worker_reports: dict[str, WorkerResourceReport] = field(default_factory=dict)
     version: int = 0
-    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK._DEFAULT_CLOCK.monotonic())
+    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
     def is_stale(self, max_age_seconds: float = 30.0) -> bool:
         """Return True if this view is older than max_age_seconds."""

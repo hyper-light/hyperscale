@@ -163,6 +163,9 @@ from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.ledger.pipeline.commit_pipeline import CommitResult
 from hyperscale.distributed.raft import LedgerReplicator
+from hyperscale.distributed.resources.resource_budget import ResourceBudget
+from hyperscale.distributed.resources.resource_enforcer import ResourceEnforcer
+from hyperscale.distributed.resources.resource_violation_type import ResourceViolationType
 from hyperscale.distributed.raft.models import LedgerProposal
 from hyperscale.distributed.raft.models.commands import ledger_append_command
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
@@ -242,6 +245,19 @@ class _ParsedCancelRequest(NamedTuple):
     reason: str
     callback_addr: tuple[str, int] | None
     unreachable_addrs: frozenset[tuple[str, int]]
+
+
+_TERMINAL_WORKFLOW_STATUS_VALUES = frozenset(
+    status.value
+    for status in (
+        WorkflowStatus.COMPLETED,
+        WorkflowStatus.FAILED,
+        WorkflowStatus.CANCELLED,
+        WorkflowStatus.AGGREGATED,
+        WorkflowStatus.AGGREGATION_FAILED,
+    )
+)
+_BYTES_PER_MEGABYTE = 1024 * 1024
 
 
 class ManagerServer(HealthAwareServer):
@@ -564,6 +580,19 @@ class ManagerServer(HealthAwareServer):
             ),
             clock=self._clock,
             logger=self._udp_logger,
+        )
+        # AD-41: per-workflow resource budgets, judged on each progress
+        # report the job leader receives (None when guards are disabled).
+        self._resource_enforcer: ResourceEnforcer | None = (
+            ResourceEnforcer(
+                clock=self._clock,
+                default_budget=ResourceBudget.from_env(self._env),
+                on_warn=self._warn_resource_violation,
+                on_kill_workflow=self._kill_workflow_for_resources,
+                on_evict_worker=self._evict_worker_for_resources,
+            )
+            if self._env.RESOURCE_GUARD_ENABLED
+            else None
         )
 
         self._worker_pool = WorkerPool(
@@ -6062,6 +6091,8 @@ class ManagerServer(HealthAwareServer):
         """
         self._task_runner.run(self._job_manager.complete_job, job_id)
         self._task_runner.run(self._raft.consensus.destroy_job_raft, job_id)
+        if self._resource_enforcer is not None:
+            self._resource_enforcer.release_job(job_id)
         self._manager_state.clear_job_state(job_id)
 
         if self._workflow_dispatcher:
@@ -6694,6 +6725,7 @@ class ManagerServer(HealthAwareServer):
 
             stats_worker_id = worker_id or f"{addr[0]}:{addr[1]}"
             await self._stats.record_progress_update(stats_worker_id, progress)
+            await self._enforce_workflow_resources(progress, worker_id)
 
             # Get backpressure signal
             backpressure = self._stats.get_backpressure_signal()
@@ -6732,6 +6764,119 @@ class ManagerServer(HealthAwareServer):
                 backpressure_delay_ms=0,
                 backpressure_batch_only=False,
             ).dump()
+
+    async def _enforce_workflow_resources(
+        self,
+        progress: WorkflowProgress,
+        worker_id: str | None,
+    ) -> None:
+        """AD-41: judge a running workflow's resource estimates; forget it
+        once it reaches a terminal status."""
+        if self._resource_enforcer is None:
+            return
+        if worker_id is None:
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=(
+                        f"Resource check skipped for workflow {progress.workflow_id[:8]}...: "
+                        "progress came from an address with no registered worker"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+        if progress.status in _TERMINAL_WORKFLOW_STATUS_VALUES:
+            self._resource_enforcer.release_workflow(progress.workflow_id)
+            return
+        await self._resource_enforcer.check_workflow(
+            workflow_id=progress.workflow_id,
+            worker_id=worker_id,
+            job_id=progress.job_id,
+            cpu_percent=progress.total_cpu_percent,
+            cpu_uncertainty=progress.total_cpu_uncertainty,
+            memory_bytes=progress.total_memory_mb * _BYTES_PER_MEGABYTE,
+            memory_uncertainty=progress.total_memory_uncertainty_mb * _BYTES_PER_MEGABYTE,
+        )
+
+    async def _warn_resource_violation(
+        self,
+        workflow_id: str,
+        worker_id: str,
+        violation_type: ResourceViolationType,
+        value: float,
+        limit: float,
+    ) -> None:
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Workflow {workflow_id[:8]}... on worker {worker_id[:8]}... "
+                    f"{violation_type.value}: {value:.1f} against a limit of {limit:.1f}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _kill_workflow_for_resources(
+        self,
+        workflow_id: str,
+        worker_id: str,
+        job_id: str,
+        violation_type: ResourceViolationType,
+    ) -> bool:
+        """Kill an over-budget workflow through the normal cancel path."""
+        if (worker := self._manager_state.get_worker(worker_id)) is None:
+            return False
+
+        killed, error = await self._cancel_running_workflow_on_worker(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            worker_addr=(worker.node.host, worker.node.port),
+            requester_id=self._node_id.full,
+            timestamp=self._clock.time(),
+            reason=f"resource budget exceeded: {violation_type.value}",
+        )
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Resource kill of workflow {workflow_id[:8]}... on worker "
+                    f"{worker_id[:8]}... ({violation_type.value}): "
+                    f"{'requested' if killed else f'failed ({error})'}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return killed
+
+    async def _evict_worker_for_resources(
+        self,
+        worker_id: str,
+        violation_type: ResourceViolationType,
+    ) -> bool:
+        """Evict a worker that keeps an over-budget workflow running after
+        repeated kill requests (AD-41 failure modes)."""
+        if self._manager_state.get_worker(worker_id) is None:
+            return False
+        await self._udp_logger.log(
+            ServerError(
+                message=(
+                    f"Worker {worker_id[:8]}... ignored resource kill requests "
+                    f"({violation_type.value}); evicting"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        await self._handle_worker_failure(worker_id)
+        if self._worker_disseminator:
+            await self._worker_disseminator.broadcast_worker_dead(worker_id, "evicted")
+        return True
 
     def _record_workflow_latency_from_results(self, results: list[dict]) -> None:
         for stats in results:
@@ -11124,6 +11269,8 @@ class ManagerServer(HealthAwareServer):
         job_token = self._job_manager.create_job_token(job_id)
         await self._job_manager.remove_job(job_token)
         await self._raft.consensus.destroy_job_raft(job_id)
+        if self._resource_enforcer is not None:
+            self._resource_enforcer.release_job(job_id)
 
     async def _log_job_completion(
         self, job_id: str, final_status: str, total_completed: int, total_failed: int

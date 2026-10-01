@@ -30,4 +30,4 @@ class ManagerClusterResourceView:
     cpu_pressure: float = 0.0
     memory_pressure: float = 0.0
     vector_clock: dict[str, int] = field(default_factory=dict)
-    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK._DEFAULT_CLOCK.monotonic())
+    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())

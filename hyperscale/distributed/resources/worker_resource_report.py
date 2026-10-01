@@ -20,7 +20,7 @@ class WorkerResourceReport:
     total_system_memory_bytes: int = 0
     total_system_cpu_count: int = 0
     version: int = 0
-    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK._DEFAULT_CLOCK.monotonic())
+    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
     def is_stale(self, max_age_seconds: float = 30.0) -> bool:
         """Return True if this report is older than max_age_seconds."""

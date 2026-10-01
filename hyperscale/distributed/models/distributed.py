@@ -1525,6 +1525,17 @@ class WorkflowProgress(Message):
     avg_cpu_percent: float = 0.0  # Average CPU utilization
     avg_memory_mb: float = 0.0  # Average memory usage in MB
     vus: int = 0  # Virtual users (from workflow config)
+    # AD-41: the workflow's whole footprint, summed across its executor
+    # processes (the averages above are per process).
+    # Kalman estimates of the workflow's total use with their standard
+    # deviations -- what the manager's resource enforcer judges. Carried on
+    # progress (TCP, one message per workflow) rather than the spec's
+    # heartbeat map: heartbeats ride SWIM datagrams whose size a
+    # per-workflow map grows without bound.
+    total_cpu_percent: float = 0.0
+    total_cpu_uncertainty: float = 0.0
+    total_memory_mb: float = 0.0
+    total_memory_uncertainty_mb: float = 0.0
     worker_workflow_assigned_cores: int = 0
     worker_workflow_completed_cores: int = 0
     worker_available_cores: int = 0  # Available cores for worker.

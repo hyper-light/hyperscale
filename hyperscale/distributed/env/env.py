@@ -288,6 +288,17 @@ class Env(BaseModel):
     )
     JOB_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between cleanup checks
 
+    # AD-41 resource guards: the per-job budget a workflow is enforced
+    # against when the job assigns none, and the graduated-response
+    # thresholds/graces (values from the AD-41 ResourceBudget spec).
+    RESOURCE_GUARD_ENABLED: StrictBool = True
+    RESOURCE_GUARD_MAX_CPU_PERCENT: StrictFloat = 800.0
+    RESOURCE_GUARD_MAX_MEMORY_BYTES: StrictInt = 16 * 1024 * 1024 * 1024
+    RESOURCE_GUARD_WARNING_THRESHOLD: StrictFloat = 0.8
+    RESOURCE_GUARD_KILL_THRESHOLD: StrictFloat = 1.0
+    RESOURCE_GUARD_WARNING_GRACE_SECONDS: StrictFloat = 10.0
+    RESOURCE_GUARD_KILL_GRACE_SECONDS: StrictFloat = 2.0
+
     # Cancelled Workflow Cleanup Settings (Section 6)
     CANCELLED_WORKFLOW_TTL: StrictFloat = (
         3600.0  # Seconds to retain cancelled workflow info (1 hour)
@@ -892,6 +903,13 @@ class Env(BaseModel):
             "COMPLETED_JOB_MAX_AGE": float,
             "FAILED_JOB_MAX_AGE": float,
             "JOB_CLEANUP_INTERVAL": float,
+            "RESOURCE_GUARD_ENABLED": bool,
+            "RESOURCE_GUARD_MAX_CPU_PERCENT": float,
+            "RESOURCE_GUARD_MAX_MEMORY_BYTES": int,
+            "RESOURCE_GUARD_WARNING_THRESHOLD": float,
+            "RESOURCE_GUARD_KILL_THRESHOLD": float,
+            "RESOURCE_GUARD_WARNING_GRACE_SECONDS": float,
+            "RESOURCE_GUARD_KILL_GRACE_SECONDS": float,
             # Cancelled workflow cleanup settings (Section 6)
             "CANCELLED_WORKFLOW_TTL": float,
             "CANCELLED_WORKFLOW_CLEANUP_INTERVAL": float,

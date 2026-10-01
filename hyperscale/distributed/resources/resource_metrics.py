@@ -16,7 +16,7 @@ class ResourceMetrics:
     memory_uncertainty: float
     memory_percent: float
     file_descriptor_count: int
-    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK._DEFAULT_CLOCK.monotonic())
+    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     sample_count: int = 1
     process_count: int = 1
 

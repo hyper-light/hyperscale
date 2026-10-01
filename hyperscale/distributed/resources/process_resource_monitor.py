@@ -14,16 +14,24 @@ from hyperscale.distributed.runtime import Clock, RealClock
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
+# Kalman noise for resource measurements (CPU in percent, memory in
+# bytes): shared by every resource estimator so node-level and
+# per-workflow estimates carry comparable uncertainty.
+CPU_PROCESS_NOISE = 15.0
+CPU_MEASUREMENT_NOISE = 50.0
+MEMORY_PROCESS_NOISE = 1e6
+MEMORY_MEASUREMENT_NOISE = 1e7
+
 
 @dataclass(slots=True)
 class ProcessResourceMonitor:
     """Monitor resource usage for a process tree with Kalman filtering."""
 
     root_pid: int = field(default_factory=os.getpid)
-    cpu_process_noise: float = 15.0
-    cpu_measurement_noise: float = 50.0
-    memory_process_noise: float = 1e6
-    memory_measurement_noise: float = 1e7
+    cpu_process_noise: float = CPU_PROCESS_NOISE
+    cpu_measurement_noise: float = CPU_MEASUREMENT_NOISE
+    memory_process_noise: float = MEMORY_PROCESS_NOISE
+    memory_measurement_noise: float = MEMORY_MEASUREMENT_NOISE
 
     _process: psutil.Process | None = field(default=None, init=False)
     _cpu_filter: AdaptiveKalmanFilter = field(init=False)
@@ -50,6 +58,11 @@ class ProcessResourceMonitor:
 
         self._total_memory = psutil.virtual_memory().total
         self._cpu_count = psutil.cpu_count() or 1
+
+    @property
+    def total_memory_bytes(self) -> int:
+        """Physical memory of this host, as sampled at construction."""
+        return self._total_memory
 
     async def sample(self) -> ResourceMetrics:
         """Sample the process tree and return filtered metrics."""

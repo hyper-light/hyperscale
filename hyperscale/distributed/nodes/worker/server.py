@@ -32,6 +32,7 @@ from hyperscale.distributed.models import (
 from hyperscale.distributed.jobs import AllocationResult
 from hyperscale.distributed.jobs import CoreAllocator
 from hyperscale.distributed.resources import ProcessResourceMonitor
+from hyperscale.distributed.resources.workflow_resource_tracker import WorkflowResourceTracker
 from hyperscale.distributed.protocol.version import (
     NodeCapabilities,
     NegotiatedCapabilities,
@@ -433,6 +434,11 @@ class WorkerServer(HealthAwareServer):
             backpressure_manager=self._backpressure_manager,
             env=env,
             logger=self._udp_logger,
+            resource_tracker=WorkflowResourceTracker(
+                clock=self._clock,
+                total_memory_bytes=self._resource_monitor.total_memory_bytes,
+            ),
+            task_runner=self._task_runner,
         )
 
         self._cancellation_handler_impl: WorkerCancellationHandler = (

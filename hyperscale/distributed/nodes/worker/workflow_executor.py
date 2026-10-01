@@ -10,6 +10,10 @@ from typing import Any, TYPE_CHECKING
 
 import cloudpickle
 
+from hyperscale.distributed.resources.workflow_resource_tracker import (
+    BYTES_PER_MEGABYTE,
+    WorkflowResourceTracker,
+)
 from hyperscale.core.jobs.models.workflow_status import (
     WorkflowStatus as CoreWorkflowStatus,
 )
@@ -42,6 +46,7 @@ if TYPE_CHECKING:
     from .lifecycle import WorkerLifecycleManager
     from .state import WorkerState
     from .backpressure import WorkerBackpressureManager
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class WorkerWorkflowExecutor:
@@ -61,6 +66,9 @@ class WorkerWorkflowExecutor:
         backpressure_manager: "WorkerBackpressureManager | None" = None,
         env: "Env | None" = None,
         logger: "Logger | None" = None,
+        *,
+        resource_tracker: "WorkflowResourceTracker",
+        task_runner: "TaskRunner",
     ) -> None:
         """
         Initialize workflow executor.
@@ -81,6 +89,10 @@ class WorkerWorkflowExecutor:
         )
         self._env: "Env | None" = env
         self._logger: "Logger | None" = logger
+        # AD-41 per-workflow resource estimates (Kalman over the executors'
+        # measurements), released with each workflow.
+        self._resource_tracker = resource_tracker
+        self._task_runner = task_runner
 
         # Event logger for crash forensics (AD-47)
         self._event_logger: Logger | None = None
@@ -251,7 +263,7 @@ class WorkerWorkflowExecutor:
         workflow_error: str | None = None
         workflow_results: Any = {}
         context_updates: bytes = b""
-        progress_token = None
+        progress_monitor_token: str | None = None
 
         if self._event_logger is not None:
             await self._event_logger.log(
@@ -288,6 +300,27 @@ class WorkerWorkflowExecutor:
             remote_manager = self._lifecycle.remote_manager
             if not remote_manager:
                 raise RuntimeError("RemoteGraphManager not available")
+
+            # In-flight progress for the whole run: live stats, AD-26
+            # extension evidence, AD-41 resource estimates. The monolithic
+            # worker started this monitor here; the modular split kept
+            # the method and dropped the call, so a running workflow
+            # reported nothing until its final result. One alias for
+            # every run keeps the TaskRunner's task map bounded.
+            progress_monitor_run = self._task_runner.run(
+                self.monitor_workflow_progress,
+                dispatch,
+                progress,
+                run_id,
+                cancel_event,
+                node_host,
+                node_port,
+                node_id_full,
+                alias="workflow_progress_monitor",
+            )
+            progress_monitor_token = (
+                f"{progress_monitor_run.task_name}:{progress_monitor_run.run_id}"
+            )
 
             (
                 _,
@@ -341,6 +374,9 @@ class WorkerWorkflowExecutor:
             # detector keeps its per-heartbeat CPU/memory resource
             # signal; its latency paths stay dormant until a genuine
             # per-operation latency source feeds them.
+
+            if progress_monitor_token is not None:
+                await self._task_runner.cancel(progress_monitor_token)
 
             # Free cores
             await self._core_allocator.free(dispatch.workflow_id)
@@ -405,6 +441,7 @@ class WorkerWorkflowExecutor:
             if self._should_send_final_result(dispatch.workflow_id, progress.status):
                 await send_final_result_callback(final_result)
         finally:
+            self._resource_tracker.release(dispatch.workflow_id)
             self._state.remove_active_workflow(dispatch.workflow_id)
             self._state._workflow_fence_tokens.pop(dispatch.workflow_id, None)
             self._state._workflow_cancel_events.pop(dispatch.workflow_id, None)
@@ -425,7 +462,6 @@ class WorkerWorkflowExecutor:
         progress: WorkflowProgress,
         run_id: int,
         cancel_event: asyncio.Event,
-        send_progress: callable,
         node_host: str,
         node_port: int,
         node_id_short: str,
@@ -440,7 +476,6 @@ class WorkerWorkflowExecutor:
             progress: Progress tracker
             run_id: Workflow run ID
             cancel_event: Cancellation event
-            send_progress: Function to send progress updates
             node_host: This worker's host
             node_port: This worker's port
             node_id_short: This worker's short node ID
@@ -453,6 +488,7 @@ class WorkerWorkflowExecutor:
             return
 
         while not cancel_event.is_set():
+            open('/private/tmp/claude-501/-Users-adalundhe-Projects-hyperscale/46360c3d-a86e-4bf8-b5b5-c784215ec6f0/scratchpad/monitor_trace.log', "a").write(f"ITER t={asyncio.get_running_loop().time():.3f} wf={progress.workflow_id[-12:]}\n")
             try:
                 # Wait for update from remote manager
                 workflow_status_update = await remote_manager.wait_for_workflow_update(
@@ -466,11 +502,12 @@ class WorkerWorkflowExecutor:
 
                 status = CoreWorkflowStatus(workflow_status_update.status)
 
-                # Get system stats
-                avg_cpu, avg_mem = self._lifecycle.get_monitor_averages(
-                    run_id,
-                    workflow_name,
-                )
+                # Per-workflow resource use as measured by the executors
+                # running it. (Read from the worker's own monitors, keyed
+                # (run_id, workflow_name) while those sample under
+                # (datacenter_id, node_id), it was always 0.)
+                avg_cpu = workflow_status_update.avg_cpu_usage or 0.0
+                avg_mem = workflow_status_update.avg_memory_usage_mb or 0.0
 
                 # Update progress
                 progress.completed_count = workflow_status_update.completed_count
@@ -485,6 +522,18 @@ class WorkerWorkflowExecutor:
                 progress.collected_at = _DEFAULT_CLOCK.time()
                 progress.avg_cpu_percent = avg_cpu
                 progress.avg_memory_mb = avg_mem
+                resource_estimate = self._resource_tracker.observe(
+                    dispatch.workflow_id,
+                    cpu_percent=workflow_status_update.total_cpu_usage or 0.0,
+                    memory_megabytes=workflow_status_update.total_memory_usage_mb or 0.0,
+                    process_count=max(len(progress.assigned_cores), 1),
+                )
+                progress.total_cpu_percent = resource_estimate.cpu_percent
+                progress.total_cpu_uncertainty = resource_estimate.cpu_uncertainty
+                progress.total_memory_mb = resource_estimate.memory_bytes / BYTES_PER_MEGABYTE
+                progress.total_memory_uncertainty_mb = (
+                    resource_estimate.memory_uncertainty / BYTES_PER_MEGABYTE
+                )
 
                 # Get availability
                 (
@@ -545,6 +594,7 @@ class WorkerWorkflowExecutor:
                 break
 
             except Exception as err:
+                open('/private/tmp/claude-501/-Users-adalundhe-Projects-hyperscale/46360c3d-a86e-4bf8-b5b5-c784215ec6f0/scratchpad/monitor_trace.log', "a").write(f"EXC t={asyncio.get_running_loop().time():.3f} {err!r}\n")
                 if self._logger:
                     await self._logger.log(
                         ServerError(
