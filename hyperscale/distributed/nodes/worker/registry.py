@@ -33,6 +33,8 @@ class WorkerRegistry:
         recovery_jitter_min: float = 0.0,
         recovery_jitter_max: float = 1.0,
         recovery_semaphore_size: int = 5,
+        *,
+        select_manager: Callable[[set[str]], str | None],
     ) -> None:
         """
         Initialize worker registry.
@@ -42,8 +44,12 @@ class WorkerRegistry:
             recovery_jitter_min: Minimum jitter for recovery operations
             recovery_jitter_max: Maximum jitter for recovery operations
             recovery_semaphore_size: Concurrent recovery limit
+            select_manager: AD-28 selection over a set of healthy manager
+                ids (weighted rendezvous + power of two choices + EWMA);
+                returns the chosen id or None when it cannot choose
         """
         self._logger: "Logger" = logger
+        self._select_manager: Callable[[set[str]], str | None] = select_manager
         self._recovery_jitter_min: float = recovery_jitter_min
         self._recovery_jitter_max: float = recovery_jitter_max
         self._recovery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
@@ -294,13 +300,22 @@ class WorkerRegistry:
                     self._primary_manager_id = manager_id
                     return manager_id
 
-        # Otherwise pick any healthy manager
-        if self._healthy_manager_ids:
-            self._primary_manager_id = next(iter(self._healthy_manager_ids))
-            return self._primary_manager_id
+        # Otherwise let AD-28 selection choose: rendezvous ranking spreads
+        # workers across managers deterministically and the EWMA latency
+        # comparison steers away from slow ones. If it cannot choose
+        # (e.g. a manager not yet known to discovery), fall back to a
+        # deterministic pick rather than set-iteration order.
+        healthy_manager_ids = set(self._healthy_manager_ids)
+        if not healthy_manager_ids:
+            self._primary_manager_id = None
+            return None
 
-        self._primary_manager_id = None
-        return None
+        selected = self._select_manager(healthy_manager_ids)
+        if selected not in healthy_manager_ids:
+            selected = min(healthy_manager_ids)
+
+        self._primary_manager_id = selected
+        return selected
 
     def find_manager_by_udp_addr(self, udp_addr: tuple[str, int]) -> str | None:
         """Find manager ID by UDP address."""

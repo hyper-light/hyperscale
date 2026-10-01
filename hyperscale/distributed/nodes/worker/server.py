@@ -169,6 +169,13 @@ class WorkerServer(HealthAwareServer):
             recovery_jitter_min=env.RECOVERY_JITTER_MIN,
             recovery_jitter_max=env.RECOVERY_JITTER_MAX,
             recovery_semaphore_size=env.RECOVERY_SEMAPHORE_SIZE,
+            # Resolved at call time: the discovery manager is built below.
+            select_manager=lambda healthy_manager_ids: (
+                self._discovery_manager.select_best_manager(
+                    self._node_id.full,
+                    healthy_manager_ids,
+                )
+            ),
         )
 
         self._backpressure_manager: WorkerBackpressureManager = (
@@ -1779,6 +1786,7 @@ class WorkerServer(HealthAwareServer):
         timeout: float = 5.0,
     ) -> bytes | Exception:
         """Send registration data to manager."""
+        sent_at = self._clock.monotonic()
         try:
             response, _ = await self.send_tcp(
                 manager_addr,
@@ -1792,18 +1800,42 @@ class WorkerServer(HealthAwareServer):
             # Parsing it as a response turned every such failure into
             # "TypeError: a bytes-like object is required".
             if isinstance(response, Exception):
+                self._record_manager_failure(manager_addr)
                 return response
 
             accepted, _ = await self._process_manager_registration_response(
                 response
             )
             if not accepted:
+                self._record_manager_failure(manager_addr)
                 return RuntimeError(
                     f"Manager {manager_addr} rejected worker registration"
                 )
+            self._record_manager_round_trip(
+                manager_addr,
+                self._clock.monotonic() - sent_at,
+            )
             return response
         except Exception as error:
+            self._record_manager_failure(manager_addr)
             return error
+
+    def _record_manager_round_trip(
+        self,
+        manager_addr: tuple[str, int],
+        round_trip_seconds: float,
+    ) -> None:
+        """Feed a manager round trip into AD-28's EWMA latency ranking."""
+        if manager := self._registry.get_manager_by_addr(manager_addr):
+            self._discovery_manager.record_success(
+                manager.node_id,
+                round_trip_seconds * 1000.0,
+            )
+
+    def _record_manager_failure(self, manager_addr: tuple[str, int]) -> None:
+        """Count a failed round trip against a known manager (AD-28)."""
+        if manager := self._registry.get_manager_by_addr(manager_addr):
+            self._discovery_manager.record_failure(manager.node_id)
 
     async def _process_manager_registration_response(
         self,

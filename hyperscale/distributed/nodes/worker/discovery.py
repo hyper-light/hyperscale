@@ -99,41 +99,32 @@ class WorkerDiscoveryManager:
         self,
         key: str,
         healthy_manager_ids: set[str],
-    ) -> tuple[str, int] | None:
+    ) -> str | None:
         """
-        Select the best manager for a given key using adaptive selection (AD-28).
+        Select a manager for ``key`` using adaptive selection (AD-28).
 
-        Uses Power of Two Choices with EWMA for load-aware selection,
-        with locality preferences if configured.
+        Weighted rendezvous ranking, then Power of Two Choices on EWMA
+        latency, restricted to ``healthy_manager_ids``. Discovery peers are
+        keyed by manager node id (registration adds them that way).
 
         Args:
-            key: Key for consistent selection (e.g., workflow_id)
-            healthy_manager_ids: Set of healthy manager IDs to consider
+            key: Rendezvous key (the worker's own node id spreads workers
+                across managers deterministically)
+            healthy_manager_ids: Manager node ids eligible for selection
 
         Returns:
-            Tuple of (host, port) for the selected manager, or None if unavailable
+            The selected manager node id, or None if none is eligible
         """
+        selection = self._discovery_service.select_peer_with_filter(
+            key,
+            healthy_manager_ids.__contains__,
+        )
+        return selection.peer_id if selection is not None else None
 
-        def is_healthy(peer_id: str) -> bool:
-            return peer_id in healthy_manager_ids
+    def record_success(self, manager_id: str, latency_ms: float) -> None:
+        """Feed a successful round trip into the manager's EWMA latency."""
+        self._discovery_service.record_success(manager_id, latency_ms)
 
-        selection = self._discovery_service.select_peer_with_filter(key, is_healthy)
-        if not selection:
-            return None
-
-        # Parse host:port from selection
-        if ":" in selection:
-            host, port_str = selection.rsplit(":", 1)
-            return (host, int(port_str))
-
-        return None
-
-    def record_success(self, peer_addr: tuple[str, int]) -> None:
-        """Record a successful interaction with a peer."""
-        peer_id = f"{peer_addr[0]}:{peer_addr[1]}"
-        self._discovery_service.record_success(peer_id)
-
-    def record_failure(self, peer_addr: tuple[str, int]) -> None:
-        """Record a failed interaction with a peer."""
-        peer_id = f"{peer_addr[0]}:{peer_addr[1]}"
-        self._discovery_service.record_failure(peer_id)
+    def record_failure(self, manager_id: str) -> None:
+        """Record a failed interaction with a manager."""
+        self._discovery_service.record_failure(manager_id)
