@@ -2,18 +2,21 @@
 Real `hyperscale run <role>` processes for CLI end-to-end tests: port
 reservation below the OS ephemeral range, a node wrapper capturing its
 output, boot/stop helpers bounded by the nodes' own --boot-timeout and
---shutdown-timeout, and leak checks scoped to one test run by an
-environment marker every launched process inherits.
+--shutdown-timeout, leak checks scoped to one test run by an
+environment marker every launched process inherits, and a temporary
+--data-directory per manager and gate, removed at teardown.
 
 Run from the repo root (the commands are invoked from `.venv/bin`).
 """
 
 import asyncio
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -105,6 +108,9 @@ def reserve_port_blocks(block_sizes: list[int]) -> list[int]:
     return block_starts
 
 
+DURABLE_ROLES = frozenset({"manager", "gate"})
+
+
 class CommandNode:
     """One `hyperscale run <role>` process with captured output."""
 
@@ -127,11 +133,19 @@ class CommandNode:
         # The boot marker is an INFO log: without an explicit level the
         # node runs at the CLI default ("fatal") and never prints it.
         log_level = () if "--log-level" in extra else ("--log-level", "info")
+        # Durable roles keep their state in a directory of their own that
+        # the test removes at teardown, never in the repository.
+        self.data_directory: str | None = (
+            tempfile.mkdtemp(prefix=f"hyperscale-{role}-")
+            if role in DURABLE_ROLES and "--data-directory" not in extra
+            else None
+        )
+        data_directory = () if self.data_directory is None else ("--data-directory", self.data_directory)
         self._arguments = [
             role, "--tcp-port", str(tcp_port), "--udp-port", str(udp_port),
             "--boot-timeout", f"{int(BOOT_TIMEOUT_SECONDS)}s",
             "--shutdown-timeout", f"{int(SHUTDOWN_TIMEOUT_SECONDS)}s",
-            *log_level, *extra,
+            *log_level, *data_directory, *extra,
         ]
         self.lines: list[str] = []
         self.process: asyncio.subprocess.Process | None = None
@@ -257,6 +271,10 @@ async def kill_remaining(nodes: list[CommandNode]) -> None:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+    for node in nodes:
+        if node.data_directory is not None:
+            shutil.rmtree(node.data_directory)
 
 
 NODE_BLOCK = 2  # tcp, udp

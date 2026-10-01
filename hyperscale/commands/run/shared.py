@@ -2,6 +2,8 @@ import asyncio
 import functools
 import json
 import os
+import pathlib
+import re
 import psutil
 
 
@@ -78,3 +80,63 @@ def node_env(**explicit_values) -> Env:
     operator exported (resource guards, timeouts, intervals).
     """
     return load_env(Env, override=Env(**explicit_values))
+
+
+_UNSAFE_PATH_CHARACTERS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _create_node_data_directory(
+    data_directory: str | None,
+    logs_directory: str,
+    role: str,
+    datacenter: str,
+    host: str,
+    tcp_port: int,
+) -> pathlib.Path:
+    if data_directory:
+        directory = pathlib.Path(data_directory)
+    else:
+        # One directory per node identity: a node restarted at the same
+        # address finds -- and recovers from -- its own durable state.
+        # Host characters a filesystem may reject (IPv6 colons) are
+        # replaced, so the name is valid on any OS.
+        node_name = _UNSAFE_PATH_CHARACTERS.sub(
+            "_",
+            f"{role}-{datacenter}-{host}-{tcp_port}",
+        )
+        directory = pathlib.Path(logs_directory).parent / "data" / node_name
+
+    directory = directory.absolute()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+async def node_data_directory(
+    data_directory: str | None,
+    logs_directory: str,
+    role: str,
+    datacenter: str,
+    host: str,
+    tcp_port: int,
+) -> pathlib.Path:
+    """The directory a manager or gate keeps its durable state in (job
+    ledger WAL, checkpoints, archive, idempotency WAL, incarnation).
+
+    ``--data-directory`` when given; otherwise a directory per node
+    identity under ``data/`` beside the configured logs directory. It is
+    created if missing; a location that cannot be created fails the
+    command instead of running the node without durability.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        functools.partial(
+            _create_node_data_directory,
+            data_directory,
+            logs_directory,
+            role,
+            datacenter,
+            host,
+            tcp_port,
+        ),
+    )

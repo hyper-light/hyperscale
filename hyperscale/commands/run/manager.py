@@ -6,7 +6,12 @@ from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.jobs.models import HyperscaleConfig
 from hyperscale.logging import LoggingConfig, LogLevelName
 
-from .shared import get_default_config, node_env, resolve_auth_secret
+from .shared import (
+    get_default_config,
+    node_data_directory,
+    node_env,
+    resolve_auth_secret,
+)
 from .shutdown_signals import ShutdownSignals
 
 
@@ -22,6 +27,7 @@ async def manager(
     boot_timeout: str = '5m',
     shutdown_timeout: str = "1m",
     acm_secret: str | None = None,
+    data_directory: str | None = None,
     config: JsonFile[HyperscaleConfig] = get_default_config,
     log_level: AssertSet[LogLevelName] = "fatal",
 ):
@@ -36,6 +42,7 @@ async def manager(
     @param boot_timeout How long to wait for the manager to boot
     @param shutdown_timeout How long to wait for the manager to shut down
     @param acm_secret The shared cluster secret (defaults to MERCURY_SYNC_AUTH_SECRET)
+    @param data_directory Where the manager keeps its durable state (defaults to a directory per manager under data/ beside the logs directory)
     @param config A path to a valid .hyperscale.json config file
     @param log_level The log level to use
     """
@@ -51,6 +58,15 @@ async def manager(
         MERCURY_SYNC_LOG_LEVEL=log_level.data,
     )
 
+    node_directory = await node_data_directory(
+        data_directory,
+        config.data.logs_directory,
+        "manager",
+        datacenter,
+        host,
+        tcp_port,
+    )
+
     start_timeout_sec = TimeParser(boot_timeout).time
     shutdown_timeout_sec = TimeParser(shutdown_timeout).time
 
@@ -60,6 +76,7 @@ async def manager(
         udp_port=udp_port,
         env=env,
         dc_id=datacenter,
+        wal_data_dir=node_directory,
     )
 
     try:
