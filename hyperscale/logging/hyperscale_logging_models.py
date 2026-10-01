@@ -302,6 +302,14 @@ class StorageFormatUnrecognized(Entry, kw_only=True):
     level: LogLevel = LogLevel.ERROR
 
 
+class WALTailDiscarded(Entry, kw_only=True):
+    path: str
+    preserved_path: str
+    discarded_bytes: int
+    recovered_entries: int
+    level: LogLevel = LogLevel.WARN
+
+
 class WorkerStarted(Entry, kw_only=True):
     node_id: str
     node_host: str

@@ -19,8 +19,11 @@ from .entry_state import WALEntryState, TransitionResult
 from hyperscale.distributed.ledger.storage_format import (
     StorageFormat,
     UnrecognizedStorageFormatError,
+    free_sibling_path,
+    require_stable_read,
     set_aside_unrecognized,
 )
+from hyperscale.logging.hyperscale_logging_models import WALTailDiscarded
 from .wal_entry import HEADER_SIZE, WALEntry
 from .wal_status_snapshot import WALStatusSnapshot
 from hyperscale.distributed.runtime import (
@@ -148,7 +151,9 @@ class NodeWAL:
         if await self._filesystem.exists(self._path):
             data = await self._filesystem.read_bytes(self._path)
             if await self._accept_existing_file(data):
-                self._recover(data)
+                recovered_count, recovered_length = self._recover(data)
+                if recovered_length < len(data):
+                    await self._discard_unrecoverable_tail(data, recovered_count, recovered_length)
 
         # A new WAL starts with its format header, before any entry.
         if not await self._filesystem.exists(self._path):
@@ -179,8 +184,40 @@ class NodeWAL:
             return False
         return True
 
-    def _recover(self, data: bytes) -> None:
-        recovered_entries = self._parse_frames(WAL_FORMAT.decode(data))
+    async def _discard_unrecoverable_tail(
+        self, data: bytes, recovered_count: int, recovered_length: int
+    ) -> None:
+        """Cut the file back to its last recoverable frame.
+
+        Recovery stops at the first torn or corrupt frame; left in place,
+        that frame would hide every entry appended after it from the next
+        recovery -- acknowledged writes lost on the following restart. The
+        discarded bytes (a crash's torn append, or damage) are preserved
+        beside the WAL, never destroyed.
+        """
+        await require_stable_read(self._filesystem, self._path, data)
+        preserved_path = await free_sibling_path(self._filesystem, self._path, "discarded")
+        await self._filesystem.atomic_write(preserved_path, data[recovered_length:])
+        await self._filesystem.atomic_write(self._path, data[:recovered_length])
+        if self._logger is not None:
+            await self._logger.log(
+                WALTailDiscarded(
+                    message=(
+                        f"WAL {self._path}: {len(data) - recovered_length} bytes after the last "
+                        f"recoverable entry discarded (preserved at {preserved_path})"
+                    ),
+                    path=str(self._path),
+                    preserved_path=str(preserved_path),
+                    discarded_bytes=len(data) - recovered_length,
+                    recovered_entries=recovered_count,
+                )
+            )
+
+    def _recover(self, data: bytes) -> tuple[int, int]:
+        """Recover the entries in ``data``: how many, and the length of
+        its recoverable prefix (format header plus every whole, valid
+        frame)."""
+        recovered_entries, frames_length = self._parse_frames(WAL_FORMAT.decode(data))
         next_lsn = max((entry.lsn + 1 for entry in recovered_entries), default=0)
         last_synced_lsn = recovered_entries[-1].lsn if recovered_entries else -1
 
@@ -197,12 +234,13 @@ class NodeWAL:
             closed=False,
         )
         self._pending_snapshot = MappingProxyType(dict(self._pending_entries_internal))
+        return len(recovered_entries), WAL_FORMAT.header_size + frames_length
 
     @staticmethod
-    def _parse_frames(frames: bytes) -> list[WALEntry]:
+    def _parse_frames(frames: bytes) -> tuple[list[WALEntry], int]:
         """The entries in the bytes after the format header, up to the
         first torn or corrupt frame (a crash mid-append leaves at most
-        one, at the tail)."""
+        one, at the tail), and how many bytes those entries span."""
         entries: list[WALEntry] = []
         offset = 0
         while offset + HEADER_SIZE <= len(frames):
@@ -214,7 +252,7 @@ class NodeWAL:
             except ValueError:
                 break
             offset += total_length
-        return entries
+        return entries, offset
 
     async def append(
         self,
@@ -387,7 +425,7 @@ class NodeWAL:
         assert loop is not None
 
         data = await self._filesystem.read_bytes(self._path)
-        for entry in self._parse_frames(WAL_FORMAT.decode(data)):
+        for entry in self._parse_frames(WAL_FORMAT.decode(data))[0]:
             if entry.lsn >= start_lsn:
                 yield entry
 

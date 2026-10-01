@@ -10,6 +10,23 @@ from hyperscale.distributed.ledger.storage_format.unstable_storage_read_error im
 )
 
 
+async def free_sibling_path(filesystem: Filesystem, path: Path, label: str) -> Path:
+    """The first ``<name>.<label>-<n>`` beside ``path`` that does not
+    exist: preserved bytes never overwrite earlier ones."""
+    attempt = 0
+    while await filesystem.exists(sibling := path.with_name(f"{path.name}.{label}-{attempt}")):
+        attempt += 1
+    return sibling
+
+
+async def require_stable_read(filesystem: Filesystem, path: Path, data: bytes) -> None:
+    """Raise ``UnstableStorageReadError`` unless ``path`` still reads as
+    ``data``: a verdict drawn from bytes a faulty read path flipped must
+    not destroy anything on disk."""
+    if await filesystem.read_bytes(path) != data:
+        raise UnstableStorageReadError(path)
+
+
 async def set_aside_unrecognized(
     filesystem: Filesystem,
     path: Path,
@@ -28,11 +45,8 @@ async def set_aside_unrecognized(
     a faulty read path flipped must not remove an intact file, so reads
     that disagree raise ``UnstableStorageReadError`` and nothing moves.
     """
-    if await filesystem.read_bytes(path) != data:
-        raise UnstableStorageReadError(path)
-    attempt = 0
-    while await filesystem.exists(aside := path.with_name(f"{path.name}.unrecognized-{attempt}")):
-        attempt += 1
+    await require_stable_read(filesystem, path, data)
+    aside = await free_sibling_path(filesystem, path, "unrecognized")
     await filesystem.atomic_write(aside, data)
     await filesystem.remove(path)
     await logger.log(
