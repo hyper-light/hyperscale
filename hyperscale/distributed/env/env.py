@@ -7,6 +7,11 @@ from typing import Callable, Dict, Literal, Union
 PrimaryType = Union[str, int, float, bytes, bool]
 
 
+def parse_bool_envar(value: str) -> bool:
+    """Parse a boolean environment variable (``bool("false")`` is True)."""
+    return value.lower() == "true"
+
+
 class Env(BaseModel):
     MERCURY_SYNC_CONNECT_SECONDS: StrictStr = "5s"
     MERCURY_SYNC_SERVER_URL: StrictStr | None = None
@@ -806,13 +811,13 @@ class Env(BaseModel):
             "MERCURY_SYNC_TASK_RUNNER_MAX_THREADS": int,
             "MERCURY_SYNC_TASK_RUNNER_KEEP": int,
             "MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE": int,
-            "MERCURY_SYNC_ENABLE_REQUEST_CACHING": str,
+            "MERCURY_SYNC_ENABLE_REQUEST_CACHING": parse_bool_envar,
             "MERCURY_SYNC_UDP_SERVER_RCVBUF": int,
             # Monitor settings
             "MERCURY_SYNC_MONITOR_SAMPLE_WINDOW": str,
-            "MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL": float,
+            "MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL": str,
             "MERCURY_SYNC_PROCESS_JOB_CPU_LIMIT": float,
-            "MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT": float,
+            "MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT": int,
             # SWIM settings
             "SWIM_MAX_PROBE_TIMEOUT": int,
             "SWIM_MIN_PROBE_TIMEOUT": int,
@@ -926,7 +931,7 @@ class Env(BaseModel):
             "GATE_TCP_TIMEOUT_STANDARD": float,
             "GATE_TCP_TIMEOUT_FORWARD": float,
             "GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS": float,
-            "GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS": bool,
+            "GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS": parse_bool_envar,
             # Gate orphan grace period settings (Section 7)
             "GATE_ORPHAN_GRACE_PERIOD": float,
             "GATE_ORPHAN_CHECK_INTERVAL": float,
@@ -1027,19 +1032,19 @@ class Env(BaseModel):
             "CROSS_DC_FLAP_DETECTION_WINDOW": float,
             "CROSS_DC_FLAP_COOLDOWN": float,
             # Latency-based correlation settings
-            "CROSS_DC_ENABLE_LATENCY_CORRELATION": bool,
+            "CROSS_DC_ENABLE_LATENCY_CORRELATION": parse_bool_envar,
             "CROSS_DC_LATENCY_ELEVATED_THRESHOLD_MS": float,
             "CROSS_DC_LATENCY_CRITICAL_THRESHOLD_MS": float,
             "CROSS_DC_MIN_LATENCY_SAMPLES": int,
             "CROSS_DC_LATENCY_SAMPLE_WINDOW": float,
             "CROSS_DC_LATENCY_CORRELATION_FRACTION": float,
             # Extension-based correlation settings
-            "CROSS_DC_ENABLE_EXTENSION_CORRELATION": bool,
+            "CROSS_DC_ENABLE_EXTENSION_CORRELATION": parse_bool_envar,
             "CROSS_DC_EXTENSION_COUNT_THRESHOLD": int,
             "CROSS_DC_EXTENSION_CORRELATION_FRACTION": float,
             "CROSS_DC_EXTENSION_WINDOW": float,
             # LHM-based correlation settings
-            "CROSS_DC_ENABLE_LHM_CORRELATION": bool,
+            "CROSS_DC_ENABLE_LHM_CORRELATION": parse_bool_envar,
             "CROSS_DC_LHM_STRESSED_THRESHOLD": int,
             "CROSS_DC_LHM_CORRELATION_FRACTION": float,
             # Recovery and thundering herd settings
@@ -1066,6 +1071,73 @@ class Env(BaseModel):
             "OUTGOING_OVERFLOW_SIZE": int,
             "OUTGOING_MAX_DESTINATIONS": int,
             "CANCELLED_WORKFLOW_TIMEOUT": float,
+            # Transport / TLS settings
+            "MERCURY_SYNC_AUTH_SECRET_PREVIOUS": str,
+            "MERCURY_SYNC_TCP_SERVER_BACKLOG": int,
+            "MERCURY_SYNC_VERIFY_SSL_CERT": str,
+            "MERCURY_SYNC_TLS_VERIFY_HOSTNAME": str,
+            "MERCURY_SYNC_CONNECT_TIMEOUT": str,
+            "MERCURY_SYNC_RETRY_INTERVAL": str,
+            "MERCURY_SYNC_SEND_RETRIES": int,
+            "MERCURY_SYNC_CONNECT_RETRIES": int,
+            "MERCURY_SYNC_MAX_RUNNING_WORKFLOWS": int,
+            "MERCURY_SYNC_MAX_PENDING_WORKFLOWS": int,
+            "MERCURY_SYNC_CONTEXT_POLL_RATE": str,
+            "MERCURY_SYNC_SHUTDOWN_POLL_RATE": str,
+            "MERCURY_SYNC_DUPLICATE_JOB_POLICY": str,
+            # Job lease settings
+            "JOB_LEASE_DURATION": float,
+            "JOB_LEASE_CLEANUP_INTERVAL": float,
+            # Idempotency settings (AD-40)
+            "IDEMPOTENCY_PENDING_TTL_SECONDS": float,
+            "IDEMPOTENCY_COMMITTED_TTL_SECONDS": float,
+            "IDEMPOTENCY_REJECTED_TTL_SECONDS": float,
+            "IDEMPOTENCY_MAX_ENTRIES": int,
+            "IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS": float,
+            "IDEMPOTENCY_WAIT_FOR_PENDING": parse_bool_envar,
+            "IDEMPOTENCY_PENDING_WAIT_TIMEOUT": float,
+            # Worker registration settings
+            "WORKER_REGISTRATION_MAX_RETRIES": int,
+            "WORKER_REGISTRATION_BASE_DELAY": float,
+            "WORKER_INITIAL_REGISTRATION_JITTER_MAX": float,
+            # Job responsiveness / timeout settings
+            "JOB_RESPONSIVENESS_THRESHOLD": float,
+            "JOB_RESPONSIVENESS_CHECK_INTERVAL": float,
+            "JOB_TIMEOUT_CHECK_INTERVAL": float,
+            # Adaptive routing settings
+            "ADAPTIVE_ROUTING_ENABLED": parse_bool_envar,
+            "ADAPTIVE_ROUTING_EWMA_ALPHA": float,
+            "ADAPTIVE_ROUTING_MIN_SAMPLES": int,
+            "ADAPTIVE_ROUTING_MAX_STALENESS_SECONDS": float,
+            "ADAPTIVE_ROUTING_LATENCY_CAP_MS": float,
+            # Capacity spillover settings (AD-43)
+            "SPILLOVER_MAX_WAIT_SECONDS": float,
+            "SPILLOVER_MAX_LATENCY_PENALTY_MS": float,
+            "SPILLOVER_MIN_IMPROVEMENT_RATIO": float,
+            "SPILLOVER_ENABLED": parse_bool_envar,
+            "CAPACITY_STALENESS_THRESHOLD_SECONDS": float,
+            # Discovery settings (AD-28)
+            "DISCOVERY_DNS_NAMES": str,
+            "DISCOVERY_DNS_CACHE_TTL": float,
+            "DISCOVERY_DNS_TIMEOUT": float,
+            "DISCOVERY_DEFAULT_PORT": int,
+            "DISCOVERY_DNS_ALLOWED_CIDRS": str,
+            "DISCOVERY_DNS_BLOCK_PRIVATE_FOR_PUBLIC": parse_bool_envar,
+            "DISCOVERY_DNS_DETECT_IP_CHANGES": parse_bool_envar,
+            "DISCOVERY_DNS_MAX_IP_CHANGES": int,
+            "DISCOVERY_DNS_IP_CHANGE_WINDOW": float,
+            "DISCOVERY_DNS_REJECT_ON_VIOLATION": parse_bool_envar,
+            "DISCOVERY_DATACENTER_ID": str,
+            "DISCOVERY_REGION_ID": str,
+            "DISCOVERY_PREFER_SAME_DC": parse_bool_envar,
+            "DISCOVERY_CANDIDATE_SET_SIZE": int,
+            "DISCOVERY_EWMA_ALPHA": float,
+            "DISCOVERY_BASELINE_LATENCY_MS": float,
+            "DISCOVERY_LATENCY_MULTIPLIER_THRESHOLD": float,
+            "DISCOVERY_MIN_PEERS_PER_TIER": int,
+            "DISCOVERY_MAX_CONCURRENT_PROBES": int,
+            "DISCOVERY_PROBE_INTERVAL": float,
+            "DISCOVERY_FAILURE_DECAY_INTERVAL": float,
         }
 
     def get_swim_init_context(self) -> dict:

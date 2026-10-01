@@ -34,7 +34,10 @@ def load_env(default: type[Env], env_file: str = None, override: T | None = None
         values.update(env_file_values)
 
     if override:
-        values.update(**override.model_dump(exclude_none=True))
+        values.update(**override.model_dump(
+            exclude_unset=True, 
+            exclude_none=True,
+        ))
 
         return type(override)(
             **{name: value for name, value in values.items() if value is not None}
