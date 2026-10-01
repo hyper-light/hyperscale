@@ -19,6 +19,8 @@ from unittest.mock import Mock, AsyncMock
 
 import pytest
 
+from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.nodes.client.protocol import ClientProtocol
 from hyperscale.distributed.nodes.client.leadership import ClientLeadershipTracker
@@ -26,6 +28,17 @@ from hyperscale.distributed.nodes.client.tracking import ClientJobTracker
 from hyperscale.distributed.nodes.client.config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.models import ClientJobResult
+
+def make_client_discovery() -> DiscoveryService:
+    """AD-28 discovery service as HyperscaleClient builds it."""
+    return DiscoveryService(
+        Env().get_discovery_config(
+            node_role="client",
+            static_seeds=[],
+            allow_dynamic_registration=True,
+        )
+    )
+
 
 
 def make_mock_logger():
@@ -49,7 +62,7 @@ class TestClientTargetSelector:
         )
         state = ClientState()
 
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         assert selector._config == config
         assert selector._state == state
@@ -64,7 +77,7 @@ class TestClientTargetSelector:
             gates=[],
         )
         state = ClientState()
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         addr = selector.get_callback_addr()
 
@@ -80,7 +93,7 @@ class TestClientTargetSelector:
             gates=[],
         )
         state = ClientState()
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         # Get managers in round-robin order
         m1 = selector.get_next_manager()
@@ -103,7 +116,7 @@ class TestClientTargetSelector:
             gates=[("g1", 9000), ("g2", 9001)],
         )
         state = ClientState()
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         g1 = selector.get_next_gate()
         g2 = selector.get_next_gate()
@@ -123,7 +136,7 @@ class TestClientTargetSelector:
             gates=[("g1", 9000)],
         )
         state = ClientState()
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         all_targets = selector.get_all_targets()
 
@@ -146,7 +159,7 @@ class TestClientTargetSelector:
 
         state.mark_job_target(job_id, sticky_target)
 
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
         targets = selector.get_targets_for_job(job_id)
 
         # Sticky target should be first
@@ -163,7 +176,7 @@ class TestClientTargetSelector:
             gates=[("g1", 9000)],
         )
         state = ClientState()
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         targets = selector.get_targets_for_job("new-job")
 
@@ -179,7 +192,7 @@ class TestClientTargetSelector:
             gates=[("g1", 9000)],
         )
         state = ClientState()
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         # Should return None, not raise
         result = selector.get_next_manager()
@@ -195,7 +208,7 @@ class TestClientTargetSelector:
             gates=[],
         )
         state = ClientState()
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         # Should return None, not raise
         result = selector.get_next_gate()
@@ -211,7 +224,7 @@ class TestClientTargetSelector:
             gates=[],
         )
         state = ClientState()
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         m1 = selector.get_next_manager()
         m2 = selector.get_next_manager()
@@ -229,7 +242,7 @@ class TestClientTargetSelector:
             gates=[],
         )
         state = ClientState()
-        selector = ClientTargetSelector(config, state)
+        selector = ClientTargetSelector(config, state, make_client_discovery())
 
         selected = []
         for _ in range(100):

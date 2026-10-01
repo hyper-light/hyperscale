@@ -338,8 +338,10 @@ class ClientJobSubmitter:
         Raises:
             RuntimeError: If submission fails after retries
         """
-        # Get all available targets for fallback
-        all_targets = self._targets.get_all_targets()
+        # AD-28 order: gates then managers, each tier ranked per job, so
+        # submissions spread across targets instead of all starting at the
+        # first configured gate.
+        all_targets = self._targets.get_submission_targets(job_id)
         if not all_targets:
             raise RuntimeError("No managers or gates configured")
 
@@ -350,7 +352,7 @@ class ClientJobSubmitter:
         retry_base_delay = 0.5
 
         for retry in range(max_retries + 1):
-            # Try each target in order, cycling through on retries
+            # Try each target in ranked order, cycling through on retries
             target_idx = retry % len(all_targets)
             target = all_targets[target_idx]
 
@@ -418,6 +420,7 @@ class ClientJobSubmitter:
         redirects = 0
         redirect_history: list[str] = []
         while redirects <= max_redirects:
+            sent_at = _DEFAULT_CLOCK.monotonic()
             response, _ = await self._send_tcp(
                 target,
                 "job_submission",
@@ -426,6 +429,7 @@ class ClientJobSubmitter:
             )
 
             if isinstance(response, Exception):
+                self._targets.record_target_failure(target)
                 return _prepend_redirect_history(redirect_history, str(response))
 
             # Check for rate limiting response (AD-32). ``Message.load``
@@ -457,6 +461,11 @@ class ClientJobSubmitter:
             ack = JobAck.load(response)
 
             if ack.accepted:
+                self._targets.record_target_success(
+                    target,
+                    (_DEFAULT_CLOCK.monotonic() - sent_at) * 1000.0,
+                )
+
                 # Track which server accepted this job for future queries
                 self._state.mark_job_target(job_id, target)
 

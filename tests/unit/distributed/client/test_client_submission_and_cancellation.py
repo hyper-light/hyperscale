@@ -28,6 +28,8 @@ from hyperscale.distributed.nodes.client.submission import ClientJobSubmitter
 from hyperscale.distributed.nodes.client.cancellation import ClientCancellationManager
 from hyperscale.distributed.nodes.client.config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
+from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.nodes.client.protocol import ClientProtocol
 from hyperscale.distributed.nodes.client.tracking import ClientJobTracker
@@ -38,6 +40,17 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.errors import MessageTooLargeError
 from hyperscale.logging import Logger
+
+def make_client_discovery() -> DiscoveryService:
+    """AD-28 discovery service as HyperscaleClient builds it."""
+    return DiscoveryService(
+        Env().get_discovery_config(
+            node_role="client",
+            static_seeds=[],
+            allow_dynamic_registration=True,
+        )
+    )
+
 
 
 class TestClientJobSubmitter:
@@ -55,7 +68,7 @@ class TestClientJobSubmitter:
         self.state = ClientState()
         self.logger = Mock(spec=Logger)
         self.logger.log = AsyncMock()
-        self.targets = ClientTargetSelector(self.config, self.state)
+        self.targets = ClientTargetSelector(self.config, self.state, make_client_discovery())
         self.tracker = ClientJobTracker(self.state, self.logger)
         self.protocol = ClientProtocol(self.state, self.logger)
 
@@ -335,7 +348,7 @@ class TestClientJobSubmitter:
             gates=[],
         )
         state = ClientState()
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         send_tcp = AsyncMock()
 
         submitter = ClientJobSubmitter(
@@ -436,7 +449,7 @@ class TestClientCancellationManager:
         self.state = ClientState()
         self.logger = Mock(spec=Logger)
         self.logger.log = AsyncMock()
-        self.targets = ClientTargetSelector(self.config, self.state)
+        self.targets = ClientTargetSelector(self.config, self.state, make_client_discovery())
         self.tracker = ClientJobTracker(self.state, self.logger)
 
     @pytest.mark.asyncio
@@ -706,7 +719,7 @@ class TestClientCancellationManager:
             gates=[],
         )
         state = ClientState()
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         send_tcp = AsyncMock()
 
         manager = ClientCancellationManager(

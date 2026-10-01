@@ -22,6 +22,8 @@ from hyperscale.distributed.nodes.client.reporting import ClientReportingManager
 from hyperscale.distributed.nodes.client.discovery import ClientDiscovery
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.models import (
     ManagerPingResponse,
@@ -36,6 +38,17 @@ from hyperscale.distributed.models import (
 from hyperscale.reporting.json import JSONConfig
 from hyperscale.reporting.csv import CSVConfig
 from hyperscale.logging import Logger
+
+
+def make_client_discovery() -> DiscoveryService:
+    """AD-28 discovery service as HyperscaleClient builds it."""
+    return DiscoveryService(
+        Env().get_discovery_config(
+            node_role="client",
+            static_seeds=[],
+            allow_dynamic_registration=True,
+        )
+    )
 
 
 # =============================================================================
@@ -314,7 +327,7 @@ class TestClientDiscovery:
     @pytest.fixture
     def targets(self, config, state):
         """Create ClientTargetSelector instance."""
-        return ClientTargetSelector(config, state)
+        return ClientTargetSelector(config, state, make_client_discovery())
 
     @pytest.fixture
     def send_tcp(self):
@@ -387,7 +400,7 @@ class TestClientDiscovery:
             managers=[],  # No managers
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No managers configured"):
@@ -403,7 +416,7 @@ class TestClientDiscovery:
             managers=[],
             gates=[],  # No gates
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No gates configured"):
@@ -554,7 +567,7 @@ class TestClientDiscovery:
             managers=[("manager1", 7000)],
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         workflow_info = WorkflowStatusInfo(
@@ -587,7 +600,7 @@ class TestClientDiscovery:
             managers=[],
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No managers configured"):
@@ -659,7 +672,7 @@ class TestClientDiscovery:
             managers=[],
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No gates configured"):
@@ -745,7 +758,7 @@ class TestClientDiscovery:
             managers=[],
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No gates configured"):
