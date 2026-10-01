@@ -495,17 +495,18 @@ class GateJobTimeoutTracker:
             if info.dc_status.get(dc) in {"completed", "failed", "cancelled"}:
                 continue  # Skip terminal DCs
 
-            try:
-                await self._gate.send_tcp(
-                    manager_addr,
-                    "receive_job_global_timeout",
-                    timeout_msg.dump(),
-                    timeout=5.0,
-                )
-            except Exception as error:
+            # send_tcp returns a failure rather than raising; anything but
+            # the manager's b"ok" means the decision was not processed.
+            response, _ = await self._gate.send_tcp(
+                manager_addr,
+                "job_global_timeout",
+                timeout_msg.dump(),
+                timeout=5.0,
+            )
+            if response != b"ok":
                 await self._gate._udp_logger.log(
                     ServerWarning(
-                        message=f"Failed to send global timeout to DC {dc} for job {job_id[:8]}...: {error}",
+                        message=f"Global timeout for job {job_id[:8]}... not delivered to DC {dc}: {response!r}",
                         node_host=self._gate._host,
                         node_port=self._gate._tcp_port,
                         node_id=self._gate._node_id.short,

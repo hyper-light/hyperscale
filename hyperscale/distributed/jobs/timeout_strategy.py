@@ -728,6 +728,36 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
     # Helper methods for gate communication
 
+    async def _send_to_gate(
+        self,
+        job_id: str,
+        gate_addr: tuple[str, int],
+        handler_name: str,
+        payload: bytes,
+        failure_log_model: type[ServerDebug] | type[ServerWarning],
+    ) -> bool:
+        """Send an AD-34 report to the job's gate; True once the gate
+        acknowledged it.
+
+        ``send_tcp`` returns a failure rather than raising, and the gate's
+        handlers answer b"ok" only when they processed the report, so any
+        other answer -- an error, no answer, an unknown handler -- is a
+        failed delivery and is logged.
+        """
+        response, _ = await self._manager.send_tcp(gate_addr, handler_name, payload)
+        if response == b"ok":
+            return True
+
+        await self._manager._udp_logger.log(
+            failure_log_model(
+                message=f"Gate {gate_addr} did not acknowledge {handler_name} for {job_id}: {response!r}",
+                node_host=self._manager._host,
+                node_port=self._manager._tcp_port,
+                node_id=self._manager._node_id.short,
+            )
+        )
+        return False
+
     async def _send_progress_report(self, job_id: str) -> None:
         """Send progress to gate (best-effort, loss tolerated)."""
         job = self._manager._job_manager.get_job_by_id(job_id)
@@ -756,20 +786,14 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             ),
         )
 
-        try:
-            await self._manager.send_tcp(
-                job.timeout_tracking.gate_addr, "job_progress_report", report.dump()
-            )
-        except Exception as error:
-            # Progress report failure is non-critical
-            await self._manager._udp_logger.log(
-                ServerDebug(
-                    message=f"Failed to send progress report for {job_id}: {error}",
-                    node_host=self._manager._host,
-                    node_port=self._manager._tcp_port,
-                    node_id=self._manager._node_id.short,
-                )
-            )
+        # Progress report failure is non-critical (the next one supersedes it)
+        await self._send_to_gate(
+            job_id,
+            job.timeout_tracking.gate_addr,
+            "receive_job_progress_report",
+            report.dump(),
+            ServerDebug,
+        )
 
     async def _send_timeout_report(self, job_id: str, reason: str) -> None:
         """Send timeout report to gate (persistent until ACK'd)."""
@@ -794,22 +818,16 @@ class GateCoordinatedTimeout(TimeoutStrategy):
                 self._pending_reports[job_id] = []
             self._pending_reports[job_id].append(report)
 
-        try:
-            await self._manager.send_tcp(
-                job.timeout_tracking.gate_addr, "job_timeout_report", report.dump()
-            )
-            # Success - remove from pending
+        # Pending until the gate acknowledges it (retried otherwise)
+        if await self._send_to_gate(
+            job_id,
+            job.timeout_tracking.gate_addr,
+            "receive_job_timeout_report",
+            report.dump(),
+            ServerWarning,
+        ):
             async with self._report_lock:
                 self._pending_reports.pop(job_id, None)
-        except Exception as error:
-            await self._manager._udp_logger.log(
-                ServerWarning(
-                    message=f"Failed to send timeout report for {job_id}: {error} (will retry)",
-                    node_host=self._manager._host,
-                    node_port=self._manager._tcp_port,
-                    node_id=self._manager._node_id.short,
-                )
-            )
 
     async def _send_leader_transfer_report(
         self, job_id: str, fence_token: int
@@ -830,19 +848,13 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             fence_token=fence_token,
         )
 
-        try:
-            await self._manager.send_tcp(
-                job.timeout_tracking.gate_addr, "job_leader_transfer", report.dump()
-            )
-        except Exception as error:
-            await self._manager._udp_logger.log(
-                ServerWarning(
-                    message=f"Failed to send leader transfer for {job_id}: {error}",
-                    node_host=self._manager._host,
-                    node_port=self._manager._tcp_port,
-                    node_id=self._manager._node_id.short,
-                )
-            )
+        await self._send_to_gate(
+            job_id,
+            job.timeout_tracking.gate_addr,
+            "receive_job_leader_transfer",
+            report.dump(),
+            ServerWarning,
+        )
 
     async def _send_final_status(self, job_id: str, reason: str) -> None:
         """Send final status to gate for cleanup."""
@@ -868,20 +880,14 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             fence_token=job.timeout_tracking.timeout_fence_token,
         )
 
-        try:
-            await self._manager.send_tcp(
-                job.timeout_tracking.gate_addr, "job_final_status", final_report.dump()
-            )
-        except Exception as error:
-            # Best-effort cleanup notification
-            await self._manager._udp_logger.log(
-                ServerDebug(
-                    message=f"Failed to send final status for {job_id}: {error}",
-                    node_host=self._manager._host,
-                    node_port=self._manager._tcp_port,
-                    node_id=self._manager._node_id.short,
-                )
-            )
+        # Best-effort cleanup notification
+        await self._send_to_gate(
+            job_id,
+            job.timeout_tracking.gate_addr,
+            "receive_job_final_status",
+            final_report.dump(),
+            ServerDebug,
+        )
 
     async def _send_status_correction(self, job_id: str, status: str) -> None:
         """Send status correction when gate's timeout conflicts with actual state."""
@@ -898,16 +904,10 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             fence_token=job.timeout_tracking.timeout_fence_token,
         )
 
-        try:
-            await self._manager.send_tcp(
-                job.timeout_tracking.gate_addr, "job_final_status", correction.dump()
-            )
-        except Exception as error:
-            await self._manager._udp_logger.log(
-                ServerDebug(
-                    message=f"Failed to send status correction for {job_id}: {error}",
-                    node_host=self._manager._host,
-                    node_port=self._manager._tcp_port,
-                    node_id=self._manager._node_id.short,
-                )
-            )
+        await self._send_to_gate(
+            job_id,
+            job.timeout_tracking.gate_addr,
+            "receive_job_final_status",
+            correction.dump(),
+            ServerDebug,
+        )

@@ -4092,7 +4092,7 @@ class ManagerServer(HealthAwareServer):
 
                 response, _clock = await self.send_tcp(
                     peer_addr,
-                    "manager_state_sync_request",
+                    "state_sync_request",
                     request.dump(),
                     timeout=self._config.state_sync_timeout_seconds,
                 )
@@ -9752,9 +9752,12 @@ class ManagerServer(HealthAwareServer):
         try:
             timeout_msg = JobGlobalTimeout.load(data)
 
+            # b"ok" acknowledges delivery: the decision was processed, even
+            # when there is nothing to do (job no longer tracked here) or
+            # its fence token lost; b"" means it could not be processed.
             strategy = self._manager_state.get_job_timeout_strategy(timeout_msg.job_id)
             if not strategy:
-                return b""
+                return b"ok"
 
             accepted = await strategy.handle_global_timeout(
                 timeout_msg.job_id,
@@ -9773,7 +9776,7 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
-            return b""
+            return b"ok"
 
         except Exception as error:
             await self._udp_logger.log(

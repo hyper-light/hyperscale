@@ -125,7 +125,7 @@ DATA_HANDLERS: frozenset[str] = frozenset(
         # AD-34 timeout coordination
         "receive_job_progress_report",
         "receive_job_timeout_report",
-        "receive_job_global_timeout",
+        "job_global_timeout",
         "receive_job_final_status",
         # Heartbeats (non-SWIM)
         "heartbeat",
