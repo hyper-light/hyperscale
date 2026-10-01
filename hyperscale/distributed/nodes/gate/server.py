@@ -385,7 +385,9 @@ class GateServer(HealthAwareServer):
         self._last_resource_metrics: ResourceMetrics | None = None
         self._gate_health_state: str = "healthy"
         self._previous_gate_health_state: str = "healthy"
-        self._load_shedder = LoadShedder(self._overload_detector)
+        # The resource sampling loop is the detector's sampler; shedding
+        # checks read the state it settled on.
+        self._load_shedder = LoadShedder(self._overload_detector, detector_sampled_externally=True)
 
         # Backpressure tracking (AD-37) - state managed by _modular_state
 

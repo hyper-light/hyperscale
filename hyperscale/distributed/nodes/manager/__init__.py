@@ -28,10 +28,6 @@ from .leadership import ManagerLeadershipCoordinator
 from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator, ProgressState, BackpressureLevel
 from .discovery import ManagerDiscoveryCoordinator
-from .load_shedding import ManagerLoadShedder, RequestPriority, OverloadStateTracker
-
-# Backwards compatibility alias
-OverloadState = OverloadStateTracker
 from .rate_limiting import ManagerRateLimitingCoordinator
 from .version_skew import ManagerVersionSkewHandler
 
@@ -56,11 +52,6 @@ __all__ = [
     "ManagerDiscoveryCoordinator",
     # AD-19 Progress State (Three-Signal Health)
     "ProgressState",
-    # AD-22 Load Shedding with Priority Queues
-    "ManagerLoadShedder",
-    "RequestPriority",
-    "OverloadState",  # Backwards compatibility alias
-    "OverloadStateTracker",
     # AD-23 Backpressure
     "BackpressureLevel",
     # AD-26 Adaptive Healthcheck Extensions

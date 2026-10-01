@@ -427,6 +427,13 @@ class HybridOverloadDetector:
         return self.get_state(cpu_percent, memory_percent).value
 
     @property
+    def current_state(self) -> OverloadState:
+        """The state the latest ``get_state`` sample settled on, without
+        taking a sample: readers that have no resource readings of their
+        own must not feed the hysteresis a sample of zero CPU and memory."""
+        return self._current_state
+
+    @property
     def baseline(self) -> float:
         """Get current (fast) baseline EMA value."""
         return self._baseline_ema

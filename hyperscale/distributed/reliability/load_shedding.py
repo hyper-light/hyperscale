@@ -154,6 +154,7 @@ class LoadShedder:
         overload_detector: HybridOverloadDetector,
         config: LoadShedderConfig | None = None,
         message_priorities: dict[str, RequestPriority] | None = None,
+        detector_sampled_externally: bool = False,
     ):
         """
         Initialize LoadShedder.
@@ -162,8 +163,13 @@ class LoadShedder:
             overload_detector: Detector for current system load state
             config: Configuration for shedding behavior
             message_priorities: Custom message type to priority mapping
+            detector_sampled_externally: True when another owner (a
+                node's resource sampler) feeds the detector its CPU and
+                memory samples: checks without readings then read the
+                state that sampler settled on instead of sampling zeros
         """
         self._detector = overload_detector
+        self._detector_sampled_externally = detector_sampled_externally
         self._config = config or LoadShedderConfig()
         self._message_priorities = (
             message_priorities or DEFAULT_MESSAGE_PRIORITIES.copy()
@@ -255,10 +261,7 @@ class LoadShedder:
         Returns:
             True if request should be shed, False if it should be processed
         """
-        # Default None to 0.0 for detector
-        cpu = cpu_percent if cpu_percent is not None else 0.0
-        memory = memory_percent if memory_percent is not None else 0.0
-        state = self._detector.get_state(cpu, memory)
+        state = self._overload_state(cpu_percent, memory_percent)
         threshold = self._config.shed_thresholds.get(state)
 
         # No threshold means accept all requests
@@ -289,10 +292,17 @@ class LoadShedder:
         Returns:
             Current OverloadState
         """
-        # Default None to 0.0 for detector
-        cpu = cpu_percent if cpu_percent is not None else 0.0
-        memory = memory_percent if memory_percent is not None else 0.0
-        return self._detector.get_state(cpu, memory)
+        return self._overload_state(cpu_percent, memory_percent)
+
+    def _overload_state(self, cpu_percent: float | None, memory_percent: float | None) -> OverloadState:
+        """Sample the detector with the caller's resource readings. With
+        none and an external sampler, read the state that sampler settled
+        on: a per-request sample of zero CPU and memory would count toward
+        the detector's de-escalation hysteresis, so a burst of requests
+        talked a CPU-overloaded node out of shedding."""
+        if cpu_percent is None and memory_percent is None and self._detector_sampled_externally:
+            return self._detector.current_state
+        return self._detector.get_state(cpu_percent or 0.0, memory_percent or 0.0)
 
     def register_message_priority(
         self,

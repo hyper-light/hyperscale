@@ -177,6 +177,7 @@ from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 # here; swap_defaults rebinds it under SIM.
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 from hyperscale.distributed.health.systemic_failure import is_systemic_failure
+from hyperscale.distributed.reliability.load_shedding import LoadShedder
 from hyperscale.distributed.resources.workflow_throttle_request import WorkflowThrottleRequest
 from hyperscale.distributed.resources.workflow_throttle_response import WorkflowThrottleResponse
 from hyperscale.distributed.hlc import (
@@ -219,7 +220,6 @@ from .capacity_reporter import ManagerCapacityReporter
 from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator
 from .discovery import ManagerDiscoveryCoordinator
-from .load_shedding import ManagerLoadShedder
 
 from .workflow_lifecycle import ManagerWorkflowLifecycle
 from .worker_dissemination import WorkerDisseminator
@@ -548,12 +548,9 @@ class ManagerServer(HealthAwareServer):
         self._workflow_reassignment_lock: asyncio.Lock = asyncio.Lock()
         # AD-19: true while deadline evictions are held as systemic.
         self._systemic_eviction_hold = False
-        self._load_shedder = ManagerLoadShedder(
-            config=self._config,
-            logger=self._udp_logger,
-            node_id=self._node_id.short,
-            task_runner=self._task_runner,
-        )
+        # AD-22 load shedding over the overload detector the resource
+        # sampler feeds -- the same shedder the gate runs.
+        self._load_shedder = LoadShedder(self._overload_detector, detector_sampled_externally=True)
 
         # Shared hybrid logical clock (AD-38/AD-39). Used by Raft so that
         # RaftLogEntry.timestamp is a replicated, wall-clock-derived value -- this
@@ -9488,14 +9485,12 @@ class ManagerServer(HealthAwareServer):
                     retry_after_seconds=rate_limit_result.retry_after_seconds,
                 ).dump()
 
-            if self._load_shedder.should_shed_message("JobSubmission"):
-                # get_current_state() returns the same state should_shed() just computed
-                # (both use same default args and HybridOverloadDetector tracks _current_state)
+            if self._load_shedder.should_shed_handler("job_submission"):
                 overload_state = self._load_shedder.get_current_state()
                 return JobAck(
                     job_id="",
                     accepted=False,
-                    error=f"System under load ({overload_state}), please retry later",
+                    error=f"System under load ({overload_state.value}), please retry later",
                     protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
