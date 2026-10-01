@@ -137,8 +137,6 @@ from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
     NodeCapabilities,
     ProtocolVersion,
-    negotiate_capabilities,
-    get_features_for_version,
 )
 from hyperscale.distributed.discovery.security.role_validator import (
     CertificateParseError,
@@ -216,6 +214,7 @@ from .leases import ManagerLeaseCoordinator
 from .health import ManagerHealthMonitor, HealthcheckExtensionManager
 from .sync import ManagerStateSync
 from .leadership import ManagerLeadershipCoordinator
+from .version_skew import ManagerVersionSkewHandler
 from .capacity_reporter import ManagerCapacityReporter
 from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator
@@ -513,6 +512,15 @@ class ManagerServer(HealthAwareServer):
             import_stats_checkpoint_fn=self._import_stats_checkpoint,
         )
 
+        # AD-25 protocol version negotiation
+        self._version_skew = ManagerVersionSkewHandler(
+            state=self._manager_state,
+            config=self._config,
+            logger=self._udp_logger,
+            node_id=self._node_id.short,
+            task_runner=self._task_runner,
+        )
+
         # Leadership coordinator
         self._leadership = ManagerLeadershipCoordinator(
             state=self._manager_state,
@@ -793,9 +801,6 @@ class ManagerServer(HealthAwareServer):
             strict_mode=self._config.mtls_strict_mode,
         )
 
-        # Protocol capabilities
-        self._node_capabilities = NodeCapabilities.current(node_version="")
-
         # Background tasks
         self._dead_node_reap_task: asyncio.Task | None = None
         self._orphan_scan_task: asyncio.Task | None = None
@@ -1031,11 +1036,6 @@ class ManagerServer(HealthAwareServer):
             logger=self._udp_logger,
         )
         await self._idempotency_ledger.start()
-
-        # Update node capabilities with proper version
-        self._node_capabilities = NodeCapabilities.current(
-            node_version=f"manager-{self._node_id.short}"
-        )
 
         # Initialize workflow lifecycle state machine (AD-33)
         self._workflow_lifecycle_states = WorkflowLifecycleStateMachine(
@@ -9078,10 +9078,9 @@ class ManagerServer(HealthAwareServer):
                 protocol_version=gate_version,
                 capabilities=gate_caps_set,
             )
-            local_caps = NodeCapabilities.current()
-            negotiated = negotiate_capabilities(local_caps, gate_caps)
-
-            if not negotiated.compatible:
+            try:
+                negotiated = self._version_skew.negotiate_with_gate(registration.node_id, gate_caps)
+            except ValueError:
                 return GateRegistrationResponse(
                     accepted=False,
                     manager_id=self._node_id.full,
@@ -9106,11 +9105,6 @@ class ManagerServer(HealthAwareServer):
             )
 
             await self._track_registered_gate(gate_info)
-
-            # Store negotiated capabilities
-            self._manager_state.set_gate_negotiated_caps(
-                registration.node_id, negotiated
-            )
 
             negotiated_caps_str = ",".join(sorted(negotiated.common_features))
             return GateRegistrationResponse(
@@ -9484,7 +9478,10 @@ class ManagerServer(HealthAwareServer):
                 minor=getattr(submission, "protocol_version_minor", 0),
             )
 
-            if client_version.major != CURRENT_PROTOCOL_VERSION.major:
+            negotiated_caps_str = self._version_skew.negotiate_with_client(
+                client_version, getattr(submission, "capabilities", "")
+            )
+            if negotiated_caps_str is None:
                 return JobAck(
                     job_id=submission.job_id,
                     accepted=False,
@@ -9502,15 +9499,6 @@ class ManagerServer(HealthAwareServer):
                     protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
-
-            # Negotiate capabilities
-            client_caps_str = getattr(submission, "capabilities", "")
-            client_features = (
-                set(client_caps_str.split(",")) if client_caps_str else set()
-            )
-            our_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
-            negotiated_features = client_features & our_features
-            negotiated_caps_str = ",".join(sorted(negotiated_features))
 
             if submission.idempotency_key and self._idempotency_ledger is not None:
                 try:

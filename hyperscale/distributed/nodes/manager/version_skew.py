@@ -62,8 +62,9 @@ class ManagerVersionSkewHandler:
         )
 
         # Negotiated capabilities per peer (node_id -> NegotiatedCapabilities)
+        # Gates' negotiated capabilities live in ManagerState (one store,
+        # cleared with the gate); workers' and peers' here.
         self._worker_capabilities: dict[str, NegotiatedCapabilities] = {}
-        self._gate_capabilities: dict[str, NegotiatedCapabilities] = {}
         self._peer_manager_capabilities: dict[str, NegotiatedCapabilities] = {}
 
     @property
@@ -172,9 +173,7 @@ class ManagerVersionSkewHandler:
                 f"{self.protocol_version} vs {remote_capabilities.protocol_version}"
             )
 
-        self._gate_capabilities[gate_id] = result
-        # Also store in state for access by other components
-        self._state._gate_negotiated_caps[gate_id] = result
+        self._state.set_gate_negotiated_caps(gate_id, result)
 
         self._task_runner.run(
             self._logger.log,
@@ -268,7 +267,7 @@ class ManagerVersionSkewHandler:
         Returns:
             True if the feature is available with this gate
         """
-        caps = self._gate_capabilities.get(gate_id)
+        caps = self._state.get_gate_negotiated_caps(gate_id)
         if caps is None:
             return False
         return caps.supports(feature)
@@ -295,7 +294,7 @@ class ManagerVersionSkewHandler:
 
     def get_gate_capabilities(self, gate_id: str) -> NegotiatedCapabilities | None:
         """Get negotiated capabilities for a gate."""
-        return self._gate_capabilities.get(gate_id)
+        return self._state.get_gate_negotiated_caps(gate_id)
 
     def get_peer_capabilities(self, peer_id: str) -> NegotiatedCapabilities | None:
         """Get negotiated capabilities for a peer manager."""
@@ -307,12 +306,24 @@ class ManagerVersionSkewHandler:
 
     def remove_gate(self, gate_id: str) -> None:
         """Remove negotiated capabilities when gate disconnects."""
-        self._gate_capabilities.pop(gate_id, None)
+        self._state._gate_negotiated_caps.pop(gate_id, None)
         self._state._gate_negotiated_caps.pop(gate_id, None)
 
     def remove_peer(self, peer_id: str) -> None:
         """Remove negotiated capabilities when peer disconnects."""
         self._peer_manager_capabilities.pop(peer_id, None)
+
+    def negotiate_with_client(
+        self,
+        client_version: ProtocolVersion,
+        client_capabilities: str,
+    ) -> str | None:
+        """A submitting client's negotiated features, comma-joined -- or None
+        when its major version is incompatible (AD-25: reject)."""
+        if client_version.major != self.protocol_version.major:
+            return None
+        client_features = set(client_capabilities.split(",")) if client_capabilities else set()
+        return ",".join(sorted(client_features & get_features_for_version(self.protocol_version)))
 
     def is_version_compatible(self, remote_version: ProtocolVersion) -> bool:
         """
@@ -354,11 +365,11 @@ class ManagerVersionSkewHandler:
         Returns:
             Set of features supported by all gates
         """
-        if not self._gate_capabilities:
+        if not self._state._gate_negotiated_caps:
             return set()
 
         common = set(self.capabilities)
-        for caps in self._gate_capabilities.values():
+        for caps in self._state._gate_negotiated_caps.values():
             common &= caps.common_features
 
         return common
@@ -373,7 +384,7 @@ class ManagerVersionSkewHandler:
             version_str = str(caps.remote_version)
             worker_versions[version_str] = worker_versions.get(version_str, 0) + 1
 
-        for caps in self._gate_capabilities.values():
+        for caps in self._state._gate_negotiated_caps.values():
             version_str = str(caps.remote_version)
             gate_versions[version_str] = gate_versions.get(version_str, 0) + 1
 
@@ -386,7 +397,7 @@ class ManagerVersionSkewHandler:
             "local_feature_count": len(self.capabilities),
             "worker_count": len(self._worker_capabilities),
             "worker_versions": worker_versions,
-            "gate_count": len(self._gate_capabilities),
+            "gate_count": len(self._state._gate_negotiated_caps),
             "gate_versions": gate_versions,
             "peer_count": len(self._peer_manager_capabilities),
             "peer_versions": peer_versions,
