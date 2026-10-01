@@ -45,6 +45,10 @@ TRANSIENT_ERRORS = frozenset({
     # quorum of peers); it clears when the clock is back in agreement,
     # and meanwhile another node takes the work.
     "clock fenced",
+    # A retry that reached a gate while an earlier attempt with the same
+    # idempotency key was still being decided: the decision lands (or is
+    # released) shortly, and the next retry gets it.
+    "submission in progress",
     # Gate-forwarded cancel where no DC could confirm because manager
     # leadership is mid-failover. The gate stamps its aggregate cancel
     # error with ``GateCancellationHandler._CANCEL_RETRYABLE_MARKER``

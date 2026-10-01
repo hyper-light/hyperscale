@@ -143,6 +143,21 @@ class GateIdempotencyCache(Generic[T]):
 
         self._resolve_waiters(waiters, result)
 
+    async def release(self, key: IdempotencyKey) -> None:
+        """Forget a PENDING entry whose request ended without an outcome
+        worth replaying (a transient refusal): a retry with the key is
+        processed afresh instead of replaying -- or waiting on -- it.
+        Waiters are woken without a result."""
+        waiters: list[asyncio.Future[T]] = []
+        async with self._lock:
+            entry = self._cache.get(key)
+            if entry is None or entry.status != IdempotencyStatus.PENDING:
+                return
+            del self._cache[key]
+            waiters = self._pending_waiters.pop(key, [])
+
+        self._resolve_waiters(waiters, None)
+
     async def get(self, key: IdempotencyKey) -> IdempotencyEntry[T] | None:
         """Get an entry by key without altering waiters."""
         return await self._get_entry(key)

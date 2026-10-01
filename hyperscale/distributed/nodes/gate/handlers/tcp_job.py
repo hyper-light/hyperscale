@@ -307,6 +307,11 @@ class GateJobHandler:
         """
         submission: JobSubmission | None = None
         idempotency_key: IdempotencyKey | None = None
+        # The PENDING idempotency entry this request inserted, until the
+        # request commits it: every other exit releases it (finally), so
+        # a transient refusal is neither replayed to the client's retries
+        # nor left pending for them to wait on.
+        owned_idempotency_key: IdempotencyKey | None = None
         lease_acquired = False
         lease_duration: float = 0.0
         fence_token: int = 0
@@ -361,22 +366,17 @@ class GateJobHandler:
                     submission.job_id,
                     self._get_node_id().full,
                 )
-                if found and entry is None:
-                    await self._logger.log(
-                        ServerInfo(
-                            message=(
-                                "Idempotency wait timed out for job "
-                                f"{submission.job_id} (key={idempotency_key})"
-                            ),
-                            node_host=self._get_host(),
-                            node_port=self._get_tcp_port(),
-                            node_id=self._get_node_id().short,
-                        )
-                    )
+                if not found:
+                    owned_idempotency_key = idempotency_key
+                elif entry is None or entry.status == IdempotencyStatus.PENDING:
+                    # An earlier attempt with this key is still being
+                    # decided (or was just released). This request must
+                    # not decide it too: a waiter that went on to process
+                    # it admitted the job after the client had given up.
                     return JobAck(
                         job_id=submission.job_id,
                         accepted=False,
-                        error="Idempotency wait timed out, retry submission",
+                        error="submission in progress, retry",
                         protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                         protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                         capabilities=negotiated_caps_str,
@@ -410,8 +410,6 @@ class GateJobHandler:
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                     capabilities=negotiated_caps_str,
                 ).dump()
-                if idempotency_key is not None and self._idempotency_cache is not None:
-                    await self._idempotency_cache.reject(idempotency_key, error_ack)
                 return error_ack
 
             lease = lease_result.lease
@@ -424,8 +422,6 @@ class GateJobHandler:
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                     capabilities=negotiated_caps_str,
                 ).dump()
-                if idempotency_key is not None and self._idempotency_cache is not None:
-                    await self._idempotency_cache.reject(idempotency_key, error_ack)
                 return error_ack
 
             lease_acquired = True
@@ -561,8 +557,6 @@ class GateJobHandler:
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                     capabilities=negotiated_caps_str,
                 ).dump()
-                if idempotency_key is not None and self._idempotency_cache is not None:
-                    await self._idempotency_cache.reject(idempotency_key, error_ack)
                 return error_ack
 
             await self._broadcast_job_leadership(
@@ -586,6 +580,7 @@ class GateJobHandler:
             # if a retry arrives while dispatch is queued
             if idempotency_key is not None and self._idempotency_cache is not None:
                 await self._idempotency_cache.commit(idempotency_key, ack_response)
+                owned_idempotency_key = None
 
             self._task_runner.run(
                 self._dispatch_job_to_datacenters, submission, target_dcs
@@ -612,8 +607,6 @@ class GateJobHandler:
                 accepted=False,
                 error=str(error),
             ).dump()
-            if idempotency_key is not None and self._idempotency_cache is not None:
-                await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
         except QuorumError as error:
             if lease_acquired and submission is not None:
@@ -625,8 +618,6 @@ class GateJobHandler:
                 accepted=False,
                 error=str(error),
             ).dump()
-            if idempotency_key is not None and self._idempotency_cache is not None:
-                await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
         except Exception as error:
             if lease_acquired and submission is not None:
@@ -645,9 +636,10 @@ class GateJobHandler:
                 accepted=False,
                 error=str(error),
             ).dump()
-            if idempotency_key is not None and self._idempotency_cache is not None:
-                await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
+        finally:
+            if owned_idempotency_key is not None and self._idempotency_cache is not None:
+                await self._idempotency_cache.release(owned_idempotency_key)
 
     async def handle_status_request(
         self,
