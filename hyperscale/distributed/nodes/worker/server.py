@@ -7,6 +7,7 @@ All business logic is delegated to specialized modules.
 
 import asyncio
 
+from hyperscale.distributed.cluster import ClusterJoinError
 from hyperscale.distributed.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed.swim.health.graceful_degradation import DegradationLevel
 from hyperscale.distributed.env import Env
@@ -690,13 +691,7 @@ class WorkerServer(HealthAwareServer):
         for manager_addr in self._seed_managers:
             await self._register_with_manager(manager_addr)
 
-        # Join SWIM cluster with all known managers for healthchecks.
-        # Workers know their seeds are managers from configuration —
-        # pass that through so manager peer roles are recorded
-        # authoritatively without waiting for gossip.
-        for manager_info in list(self._registry._known_managers.values()):
-            manager_udp_addr = (manager_info.udp_host, manager_info.udp_port)
-            await self.join_cluster(manager_udp_addr, seed_role="manager")
+        await self._join_known_managers_swim()
 
         # Start SWIM probe cycle. `start_probe_cycle` is an async loop;
         # submit it to the TaskRunner the same way the manager does
@@ -1693,6 +1688,42 @@ class WorkerServer(HealthAwareServer):
         if manager_info is None:
             return False
         return (manager_info.tcp_host, manager_info.tcp_port) in self._seed_managers
+
+    async def _join_known_managers_swim(self) -> None:
+        """Join SWIM with every known manager for healthchecks.
+
+        Workers know these peers are managers (they came from manager
+        registration), so the role is passed through and recorded
+        authoritatively without waiting for gossip.
+        """
+        for manager_info in list(self._registry._known_managers.values()):
+            manager_udp_addr = (manager_info.udp_host, manager_info.udp_port)
+            await self.join_cluster(manager_udp_addr, seed_role="manager")
+
+    async def _join_node(self, target_addr: tuple[str, int]) -> None:
+        """Operator join: register with the manager at ``target_addr``.
+
+        The same registration the boot path runs against seed managers.
+        An explicit operator join clears any open circuit / cached
+        transport from earlier failed attempts, as a lifecycle refresh
+        does, and adopts the manager as a seed so reaping and the
+        isolation rejoin loop treat it like a configured one.
+        """
+        self._invalidate_tcp_client_transport(target_addr)
+        self._registry.get_or_create_circuit_by_addr(target_addr).reset()
+
+        if not await self._register_with_manager(target_addr):
+            raise ClusterJoinError(
+                f"manager {target_addr[0]}:{target_addr[1]} did not accept "
+                "worker registration (see worker log for the cause)"
+            )
+
+        if target_addr not in self._seed_managers:
+            self._seed_managers.append(target_addr)
+        self._cluster_connection.add_seed_manager(target_addr)
+
+        await self._join_known_managers_swim()
+        self._cluster_connection.update()
 
     async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
         """Register this worker with a manager."""

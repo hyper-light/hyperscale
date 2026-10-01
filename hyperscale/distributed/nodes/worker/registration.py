@@ -33,6 +33,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
 )
 
+# Per-attempt bound on one worker_register round trip. Named so callers
+# that must outwait a whole registration (e.g. `hyperscale join`) derive
+# their budget from it instead of repeating the number.
+REGISTRATION_ATTEMPT_TIMEOUT_SECONDS = 5.0
+
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
     from hyperscale.distributed.discovery import DiscoveryService
@@ -157,7 +162,11 @@ class WorkerRegistrationHandler:
         executor = RetryExecutor(retry_config)
 
         async def attempt_registration() -> bool:
-            result = await send_func(manager_addr, registration.dump(), timeout=5.0)
+            result = await send_func(
+                manager_addr,
+                registration.dump(),
+                timeout=REGISTRATION_ATTEMPT_TIMEOUT_SECONDS,
+            )
             if isinstance(result, Exception):
                 raise result
             return True

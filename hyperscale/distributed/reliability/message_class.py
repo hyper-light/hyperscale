@@ -72,6 +72,8 @@ CONTROL_HANDLERS: frozenset[str] = frozenset(
         "alive",
         "dead",
         "leave",
+        # Operator-driven cluster join (hyperscale join)
+        "node_join",
     }
 )
 

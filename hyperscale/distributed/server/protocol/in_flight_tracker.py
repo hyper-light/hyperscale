@@ -83,6 +83,8 @@ _CONTROL_HANDLERS: frozenset[str] = frozenset(
         "leave",
         "join",
         "join_ack",
+        # Operator-driven cluster join (hyperscale join)
+        "node_join",
     }
 )
 

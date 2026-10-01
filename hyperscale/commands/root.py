@@ -9,6 +9,7 @@ from .cli import (
     CLI,
     CLIStyle,
 )
+from .join import join
 from .new import new
 from .ping import ping
 from .run import run
@@ -64,6 +65,7 @@ async def create_header():
     return await terminal.render_once()
 
 @CLI.root(
+    join,
     new,
     ping,
     run,

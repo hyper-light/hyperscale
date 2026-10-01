@@ -194,6 +194,17 @@ class WorkerClusterConnection:
         """
         self._manager_last_heartbeat[manager_id] = _DEFAULT_CLOCK.monotonic()
 
+    def add_seed_manager(self, manager_tcp_addr: tuple[str, int]) -> None:
+        """Adopt a manager joined at runtime as a rejoin seed.
+
+        An operator join (``hyperscale join``) is as explicit as a boot
+        seed, so the rejoin loop must fall back to it on isolation just
+        like the managers configured at startup. Deduplicated, so the
+        list grows only with distinct operator-chosen managers.
+        """
+        if manager_tcp_addr not in self._seed_manager_tcp_addrs:
+            self._seed_manager_tcp_addrs.append(manager_tcp_addr)
+
     def update(self) -> None:
         """Re-derive state from the live-manager set and transition.
 

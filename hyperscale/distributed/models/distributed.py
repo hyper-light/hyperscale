@@ -2640,6 +2640,32 @@ class StateSyncResponse(Message):
 
 
 @dataclass(slots=True)
+class NodeJoinRequest(Message):
+    """
+    Operator instruction: join the cluster the target node belongs to.
+
+    Sent by ``hyperscale join`` to the node that should join; the node
+    runs its existing registration routine against the target, whose
+    register endpoint performs isolation and protocol validation.
+    """
+
+    target_host: str  # TCP host of the node to join
+    target_port: int  # TCP port of the node to join
+
+
+@dataclass(slots=True)
+class NodeJoinResponse(Message):
+    """
+    Outcome of a ``NodeJoinRequest``.
+    """
+
+    accepted: bool  # Whether the join completed
+    node_id: str  # Joining node ID
+    node_role: str  # Joining node's NodeRole value
+    error: str | None = None  # Reason when not accepted
+
+
+@dataclass(slots=True)
 class GateStateSyncRequest(Message):
     """
     Request for gate-to-gate state synchronization.

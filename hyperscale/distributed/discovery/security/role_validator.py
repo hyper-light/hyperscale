@@ -132,19 +132,26 @@ class RoleValidator:
         # Gate connections
         (NodeRole.GATE, NodeRole.MANAGER),
         (NodeRole.GATE, NodeRole.GATE),  # Cross-DC
+        (NodeRole.GATE, NodeRole.CLIENT),  # Status/result push
         # Manager connections
         (NodeRole.MANAGER, NodeRole.WORKER),
         (NodeRole.MANAGER, NodeRole.MANAGER),  # Peer coordination
+        (NodeRole.MANAGER, NodeRole.GATE),  # Registration/heartbeats/results
+        (NodeRole.MANAGER, NodeRole.CLIENT),  # Status/result push
         # Worker connections
         (NodeRole.WORKER, NodeRole.MANAGER),  # Results/heartbeats
     }
 
+    # Mirrors the AD-28 connection matrix (docs/architecture/AD_28.md).
     _role_descriptions: ClassVar[dict[tuple[NodeRole, NodeRole], str]] = {
         (NodeRole.CLIENT, NodeRole.GATE): "Job submission",
         (NodeRole.GATE, NodeRole.MANAGER): "Job distribution",
         (NodeRole.GATE, NodeRole.GATE): "Cross-DC coordination",
+        (NodeRole.GATE, NodeRole.CLIENT): "Status and result push",
         (NodeRole.MANAGER, NodeRole.WORKER): "Workflow dispatch",
         (NodeRole.MANAGER, NodeRole.MANAGER): "Peer coordination",
+        (NodeRole.MANAGER, NodeRole.GATE): "Registration, heartbeats and results",
+        (NodeRole.MANAGER, NodeRole.CLIENT): "Status and result push",
         (NodeRole.WORKER, NodeRole.MANAGER): "Results and heartbeats",
     }
 

@@ -135,6 +135,8 @@ from .distributed import (
     GateStateSnapshot as GateStateSnapshot,
     StateSyncRequest as StateSyncRequest,
     StateSyncResponse as StateSyncResponse,
+    NodeJoinRequest as NodeJoinRequest,
+    NodeJoinResponse as NodeJoinResponse,
     GateStateSyncRequest as GateStateSyncRequest,
     GateStateSyncResponse as GateStateSyncResponse,
     # Context sync (layer-boundary protocol)

@@ -23,12 +23,15 @@ Usage:
 
 from typing import Callable
 
+from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
 from hyperscale.distributed.server import tcp
 from hyperscale.distributed.server.server.mercury_sync_base_server import (
     MercurySyncBaseServer,
 )
 from hyperscale.distributed.models import (
     JobStatusPush,
+    NodeJoinRequest,
+    NodeJoinResponse,
     ReporterResultPush,
     WorkflowResultPush,
     ManagerPingResponse,
@@ -355,6 +358,42 @@ class HyperscaleClient(MercurySyncBaseServer):
             on_reporter_result=on_reporter_result,
             retry_budget=retry_budget,
             retry_budget_per_workflow=retry_budget_per_workflow,
+        )
+
+    async def join_node(
+        self,
+        node_addr: tuple[str, int],
+        target_addr: tuple[str, int],
+        timeout: float,
+    ) -> NodeJoinResponse:
+        """Tell the node at ``node_addr`` to join the node at ``target_addr``.
+
+        The node runs its own registration routine against the target
+        (worker->manager, manager->gate, gate->manager); the target's
+        register endpoint validates isolation and protocol version.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a join response. A refused join is returned, not
+                raised, so callers can report the node's reason.
+        """
+        request = NodeJoinRequest(target_host=target_addr[0], target_port=target_addr[1])
+        response, _ = await self.send_tcp(
+            node_addr,
+            "node_join",
+            request.dump(),
+            timeout=timeout,
+        )
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"node {node_addr[0]}:{node_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+
+        return decode_join_message(
+            response,
+            NodeJoinResponse,
+            f"join reply from {node_addr[0]}:{node_addr[1]}",
         )
 
     async def wait_for_job(

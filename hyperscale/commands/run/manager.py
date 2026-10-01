@@ -12,7 +12,8 @@ from .shutdown_signals import ShutdownSignals
 
 
 @command(
-    display_help_on_error=False
+    display_help_on_error=False,
+    shortnames={"host": "H"},
 )
 async def manager(
     host: str = "127.0.0.1",

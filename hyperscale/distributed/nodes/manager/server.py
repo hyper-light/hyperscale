@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from hyperscale.core.graph.workflow import Workflow
+from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
 from hyperscale.distributed.swim import HealthAwareServer, ManagerStateEmbedder
 from hyperscale.distributed.swim.core import ErrorStats, CircuitState
 from hyperscale.distributed.swim.detection import HierarchicalConfig
@@ -29,6 +30,7 @@ from hyperscale.distributed.idempotency import (
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed.models import (
     GlobalJobStatus,
+    ManagerRegistrationResponse,
     NodeInfo,
     NodeRole,
     ManagerInfo,
@@ -1411,6 +1413,48 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
                 await self._clock.sleep(sync_interval)
+
+    async def _join_node(self, target_addr: tuple[str, int]) -> None:
+        """Operator join: register this manager with the gate at ``target_addr``.
+
+        Uses the gate's existing ``manager_register`` endpoint, which
+        validates cluster/environment isolation, mTLS role and protocol
+        version, records this datacenter, and answers with its healthy
+        gate tier (itself first). Each returned gate is tracked exactly as
+        a gate registering with us would be. Manager peers are not a
+        valid target: that endpoint exists only on gates (and workers),
+        so a peer join is refused by the target.
+        """
+        response, _ = await self.send_tcp(
+            target_addr,
+            "manager_register",
+            self._build_manager_heartbeat().dump(),
+            timeout=self._config.tcp_timeout_standard_seconds,
+        )
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"{target_addr[0]}:{target_addr[1]} did not answer manager "
+                f"registration: {type(response).__name__}: {response}"
+            )
+
+        registration = decode_join_message(
+            response,
+            ManagerRegistrationResponse,
+            f"manager registration reply from {target_addr[0]}:{target_addr[1]} "
+            "(managers can only join gates)",
+        )
+
+        if not registration.accepted:
+            raise ClusterJoinError(
+                f"gate {target_addr[0]}:{target_addr[1]} refused registration: "
+                f"{registration.error}"
+            )
+
+        for gate_info in registration.healthy_gates:
+            await self._track_registered_gate(gate_info)
+
+        if target_addr not in self._seed_gates:
+            self._seed_gates.append(target_addr)
 
     async def _register_with_manager(
         self,
@@ -8425,6 +8469,60 @@ class ManagerServer(HealthAwareServer):
                 error=str(error),
             ).dump()
 
+    async def _track_registered_gate(self, gate_info: GateInfo) -> None:
+        """Record a gate learned through a registration handshake.
+
+        Shared by both registration directions — a gate registering with
+        us (``gate_register``) and us registering with a gate (operator
+        join via the gate's ``manager_register``) — so stale-identity
+        eviction, rejoin reset and SWIM probing behave identically.
+        """
+        # Track gate addresses
+        gate_tcp_addr = (gate_info.tcp_host, gate_info.tcp_port)
+        gate_udp_addr = (gate_info.udp_host, gate_info.udp_port)
+        stale_gate_ids = [
+            gate_id
+            for gate_id, known_gate in self._manager_state.iter_known_gates()
+            if gate_id != gate_info.node_id
+            and (
+                (known_gate.tcp_host, known_gate.tcp_port) == gate_tcp_addr
+                or (known_gate.udp_host, known_gate.udp_port) == gate_udp_addr
+            )
+        ]
+        gate_node_state = self._incarnation_tracker.get_node_state(gate_udp_addr)
+        requires_rejoin_reset = (
+            bool(stale_gate_ids)
+            or (
+                gate_node_state is not None
+                and gate_node_state.status in (b"SUSPECT", b"DEAD")
+            )
+            or self._incarnation_tracker.get_required_rejoin_incarnation(
+                gate_udp_addr
+            )
+            > 0
+            or self._manager_state.get_gate_unhealthy_since(gate_info.node_id)
+            is not None
+        )
+
+        self._registry.register_gate(gate_info)
+        self._manager_state.set_gate_udp_to_tcp_mapping(
+            gate_udp_addr, gate_tcp_addr
+        )
+
+        # Add to SWIM probing
+        if requires_rejoin_reset:
+            await self.reset_peer_for_rejoin(gate_udp_addr)
+            self._task_runner.run(
+                self._handle_gate_peer_recovery,
+                gate_udp_addr,
+                gate_tcp_addr,
+            )
+        else:
+            await self.add_unconfirmed_peer(gate_udp_addr)
+        self._probe_scheduler.add_member(gate_udp_addr)
+        # Explicit registration handshake — see ``manager_peer_register``.
+        self.register_peer(gate_udp_addr)
+
     @tcp.receive()
     async def gate_register(
         self,
@@ -8536,51 +8634,7 @@ class ManagerServer(HealthAwareServer):
                 is_leader=registration.is_leader,
             )
 
-            # Track gate addresses
-            gate_tcp_addr = (registration.tcp_host, registration.tcp_port)
-            gate_udp_addr = (registration.udp_host, registration.udp_port)
-            stale_gate_ids = [
-                gate_id
-                for gate_id, known_gate in self._manager_state.iter_known_gates()
-                if gate_id != registration.node_id
-                and (
-                    (known_gate.tcp_host, known_gate.tcp_port) == gate_tcp_addr
-                    or (known_gate.udp_host, known_gate.udp_port) == gate_udp_addr
-                )
-            ]
-            gate_node_state = self._incarnation_tracker.get_node_state(gate_udp_addr)
-            requires_rejoin_reset = (
-                bool(stale_gate_ids)
-                or (
-                    gate_node_state is not None
-                    and gate_node_state.status in (b"SUSPECT", b"DEAD")
-                )
-                or self._incarnation_tracker.get_required_rejoin_incarnation(
-                    gate_udp_addr
-                )
-                > 0
-                or self._manager_state.get_gate_unhealthy_since(registration.node_id)
-                is not None
-            )
-
-            self._registry.register_gate(gate_info)
-            self._manager_state.set_gate_udp_to_tcp_mapping(
-                gate_udp_addr, gate_tcp_addr
-            )
-
-            # Add to SWIM probing
-            if requires_rejoin_reset:
-                await self.reset_peer_for_rejoin(gate_udp_addr)
-                self._task_runner.run(
-                    self._handle_gate_peer_recovery,
-                    gate_udp_addr,
-                    gate_tcp_addr,
-                )
-            else:
-                await self.add_unconfirmed_peer(gate_udp_addr)
-            self._probe_scheduler.add_member(gate_udp_addr)
-            # Explicit registration handshake — see ``manager_peer_register``.
-            self.register_peer(gate_udp_addr)
+            await self._track_registered_gate(gate_info)
 
             # Store negotiated capabilities
             self._manager_state.set_gate_negotiated_caps(

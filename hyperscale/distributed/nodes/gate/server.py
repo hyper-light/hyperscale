@@ -48,6 +48,7 @@ from hyperscale.reporting.reporter import Reporter
 from hyperscale.reporting.common.types import ReporterTypes
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed.server.events import VersionedStateClock
+from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
 from hyperscale.distributed.swim import HealthAwareServer, GateStateEmbedder
 from hyperscale.distributed.swim.health import (
     FederatedHealthMonitor,
@@ -55,6 +56,7 @@ from hyperscale.distributed.swim.health import (
     CrossClusterAck,
 )
 from hyperscale.distributed.models import (
+    GateRegistrationResponse,
     GateInfo,
     GateState,
     NodeRole,
@@ -6304,40 +6306,85 @@ class GateServer(HealthAwareServer):
             )
             return False
 
+    async def _join_node(self, target_addr: tuple[str, int]) -> None:
+        """Operator join: register this gate with the manager at ``target_addr``.
+
+        Uses the manager's existing ``gate_register`` endpoint (isolation,
+        protocol and role validation happen there). The accepted manager
+        tracks this gate as healthy and its heartbeat loop starts sending
+        ``manager_status_update`` here, which the gate ingests through the
+        same canonical path as a manager registration — adding the
+        manager's datacenter. ``gate_register`` exists only on managers,
+        so any other target is refused by the target itself.
+        """
+        registration = await self._register_with_manager(target_addr)
+        if not registration.accepted:
+            raise ClusterJoinError(
+                f"manager {target_addr[0]}:{target_addr[1]} refused registration: "
+                f"{registration.error}"
+            )
+
+    async def _register_with_manager(
+        self,
+        manager_addr: tuple[str, int],
+    ) -> GateRegistrationResponse:
+        """Send this gate's registration to one manager and decode the reply.
+
+        Raises ``ClusterJoinError`` when the manager is unreachable or its
+        reply is not a registration response.
+        """
+        request = GateRegistrationRequest(
+            node_id=self._node_id.full,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
+            udp_host=self._host,
+            udp_port=self._udp_port,
+            is_leader=self.is_leader(),
+            term=self._leader_election.state.current_term,
+            state=self._gate_state.value,
+            datacenter=self._node_id.datacenter,
+            cluster_id=self.env.CLUSTER_ID,
+            environment_id=self.env.ENVIRONMENT_ID,
+            active_jobs=self._job_manager.job_count(),
+            manager_count=sum(
+                len(addrs) for addrs in self._datacenter_managers.values()
+            ),
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            capabilities=",".join(
+                sorted(self._node_capabilities.capabilities)
+            ),
+        )
+
+        response, _ = await self.send_tcp(
+            manager_addr,
+            "gate_register",
+            request.dump(),
+            timeout=5.0,
+        )
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"manager {manager_addr[0]}:{manager_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+
+        return decode_join_message(
+            response,
+            GateRegistrationResponse,
+            f"gate registration reply from {manager_addr[0]}:{manager_addr[1]} "
+            "(gates can only join managers)",
+        )
+
     async def _register_with_managers(self) -> None:
         """Register with all managers."""
         for dc_id, manager_addrs in self._datacenter_managers.items():
             for manager_addr in manager_addrs:
                 try:
-                    request = GateRegistrationRequest(
-                        node_id=self._node_id.full,
-                        tcp_host=self._host,
-                        tcp_port=self._tcp_port,
-                        udp_host=self._host,
-                        udp_port=self._udp_port,
-                        is_leader=self.is_leader(),
-                        term=self._leader_election.state.current_term,
-                        state=self._gate_state.value,
-                        datacenter=self._node_id.datacenter,
-                        cluster_id=self.env.CLUSTER_ID,
-                        environment_id=self.env.ENVIRONMENT_ID,
-                        active_jobs=self._job_manager.job_count(),
-                        manager_count=sum(
-                            len(addrs) for addrs in self._datacenter_managers.values()
-                        ),
-                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                        capabilities=",".join(
-                            sorted(self._node_capabilities.capabilities)
-                        ),
-                    )
-
-                    await self.send_tcp(
-                        manager_addr,
-                        "gate_register",
-                        request.dump(),
-                        timeout=5.0,
-                    )
+                    registration = await self._register_with_manager(manager_addr)
+                    if not registration.accepted:
+                        raise ClusterJoinError(
+                            f"registration refused: {registration.error}"
+                        )
 
                 except Exception as register_error:
                     await self._udp_logger.log(

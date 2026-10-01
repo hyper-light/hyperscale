@@ -19,8 +19,10 @@ import math
 from base64 import b64decode, b64encode
 from typing import Callable, Literal
 
+from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
 from hyperscale.distributed.env import Env
-from hyperscale.distributed.server import udp
+from hyperscale.distributed.models import NodeJoinRequest, NodeJoinResponse
+from hyperscale.distributed.server import tcp, udp
 from hyperscale.distributed.server.server.mercury_sync_base_server import (
     MercurySyncBaseServer,
 )
@@ -188,6 +190,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._node_role: str = (
             node_role or "worker"
         )  # Default to worker if not specified
+
 
         # Store Vivaldi config for metrics and observability (AD-35 Task 12.7)
         self._vivaldi_config: VivaldiConfig = vivaldi_config or VivaldiConfig()
@@ -4657,6 +4660,58 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             import traceback
 
             print(traceback.format_exc())
+
+    async def _join_node(self, target_addr: tuple[str, int]) -> None:
+        """Register with the node at ``target_addr`` (operator join).
+
+        Roles override this with their existing registration routine;
+        the target's register endpoint performs the isolation and
+        protocol validation. Raises ``ClusterJoinError`` on refusal.
+        """
+        raise ClusterJoinError(f"{self._node_role} nodes cannot join other nodes")
+
+    @tcp.receive()
+    async def node_join(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        """Operator join (``hyperscale join``): register with the named node."""
+        try:
+            request = decode_join_message(data, NodeJoinRequest, "join request")
+
+            target_addr = (request.target_host, request.target_port)
+            if target_addr == (self._host, self._tcp_port):
+                raise ClusterJoinError("a node cannot join itself")
+
+            await self._join_node(target_addr)
+
+        except ClusterJoinError as join_error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Cluster join refused: {join_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return self._node_join_response(error=str(join_error)).dump()
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=f"Joined node at {target_addr[0]}:{target_addr[1]}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return self._node_join_response().dump()
+
+    def _node_join_response(self, error: str | None = None) -> NodeJoinResponse:
+        return NodeJoinResponse(
+            accepted=error is None,
+            node_id=self._node_id.full,
+            node_role=self._node_role,
+            error=error,
+        )
 
     def get_current_leader(self) -> tuple[str, int] | None:
         """Get the current leader, if known."""

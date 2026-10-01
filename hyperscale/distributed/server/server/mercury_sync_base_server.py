@@ -1838,7 +1838,11 @@ class MercurySyncBaseServer(Generic[T]):
 
             handler = self.tcp_handlers.get(handler_name)
             if handler is None:
-                return
+                # Answer through the sanitized error path below instead of
+                # dropping: a silent drop left the sender waiting out its
+                # whole timeout (and retry budget) for a request this node
+                # can never serve — e.g. registering with the wrong role.
+                raise LookupError(f"no TCP handler named {handler_name!r}")
 
             # The @tcp.receive() wrapper signature is (server, addr, data,
             # clock_time) — passing `transport` as a 4th positional arg
@@ -2209,6 +2213,15 @@ class MercurySyncBaseServer(Generic[T]):
         ):
             if sleep_future is not None and not sleep_future.done():
                 sleep_future.set_result(None)
+
+        # The drop-stats loop sleeps a full stats interval on the clock
+        # and has no wake future, so the quiescence barrier used to wait
+        # out its entire drain budget (measured: every shutdown after any
+        # traffic took exactly drain_timeout). Cancellation IS its exit
+        # path — it breaks on CancelledError mid-sleep and logs nothing
+        # on the way out — so cancelling here equals waking it.
+        if self._drop_stats_task is not None and not self._drop_stats_task.done():
+            self._drop_stats_task.cancel()
 
     def _close_tcp_transports(self) -> None:
         """Close every TCP transport owned by this server."""
