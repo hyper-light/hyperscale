@@ -55,7 +55,6 @@ from hyperscale.distributed.models import (
     JobStatusPush,
     JobCancellationComplete,
     WorkflowDispatch,
-    WorkflowDispatchAck,
     WorkflowProgress,
     WorkflowProgressAck,
     WorkflowFinalResult,
@@ -451,18 +450,6 @@ class ManagerServer(HealthAwareServer):
         )
 
         # Dispatch coordinator for workflow dispatch
-        self._dispatch = ManagerDispatchCoordinator(
-            state=self._manager_state,
-            config=self._config,
-            registry=self._registry,
-            leases=self._leases,
-            logger=self._udp_logger,
-            node_id=self._node_id.short,
-            task_runner=self._task_runner,
-            send_to_worker=self._send_to_worker,
-            send_to_peer=self._send_to_peer,
-        )
-
         # JobManager must exist before any coordinator that takes it as a
         # dependency (e.g. cancellation below). Constructed here so the rest
         # of the init sequence can reference it.
@@ -714,6 +701,18 @@ class ManagerServer(HealthAwareServer):
             clock=self._clock,
             get_healthy_worker_count=lambda: len(self._registry.get_healthy_worker_ids()),
             send_to_callback=self._send_to_client,
+        )
+        # Sends each workflow dispatch the WorkflowDispatcher decides on
+        self._dispatch = ManagerDispatchCoordinator(
+            registry=self._registry,
+            worker_pool=self._worker_pool,
+            stats=self._stats,
+            send_tcp=self.send_tcp,
+            logger=self._udp_logger,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id=self._node_id.short,
+            dispatch_timeout_seconds=self._config.tcp_timeout_standard_seconds,
         )
 
         # Worker health manager (AD-26)
@@ -1048,7 +1047,7 @@ class ManagerServer(HealthAwareServer):
             worker_pool=self._worker_pool,
             manager_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
-            send_dispatch=self._send_workflow_dispatch,
+            send_dispatch=self._dispatch.send_workflow_dispatch,
             on_dispatch_state_registered=self._replicate_job_state_for_dispatch,
             env=self.env,
             max_concurrent_dispatches=self._config.dispatch_max_concurrent_workers,
@@ -6251,131 +6250,6 @@ class ManagerServer(HealthAwareServer):
             self._workflow_dispatcher.signal_cores_available()
 
         return marked_worker_ids
-
-    async def _record_worker_dispatch_success(self, worker_id: str) -> None:
-        """Record successful workflow dispatch routing without mutating SWIM health."""
-        if self._worker_pool.record_dispatch_success(worker_id):
-            await self._worker_pool.notify_cores_available()
-
-    async def _record_worker_dispatch_transport_failure(
-        self,
-        worker_id: str,
-        error: str,
-    ) -> None:
-        """Record temporary dispatch-route failure without mutating SWIM health."""
-        if self._worker_pool.record_dispatch_transport_failure(worker_id, error):
-            await self._worker_pool.notify_cores_available()
-
-    async def _record_worker_dispatch_readiness_rejection(
-        self,
-        worker_id: str,
-        error: str,
-    ) -> None:
-        """Record worker-side readiness rejection without mutating SWIM health."""
-        if self._worker_pool.record_dispatch_readiness_rejection(worker_id, error):
-            await self._worker_pool.notify_cores_available()
-
-    def _is_dispatch_readiness_rejection(self, error: str | None) -> bool:
-        """Return whether a dispatch rejection should cool down worker routing."""
-        if not error:
-            return False
-
-        normalized_error = error.lower()
-        readiness_markers = (
-            "draining",
-            "not accepting",
-            "queue depth",
-            "pending",
-            "capacity",
-            "allocate",
-            "cores",
-        )
-        return any(marker in normalized_error for marker in readiness_markers)
-
-    async def _send_workflow_dispatch(
-        self,
-        worker_id: str,
-        dispatch: WorkflowDispatch,
-    ) -> bool:
-        """Send workflow dispatch to worker.
-
-        WorkflowDispatcher's ``send_dispatch`` callback contract is
-        ``(worker_id: str, WorkflowDispatch) -> bool``. Resolve the
-        worker's TCP address from the registry, send, and report
-        success based on whether a non-error WorkflowDispatchAck came
-        back. Previous signature took an address tuple and returned
-        the parsed ack — the dispatcher passed the worker_id string
-        anyway, so send_tcp received a string and never reached the
-        worker.
-        """
-        registration = self._registry.get_worker(worker_id)
-        if registration is None:
-            # Self-healing chokepoint: the allocator handed us a worker
-            # the registry does not know — by definition a STALE pool
-            # entry (the registry is the registration truth). Purge it
-            # so the retry loop cannot re-select it; without this the
-            # stale pick repeated every attempt and the job stranded.
-            if await self._worker_pool.deregister_worker(worker_id):
-                await self._worker_pool.notify_cores_available()
-            await self._udp_logger.log(
-                ServerWarning(
-                    message=(
-                        f"Workflow dispatch: unknown worker {worker_id[:8]}"
-                        "... — purged stale pool entry"
-                    ),
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return False
-        if dispatch.job_leader_addr is None:
-            dispatch.job_leader_addr = (self._host, self._tcp_port)
-        worker_addr = (registration.node.host, registration.node.port)
-        try:
-            response, _clock = await self.send_tcp(
-                worker_addr,
-                "workflow_dispatch",
-                dispatch.dump(),
-                timeout=self._config.tcp_timeout_standard_seconds,
-            )
-
-            if response and not isinstance(response, Exception):
-                ack = WorkflowDispatchAck.load(response)
-                if bool(getattr(ack, "accepted", True)):
-                    await self._record_worker_dispatch_success(worker_id)
-                    await self._stats.record_dispatch()
-                    return True
-                error = getattr(ack, "error", None)
-                if self._is_dispatch_readiness_rejection(error):
-                    await self._record_worker_dispatch_readiness_rejection(
-                        worker_id,
-                        error or "workflow dispatch rejected",
-                    )
-                else:
-                    await self._record_worker_dispatch_success(worker_id)
-                return False
-
-            await self._record_worker_dispatch_transport_failure(
-                worker_id,
-                "workflow dispatch returned no response",
-            )
-
-        except Exception as error:
-            await self._record_worker_dispatch_transport_failure(
-                worker_id,
-                str(error),
-            )
-            await self._udp_logger.log(
-                ServerError(
-                    message=f"Workflow dispatch error: {error}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-
-        return False
 
     async def _validate_mtls_claims(
         self,
