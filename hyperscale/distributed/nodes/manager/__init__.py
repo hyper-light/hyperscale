@@ -21,8 +21,6 @@ from .health import (
     ManagerHealthMonitor,
     NodeStatus,
     JobSuspicion,
-    ExtensionTracker,
-    HealthcheckExtensionManager,
 )
 from .leadership import ManagerLeadershipCoordinator
 from .raft_integration import ManagerRaftIntegration
@@ -54,8 +52,6 @@ __all__ = [
     # AD-23 Backpressure
     "BackpressureLevel",
     # AD-26 Adaptive Healthcheck Extensions
-    "ExtensionTracker",
-    "HealthcheckExtensionManager",
     # AD-30 Hierarchical Failure Detection
     "NodeStatus",
     "JobSuspicion",

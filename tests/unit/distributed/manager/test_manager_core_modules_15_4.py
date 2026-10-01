@@ -42,8 +42,6 @@ from hyperscale.distributed.nodes.manager.health import (
     ManagerHealthMonitor,
     NodeStatus,
     JobSuspicion,
-    ExtensionTracker,
-    HealthcheckExtensionManager,
 )
 from hyperscale.distributed.nodes.manager.stats import (
     ManagerStatsCoordinator,
@@ -874,85 +872,6 @@ class TestJobSuspicionClass:
         remaining_after = suspicion.time_remaining(cluster_size=5)
         # Should shrink due to confirmations
         assert remaining_after <= remaining
-
-
-class TestExtensionTracker:
-    """Tests for ExtensionTracker (AD-26)."""
-
-    def test_request_extension_first_time(self):
-        """First extension request should succeed."""
-        tracker = ExtensionTracker(
-            worker_id="worker-123",
-            base_deadline=30.0,
-            min_grant=1.0,
-            max_extensions=5,
-        )
-
-        granted, seconds = tracker.request_extension(
-            "long_workflow", current_progress=0.1
-        )
-
-        assert granted is True
-        assert seconds == 30.0  # Full base deadline on first extension
-
-    def test_extension_requires_progress(self):
-        """Subsequent extensions require progress."""
-        tracker = ExtensionTracker(
-            worker_id="worker-123",
-            base_deadline=30.0,
-            min_grant=1.0,
-            max_extensions=5,
-        )
-
-        # First extension
-        tracker.request_extension("long_workflow", current_progress=0.1)
-
-        # Second extension without progress should fail
-        granted, seconds = tracker.request_extension(
-            "long_workflow", current_progress=0.1
-        )
-        assert granted is False
-
-        # Second extension with progress should succeed
-        granted, seconds = tracker.request_extension(
-            "long_workflow", current_progress=0.2
-        )
-        assert granted is True
-
-    def test_extension_limit(self):
-        """Extensions are limited to max_extensions."""
-        tracker = ExtensionTracker(
-            worker_id="worker-123",
-            base_deadline=30.0,
-            min_grant=1.0,
-            max_extensions=2,
-        )
-
-        # First two should succeed
-        granted1, _ = tracker.request_extension("long_workflow", current_progress=0.1)
-        granted2, _ = tracker.request_extension("long_workflow", current_progress=0.2)
-        granted3, _ = tracker.request_extension("long_workflow", current_progress=0.3)
-
-        assert granted1 is True
-        assert granted2 is True
-        assert granted3 is False
-
-    def test_logarithmic_reduction(self):
-        """Extensions reduce logarithmically."""
-        tracker = ExtensionTracker(
-            worker_id="worker-123",
-            base_deadline=32.0,
-            min_grant=1.0,
-            max_extensions=5,
-        )
-
-        _, seconds1 = tracker.request_extension("long_workflow", current_progress=0.1)
-        _, seconds2 = tracker.request_extension("long_workflow", current_progress=0.2)
-        _, seconds3 = tracker.request_extension("long_workflow", current_progress=0.3)
-
-        assert seconds1 == 32.0
-        assert seconds2 == 16.0
-        assert seconds3 == 8.0
 
 
 # =============================================================================

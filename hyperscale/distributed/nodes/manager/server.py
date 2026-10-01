@@ -211,7 +211,7 @@ from .registry import ManagerRegistry
 from .dispatch import ManagerDispatchCoordinator
 from .cancellation import ManagerCancellationCoordinator
 from .leases import ManagerLeaseCoordinator
-from .health import ManagerHealthMonitor, HealthcheckExtensionManager
+from .health import ManagerHealthMonitor
 from .sync import ManagerStateSync
 from .leadership import ManagerLeadershipCoordinator
 from .version_skew import ManagerVersionSkewHandler
@@ -445,14 +445,6 @@ class ManagerServer(HealthAwareServer):
             state=self._manager_state,
             config=self._config,
             registry=self._registry,
-            logger=self._udp_logger,
-            node_id=self._node_id.short,
-            task_runner=self._task_runner,
-        )
-
-        # Extension manager for AD-26 deadline extensions
-        self._extension_manager = HealthcheckExtensionManager(
-            config=self._config,
             logger=self._udp_logger,
             node_id=self._node_id.short,
             task_runner=self._task_runner,
