@@ -38,11 +38,17 @@ class CPUMonitor(BaseMonitor):
             if self._process is None:
                 self._process = psutil.Process()
 
-            cutoff_time = (time.monotonic() - self._sample_window) * 1.1
+            # The workflow's own samples, kept for one window plus 10%
+            # slack. (This iterated ``self.active[run_id]`` -- the dict of
+            # workflow NAMES -- so every update raised unpacking a name
+            # and was swallowed below, and the cutoff scaled the absolute
+            # timestamp by 1.1 instead of the window: no sample was ever
+            # recorded, and every reported average was 0.)
+            cutoff_time = time.monotonic() - self._sample_window * 1.1
 
             self.active[run_id][workflow_name] = [
                 (timestamp, sample)
-                for timestamp, sample in self.active[run_id]
+                for timestamp, sample in self.active[run_id][workflow_name]
                 if timestamp >= cutoff_time
             ]
 
@@ -50,5 +56,7 @@ class CPUMonitor(BaseMonitor):
                 (time.monotonic(), self._process.cpu_percent())
             )
 
-        except Exception:
-            pass
+        except psutil.Error:
+            # The measured process vanished or is unreadable: no sample
+            # this tick. Anything else is a bug and must surface.
+            return

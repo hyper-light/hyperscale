@@ -1633,6 +1633,9 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             if len(memory_usage_stats) > 0:
                 avg_mem_usage_mb = statistics.mean(memory_usage_stats)
 
+            total_cpu_usage = sum(cpu_usage_stats)
+            total_mem_usage_mb = sum(memory_usage_stats)
+
             workers_completed = len(self._completions[run_id][workflow_name])
 
             # Update the completion state
@@ -1653,6 +1656,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 avg_cpu_usage=avg_cpu_usage,
                 avg_memory_usage_mb=avg_mem_usage_mb,
                 workers_completed=workers_completed,
+                total_cpu_usage=total_cpu_usage,
+                total_memory_usage_mb=total_mem_usage_mb,
             )
 
             try:
