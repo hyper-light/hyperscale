@@ -43,6 +43,7 @@ from .job_event_applier import (
     JOB_TIMED_OUT_STATUS,
     JobEventApplier,
 )
+from .job_commit_sequencer import JobCommitSequencer
 from .job_id import JobIdGenerator
 from .unsatisfiable_durability_error import UnsatisfiableDurabilityError
 from .job_state import JobState
@@ -96,10 +97,18 @@ class JobLedger:
     Apply contract
     --------------
 
-    Each write path appends to the WAL, commits through the durability
-    pipeline, and then applies the event to in-memory state -- and the
+    Each write path appends to the WAL, applies the event to in-memory
+    state, and then commits through the durability pipeline -- and the
     apply is UNCONDITIONAL, including when the commit reports a level
     below the one requested.
+
+    The commit runs outside the ledger lock, in the job's turn
+    (``JobCommitSequencer``): a replicated commit is a consensus round
+    trip that can wait out an election, and holding the lock across it
+    stalled every job's writes behind one job's group. Turns keep each
+    job's commits in append order. An entry is marked APPLIED only after
+    its commit finishes, so a checkpoint cannot compact an entry whose
+    replication is still in flight.
 
     That is not a shortcut, it is the only way live and recovered
     state can agree. The append is fsync'd before the commit runs, and
@@ -137,6 +146,7 @@ class JobLedger:
         "_lock",
         "_next_fence_token",
         "_event_applier",
+        "_commit_sequencer",
         "_logger",
         "_pending_archive_jobs",
         "_checkpoint_wal_ratio",
@@ -176,6 +186,7 @@ class JobLedger:
         self._lock = asyncio.Lock()
         self._next_fence_token = 1
         self._event_applier = JobEventApplier()
+        self._commit_sequencer = JobCommitSequencer()
         self._pending_archive_jobs: dict[str, JobState] = {}
         self._checkpoint_wal_ratio = checkpoint_wal_ratio
         self._min_checkpoint_wal_entries = min_checkpoint_wal_entries
@@ -318,7 +329,8 @@ class JobLedger:
         """Write one terminal job's archive record, CONTAINED.
 
         The archive is the ledger's cold-read copy of terminal state;
-        the WAL commit that precedes every call is the durable truth.
+        the fsync'd WAL append that precedes every call is the durable
+        truth.
         Pre-isolation, the first live archive failure (ENOSPC on the
         236-byte terminal copy after the 86-byte WAL append had fit)
         propagated out of the manager's completion handler: the
@@ -453,16 +465,7 @@ class JobLedger:
                 timeout_seconds=timeout_seconds,
             )
 
-            append_result = await self._wal.append(
-                event_type=JobEventType.JOB_CREATED,
-                payload=event.to_bytes(),
-            )
-
-            result = await self._pipeline.commit(
-                append_result.entry,
-                durability,
-                backpressure=append_result.backpressure,
-            )
+            append_result = await self._append(JobEventType.JOB_CREATED, event)
 
             # Applied unconditionally -- see the class docstring's apply
             # contract: the fsync'd append is replayed on recovery either
@@ -477,9 +480,10 @@ class JobLedger:
                 timeout_seconds=timeout_seconds,
             )
             self._publish_snapshot()
-            await self._wal.mark_applied(append_result.entry.lsn)
+            commit_turn = self._commit_sequencer.reserve(job_id)
 
-            return job_id, result
+        result = await self._commit_in_turn(job_id, append_result, durability, commit_turn)
+        return job_id, result
 
     async def accept_job(
         self,
@@ -505,29 +509,16 @@ class JobLedger:
                 worker_count=worker_count,
             )
 
-            append_result = await self._wal.append(
-                event_type=JobEventType.JOB_ACCEPTED,
-                payload=event.to_bytes(),
-            )
-
-            result = await self._pipeline.commit(
-                append_result.entry,
-                durability,
-                backpressure=append_result.backpressure,
-            )
+            append_result = await self._append(JobEventType.JOB_ACCEPTED, event)
 
             # Applied unconditionally -- see the class docstring's apply
-            # contract: the fsync'd append is replayed on recovery either
-            # way, so gating this on replication only splits live state
-            # from recovered state.
-            self._jobs_internal[job_id] = job.with_accepted(
-                datacenter_id=datacenter_id,
-                hlc=hlc,
+            # contract.
+            commit_turn = self._apply_live(
+                job_id,
+                job.with_accepted(datacenter_id=datacenter_id, hlc=hlc),
             )
-            self._publish_snapshot()
-            await self._wal.mark_applied(append_result.entry.lsn)
 
-            return result
+        return await self._commit_in_turn(job_id, append_result, durability, commit_turn)
 
     async def request_cancellation(
         self,
@@ -556,26 +547,17 @@ class JobLedger:
                 requestor_id=requestor_id,
             )
 
-            append_result = await self._wal.append(
-                event_type=JobEventType.JOB_CANCELLATION_REQUESTED,
-                payload=event.to_bytes(),
-            )
-
-            result = await self._pipeline.commit(
-                append_result.entry,
-                durability,
-                backpressure=append_result.backpressure,
+            append_result = await self._append(
+                JobEventType.JOB_CANCELLATION_REQUESTED, event
             )
 
             # Applied unconditionally -- see the class docstring's apply
-            # contract: the fsync'd append is replayed on recovery either
-            # way, so gating this on replication only splits live state
-            # from recovered state.
-            self._jobs_internal[job_id] = job.with_cancellation_requested(hlc=hlc)
-            self._publish_snapshot()
-            await self._wal.mark_applied(append_result.entry.lsn)
+            # contract.
+            commit_turn = self._apply_live(
+                job_id, job.with_cancellation_requested(hlc=hlc)
+            )
 
-            return result
+        return await self._commit_in_turn(job_id, append_result, durability, commit_turn)
 
     async def report_progress(
         self,
@@ -602,7 +584,7 @@ class JobLedger:
                 return None
 
             hlc = await self._clock.generate()
-            append_result, result = await self._append_and_commit(
+            append_result = await self._append(
                 JobEventType.JOB_PROGRESS_REPORTED,
                 JobProgressReported(
                     job_id=job_id,
@@ -612,15 +594,12 @@ class JobLedger:
                     completed_count=completed_count,
                     failed_count=failed_count,
                 ),
-                durability,
             )
-            await self._apply_live(
-                job_id,
-                job.with_progress(completed_count, failed_count, hlc),
-                append_result,
+            commit_turn = self._apply_live(
+                job_id, job.with_progress(completed_count, failed_count, hlc)
             )
 
-            return result
+        return await self._commit_in_turn(job_id, append_result, durability, commit_turn)
 
     async def acknowledge_cancellation(
         self,
@@ -645,7 +624,7 @@ class JobLedger:
                 return None
 
             hlc = await self._clock.generate()
-            append_result, result = await self._append_and_commit(
+            append_result = await self._append(
                 JobEventType.JOB_CANCELLATION_ACKED,
                 JobCancellationAcked(
                     job_id=job_id,
@@ -654,15 +633,12 @@ class JobLedger:
                     datacenter_id=datacenter_id,
                     workflows_cancelled=workflows_cancelled,
                 ),
-                durability,
             )
-            await self._apply_live(
-                job_id,
-                job.with_cancellation_acked(datacenter_id, hlc),
-                append_result,
+            commit_turn = self._apply_live(
+                job_id, job.with_cancellation_acked(datacenter_id, hlc)
             )
 
-            return result
+        return await self._commit_in_turn(job_id, append_result, durability, commit_turn)
 
     async def complete_job(
         self,
@@ -777,11 +753,7 @@ class JobLedger:
                 return None
 
             hlc = await self._clock.generate()
-            append_result, result = await self._append_and_commit(
-                event_type,
-                build_event(job, hlc),
-                durability,
-            )
+            append_result = await self._append(event_type, build_event(job, hlc))
 
             # Applied unconditionally -- see the class docstring's apply
             # contract: the fsync'd append is replayed on recovery either
@@ -805,37 +777,59 @@ class JobLedger:
             if await self._archive_job_isolated(terminal_job):
                 await self._heal_pending_archive_jobs()
 
-            await self._wal.mark_applied(append_result.entry.lsn)
+            commit_turn = self._commit_sequencer.reserve(job_id)
 
-            return result
+        return await self._commit_in_turn(job_id, append_result, durability, commit_turn)
 
-    async def _append_and_commit(
+    async def _append(
         self,
         event_type: JobEventType,
         event: msgspec.Struct,
-        durability: DurabilityLevel,
-    ) -> tuple[WALAppendResult, CommitResult]:
-        append_result = await self._wal.append(
+    ) -> WALAppendResult:
+        return await self._wal.append(
             event_type=event_type,
             payload=event.to_bytes(),
         )
-        result = await self._pipeline.commit(
-            append_result.entry,
-            durability,
-            backpressure=append_result.backpressure,
-        )
-        return append_result, result
 
-    async def _apply_live(
+    def _apply_live(
         self,
         job_id: str,
         job: JobState,
-        append_result: WALAppendResult,
-    ) -> None:
+    ) -> tuple[asyncio.Future[None] | None, asyncio.Future[None]]:
+        """Apply under the ledger lock and take the job's commit turn
+        (the lock fixes the turn order to the append order)."""
         # Applied unconditionally -- the class docstring's apply contract.
         self._jobs_internal[job_id] = job
         self._publish_snapshot()
-        await self._wal.mark_applied(append_result.entry.lsn)
+        return self._commit_sequencer.reserve(job_id)
+
+    async def _commit_in_turn(
+        self,
+        job_id: str,
+        append_result: WALAppendResult,
+        durability: DurabilityLevel,
+        commit_turn: tuple[asyncio.Future[None] | None, asyncio.Future[None]],
+    ) -> CommitResult:
+        """Commit outside the ledger lock, in the job's append order.
+
+        The entry turns APPLIED only once its commit has finished (or
+        been cancelled), never before, so a checkpoint cannot compact it
+        mid-replication and it never stays PENDING forever.
+        """
+        predecessor, turn = commit_turn
+        try:
+            return await self._commit_sequencer.run(
+                job_id,
+                predecessor,
+                turn,
+                lambda: self._pipeline.commit(
+                    append_result.entry,
+                    durability,
+                    backpressure=append_result.backpressure,
+                ),
+            )
+        finally:
+            await self._wal.mark_applied(append_result.entry.lsn)
 
     def get_job(
         self,
