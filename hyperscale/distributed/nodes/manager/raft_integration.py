@@ -67,6 +67,7 @@ class ManagerRaftIntegration:
         manager_state: "ManagerState | None" = None,
         *,
         clock: "HybridLogicalClock",
+        may_lead: Callable[[], bool],
         ledger_replica: "JobLedgerReplica",
     ) -> None:
         self._node_id = node_id
@@ -93,6 +94,7 @@ class ManagerRaftIntegration:
             on_lose_leadership=on_job_raft_lose_leader,
             manager_state=manager_state,
             clock=clock,
+            may_lead=may_lead,
             ledger_replica=ledger_replica,
         )
 

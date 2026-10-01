@@ -302,6 +302,33 @@ class StorageFormatUnrecognized(Entry, kw_only=True):
     level: LogLevel = LogLevel.ERROR
 
 
+class ClockFenced(Entry, kw_only=True):
+    node_id: str
+    peers_beyond: int
+    peers_measured: int
+    quorum: int
+    hlc_lead_ms: int
+    threshold_ms: int
+    level: LogLevel = LogLevel.ERROR
+
+
+class ClockUnfenced(Entry, kw_only=True):
+    node_id: str
+    peers_beyond: int
+    peers_measured: int
+    quorum: int
+    hlc_lead_ms: int
+    threshold_ms: int
+    level: LogLevel = LogLevel.INFO
+
+
+class ClockOffsetProbeFailed(Entry, kw_only=True):
+    node_id: str
+    peer_id: str
+    error_type: str
+    level: LogLevel = LogLevel.DEBUG
+
+
 class WALTailDiscarded(Entry, kw_only=True):
     path: str
     preserved_path: str

@@ -84,6 +84,7 @@ def make_node(
         logger=logger_mock,
         configured_cluster_size=len(members),
         clock=new_hybrid_logical_clock(),
+        may_lead=lambda: True,
     )
     return node, send_mock, apply_mock
 

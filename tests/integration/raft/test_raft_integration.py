@@ -82,6 +82,7 @@ def manager_integration(
 ):
     return ManagerRaftIntegration(
         clock=new_hybrid_logical_clock(),
+        may_lead=lambda: True,
         ledger_replica=JobLedgerReplica(),
         node_id="node-1",
         job_manager=mock_job_manager,
@@ -103,6 +104,7 @@ def gate_integration(
 ):
     return GateRaftIntegration(
         clock=new_hybrid_logical_clock(),
+        may_lead=lambda: True,
         ledger_replica=JobLedgerReplica(),
         cluster_size=lambda: 3,
         proposal_timeout_seconds=5.0,
@@ -453,6 +455,7 @@ class TestManagerRaftLeaderCallbacks:
         callback = MagicMock()
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -476,6 +479,7 @@ class TestManagerRaftLeaderCallbacks:
         callback = MagicMock()
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -504,6 +508,7 @@ class TestManagerRaftLeaderCallbacks:
 
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -546,6 +551,7 @@ class TestGateRaftLeaderCallbacks:
         callback = MagicMock()
         integration = GateRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             cluster_size=lambda: 3,
             proposal_timeout_seconds=5.0,
@@ -573,6 +579,7 @@ class TestGateRaftLeaderCallbacks:
         callback = MagicMock()
         integration = GateRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             cluster_size=lambda: 3,
             proposal_timeout_seconds=5.0,
@@ -605,6 +612,7 @@ class TestGateRaftLeaderCallbacks:
 
         integration = GateRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             cluster_size=lambda: 3,
             proposal_timeout_seconds=5.0,

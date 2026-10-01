@@ -190,7 +190,15 @@ from hyperscale.distributed.routing import (
     GateJobRouter,
 )
 from hyperscale.distributed.swim.coordinates import CoordinateTracker
-from hyperscale.distributed.hlc import HybridLogicalClock, hlc_node_id
+from hyperscale.distributed.hlc import (
+    ClockFenceVerdict,
+    ClockOffsetMonitor,
+    ClockOffsetProber,
+    HybridLogicalClock,
+    hlc_node_id,
+    tcp_probe_exchange,
+)
+from hyperscale.distributed.hlc.models import ClockOffsetProbeReply
 from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
     SpilloverEvaluator,
@@ -479,6 +487,16 @@ class GateServer(HealthAwareServer):
             clock=self._clock,
             max_offset_ms=env.HLC_MAX_CLOCK_OFFSET_MS,
         )
+        # AD-39: fenced while this gate's clock disagrees with a quorum of
+        # the gate cluster (or its HLC ran past its own clock). A fenced
+        # gate neither leads (Raft or SWIM) nor accepts jobs.
+        self._clock_offset_monitor = ClockOffsetMonitor(
+            hlc=self._hlc,
+            cluster_size=self._configured_gate_count,
+            sample_ttl_seconds=env.HLC_OFFSET_SAMPLE_TTL_SECONDS,
+            clock=self._clock,
+        )
+        self._leadership_refusals.append(self._is_clock_fenced)
 
         # Job submissions
         self._job_submissions: dict[str, JobSubmission] = {}
@@ -975,6 +993,18 @@ class GateServer(HealthAwareServer):
             on_job_raft_leader=self._on_job_raft_leader,
             on_job_raft_lose_leader=self._on_job_raft_lose_leader,
             clock=self._hlc,
+            may_lead=self._may_lead,
+        )
+        self._clock_offset_prober = ClockOffsetProber(
+            node_id=self._node_id.full,
+            hlc=self._hlc,
+            monitor=self._clock_offset_monitor,
+            peers=self._raft.consensus.member_addresses,
+            exchange=tcp_probe_exchange(self.send_tcp),
+            clock=self._clock,
+            probe_interval_seconds=self.env.HLC_OFFSET_PROBE_INTERVAL_SECONDS,
+            logger=self._udp_logger,
+            on_fence_change=self._on_clock_fence_change,
         )
         # A forwarded proposal or placement query waits out the group
         # leader's proposal timeout plus one short transit.
@@ -1244,6 +1274,7 @@ class GateServer(HealthAwareServer):
 
         # Start Raft consensus tick loop and seed membership from known gate peers
         self._raft.start()
+        self._task_runner.run(self._clock_offset_prober.run, alias="clock_offset_prober")
         raft_members: set[str] = set()
         raft_addrs: dict[str, tuple[str, int]] = {}
         for gate_id, gate_info in self._modular_state.iter_known_gates():
@@ -1303,7 +1334,8 @@ class GateServer(HealthAwareServer):
         if self._idempotency_cache is not None:
             await self._idempotency_cache.close()
 
-        # Stop Raft consensus
+        # Stop Raft consensus and clock offset probing
+        self._clock_offset_prober.stop()
         if self._raft is not None:
             await self._raft.stop()
 
@@ -1453,6 +1485,14 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job submission from client."""
+        if self._is_clock_fenced():
+            return JobAck(
+                job_id=JobSubmission.load(data).job_id,
+                accepted=False,
+                error="Gate clock fenced (offset beyond bound), not accepting jobs",
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
         if self._job_handler:
             return await self._job_handler.handle_submission(
                 addr, data, self._modular_state.get_active_peer_count()
@@ -4784,6 +4824,18 @@ class GateServer(HealthAwareServer):
         total_gates = self._configured_gate_count()
         return (total_gates // 2) + 1
 
+    def _is_clock_fenced(self) -> bool:
+        return self._clock_offset_monitor.is_fenced
+
+    def _may_lead(self) -> bool:
+        return not self._clock_offset_monitor.is_fenced
+
+    async def _on_clock_fence_change(self, verdict: ClockFenceVerdict) -> None:
+        """A fenced gate gives up cluster leadership (re-election is
+        refused while fenced); Raft groups relinquish on their next tick."""
+        if verdict.fenced and self.is_leader():
+            self._task_runner.run(self._leader_election._step_down)
+
     def _configured_gate_count(self) -> int:
         """Return the static gate cluster size used for quorum decisions."""
         return max(
@@ -7563,6 +7615,20 @@ class GateServer(HealthAwareServer):
             return b""
         response = await self._raft.handle_append_entries(data)
         return response if response is not None else b""
+
+    @tcp.receive()
+    async def clock_offset_probe(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """AD-39: answer a peer's clock offset probe with this node's
+        physical time."""
+        return ClockOffsetProbeReply(
+            responder_id=self._node_id.full,
+            responder_physical_ms=self._hlc.physical_ms(),
+        ).dump()
 
     @tcp.receive()
     async def gate_raft_append_entries_response(

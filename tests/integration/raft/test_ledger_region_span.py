@@ -64,6 +64,7 @@ class GateLedgerCluster:
             send_tcp = self._sender(addr)
             self.integrations[addr] = GateRaftIntegration(
                 clock=new_hybrid_logical_clock(),
+                may_lead=lambda: True,
                 ledger_replica=self.replicas[addr],
                 cluster_size=lambda: len(self.addresses),
                 proposal_timeout_seconds=LIVENESS_CEILING_SECONDS,

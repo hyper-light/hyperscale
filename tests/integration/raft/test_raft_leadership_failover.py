@@ -97,6 +97,7 @@ class TestManagerRaftLeaderTakeover:
 
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -121,6 +122,7 @@ class TestManagerRaftLeaderTakeover:
         """on_node_leave removes the dead node from all Raft groups."""
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -154,6 +156,7 @@ class TestManagerRaftLeaderTakeover:
         """After a node leaves, quorum size recalculates for smaller cluster."""
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -200,6 +203,7 @@ class TestManagerRaftLeaderTakeover:
 
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -229,6 +233,7 @@ class TestManagerRaftLeaderTakeover:
         """Raft proposals fail when this node is not the per-job Raft leader."""
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -272,6 +277,7 @@ class TestGateRaftLeaderTakeover:
 
         integration = GateRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             cluster_size=lambda: 3,
             proposal_timeout_seconds=5.0,
@@ -300,6 +306,7 @@ class TestGateRaftLeaderTakeover:
         """on_node_leave removes the dead gate from all gate Raft groups."""
         integration = GateRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             cluster_size=lambda: 3,
             proposal_timeout_seconds=5.0,
@@ -334,6 +341,7 @@ class TestGateRaftLeaderTakeover:
         """Gate Raft proposals fail when not the per-job Raft leader."""
         integration = GateRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             cluster_size=lambda: 3,
             proposal_timeout_seconds=5.0,
@@ -458,6 +466,7 @@ class TestDualPathFailover:
         """Creating a Raft instance for an existing job returns True (idempotent)."""
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -488,6 +497,7 @@ class TestDualPathFailover:
         """Raft instance creation is rejected when at capacity."""
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -521,6 +531,7 @@ class TestDualPathFailover:
         """Destroying a job Raft instance releases all memory."""
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -549,6 +560,7 @@ class TestDualPathFailover:
         """Proposing to a job without a Raft instance fails gracefully."""
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
@@ -574,6 +586,7 @@ class TestDualPathFailover:
         """Each job has independent Raft state."""
         integration = ManagerRaftIntegration(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,

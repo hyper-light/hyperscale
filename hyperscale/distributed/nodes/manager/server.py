@@ -176,7 +176,15 @@ from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 # Module-level storage seam (Phase 7): borrowed, never shut down
 # here; swap_defaults rebinds it under SIM.
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
-from hyperscale.distributed.hlc import HybridLogicalClock, hlc_node_id
+from hyperscale.distributed.hlc import (
+    ClockFenceVerdict,
+    ClockOffsetMonitor,
+    ClockOffsetProber,
+    HybridLogicalClock,
+    hlc_node_id,
+    tcp_probe_exchange,
+)
+from hyperscale.distributed.hlc.models import ClockOffsetProbeReply
 from hyperscale.distributed.jobs.timeout_strategy import (
     TimeoutStrategy,
     LocalAuthorityTimeout,
@@ -550,6 +558,17 @@ class ManagerServer(HealthAwareServer):
             clock=self._clock,
             max_offset_ms=self._env.HLC_MAX_CLOCK_OFFSET_MS,
         )
+        # AD-39: fenced while this manager's clock disagrees with a quorum
+        # of the cluster (or its HLC ran past its own clock). A fenced
+        # manager neither leads (Raft or SWIM) nor accepts jobs.
+        configured_manager_count = len(self._config.manager_udp_peers) + 1
+        self._clock_offset_monitor = ClockOffsetMonitor(
+            hlc=self._hlc,
+            cluster_size=lambda: configured_manager_count,
+            sample_ttl_seconds=self._env.HLC_OFFSET_SAMPLE_TTL_SECONDS,
+            clock=self._clock,
+        )
+        self._leadership_refusals.append(self._is_clock_fenced)
 
         # Raft consensus integration
         self._raft_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
@@ -567,13 +586,25 @@ class ManagerServer(HealthAwareServer):
             task_runner=self._task_runner,
             send_tcp=self._send_to_peer,
             node_addr=(self._host, self._tcp_port),
-            configured_cluster_size=len(self._config.manager_udp_peers) + 1,
+            configured_cluster_size=configured_manager_count,
             proposal_timeout_seconds=self._config.quorum_timeout_seconds,
             on_job_raft_leader=self._on_job_raft_leader,
             on_job_raft_lose_leader=self._on_job_raft_lose_leader,
             manager_state=self._manager_state,
             clock=self._hlc,
+            may_lead=self._may_lead,
             ledger_replica=self._ledger_replica,
+        )
+        self._clock_offset_prober = ClockOffsetProber(
+            node_id=self._node_id.full,
+            hlc=self._hlc,
+            monitor=self._clock_offset_monitor,
+            peers=self._raft.consensus.member_addresses,
+            exchange=tcp_probe_exchange(self.send_tcp),
+            clock=self._clock,
+            probe_interval_seconds=self._env.HLC_OFFSET_PROBE_INTERVAL_SECONDS,
+            logger=self._udp_logger,
+            on_fence_change=self._on_clock_fence_change,
         )
         # A forwarded proposal waits out the group leader's proposal
         # timeout, plus one short transit for the request and its reply.
@@ -848,8 +879,7 @@ class ManagerServer(HealthAwareServer):
             get_tcp_port=lambda: self._tcp_port,
             get_udp_host=lambda: self._host,
             get_udp_port=lambda: self._udp_port,
-            get_health_accepting_jobs=lambda: self._manager_state.manager_state_enum
-            == ManagerStateEnum.ACTIVE,
+            get_health_accepting_jobs=self._is_accepting_jobs,
             get_health_has_quorum=self._has_quorum_available,
             get_health_throughput=self._get_dispatch_throughput,
             get_health_expected_throughput=self._get_expected_dispatch_throughput,
@@ -928,6 +958,24 @@ class ManagerServer(HealthAwareServer):
         have landed at any given moment.
         """
         return len(self._manager_udp_peers) + 1
+
+    def _is_clock_fenced(self) -> bool:
+        return self._clock_offset_monitor.is_fenced
+
+    def _may_lead(self) -> bool:
+        return not self._clock_offset_monitor.is_fenced
+
+    def _is_accepting_jobs(self) -> bool:
+        return (
+            self._manager_state.manager_state_enum == ManagerStateEnum.ACTIVE
+            and not self._clock_offset_monitor.is_fenced
+        )
+
+    async def _on_clock_fence_change(self, verdict: ClockFenceVerdict) -> None:
+        """A fenced manager gives up datacenter leadership (re-election is
+        refused while fenced); Raft groups relinquish on their next tick."""
+        if verdict.fenced and self.is_leader():
+            self._task_runner.run(self._leader_election._step_down)
 
     def _get_manager_health_state_snapshot(self) -> str:
         return self._manager_health_state_snapshot
@@ -1090,6 +1138,7 @@ class ManagerServer(HealthAwareServer):
         # by now.
         self._raft._consensus._task_runner = self._task_runner
         self._raft.start()
+        self._task_runner.run(self._clock_offset_prober.run, alias="clock_offset_prober")
         raft_members: set[str] = set()
         raft_addrs: dict[str, tuple[str, int]] = {}
         for peer_id, peer_info in self._manager_state.iter_known_manager_peers():
@@ -1141,7 +1190,8 @@ class ManagerServer(HealthAwareServer):
         elif self._node_wal is not None:
             await self._node_wal.close()
 
-        # Stop Raft consensus
+        # Stop Raft consensus and clock offset probing
+        self._clock_offset_prober.stop()
         await self._raft.stop()
 
         # Graceful shutdown
@@ -4642,9 +4692,7 @@ class ManagerServer(HealthAwareServer):
             # these two booleans straight into ManagerHealthState
             # readiness, so a draining or quorum-less manager kept
             # receiving jobs.
-            health_accepting_jobs=(
-                self._manager_state.manager_state_enum == ManagerStateEnum.ACTIVE
-            ),
+            health_accepting_jobs=self._is_accepting_jobs(),
             health_has_quorum=self._has_quorum_available(),
             health_throughput=self._get_dispatch_throughput(),
             health_expected_throughput=self._get_expected_dispatch_throughput(),
@@ -9437,6 +9485,13 @@ class ManagerServer(HealthAwareServer):
                     error=f"Manager is {self._manager_state.manager_state_enum.value}, not accepting jobs",
                 ).dump()
 
+            if self._is_clock_fenced():
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="Manager clock fenced (offset beyond bound), not accepting jobs",
+                ).dump()
+
             # Leader fencing: only DC leader accepts new jobs to prevent duplicates
             # during multi-gate submit storms (FIX 2.5)
             if not self.is_leader():
@@ -11430,6 +11485,20 @@ class ManagerServer(HealthAwareServer):
         proposal = LedgerProposal.load(data)
         result = await self._ledger_replicator.handle_forwarded(proposal)
         return result.dump()
+
+    @tcp.receive()
+    async def clock_offset_probe(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """AD-39: answer a peer's clock offset probe with this node's
+        physical time."""
+        return ClockOffsetProbeReply(
+            responder_id=self._node_id.full,
+            responder_physical_ms=self._hlc.physical_ms(),
+        ).dump()
 
     @tcp.receive()
     async def raft_append_entries_response(

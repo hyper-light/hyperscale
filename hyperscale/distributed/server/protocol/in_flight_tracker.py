@@ -99,6 +99,9 @@ _CONTROL_HANDLERS: frozenset[str] = frozenset(
         "gate_raft_append_entries_response",
         "gate_raft_ledger_proposal",
         "gate_raft_ledger_placement",
+        # AD-39 clock offset measurement: a throttled probe would delay
+        # (or prevent) fencing a node whose clock ran away.
+        "clock_offset_probe",
     }
 )
 

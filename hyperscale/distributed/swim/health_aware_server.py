@@ -443,6 +443,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Graceful degradation (load shedding under pressure)
         self._degradation = GracefulDegradation()
+        # Further reasons a role may refuse SWIM leadership (beyond
+        # graceful degradation): each is consulted on every eligibility
+        # check; roles register theirs in their own constructors.
+        self._leadership_refusals: list[Callable[[], bool]] = []
 
         # Cleanup configuration
         self._cleanup_interval: float = 30.0  # Seconds between cleanup runs
@@ -2319,6 +2323,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if stale_count > 0:
             self._metrics.record_counter("stale_unconfirmed_peers", stale_count)
 
+    def _should_refuse_leadership(self) -> bool:
+        return self._degradation.should_refuse_leadership() or any(
+            refuses() for refuses in self._leadership_refusals
+        )
+
     def _setup_leader_election(self) -> None:
         """Initialize leader election callbacks after server is started."""
         self._leader_election.set_callbacks(
@@ -2327,7 +2336,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             get_lhm_score=lambda: self._local_health.score,
             self_addr=self._get_self_udp_addr(),
             on_error=self._handle_election_error,
-            should_refuse_leadership=lambda: self._degradation.should_refuse_leadership(),
+            should_refuse_leadership=self._should_refuse_leadership,
             task_runner=self._task_runner,
             on_election_started=self._on_election_started,
             on_heartbeat_sent=self._on_heartbeat_sent,

@@ -73,6 +73,7 @@ class InMemoryCluster:
         for addr in self.addresses:
             self.integrations[addr] = ManagerRaftIntegration(
                 clock=new_hybrid_logical_clock(),
+                may_lead=lambda: True,
                 ledger_replica=JobLedgerReplica(),
                 node_id=_member_id(addr),
                 job_manager=MagicMock(),

@@ -48,6 +48,7 @@ class RaftConsensus:
         "_task_runner",
         "_send_message",
         "_clock",
+        "_may_lead",
         "_members",
         "_member_addrs",
         "_nodes",
@@ -75,6 +76,7 @@ class RaftConsensus:
         manager_state: "ManagerState | None" = None,
         *,
         clock: "HybridLogicalClock",
+        may_lead: Callable[[], bool],
         ledger_replica: "JobLedgerReplica",
     ) -> None:
         self._node_id = node_id
@@ -88,6 +90,7 @@ class RaftConsensus:
         self._task_runner = task_runner
         self._send_message = send_message
         self._clock = clock
+        self._may_lead = may_lead
 
         self._members: set[str] = set()
         self._member_addrs: dict[str, tuple[str, int]] = {}
@@ -179,6 +182,7 @@ class RaftConsensus:
             on_lose_leadership=self._make_lose_leadership_callback(job_id),
             logger=self._logger,
             clock=self._clock,
+            may_lead=self._may_lead,
             configured_cluster_size=self._configured_cluster_size,
             proposal_timeout_seconds=self._proposal_timeout_seconds,
         )
@@ -285,6 +289,14 @@ class RaftConsensus:
     def member_address(self, node_id: str) -> tuple[str, int] | None:
         """TCP address of a current member, or None if unknown."""
         return self._member_addrs.get(node_id)
+
+    def member_addresses(self) -> dict[str, tuple[str, int]]:
+        """Each current member's TCP address, by node id."""
+        return {
+            member: address
+            for member in self._members
+            if (address := self._member_addrs.get(member)) is not None
+        }
 
     def on_node_leave(self, node_id: str) -> None:
         """Handle a node leaving the cluster."""

@@ -101,6 +101,7 @@ class RaftNode:
         "_on_lose_leadership",
         "_logger",
         "_clock",
+        "_may_lead",
         "_lock",
         "_log",
         "_role",
@@ -138,6 +139,7 @@ class RaftNode:
         proposal_timeout_seconds: float = 5.0,
         *,
         clock: "HybridLogicalClock",
+        may_lead: Callable[[], bool],
     ) -> None:
         self._job_id = job_id
         self._node_id = node_id
@@ -149,6 +151,9 @@ class RaftNode:
         self._on_lose_leadership = on_lose_leadership
         self._logger = logger
         self._clock = clock
+        # AD-39: false while this node's clock is fenced -- it then neither
+        # campaigns, leads, nor mints entries; it still votes and follows.
+        self._may_lead = may_lead
 
         self._lock = asyncio.Lock()
         self._log = RaftLog(job_id)
@@ -221,8 +226,13 @@ class RaftNode:
                     await self._start_pre_vote_locked()
 
     def _tick_leader(self) -> None:
-        """Check if heartbeat is due. Does NOT send -- replicate_to_followers does."""
-        pass  # Heartbeats sent via replicate_to_followers in consensus coordinator
+        """Relinquish leadership when this node may no longer lead.
+
+        Heartbeats are sent by replicate_to_followers in the consensus
+        coordinator. Stepping down keeps the term and the vote cast in it.
+        """
+        if not self._may_lead():
+            self._step_down(self._current_term)
 
     def _election_timed_out(self) -> bool:
         return _DEFAULT_CLOCK.monotonic() >= self._election_deadline
@@ -250,6 +260,8 @@ class RaftNode:
         no fresher -- lets this node bump its term and campaign.
         """
         self._election_deadline = self._new_election_deadline()
+        if not self._may_lead():
+            return
         self._pre_vote_term = self._current_term + 1
         self._pre_votes_received = {self._node_id}
         if len(self._pre_votes_received) >= self._quorum_size():
@@ -258,7 +270,16 @@ class RaftNode:
         await self._broadcast_request_vote(term=self._pre_vote_term, pre_vote=True)
 
     async def _start_election_locked(self) -> None:
-        """Transition to candidate and request votes. Lock must be held."""
+        """Transition to candidate and request votes. Lock must be held.
+
+        Every path into a campaign (timeout PreVote, a PreVote majority
+        arriving later, an explicit start_election) passes here, so a node
+        that may not lead never becomes a candidate.
+        """
+        if not self._may_lead():
+            self._pre_vote_term = None
+            self._pre_votes_received = set()
+            return
         self._pre_vote_term = None
         self._pre_votes_received = set()
         self._current_term += 1
@@ -682,7 +703,7 @@ class RaftNode:
         async with self._lock:
             if self._destroyed or self._role != "leader":
                 return False, 0
-            if self._log.is_at_capacity:
+            if self._log.is_at_capacity or not self._may_lead():
                 return False, 0
 
             entry = RaftLogEntry(

@@ -41,6 +41,10 @@ TRANSIENT_ERRORS = frozenset({
     # classification lets the client round-robin to another target.
     "not dc leader",
     "not job leader",
+    # AD-39: the node's clock is fenced (offset beyond the bound against a
+    # quorum of peers); it clears when the clock is back in agreement,
+    # and meanwhile another node takes the work.
+    "clock fenced",
     # Gate-forwarded cancel where no DC could confirm because manager
     # leadership is mid-failover. The gate stamps its aggregate cancel
     # error with ``GateCancellationHandler._CANCEL_RETRYABLE_MARKER``

@@ -141,6 +141,7 @@ def create_cluster(
 
         node = RaftNode(
             clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             job_id="job-1",
             node_id=node_id,
             members=members,

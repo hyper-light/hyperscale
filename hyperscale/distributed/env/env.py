@@ -308,6 +308,12 @@ class Env(BaseModel):
     # than adopted. 500ms is CockroachDB's default --max-offset, sized
     # for NTP-disciplined clocks.
     HLC_MAX_CLOCK_OFFSET_MS: StrictInt = 500
+    # AD-39 offset measurement: each node probes its tier peers' clocks this
+    # often (the detection latency of a clock that runs away), and a
+    # measurement counts toward fencing for this long -- three intervals,
+    # so two lost probes in a row do not drop a peer's measurement.
+    HLC_OFFSET_PROBE_INTERVAL_SECONDS: StrictFloat = 1.0
+    HLC_OFFSET_SAMPLE_TTL_SECONDS: StrictFloat = 3.0
 
     # Cancelled Workflow Cleanup Settings (Section 6)
     CANCELLED_WORKFLOW_TTL: StrictFloat = (
@@ -922,6 +928,8 @@ class Env(BaseModel):
             "RESOURCE_GUARD_KILL_GRACE_SECONDS": float,
             "RESOURCE_VIEW_STALENESS_SECONDS": float,
             "HLC_MAX_CLOCK_OFFSET_MS": int,
+            "HLC_OFFSET_PROBE_INTERVAL_SECONDS": float,
+            "HLC_OFFSET_SAMPLE_TTL_SECONDS": float,
             # Cancelled workflow cleanup settings (Section 6)
             "CANCELLED_WORKFLOW_TTL": float,
             "CANCELLED_WORKFLOW_CLEANUP_INTERVAL": float,

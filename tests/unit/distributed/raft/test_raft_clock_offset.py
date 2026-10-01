@@ -59,6 +59,7 @@ def make_node(node_id: str, physical_ms: int) -> tuple[RaftNode, HybridLogicalCl
         logger=logger,
         configured_cluster_size=len(MEMBERS),
         clock=clock,
+        may_lead=lambda: True,
     )
     return node, clock, send_message, logger
 
