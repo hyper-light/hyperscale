@@ -571,12 +571,16 @@ class DiscoveryService(Generic[T]):
                     tier=peer_tier,
                     load_balanced=False,
                 )
+                # Unreachable until the sticky health comparison was fixed
+                # (it reported healthy peers as unhealthy), so this
+                # constructor used SelectionResult fields that never existed.
                 return SelectionResult(
                     peer_id=sticky_peer_id,
-                    latency_estimate_ms=self._selector.get_effective_latency(
+                    effective_latency_ms=self._selector.get_effective_latency(
                         sticky_peer_id
                     ),
                     was_load_balanced=False,
+                    candidates_considered=1,
                 )
 
         # Perform standard selection
@@ -727,8 +731,9 @@ class DiscoveryService(Generic[T]):
                 results.append(
                     SelectionResult(
                         peer_id=peer_id,
-                        latency_estimate_ms=latency,
+                        effective_latency_ms=latency,
                         was_load_balanced=False,
+                        candidates_considered=len(peer_latencies),
                     )
                 )
                 used_peer_ids.add(peer_id)

@@ -38,8 +38,9 @@ def _resolve_total_cores(env: Env, explicit_total_cores: int | None) -> int:
     if explicit_total_cores is not None:
         return _require_positive_core_count(explicit_total_cores, "total_cores")
 
-    if env.WORKER_MAX_CORES:
-        return _require_positive_core_count(env.WORKER_MAX_CORES, "WORKER_MAX_CORES")
+    env_total_cores = getattr(env, "WORKER_MAX_CORES", None)
+    if env_total_cores:
+        return _require_positive_core_count(env_total_cores, "WORKER_MAX_CORES")
 
     return _get_os_cpus()
 

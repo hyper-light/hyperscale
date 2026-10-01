@@ -55,3 +55,48 @@ def test_unhealthy_binding_is_not_reported_healthy_when_eviction_is_off(health: 
     assert not manager.is_bound_healthy("job-1")
     assert manager.get_stats()["unhealthy_bindings"] == 1
     assert manager.get_stats()["healthy_bindings"] == 0
+
+
+# The sticky-hit branch of DiscoveryService.select_peer and the backup
+# fill of select_peers were unreachable while the comparisons above ran
+# backwards, so both built SelectionResult with fields that never existed
+# (latency_estimate_ms, no candidates_considered): the first sticky hit
+# after the ordering fix raised TypeError.
+
+
+def _service_with_seeds(seed_count: int):
+    from hyperscale.distributed.discovery import DiscoveryService
+    from hyperscale.distributed.discovery.models.discovery_config import (
+        DiscoveryConfig,
+    )
+
+    return DiscoveryService(
+        DiscoveryConfig(
+            cluster_id="test-cluster",
+            environment_id="test",
+            static_seeds=[f"10.0.0.{index}:9000" for index in range(1, seed_count + 1)],
+        )
+    )
+
+
+def test_sticky_hit_returns_the_bound_peer() -> None:
+    service = _service_with_seeds(3)
+
+    first = service.select_peer("job-1")
+    second = service.select_peer("job-1")
+
+    assert first is not None and second is not None
+    assert second.peer_id == first.peer_id
+    assert second.was_load_balanced is False
+    assert second.candidates_considered == 1
+
+
+@pytest.mark.parametrize("requested", [1, 3, 5, 8])
+def test_select_peers_fills_with_distinct_peers_up_to_the_pool(requested: int) -> None:
+    service = _service_with_seeds(5)
+
+    results = service.select_peers("job-1", count=requested)
+
+    peer_ids = [result.peer_id for result in results]
+    assert len(peer_ids) == min(requested, 5)
+    assert len(set(peer_ids)) == len(peer_ids)

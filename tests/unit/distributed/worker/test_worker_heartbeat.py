@@ -20,6 +20,12 @@ from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
 from hyperscale.distributed.models import ManagerHeartbeat, ManagerInfo
 
 
+def _select_lowest_id(healthy_manager_ids: set[str]) -> str | None:
+    """Stand-in for AD-28 selection: a deterministic choice."""
+    return min(healthy_manager_ids)
+
+
+
 def create_manager_heartbeat(
     node_id: str = "mgr-1",
     datacenter: str = "dc-1",
@@ -73,7 +79,7 @@ class TestWorkerHeartbeatHandlerInitialization:
 
     def test_happy_path_instantiation(self) -> None:
         """Test normal instantiation."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         logger = MagicMock()
 
         handler = WorkerHeartbeatHandler(
@@ -88,7 +94,7 @@ class TestWorkerHeartbeatHandlerInitialization:
 
     def test_without_logger(self) -> None:
         """Test instantiation without logger."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
 
         handler = WorkerHeartbeatHandler(registry=registry)
 
@@ -100,7 +106,7 @@ class TestWorkerHeartbeatHandlerCallbacks:
 
     def test_set_callbacks(self) -> None:
         """Test setting callbacks."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_new_manager = MagicMock()
@@ -116,7 +122,7 @@ class TestWorkerHeartbeatHandlerCallbacks:
 
     def test_set_partial_callbacks(self) -> None:
         """Test setting only some callbacks."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_new_manager = MagicMock()
@@ -133,7 +139,7 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
     @pytest.mark.asyncio
     async def test_process_heartbeat_new_manager(self) -> None:
         """Test processing heartbeat from new manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         logger = MagicMock()
         handler = WorkerHeartbeatHandler(registry=registry, logger=logger)
 
@@ -173,7 +179,7 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
     @pytest.mark.asyncio
     async def test_process_heartbeat_existing_manager(self) -> None:
         """Test processing heartbeat from existing manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         # Add existing manager
@@ -218,7 +224,7 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
     @pytest.mark.asyncio
     async def test_process_heartbeat_leadership_change(self) -> None:
         """Test processing heartbeat with leadership change."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         logger = MagicMock()
         handler = WorkerHeartbeatHandler(registry=registry, logger=logger)
 
@@ -268,7 +274,7 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
     @pytest.mark.asyncio
     async def test_process_heartbeat_with_job_leaderships(self) -> None:
         """Test processing heartbeat with job leadership claims."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_job_leadership = MagicMock()
@@ -306,7 +312,7 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
     @pytest.mark.asyncio
     async def test_process_heartbeat_no_job_leaderships(self) -> None:
         """Test processing heartbeat without job leadership claims."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_job_leadership = MagicMock()
@@ -343,7 +349,7 @@ class TestWorkerHeartbeatHandlerPeerConfirmation:
 
     def test_on_peer_confirmed_known_manager(self) -> None:
         """Test peer confirmation for known manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         logger = MagicMock()
         handler = WorkerHeartbeatHandler(registry=registry, logger=logger)
 
@@ -372,7 +378,7 @@ class TestWorkerHeartbeatHandlerPeerConfirmation:
 
     def test_on_peer_confirmed_unknown_peer(self) -> None:
         """Test peer confirmation for unknown peer."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         task_runner_run = MagicMock()
@@ -396,7 +402,7 @@ class TestWorkerHeartbeatHandlerTCPAddressInference:
     @pytest.mark.asyncio
     async def test_tcp_address_from_heartbeat(self) -> None:
         """Test TCP address is taken from heartbeat."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         heartbeat = create_manager_heartbeat(
@@ -424,7 +430,7 @@ class TestWorkerHeartbeatHandlerTCPAddressInference:
     @pytest.mark.asyncio
     async def test_tcp_address_inferred_from_source(self) -> None:
         """Test TCP address inferred from source when not in heartbeat."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         heartbeat = create_manager_heartbeat(
@@ -456,7 +462,7 @@ class TestWorkerHeartbeatHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_new_manager_becomes_primary_when_none_set(self) -> None:
         """Test new leader becomes primary when none set."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         assert registry._primary_manager_id is None
@@ -484,7 +490,7 @@ class TestWorkerHeartbeatHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_multiple_heartbeats_same_manager(self) -> None:
         """Test processing multiple heartbeats from same manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         for i in range(5):
@@ -512,7 +518,7 @@ class TestWorkerHeartbeatHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_special_characters_in_node_id(self) -> None:
         """Test processing heartbeat with special characters in node ID."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         heartbeat = create_manager_heartbeat(
@@ -538,7 +544,7 @@ class TestWorkerHeartbeatHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_heartbeat_with_many_job_leaderships(self) -> None:
         """Test heartbeat with many job leadership claims."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_job_leadership = MagicMock()

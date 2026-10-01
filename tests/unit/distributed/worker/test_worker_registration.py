@@ -29,6 +29,12 @@ from hyperscale.distributed.protocol.version import NodeCapabilities, ProtocolVe
 from hyperscale.distributed.swim.core import CircuitState
 
 
+def _select_lowest_id(healthy_manager_ids: set[str]) -> str | None:
+    """Stand-in for AD-28 selection: a deterministic choice."""
+    return min(healthy_manager_ids)
+
+
+
 class MockDiscoveryService:
     """Mock DiscoveryService for testing."""
 
@@ -57,7 +63,7 @@ class TestWorkerRegistrationHandlerInitialization:
 
     def test_happy_path_instantiation(self) -> None:
         """Test normal instantiation."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
 
@@ -74,7 +80,7 @@ class TestWorkerRegistrationHandlerInitialization:
 
     def test_with_node_capabilities(self) -> None:
         """Test with explicit node capabilities."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         capabilities = NodeCapabilities.current(node_version="1.0.0")
 
@@ -88,7 +94,7 @@ class TestWorkerRegistrationHandlerInitialization:
 
     def test_set_node_capabilities(self) -> None:
         """Test updating node capabilities."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -108,7 +114,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
     @pytest.mark.asyncio
     async def test_register_success(self) -> None:
         """Test successful registration."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
         logger.log = AsyncMock()
@@ -147,7 +153,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
     @pytest.mark.asyncio
     async def test_register_circuit_breaker_open(self) -> None:
         """Test registration when circuit breaker is open."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
         logger.log = AsyncMock()
@@ -194,7 +200,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
     @pytest.mark.asyncio
     async def test_register_with_retries(self) -> None:
         """Test registration with retry logic."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
         logger.log = AsyncMock()
@@ -241,7 +247,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
     @pytest.mark.asyncio
     async def test_register_all_retries_fail(self) -> None:
         """Test registration when all retries fail."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
         logger.log = AsyncMock()
@@ -285,7 +291,7 @@ class TestWorkerRegistrationHandlerProcessResponse:
     @pytest.mark.asyncio
     async def test_process_response_success(self) -> None:
         """Test processing successful registration response."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -333,7 +339,7 @@ class TestWorkerRegistrationHandlerProcessResponse:
     @pytest.mark.asyncio
     async def test_process_response_rejected(self) -> None:
         """Test processing rejected registration response."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -365,7 +371,7 @@ class TestWorkerRegistrationHandlerProcessResponse:
     @pytest.mark.asyncio
     async def test_process_response_with_multiple_managers(self) -> None:
         """Test processing response with multiple managers."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -423,7 +429,7 @@ class TestWorkerRegistrationHandlerProcessResponse:
     @pytest.mark.asyncio
     async def test_process_response_invalid_data(self) -> None:
         """Test processing invalid response data."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -453,7 +459,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
     @pytest.mark.asyncio
     async def test_process_manager_registration_success(self) -> None:
         """Test processing manager registration request."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -505,7 +511,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
     @pytest.mark.asyncio
     async def test_process_manager_registration_as_leader(self) -> None:
         """Test processing registration from leader manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -551,7 +557,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
     @pytest.mark.asyncio
     async def test_process_manager_registration_with_known_managers(self) -> None:
         """Test processing registration with known managers list."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -608,7 +614,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
     @pytest.mark.asyncio
     async def test_process_manager_registration_invalid_data(self) -> None:
         """Test processing invalid registration data."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -639,7 +645,7 @@ class TestWorkerRegistrationHandlerNegotiatedCapabilities:
     @pytest.mark.asyncio
     async def test_negotiated_capabilities_property(self) -> None:
         """Test negotiated_capabilities property."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -678,7 +684,7 @@ class TestWorkerRegistrationHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_empty_capabilities_string(self) -> None:
         """Test processing response with empty capabilities."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -711,7 +717,7 @@ class TestWorkerRegistrationHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_special_characters_in_node_id(self) -> None:
         """Test with special characters in node ID."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
