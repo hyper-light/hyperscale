@@ -907,7 +907,7 @@ class Env(BaseModel):
             "COMPLETED_JOB_MAX_AGE": float,
             "FAILED_JOB_MAX_AGE": float,
             "JOB_CLEANUP_INTERVAL": float,
-            "RESOURCE_GUARD_ENABLED": bool,
+            "RESOURCE_GUARD_ENABLED": parse_bool_envar,
             "RESOURCE_GUARD_MAX_CPU_PERCENT": float,
             "RESOURCE_GUARD_MAX_MEMORY_BYTES": int,
             "RESOURCE_GUARD_WARNING_THRESHOLD": float,
