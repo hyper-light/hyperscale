@@ -113,7 +113,11 @@ class GateDispatchCoordinator:
         *,
         manager_selector: DatacenterManagerSelector,
         finalize_failed_job: Callable[[str, tuple[str, ...], str], Awaitable[None]],
+        on_job_dispatched: Callable[[JobSubmission, list[str]], Awaitable[None]],
     ) -> None:
+        # Told which datacenters actually accepted a job (AD-44 best-effort
+        # tracking starts from exactly those).
+        self._on_job_dispatched = on_job_dispatched
         # Every terminal transition goes through the gate's terminal hook:
         # the AD-38 terminal record (these two FAILED paths never wrote
         # one) and the terminal status replicated to peer gates.
@@ -745,6 +749,7 @@ class GateDispatchCoordinator:
                 timeout_seconds=submission.timeout_seconds,
                 target_dcs=successful_dcs,
             )
+            await self._on_job_dispatched(submission, successful_dcs)
 
             if self._persist_accepted_job is not None:
                 # Durable acceptance: recorded only for jobs that

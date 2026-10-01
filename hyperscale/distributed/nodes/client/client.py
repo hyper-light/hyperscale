@@ -335,6 +335,9 @@ class HyperscaleClient(MercurySyncBaseServer):
         retry_budget: int = 0,
         retry_budget_per_workflow: int = 0,
         resource_budget: ResourceBudget | None = None,
+        best_effort: bool = False,
+        best_effort_min_dcs: int = 0,
+        best_effort_deadline_seconds: float = 0.0,
     ) -> str:
         """Submit a job for execution (delegates to ClientJobSubmitter).
 
@@ -361,6 +364,12 @@ class HyperscaleClient(MercurySyncBaseServer):
         job's workflows is enforced against (None applies the manager's
         configured default). A manager with resource guards disabled
         rejects a job that sets one rather than run it unenforced.
+
+        AD-44: ``best_effort`` completes a multi-datacenter job once
+        ``best_effort_min_dcs`` datacenters completed, or with whatever
+        completed once ``best_effort_deadline_seconds`` passed, instead
+        of waiting for every datacenter; the rest are cancelled. 0 applies
+        the gate's configured default for either.
         """
         return await self._submitter.submit_job(
             workflows=workflows,
@@ -376,6 +385,9 @@ class HyperscaleClient(MercurySyncBaseServer):
             retry_budget=retry_budget,
             retry_budget_per_workflow=retry_budget_per_workflow,
             resource_budget=resource_budget,
+            best_effort=best_effort,
+            best_effort_min_dcs=best_effort_min_dcs,
+            best_effort_deadline_seconds=best_effort_deadline_seconds,
         )
 
     async def join_node(

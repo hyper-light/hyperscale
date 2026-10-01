@@ -266,6 +266,10 @@ class GateRuntimeState:
             self._datacenter_manager_status[datacenter_id][manager_addr] = heartbeat
             self._manager_last_status[manager_addr] = timestamp
 
+    def get_job_dc_managers(self, job_id: str) -> Mapping[str, tuple[str, int]]:
+        """The manager each datacenter dispatched ``job_id`` to (read-only)."""
+        return MappingProxyType(self._job_dc_managers.get(job_id, {}))
+
     def get_datacenter_manager_statuses(
         self, datacenter_id: str
     ) -> Mapping[tuple[str, int], ManagerHeartbeat]:

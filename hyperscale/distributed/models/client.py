@@ -73,6 +73,10 @@ class ClientJobResult:
     per_datacenter_results: list = field(default_factory=list)  # list[JobFinalResult]
     per_datacenter_statuses: dict[str, str] = field(default_factory=dict)
     aggregated: Any = None  # AggregatedJobStats
+    # AD-44 best-effort: why the job completed before every datacenter
+    # reported, and the datacenters it stopped waiting for
+    completion_reason: str = ""
+    unreported_datacenters: list[str] = field(default_factory=list)
     # Reporter results (populated as reporters complete)
     reporter_results: dict[str, ClientReporterResult] = field(
         default_factory=dict

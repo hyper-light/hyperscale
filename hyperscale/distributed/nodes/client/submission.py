@@ -118,6 +118,9 @@ class ClientJobSubmitter:
         retry_budget: int = 0,
         retry_budget_per_workflow: int = 0,
         resource_budget: ResourceBudget | None = None,
+        best_effort: bool = False,
+        best_effort_min_dcs: int = 0,
+        best_effort_deadline_seconds: float = 0.0,
     ) -> str:
         """
         Submit a job for execution.
@@ -137,6 +140,9 @@ class ClientJobSubmitter:
             retry_budget_per_workflow: AD-44 per-workflow retry cap (0 = manager default)
             resource_budget: AD-41 limits each workflow is enforced against
                 (None = the manager's configured default)
+            best_effort: AD-44 complete before every DC reported
+            best_effort_min_dcs: completed DCs that end the job (0 = gate default)
+            best_effort_deadline_seconds: longest wait for DCs (0 = gate default)
 
         Returns:
             job_id: Unique identifier for the submitted job
@@ -192,6 +198,9 @@ class ClientJobSubmitter:
             retry_budget=retry_budget,
             retry_budget_per_workflow=retry_budget_per_workflow,
             resource_budget=resource_budget,
+            best_effort=best_effort,
+            best_effort_min_dcs=best_effort_min_dcs,
+            best_effort_deadline_seconds=best_effort_deadline_seconds,
         )
 
         # Initialize job tracking
@@ -285,6 +294,9 @@ class ClientJobSubmitter:
         retry_budget: int = 0,
         retry_budget_per_workflow: int = 0,
         resource_budget: ResourceBudget | None = None,
+        best_effort: bool = False,
+        best_effort_min_dcs: int = 0,
+        best_effort_deadline_seconds: float = 0.0,
     ) -> JobSubmission:
         """
         Build JobSubmission message with protocol version.
@@ -328,6 +340,9 @@ class ClientJobSubmitter:
             retry_budget=retry_budget,
             retry_budget_per_workflow=retry_budget_per_workflow,
             resource_budget=resource_budget,
+            best_effort=best_effort,
+            best_effort_min_dcs=best_effort_min_dcs,
+            best_effort_deadline_seconds=best_effort_deadline_seconds,
         )
 
     async def _submit_with_retry(

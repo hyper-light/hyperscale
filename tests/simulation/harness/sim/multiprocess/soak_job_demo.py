@@ -83,6 +83,10 @@ def soak_gate_dispatch_client_entry(
     wait_timeout_seconds,
     submit_at=0.0,
     pinned_datacenters=None,
+    datacenter_count=1,
+    best_effort=False,
+    best_effort_min_dcs=0,
+    best_effort_deadline_seconds=0.0,
 ) -> None:
     """Client child: submit one ``SimSoakWorkflow`` of ``duration_seconds``
     through a gate and await completion.
@@ -99,6 +103,10 @@ def soak_gate_dispatch_client_entry(
       long-horizon scenarios.
     * ``pinned_datacenters`` — optional placement constraint
       (``datacenters=[...]``), how scenarios aim a job at a specific DC.
+    * ``datacenter_count`` / ``best_effort*`` — run the job in several
+      datacenters, optionally in AD-44 best-effort mode; the finished
+      entry then also records the completion reason and the
+      datacenters the gate stopped waiting for.
     """
     client = HyperscaleClient(
         host=host,
@@ -127,6 +135,10 @@ def soak_gate_dispatch_client_entry(
                     datacenters=(
                         list(pinned_datacenters) if pinned_datacenters else None
                     ),
+                    datacenter_count=datacenter_count,
+                    best_effort=best_effort,
+                    best_effort_min_dcs=best_effort_min_dcs,
+                    best_effort_deadline_seconds=best_effort_deadline_seconds,
                 )
             except Exception as submit_error:
                 # Production behavior: gates/managers reject until they
@@ -169,6 +181,14 @@ def soak_gate_dispatch_client_entry(
         log.append(
             ("job-finished", result.status, round(context.loop.time(), 6))
         )
+        if best_effort:
+            log.append(
+                (
+                    "best-effort-outcome",
+                    result.completion_reason,
+                    tuple(result.unreported_datacenters),
+                )
+            )
 
     if submit_at > 0.0:
         context.loop.call_at(submit_at, lambda: context.loop.create_task(run()))

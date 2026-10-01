@@ -960,6 +960,12 @@ class JobSubmission(Message):
     # AD-41: resource limits each of this job's workflows is enforced
     # against; None applies the manager's configured default budget.
     resource_budget: "ResourceBudget | None" = None
+    # AD-44 best-effort: complete once best_effort_min_dcs datacenters
+    # completed or best_effort_deadline_seconds passed, instead of waiting
+    # for every datacenter (0 = the gate's configured default for each).
+    best_effort: bool = False
+    best_effort_min_dcs: int = 0
+    best_effort_deadline_seconds: float = 0.0
 
 
 @dataclass(slots=True)
@@ -1792,6 +1798,11 @@ class GlobalJobResult(Message):
     failed_datacenters: int = 0
     errors: list[str] = field(default_factory=list)  # All errors from all DCs
     elapsed_seconds: float = 0.0  # Max elapsed across all DCs
+    # AD-44 best-effort: why the job completed before every datacenter
+    # reported ("" otherwise), and the datacenters it stopped waiting for
+    # (cancelled, their results not included).
+    completion_reason: str = ""
+    unreported_datacenters: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

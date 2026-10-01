@@ -112,6 +112,8 @@ class GlobalJobResultHandler:
             job.per_datacenter_results = result.per_datacenter_results
             job.per_datacenter_statuses = result.per_datacenter_statuses
             job.aggregated = result.aggregated
+            job.completion_reason = result.completion_reason
+            job.unreported_datacenters = list(result.unreported_datacenters)
 
             # Signal completion
             event = self._state._job_events.get(result.job_id)

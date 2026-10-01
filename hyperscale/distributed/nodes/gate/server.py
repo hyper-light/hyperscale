@@ -193,6 +193,10 @@ from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
     SpilloverEvaluator,
 )
+from hyperscale.distributed.reliability.best_effort_manager import BestEffortManager
+from hyperscale.distributed.reliability.reliability_config import (
+    create_reliability_config_from_env,
+)
 from hyperscale.distributed.resources.datacenter_resource_aggregator import (
     DatacenterResourceAggregator,
 )
@@ -394,6 +398,10 @@ class GateServer(HealthAwareServer):
         self._job_manager = GateJobManager()
         self._job_final_statuses: dict[tuple[str, str], float] = {}
         self._job_global_result_sent: set[str] = set()
+        # Jobs whose global result was built (claimed under the job lock):
+        # each job is finished exactly once, whichever of a datacenter's
+        # final result or the AD-44 deadline gets there first.
+        self._job_completion_claimed: set[str] = set()
 
         # Consistent hash ring
         self._job_hash_ring = ConsistentHashRing(replicas=150)
@@ -557,6 +565,10 @@ class GateServer(HealthAwareServer):
             env.GATE_QUORUM_STEPDOWN_CONSECUTIVE_FAILURES
         )
         self._consecutive_quorum_failures: int = 0
+
+        # AD-44 best-effort completion; built with the coordinators at start
+        # (it runs on the task runner the gate starts with).
+        self._best_effort_manager: BestEffortManager | None = None
 
         # Job timeout tracker (AD-34)
         self._job_timeout_tracker = GateJobTimeoutTracker(
@@ -757,6 +769,12 @@ class GateServer(HealthAwareServer):
 
     def _init_coordinators(self) -> None:
         """Initialize coordinator instances with dependencies."""
+        self._best_effort_manager = BestEffortManager(
+            task_runner=self._task_runner,
+            config=create_reliability_config_from_env(self.env),
+            clock=self._clock,
+            completion_handler=self._complete_best_effort_job,
+        )
         self._stats_coordinator = GateStatsCoordinator(
             state=self._modular_state,
             logger=self._udp_logger,
@@ -829,6 +847,7 @@ class GateServer(HealthAwareServer):
             observed_latency_tracker=self._observed_latency_tracker,
             manager_selector=self._manager_selector,
             finalize_failed_job=self._finalize_failed_job,
+            on_job_dispatched=self._start_best_effort_tracking,
             record_dispatch_failure=lambda job_id,
             datacenter_id: self._job_router.record_dispatch_failure(
                 job_id,
@@ -1220,6 +1239,7 @@ class GateServer(HealthAwareServer):
         await self._idempotency_cache.start()
 
         self._init_coordinators()
+        self._best_effort_manager.start_deadline_loop()
         self._init_handlers()
 
         # Start Raft consensus tick loop and seed membership from known gate peers
@@ -1271,6 +1291,8 @@ class GateServer(HealthAwareServer):
 
         await self._dc_health_monitor.stop()
         await self._job_timeout_tracker.stop()
+        if self._best_effort_manager is not None:
+            await self._best_effort_manager.shutdown()
 
         if self._job_ledger is not None:
             await self._job_ledger.close()
@@ -2495,6 +2517,19 @@ class GateServer(HealthAwareServer):
             if not callback:
                 return b"no_callback"
             push.callback_addr = callback
+            # One datacenter's terminal status is not the job's when the
+            # job runs in several: the gate's global result (all DCs, or
+            # the AD-44 best-effort decision) is. Relayed as final, it
+            # ended the client's wait on the first DC to finish.
+            if push.is_final and (
+                datacenter_count := len(self._job_manager.get_target_dcs(job_id))
+            ) > 1:
+                push.is_final = False
+                push.status = JobStatus.RUNNING.value
+                push.message = (
+                    f"{push.message} (one of {datacenter_count} datacenters; "
+                    "the job continues)"
+                )
             self._record_job_callback(job_id, callback)
             data = push.dump()
 
@@ -3107,53 +3142,84 @@ class GateServer(HealthAwareServer):
             previous_status = job.status
 
         global_result = await self._record_job_final_result(result)
-        if global_result:
-            await self._push_global_job_result(global_result)
-
-            async with self._job_manager.lock_job(job_id):
-                job = self._job_manager.get_job(job_id)
-                if job:
-                    job.status = global_result.status
-                    job.total_completed = global_result.total_completed
-                    job.total_failed = global_result.total_failed
-                    job.completed_datacenters = global_result.successful_datacenters
-                    job.failed_datacenters = global_result.failed_datacenters
-                    job.errors = list(global_result.errors)
-                    job.elapsed_seconds = global_result.elapsed_seconds
-                    self._job_manager.set_job(job_id, job)
-
-            self._handle_update_by_tier(
-                job_id,
-                previous_status,
-                global_result.status,
-                None,
-            )
-
-            await self._finalize_terminal_job(
-                job_id,
-                final_status=global_result.status,
-                total_completed=global_result.total_completed,
-                total_failed=global_result.total_failed,
-                elapsed_seconds=global_result.elapsed_seconds,
-                reason="; ".join(global_result.errors),
-                failed_datacenters=tuple(
-                    sorted(
-                        datacenter_id
-                        for datacenter_id, datacenter_status in (
-                            global_result.per_datacenter_statuses.items()
-                        )
-                        if datacenter_status == JobStatus.FAILED.value
-                    )
-                ),
-            )
-
-            self._task_runner.run(
-                self._dispatch_to_reporters,
-                job_id,
-                global_result,
+        if global_result and await self._claim_job_completion(job_id):
+            await self._finish_job_with_global_result(
+                job_id, previous_status, global_result
             )
 
         return True
+
+    async def _claim_job_completion(self, job_id: str) -> bool:
+        """Claim the right to finish ``job_id``; True for exactly one caller."""
+        async with self._job_manager.lock_job(job_id):
+            if job_id in self._job_completion_claimed:
+                return False
+            self._job_completion_claimed.add(job_id)
+            return True
+
+    async def _finish_job_with_global_result(
+        self,
+        job_id: str,
+        previous_status: str,
+        global_result: GlobalJobResult,
+    ) -> None:
+        """Deliver a job's global result and make it terminal everywhere."""
+        await self._push_global_job_result(global_result)
+
+        async with self._job_manager.lock_job(job_id):
+            job = self._job_manager.get_job(job_id)
+            if job:
+                job.status = global_result.status
+                job.total_completed = global_result.total_completed
+                job.total_failed = global_result.total_failed
+                job.completed_datacenters = global_result.successful_datacenters
+                job.failed_datacenters = global_result.failed_datacenters
+                job.errors = list(global_result.errors)
+                job.elapsed_seconds = global_result.elapsed_seconds
+                self._job_manager.set_job(job_id, job)
+
+        self._handle_update_by_tier(
+            job_id,
+            previous_status,
+            global_result.status,
+            None,
+        )
+
+        await self._finalize_terminal_job(
+            job_id,
+            final_status=global_result.status,
+            total_completed=global_result.total_completed,
+            total_failed=global_result.total_failed,
+            elapsed_seconds=global_result.elapsed_seconds,
+            reason="; ".join(global_result.errors),
+            failed_datacenters=tuple(
+                sorted(
+                    datacenter_id
+                    for datacenter_id, datacenter_status in (
+                        global_result.per_datacenter_statuses.items()
+                    )
+                    if datacenter_status == JobStatus.FAILED.value
+                )
+            ),
+        )
+
+        self._task_runner.run(
+            self._dispatch_to_reporters,
+            job_id,
+            global_result,
+        )
+
+        await self._best_effort_manager.cleanup(job_id)
+        if global_result.unreported_datacenters:
+            # Cancelling may wait out unreachable datacenters (the likely
+            # reason they never reported); it must not hold up the
+            # completion this result delivers.
+            self._task_runner.run(
+                self._abandon_unreported_datacenters,
+                job_id,
+                list(global_result.unreported_datacenters),
+                global_result.completion_reason,
+            )
 
     async def _dispatch_to_reporters(
         self,
@@ -4099,6 +4165,7 @@ class GateServer(HealthAwareServer):
             return None
 
         await self._adopt_replicated_ledger_history(job_id)
+        await self._resume_best_effort_tracking(job_id, submission, target_dcs)
         self._task_runner.run(
             self._notify_managers_gate_job_leader_transfer,
             job_id,
@@ -6359,6 +6426,113 @@ class GateServer(HealthAwareServer):
             elapsed_seconds=max_elapsed,
         )
 
+    async def _start_best_effort_tracking(
+        self,
+        submission: JobSubmission,
+        dispatched_datacenters: list[str],
+    ) -> None:
+        """AD-44: track a best-effort job over the datacenters that accepted it."""
+        if not submission.best_effort or not dispatched_datacenters:
+            return
+        await self._best_effort_manager.create_state(
+            job_id=submission.job_id,
+            min_dcs=submission.best_effort_min_dcs,
+            deadline_seconds=submission.best_effort_deadline_seconds,
+            target_dcs=set(dispatched_datacenters),
+        )
+
+    async def _resume_best_effort_tracking(
+        self,
+        job_id: str,
+        submission: JobSubmission | None,
+        target_dcs: list[str],
+    ) -> None:
+        """AD-44 on gate takeover: keep a best-effort job best-effort.
+
+        The new leader gate holds the replicated submission but neither the
+        previous leader's tracking nor the datacenter results it received
+        (those are not replicated). It tracks the job afresh over its
+        datacenters: results arriving from here on count, and the deadline
+        runs from the takeover -- never shorter than the job asked for.
+        """
+        if submission is None or self._best_effort_manager.has_state(job_id):
+            return
+        await self._start_best_effort_tracking(submission, target_dcs)
+
+    def _build_best_effort_global_result(
+        self,
+        job_id: str,
+        per_dc_results: dict[str, JobFinalResult],
+        reason: str,
+        success: bool,
+    ) -> GlobalJobResult:
+        """AD-44: the result of a best-effort job from the datacenters that
+        reported. It is COMPLETED when the policy judged it a success --
+        even with a failed datacenter among them -- and FAILED otherwise;
+        datacenters that never reported are listed, not counted as
+        timeouts."""
+        reported_result = self._build_global_job_result(
+            job_id, per_dc_results, set(per_dc_results)
+        )
+        unreported = sorted(
+            (
+                self._best_effort_manager.get_target_dcs(job_id)
+                or set(self._job_manager.get_target_dcs(job_id))
+            )
+            - set(per_dc_results)
+        )
+        return dataclasses.replace(
+            reported_result,
+            status=JobStatus.COMPLETED.value if success else JobStatus.FAILED.value,
+            completion_reason=f"best_effort: {reason}",
+            unreported_datacenters=unreported,
+        )
+
+    async def _complete_best_effort_job(
+        self,
+        job_id: str,
+        reason: str,
+        success: bool,
+    ) -> None:
+        """AD-44 deadline: complete a best-effort job with what reported."""
+        async with self._job_manager.lock_job(job_id):
+            job = self._job_manager.get_job(job_id)
+            if (
+                job is None
+                or JobStatusOrder().is_terminal(job.status)
+                or job_id in self._job_completion_claimed
+            ):
+                await self._best_effort_manager.cleanup(job_id)
+                return
+            self._job_completion_claimed.add(job_id)
+            previous_status = job.status
+            global_result = self._build_best_effort_global_result(
+                job_id,
+                self._job_manager.get_all_dc_results(job_id),
+                reason,
+                success,
+            )
+
+        await self._finish_job_with_global_result(job_id, previous_status, global_result)
+
+    async def _abandon_unreported_datacenters(
+        self,
+        job_id: str,
+        datacenters: list[str],
+        reason: str,
+    ) -> None:
+        """AD-44: the job completed without these datacenters -- cancel what
+        they still run, and release the per-workflow results that were
+        waiting on them so those are delivered from the datacenters that
+        reported."""
+        manager_addresses = {
+            **self._modular_state.get_job_dc_managers(job_id),
+            **self._job_dc_managers.get(job_id, {}),
+        }
+        await self._cancel_job_for_timeout(job_id, reason, datacenters, manager_addresses)
+        for workflow_id in list(self._workflow_dc_results.get(job_id, {})):
+            await self._aggregate_and_forward_workflow_result(job_id, workflow_id)
+
     async def _record_job_final_result(
         self, result: JobFinalResult
     ) -> GlobalJobResult | None:
@@ -6378,8 +6552,25 @@ class GateServer(HealthAwareServer):
             if result.job_id in self._job_global_result_sent:
                 return None
 
-            target_dcs = set(self._job_manager.get_target_dcs(result.job_id))
             per_dc_results = self._job_manager.get_all_dc_results(result.job_id)
+            # AD-44: a best-effort job completes on its own policy -- a
+            # failed datacenter does not end it while others may still
+            # complete it.
+            if (
+                decision := await self._best_effort_manager.record_result(
+                    result.job_id,
+                    result.datacenter,
+                    self._normalize_final_status(result.status) == JobStatus.COMPLETED.value,
+                )
+            ) is not None:
+                should_complete, reason, success = decision
+                if not should_complete:
+                    return None
+                return self._build_best_effort_global_result(
+                    result.job_id, per_dc_results, reason, success
+                )
+
+            target_dcs = set(self._job_manager.get_target_dcs(result.job_id))
             missing_dcs = target_dcs - set(per_dc_results.keys())
             if target_dcs and missing_dcs:
                 normalized_statuses = [
@@ -6853,10 +7044,13 @@ class GateServer(HealthAwareServer):
             for key in keys_to_remove:
                 self._job_final_statuses.pop(key, None)
         self._job_global_result_sent.discard(job_id)
+        self._job_completion_claimed.discard(job_id)
         self._job_workflow_ids.pop(job_id, None)
         self._progress_callbacks.pop(job_id, None)
         self._job_leadership_tracker.release_leadership(job_id)
         self._job_dc_managers.pop(job_id, None)
+        if self._best_effort_manager is not None:
+            await self._best_effort_manager.cleanup(job_id)
         self._job_submissions.pop(job_id, None)
 
         reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
