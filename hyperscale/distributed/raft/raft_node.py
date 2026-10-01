@@ -801,11 +801,17 @@ class RaftNode:
     # =========================================================================
 
     def _step_down(self, new_term: int) -> None:
-        """Step down to follower for a newer or conflicting term."""
+        """Step down to follower for a newer or conflicting term.
+
+        A vote is cast once per term: it is released only when the term
+        advances, so a same-term step-down cannot let this node vote
+        twice in one term (two leaders).
+        """
         was_leader = self._role == "leader"
+        if new_term > self._current_term:
+            self._voted_for = None
         self._current_term = new_term
         self._role = "follower"
-        self._voted_for = None
         self._pre_vote_term = None
         self._election_deadline = self._new_election_deadline()
         self._fail_pending_proposals()

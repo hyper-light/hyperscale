@@ -754,3 +754,37 @@ class TestConstants:
 
     def test_election_timeout_max(self) -> None:
         assert ELECTION_TIMEOUT_MAX == 0.300
+
+
+# =============================================================================
+# Vote safety
+# =============================================================================
+
+
+class TestSameTermStepDown:
+    @pytest.mark.asyncio
+    async def test_same_term_step_down_keeps_the_vote_cast_in_that_term(self) -> None:
+        """A leader that learns of a same-term leader (only possible after a
+        fault) steps down, but it voted for itself in that term: a second
+        candidate in the same term must not get its vote too."""
+        node, _, _ = make_node(node_id="node-1")
+        await node.start_election()
+        await node.handle_request_vote_response(
+            RequestVoteResponse(job_id="job-1", term=node.current_term, vote_granted=True, voter_id="node-2")
+        )
+        assert node.role == "leader"
+        term = node.current_term
+
+        await node.handle_append_entries(
+            AppendEntries(
+                job_id="job-1", term=term, leader_id="node-2",
+                prev_log_index=0, prev_log_term=0, entries=[], leader_commit=0,
+            )
+        )
+        assert node.role == "follower"
+        node._last_leader_contact = float("-inf")  # past leader stickiness
+
+        response = await node.handle_request_vote(
+            RequestVote(job_id="job-1", term=term, candidate_id="node-3", last_log_index=0, last_log_term=0)
+        )
+        assert response.vote_granted is False
