@@ -101,11 +101,14 @@ class RaftPeerOutbox:
     def _start_sender(self, peer_addr: PeerAddress) -> asyncio.Event:
         wakeup = asyncio.Event()
         self._wakeups[peer_addr] = wakeup
+        # TaskRunner binds an alias to the FIRST callable run under it, so
+        # a shared alias would route a second outbox's runs through the
+        # first outbox's loop; the alias is unique to this node's outbox.
         run = self._task_runner.run(
             self._send_loop,
             peer_addr,
             wakeup,
-            alias="raft_peer_outbox",
+            alias=f"raft_peer_outbox:{self._node_id}",
         )
         self._sender_tokens[peer_addr] = f"{run.task_name}:{run.run_id}"
         return wakeup

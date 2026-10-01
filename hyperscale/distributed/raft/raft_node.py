@@ -46,40 +46,46 @@ class RaftNode:
     Thread safety: All public methods acquire _lock.
     Memory: Call destroy() on job completion to release all state.
 
-    Volatility -- a deliberate decision, not an omission
-    ----------------------------------------------------
+    Volatility -- current state, and the storage decision
+    -----------------------------------------------------
 
-    ``current_term``, ``voted_for``, and the log live only in memory:
-    a process restart loses all three. The Raft paper requires them
-    durable, and ``RaftWAL`` / ``SnapshotManager`` exist and are
-    tested -- they are deliberately NOT wired here, because AD-52's
-    formation protocol requires zero persistent storage on any node
-    ("no PVCs, no local files surviving restart"), and wiring
-    per-job Raft WALs would re-introduce exactly the local-disk
-    correctness dependency it forbids.
+    ``current_term``, ``voted_for``, and the log live only in memory: a
+    process restart loses all three. The Raft paper requires them
+    durable; ``RaftWAL`` / ``SnapshotManager`` exist and are tested but
+    are not wired here yet.
 
-    What the lost guarantees would have prevented, and what contains
-    the loss instead:
+    Storage decision (2026-09-30, supersedes the earlier reading that
+    AD-52 forbids restart-surviving storage): a node MAY write to disk
+    but may never ASSUME what that disk is -- present, empty, its own,
+    intact. Correctness must hold with no disk at all. So persistence is
+    opportunistic: when wired, term/vote/log go to disk where an identity
+    stamp and integrity checks prove the disk is this node's and intact,
+    and a missing or untrustworthy disk is treated as empty (the node
+    rejoins with nothing). Until then the guarantees below are the
+    in-memory ones.
 
-    * **Double vote.** Node ids are address-derived, so a manager
-      that restarts mid-election rejoins under its old identity with
-      ``voted_for`` cleared and can vote twice in the same term --
-      two leaders for one job's group. The window is one election
-      round (restart + rejoin inside a seconds-scale timeout), and
-      the damage is bounded one layer up: every dispatch a job
-      leader issues carries a fence token that workers and gates
-      validate, so the elder of two leaders is fenced out at the
-      first boundary it touches.
+    This matters more now that AD-38 REGIONAL durability is a commit in
+    the job's group: REGIONAL means "held by a majority of the
+    datacenter's managers", which survives any minority of crashes but
+    not a simultaneous majority restart.
 
-    * **Log loss.** A restarted member returns with an empty log.
-      Groups are per-job and die with the job; the durable record of
-      job state is the AD-38 ledger tier, not this log, so replay
-      correctness never depends on a Raft entry surviving a crash.
+    What volatility costs, and what contains it:
 
-    If a deployment mode ever genuinely needs restart-surviving
-    consensus, wire ``RaftWAL`` behind a constructor parameter and
-    persist term/vote BEFORE acking votes -- and reconcile that
-    decision with AD-52 first.
+    * **Double vote.** Node ids are address-derived, so a manager that
+      restarts mid-election rejoins under its old identity with
+      ``voted_for`` cleared and can vote twice in the same term -- two
+      leaders for one job's group. The window is one election round,
+      and every dispatch a job leader issues carries a fence token that
+      workers and gates validate, so the elder of two leaders is fenced
+      out at the first boundary it touches.
+
+    * **Log loss.** A restarted member returns with an empty log and
+      catches up from the group's leader like any lagging follower; the
+      group's entries survive while a majority of members stays up.
+
+    Disruption by a member that cannot hear the leader is contained
+    regardless of storage: elections start with a PreVote round, and
+    members that heard from a live leader recently refuse to vote.
     """
 
     __slots__ = (
@@ -104,6 +110,9 @@ class RaftNode:
         "_next_index",
         "_match_index",
         "_votes_received",
+        "_pre_vote_term",
+        "_pre_votes_received",
+        "_last_leader_contact",
         "_proposal_waiters",
         "_proposal_timeout_seconds",
         "_election_deadline",
@@ -151,6 +160,12 @@ class RaftNode:
         self._next_index: dict[str, int] = {}
         self._match_index: dict[str, int] = {}
         self._votes_received: set[str] = set()
+        # PreVote round in progress: the term this node would campaign in.
+        self._pre_vote_term: int | None = None
+        self._pre_votes_received: set[str] = set()
+        # Last instant a valid leader's AppendEntries arrived (leader
+        # stickiness: votes are withheld while a leader is evidently live).
+        self._last_leader_contact: float | None = None
         self._proposal_waiters: dict[int, asyncio.Future[bool]] = {}
         self._proposal_timeout_seconds = proposal_timeout_seconds
 
@@ -200,7 +215,7 @@ class RaftNode:
                 case "leader":
                     self._tick_leader()
                 case "follower" | "candidate" if self._election_timed_out():
-                    await self._start_election_locked()
+                    await self._start_pre_vote_locked()
 
     def _tick_leader(self) -> None:
         """Check if heartbeat is due. Does NOT send -- replicate_to_followers does."""
@@ -220,8 +235,29 @@ class RaftNode:
                 return
             await self._start_election_locked()
 
+    async def _start_pre_vote_locked(self) -> None:
+        """Ask whether an election could succeed before disrupting anyone.
+
+        Raft thesis 9.6: a member that cannot hear the leader (an
+        asymmetric partition, a stalled inbound path) would otherwise
+        time out again and again, campaigning at ever higher terms that
+        force a healthy leader to step down each time. A PreVote round
+        changes no state anywhere; only a majority of grants -- members
+        that have not heard from a live leader either and whose logs are
+        no fresher -- lets this node bump its term and campaign.
+        """
+        self._election_deadline = self._new_election_deadline()
+        self._pre_vote_term = self._current_term + 1
+        self._pre_votes_received = {self._node_id}
+        if len(self._pre_votes_received) >= self._quorum_size():
+            await self._start_election_locked()
+            return
+        await self._broadcast_request_vote(term=self._pre_vote_term, pre_vote=True)
+
     async def _start_election_locked(self) -> None:
         """Transition to candidate and request votes. Lock must be held."""
+        self._pre_vote_term = None
+        self._pre_votes_received = set()
         self._current_term += 1
         self._role = "candidate"
         self._voted_for = self._node_id
@@ -234,16 +270,17 @@ class RaftNode:
             self._transition_to_leader()
             return
 
-        await self._broadcast_request_vote()
+        await self._broadcast_request_vote(term=self._current_term, pre_vote=False)
 
-    async def _broadcast_request_vote(self) -> None:
-        """Send RequestVote to all peers."""
+    async def _broadcast_request_vote(self, *, term: int, pre_vote: bool) -> None:
+        """Send RequestVote (or its PreVote form) to all peers."""
         request = RequestVote(
             job_id=self._job_id,
-            term=self._current_term,
+            term=term,
             candidate_id=self._node_id,
             last_log_index=self._log.last_index(),
             last_log_term=self._log.last_term(),
+            pre_vote=pre_vote,
         )
         for peer_id in self._members:
             if peer_id == self._node_id:
@@ -255,6 +292,17 @@ class RaftNode:
         """Handle an incoming RequestVote RPC."""
         async with self._lock:
             if self._destroyed:
+                return self._vote_response(granted=False)
+
+            if request.pre_vote:
+                return self._vote_response(
+                    granted=self._should_grant_pre_vote(request), pre_vote=True
+                )
+
+            # Leader stickiness (Raft thesis 4.2.3): while a live leader is
+            # evidently in charge, a vote request neither moves this term
+            # nor wins a vote -- a disruptive member cannot depose it.
+            if self._heard_from_leader_recently():
                 return self._vote_response(granted=False)
 
             # Step down if request has higher term
@@ -278,6 +326,29 @@ class RaftNode:
         )
         return vote_available and candidate_log_ok
 
+    def _should_grant_pre_vote(self, request: RequestVote) -> bool:
+        """Would this member vote for ``request`` in its proposed term?
+        Answered without changing any state."""
+        if self._role == "leader" or self._heard_from_leader_recently():
+            return False
+        if request.term <= self._current_term:
+            return False
+        return self._candidate_log_is_current(
+            request.last_log_index, request.last_log_term
+        )
+
+    def _heard_from_leader_recently(self) -> bool:
+        """A valid leader's AppendEntries arrived within the minimum
+        election timeout -- no follower could have timed out on it yet."""
+        if self._role == "leader":
+            return False
+        if self._current_leader is None or self._last_leader_contact is None:
+            return False
+        return (
+            _DEFAULT_CLOCK.monotonic() - self._last_leader_contact
+            < ELECTION_TIMEOUT_MIN
+        )
+
     def _candidate_log_is_current(self, last_index: int, last_term: int) -> bool:
         """Check if candidate's log is at least as up-to-date as ours (Section 5.4.1)."""
         my_last_term = self._log.last_term()
@@ -285,18 +356,24 @@ class RaftNode:
             return last_term > my_last_term
         return last_index >= self._log.last_index()
 
-    def _vote_response(self, *, granted: bool) -> RequestVoteResponse:
+    def _vote_response(self, *, granted: bool, pre_vote: bool = False) -> RequestVoteResponse:
         return RequestVoteResponse(
             job_id=self._job_id,
             term=self._current_term,
             vote_granted=granted,
             voter_id=self._node_id,
+            pre_vote=pre_vote,
         )
 
     async def handle_request_vote_response(self, response: RequestVoteResponse) -> None:
         """Handle a vote response from a peer."""
         async with self._lock:
-            if self._destroyed or self._role != "candidate":
+            if self._destroyed:
+                return
+            if response.pre_vote:
+                await self._handle_pre_vote_response(response)
+                return
+            if self._role != "candidate":
                 return
             if response.term > self._current_term:
                 self._step_down(response.term)
@@ -307,6 +384,20 @@ class RaftNode:
             self._votes_received.add(response.voter_id)
             if len(self._votes_received) >= self._quorum_size():
                 self._transition_to_leader()
+
+    async def _handle_pre_vote_response(self, response: RequestVoteResponse) -> None:
+        """Count a PreVote grant; campaign for real on a majority. Lock held."""
+        if self._pre_vote_term is None or self._role == "leader":
+            return
+        if response.term > self._current_term:
+            self._step_down(response.term)
+            return
+        if not response.vote_granted:
+            return
+
+        self._pre_votes_received.add(response.voter_id)
+        if len(self._pre_votes_received) >= self._quorum_size():
+            await self._start_election_locked()
 
     def _transition_to_leader(self) -> None:
         """Become leader. Initialize next_index and match_index."""
@@ -382,7 +473,9 @@ class RaftNode:
 
             # Valid leader heartbeat -- reset election timer
             self._current_leader = request.leader_id
+            self._last_leader_contact = _DEFAULT_CLOCK.monotonic()
             self._election_deadline = self._new_election_deadline()
+            self._pre_vote_term = None
 
             if self._role == "candidate":
                 self._role = "follower"
@@ -637,6 +730,7 @@ class RaftNode:
         self._current_term = new_term
         self._role = "follower"
         self._voted_for = None
+        self._pre_vote_term = None
         self._election_deadline = self._new_election_deadline()
         self._fail_pending_proposals()
 

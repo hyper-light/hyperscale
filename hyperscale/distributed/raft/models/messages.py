@@ -26,6 +26,9 @@ class RequestVote(Message):
     candidate_id: str = ""
     last_log_index: int = 0
     last_log_term: int = 0
+    # PreVote (Raft thesis 9.6): ``term`` is the term the sender WOULD
+    # campaign in; receivers answer without changing any state.
+    pre_vote: bool = False
 
 
 @dataclass(slots=True)
@@ -40,6 +43,7 @@ class RequestVoteResponse(Message):
     term: int = 0
     vote_granted: bool = False
     voter_id: str = ""
+    pre_vote: bool = False
 
 
 @dataclass(slots=True)
