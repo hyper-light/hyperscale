@@ -30,7 +30,8 @@ production-real and modeled here:
 
 The oracle battery: client history linearizes (``JobStatusOracle``),
 observed stats are NEVER wound back (``stats-seen`` monotone), the
-final stats equal the ACTION-chain's deterministic totals (zeros — VU
+final stats equal the ACTION chain's deterministic total (one completed
+action per step, ``SUSTAINED_ACTION_STEP_COUNT`` — VU
 counters do not tick for one-shot action DAGs), and the terminal is
 exactly-once at execution length + push latency.
 
@@ -51,6 +52,7 @@ Measured (probe scripts in the L2 workload series):
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.l2_workload_demo import (
     dag_worker_entry,
+    SUSTAINED_ACTION_STEP_COUNT,
     sustained_client_entry,
 )
 from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
@@ -172,8 +174,9 @@ def _assert_clean_observation_under_stress(
     assert JobStatusOracle().check_client_log(client_log) == [], client_log
 
     # The stats view is NEVER wound back by late/reordered/duplicated
-    # pushes racing polls — and the ACTION chain's deterministic totals
-    # are zeros, so ANY nonzero observation is a phantom count.
+    # pushes racing polls, starts at zero, and never exceeds the ACTION
+    # chain's deterministic total (one completed action per step) -- a
+    # count past it, or any failure, is a phantom.
     stats_sequence = [
         (entry[1], entry[2])
         for entry in client_log
@@ -183,10 +186,14 @@ def _assert_clean_observation_under_stress(
         assert later[0] >= earlier[0] and later[1] >= earlier[1], (
             f"stats wound back: {earlier} -> {later}: {client_log}"
         )
-    assert stats_sequence == [(0, 0)], client_log
+    assert stats_sequence[0] == (0, 0), client_log
+    assert all(
+        completed <= SUSTAINED_ACTION_STEP_COUNT and failed == 0
+        for completed, failed in stats_sequence
+    ), client_log
     final_stats = [entry for entry in client_log if entry[0] == "final-stats"]
     assert final_stats == [
-        ("final-stats", 0, 0, finished[0][2])
+        ("final-stats", SUSTAINED_ACTION_STEP_COUNT, 0, finished[0][2])
     ], client_log
 
     # The worker executed the workflow exactly once, for its full

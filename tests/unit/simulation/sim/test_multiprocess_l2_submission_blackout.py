@@ -36,6 +36,7 @@ execution 103.75 -> 109.75, client completion 109.698168.
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.l2_workload_demo import (
     dag_worker_entry,
+    SUSTAINED_ACTION_STEP_COUNT,
     sustained_client_entry,
 )
 from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
@@ -144,12 +145,12 @@ def test_submission_survives_blackout_with_bounded_timeout_paced_retries():
         <= submitted[0][1] + _WORKFLOW_DURATION_SECONDS + 2.0
     ), client_log
 
-    # The client-observed history linearizes and the ACTION-chain stats
-    # stay at their deterministic zeros.
+    # The client-observed history linearizes and the final stats are the
+    # ACTION chain's deterministic total: one completed action per step.
     assert JobStatusOracle().check_client_log(client_log) == [], client_log
     final_stats = [entry for entry in client_log if entry[0] == "final-stats"]
     assert final_stats == [
-        ("final-stats", 0, 0, finished[0][2])
+        ("final-stats", SUSTAINED_ACTION_STEP_COUNT, 0, finished[0][2])
     ], client_log
 
     # G3/G4: exactly-once execution evidence and audit absence.

@@ -85,6 +85,11 @@ def _env(**overrides) -> Env:
     return Env(MERCURY_SYNC_AUTH_SECRET=_AUTH_SECRET, **overrides)
 
 
+# The sustained workflow's ACTION steps; each completes once, so a run of
+# it completes exactly this many actions.
+SUSTAINED_ACTION_STEP_COUNT = 2
+
+
 def _build_sustained_workflow(
     workflow_duration_seconds: float, workflow_vus: int
 ) -> type[Workflow]:

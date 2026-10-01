@@ -923,7 +923,13 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 timestamp,
                 results,
             )
-            self._statuses[run_id][workflow_name][node_id] = status
+            # Stored as a WorkflowStatus like every other writer of
+            # ``_statuses``: results carry the status's string value, and
+            # a raw string made aggregation raise (WorkflowStatusUpdate
+            # takes the enum) once every node had reported.
+            self._statuses[run_id][workflow_name][node_id] = (
+                WorkflowStatus.map_value_to_status(status)
+            )
             self._errors[run_id][workflow_name][node_id] = Exception(error)
 
             self._completions[run_id][workflow_name].add(node_id)
@@ -950,6 +956,12 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     pass
 
                 if completions_count >= completion_state.expected_workers:
+                    # Each node sent its terminal status before its results
+                    # (run_workflow); publish the aggregate now so the run's
+                    # final counts reach its consumer with the completion,
+                    # not on the next aggregation tick -- after the consumer
+                    # stopped reading.
+                    self._publish_aggregated_status(run_id, workflow_name, completion_state)
                     completion_state.completion_event.set()
 
             if self._leader_lock.locked():
@@ -1321,6 +1333,13 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 if context is None:
                     context = job.context
 
+                # The run's final counts go out before its results: the
+                # receiving node signals completion on the results, and the
+                # periodic status push could otherwise land after it --
+                # leaving the run's consumer with the last in-flight counts.
+                await self._send_workflow_status_update(
+                    node_id, run_id, job.workflow.name
+                )
                 await self.push_results(
                     node_id,
                     WorkflowResults(
@@ -1512,19 +1531,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 name="debug",
             )
 
-            (
-                status,
-                completed_count,
-                failed_count,
-                step_stats,
-            ) = self._workflows.get_running_workflow_stats(
-                run_id,
-                workflow_name,
-            )
-
-            avg_cpu_usage, avg_mem_usage = self._workflows.get_system_stats(
-                run_id,
-                workflow_name,
+            status = await self._send_workflow_status_update(
+                node_id, run_id, workflow_name
             )
 
             if status in [
@@ -1544,23 +1552,47 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     "push_workflow_status_update", run_id=schedule_id
                 )
 
-            await self.send(
-                "receive_status_update",
-                JobContext(
-                    WorkflowStatusUpdate(
-                        workflow_name,
-                        status,
-                        node_id=node_id,
-                        completed_count=completed_count,
-                        failed_count=failed_count,
-                        step_stats=step_stats,
-                        avg_cpu_usage=avg_cpu_usage,
-                        avg_memory_usage_mb=avg_mem_usage,
-                    ),
-                    run_id=run_id,
+    async def _send_workflow_status_update(
+        self,
+        node_id: int,
+        run_id: int,
+        workflow_name: str,
+    ) -> WorkflowStatus:
+        """Send this node's current status and counts for the run's
+        workflow to ``node_id``; returns the status sent."""
+        (
+            status,
+            completed_count,
+            failed_count,
+            step_stats,
+        ) = self._workflows.get_running_workflow_stats(
+            run_id,
+            workflow_name,
+        )
+
+        avg_cpu_usage, avg_mem_usage = self._workflows.get_system_stats(
+            run_id,
+            workflow_name,
+        )
+
+        await self.send(
+            "receive_status_update",
+            JobContext(
+                WorkflowStatusUpdate(
+                    workflow_name,
+                    status,
+                    node_id=node_id,
+                    completed_count=completed_count,
+                    failed_count=failed_count,
+                    step_stats=step_stats,
+                    avg_cpu_usage=avg_cpu_usage,
+                    avg_memory_usage_mb=avg_mem_usage,
                 ),
-                node_id=node_id,
-            )
+                run_id=run_id,
+            ),
+            node_id=node_id,
+        )
+        return status
 
     @task(
         keep=int(
@@ -1599,76 +1631,86 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 name="debug",
             )
 
-            workflow_status = WorkflowStatus.SUBMITTED
-
-            status_counts = Counter(self._statuses[run_id][workflow_name].values())
-            for status, count in status_counts.items():
-                if count == completion_state.expected_workers:
-                    workflow_status = status
-                    break
-
-            completed_count = sum(self._completed_counts[run_id][workflow_name].values())
-            failed_count = sum(self._failed_counts[run_id][workflow_name].values())
-
-            step_stats: StepStatsUpdate = defaultdict(
-                lambda: {
-                    "ok": 0,
-                    "total": 0,
-                    "err": 0,
-                }
-            )
-
-            for _, stats_update in self._step_stats[run_id][workflow_name].items():
-                for hook, stats_set in stats_update.items():
-                    for stats_type, stat in stats_set.items():
-                        step_stats[hook][stats_type] += stat
-
-            cpu_usage_stats = self._cpu_usage_stats[run_id][workflow_name].values()
-            avg_cpu_usage = 0
-            if len(cpu_usage_stats) > 0:
-                avg_cpu_usage = statistics.mean(cpu_usage_stats)
-
-            memory_usage_stats = self._memory_usage_stats[run_id][workflow_name].values()
-            avg_mem_usage_mb = 0
-            if len(memory_usage_stats) > 0:
-                avg_mem_usage_mb = statistics.mean(memory_usage_stats)
-
-            total_cpu_usage = sum(cpu_usage_stats)
-            total_mem_usage_mb = sum(memory_usage_stats)
-
-            workers_completed = len(self._completions[run_id][workflow_name])
-
-            # Update the completion state
-            completion_state.completed_count = completed_count
-            completion_state.failed_count = failed_count
-            completion_state.step_stats = step_stats
-            completion_state.avg_cpu_usage = avg_cpu_usage
-            completion_state.avg_memory_usage_mb = avg_mem_usage_mb
-            completion_state.workers_completed = workers_completed
-
-            # Push update to the queue (non-blocking)
-            status_update = WorkflowStatusUpdate(
-                workflow_name,
-                workflow_status,
-                completed_count=completed_count,
-                failed_count=failed_count,
-                step_stats=step_stats,
-                avg_cpu_usage=avg_cpu_usage,
-                avg_memory_usage_mb=avg_mem_usage_mb,
-                workers_completed=workers_completed,
-                total_cpu_usage=total_cpu_usage,
-                total_memory_usage_mb=total_mem_usage_mb,
-            )
-
-            try:
-                completion_state.status_update_queue.put_nowait(status_update)
-            except asyncio.QueueFull:
-                # Queue is full, skip this update
-                pass
+            self._publish_aggregated_status(run_id, workflow_name, completion_state)
 
             # Stop the task if workflow is complete
             if completion_state.completion_event.is_set():
                 self.tasks.stop("aggregate_status_updates")
+
+    def _publish_aggregated_status(
+        self,
+        run_id: int,
+        workflow_name: str,
+        completion_state: WorkflowCompletionState,
+    ) -> None:
+        """Fold every node's latest status into the completion state and
+        queue the aggregate for the run's consumer."""
+        workflow_status = WorkflowStatus.SUBMITTED
+
+        status_counts = Counter(self._statuses[run_id][workflow_name].values())
+        for status, count in status_counts.items():
+            if count == completion_state.expected_workers:
+                workflow_status = status
+                break
+
+        completed_count = sum(self._completed_counts[run_id][workflow_name].values())
+        failed_count = sum(self._failed_counts[run_id][workflow_name].values())
+
+        step_stats: StepStatsUpdate = defaultdict(
+            lambda: {
+                "ok": 0,
+                "total": 0,
+                "err": 0,
+            }
+        )
+
+        for _, stats_update in self._step_stats[run_id][workflow_name].items():
+            for hook, stats_set in stats_update.items():
+                for stats_type, stat in stats_set.items():
+                    step_stats[hook][stats_type] += stat
+
+        cpu_usage_stats = self._cpu_usage_stats[run_id][workflow_name].values()
+        avg_cpu_usage = 0
+        if len(cpu_usage_stats) > 0:
+            avg_cpu_usage = statistics.mean(cpu_usage_stats)
+
+        memory_usage_stats = self._memory_usage_stats[run_id][workflow_name].values()
+        avg_mem_usage_mb = 0
+        if len(memory_usage_stats) > 0:
+            avg_mem_usage_mb = statistics.mean(memory_usage_stats)
+
+        total_cpu_usage = sum(cpu_usage_stats)
+        total_mem_usage_mb = sum(memory_usage_stats)
+
+        workers_completed = len(self._completions[run_id][workflow_name])
+
+        # Update the completion state
+        completion_state.completed_count = completed_count
+        completion_state.failed_count = failed_count
+        completion_state.step_stats = step_stats
+        completion_state.avg_cpu_usage = avg_cpu_usage
+        completion_state.avg_memory_usage_mb = avg_mem_usage_mb
+        completion_state.workers_completed = workers_completed
+
+        # Push update to the queue (non-blocking)
+        status_update = WorkflowStatusUpdate(
+            workflow_name,
+            workflow_status,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            step_stats=step_stats,
+            avg_cpu_usage=avg_cpu_usage,
+            avg_memory_usage_mb=avg_mem_usage_mb,
+            workers_completed=workers_completed,
+            total_cpu_usage=total_cpu_usage,
+            total_memory_usage_mb=total_mem_usage_mb,
+        )
+
+        try:
+            completion_state.status_update_queue.put_nowait(status_update)
+        except asyncio.QueueFull:
+            # Queue is full, skip this update
+            pass
 
     @task(
         trigger="MANUAL",

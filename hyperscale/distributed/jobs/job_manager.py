@@ -1013,7 +1013,8 @@ class JobManager:
 
         Thread-safe: acquires job lock.
         Uses WorkflowStateMachine to ensure parent state only advances, never regresses.
-        Returns True if update was applied, False if sub-workflow not found.
+        Returns True if update was applied, False if sub-workflow not found
+        or its final result (with its final progress) is already recorded.
         """
         token_str = str(sub_workflow_token)
         job = self.get_job_for_sub_workflow(token_str)
@@ -1023,6 +1024,10 @@ class JobManager:
         async with job.lock:
             sub_wf = job.sub_workflows.get(token_str)
             if not sub_wf:
+                return False
+            # Once the final result is recorded its final progress is
+            # authoritative; an in-flight report arriving later is stale.
+            if sub_wf.result is not None:
                 return False
 
             sub_wf.progress = progress
@@ -1036,6 +1041,23 @@ class JobManager:
                     parent.status, WorkflowStatus.RUNNING
                 )
 
+            return True
+
+    async def set_final_workflow_progress(
+        self,
+        sub_workflow_token: str | TrackingToken,
+        progress: WorkflowProgress,
+    ) -> bool:
+        """Record a sub-workflow's final progress, carried by its final
+        result. Returns False if the sub-workflow is not found."""
+        token_str = str(sub_workflow_token)
+        if (job := self.get_job_for_sub_workflow(token_str)) is None:
+            return False
+
+        async with job.lock:
+            if (sub_wf := job.sub_workflows.get(token_str)) is None:
+                return False
+            sub_wf.progress = progress
             return True
 
     async def record_sub_workflow_result(

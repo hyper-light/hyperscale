@@ -1588,6 +1588,10 @@ class WorkflowFinalResult(Message):
     worker_available_cores: int = 0  # Worker's available cores after completion
     fence_token: int = 0  # Dispatch fence token accepted by the worker
     job_leader_addr: tuple[str, int] | None = None  # Manager that dispatched this workflow
+    # The run's final progress (its final counts), carried with the result:
+    # sent separately it could arrive after the result and the job's
+    # totals would be built from an earlier snapshot.
+    final_progress: "WorkflowProgress | None" = None
 
 
 @dataclass(slots=True, kw_only=True)

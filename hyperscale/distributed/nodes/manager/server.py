@@ -7393,6 +7393,12 @@ class ManagerServer(HealthAwareServer):
 
             self._record_workflow_latency_from_results(result.results)
 
+            # The run's final counts: the job's totals are built from them.
+            if result.final_progress is not None:
+                await self._job_manager.set_final_workflow_progress(
+                    result.workflow_id, result.final_progress
+                )
+
             if result.context_updates:
                 await self._job_manager.apply_workflow_context(
                     job_id=result.job_id,

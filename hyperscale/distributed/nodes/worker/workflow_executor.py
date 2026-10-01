@@ -40,6 +40,7 @@ from hyperscale.distributed.runtime import Clock, RealClock
 _DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
+    from hyperscale.core.jobs.models.workflow_status_update import WorkflowStatusUpdate
     from hyperscale.logging import Logger
     from hyperscale.distributed.env import Env
     from hyperscale.distributed.jobs import CoreAllocator
@@ -338,6 +339,19 @@ class WorkerWorkflowExecutor:
 
             progress.cores_completed = len(progress.assigned_cores)
 
+            # The run's final counts arrive with its completion (the runner
+            # sends them before its results); the monitor may not have read
+            # them before the run returned, and the final progress -- what
+            # the job's totals are built from -- must carry them.
+            await self._task_runner.cancel(progress_monitor_token)
+            progress_monitor_token = None
+            if (
+                final_update := await remote_manager.drain_workflow_updates(
+                    run_id, workflow.name
+                )
+            ) is not None:
+                self._apply_status_counts(progress, final_update)
+
             # Phase 3: Determine final status
             if status != CoreWorkflowStatus.COMPLETED:
                 workflow_error = str(error) if error else "Unknown error"
@@ -435,6 +449,7 @@ class WorkerWorkflowExecutor:
             fence_token=dispatch.fence_token,
             job_leader_addr=dispatch.job_leader_addr
             or self._state.get_workflow_job_leader(dispatch.workflow_id),
+            final_progress=progress,
         )
 
         try:
@@ -455,6 +470,24 @@ class WorkerWorkflowExecutor:
             return True
 
         return not self._state.is_final_result_suppressed(workflow_id)
+
+    @staticmethod
+    def _apply_status_counts(
+        progress: WorkflowProgress,
+        workflow_status_update: "WorkflowStatusUpdate",
+    ) -> None:
+        """Copy the runner's cumulative counts and per-step stats."""
+        progress.completed_count = workflow_status_update.completed_count
+        progress.failed_count = workflow_status_update.failed_count
+        progress.step_stats = [
+            StepStats(
+                step_name=step_name,
+                completed_count=stats.get("ok", 0),
+                failed_count=stats.get("err", 0),
+                total_count=stats.get("total", 0),
+            )
+            for step_name, stats in workflow_status_update.step_stats.items()
+        ]
 
     async def monitor_workflow_progress(
         self,
@@ -509,8 +542,7 @@ class WorkerWorkflowExecutor:
                 avg_mem = workflow_status_update.avg_memory_usage_mb or 0.0
 
                 # Update progress
-                progress.completed_count = workflow_status_update.completed_count
-                progress.failed_count = workflow_status_update.failed_count
+                self._apply_status_counts(progress, workflow_status_update)
                 progress.elapsed_seconds = _DEFAULT_CLOCK.monotonic() - start_time
                 progress.rate_per_second = (
                     workflow_status_update.completed_count / progress.elapsed_seconds
@@ -550,17 +582,6 @@ class WorkerWorkflowExecutor:
                 progress.worker_workflow_assigned_cores = workflow_assigned_cores
                 progress.worker_workflow_completed_cores = workflow_completed_cores
                 progress.worker_available_cores = self._core_allocator.available_cores
-
-                # Convert step stats
-                progress.step_stats = [
-                    StepStats(
-                        step_name=step_name,
-                        completed_count=stats.get("ok", 0),
-                        failed_count=stats.get("err", 0),
-                        total_count=stats.get("total", 0),
-                    )
-                    for step_name, stats in workflow_status_update.step_stats.items()
-                ]
 
                 # Estimate cores_completed
                 total_cores = len(progress.assigned_cores)

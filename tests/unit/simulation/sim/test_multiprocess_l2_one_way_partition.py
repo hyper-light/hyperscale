@@ -41,6 +41,7 @@ scenario deliberately leaves visible in the pinned worker log.
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.l2_workload_demo import (
     dag_worker_entry,
+    SUSTAINED_ACTION_STEP_COUNT,
     sustained_client_entry,
 )
 from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
@@ -140,10 +141,13 @@ def test_poll_fallback_converges_terminal_after_one_way_push_loss():
         f"outside the 5s-cadence + 5s-timeout budget: {client_log}"
     )
 
-    # History linearizes; stats stay at the ACTION-chain zeros.
+    # History linearizes; the final stats are the ACTION chain's total --
+    # one completed action per step.
     assert JobStatusOracle().check_client_log(client_log) == [], client_log
     final_stats = [entry for entry in client_log if entry[0] == "final-stats"]
-    assert final_stats == [("final-stats", 0, 0, finished_time)], client_log
+    assert final_stats == [
+        ("final-stats", SUSTAINED_ACTION_STEP_COUNT, 0, finished_time)
+    ], client_log
 
     # G3/G4: exactly-once execution evidence and audit absence.
     trace_oracle = ClusterTraceOracle(
