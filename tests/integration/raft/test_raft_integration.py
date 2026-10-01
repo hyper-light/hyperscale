@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
 from hyperscale.distributed.nodes.gate.raft_integration import GateRaftIntegration
 from hyperscale.distributed.nodes.manager.raft_integration import ManagerRaftIntegration
@@ -79,6 +80,7 @@ def manager_integration(
     mock_send_tcp,
 ):
     return ManagerRaftIntegration(
+        ledger_replica=JobLedgerReplica(),
         node_id="node-1",
         job_manager=mock_job_manager,
         leadership_tracker=leadership_tracker,
@@ -444,6 +446,7 @@ class TestManagerRaftLeaderCallbacks:
         """on_job_raft_leader callback is forwarded to RaftConsensus."""
         callback = MagicMock()
         integration = ManagerRaftIntegration(
+            ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
             leadership_tracker=leadership_tracker,
@@ -465,6 +468,7 @@ class TestManagerRaftLeaderCallbacks:
         """on_job_raft_lose_leader callback is forwarded to RaftConsensus."""
         callback = MagicMock()
         integration = ManagerRaftIntegration(
+            ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
             leadership_tracker=leadership_tracker,
@@ -491,6 +495,7 @@ class TestManagerRaftLeaderCallbacks:
             invoked_jobs.append(job_id)
 
         integration = ManagerRaftIntegration(
+            ledger_replica=JobLedgerReplica(),
             node_id="node-1",
             job_manager=mock_job_manager,
             leadership_tracker=leadership_tracker,

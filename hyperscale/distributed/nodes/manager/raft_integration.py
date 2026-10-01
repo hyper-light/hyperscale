@@ -23,6 +23,7 @@ from hyperscale.distributed.raft.models import (
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
     from hyperscale.distributed.jobs.job_manager import JobManager
+    from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
@@ -65,6 +66,8 @@ class ManagerRaftIntegration:
         on_job_raft_lose_leader: Callable[[str], None] | None = None,
         manager_state: "ManagerState | None" = None,
         clock: "HybridLamportClock | None" = None,
+        *,
+        ledger_replica: "JobLedgerReplica",
     ) -> None:
         self._node_id = node_id
         self._node_addr = node_addr if node_addr is not None else ("", 0)
@@ -90,6 +93,7 @@ class ManagerRaftIntegration:
             on_lose_leadership=on_job_raft_lose_leader,
             manager_state=manager_state,
             clock=clock,
+            ledger_replica=ledger_replica,
         )
 
         self._raft_job_manager = RaftJobManager(

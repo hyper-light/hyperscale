@@ -44,6 +44,21 @@ class SimPingWorkflow(Workflow):
         return {"status": "ok"}
 
 
+class SimSustainedPingWorkflow(Workflow):
+    """A step slower than the workflow's own duration: the runner cuts
+    it at the two-second duration, so the job stays mid-flight for that
+    whole window (measured: accepted ~8.0s, completed ~10.1s) -- room
+    for a fault scenario to strike a running job."""
+
+    vus = 2
+    duration = "2s"
+
+    @step()
+    async def sustained_ping(self) -> dict[str, str]:
+        await asyncio.sleep(20.0)
+        return {"status": "ok"}
+
+
 # Ship the workflow class BY VALUE, exactly as a user's script-defined
 # workflow travels: the restricted unpickler's module allowlist admits
 # hyperscale.* and ``__main__`` (user code) by reference only — a
@@ -80,12 +95,21 @@ def dispatch_client_entry(context, host, port, manager_tcp_address) -> None:
 
 
 def multi_manager_client_entry(
-    context, host, port, manager_tcp_addresses
+    context,
+    host,
+    port,
+    manager_tcp_addresses,
+    sustained=False,
+    job_timeout_seconds=30.0,
+    wait_timeout_seconds=45.0,
 ) -> None:
-    """Client child: submit ``SimPingWorkflow`` to a peered manager tier
-    (several managers in one datacenter, no gate) and await completion —
-    the client ranks the managers itself (AD-28) and follows leader
-    redirects."""
+    """Client child: submit to a peered manager tier (several managers in
+    one datacenter, no gate) and await completion — the client ranks the
+    managers itself (AD-28) and follows leader redirects.
+
+    ``sustained`` submits ``SimSustainedPingWorkflow`` instead of the
+    two-second ping, for scenarios that fault the tier mid-job.
+    """
     client = HyperscaleClient(
         host=host,
         port=port,
@@ -95,7 +119,14 @@ def multi_manager_client_entry(
     )
     log: list = []
     context.set_result(log)
-    _run_client_submission(context, client, log)
+    _run_client_submission(
+        context,
+        client,
+        log,
+        workflow_class=SimSustainedPingWorkflow if sustained else SimPingWorkflow,
+        job_timeout_seconds=job_timeout_seconds,
+        wait_timeout_seconds=wait_timeout_seconds,
+    )
 
 
 def gate_dispatch_client_entry(context, host, port, gate_tcp_address) -> None:
@@ -135,7 +166,15 @@ def pinned_gate_dispatch_client_entry(
     )
 
 
-def _run_client_submission(context, client, log: list, datacenters=None) -> None:
+def _run_client_submission(
+    context,
+    client,
+    log: list,
+    datacenters=None,
+    workflow_class=SimPingWorkflow,
+    job_timeout_seconds=30.0,
+    wait_timeout_seconds=45.0,
+) -> None:
     """Shared submit -> watch -> await-completion flow for the client
     entries; identical await ordering regardless of target tier so the
     pinned schedules of existing scenarios stay byte-for-byte.
@@ -150,9 +189,9 @@ def _run_client_submission(context, client, log: list, datacenters=None) -> None
         while job_id is None:
             try:
                 job_id = await client.submit_job(
-                    workflows=[([], SimPingWorkflow())],
+                    workflows=[([], workflow_class())],
                     vus=2,
-                    timeout_seconds=30.0,
+                    timeout_seconds=job_timeout_seconds,
                     datacenters=datacenters,
                 )
             except Exception as submit_error:
@@ -185,7 +224,7 @@ def _run_client_submission(context, client, log: list, datacenters=None) -> None
                 await asyncio.sleep(0.5)
 
         status_watcher = context.loop.create_task(watch_status())
-        result = await client.wait_for_job(job_id, timeout=45.0)
+        result = await client.wait_for_job(job_id, timeout=wait_timeout_seconds)
         status_watcher.cancel()
         log.append(("job-finished", result.status, round(context.loop.time(), 6)))
 

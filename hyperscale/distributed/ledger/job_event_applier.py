@@ -50,7 +50,16 @@ class JobEventApplier:
                 an unreplayable WAL must fail recovery loudly rather
                 than silently drop state.
         """
-        return self._appliers[entry.event_type](entry.payload, jobs)
+        return self.apply_event(entry.event_type, entry.payload, jobs)
+
+    def apply_event(
+        self,
+        event_type: JobEventType,
+        payload: bytes,
+        jobs: dict[str, JobState],
+    ) -> int:
+        """Apply one encoded event to ``jobs`` (see ``apply``)."""
+        return self._appliers[event_type](payload, jobs)
 
     @staticmethod
     def _apply_created(payload: bytes, jobs: dict[str, JobState]) -> int:

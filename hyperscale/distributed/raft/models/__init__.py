@@ -8,6 +8,8 @@ from .command_types import RaftCommandType
 from .commands import RaftCommand
 from .gate_command_types import GateRaftCommandType
 from .gate_commands import GateRaftCommand
+from .ledger_proposal import LedgerProposal
+from .ledger_proposal_result import LedgerProposalResult
 from .log_entry import RaftLogEntry
 from .messages import (
     AppendEntries,
@@ -32,6 +34,8 @@ __all__ = [
     "RaftLogEntry",
     # Messages
     "AppendEntries",
+    "LedgerProposal",
+    "LedgerProposalResult",
     "AppendEntriesResponse",
     "RequestVote",
     "RequestVoteResponse",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Callable, Awaitable, Mapping
+from typing import TYPE_CHECKING, Callable, Awaitable, Mapping, Sequence
 
 import msgspec
 
@@ -830,6 +830,41 @@ class JobLedger:
             )
         finally:
             await self._wal.mark_applied(append_result.entry.lsn)
+
+    async def adopt_replicated_history(
+        self,
+        job_id: str,
+        history: Sequence[tuple[JobEventType, bytes]],
+    ) -> int:
+        """Record a taken-over job's replicated events in this ledger.
+
+        The events already reached the job's consensus group (REGIONAL)
+        through the previous leader; a member taking the job over appends
+        them to its own WAL and applies them through the same applier as
+        recovery, so its later events for the job -- its terminal above
+        all -- land on a ledger that knows the job, and a restart replays
+        the adopted history like any other. Nothing is re-proposed.
+
+        Adopts nothing when this ledger already holds the job (live or
+        completed). Returns the number of events adopted.
+        """
+        async with self._lock:
+            if not history or job_id in self._jobs_internal:
+                return 0
+            if self._completed_cache.get(job_id) is not None:
+                return 0
+
+            for event_type, payload in history:
+                append_result = await self._wal.append(
+                    event_type=event_type, payload=payload
+                )
+                self._apply_entry(append_result.entry)
+                await self._wal.mark_applied(append_result.entry.lsn)
+
+            # A history that ends terminal settles exactly like recovery.
+            await self._archive_terminal_jobs()
+            self._publish_snapshot()
+            return len(history)
 
     def get_job(
         self,

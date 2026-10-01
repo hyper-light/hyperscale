@@ -160,6 +160,9 @@ from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTrac
 from hyperscale.distributed.jobs.job_status_order import JobStatusOrder
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.distributed.ledger.job_ledger import JobLedger
+from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
+from hyperscale.distributed.ledger.pipeline.commit_pipeline import CommitResult
+from hyperscale.distributed.raft.models import LedgerProposal
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 
@@ -196,6 +199,7 @@ from .capacity_reporter import ManagerCapacityReporter
 from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator
 from .discovery import ManagerDiscoveryCoordinator
+from .ledger_replicator import ManagerLedgerReplicator
 from .load_shedding import ManagerLoadShedder
 
 from .workflow_lifecycle import ManagerWorkflowLifecycle
@@ -526,6 +530,9 @@ class ManagerServer(HealthAwareServer):
             node_id=self._node_id.full,
             node_addr=(self._host, self._tcp_port),
         )
+        # AD-38 REGIONAL: every member's copy of the ledger events its
+        # job groups commit; a takeover adopts a job's history from here.
+        self._ledger_replica = JobLedgerReplica()
         self._raft = ManagerRaftIntegration(
             node_id=self._node_id.full,
             job_manager=self._job_manager,
@@ -540,6 +547,20 @@ class ManagerServer(HealthAwareServer):
             on_job_raft_lose_leader=self._on_job_raft_lose_leader,
             manager_state=self._manager_state,
             clock=self._hlc,
+            ledger_replica=self._ledger_replica,
+        )
+        # A forwarded proposal waits out the group leader's proposal
+        # timeout, plus one short transit for the request and its reply.
+        self._ledger_replicator = ManagerLedgerReplicator(
+            consensus=self._raft.consensus,
+            node_id=self._node_id.full,
+            send_tcp=self._send_to_peer,
+            forward_timeout_seconds=(
+                self._config.quorum_timeout_seconds
+                + self._config.tcp_timeout_short_seconds
+            ),
+            clock=self._clock,
+            logger=self._udp_logger,
         )
 
         self._worker_pool = WorkerPool(
@@ -908,6 +929,7 @@ class ManagerServer(HealthAwareServer):
                 region_code=self._node_id.datacenter,
                 gate_id=self._node_id.short,
                 node_id=1,
+                regional_replicator=self._ledger_replicator.replicate,
                 logger=self._udp_logger,
                 clock=self._hlc,
             )
@@ -2472,6 +2494,7 @@ class ManagerServer(HealthAwareServer):
             return False
 
         await self._hydrate_job_state_for_takeover(job_id)
+        await self._adopt_replicated_ledger_history(job_id)
 
         job = self._job_manager.get_job_by_id(job_id)
         workflow_names: list[str] = []
@@ -2501,6 +2524,47 @@ class ManagerServer(HealthAwareServer):
         # leader's persisted TimeoutTrackingState.
         self._replay_extension_state_for_job(job_id)
         return True
+
+    async def _adopt_replicated_ledger_history(self, job_id: str) -> None:
+        """AD-38: take over the job's ledger record along with the job.
+
+        The previous leader's ledger held the job; this member mirrored
+        every REGIONAL entry of it through the job's Raft group. Without
+        adopting that history here, this ledger does not know the job and
+        every later event -- the terminal included -- appends nothing, so
+        the job's outcome is never durably recorded anywhere.
+        """
+        if self._job_ledger is None:
+            return
+
+        if self._ledger_replica.job_state(job_id) is None:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Taking over job {job_id[:8]}... with no replicated "
+                        "JobCreated; its ledger record cannot be adopted"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        adopted = await self._job_ledger.adopt_replicated_history(
+            job_id, self._ledger_replica.history(job_id)
+        )
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    f"Adopted {adopted} replicated ledger events for taken-over "
+                    f"job {job_id[:8]}..."
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     async def _hydrate_job_state_for_takeover(self, job_id: str) -> None:
         """Hydrate executable job state before serving a taken-over job."""
@@ -5790,13 +5854,17 @@ class ManagerServer(HealthAwareServer):
             elapsed_seconds = job.elapsed_seconds()
 
             if self._job_ledger is not None:
-                await self._job_ledger.time_out_job(
+                await self._log_ledger_shortfall(
+                    "JobTimedOut",
                     job.job_id,
-                    timeout_type=reason,
-                    total_completed=job.workflows_completed,
-                    total_failed=job.workflows_failed,
-                    duration_ms=int(elapsed_seconds * 1000),
-                    durability=DurabilityLevel.LOCAL,
+                    await self._job_ledger.time_out_job(
+                        job.job_id,
+                        timeout_type=reason,
+                        total_completed=job.workflows_completed,
+                        total_failed=job.workflows_failed,
+                        duration_ms=int(elapsed_seconds * 1000),
+                        durability=DurabilityLevel.REGIONAL,
+                    ),
                 )
                 await self._discard_persisted_submission(job.job_id)
 
@@ -7763,28 +7831,40 @@ class ManagerServer(HealthAwareServer):
             job.completed_at = self._clock.time()
 
             if self._job_ledger is not None:
-                await self._job_ledger.request_cancellation(
+                await self._log_ledger_shortfall(
+                    "JobCancellationRequested",
                     job_id,
-                    reason=reason,
-                    requestor_id=requester_id,
-                    durability=DurabilityLevel.LOCAL,
+                    await self._job_ledger.request_cancellation(
+                        job_id,
+                        reason=reason,
+                        requestor_id=requester_id,
+                        durability=DurabilityLevel.REGIONAL,
+                    ),
                 )
                 # This datacenter has now cancelled what it was running:
                 # its pending workflows and the running ones the workers
                 # confirmed (AD-38 JobCancellationAcked).
-                await self._job_ledger.acknowledge_cancellation(
+                await self._log_ledger_shortfall(
+                    "JobCancellationAcked",
                     job_id,
-                    datacenter_id=self._node_id.datacenter,
-                    workflows_cancelled=len(pending_cancelled) + len(running_cancelled),
-                    durability=DurabilityLevel.LOCAL,
+                    await self._job_ledger.acknowledge_cancellation(
+                        job_id,
+                        datacenter_id=self._node_id.datacenter,
+                        workflows_cancelled=len(pending_cancelled) + len(running_cancelled),
+                        durability=DurabilityLevel.REGIONAL,
+                    ),
                 )
-                await self._job_ledger.complete_job(
+                await self._log_ledger_shortfall(
+                    "JobCompleted",
                     job_id,
-                    final_status=JobStatus.CANCELLED.value,
-                    total_completed=job.workflows_completed,
-                    total_failed=job.workflows_failed,
-                    duration_ms=int(job.elapsed_seconds() * 1000),
-                    durability=DurabilityLevel.LOCAL,
+                    await self._job_ledger.complete_job(
+                        job_id,
+                        final_status=JobStatus.CANCELLED.value,
+                        total_completed=job.workflows_completed,
+                        total_failed=job.workflows_failed,
+                        duration_ms=int(job.elapsed_seconds() * 1000),
+                        durability=DurabilityLevel.REGIONAL,
+                    ),
                 )
                 await self._discard_persisted_submission(job_id)
 
@@ -9221,56 +9301,6 @@ class ManagerServer(HealthAwareServer):
                 callback_addr=callback_addr,
             )
 
-            if self._job_ledger is not None:
-                # Durable acceptance record (AD-38 LOCAL tier: fsynced
-                # via group commit — a solo manager has no replicators,
-                # so LOCAL is the honest level). A restart after this
-                # point recovers the job instead of forgetting it.
-                # The requestor contact is the client's CALLBACK
-                # listener when it registered one (where a restarted
-                # manager can reach it), else the submitting socket.
-                requestor_contact = (
-                    f"{callback_addr[0]}:{callback_addr[1]}"
-                    if callback_addr
-                    else f"{addr[0]}:{addr[1]}"
-                )
-                _ledger_job_id, create_result = (
-                    await self._job_ledger.create_job(
-                        spec_hash=hashlib.sha256(
-                            submission.workflows
-                        ).digest(),
-                        assigned_datacenters=(self._node_id.datacenter,),
-                        requestor_id=requestor_contact,
-                        durability=DurabilityLevel.LOCAL,
-                        job_id=submission.job_id,
-                    )
-                )
-                # An invariant assertion, not a live error path: LOCAL
-                # is the fsync'd append itself, so it cannot fall
-                # short. Raising is only correct while this site
-                # requests LOCAL — above it, a shortfall means the
-                # record IS durable here and applied to ledger state,
-                # just not replicated, so the right response becomes a
-                # durability warning on ``level_achieved`` rather than
-                # aborting acceptance for a job that exists.
-                if not create_result.success:
-                    raise RuntimeError(
-                        "job ledger rejected acceptance record for "
-                        f"{submission.job_id}: {create_result.error}"
-                    )
-                await self._job_ledger.accept_job(
-                    submission.job_id,
-                    datacenter_id=self._node_id.datacenter,
-                    worker_count=len(self._worker_pool.iter_workers()),
-                    durability=DurabilityLevel.LOCAL,
-                )
-                # Persist the submission payload itself: the ledger
-                # records THAT the job exists; the payload is what a
-                # restarted manager needs to RESUME it rather than
-                # fail it. Crash between the two records degrades to
-                # the fail-loudly path — never silence.
-                await self._persist_submission_payload(submission)
-
             job_info.leader_node_id = self._node_id.full
             job_info.leader_addr = (self._host, self._tcp_port)
             job_info.fencing_token = 1
@@ -9326,6 +9356,57 @@ class ManagerServer(HealthAwareServer):
                 callback_addr=submission.callback_addr,
                 origin_gate_addr=submission.origin_gate_addr,
             )
+
+            if self._job_ledger is not None:
+                # Durable acceptance record (AD-38 REGIONAL: fsynced
+                # here, then committed in the job's Raft group). Written
+                # AFTER the leadership broadcast: peers create the job's
+                # group on the announcement, and a REGIONAL commit needs
+                # a majority of members to hold the group. A restart
+                # after this point recovers the job instead of
+                # forgetting it.
+                # The requestor contact is the client's CALLBACK
+                # listener when it registered one (where a restarted
+                # manager can reach it), else the submitting socket.
+                requestor_contact = (
+                    f"{callback_addr[0]}:{callback_addr[1]}"
+                    if callback_addr
+                    else f"{addr[0]}:{addr[1]}"
+                )
+                _ledger_job_id, create_result = (
+                    await self._job_ledger.create_job(
+                        spec_hash=hashlib.sha256(
+                            submission.workflows
+                        ).digest(),
+                        assigned_datacenters=(self._node_id.datacenter,),
+                        requestor_id=requestor_contact,
+                        durability=DurabilityLevel.REGIONAL,
+                        job_id=submission.job_id,
+                    )
+                )
+                # A shortfall means the record IS durable here and
+                # applied to ledger state, just not replicated: a
+                # durability warning, not a reason to abort acceptance
+                # of a job that exists.
+                await self._log_ledger_shortfall(
+                    "JobCreated", submission.job_id, create_result
+                )
+                await self._log_ledger_shortfall(
+                    "JobAccepted",
+                    submission.job_id,
+                    await self._job_ledger.accept_job(
+                        submission.job_id,
+                        datacenter_id=self._node_id.datacenter,
+                        worker_count=len(self._worker_pool.iter_workers()),
+                        durability=DurabilityLevel.REGIONAL,
+                    ),
+                )
+                # Persist the submission payload itself: the ledger
+                # records THAT the job exists; the payload is what a
+                # restarted manager needs to RESUME it rather than
+                # fail it. Crash between the two records degrades to
+                # the fail-loudly path — never silence.
+                await self._persist_submission_payload(submission)
 
             # Dispatch workflows
             await self._dispatch_job_workflows(submission, workflows)
@@ -10515,17 +10596,21 @@ class ManagerServer(HealthAwareServer):
         for job_id, job_state in recovered_active.items():
             if await self._try_resume_recovered_job(job_id):
                 continue
-            await self._job_ledger.fail_job(
+            await self._log_ledger_shortfall(
+                "JobFailed",
                 job_id,
-                error_message=(
-                    "manager restarted and the job could not be resumed "
-                    "(no persisted submission, or its resume failed)"
+                await self._job_ledger.fail_job(
+                    job_id,
+                    error_message=(
+                        "manager restarted and the job could not be resumed "
+                        "(no persisted submission, or its resume failed)"
+                    ),
+                    failed_datacenter=self._node_id.datacenter,
+                    total_completed=job_state.completed_count,
+                    total_failed=job_state.failed_count,
+                    duration_ms=0,
+                    durability=DurabilityLevel.REGIONAL,
                 ),
-                failed_datacenter=self._node_id.datacenter,
-                total_completed=job_state.completed_count,
-                total_failed=job_state.failed_count,
-                duration_ms=0,
-                durability=DurabilityLevel.LOCAL,
             )
             await self._discard_persisted_submission(job_id)
             await self._udp_logger.log(
@@ -10684,6 +10769,34 @@ class ManagerServer(HealthAwareServer):
             elapsed_seconds,
         )
 
+    async def _log_ledger_shortfall(
+        self,
+        event_name: str,
+        job_id: str,
+        result: CommitResult | None,
+    ) -> None:
+        """Log a job-ledger record that fell short of its requested level.
+
+        The record is durable on this node and applied to ledger state
+        either way (the ledger's apply contract); a shortfall only means
+        it did not reach the requested tier, which an operator must see.
+        ``None`` means the ledger appended nothing (unknown or already
+        terminal job), which is not a shortfall.
+        """
+        if result is None or result.success:
+            return
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Job ledger {event_name} for {job_id[:8]}... is "
+                    f"{result.level_achieved.name}-durable only: {result.error}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
     async def _record_job_outcome_durable(
         self,
         job_id: str,
@@ -10696,24 +10809,32 @@ class ManagerServer(HealthAwareServer):
         """Record a finished job's terminal as AD-38 ``JobFailed`` when every
         workflow failed, ``JobCompleted`` otherwise."""
         if final_status == JobStatus.FAILED.value:
-            await self._job_ledger.fail_job(
+            await self._log_ledger_shortfall(
+                "JobFailed",
                 job_id,
-                error_message="; ".join(errors) or "every workflow failed",
-                failed_datacenter=self._node_id.datacenter,
-                total_completed=total_completed,
-                total_failed=total_failed,
-                duration_ms=duration_ms,
-                durability=DurabilityLevel.LOCAL,
+                await self._job_ledger.fail_job(
+                    job_id,
+                    error_message="; ".join(errors) or "every workflow failed",
+                    failed_datacenter=self._node_id.datacenter,
+                    total_completed=total_completed,
+                    total_failed=total_failed,
+                    duration_ms=duration_ms,
+                    durability=DurabilityLevel.REGIONAL,
+                ),
             )
             return
 
-        await self._job_ledger.complete_job(
+        await self._log_ledger_shortfall(
+            "JobCompleted",
             job_id,
-            final_status=final_status,
-            total_completed=total_completed,
-            total_failed=total_failed,
-            duration_ms=duration_ms,
-            durability=DurabilityLevel.LOCAL,
+            await self._job_ledger.complete_job(
+                job_id,
+                final_status=final_status,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                duration_ms=duration_ms,
+                durability=DurabilityLevel.REGIONAL,
+            ),
         )
 
     def _determine_final_job_status(self, job: JobInfo) -> str:
@@ -11050,6 +11171,18 @@ class ManagerServer(HealthAwareServer):
         """Handle incoming Raft AppendEntries RPC from a manager peer."""
         response = await self._raft.handle_append_entries(data)
         return response if response is not None else b""
+
+    @tcp.receive()
+    async def raft_ledger_proposal(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Propose a peer's forwarded AD-38 ledger entry (if Raft leader)."""
+        proposal = LedgerProposal.load(data)
+        result = await self._ledger_replicator.handle_forwarded(proposal)
+        return result.dump()
 
     @tcp.receive()
     async def raft_append_entries_response(

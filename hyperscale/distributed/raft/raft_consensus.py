@@ -25,6 +25,7 @@ _DEFAULT_CLOCK: Clock = RealClock()
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
     from hyperscale.distributed.jobs.job_manager import JobManager
+    from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
@@ -73,12 +74,15 @@ class RaftConsensus:
         on_lose_leadership: Callable[[str], None] | None = None,
         manager_state: "ManagerState | None" = None,
         clock: "HybridLamportClock | None" = None,
+        *,
+        ledger_replica: "JobLedgerReplica",
     ) -> None:
         self._node_id = node_id
         self._job_manager = job_manager
         self._state_machine = RaftStateMachine(
             job_manager, leadership_tracker, logger, node_id,
             manager_state=manager_state,
+            ledger_replica=ledger_replica,
         )
         self._logger = logger
         self._task_runner = task_runner
@@ -193,6 +197,7 @@ class RaftConsensus:
         if node is None:
             return
         node.destroy()
+        self._state_machine.release_job(job_id)
 
         await self._logger.log(RaftInfo(
             message=f"Destroyed Raft instance for job {job_id}",

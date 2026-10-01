@@ -25,6 +25,7 @@ from .models.commands import RaftCommand
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
     from hyperscale.distributed.jobs.job_manager import JobManager
+    from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.logging import Logger
 
@@ -42,6 +43,7 @@ class RaftStateMachine:
         "_job_manager",
         "_leadership_tracker",
         "_manager_state",
+        "_ledger_replica",
         "_logger",
         "_node_id",
         "_handlers",
@@ -54,10 +56,13 @@ class RaftStateMachine:
         logger: "Logger",
         node_id: str,
         manager_state: "ManagerState | None" = None,
+        *,
+        ledger_replica: "JobLedgerReplica",
     ) -> None:
         self._job_manager = job_manager
         self._leadership_tracker = leadership_tracker
         self._manager_state = manager_state
+        self._ledger_replica = ledger_replica
         self._logger = logger
         self._node_id = node_id
         self._handlers: dict[str, object] = {
@@ -83,6 +88,7 @@ class RaftStateMachine:
             RaftCommandType.FLUSH_STATS_WINDOW: self._apply_flush_stats_window,
             RaftCommandType.NODE_MEMBERSHIP_EVENT: self._apply_node_membership_event,
             RaftCommandType.NO_OP: self._apply_no_op,
+            RaftCommandType.LEDGER_APPEND: self._apply_ledger_append,
         }
 
     async def apply(self, entry: RaftLogEntry) -> None:
@@ -105,21 +111,22 @@ class RaftStateMachine:
             ))
             return
 
-        command = self._deserialize(entry)
+        command = await self._deserialize(entry)
         if command is None:
             return
 
         await handler(command, entry)
 
-    def _deserialize(self, entry: RaftLogEntry) -> RaftCommand | None:
+    async def _deserialize(self, entry: RaftLogEntry) -> RaftCommand | None:
         """Deserialize command bytes. Returns None on failure."""
         if not entry.command:
             return None
         try:
             return cloudpickle.loads(entry.command)
         except Exception as error:
-            # Log but do not re-raise -- Raft log is immutable
-            self._logger.log(RaftError(
+            # Log but do not re-raise -- Raft log is immutable. (This log
+            # call was never awaited, so the error was silently dropped.)
+            await self._logger.log(RaftError(
                 message=f"Failed to deserialize command: {error}",
                 node_id=self._node_id,
                 job_id=entry.job_id,
@@ -413,6 +420,32 @@ class RaftStateMachine:
     # =========================================================================
     # Raft Control
     # =========================================================================
+
+    async def _apply_ledger_append(self, command: RaftCommand, entry: RaftLogEntry) -> None:
+        """Apply LEDGER_APPEND: mirror one committed job-ledger event.
+
+        A malformed event is logged as an error and skipped rather than
+        raised: the Raft log is immutable, and an exception here would
+        stop the tick loop that drives every job's group.
+        """
+        try:
+            self._ledger_replica.apply(
+                entry.job_id, command.ledger_event_type, command.ledger_payload
+            )
+        except Exception as error:
+            await self._logger.log(RaftError(
+                message=(
+                    f"Unreplayable ledger entry {entry.index} "
+                    f"({command.ledger_event_type}): {error!r}"
+                ),
+                node_id=self._node_id,
+                job_id=entry.job_id,
+                term=entry.term,
+            ))
+
+    def release_job(self, job_id: str) -> None:
+        """Drop per-job state held for ``job_id``'s (destroyed) group."""
+        self._ledger_replica.release(job_id)
 
     async def _apply_no_op(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply NO_OP: no state change. Used for leadership confirmation."""

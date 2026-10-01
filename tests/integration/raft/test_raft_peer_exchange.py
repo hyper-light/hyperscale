@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.manager.raft_integration import ManagerRaftIntegration
 from hyperscale.distributed.raft import RaftPeerOutbox
@@ -55,33 +56,43 @@ def _member_id(addr: tuple[str, int]) -> str:
 class InMemoryCluster:
     """N manager Raft integrations joined by a send_tcp-shaped transport."""
 
-    def __init__(self, member_count: int, task_runner: TaskRunner) -> None:
+    def __init__(self, member_count: int) -> None:
         self.addresses = [("127.0.0.1", 9000 + index) for index in range(member_count)]
+        # One TaskRunner per member, as in production (each server owns one).
+        self.task_runners = {addr: TaskRunner(0, Env()) for addr in self.addresses}
         self.integrations: dict[tuple[str, int], ManagerRaftIntegration] = {}
+        # hung / isolated: failed in BOTH directions (a stalled process, a
+        # symmetric partition). deaf: can send, cannot receive (an
+        # asymmetric partition) -- the disruptive-member case.
         self.hung_addresses: set[tuple[str, int]] = set()
-        self.unreachable_addresses: set[tuple[str, int]] = set()
+        self.isolated_addresses: set[tuple[str, int]] = set()
+        self.deaf_addresses: set[tuple[str, int]] = set()
         self.release_hung = asyncio.Event()
         self.logger = _logger()
         for addr in self.addresses:
             self.integrations[addr] = ManagerRaftIntegration(
+                ledger_replica=JobLedgerReplica(),
                 node_id=_member_id(addr),
                 job_manager=MagicMock(),
                 leadership_tracker=MagicMock(),
                 logger=self.logger,
-                task_runner=task_runner,
-                send_tcp=self._send_tcp,
+                task_runner=self.task_runners[addr],
+                send_tcp=self._sender(addr),
                 node_addr=addr,
                 configured_cluster_size=member_count,
             )
 
-    async def _send_tcp(self, addr, method, data, timeout=None):
-        if addr in self.unreachable_addresses:
-            return ConnectionRefusedError(f"{addr} unreachable")
-        if addr in self.hung_addresses:
-            await self.release_hung.wait()
-            return asyncio.TimeoutError(f"{addr} timed out")
-        reply = await getattr(self.integrations[addr], HANDLERS[method])(data)
-        return reply if reply is not None else b""
+    def _sender(self, sender_addr: tuple[str, int]):
+        async def send_tcp(addr, method, data, timeout=None):
+            if {sender_addr, addr} & self.isolated_addresses or addr in self.deaf_addresses:
+                return ConnectionRefusedError(f"{addr} unreachable")
+            if {sender_addr, addr} & self.hung_addresses:
+                await self.release_hung.wait()
+                return asyncio.TimeoutError(f"{addr} timed out")
+            reply = await getattr(self.integrations[addr], HANDLERS[method])(data)
+            return reply if reply is not None else b""
+
+        return send_tcp
 
     async def start(self) -> None:
         for addr, integration in self.integrations.items():
@@ -97,6 +108,8 @@ class InMemoryCluster:
         self.release_hung.set()
         for integration in self.integrations.values():
             await integration.stop()
+        for runner in self.task_runners.values():
+            await runner.shutdown()
 
     def nodes(self, among: list[tuple[str, int]] | None = None):
         return [self.integrations[addr].consensus.get_node(JOB_ID) for addr in among or self.addresses]
@@ -137,18 +150,20 @@ async def _propose(cluster: InMemoryCluster, leader: tuple[str, int]) -> tuple[b
 @pytest.mark.asyncio
 @pytest.mark.parametrize("member_count", [3, 5])
 async def test_group_elects_one_leader_commits_and_followers_apply(
-    task_runner: TaskRunner,
     member_count: int,
 ) -> None:
-    cluster = InMemoryCluster(member_count, task_runner)
+    cluster = InMemoryCluster(member_count)
     await cluster.start()
     try:
         leader = await cluster.wait_for_leader()
         committed, index = await _propose(cluster, leader)
 
         assert committed is True
+        # Every member, followers included, must APPLY the entry -- each
+        # member's own tick loop drives that, so this also proves every
+        # member's loop runs.
         async with asyncio.timeout(LIVENESS_CEILING_SECONDS):
-            while any(node.commit_index < index for node in cluster.nodes()):
+            while any(node._last_applied < index for node in cluster.nodes()):
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
 
         nodes = cluster.nodes()
@@ -163,9 +178,9 @@ async def test_group_elects_one_leader_commits_and_followers_apply(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["hung", "unreachable"])
-async def test_majority_commits_despite_a_failed_peer(task_runner: TaskRunner, failure: str) -> None:
-    cluster = InMemoryCluster(3, task_runner)
+@pytest.mark.parametrize("failure", ["hung", "isolated"])
+async def test_majority_commits_despite_a_failed_peer(failure: str) -> None:
+    cluster = InMemoryCluster(3)
     failed_peer = cluster.addresses[-1]
     getattr(cluster, f"{failure}_addresses").add(failed_peer)
     healthy = [addr for addr in cluster.addresses if addr != failed_peer]
@@ -180,9 +195,35 @@ async def test_majority_commits_despite_a_failed_peer(task_runner: TaskRunner, f
 
 
 @pytest.mark.asyncio
-async def test_unreachable_peer_is_logged_not_swallowed(task_runner: TaskRunner) -> None:
-    cluster = InMemoryCluster(3, task_runner)
-    cluster.unreachable_addresses.add(cluster.addresses[-1])
+async def test_deaf_member_cannot_depose_a_live_leader() -> None:
+    """A follower that can send but not receive never hears heartbeats and
+    times out again and again. Without PreVote each timeout bumped its
+    term and its RequestVote forced the live leader to step down; with
+    PreVote no member grants while it hears the leader, so the term and
+    the leader hold."""
+    cluster = InMemoryCluster(3)
+    await cluster.start()
+    try:
+        leader = await cluster.wait_for_leader()
+        deaf_follower = next(addr for addr in cluster.addresses if addr != leader)
+        term_before = cluster.integrations[leader].consensus.get_node(JOB_ID).current_term
+        cluster.deaf_addresses.add(deaf_follower)
+
+        await asyncio.sleep(ELECTION_TIMEOUT_MAX * 10)
+
+        leader_node = cluster.integrations[leader].consensus.get_node(JOB_ID)
+        assert leader_node.is_leader()
+        assert leader_node.current_term == term_before
+        committed, _ = await _propose(cluster, leader)
+        assert committed is True
+    finally:
+        await cluster.stop()
+
+
+@pytest.mark.asyncio
+async def test_unreachable_peer_is_logged_not_swallowed() -> None:
+    cluster = InMemoryCluster(3)
+    cluster.isolated_addresses.add(cluster.addresses[-1])
     await cluster.start()
     try:
         await cluster.wait_for_leader(among=cluster.addresses[:-1])
@@ -194,8 +235,8 @@ async def test_unreachable_peer_is_logged_not_swallowed(task_runner: TaskRunner)
 
 
 @pytest.mark.asyncio
-async def test_shutdown_leaves_no_sender_loops(task_runner: TaskRunner) -> None:
-    cluster = InMemoryCluster(3, task_runner)
+async def test_shutdown_leaves_no_sender_loops() -> None:
+    cluster = InMemoryCluster(3)
     cluster.hung_addresses.add(cluster.addresses[-1])
     await cluster.start()
     await cluster.wait_for_leader(among=cluster.addresses[:-1])

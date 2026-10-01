@@ -31,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock
 import cloudpickle
 import pytest
 
+from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
 from hyperscale.distributed.jobs.job_manager import JobManager
 from hyperscale.distributed.models.jobs import JobInfo
@@ -59,6 +60,7 @@ def _build_state_machine() -> tuple[JobManager, RaftStateMachine]:
     logger = MagicMock()
     logger.log = AsyncMock()
     state_machine = RaftStateMachine(
+        ledger_replica=JobLedgerReplica(),
         job_manager=job_manager,
         leadership_tracker=leadership_tracker,
         logger=logger,

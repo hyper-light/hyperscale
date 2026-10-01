@@ -51,6 +51,12 @@ class _NoJobManager:
         return None
 
 
+async def _committed_regionally(entry) -> bool:
+    """A manager ledger always has a REGIONAL replicator (its job groups);
+    these tests are about restart truth-telling, so it always commits."""
+    return True
+
+
 async def _open_ledger(filesystem: SimFilesystem) -> JobLedger:
     return await JobLedger.open(
         wal_path=Path("/manager/ledger/wal"),
@@ -59,6 +65,7 @@ async def _open_ledger(filesystem: SimFilesystem) -> JobLedger:
         region_code="dc-east",
         gate_id="mgr-1",
         node_id=1,
+        regional_replicator=_committed_regionally,
         filesystem=filesystem,
     )
 

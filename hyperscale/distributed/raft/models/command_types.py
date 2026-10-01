@@ -57,5 +57,8 @@ class RaftCommandType(str, Enum):
     # Membership (1 method)
     NODE_MEMBERSHIP_EVENT = "node_membership_event"
 
+    # AD-38 REGIONAL: one job-ledger WAL entry replicated to the job's group
+    LEDGER_APPEND = "ledger_append"
+
     # Raft control
     NO_OP = "no_op"

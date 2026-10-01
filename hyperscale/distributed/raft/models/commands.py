@@ -17,6 +17,8 @@ from hyperscale.distributed.models import (
     WorkflowStatus,
 )
 
+from hyperscale.distributed.ledger.events.event_type import JobEventType
+
 from .command_types import RaftCommandType
 
 
@@ -78,4 +80,8 @@ class RaftCommand:
     # Membership events
     event_type: str | None = None
     node_id: str | None = None
+
+    # AD-38 ledger replication (ledger_append): the WAL entry's event
+    ledger_event_type: JobEventType | None = None
+    ledger_payload: bytes | None = None
     node_addr: tuple[str, int] | None = None

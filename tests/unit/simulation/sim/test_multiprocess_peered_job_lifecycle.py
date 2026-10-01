@@ -18,59 +18,21 @@ precedes the leader's removal (one watcher sample of slack), the
 follower's job within retention + one cleanup interval + one sample.
 """
 
-from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
-from tests.simulation.harness.sim.multiprocess.job_dispatch_demo import (
-    multi_manager_client_entry,
-)
 from tests.simulation.harness.sim.multiprocess.peered_manager_demo import (
+    PEERED_MANAGERS,
     WATCH_INTERVAL_SECONDS,
-    peered_manager_entry,
-)
-from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
-    worker_entry,
+    run_peered_manager_job,
 )
 
 _CEILING = 90.0
 _JOB_RETENTION_SECONDS = 10.0
 _JOB_CLEANUP_INTERVAL_SECONDS = 2.0
-_MANAGERS = [(f"sim-mgr-{name}", 9000, 9001) for name in "abc"]
 
 
 def _run_peered_job() -> dict:
-    coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_CEILING, seed=23
+    return run_peered_manager_job(
+        _CEILING, _JOB_RETENTION_SECONDS, _JOB_CLEANUP_INTERVAL_SECONDS
     )
-    for host, tcp_port, udp_port in _MANAGERS:
-        coordinator.add_process(
-            host,
-            peered_manager_entry,
-            host,
-            tcp_port,
-            udp_port,
-            "sim-dc",
-            [(peer, peer_tcp) for peer, peer_tcp, _ in _MANAGERS if peer != host],
-            [(peer, peer_udp) for peer, _, peer_udp in _MANAGERS if peer != host],
-            _JOB_RETENTION_SECONDS,
-            _JOB_CLEANUP_INTERVAL_SECONDS,
-        )
-    coordinator.add_process(
-        "worker",
-        worker_entry,
-        "sim-wkr",
-        9000,
-        9001,
-        "sim-dc",
-        (_MANAGERS[0][0], _MANAGERS[0][1]),
-        2,
-    )
-    coordinator.add_process(
-        "client",
-        multi_manager_client_entry,
-        "sim-cli",
-        9500,
-        [(host, tcp_port) for host, tcp_port, _ in _MANAGERS],
-    )
-    return coordinator.run()
 
 
 def _transitions(log: list, tag: str) -> list[tuple[int, float]]:
@@ -88,7 +50,7 @@ def test_every_member_releases_the_job_and_its_raft_group():
     assert [entry[1] for entry in finished] == ["completed"], results["client"]
     finished_time = finished[0][2]
 
-    manager_logs = {host: results[host] for host, _, _ in _MANAGERS}
+    manager_logs = {host: results[host] for host, _, _ in PEERED_MANAGERS}
     for host, log in manager_logs.items():
         assert _transitions(log, "jobs")[-1][0] == 0, (host, log)
         assert _transitions(log, "raft-groups")[-1][0] == 0, (host, log)
