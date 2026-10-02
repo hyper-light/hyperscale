@@ -324,7 +324,6 @@ class GateServer(HealthAwareServer):
         # AD-38 replication of the ledger; built with the Raft integration
         # in _init_coordinators (ledger writes only happen after start).
         self._ledger_replicator: LedgerReplicator | None = None
-        self._ledger_region_span: LedgerRegionSpan | None = None
         self._ledger_tier_spans_regions: bool | None = None
 
         # Create modular runtime state
@@ -604,10 +603,6 @@ class GateServer(HealthAwareServer):
         )
         self._consecutive_quorum_failures: int = 0
 
-        # AD-44 best-effort completion; built with the coordinators at start
-        # (it runs on the task runner the gate starts with).
-        self._best_effort_manager: BestEffortManager | None = None
-
         # Job timeout tracker (AD-34)
         self._job_timeout_tracker = GateJobTimeoutTracker(
             gate=self,
@@ -615,12 +610,13 @@ class GateServer(HealthAwareServer):
             stuck_threshold=getattr(env, "GATE_ALL_DC_STUCK_THRESHOLD", 180.0),
         )
 
-        # Idempotency cache (AD-40) - initialized in start() after task_runner is available
-        self._idempotency_cache: GateIdempotencyCache[bytes] | None = None
+        # Idempotency cache (AD-40); its cleanup task starts in start()
         self._idempotency_config = create_idempotency_config_from_env(env)
-
-        # Raft integration (initialized in _init_coordinators, declared here for SWIM callback safety)
-        self._raft: GateRaftIntegration | None = None
+        self._idempotency_cache: GateIdempotencyCache[bytes] = GateIdempotencyCache(
+            config=self._idempotency_config,
+            task_runner=self._task_runner,
+            logger=self._udp_logger,
+        )
 
         # Dead gate tracking for Raft-based leadership takeover
         self._dead_gate_addrs: set[tuple[str, int]] = set()
@@ -785,21 +781,14 @@ class GateServer(HealthAwareServer):
             strict_mode=env.MTLS_STRICT_MODE.lower() == "true",
         )
 
-        # Coordinators (initialized in _init_coordinators)
-        self._stats_coordinator: GateStatsCoordinator | None = None
-        self._cancellation_coordinator: GateCancellationCoordinator | None = None
-        self._dispatch_coordinator: GateDispatchCoordinator | None = None
-        self._leadership_coordinator: GateLeadershipCoordinator | None = None
-        self._peer_coordinator: GatePeerCoordinator | None = None
-        self._health_coordinator: GateHealthCoordinator | None = None
-        self._replication_coordinator: GateJobReplicationCoordinator | None = None
-
-        # Handlers (initialized in _init_handlers)
-        self._ping_handler: GatePingHandler | None = None
-        self._job_handler: GateJobHandler | None = None
-        self._manager_handler: GateManagerHandler | None = None
-        self._cancellation_handler: GateCancellationHandler | None = None
-        self._state_sync_handler: GateStateSyncHandler | None = None
+        # Coordinators and handlers exist from construction: SWIM callbacks,
+        # peer failure handling and leader election reach them while
+        # start() is still running, so they are never absent. The TCP
+        # endpoints answer "not ready" until start() opens them
+        # (_accepting_requests) -- the gate's warm-up contract.
+        self._accepting_requests: bool = False
+        self._init_coordinators()
+        self._init_handlers()
 
     # =========================================================================
     # Coordinator and Handler Initialization
@@ -1269,16 +1258,9 @@ class GateServer(HealthAwareServer):
         # Start timeout tracker (AD-34)
         await self._job_timeout_tracker.start()
 
-        self._idempotency_cache = GateIdempotencyCache(
-            config=self._idempotency_config,
-            task_runner=self._task_runner,
-            logger=self._udp_logger,
-        )
         await self._idempotency_cache.start()
-
-        self._init_coordinators()
         self._best_effort_manager.start_deadline_loop()
-        self._init_handlers()
+        self._accepting_requests = True
 
         # Start Raft consensus tick loop and seed membership from known gate peers
         self._raft.start()
@@ -1290,11 +1272,10 @@ class GateServer(HealthAwareServer):
             raft_addrs[gate_id] = (gate_info.tcp_host, gate_info.tcp_port)
         self._raft.set_initial_membership(raft_members, raft_addrs)
 
-        if self._orphan_job_coordinator:
-            self._job_lease_manager._on_lease_expired = (
-                self._orphan_job_coordinator.on_lease_expired
-            )
-            await self._orphan_job_coordinator.start()
+        self._job_lease_manager._on_lease_expired = (
+            self._orphan_job_coordinator.on_lease_expired
+        )
+        await self._orphan_job_coordinator.start()
 
         if self._datacenter_managers:
             await self._register_with_managers()
@@ -1330,22 +1311,17 @@ class GateServer(HealthAwareServer):
 
         await self._dc_health_monitor.stop()
         await self._job_timeout_tracker.stop()
-        if self._best_effort_manager is not None:
-            await self._best_effort_manager.shutdown()
+        await self._best_effort_manager.shutdown()
 
         if self._job_ledger is not None:
             await self._job_ledger.close()
 
-        if self._orphan_job_coordinator is not None:
-            await self._orphan_job_coordinator.stop()
-
-        if self._idempotency_cache is not None:
-            await self._idempotency_cache.close()
+        await self._orphan_job_coordinator.stop()
+        await self._idempotency_cache.close()
 
         # Stop Raft consensus and clock offset probing
         self._clock_offset_prober.stop()
-        if self._raft is not None:
-            await self._raft.stop()
+        await self._raft.stop()
 
         await super().stop(
             drain_timeout=drain_timeout,
@@ -1435,7 +1411,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle manager status update via TCP."""
-        if self._manager_handler:
+        if self._accepting_requests:
             return await self._manager_handler.handle_status_update(
                 addr, data, self.handle_exception
             )
@@ -1449,7 +1425,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle manager registration."""
-        if self._manager_handler and (
+        if self._accepting_requests and (
             transport := self._tcp_server_request_transports.get(addr)
         ):
             return await self._manager_handler.handle_register(
@@ -1465,7 +1441,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle manager discovery broadcast from peer gate."""
-        if self._manager_handler:
+        if self._accepting_requests:
             return await self._manager_handler.handle_discovery(
                 addr, data, self.handle_exception
             )
@@ -1479,7 +1455,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle reporter result push from manager."""
-        if self._manager_handler:
+        if self._accepting_requests:
             return await self._manager_handler.handle_reporter_result_push(
                 addr, data, self.handle_exception
             )
@@ -1501,7 +1477,7 @@ class GateServer(HealthAwareServer):
                 protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                 protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
             ).dump()
-        if self._job_handler:
+        if self._accepting_requests:
             return await self._job_handler.handle_submission(
                 addr, data, self._modular_state.get_active_peer_count()
             )
@@ -1526,7 +1502,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job status request from client."""
-        if self._job_handler:
+        if self._accepting_requests:
             return await self._job_handler.handle_status_request(
                 addr, data, self._gather_job_status
             )
@@ -1540,7 +1516,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job progress update from manager."""
-        if self._job_handler:
+        if self._accepting_requests:
             return await self._job_handler.handle_progress(
                 addr, data, self.handle_exception
             )
@@ -1554,7 +1530,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle ping request."""
-        if self._ping_handler:
+        if self._accepting_requests:
             return await self._ping_handler.handle_ping(
                 addr, data, self.handle_exception
             )
@@ -1576,7 +1552,7 @@ class GateServer(HealthAwareServer):
         named this ``receive_cancel_job`` which silently mismatched
         every inbound cancel request.
         """
-        if self._cancellation_handler:
+        if self._accepting_requests:
             return await self._cancellation_handler.handle_cancel_job(
                 addr, data, self.handle_exception
             )
@@ -1596,7 +1572,7 @@ class GateServer(HealthAwareServer):
         ``func.__name__`` and the manager's push uses action
         ``"job_cancellation_complete"``.
         """
-        if self._cancellation_handler:
+        if self._accepting_requests:
             return await self._cancellation_handler.handle_cancellation_complete(
                 addr, data, self.handle_exception
             )
@@ -1610,7 +1586,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle single workflow cancellation request."""
-        if self._cancellation_handler:
+        if self._accepting_requests:
             return await self._cancellation_handler.handle_cancel_single_workflow(
                 addr, data, self.handle_exception
             )
@@ -1624,7 +1600,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle state sync request from peer gate."""
-        if self._state_sync_handler:
+        if self._accepting_requests:
             return await self._state_sync_handler.handle_state_sync_request(
                 addr, data, self.handle_exception
             )
@@ -1638,7 +1614,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle lease transfer during gate scaling."""
-        if self._state_sync_handler:
+        if self._accepting_requests:
             return await self._state_sync_handler.handle_lease_transfer(
                 addr, data, self.handle_exception
             )
@@ -1676,7 +1652,7 @@ class GateServer(HealthAwareServer):
                 ),
             )
 
-        if self._state_sync_handler:
+        if self._accepting_requests:
             response = await self._state_sync_handler.handle_job_final_result(
                 addr,
                 data,
@@ -1701,7 +1677,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job leadership notification from peer gate."""
-        if self._state_sync_handler:
+        if self._accepting_requests:
             return await self._state_sync_handler.handle_job_leadership_notification(
                 addr, data, self.handle_exception
             )
@@ -2182,7 +2158,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Receive a prepare for the 2PC gate-job-replication protocol."""
-        if self._replication_coordinator is None:
+        if not self._accepting_requests:
             return b"error"
         try:
             return await self._replication_coordinator.handle_prepare(data)
@@ -2198,7 +2174,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Promote a prepared replica into committed gate-job state."""
-        if self._replication_coordinator is None:
+        if not self._accepting_requests:
             return b"error"
         try:
             return await self._replication_coordinator.handle_commit(data)
@@ -2214,7 +2190,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Drop a prepared replica on leader-side quorum failure."""
-        if self._replication_coordinator is None:
+        if not self._accepting_requests:
             return b"error"
         try:
             return await self._replication_coordinator.handle_abort(data)
@@ -2230,7 +2206,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Return the cached committed replica for orphan-state-repair."""
-        if self._replication_coordinator is None:
+        if not self._accepting_requests:
             return b"error"
         try:
             return await self._replication_coordinator.handle_fetch(data)
@@ -2261,10 +2237,7 @@ class GateServer(HealthAwareServer):
                 callback = self._normalize_callback_addr(announcement.callback_addr)
                 if callback is not None:
                     self._record_job_callback(announcement.job_id, callback)
-                if self._orphan_job_coordinator is not None:
-                    self._orphan_job_coordinator.clear_orphaned_job(
-                        announcement.job_id
-                    )
+                self._orphan_job_coordinator.clear_orphaned_job(announcement.job_id)
 
                 self._task_runner.run(
                     self._udp_logger.log,
@@ -2477,7 +2450,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job leader gate transfer notification from peer gate."""
-        if self._job_handler:
+        if self._accepting_requests:
             return await self._job_handler.handle_job_leader_gate_transfer(addr, data)
         return JobLeaderGateTransferAck(
             job_id="unknown",
@@ -2870,8 +2843,6 @@ class GateServer(HealthAwareServer):
         ``sequence``, so the terminal status goes out one sequence above
         the committed replica, reusing the protocol that created it.
         """
-        if self._replication_coordinator is None:
-            return
         committed = self._replication_coordinator.get_committed_replica(job_id)
         job = self._job_manager.get_job(job_id)
         if committed is None or job is None or committed.status_seed == job.status:
@@ -2975,8 +2946,6 @@ class GateServer(HealthAwareServer):
 
     async def _replicate_ledger_global(self, entry: WALEntry) -> bool:
         """Ledger GLOBAL replicator: holders span two regions."""
-        if self._ledger_region_span is None:
-            return False
         return await self._ledger_region_span.replicate(entry)
 
     async def _ledger_target_durability(self) -> DurabilityLevel:
@@ -2984,10 +2953,7 @@ class GateServer(HealthAwareServer):
         tier spans two or more regions, else REGIONAL (GLOBAL cannot be
         met by a single-region tier). Logs each change of that answer
         once rather than one shortfall per job."""
-        spans_regions = (
-            self._ledger_region_span is not None
-            and self._ledger_region_span.tier_spans_regions()
-        )
+        spans_regions = self._ledger_region_span.tier_spans_regions()
         if spans_regions != self._ledger_tier_spans_regions:
             self._ledger_tier_spans_regions = spans_regions
             await self._udp_logger.log(
@@ -3957,11 +3923,10 @@ class GateServer(HealthAwareServer):
         )
         if gate_tcp_addr:
             self._dead_gate_addrs.add(gate_tcp_addr)
-            if self._raft is not None:
-                for gate_id, gate_info in self._modular_state.iter_known_gates():
-                    if (gate_info.udp_host, gate_info.udp_port) == node_addr:
-                        self._raft.on_node_leave(gate_id)
-                        break
+            for gate_id, gate_info in self._modular_state.iter_known_gates():
+                if (gate_info.udp_host, gate_info.udp_port) == node_addr:
+                    self._raft.on_node_leave(gate_id)
+                    break
             self._task_runner.run(
                 self._handle_gate_peer_failure, node_addr, gate_tcp_addr
             )
@@ -3971,11 +3936,10 @@ class GateServer(HealthAwareServer):
         gate_tcp_addr = self._modular_state.get_tcp_addr_for_udp(node_addr)
         if gate_tcp_addr:
             self._dead_gate_addrs.discard(gate_tcp_addr)
-            if self._raft is not None:
-                for gate_id, gate_info in self._modular_state.iter_known_gates():
-                    if (gate_info.udp_host, gate_info.udp_port) == node_addr:
-                        self._raft.on_node_join(gate_id, gate_tcp_addr)
-                        break
+            for gate_id, gate_info in self._modular_state.iter_known_gates():
+                if (gate_info.udp_host, gate_info.udp_port) == node_addr:
+                    self._raft.on_node_join(gate_id, gate_tcp_addr)
+                    break
             self._task_runner.run(
                 self._handle_gate_peer_recovery, node_addr, gate_tcp_addr
             )
@@ -4013,13 +3977,7 @@ class GateServer(HealthAwareServer):
         tcp_addr: tuple[str, int],
     ) -> None:
         """Handle gate peer failure."""
-        if self._peer_coordinator:
-            await self._peer_coordinator.handle_peer_failure(udp_addr, tcp_addr)
-        else:
-            await self._modular_state.remove_active_peer(tcp_addr)
-            self._modular_state.cleanup_peer_udp_tracking(tcp_addr)
-            self._modular_state.cleanup_peer_tcp_tracking(tcp_addr)
-            await self._peer_gate_circuit_breaker.remove_circuit(tcp_addr)
+        await self._peer_coordinator.handle_peer_failure(udp_addr, tcp_addr)
 
     async def _handle_gate_peer_recovery(
         self,
@@ -4027,10 +3985,7 @@ class GateServer(HealthAwareServer):
         tcp_addr: tuple[str, int],
     ) -> None:
         """Handle gate peer recovery."""
-        if self._peer_coordinator:
-            await self._peer_coordinator.handle_peer_recovery(udp_addr, tcp_addr)
-        else:
-            await self._modular_state.add_active_peer(tcp_addr)
+        await self._peer_coordinator.handle_peer_recovery(udp_addr, tcp_addr)
 
     async def _apply_committed_replica(self, replica) -> None:
         """Apply a committed ``GateJobReplica`` to local gate state.
@@ -4126,8 +4081,6 @@ class GateServer(HealthAwareServer):
         and re-evaluates on the next scan tick until the orphan
         timeout elapses.
         """
-        if self._replication_coordinator is None:
-            return False
         peer_addrs = list(self._modular_state.get_active_peers_list())
         return await self._replication_coordinator.repair_committed_replica_from_peers(
             job_id,
@@ -4139,9 +4092,6 @@ class GateServer(HealthAwareServer):
         leader_addr: tuple[str, int],
     ) -> list[str]:
         """Fetch committed replicas for jobs led by a SWIM-dead gate."""
-        if self._replication_coordinator is None:
-            return []
-
         peer_addrs = list(self._modular_state.get_active_peers_list())
         return (
             await self._replication_coordinator.repair_committed_replicas_for_leader_from_peers(
@@ -4155,9 +4105,6 @@ class GateServer(HealthAwareServer):
         leader_addr: tuple[str, int],
     ) -> list[str]:
         """Mark and repair SWIM-confirmed orphans for a dead gate leader."""
-        if self._orphan_job_coordinator is None:
-            return []
-
         orphaned_job_ids = (
             self._orphan_job_coordinator.mark_jobs_confirmed_orphaned_by_gate(
                 leader_addr
@@ -4178,8 +4125,6 @@ class GateServer(HealthAwareServer):
 
     async def _commit_gate_job_leadership_takeover(self, job_id: str) -> int | None:
         """Quorum-commit a gate job leadership takeover by the SWIM leader."""
-        if self._replication_coordinator is None:
-            return None
         if not self.is_leader():
             return None
 
@@ -4384,10 +4329,7 @@ class GateServer(HealthAwareServer):
             ),
         )
         self._task_runner.run(self._scan_for_orphaned_gate_jobs)
-        if self._orphan_job_coordinator is not None:
-            self._task_runner.run(
-                self._orphan_job_coordinator.evaluate_confirmed_orphans
-            )
+        self._task_runner.run(self._orphan_job_coordinator.evaluate_confirmed_orphans)
 
     def _on_gate_lose_leadership(self) -> None:
         """Called when this gate loses cluster leadership."""
@@ -4448,8 +4390,6 @@ class GateServer(HealthAwareServer):
         Marks jobs whose leader is in the dead gate-address set so the orphan
         coordinator can quorum-commit the SWIM-leader takeover.
         """
-        if self._orphan_job_coordinator is None:
-            return
         all_leaderships = self._job_leadership_tracker.get_all_leaderships()
         dead_leader_addrs: set[tuple[str, int]] = set()
         for _job_id, _leader_id, leader_addr, _fencing_token in all_leaderships:
@@ -4525,11 +4465,10 @@ class GateServer(HealthAwareServer):
         heartbeat: ManagerHeartbeat,
         source_addr: tuple[str, int],
     ) -> None:
-        if self._health_coordinator:
-            await self._health_coordinator.handle_embedded_manager_heartbeat(
-                heartbeat,
-                source_addr,
-            )
+        await self._health_coordinator.handle_embedded_manager_heartbeat(
+            heartbeat,
+            source_addr,
+        )
 
     async def _ingest_manager_heartbeat(
         self,
@@ -4539,8 +4478,6 @@ class GateServer(HealthAwareServer):
         *,
         use_version_clock: bool = True,
     ) -> tuple[str, tuple[str, int]] | None:
-        if self._health_coordinator is None:
-            return None
         return await self._health_coordinator.ingest_manager_heartbeat(
             heartbeat,
             source_addr,
@@ -4573,7 +4510,7 @@ class GateServer(HealthAwareServer):
         # stressed gate-tier surfaces alongside manager- and worker-
         # tier LHM in correlation analysis. Gate's own DC is
         # ``heartbeat.datacenter`` — the reporting peer's home DC.
-        if self._health_coordinator is not None and heartbeat.datacenter:
+        if heartbeat.datacenter:
             self._health_coordinator.record_peer_lhm_score(
                 datacenter_id=heartbeat.datacenter,
                 lhm_score=getattr(heartbeat, "lhm_score", 0),
@@ -4594,18 +4531,7 @@ class GateServer(HealthAwareServer):
 
     def _get_known_gates_for_piggyback(self) -> dict[str, tuple[str, int, str, int]]:
         """Get known gates for SWIM piggyback."""
-        if self._peer_coordinator:
-            return self._peer_coordinator.get_known_gates_for_piggyback()
-
-        return {
-            gate_id: (
-                gate_info.tcp_host,
-                gate_info.tcp_port,
-                gate_info.udp_host,
-                gate_info.udp_port,
-            )
-            for gate_id, gate_info in self._modular_state.iter_known_gates()
-        }
+        return self._peer_coordinator.get_known_gates_for_piggyback()
 
     def _get_job_leaderships_for_piggyback(
         self,
@@ -4620,9 +4546,7 @@ class GateServer(HealthAwareServer):
         return dict(self._job_dc_managers)
 
     def _count_active_datacenters(self) -> int:
-        if self._health_coordinator:
-            return self._health_coordinator.count_active_datacenters()
-        return 0
+        return self._health_coordinator.count_active_datacenters()
 
     def _get_forward_throughput(self) -> float:
         return self._modular_state.calculate_throughput(
@@ -4741,109 +4665,22 @@ class GateServer(HealthAwareServer):
 
         return (primary, fallback, health_bucket.lower())
 
-    def _categorize_datacenters_by_health(
-        self,
-        dc_health: dict[str, DatacenterStatus],
-    ) -> tuple[list[str], list[str], list[str]]:
-        healthy = [
-            dc
-            for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.HEALTHY.value
-        ]
-        busy = [
-            dc
-            for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.BUSY.value
-        ]
-        degraded = [
-            dc
-            for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.DEGRADED.value
-        ]
-        return healthy, busy, degraded
-
-    def _determine_worst_health(
-        self, healthy: list[str], busy: list[str], degraded: list[str]
-    ) -> str | None:
-        if healthy:
-            return "healthy"
-        if busy:
-            return "busy"
-        if degraded:
-            return "degraded"
-        return None
-
     def _legacy_select_datacenters(
         self,
         count: int,
         preferred: list[str] | None = None,
     ) -> tuple[list[str], list[str], str]:
         dc_health = self._get_all_datacenter_health()
-        if self._health_coordinator:
-            return self._health_coordinator.legacy_select_datacenters(
-                count,
-                dc_health,
-                len(self._datacenter_managers),
-                preferred,
-            )
-
-        if not dc_health and len(self._datacenter_managers) > 0:
-            return ([], [], "initializing")
-        if not dc_health:
-            return ([], [], "unhealthy")
-
-        healthy, busy, degraded = self._categorize_datacenters_by_health(dc_health)
-        worst_health = self._determine_worst_health(healthy, busy, degraded)
-        if worst_health is None:
-            # Nothing usable: a datacenter still in its pre-first-heartbeat
-            # window makes the aggregate INITIALIZING (transient, retried)
-            # rather than UNHEALTHY (terminal) — same rule as the
-            # health-coordinator selector.
-            initializing = any(
-                status.health == DatacenterHealth.INITIALIZING.value
-                for status in dc_health.values()
-            )
-            return ([], [], "initializing" if initializing else "unhealthy")
-
-        all_usable = healthy + busy + degraded
-        primary = all_usable[:count]
-        fallback = all_usable[count:]
-
-        return (primary, fallback, worst_health)
+        return self._health_coordinator.legacy_select_datacenters(
+            count,
+            dc_health,
+            len(self._datacenter_managers),
+            preferred,
+        )
 
     def _build_datacenter_candidates(self) -> list[DatacenterCandidate]:
         datacenter_ids = list(self._datacenter_managers.keys())
-        if self._health_coordinator:
-            return self._health_coordinator.build_datacenter_candidates(datacenter_ids)
-
-        candidates: list[DatacenterCandidate] = []
-        for datacenter_id in datacenter_ids:
-            status = self._classify_datacenter_health(datacenter_id)
-            slo_routing_factor = self._modular_state.get_dc_slo_routing_factor(
-                datacenter_id
-            )
-            candidates.append(
-                DatacenterCandidate(
-                    datacenter_id=datacenter_id,
-                    health_bucket=status.health.upper(),
-                    available_cores=status.available_capacity,
-                    total_cores=status.available_capacity + status.queue_depth,
-                    queue_depth=status.queue_depth,
-                    lhm_multiplier=1.0,
-                    circuit_breaker_pressure=0.0,
-                    total_managers=status.manager_count,
-                    healthy_managers=status.manager_count,
-                    health_severity_weight=getattr(
-                        status, "health_severity_weight", 1.0
-                    ),
-                    worker_overload_ratio=getattr(status, "worker_overload_ratio", 0.0),
-                    overloaded_worker_count=getattr(
-                        status, "overloaded_worker_count", 0
-                    ),
-                    slo_routing_factor=slo_routing_factor,
-                )
-            )
-        return candidates
+        return self._health_coordinator.build_datacenter_candidates(datacenter_ids)
 
     async def _check_rate_limit_for_operation(
         self,
@@ -4859,18 +4696,10 @@ class GateServer(HealthAwareServer):
         return self._load_shedder.should_shed_handler(request_type)
 
     def _has_quorum_available(self) -> bool:
-        if self._leadership_coordinator:
-            return self._leadership_coordinator.has_quorum(self._gate_state.value)
-        if self._gate_state != GateState.ACTIVE:
-            return False
-        active_count = self._modular_state.get_active_peer_count() + 1
-        return active_count >= self._quorum_size()
+        return self._leadership_coordinator.has_quorum(self._gate_state.value)
 
     def _quorum_size(self) -> int:
-        if self._leadership_coordinator:
-            return self._leadership_coordinator.get_quorum_size()
-        total_gates = self._configured_gate_count()
-        return (total_gates // 2) + 1
+        return self._leadership_coordinator.get_quorum_size()
 
     def _is_clock_fenced(self) -> bool:
         return self._clock_offset_monitor.is_fenced
@@ -4893,21 +4722,7 @@ class GateServer(HealthAwareServer):
         )
 
     def _get_healthy_gates(self) -> list[GateInfo]:
-        if self._peer_coordinator:
-            return self._peer_coordinator.get_healthy_gates()
-
-        node_id = self._node_id
-        return [
-            GateInfo(
-                node_id=node_id.full,
-                tcp_host=self._host,
-                tcp_port=self._tcp_port,
-                udp_host=self._host,
-                udp_port=self._udp_port,
-                datacenter=node_id.datacenter,
-                is_leader=self.is_leader(),
-            )
-        ]
+        return self._peer_coordinator.get_healthy_gates()
 
     def _get_progress_callback_for_job(self, job_id: str) -> tuple[str, int] | None:
         """Get the client callback address for a job."""
@@ -5129,20 +4944,18 @@ class GateServer(HealthAwareServer):
         target_dc_count: int,
         callback_addr: tuple[str, int] | None = None,
     ) -> None:
-        if self._leadership_coordinator:
-            if callback_addr is None:
-                callback_addr = self._job_manager.get_callback(job_id)
-            await self._leadership_coordinator.broadcast_leadership(
-                job_id, target_dc_count, callback_addr
-            )
+        if callback_addr is None:
+            callback_addr = self._job_manager.get_callback(job_id)
+        await self._leadership_coordinator.broadcast_leadership(
+            job_id, target_dc_count, callback_addr
+        )
 
     async def _dispatch_job_to_datacenters(
         self,
         submission: JobSubmission,
         target_dcs: list[str],
     ) -> None:
-        if self._dispatch_coordinator:
-            await self._dispatch_coordinator.dispatch_job(submission, target_dcs)
+        await self._dispatch_coordinator.dispatch_job(submission, target_dcs)
 
     async def _forward_job_progress_to_peers(
         self,
@@ -5251,9 +5064,6 @@ class GateServer(HealthAwareServer):
         callback: tuple[str, int],
         last_sequence: int,
     ) -> None:
-        if not self._stats_coordinator:
-            return
-
         if not self._job_manager.has_job(job_id):
             await self._udp_logger.log(
                 ServerWarning(
@@ -5340,10 +5150,9 @@ class GateServer(HealthAwareServer):
         payload: bytes | None = None,
     ) -> None:
         """Send immediate update to client."""
-        if self._stats_coordinator:
-            await self._stats_coordinator.send_immediate_update(
-                job_id, event_type, payload
-            )
+        await self._stats_coordinator.send_immediate_update(
+            job_id, event_type, payload
+        )
 
     def _get_known_leader_manager_term_for_dc(self, dc_id: str) -> int:
         """Return the highest known leader-manager term for ``dc_id``.
@@ -7149,8 +6958,7 @@ class GateServer(HealthAwareServer):
         self._progress_callbacks.pop(job_id, None)
         self._job_leadership_tracker.release_leadership(job_id)
         self._job_dc_managers.pop(job_id, None)
-        if self._best_effort_manager is not None:
-            await self._best_effort_manager.cleanup(job_id)
+        await self._best_effort_manager.cleanup(job_id)
         self._job_submissions.pop(job_id, None)
 
         reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
@@ -7168,8 +6976,7 @@ class GateServer(HealthAwareServer):
         self._modular_state.cleanup_job_progress_tracking(job_id)
         await self._modular_state.cleanup_job_update_state(job_id)
         self._modular_state.cleanup_cancellation(job_id)
-        if self._replication_coordinator is not None:
-            self._replication_coordinator.clear_for_job(job_id)
+        self._replication_coordinator.clear_for_job(job_id)
 
     async def _job_cleanup_loop(self) -> None:
         while self._running:
@@ -7213,8 +7020,7 @@ class GateServer(HealthAwareServer):
 
     async def _batch_stats_update(self) -> None:
         """Process batch stats update."""
-        if self._stats_coordinator:
-            await self._stats_coordinator.batch_stats_update()
+        await self._stats_coordinator.batch_stats_update()
 
     async def _windowed_stats_push_loop(self) -> None:
         """Background loop for windowed stats push."""
@@ -7223,8 +7029,7 @@ class GateServer(HealthAwareServer):
                 await self._clock.sleep(self._stats_push_interval_ms / 1000.0)
                 if not self._running:
                     break
-                if self._stats_coordinator:
-                    await self._stats_coordinator.push_windowed_stats()
+                await self._stats_coordinator.push_windowed_stats()
             except asyncio.CancelledError:
                 break
             except Exception as error:
@@ -7401,14 +7206,9 @@ class GateServer(HealthAwareServer):
                 ]
 
                 for peer_addr in peers_to_cleanup:
-                    if self._peer_coordinator:
-                        gate_ids_to_remove = (
-                            await self._peer_coordinator.cleanup_dead_peer(peer_addr)
-                        )
-                    else:
-                        gate_ids_to_remove = self._modular_state.cleanup_dead_peer(
-                            peer_addr
-                        )
+                    gate_ids_to_remove = (
+                        await self._peer_coordinator.cleanup_dead_peer(peer_addr)
+                    )
 
                     for gate_id in gate_ids_to_remove:
                         await self._versioned_clock.remove_entity(gate_id)
@@ -7608,7 +7408,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """Handle incoming Raft RequestVote RPC from a gate peer."""
-        if self._raft is None:
+        if not self._accepting_requests:
             return b""
         response = await self._raft.handle_request_vote(data)
         return response if response is not None else b""
@@ -7621,7 +7421,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """Handle incoming Raft RequestVoteResponse from a gate peer."""
-        if self._raft is not None:
+        if self._accepting_requests:
             await self._raft.handle_request_vote_response(data)
         return b""
 
@@ -7646,7 +7446,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """Answer which gates hold a ledger entry (AD-38 GLOBAL check)."""
-        if self._ledger_region_span is None:
+        if not self._accepting_requests:
             return b""
         result = await self._ledger_region_span.handle_query(LedgerPlacementQuery.load(data))
         return result.dump()
@@ -7659,7 +7459,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """Handle incoming Raft AppendEntries RPC from a gate peer."""
-        if self._raft is None:
+        if not self._accepting_requests:
             return b""
         response = await self._raft.handle_append_entries(data)
         return response if response is not None else b""
@@ -7686,7 +7486,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """Handle incoming Raft AppendEntriesResponse from a gate peer."""
-        if self._raft is not None:
+        if self._accepting_requests:
             await self._raft.handle_append_entries_response(data)
         return b""
 

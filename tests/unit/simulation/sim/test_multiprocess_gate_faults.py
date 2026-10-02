@@ -9,16 +9,16 @@ milestones), one ``ManagerServer`` registered with ALL three gates,
 one 2-core ``WorkerServer``, and client(s) running the multi-gate
 sustained-load entry (6 virtual seconds of chained ACTION execution).
 
-Probed baseline (seed 211, no faults): gates discover both peers by
-t=0.5; gate-c wins the initial election at ~1.5 and holds leadership
-all run; submission accepted t=8.38 at gate index 0 (gate-a — the
+Probed baseline (seed 210, no faults): gates discover both peers by
+t=0.5; gate-c wins the initial election at 2.0 and holds leadership
+all run; submission accepted t=6.28 at gate index 0 (gate-a — the
 SUBMISSION gate every kill/restart scenario targets or deliberately
-spares); 'running' seen t=8.88, worker active [8.5, 14.75];
-client-visible completion t=14.522 (dispatch + the full 6s duration +
-push). Re-probed 2026-10-01 on the clock-offset fencing base: the gate
-now answers warmup submissions with a transient "not ready" JobAck, so
-the client stays on its first-ranked gate (gate-a) instead of failing
-over to gate-b.
+spares); 'running' seen t=9.78, worker active [9.5, 15.75];
+client-visible completion t=15.407 (dispatch + the full 6s duration +
+push). Re-probed 2026-10-01 when the gate's coordinators began
+existing from construction: peer handling during warm-up shifted the
+seeded election draws, so the seed was re-selected for the role
+layout (see _SEED).
 
 Scenario families (mission points 1-5 + scope extension), each pinned
 to PROBED current behavior — loud truths, with aspirational invariants
@@ -89,11 +89,17 @@ _GATE_HOSTS = {
     "gate-c": "sim-gate-c",
 }
 
-# Probed baseline instants (seed 211): submission accepted 8.38 at gate
-# index 0 (gate-a), 'running' 8.88, worker active [8.5, 14.75],
-# client-visible completion 14.522. A fault at t=12.0 provably lands
+# The scenarios need three DISTINCT roles -- the elected leader, the
+# gate that accepts the submission, and a follower that is neither --
+# and which gate plays which is a function of the seed (election
+# timeouts and warm-up order). Seed 210 is the seed in the swept range
+# 200-225 whose fault-free run yields that layout with these role
+# assignments (leader gate-c, submission gate-a, follower gate-b).
+# Probed baseline instants (seed 210): submission accepted 6.28 at gate
+# index 0 (gate-a), 'running' 9.78, worker active [9.5, 15.75],
+# client-visible completion 15.407. A fault at t=12.0 provably lands
 # INSIDE live execution.
-_SEED = 211
+_SEED = 210
 _SUBMISSION_GATE_INDEX = 0
 _SUBMISSION_GATE = "gate-a"
 _INITIAL_LEADER_GATE = "gate-c"
@@ -102,9 +108,9 @@ _MID_EXECUTION_AT = 12.0
 _WORKFLOW_DURATION = 6.0
 _JOB_TIMEOUT = 30.0
 _LATE_CLIENT_AT = 300.0
-_BASELINE_SUBMITTED_AT = 8.381971
-_BASELINE_RUNNING_AT = 8.881971
-_BASELINE_COMPLETION_AT = 14.521971
+_BASELINE_SUBMITTED_AT = 6.276553
+_BASELINE_RUNNING_AT = 9.776553
+_BASELINE_COMPLETION_AT = 15.407052
 # A fault that perturbed the job path costs at least one failure
 # detection/retry cycle -- no less than a SWIM probe interval -- so a
 # completion within one interval of the baseline is unperturbed.
@@ -245,8 +251,8 @@ def _final_leader_flags(results: dict, gate_pids: tuple) -> dict[str, int]:
 
 
 def _run_kill_follower() -> dict:
-    """Kill the pure-follower gate (gate-a: neither leader nor the
-    accepting gate for seed 211) at t=12 — inside live execution."""
+    """Kill the pure-follower gate (gate-b: neither leader nor the
+    accepting gate) at t=12 — inside live execution."""
     coordinator = _build_cluster(_SEED, 150.0, wait_timeout=100.0)
     coordinator.schedule_kill(_FOLLOWER_GATE, _MID_EXECUTION_AT)
     return coordinator.run()
@@ -468,6 +474,9 @@ _DURABLE_DOWN_SECONDS = 8.0
 _DURABLE_GEN2_BOOT = _DURABLE_RESTART_AT + _DURABLE_DOWN_SECONDS
 _DURABLE_WORKFLOW_SECONDS = 20.0
 _DURABLE_CEILING = 120.0
+# The solo-gate topology has no leader/submission/follower roles, so it
+# keeps the seed its timeline (below) was probed under.
+_DURABLE_SEED = 211
 
 
 def _run_durable_gate_restart() -> dict:
@@ -493,7 +502,7 @@ def _run_durable_gate_restart() -> dict:
     job from the WAL, the obligation resend delivers the final result
     to gen-2, and the client observes ``completed``."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_DURABLE_CEILING, seed=_SEED
+        latency=0.01, max_virtual_time=_DURABLE_CEILING, seed=_DURABLE_SEED
     )
     datacenter_managers = {"dc-1": [("sim-mgr", 9000)]}
     datacenter_manager_udp = {"dc-1": [("sim-mgr", 9001)]}

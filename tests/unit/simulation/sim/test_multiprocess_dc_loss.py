@@ -80,6 +80,14 @@ _DC_VICTIMS = {
 }
 
 
+# Every scenario faults dc-west (dc-east is the healthy standby), so the
+# job under fault is pinned there (the post-quiesce job keeps free
+# selection -- routing around the dead DC is what it tests): unpinned, the router scores the two DCs on the
+# health each gate has ingested by submission time, and which one wins
+# is an accident of warm-up timing, not part of any scenario.
+_JOB_PLACEMENT = ["dc-west"]
+
+
 def _add_multi_dc_topology(
     coordinator: SimulationCoordinator,
     storage_schedule_by_dc: dict[str, tuple] | None = None,
@@ -231,7 +239,7 @@ def _run_stranded_dc_loss() -> dict:
         latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
-    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0)
+    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
     for victim_id in _DC_VICTIMS["dc-west"]:
         coordinator.schedule_kill(victim_id, _LOSS_AT)
     return coordinator.run()
@@ -327,7 +335,7 @@ def _run_manager_restart_mid_execution() -> dict:
         latency=0.01, max_virtual_time=_RESTART_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
-    _add_soak_client(coordinator, "client-a", "sim-cli-a", 140.0)
+    _add_soak_client(coordinator, "client-a", "sim-cli-a", 140.0, pinned_datacenters=_JOB_PLACEMENT)
     coordinator.schedule_restart(
         "manager-dc-west", _RESTART_AT, down_seconds=_RESTART_DOWN_SECONDS
     )
@@ -435,7 +443,7 @@ def _run_partition_over_completion_push() -> dict:
         latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
-    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0)
+    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
     coordinator.schedule_partition(
         "sim-gate-a", "manager-dc-west", _PUSH_CUT_AT, heal_time=_PUSH_CUT_HEAL
     )
@@ -525,7 +533,7 @@ def _run_standby_dc_long_partition() -> dict:
         latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
-    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0)
+    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
     coordinator.schedule_partition(
         "sim-gate-a",
         "manager-dc-east",
@@ -610,7 +618,7 @@ def _run_slow_disk_through_execution() -> dict:
     _add_multi_dc_topology(
         coordinator, storage_schedule_by_dc={"dc-west": _SLOW_DISK_SCHEDULE}
     )
-    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0)
+    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
     return coordinator.run()
 
 
@@ -678,7 +686,7 @@ def _run_disk_full_dispatch_failure() -> dict:
     _add_multi_dc_topology(
         coordinator, storage_schedule_by_dc={"dc-west": _DISK_FULL_SCHEDULE}
     )
-    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0)
+    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
     return coordinator.run()
 
 
@@ -747,7 +755,7 @@ def _run_chaos_then_quiesce_two_jobs() -> dict:
         latency=0.01, max_virtual_time=_LONG_HORIZON_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
-    _add_soak_client(coordinator, "client-a", "sim-cli-a", 150.0)
+    _add_soak_client(coordinator, "client-a", "sim-cli-a", 150.0, pinned_datacenters=_JOB_PLACEMENT)
     _add_soak_client(
         coordinator,
         "client-b",
@@ -843,7 +851,6 @@ _CONCURRENT_CEILING = 160.0
 # Both jobs in the datacenter that dies: the scenario's premise, pinned
 # (free selection co-placed them only while dc-east was still
 # initializing, and the gate no longer places around an initializing DC).
-_CONCURRENT_PLACEMENT = ["dc-west"]
 
 
 def _run_concurrent_jobs_dc_loss_after_completion() -> dict:
@@ -875,7 +882,7 @@ def _run_concurrent_jobs_dc_loss_after_completion() -> dict:
         _JOB_TIMEOUT_SECONDS,
         140.0,
         0.0,
-        _CONCURRENT_PLACEMENT,
+        _JOB_PLACEMENT,
     )
     coordinator.add_process(
         "client-b",
@@ -887,7 +894,7 @@ def _run_concurrent_jobs_dc_loss_after_completion() -> dict:
         _JOB_TIMEOUT_SECONDS,
         140.0,
         0.0,
-        _CONCURRENT_PLACEMENT,
+        _JOB_PLACEMENT,
     )
     for victim_id in _DC_VICTIMS["dc-west"]:
         coordinator.schedule_kill(victim_id, _CONCURRENT_KILL_AT)
