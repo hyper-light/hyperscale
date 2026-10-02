@@ -21,7 +21,6 @@ import pytest
 from hyperscale.core.jobs.graphs.workflow_runner import WorkflowRunner
 from hyperscale.distributed.env import Env
 from hyperscale.graph import Workflow, step
-from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.testing import URL, HTTPResponse
 
 VUS = 5
@@ -59,18 +58,6 @@ def load_workflow(target: str) -> Workflow:
 
 
 async def test_a_finished_run_closes_its_connections_to_the_target() -> None:
-    # The runner's logger attaches a pipe transport to stdout, which
-    # fails when stdout is a capture or a regular file; this test is
-    # about connections, so logging is disabled for its duration.
-    logging_config = LoggingConfig()
-    logging_config.disable()
-    try:
-        await _run_and_measure()
-    finally:
-        logging_config.enable()
-
-
-async def _run_and_measure() -> None:
     counting = ConnectionCountingServer()
     server = await asyncio.start_server(counting.answer, "127.0.0.1", 0)
     target = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/"

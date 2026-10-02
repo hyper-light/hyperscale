@@ -4,6 +4,7 @@ import functools
 import io
 import os
 import pathlib
+import stat
 import struct
 import sys
 import threading
@@ -43,6 +44,7 @@ from hyperscale.logging.queue import (
 from hyperscale.logging.snowflake import SnowflakeGenerator
 
 from .protocol import LoggerProtocol
+from .regular_file_stream_writer import RegularFileStreamWriter
 from .retention_policy import (
     RetentionPolicy,
     RetentionPolicyConfig,
@@ -120,7 +122,9 @@ class LoggerStream:
             self._default_retention_policy.parse()
 
         self._init_lock = asyncio.Lock()
-        self._stream_writers: Dict[StreamType, asyncio.StreamWriter] = {}
+        self._stream_writers: Dict[
+            StreamType, asyncio.StreamWriter | RegularFileStreamWriter
+        ] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._compressor: zstandard.ZstdCompressor | None = None
 
@@ -227,8 +231,24 @@ class LoggerStream:
         if self._stdout is None or self._stdout.closed:
             self._stdout = await self._dup_stdout()
 
+        self._stream_writers[StreamType.STDOUT] = await self._create_stream_writer(
+            self._stdout
+        )
+
+    async def _create_stream_writer(
+        self, stream_file: io.TextIOWrapper
+    ) -> asyncio.StreamWriter | RegularFileStreamWriter:
+        """A writer for a duplicated standard stream: asyncio's pipe
+        transport for a pipe, socket or terminal, or a buffered off-loop
+        writer for a regular file, which the pipe transport rejects."""
+        file_mode = (
+            await self._loop.run_in_executor(None, os.fstat, stream_file.fileno())
+        ).st_mode
+        if stat.S_ISREG(file_mode):
+            return RegularFileStreamWriter(stream_file.fileno(), self._loop)
+
         transport, protocol = await self._loop.connect_write_pipe(
-            lambda: LoggerProtocol(), self._stdout
+            lambda: LoggerProtocol(), stream_file
         )
 
         if has_uvloop:
@@ -237,7 +257,7 @@ class LoggerStream:
             except Exception:
                 pass
 
-        self._stream_writers[StreamType.STDOUT] = asyncio.StreamWriter(
+        return asyncio.StreamWriter(
             transport,
             protocol,
             None,
@@ -257,21 +277,8 @@ class LoggerStream:
         if self._stderr is None or self._stderr.closed:
             self._stderr = await self._dup_stderr()
 
-        transport, protocol = await self._loop.connect_write_pipe(
-            lambda: LoggerProtocol(), self._stderr
-        )
-
-        if has_uvloop:
-            try:
-                transport.close = patch_transport_close(transport, self._loop)
-            except Exception:
-                pass
-
-        self._stream_writers[StreamType.STDERR] = asyncio.StreamWriter(
-            transport,
-            protocol,
-            None,
-            self._loop,
+        self._stream_writers[StreamType.STDERR] = await self._create_stream_writer(
+            self._stderr
         )
 
     def _get_file_lock(self, logfile_path: str) -> asyncio.Lock:
@@ -837,7 +844,7 @@ class LoggerStream:
         log_file: str,
         line_number: int,
         function_name: str,
-        stream_writer: asyncio.StreamWriter,
+        stream_writer: asyncio.StreamWriter | RegularFileStreamWriter,
     ) -> None:
         context = {
             "filename": log_file,
