@@ -306,7 +306,14 @@ class NodeWAL:
                 dict(self._pending_entries_internal)
             )
 
-        await future
+        try:
+            await future
+        except BaseException:
+            # The write failed (the writer rolled the log back): this
+            # entry was never durable, so it must not linger as pending.
+            # Its LSN stays consumed -- recovery tolerates the gap.
+            await self._forget_unwritten_entry(lsn)
+            raise
 
         async with self._state_lock:
             self._status_snapshot = WALStatusSnapshot(
@@ -317,6 +324,20 @@ class NodeWAL:
             )
 
         return WALAppendResult(entry=entry, queue_result=queue_result)
+
+    async def _forget_unwritten_entry(self, lsn: int) -> None:
+        async with self._state_lock:
+            if self._pending_entries_internal.pop(lsn, None) is None:
+                return
+            self._status_snapshot = WALStatusSnapshot(
+                next_lsn=self._status_snapshot.next_lsn,
+                last_synced_lsn=self._status_snapshot.last_synced_lsn,
+                pending_count=len(self._pending_entries_internal),
+                closed=self._status_snapshot.closed,
+            )
+            self._pending_snapshot = MappingProxyType(
+                dict(self._pending_entries_internal)
+            )
 
     async def mark_regional(self, lsn: int) -> TransitionResult:
         async with self._state_lock:
