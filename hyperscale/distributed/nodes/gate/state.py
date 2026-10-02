@@ -597,6 +597,16 @@ class GateRuntimeState:
             self._state_version += 1
             return self._state_version
 
+    def advance_state_version(self) -> int:
+        """Synchronous increment for callers that cannot await. It never
+        yields, so it cannot interleave with increment_state_version."""
+        self._state_version += 1
+        return self._state_version
+
+    def adopt_state_version(self, version: int) -> None:
+        """Raise the version to a peer snapshot's (never lowers it)."""
+        self._state_version = max(self._state_version, version)
+
     def get_state_version(self) -> int:
         return self._state_version
 

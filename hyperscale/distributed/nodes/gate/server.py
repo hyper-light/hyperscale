@@ -607,11 +607,8 @@ class GateServer(HealthAwareServer):
         # Dead gate tracking for Raft-based leadership takeover
         self._dead_gate_addrs: set[tuple[str, int]] = set()
 
-        # State version
-        self._state_version = 0
-
-        # Gate state
-        self._gate_state = GateState.SYNCING
+        # The gate's lifecycle state and state version live in
+        # GateRuntimeState (_modular_state), shared with the handlers.
 
         # Quorum circuit breaker
         cb_config = env.get_circuit_breaker_config()
@@ -643,8 +640,8 @@ class GateServer(HealthAwareServer):
                 get_datacenter=lambda: self._node_id.datacenter,
                 is_leader=self.is_leader,
                 get_term=lambda: self._leader_election.state.current_term,
-                get_state_version=lambda: self._state_version,
-                get_gate_state=lambda: self._gate_state.value,
+                get_state_version=self._modular_state.get_state_version,
+                get_gate_state=lambda: self._modular_state.get_gate_state().value,
                 get_active_jobs=lambda: self._job_manager.job_count(),
                 get_active_datacenters=lambda: self._count_active_datacenters(),
                 get_manager_count=lambda: sum(
@@ -1267,7 +1264,7 @@ class GateServer(HealthAwareServer):
         await self._udp_logger.log(
             ServerInfo(
                 message=f"Gate started with {len(self._datacenter_managers)} DCs, "
-                f"state={self._gate_state.value}",
+                f"state={self._modular_state.get_gate_state().value}",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -4659,7 +4656,9 @@ class GateServer(HealthAwareServer):
         return self._load_shedder.should_shed_handler(request_type)
 
     def _has_quorum_available(self) -> bool:
-        return self._leadership_coordinator.has_quorum(self._gate_state.value)
+        return self._leadership_coordinator.has_quorum(
+            self._modular_state.get_gate_state().value
+        )
 
     def _quorum_size(self) -> int:
         return self._leadership_coordinator.get_quorum_size()
@@ -5255,7 +5254,7 @@ class GateServer(HealthAwareServer):
         }
         return GateStateSnapshot(
             node_id=self._node_id.full,
-            version=self._state_version,
+            version=self._modular_state.get_state_version(),
             jobs={job_id: job for job_id, job in self._job_manager.items()},
             datacenter_managers=dict(self._datacenter_managers),
             datacenter_manager_udp=dict(self._datacenter_manager_udp),
@@ -5314,12 +5313,11 @@ class GateServer(HealthAwareServer):
             job_fencing_tokens=snapshot.job_fencing_tokens,
         )
 
-        if snapshot.version > self._state_version:
-            self._state_version = snapshot.version
+        self._modular_state.adopt_state_version(snapshot.version)
 
     def _increment_version(self) -> None:
         """Increment state version."""
-        self._state_version += 1
+        self._modular_state.advance_state_version()
 
     async def _send_xprobe(self, target: tuple[str, int], data: bytes) -> bool:
         """Send cross-cluster probe."""
@@ -6668,7 +6666,7 @@ class GateServer(HealthAwareServer):
     async def _complete_startup_sync(self) -> None:
         """Complete startup sync and transition to ACTIVE."""
         if self.is_leader():
-            self._gate_state = GateState.ACTIVE
+            self._modular_state.set_gate_state(GateState.ACTIVE)
             return
 
         leader_addr = self.get_current_leader()
@@ -6677,7 +6675,7 @@ class GateServer(HealthAwareServer):
             if leader_tcp_addr:
                 await self._sync_state_from_peer(leader_tcp_addr)
 
-        self._gate_state = GateState.ACTIVE
+        self._modular_state.set_gate_state(GateState.ACTIVE)
 
     async def _sync_state_from_peer(
         self,
@@ -6699,7 +6697,7 @@ class GateServer(HealthAwareServer):
         try:
             request = GateStateSyncRequest(
                 requester_id=self._node_id.full,
-                known_version=self._state_version,
+                known_version=self._modular_state.get_state_version(),
             )
 
             result, _ = await self.send_tcp(
@@ -6718,14 +6716,14 @@ class GateServer(HealthAwareServer):
                     await self._apply_gate_state_snapshot(response.snapshot)
                     circuit.record_success()
                     return True
-                if response.state_version <= self._state_version:
+                if response.state_version <= self._modular_state.get_state_version():
                     circuit.record_success()
                     return True
                 await self._udp_logger.log(
                     ServerWarning(
                         message=(
                             "State sync response missing snapshot despite newer version "
-                            f"{response.state_version} > {self._state_version}"
+                            f"{response.state_version} > {self._modular_state.get_state_version()}"
                         ),
                         node_host=self._host,
                         node_port=self._tcp_port,
@@ -6785,7 +6783,7 @@ class GateServer(HealthAwareServer):
             udp_port=self._udp_port,
             is_leader=self.is_leader(),
             term=self._leader_election.state.current_term,
-            state=self._gate_state.value,
+            state=self._modular_state.get_gate_state().value,
             datacenter=self._node_id.datacenter,
             cluster_id=self.env.CLUSTER_ID,
             environment_id=self.env.ENVIRONMENT_ID,
