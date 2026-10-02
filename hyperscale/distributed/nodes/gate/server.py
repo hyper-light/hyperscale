@@ -136,7 +136,6 @@ from hyperscale.distributed.swim.core import (
 )
 from hyperscale.distributed.swim.detection import HierarchicalConfig
 from hyperscale.distributed.health import (
-    ManagerHealthState,
     ManagerHealthConfig,
     GateHealthState,
     GateHealthConfig,
@@ -175,7 +174,6 @@ from hyperscale.distributed.datacenters import (
 )
 from hyperscale.distributed.protocol.version import (
     NodeCapabilities,
-    NegotiatedCapabilities,
     CURRENT_PROTOCOL_VERSION,
 )
 from hyperscale.distributed.discovery import DiscoveryService
@@ -360,14 +358,9 @@ class GateServer(HealthAwareServer):
                     self._gate_udp_peers[idx], tcp_addr
                 )
 
-        # Datacenter manager status
-        self._datacenter_manager_status: dict[
-            str, dict[tuple[str, int], ManagerHeartbeat]
-        ] = {}
-        self._manager_last_status: dict[tuple[str, int], float] = {}
-
-        # Health state tracking (AD-19)
-        self._manager_health: dict[tuple[str, tuple[str, int]], ManagerHealthState] = {}
+        # Health state tracking (AD-19). Manager heartbeats, last-seen
+        # times, health and negotiated capabilities live in
+        # GateRuntimeState (_modular_state).
         self._manager_health_config = ManagerHealthConfig()
         self._gate_peer_health: dict[str, GateHealthState] = {}
         self._gate_health_config = GateHealthConfig()
@@ -405,9 +398,6 @@ class GateServer(HealthAwareServer):
 
         # Protocol version (AD-25)
         self._node_capabilities = NodeCapabilities.current(node_version=f"gate-{dc_id}")
-        self._manager_negotiated_caps: dict[
-            tuple[str, int], NegotiatedCapabilities
-        ] = {}
 
         # Versioned state clock
         self._versioned_clock = VersionedStateClock()
@@ -668,7 +658,6 @@ class GateServer(HealthAwareServer):
                 get_tcp_port=lambda: self._tcp_port,
                 on_manager_heartbeat=self._handle_embedded_manager_heartbeat,
                 on_gate_heartbeat=self._handle_gate_peer_heartbeat,
-                get_known_managers=self._get_known_managers_for_piggyback,
                 get_known_gates=self._get_known_gates_for_piggyback,
                 get_job_leaderships=self._get_job_leaderships_for_piggyback,
                 get_job_dc_managers=self._get_job_dc_managers_for_piggyback,
@@ -4428,7 +4417,7 @@ class GateServer(HealthAwareServer):
         manager_addr: tuple[str, int],
     ) -> None:
         incarnation = 0
-        health_state = self._datacenter_manager_status.get(dc_id, {}).get(manager_addr)
+        health_state = self._modular_state.get_manager_status(dc_id, manager_addr)
         if health_state:
             incarnation = getattr(health_state, "incarnation", 0)
 
@@ -4447,7 +4436,7 @@ class GateServer(HealthAwareServer):
         manager_addr: tuple[str, int],
     ) -> None:
         incarnation = 0
-        health_state = self._datacenter_manager_status.get(dc_id, {}).get(manager_addr)
+        health_state = self._modular_state.get_manager_status(dc_id, manager_addr)
         if health_state:
             incarnation = getattr(health_state, "incarnation", 0)
 
@@ -4516,18 +4505,6 @@ class GateServer(HealthAwareServer):
                 lhm_score=getattr(heartbeat, "lhm_score", 0),
                 node_type="gate",
             )
-
-    def _get_known_managers_for_piggyback(
-        self,
-    ) -> list[tuple[str, tuple[str, int], int, int]]:
-        """Get known managers for SWIM piggyback."""
-        result = []
-        for dc_id, managers in self._datacenter_manager_status.items():
-            for addr, status in managers.items():
-                result.append(
-                    (dc_id, addr, status.worker_count, status.available_cores)
-                )
-        return result
 
     def _get_known_gates_for_piggyback(self) -> dict[str, tuple[str, int, str, int]]:
         """Get known gates for SWIM piggyback."""
@@ -6655,7 +6632,7 @@ class GateServer(HealthAwareServer):
         if dc_id in job_dc_managers:
             return job_dc_managers[dc_id]
 
-        manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+        manager_statuses = self._modular_state.get_datacenter_manager_statuses(dc_id)
         fallback_addr: tuple[str, int] | None = None
 
         for manager_addr, heartbeat in manager_statuses.items():
@@ -7108,33 +7085,16 @@ class GateServer(HealthAwareServer):
         self._manager_selector.decay_failures()
         self._peer_discovery.decay_failures()
 
-    def _get_stale_manager_addrs(self, stale_cutoff: float) -> list[tuple[str, int]]:
-        return [
-            manager_addr
-            for manager_addr, last_status in self._manager_last_status.items()
-            if last_status < stale_cutoff
-        ]
-
     async def _cleanup_stale_manager(self, manager_addr: tuple[str, int]) -> None:
-        self._manager_last_status.pop(manager_addr, None)
+        await self._modular_state.remove_manager(manager_addr)
         self._manager_selector.forget_manager(manager_addr)
         await self._clear_manager_backpressure(manager_addr)
-        self._manager_negotiated_caps.pop(manager_addr, None)
         await self._circuit_breaker_manager.remove_circuit(manager_addr)
 
-        for dc_id in list(self._datacenter_manager_status.keys()):
-            dc_managers = self._datacenter_manager_status.get(dc_id)
-            if dc_managers and manager_addr in dc_managers:
-                dc_managers.pop(manager_addr, None)
-
-        health_keys_to_remove = [
-            key for key in self._manager_health if key[1] == manager_addr
-        ]
-        for key in health_keys_to_remove:
-            self._manager_health.pop(key, None)
-
     async def _discovery_maintenance_loop(self) -> None:
-        stale_manager_threshold = 300.0
+        # A silent manager is retained as long as a dead gate peer is
+        # (the operator's retention for departed members), then forgotten.
+        stale_manager_threshold = self._dead_peer_reap_interval
         while self._running:
             try:
                 await self._clock.sleep(self._discovery_failure_decay_interval)
@@ -7143,7 +7103,9 @@ class GateServer(HealthAwareServer):
 
                 now = self._clock.monotonic()
                 stale_cutoff = now - stale_manager_threshold
-                stale_manager_addrs = self._get_stale_manager_addrs(stale_cutoff)
+                stale_manager_addrs = self._modular_state.get_stale_manager_addrs(
+                    stale_cutoff
+                )
 
                 for manager_addr in stale_manager_addrs:
                     await self._cleanup_stale_manager(manager_addr)

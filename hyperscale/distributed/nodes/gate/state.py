@@ -266,6 +266,29 @@ class GateRuntimeState:
             self._datacenter_manager_status[datacenter_id][manager_addr] = heartbeat
             self._manager_last_status[manager_addr] = timestamp
 
+    def get_stale_manager_addrs(self, stale_cutoff: float) -> list[tuple[str, int]]:
+        """Managers whose last heartbeat is older than ``stale_cutoff``."""
+        return [
+            manager_addr
+            for manager_addr, last_status in self._manager_last_status.items()
+            if last_status < stale_cutoff
+        ]
+
+    async def remove_manager(self, manager_addr: tuple[str, int]) -> None:
+        """Forget a departed manager: its heartbeats, health state and
+        negotiated capabilities. A manager that returns is re-learned
+        from its next heartbeat."""
+        async with self._get_manager_state_lock():
+            self._manager_last_status.pop(manager_addr, None)
+            for datacenter_id in list(self._datacenter_manager_status):
+                datacenter_managers = self._datacenter_manager_status[datacenter_id]
+                datacenter_managers.pop(manager_addr, None)
+                if not datacenter_managers:
+                    del self._datacenter_manager_status[datacenter_id]
+        for health_key in [key for key in self._manager_health if key[1] == manager_addr]:
+            del self._manager_health[health_key]
+        self._manager_negotiated_caps.pop(manager_addr, None)
+
     def get_job_dc_managers(self, job_id: str) -> Mapping[str, tuple[str, int]]:
         """The manager each datacenter dispatched ``job_id`` to (read-only)."""
         return MappingProxyType(self._job_dc_managers.get(job_id, {}))
