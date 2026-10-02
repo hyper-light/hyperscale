@@ -19,7 +19,6 @@ from .dispatch import ManagerDispatchCoordinator
 from .sync import ManagerStateSync
 from .health import (
     ManagerHealthMonitor,
-    NodeStatus,
     JobSuspicion,
 )
 from .leadership import ManagerLeadershipCoordinator
@@ -53,7 +52,6 @@ __all__ = [
     "BackpressureLevel",
     # AD-26 Adaptive Healthcheck Extensions
     # AD-30 Hierarchical Failure Detection
-    "NodeStatus",
     "JobSuspicion",
     # AD-24 Rate Limiting
     # AD-25 Version Skew Handling

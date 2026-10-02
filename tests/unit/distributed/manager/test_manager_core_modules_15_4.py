@@ -36,7 +36,6 @@ from hyperscale.distributed.nodes.manager.workflow_lifecycle import (
 from hyperscale.distributed.nodes.manager.dispatch import ManagerDispatchCoordinator
 from hyperscale.distributed.nodes.manager.health import (
     ManagerHealthMonitor,
-    NodeStatus,
     JobSuspicion,
 )
 from hyperscale.distributed.nodes.manager.stats import (
@@ -704,42 +703,6 @@ class TestManagerHealthMonitorJobSuspicion:
         await monitor.refute_job_suspicion("job-123", "worker-456")
 
         assert ("job-123", "worker-456") not in monitor._job_suspicions
-
-    @pytest.mark.asyncio
-    async def test_get_node_status(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
-    ):
-        """Can get comprehensive node status."""
-        registry = ManagerRegistry(
-            state=manager_state,
-            config=manager_config,
-            logger=mock_logger,
-            node_id="manager-1",
-            task_runner=mock_task_runner,
-        )
-
-        monitor = ManagerHealthMonitor(
-            state=manager_state,
-            config=manager_config,
-            registry=registry,
-            logger=mock_logger,
-            node_id="manager-1",
-            task_runner=mock_task_runner,
-        )
-
-        # Alive status
-        assert monitor.get_node_status("worker-123") == NodeStatus.ALIVE
-
-        # Suspected global
-        manager_state._worker_unhealthy_since["worker-123"] = time.monotonic()
-        assert monitor.get_node_status("worker-123") == NodeStatus.SUSPECTED_GLOBAL
-
-        # Clear and suspect for job
-        del manager_state._worker_unhealthy_since["worker-123"]
-        await monitor.suspect_job("job-456", "worker-123")
-        assert (
-            monitor.get_node_status("worker-123", "job-456") == NodeStatus.SUSPECTED_JOB
-        )
 
 
 class TestJobSuspicionClass:

@@ -125,7 +125,7 @@ from hyperscale.distributed.discovery.security.role_validator import (
     RoleValidator,
 )
 from hyperscale.distributed.server.protocol.utils import get_peer_certificate_der
-from hyperscale.distributed.nodes.manager.health import NodeStatus
+from hyperscale.distributed.swim.detection.hierarchical_failure_detector import NodeStatus
 from hyperscale.distributed.jobs import (
     JobManager,
     WorkerPool,

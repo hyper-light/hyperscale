@@ -6,11 +6,9 @@ AD-26 deadline extensions, and AD-30 hierarchical failure detection with job-lev
 """
 
 import asyncio
-from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.models import WorkerHeartbeat
-from hyperscale.distributed.reliability import HybridOverloadDetector
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 from hyperscale.distributed.runtime import Clock, RealClock
@@ -24,20 +22,6 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
-
-
-class NodeStatus(Enum):
-    """
-    Node status for AD-30 hierarchical failure detection.
-
-    Distinguishes between global liveness and job-specific responsiveness.
-    """
-
-    ALIVE = "alive"  # Not suspected at any layer
-    SUSPECTED_GLOBAL = "suspected_global"  # Machine may be down
-    SUSPECTED_JOB = "suspected_job"  # Unresponsive for specific job(s) but not global
-    DEAD_GLOBAL = "dead_global"  # Declared dead at global level
-    DEAD_JOB = "dead_job"  # Declared dead for specific job only
 
 
 class JobSuspicion:
@@ -125,22 +109,13 @@ class ManagerHealthMonitor:
         self._logger: "Logger" = logger
         self._node_id: str = node_id
         self._task_runner: "TaskRunner" = task_runner
-        self._latency_max_age: float = 60.0
-        self._latency_max_count: int = 30
 
         # Lock for health state mutations to prevent race conditions
         self._health_state_lock: asyncio.Lock = asyncio.Lock()
 
-        # AD-18: Hybrid overload detector for manager self-health
-        self._overload_detector: HybridOverloadDetector = HybridOverloadDetector()
-
-        # AD-30: Job-level suspicion tracking
-        # Key: (job_id, worker_id) -> JobSuspicion
+        # AD-30 job-layer suspicion: (job_id, worker_id) -> JobSuspicion.
+        # The global layer is the server's HierarchicalFailureDetector.
         self._job_suspicions: dict[tuple[str, str], JobSuspicion] = {}
-        # Workers declared dead for specific jobs
-        self._job_dead_workers: dict[str, set[str]] = {}  # job_id -> {worker_ids}
-        # Global dead workers (affects all jobs)
-        self._global_dead_workers: set[str] = set()
 
     async def handle_worker_heartbeat(
         self,
@@ -233,52 +208,6 @@ class ManagerHealthMonitor:
                 node_id=self._node_id,
             ),
         )
-
-    async def record_latency_sample(
-        self,
-        target_type: str,
-        target_id: str,
-        latency_ms: float,
-    ) -> None:
-        """
-        Record a latency sample for health tracking.
-
-        Also feeds the AD-18 hybrid overload detector for self-health monitoring.
-
-        Args:
-            target_type: Type of target (worker, peer, gate)
-            target_id: Target identifier
-            latency_ms: Measured latency in milliseconds
-        """
-        now = _DEFAULT_CLOCK.monotonic()
-        sample = (now, latency_ms)
-
-        if target_type == "worker":
-            samples = await self._state.get_worker_latency_samples(target_id)
-        elif target_type == "peer":
-            samples = await self._state.get_peer_latency_samples(target_id)
-        elif target_type == "gate":
-            samples = self._state._gate_latency_samples
-        else:
-            return
-
-        samples.append(sample)
-
-        # AD-18: Feed latency to hybrid overload detector for manager self-health
-        self._overload_detector.record_latency(latency_ms)
-
-    def _prune_latency_samples(self, samples: list[tuple[float, float]]) -> None:
-        """Prune old latency samples."""
-        now = _DEFAULT_CLOCK.monotonic()
-        cutoff = now - self._latency_max_age
-
-        # Remove old samples
-        while samples and samples[0][0] < cutoff:
-            samples.pop(0)
-
-        # Limit count
-        while len(samples) > self._latency_max_count:
-            samples.pop(0)
 
     def get_worker_health_status(self, worker_id: str) -> str:
         """
@@ -530,11 +459,6 @@ class ManagerHealthMonitor:
                 job_id, worker_id = key
                 expired.append((job_id, worker_id))
 
-                # Mark worker as dead for this job
-                if job_id not in self._job_dead_workers:
-                    self._job_dead_workers[job_id] = set()
-                self._job_dead_workers[job_id].add(worker_id)
-
                 # Remove suspicion
                 del self._job_suspicions[key]
 
@@ -581,106 +505,10 @@ class ManagerHealthMonitor:
                 silent.append(key)
         return silent
 
-    def is_worker_alive_for_job(self, job_id: str, worker_id: str) -> bool:
-        """
-        Check if worker is alive for a specific job (AD-30).
-
-        Args:
-            job_id: Job ID
-            worker_id: Worker ID
-
-        Returns:
-            True if worker is not dead for this job
-        """
-        # Check global death first
-        if worker_id in self._global_dead_workers:
-            return False
-
-        # Check job-specific death
-        job_dead = self._job_dead_workers.get(job_id, set())
-        return worker_id not in job_dead
-
-    def get_node_status(self, worker_id: str, job_id: str | None = None) -> NodeStatus:
-        """
-        Get comprehensive node status (AD-30).
-
-        Args:
-            worker_id: Worker ID
-            job_id: Optional job ID for job-specific check
-
-        Returns:
-            Current NodeStatus
-        """
-        # Check global death
-        if worker_id in self._global_dead_workers:
-            return NodeStatus.DEAD_GLOBAL
-
-        # Check global suspicion
-        if worker_id in self._state._worker_unhealthy_since:
-            return NodeStatus.SUSPECTED_GLOBAL
-
-        if job_id:
-            # Check job-specific death
-            job_dead = self._job_dead_workers.get(job_id, set())
-            if worker_id in job_dead:
-                return NodeStatus.DEAD_JOB
-
-            # Check job-specific suspicion
-            key = (job_id, worker_id)
-            if key in self._job_suspicions:
-                return NodeStatus.SUSPECTED_JOB
-
-        return NodeStatus.ALIVE
-
-    def on_global_death(self, worker_id: str) -> None:
-        """
-        Handle global worker death (AD-30).
-
-        Clears all job suspicions for this worker.
-
-        Args:
-            worker_id: Dead worker ID
-        """
-        self._global_dead_workers.add(worker_id)
-
-        keys_to_remove = [key for key in self._job_suspicions if key[1] == worker_id]
-        for key in keys_to_remove:
-            del self._job_suspicions[key]
-
-        for job_dead_set in self._job_dead_workers.values():
-            job_dead_set.discard(worker_id)
-
-        progress_keys_to_remove = [
-            key for key in self._state._worker_job_last_progress if key[0] == worker_id
-        ]
-        for key in progress_keys_to_remove:
-            self._state._worker_job_last_progress.pop(key, None)
-
-        self._task_runner.run(
-            self._logger.log,
-            ServerWarning(
-                message=f"Worker {worker_id[:8]}... globally dead, cleared job suspicions",
-                node_host=self._config.host,
-                node_port=self._config.tcp_port,
-                node_id=self._node_id,
-            ),
-        )
-
-    def clear_global_death(self, worker_id: str) -> None:
-        """
-        Clear global death status (worker rejoined).
-
-        Args:
-            worker_id: Worker that rejoined
-        """
-        self._global_dead_workers.discard(worker_id)
-
     def clear_job_suspicions(self, job_id: str) -> None:
         keys_to_remove = [key for key in self._job_suspicions if key[0] == job_id]
         for key in keys_to_remove:
             del self._job_suspicions[key]
-
-        self._job_dead_workers.pop(job_id, None)
 
     def _count_peer_manager_health_states(
         self,
@@ -783,35 +611,8 @@ class ManagerHealthMonitor:
             ),
         )
 
-    def get_manager_overload_state(
-        self,
-        cpu_percent: float = 0.0,
-        memory_percent: float = 0.0,
-    ) -> str:
-        """
-        Get manager's own overload state (AD-18).
-
-        Args:
-            cpu_percent: Current CPU utilization (0-100)
-            memory_percent: Current memory utilization (0-100)
-
-        Returns:
-            Overload state: "healthy", "busy", "stressed", or "overloaded"
-        """
-        return self._overload_detector.get_state(cpu_percent, memory_percent).value
-
-    def get_overload_diagnostics(self) -> dict[str, Any]:
-        """
-        Get hybrid overload detector diagnostics (AD-18).
-
-        Returns:
-            Dict with baseline, drift, state, and other diagnostic info
-        """
-        return self._overload_detector.get_diagnostics()
-
     def get_health_metrics(self) -> dict[str, Any]:
         """Get health-related metrics."""
-        overload_diag = self._overload_detector.get_diagnostics()
         return {
             "healthy_workers": self.get_healthy_worker_count(),
             "unhealthy_workers": self.get_unhealthy_worker_count(),
@@ -820,12 +621,6 @@ class ManagerHealthMonitor:
                 len(self._state._worker_latency_samples)
                 + len(self._state._peer_manager_latency_samples)
             ),
-            # AD-18 metrics
-            "manager_overload_state": overload_diag.get("current_state", "healthy"),
-            "manager_baseline_latency": overload_diag.get("baseline", 0.0),
-            "manager_baseline_drift": overload_diag.get("baseline_drift", 0.0),
-            # AD-30 metrics
+            # AD-30 job-layer metrics
             "job_suspicions": len(self._job_suspicions),
-            "global_dead_workers": len(self._global_dead_workers),
-            "jobs_with_dead_workers": len(self._job_dead_workers),
         }
