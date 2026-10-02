@@ -558,13 +558,6 @@ class GateCancellationHandler:
                 )
             )
 
-            if completion.errors:
-                self._state._cancellation_errors[job_id].extend(completion.errors)
-
-            event = self._state._cancellation_completion_events.get(job_id)
-            if event:
-                event.set()
-
             callback = self._job_manager.get_callback(job_id)
             if callback:
                 self._task_runner.run(
@@ -607,9 +600,6 @@ class GateCancellationHandler:
                     node_id=self._get_node_id().short,
                 )
             )
-
-        self._state._cancellation_completion_events.pop(job_id, None)
-        self._state._cancellation_errors.pop(job_id, None)
 
     async def handle_cancel_single_workflow(
         self,

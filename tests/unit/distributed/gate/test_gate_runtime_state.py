@@ -488,79 +488,6 @@ class TestOrphanLeadershipMethods:
 # =============================================================================
 
 
-class TestCancellationMethods:
-    """Tests for cancellation tracking methods."""
-
-    def test_initialize_cancellation(self):
-        """Initialize cancellation creates event."""
-        state = GateRuntimeState()
-        job_id = "job-123"
-
-        event = state.initialize_cancellation(job_id)
-
-        assert isinstance(event, asyncio.Event)
-        assert job_id in state._cancellation_completion_events
-
-    def test_get_cancellation_event(self):
-        """Get cancellation event returns stored event."""
-        state = GateRuntimeState()
-        job_id = "job-123"
-
-        created_event = state.initialize_cancellation(job_id)
-        retrieved_event = state.get_cancellation_event(job_id)
-
-        assert created_event is retrieved_event
-
-    def test_get_cancellation_event_unknown(self):
-        """Get cancellation event for unknown job returns None."""
-        state = GateRuntimeState()
-        assert state.get_cancellation_event("unknown") is None
-
-    def test_add_cancellation_error(self):
-        """Add cancellation error appends to list."""
-        state = GateRuntimeState()
-        job_id = "job-123"
-
-        state.add_cancellation_error(job_id, "Error 1")
-        state.add_cancellation_error(job_id, "Error 2")
-
-        errors = state.get_cancellation_errors(job_id)
-        assert len(errors) == 2
-        assert "Error 1" in errors
-        assert "Error 2" in errors
-
-    def test_get_cancellation_errors_unknown(self):
-        """Get cancellation errors for unknown job returns empty list."""
-        state = GateRuntimeState()
-        errors = state.get_cancellation_errors("unknown")
-        assert errors == []
-
-    def test_get_cancellation_errors_returns_copy(self):
-        """Get cancellation errors returns copy."""
-        state = GateRuntimeState()
-        job_id = "job-123"
-
-        state.add_cancellation_error(job_id, "Error 1")
-        errors = state.get_cancellation_errors(job_id)
-        errors.append("Error 2")
-
-        # Original should not be modified
-        assert len(state.get_cancellation_errors(job_id)) == 1
-
-    def test_cleanup_cancellation(self):
-        """Cleanup cancellation removes all state."""
-        state = GateRuntimeState()
-        job_id = "job-123"
-
-        state.initialize_cancellation(job_id)
-        state.add_cancellation_error(job_id, "Error")
-
-        state.cleanup_cancellation(job_id)
-
-        assert state.get_cancellation_event(job_id) is None
-        assert state.get_cancellation_errors(job_id) == []
-
-
 # =============================================================================
 # Throughput Methods Tests
 # =============================================================================
@@ -712,23 +639,6 @@ class TestConcurrency:
 
         # Operations should be serialized
         assert len(execution_order) == 4
-
-    @pytest.mark.asyncio
-    async def test_concurrent_cancellation_events(self):
-        """Concurrent cancellation event operations are safe."""
-        state = GateRuntimeState()
-        results = []
-
-        async def task(job_id: str):
-            event = state.initialize_cancellation(job_id)
-            state.add_cancellation_error(job_id, f"Error from {job_id}")
-            results.append(job_id)
-
-        await asyncio.gather(*[task(f"job-{i}") for i in range(100)])
-
-        assert len(results) == 100
-        for i in range(100):
-            assert state.get_cancellation_event(f"job-{i}") is not None
 
     @pytest.mark.asyncio
     async def test_concurrent_fence_token_increments(self):

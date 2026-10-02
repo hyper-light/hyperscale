@@ -215,7 +215,6 @@ from hyperscale.logging.hyperscale_logging_models import (
 )
 
 from .stats_coordinator import GateStatsCoordinator
-from .cancellation_coordinator import GateCancellationCoordinator
 from .dispatch_coordinator import GateDispatchCoordinator
 from .ledger_region_span import LedgerRegionSpan
 from .leadership_coordinator import GateLeadershipCoordinator
@@ -776,17 +775,6 @@ class GateServer(HealthAwareServer):
             forward_status_push_to_peers=self._forward_job_status_push_to_peers,
         )
 
-        self._cancellation_coordinator = GateCancellationCoordinator(
-            state=self._modular_state,
-            logger=self._udp_logger,
-            task_runner=self._task_runner,
-            get_job_target_dcs=self._job_manager.get_target_dcs,
-            get_dc_manager_addr=lambda job_id, dc_id: self._modular_state.get_job_dc_managers(
-                job_id
-            ).get(dc_id),
-            send_tcp=self._send_tcp,
-            is_job_leader=self._job_leadership_tracker.is_leader,
-        )
 
         self._leadership_coordinator = GateLeadershipCoordinator(
             state=self._modular_state,
@@ -6891,7 +6879,6 @@ class GateServer(HealthAwareServer):
 
         self._modular_state.cleanup_job_progress_tracking(job_id)
         await self._modular_state.cleanup_job_update_state(job_id)
-        self._modular_state.cleanup_cancellation(job_id)
         self._replication_coordinator.clear_for_job(job_id)
 
     async def _job_cleanup_loop(self) -> None:
@@ -7281,11 +7268,6 @@ class GateServer(HealthAwareServer):
         return self._stats_coordinator
 
     @property
-    def cancellation_coordinator(self) -> GateCancellationCoordinator | None:
-        """Get the cancellation coordinator."""
-        return self._cancellation_coordinator
-
-    @property
     def dispatch_coordinator(self) -> GateDispatchCoordinator | None:
         """Get the dispatch coordinator."""
         return self._dispatch_coordinator
@@ -7407,7 +7389,6 @@ __all__ = [
     "create_gate_config",
     "GateRuntimeState",
     "GateStatsCoordinator",
-    "GateCancellationCoordinator",
     "GateDispatchCoordinator",
     "GateLeadershipCoordinator",
     "GatePeerCoordinator",

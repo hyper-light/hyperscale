@@ -6,7 +6,6 @@ datacenter health, leases, and metrics.
 """
 
 import asyncio
-from collections import defaultdict
 from types import MappingProxyType
 from typing import Callable, Mapping
 
@@ -117,8 +116,6 @@ class GateRuntimeState:
         self._job_progress_lock: asyncio.Lock | None = None
 
         # Cancellation state
-        self._cancellation_completion_events: dict[str, asyncio.Event] = {}
-        self._cancellation_errors: dict[str, list[str]] = defaultdict(list)
 
         # Progress callbacks
         self._progress_callbacks: dict[str, tuple[str, int]] = {}
@@ -536,29 +533,6 @@ class GateRuntimeState:
     def get_orphaned_jobs(self) -> dict[str, float]:
         """Get all orphaned jobs with their timestamps."""
         return dict(self._orphaned_jobs)
-
-    # Cancellation methods
-    def initialize_cancellation(self, job_id: str) -> asyncio.Event:
-        """Initialize cancellation tracking for a job."""
-        self._cancellation_completion_events[job_id] = asyncio.Event()
-        return self._cancellation_completion_events[job_id]
-
-    def get_cancellation_event(self, job_id: str) -> asyncio.Event | None:
-        """Get the cancellation event for a job."""
-        return self._cancellation_completion_events.get(job_id)
-
-    def add_cancellation_error(self, job_id: str, error: str) -> None:
-        """Add a cancellation error for a job."""
-        self._cancellation_errors[job_id].append(error)
-
-    def get_cancellation_errors(self, job_id: str) -> list[str]:
-        """Get all cancellation errors for a job."""
-        return list(self._cancellation_errors.get(job_id, []))
-
-    def cleanup_cancellation(self, job_id: str) -> None:
-        """Clean up cancellation state for a job."""
-        self._cancellation_completion_events.pop(job_id, None)
-        self._cancellation_errors.pop(job_id, None)
 
     def set_job_reporter_task(
         self, job_id: str, reporter_type: str, task: asyncio.Task

@@ -477,7 +477,6 @@ class TestHandleJobCancellationComplete:
     async def test_handles_completion_notification(self):
         """Handles cancellation completion notification."""
         state = GateRuntimeState()
-        state.initialize_cancellation("job-123")
 
         handler = create_mock_handler(state=state)
 
