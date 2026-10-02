@@ -289,6 +289,27 @@ class GateRuntimeState:
             del self._manager_health[health_key]
         self._manager_negotiated_caps.pop(manager_addr, None)
 
+    def set_job_dc_manager(
+        self, job_id: str, datacenter_id: str, manager_addr: tuple[str, int]
+    ) -> None:
+        """Record the manager ``datacenter_id`` runs ``job_id`` on."""
+        self._job_dc_managers.setdefault(job_id, {})[datacenter_id] = manager_addr
+
+    def copy_job_dc_managers(self) -> dict[str, dict[str, tuple[str, int]]]:
+        """Every job's DC managers, copied (for a state snapshot)."""
+        return {
+            job_id: dict(datacenter_managers)
+            for job_id, datacenter_managers in self._job_dc_managers.items()
+        }
+
+    def clear_job(self, job_id: str) -> None:
+        """Drop every per-job entry this state holds for ``job_id``: its
+        submission, workflow ids, client callback and DC managers."""
+        self._job_submissions.pop(job_id, None)
+        self._job_workflow_ids.pop(job_id, None)
+        self._progress_callbacks.pop(job_id, None)
+        self._job_dc_managers.pop(job_id, None)
+
     def get_job_dc_managers(self, job_id: str) -> Mapping[str, tuple[str, int]]:
         """The manager each datacenter dispatched ``job_id`` to (read-only)."""
         return MappingProxyType(self._job_dc_managers.get(job_id, {}))

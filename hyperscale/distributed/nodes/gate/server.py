@@ -426,7 +426,6 @@ class GateServer(HealthAwareServer):
         )
         self._workflow_result_timeout_tokens: dict[str, dict[str, str]] = {}
         self._workflow_result_expected_dc_counts: dict[str, dict[str, int]] = {}
-        self._job_workflow_ids: dict[str, set[str]] = {}
 
         # Data-plane idempotency: highest finalized result_sequence per
         # ``(job_id, workflow_id, datacenter)``. Populated when an
@@ -456,14 +455,12 @@ class GateServer(HealthAwareServer):
         )
 
         # Per-job per-DC manager tracking
-        self._job_dc_managers: dict[str, dict[str, tuple[str, int]]] = {}
 
         # Cancellation tracking
         self._cancellation_completion_events: dict[str, asyncio.Event] = {}
         self._cancellation_errors: dict[str, list[str]] = defaultdict(list)
 
         # Progress callbacks
-        self._progress_callbacks: dict[str, tuple[str, int]] = {}
 
         self._partition_detected_callbacks: list[Callable[[list[str]], None]] = []
         self._partition_healed_callbacks: list[Callable[[list[str]], None]] = []
@@ -496,7 +493,6 @@ class GateServer(HealthAwareServer):
         self._leadership_refusals.append(self._is_clock_fenced)
 
         # Job submissions
-        self._job_submissions: dict[str, JobSubmission] = {}
 
         # Reporter tasks
         self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
@@ -660,7 +656,6 @@ class GateServer(HealthAwareServer):
                 on_gate_heartbeat=self._handle_gate_peer_heartbeat,
                 get_known_gates=self._get_known_gates_for_piggyback,
                 get_job_leaderships=self._get_job_leaderships_for_piggyback,
-                get_job_dc_managers=self._get_job_dc_managers_for_piggyback,
                 get_health_has_dc_connectivity=lambda: len(self._datacenter_managers)
                 > 0,
                 get_health_connected_dc_count=self._count_active_datacenters,
@@ -812,8 +807,8 @@ class GateServer(HealthAwareServer):
             logger=self._udp_logger,
             task_runner=self._task_runner,
             get_job_target_dcs=self._job_manager.get_target_dcs,
-            get_dc_manager_addr=lambda job_id, dc_id: self._job_dc_managers.get(
-                job_id, {}
+            get_dc_manager_addr=lambda job_id, dc_id: self._modular_state.get_job_dc_managers(
+                job_id
             ).get(dc_id),
             send_tcp=self._send_tcp,
             is_job_leader=self._job_leadership_tracker.is_leader,
@@ -2303,7 +2298,7 @@ class GateServer(HealthAwareServer):
             transfer = JobLeaderManagerTransfer.load(data)
 
             job_known = (
-                transfer.job_id in self._job_dc_managers
+                bool(self._modular_state.get_job_dc_managers(transfer.job_id))
                 or transfer.job_id in self._job_leadership_tracker
             )
             if not job_known:
@@ -2328,10 +2323,10 @@ class GateServer(HealthAwareServer):
             old_manager_addr = self._job_leadership_tracker.get_dc_manager(
                 transfer.job_id, transfer.datacenter_id
             )
-            if old_manager_addr is None and transfer.job_id in self._job_dc_managers:
-                old_manager_addr = self._job_dc_managers[transfer.job_id].get(
-                    transfer.datacenter_id
-                )
+            if old_manager_addr is None:
+                old_manager_addr = self._modular_state.get_job_dc_managers(
+                    transfer.job_id
+                ).get(transfer.datacenter_id)
 
             accepted = await self._job_leadership_tracker.update_dc_manager_async(
                 job_id=transfer.job_id,
@@ -2366,8 +2361,9 @@ class GateServer(HealthAwareServer):
                     accepted=False,
                 ).dump()
 
-            job_dc_managers = self._job_dc_managers.setdefault(transfer.job_id, {})
-            job_dc_managers[transfer.datacenter_id] = transfer.new_manager_addr
+            self._modular_state.set_job_dc_manager(
+                transfer.job_id, transfer.datacenter_id, transfer.new_manager_addr
+            )
 
             self._clear_orphaned_job(transfer.job_id, transfer.new_manager_addr)
 
@@ -2384,7 +2380,7 @@ class GateServer(HealthAwareServer):
                 ),
             )
 
-            callback = self._progress_callbacks.get(transfer.job_id)
+            callback = self._modular_state._progress_callbacks.get(transfer.job_id)
             if callback:
                 manager_transfer = ManagerJobLeaderTransfer(
                     job_id=transfer.job_id,
@@ -3246,9 +3242,7 @@ class GateServer(HealthAwareServer):
         Creates reporter tasks for each configured reporter type
         and submits the results.
         """
-        submission = self._job_submissions.get(
-            job_id
-        ) or self._modular_state._job_submissions.get(job_id)
+        submission = self._modular_state._job_submissions.get(job_id)
         if not submission or not submission.reporting_configs:
             return
 
@@ -3443,7 +3437,7 @@ class GateServer(HealthAwareServer):
             reason=reason or "global_timeout",
             fence_token=self._job_manager.get_fence_token(job_id),
         ).dump()
-        job_dc_managers = self._job_dc_managers.get(job_id, {})
+        job_dc_managers = self._modular_state.get_job_dc_managers(job_id)
         errors: list[str] = []
 
         for dc_id in target_dcs:
@@ -4053,9 +4047,7 @@ class GateServer(HealthAwareServer):
         """Remove all replicated state for ``job_id`` (failed-commit cleanup)."""
         await self._raft.consensus.destroy_job_raft(job_id)
         self._job_manager.delete_job(job_id)
-        self._modular_state._job_workflow_ids.pop(job_id, None)
-        self._modular_state._job_submissions.pop(job_id, None)
-        self._modular_state._progress_callbacks.pop(job_id, None)
+        self._modular_state.clear_job(job_id)
         self._job_leadership_tracker.release_leadership(job_id)
         await self._modular_state.increment_state_version()
 
@@ -4218,7 +4210,7 @@ class GateServer(HealthAwareServer):
         """Notify relevant managers that this gate is the new job leader."""
         manager_addrs: list[tuple[str, int]] = []
         seen_manager_addrs: set[tuple[str, int]] = set()
-        job_dc_managers = self._job_dc_managers.get(job_id, {})
+        job_dc_managers = self._modular_state.get_job_dc_managers(job_id)
 
         for manager_addr in job_dc_managers.values():
             if manager_addr in seen_manager_addrs:
@@ -4516,12 +4508,6 @@ class GateServer(HealthAwareServer):
         """Get job leaderships for SWIM piggyback."""
         return self._job_leadership_tracker.get_all_leaderships()
 
-    def _get_job_dc_managers_for_piggyback(
-        self,
-    ) -> dict[str, dict[str, tuple[str, int]]]:
-        """Get job DC managers for SWIM piggyback."""
-        return dict(self._job_dc_managers)
-
     def _count_active_datacenters(self) -> int:
         return self._health_coordinator.count_active_datacenters()
 
@@ -4703,10 +4689,7 @@ class GateServer(HealthAwareServer):
 
     def _get_progress_callback_for_job(self, job_id: str) -> tuple[str, int] | None:
         """Get the client callback address for a job."""
-        callback = self._progress_callbacks.get(job_id)
-        if callback is None:
-            callback = self._modular_state._progress_callbacks.get(job_id)
-        return callback
+        return self._modular_state._progress_callbacks.get(job_id)
 
     def _normalize_callback_addr(
         self,
@@ -4723,7 +4706,6 @@ class GateServer(HealthAwareServer):
         """Record a client callback in every gate-local callback store."""
         previous_callback = self._job_manager.get_callback(job_id)
         self._job_manager.set_callback(job_id, callback)
-        self._progress_callbacks[job_id] = callback
         self._modular_state._progress_callbacks[job_id] = callback
         if previous_callback != callback:
             self._increment_version()
@@ -4764,7 +4746,7 @@ class GateServer(HealthAwareServer):
         if manager_addr is not None:
             return manager_addr
 
-        return self._job_dc_managers.get(job_id, {}).get(datacenter)
+        return self._modular_state.get_job_dc_managers(job_id).get(datacenter)
 
     def _validate_manager_result_producer(
         self,
@@ -4867,10 +4849,6 @@ class GateServer(HealthAwareServer):
             return callback
 
         callback = self._job_manager.get_callback(job_id)
-        if callback is not None:
-            return callback
-
-        callback = self._progress_callbacks.get(job_id)
         if callback is not None:
             return callback
 
@@ -5268,7 +5246,6 @@ class GateServer(HealthAwareServer):
             self._job_leadership_tracker.to_snapshot()
         )
         progress_callbacks = dict(self._modular_state._progress_callbacks)
-        progress_callbacks.update(self._progress_callbacks)
         workflow_dc_results = {
             job_id: {
                 workflow_id: dict(dc_results)
@@ -5285,7 +5262,7 @@ class GateServer(HealthAwareServer):
             job_leaders=job_leaders,
             job_leader_addrs=job_leader_addrs,
             job_fencing_tokens=job_fencing_tokens,
-            job_dc_managers=dict(self._job_dc_managers),
+            job_dc_managers=self._modular_state.copy_job_dc_managers(),
             workflow_dc_results=workflow_dc_results,
             progress_callbacks=progress_callbacks,
         )
@@ -5314,6 +5291,17 @@ class GateServer(HealthAwareServer):
                     for dc_id, result in dc_results.items():
                         if dc_id not in workflow_entries:
                             workflow_entries[dc_id] = result
+
+        # The DC managers running each job route status queries and the
+        # takeover notices; a syncing gate keeps what it already knows.
+        for job_id, datacenter_managers in snapshot.job_dc_managers.items():
+            known_managers = self._modular_state.get_job_dc_managers(job_id)
+            for datacenter_id, manager_addr in datacenter_managers.items():
+                manager_addr_tuple = self._normalize_callback_addr(manager_addr)
+                if manager_addr_tuple is not None and datacenter_id not in known_managers:
+                    self._modular_state.set_job_dc_manager(
+                        job_id, datacenter_id, manager_addr_tuple
+                    )
 
         for job_id, callback_addr in snapshot.progress_callbacks.items():
             callback_tuple = self._normalize_callback_addr(callback_addr)
@@ -6411,10 +6399,7 @@ class GateServer(HealthAwareServer):
         they still run, and release the per-workflow results that were
         waiting on them so those are delivered from the datacenters that
         reported."""
-        manager_addresses = {
-            **self._modular_state.get_job_dc_managers(job_id),
-            **self._job_dc_managers.get(job_id, {}),
-        }
+        manager_addresses = dict(self._modular_state.get_job_dc_managers(job_id))
         await self._cancel_job_for_timeout(job_id, reason, datacenters, manager_addresses)
         for workflow_id in list(self._workflow_dc_results.get(job_id, {})):
             await self._aggregate_and_forward_workflow_result(job_id, workflow_id)
@@ -6609,7 +6594,7 @@ class GateServer(HealthAwareServer):
                 )
 
         job_dc_managers = (
-            self._job_dc_managers.get(request.job_id, {}) if request.job_id else {}
+            self._modular_state.get_job_dc_managers(request.job_id) if request.job_id else {}
         )
 
         query_tasks = []
@@ -6931,12 +6916,9 @@ class GateServer(HealthAwareServer):
                 self._job_final_statuses.pop(key, None)
         self._job_global_result_sent.discard(job_id)
         self._job_completion_claimed.discard(job_id)
-        self._job_workflow_ids.pop(job_id, None)
-        self._progress_callbacks.pop(job_id, None)
+        self._modular_state.clear_job(job_id)
         self._job_leadership_tracker.release_leadership(job_id)
-        self._job_dc_managers.pop(job_id, None)
         await self._best_effort_manager.cleanup(job_id)
-        self._job_submissions.pop(job_id, None)
 
         reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
         self._cancel_reporter_tasks(reporter_tasks)
