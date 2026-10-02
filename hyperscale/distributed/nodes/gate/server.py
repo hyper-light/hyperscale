@@ -7075,8 +7075,12 @@ class GateServer(HealthAwareServer):
                 ]
 
                 for peer_addr in peers_to_reap:
-                    self._modular_state.cleanup_peer_udp_tracking(peer_addr)
-                    self._modular_state.cleanup_peer_tcp_tracking(peer_addr)
+                    # Stop treating the peer as active and start its dead
+                    # clock. Its UDP mapping and last heartbeat stay: the
+                    # cleanup pass below needs them to resolve the peer's
+                    # gate id (known gates, versioned clock, hash ring,
+                    # discovery are keyed by it).
+                    await self._modular_state.remove_active_peer(peer_addr)
                     self._modular_state.mark_peer_dead(peer_addr, now)
 
                     self._task_runner.run(
