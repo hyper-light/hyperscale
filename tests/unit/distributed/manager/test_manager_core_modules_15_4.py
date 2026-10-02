@@ -4,7 +4,6 @@ Unit tests for Manager Core Modules from Section 15.4.6 of REFACTOR.md.
 Tests cover:
 - ManagerRegistry
 - ManagerLeaseCoordinator
-- ManagerWorkflowLifecycle
 - ManagerDispatchCoordinator
 - ManagerHealthMonitor
 - ManagerStatsCoordinator
@@ -30,9 +29,6 @@ from hyperscale.distributed.nodes.manager.config import ManagerConfig
 from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
 from hyperscale.distributed.reliability import StatsBuffer, StatsBufferConfig
 from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator
-from hyperscale.distributed.nodes.manager.workflow_lifecycle import (
-    ManagerWorkflowLifecycle,
-)
 from hyperscale.distributed.nodes.manager.dispatch import ManagerDispatchCoordinator
 from hyperscale.distributed.nodes.manager.health import (
     ManagerHealthMonitor,

@@ -14,7 +14,6 @@ from .state import ManagerState
 from .registry import ManagerRegistry
 from .cancellation import ManagerCancellationCoordinator
 from .leases import ManagerLeaseCoordinator
-from .workflow_lifecycle import ManagerWorkflowLifecycle
 from .dispatch import ManagerDispatchCoordinator
 from .sync import ManagerStateSync
 from .health import (
@@ -38,7 +37,6 @@ __all__ = [
     "ManagerRegistry",
     "ManagerCancellationCoordinator",
     "ManagerLeaseCoordinator",
-    "ManagerWorkflowLifecycle",
     "ManagerDispatchCoordinator",
     "ManagerStateSync",
     "ManagerHealthMonitor",

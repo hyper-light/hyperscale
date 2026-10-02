@@ -39,7 +39,6 @@ if TYPE_CHECKING:
         WorkflowProgressSnapshot,
     )
     from hyperscale.distributed.jobs.timeout_strategy import TimeoutStrategy
-    from hyperscale.distributed.workflow import WorkflowStateMachine
     from hyperscale.reporting.common.results_types import WorkflowStats
     from hyperscale.distributed.slo import LatencyObservation, SLOSummary
 
@@ -195,7 +194,6 @@ class ManagerState:
         self._workflow_cancellation_locks: dict[str, asyncio.Lock] = {}
 
         # Workflow lifecycle (AD-33)
-        self._workflow_lifecycle_states: "WorkflowStateMachine | None" = None
         self._workflow_completion_events: dict[str, asyncio.Event] = {}
 
         # Job tracking

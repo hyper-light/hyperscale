@@ -199,7 +199,6 @@ from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator
 from .discovery import ManagerDiscoveryCoordinator
 
-from .workflow_lifecycle import ManagerWorkflowLifecycle
 from .worker_dissemination import WorkerDisseminator
 from hyperscale.distributed.swim.gossip.worker_state_gossip_buffer import (
     WorkerStateGossipBuffer,
@@ -610,15 +609,6 @@ class ManagerServer(HealthAwareServer):
         )
 
         self._registry.set_worker_pool(self._worker_pool)
-
-        # Workflow lifecycle state machine (AD-33)
-        self._workflow_lifecycle = ManagerWorkflowLifecycle(
-            state=self._manager_state,
-            config=self._config,
-            logger=self._udp_logger,
-            node_id=self._node_id.short,
-            task_runner=self._task_runner,
-        )
 
         # Rate limiting (AD-24)
         # Health-gated (AD-24): limits tighten with the overload state the
