@@ -360,6 +360,10 @@ class DatacenterHealthManager:
         self._pending_transitions.clear()
         return transitions
 
+    def known_datacenters(self) -> frozenset[str]:
+        """Every datacenter this manager has heard of."""
+        return frozenset(self._known_datacenters)
+
     def get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
         """Get health classification for all known datacenters."""
         return {

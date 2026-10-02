@@ -525,28 +525,14 @@ class GateHealthCoordinator:
             last_update=tcp_status.last_update,
         )
 
-    def get_all_datacenter_health(
-        self,
-        datacenter_ids: list[str],
-        is_dc_ready_for_health: Callable[[str], bool],
-    ) -> dict[str, DatacenterStatus]:
-        """
-        Get health classification for all registered datacenters.
-
-        Only classifies DCs that have achieved READY or PARTIAL registration
-        status (AD-27).
-
-        Args:
-            datacenter_ids: List of datacenter IDs to classify
-            is_dc_ready_for_health: Callback to check if DC is ready for classification
-
-        Returns:
-            Dict mapping datacenter_id -> DatacenterStatus
-        """
+    def get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
+        """Every known datacenter's health, classified as
+        classify_datacenter_health does (TCP heartbeats merged with the
+        federated UDP probes) -- the one view routing, admission, ping and
+        the active-DC count share."""
         return {
-            dc_id: self.classify_datacenter_health(dc_id)
-            for dc_id in datacenter_ids
-            if is_dc_ready_for_health(dc_id)
+            datacenter_id: self.classify_datacenter_health(datacenter_id)
+            for datacenter_id in self._dc_health_manager.known_datacenters()
         }
 
     def get_best_manager_heartbeat(
@@ -594,40 +580,11 @@ class GateHealthCoordinator:
         return best_heartbeat, alive_count, len(manager_statuses)
 
     def count_active_datacenters(self) -> int:
-        count = 0
-        for (
-            datacenter_id,
-            status,
-        ) in self._dc_health_manager.get_all_datacenter_health().items():
-            if status.health != DatacenterHealth.UNHEALTHY.value:
-                count += 1
-        return count
-
-    def get_known_managers_for_piggyback(
-        self,
-    ) -> dict[str, tuple[str, int, str, int, str]]:
-        """
-        Get known managers for piggybacking in SWIM heartbeats.
-
-        Returns:
-            Dict mapping manager_id -> (tcp_host, tcp_port, udp_host, udp_port, datacenter)
-        """
-        result: dict[str, tuple[str, int, str, int, str]] = {}
-        for dc_id, manager_status in self._state._datacenter_manager_status.items():
-            for manager_addr, heartbeat in manager_status.items():
-                if heartbeat.node_id:
-                    tcp_host = heartbeat.tcp_host or manager_addr[0]
-                    tcp_port = heartbeat.tcp_port or manager_addr[1]
-                    udp_host = heartbeat.udp_host or manager_addr[0]
-                    udp_port = heartbeat.udp_port or manager_addr[1]
-                    result[heartbeat.node_id] = (
-                        tcp_host,
-                        tcp_port,
-                        udp_host,
-                        udp_port,
-                        dc_id,
-                    )
-        return result
+        return sum(
+            1
+            for status in self.get_all_datacenter_health().values()
+            if status.health != DatacenterHealth.UNHEALTHY.value
+        )
 
     def _handle_partition_healed(
         self,
