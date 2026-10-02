@@ -13,24 +13,128 @@ Driven through the coordinator's real dispatch with a real
 CircuitBreakerManager.
 """
 
+import asyncio
+import inspect
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.env import Env
+from hyperscale.distributed.nodes.gate.datacenter_manager_selector import DatacenterManagerSelector
+from hyperscale.distributed.swim.core import CircuitState
 from hyperscale.distributed.health.circuit_breaker_manager import CircuitBreakerManager
 from hyperscale.distributed.models import JobAck, JobSubmission
 from hyperscale.distributed.nodes.gate.dispatch_coordinator import GateDispatchCoordinator
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
-from tests.unit.distributed.gate.test_gate_dispatch_coordinator import (
-    MockGateJobManager,
-    MockLogger,
-    MockQuorumCircuit,
-    MockTaskRunner,
-    make_dispatch_time_tracker,
-    make_lease_manager,
-    make_manager_selector,
-)
+
+def make_manager_selector(state: GateRuntimeState) -> DatacenterManagerSelector:
+    """A real AD-28 selector reading the test's runtime state."""
+    return DatacenterManagerSelector(
+        create_discovery=lambda: DiscoveryService(
+            Env().get_discovery_config(
+                node_role="gate",
+                static_seeds=[],
+                allow_dynamic_registration=True,
+            )
+        ),
+        get_manager_heartbeats=state.get_datacenter_manager_statuses,
+    )
+
+
+@dataclass
+class MockLogger:
+    """Mock logger for testing."""
+
+    messages: list[str] = field(default_factory=list)
+
+    async def log(self, *args, **kwargs):
+        self.messages.append(str(args))
+
+
+@dataclass
+class MockTaskRunner:
+    """Mock task runner for testing."""
+
+    tasks: list = field(default_factory=list)
+
+    def run(self, coro, *args, **kwargs):
+        # Production TaskRunner.run accepts run-level kwargs (e.g. ``alias``)
+        # that are NOT forwarded to the coroutine, and returns a run handle
+        # exposing ``.token``.
+        if inspect.iscoroutinefunction(coro):
+            task = asyncio.create_task(coro(*args))
+            self.tasks.append(task)
+            return SimpleNamespace(token=f"token-{len(self.tasks)}", task=task)
+        return None
+
+    async def cancel(self, token: str):
+        return None
+
+
+@dataclass
+class MockGateJobManager:
+    """Mock gate job manager."""
+
+    jobs: dict = field(default_factory=dict)
+    target_dcs: dict = field(default_factory=dict)
+    callbacks: dict = field(default_factory=dict)
+    fence_tokens: dict = field(default_factory=dict)
+    job_count_val: int = 0
+
+    def set_job(self, job_id: str, job):
+        self.jobs[job_id] = job
+
+    def get_job(self, job_id: str):
+        return self.jobs.get(job_id)
+
+    def set_target_dcs(self, job_id: str, dcs: set[str]):
+        self.target_dcs[job_id] = dcs
+
+    def get_target_dcs(self, job_id: str) -> set[str]:
+        return self.target_dcs.get(job_id, set())
+
+    def set_callback(self, job_id: str, callback):
+        self.callbacks[job_id] = callback
+
+    def get_callback(self, job_id: str):
+        return self.callbacks.get(job_id)
+
+    def set_fence_token(self, job_id: str, token: int):
+        self.fence_tokens[job_id] = token
+
+    def get_fence_token(self, job_id: str) -> int:
+        return self.fence_tokens.get(job_id, 0)
+
+    def job_count(self) -> int:
+        return self.job_count_val
+
+
+@dataclass
+class MockQuorumCircuit:
+    """Mock quorum circuit breaker."""
+
+    circuit_state: CircuitState = CircuitState.CLOSED
+    half_open_after: float = 10.0
+    successes: int = 0
+
+    error_count: int = 0
+
+    def record_success(self):
+        self.successes += 1
+
+    def record_error(self):
+        self.error_count += 1
+
+
+def make_dispatch_time_tracker():
+    """Build a dispatch-time tracker mock with an async record_dispatch."""
+    tracker = MagicMock()
+    tracker.record_dispatch = AsyncMock(return_value=None)
+    return tracker
+
 
 MANAGER = ("10.0.0.5", 9000)
 DISPATCH_ROUNDS = 20
@@ -49,7 +153,6 @@ def make_coordinator(send_tcp: AsyncMock, breakers: CircuitBreakerManager) -> Ga
         job_timeout_tracker=MagicMock(),
         dispatch_time_tracker=make_dispatch_time_tracker(),
         circuit_breaker_manager=breakers,
-        job_lease_manager=make_lease_manager(),
         datacenter_managers={"dc-west": [MANAGER]},
         send_tcp=send_tcp,
         increment_version=lambda: None,
@@ -60,13 +163,8 @@ def make_coordinator(send_tcp: AsyncMock, breakers: CircuitBreakerManager) -> Ga
         get_node_port=lambda: 9000,
         get_node_id_short=lambda: "gate-a",
         job_manager=MockGateJobManager(),
-        check_rate_limit=AsyncMock(return_value=(True, 0.0)),
-        should_shed_request=lambda request_type: False,
-        has_quorum_available=lambda: True,
-        quorum_size=lambda: 1,
         quorum_circuit=MockQuorumCircuit(),
         select_datacenters=lambda count, datacenters, job_id: (["dc-west"], [], "healthy"),
-        assume_leadership=lambda job_id, count, initial_token=None: None,
         broadcast_leadership=AsyncMock(),
     )
 

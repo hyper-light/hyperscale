@@ -1,22 +1,18 @@
 """
 Gate job dispatch coordination module.
 
-Coordinates job submission and dispatch to datacenter managers.
+Dispatches an admitted job to its datacenters' managers (submission
+admission is GateJobHandler's).
 """
 
-import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
-import cloudpickle
-
-from hyperscale.distributed.leases import JobLeaseManager
 from hyperscale.distributed.models import (
     JobSubmission,
     JobAck,
     JobStatus,
     JobStatusPush,
-    GlobalJobStatus,
 )
 from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
@@ -29,12 +25,6 @@ from hyperscale.distributed.nodes.gate.models import TransientDispatchError
 from hyperscale.distributed.protocol.transient_errors import (
     is_transient_rejection,
 )
-from hyperscale.distributed.protocol.version import (
-    ProtocolVersion,
-    CURRENT_PROTOCOL_VERSION,
-    get_features_for_version,
-)
-from hyperscale.distributed.swim.core import CircuitState
 from hyperscale.distributed.reliability import (
     RetryExecutor,
     RetryConfig,
@@ -84,15 +74,9 @@ class GateDispatchCoordinator:
         job_timeout_tracker: "GateJobTimeoutTracker",
         dispatch_time_tracker: "DispatchTimeTracker",
         circuit_breaker_manager: "CircuitBreakerManager",
-        job_lease_manager: JobLeaseManager,
         datacenter_managers: dict[str, list[tuple[str, int]]],
-        check_rate_limit: Callable,
-        should_shed_request: Callable,
-        has_quorum_available: Callable,
-        quorum_size: Callable,
         quorum_circuit: "ErrorStats",
         select_datacenters: Callable,
-        assume_leadership: Callable,
         broadcast_leadership: Callable[
             [str, int, tuple[str, int] | None], Awaitable[None]
         ],
@@ -140,17 +124,11 @@ class GateDispatchCoordinator:
         self._persist_accepted_job = persist_accepted_job
         self._dispatch_time_tracker: "DispatchTimeTracker" = dispatch_time_tracker
         self._circuit_breaker_manager: "CircuitBreakerManager" = circuit_breaker_manager
-        self._job_lease_manager: JobLeaseManager = job_lease_manager
         self._datacenter_managers: dict[str, list[tuple[str, int]]] = (
             datacenter_managers
         )
-        self._check_rate_limit: Callable = check_rate_limit
-        self._should_shed_request: Callable = should_shed_request
-        self._has_quorum_available: Callable = has_quorum_available
-        self._quorum_size: Callable = quorum_size
         self._quorum_circuit: "ErrorStats" = quorum_circuit
         self._select_datacenters: Callable = select_datacenters
-        self._assume_leadership: Callable = assume_leadership
         self._broadcast_leadership: Callable[
             [str, int, tuple[str, int] | None], Awaitable[None]
         ] = broadcast_leadership
@@ -191,44 +169,6 @@ class GateDispatchCoordinator:
             return default_rtt_ms
 
         return observed_ms
-
-    def _is_terminal_status(self, status: str) -> bool:
-        return status in (
-            JobStatus.COMPLETED.value,
-            JobStatus.FAILED.value,
-            JobStatus.CANCELLED.value,
-            JobStatus.TIMEOUT.value,
-        )
-
-    def _pop_lease_renewal_token(self, job_id: str) -> str | None:
-        return self._state._job_lease_renewal_tokens.pop(job_id, None)
-
-    async def _cancel_lease_renewal(self, job_id: str) -> None:
-        token = self._pop_lease_renewal_token(job_id)
-        if not token:
-            return
-        try:
-            await self._task_runner.cancel(token)
-        except Exception as error:
-            await self._logger.log(
-                ServerWarning(
-                    message=f"Failed to cancel lease renewal for job {job_id}: {error}",
-                    node_host=self._get_node_host(),
-                    node_port=self._get_node_port(),
-                    node_id=self._get_node_id_short(),
-                )
-            )
-
-    async def _release_job_lease(
-        self,
-        job_id: str,
-        cancel_renewal: bool = True,
-    ) -> None:
-        if cancel_renewal:
-            await self._cancel_lease_renewal(job_id)
-        else:
-            self._pop_lease_renewal_token(job_id)
-        await self._job_lease_manager.release(job_id)
 
     async def _push_job_status_to_client(
         self,
@@ -297,299 +237,6 @@ class GateDispatchCoordinator:
                     node_port=self._get_node_port(),
                     node_id=self._get_node_id_short(),
                 )
-            )
-
-    async def _renew_job_lease(self, job_id: str, lease_duration: float) -> None:
-        renewal_interval = max(1.0, lease_duration * 0.5)
-
-        try:
-            while True:
-                await _DEFAULT_CLOCK.sleep(renewal_interval)
-                job = self._job_manager.get_job(job_id)
-                if job is None or self._is_terminal_status(job.status):
-                    await self._release_job_lease(job_id, cancel_renewal=False)
-                    return
-
-                lease_renewed = await self._job_lease_manager.renew(
-                    job_id, lease_duration
-                )
-                if not lease_renewed:
-                    await self._logger.log(
-                        ServerError(
-                            message=f"Failed to renew lease for job {job_id}: lease lost",
-                            node_host=self._get_node_host(),
-                            node_port=self._get_node_port(),
-                            node_id=self._get_node_id_short(),
-                        )
-                    )
-                    await self._release_job_lease(job_id, cancel_renewal=False)
-                    return
-        except asyncio.CancelledError:
-            self._pop_lease_renewal_token(job_id)
-            return
-
-    async def _check_rate_and_load(
-        self,
-        client_id: str,
-        job_id: str,
-    ) -> JobAck | None:
-        """Check rate limit and load shedding. Returns rejection JobAck if rejected."""
-        allowed, retry_after = await self._check_rate_limit(client_id, "job_submit")
-        if not allowed:
-            return JobAck(
-                job_id=job_id,
-                accepted=False,
-                error=f"Rate limited, retry after {retry_after}s",
-            )
-
-        if self._should_shed_request("JobSubmission"):
-            return JobAck(
-                job_id=job_id,
-                accepted=False,
-                error="System under load, please retry later",
-            )
-        return None
-
-    def _check_protocol_version(
-        self,
-        submission: JobSubmission,
-    ) -> tuple[JobAck | None, str]:
-        """Check protocol compatibility. Returns (rejection_ack, negotiated_caps)."""
-        client_version = ProtocolVersion(
-            major=getattr(submission, "protocol_version_major", 1),
-            minor=getattr(submission, "protocol_version_minor", 0),
-        )
-
-        if client_version.major != CURRENT_PROTOCOL_VERSION.major:
-            return (
-                JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=f"Incompatible protocol version: {client_version}",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ),
-                "",
-            )
-
-        client_caps = getattr(submission, "capabilities", "")
-        client_features = set(client_caps.split(",")) if client_caps else set()
-        our_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
-        negotiated = ",".join(sorted(client_features & our_features))
-        return (None, negotiated)
-
-    def _check_circuit_and_quorum(self, job_id: str) -> JobAck | None:
-        """Check circuit breaker and quorum. Returns rejection JobAck if unavailable."""
-        if self._quorum_circuit.circuit_state == CircuitState.OPEN:
-            retry_after = self._quorum_circuit.half_open_after
-            return JobAck(
-                job_id=job_id,
-                accepted=False,
-                error=f"Circuit open, retry after {retry_after}s",
-            )
-
-        if self._state.get_active_peer_count() > 0 and not self._has_quorum_available():
-            return JobAck(job_id=job_id, accepted=False, error="Quorum unavailable")
-        return None
-
-    def _setup_job_tracking(
-        self,
-        submission: JobSubmission,
-        primary_dcs: list[str],
-        fence_token: int,
-    ) -> None:
-        """Initialize job tracking state for a new submission."""
-        job = GlobalJobStatus(
-            job_id=submission.job_id,
-            status=JobStatus.SUBMITTED.value,
-            datacenters=[],
-            timestamp=_DEFAULT_CLOCK.monotonic(),
-            fence_token=fence_token,
-        )
-        self._job_manager.set_job(submission.job_id, job)
-        self._job_manager.set_target_dcs(submission.job_id, set(primary_dcs))
-        self._job_manager.set_fence_token(submission.job_id, fence_token)
-
-        try:
-            workflows = cloudpickle.loads(submission.workflows)
-            self._state._job_workflow_ids[submission.job_id] = {
-                wf_id for wf_id, _, _ in workflows
-            }
-        except Exception as workflow_parse_error:
-            self._state._job_workflow_ids[submission.job_id] = set()
-            self._task_runner.run(
-                self._logger.log,
-                ServerWarning(
-                    message=f"Failed to parse workflows for job {submission.job_id}: {workflow_parse_error}",
-                    node_host="",
-                    node_port=0,
-                    node_id="",
-                ),
-            )
-
-        if submission.callback_addr:
-            self._job_manager.set_callback(submission.job_id, submission.callback_addr)
-            self._state._progress_callbacks[submission.job_id] = (
-                submission.callback_addr
-            )
-
-        if submission.reporting_configs:
-            self._state._job_submissions[submission.job_id] = submission
-
-    async def submit_job(
-        self,
-        addr: tuple[str, int],
-        submission: JobSubmission,
-    ) -> JobAck:
-        """
-        Process job submission from client.
-
-        Args:
-            addr: Client address
-            submission: Job submission message
-
-        Returns:
-            JobAck with acceptance status
-        """
-        client_id = f"{addr[0]}:{addr[1]}"
-        negotiated_caps = ""
-        lease_acquired = False
-        lease_duration = 0.0
-        fence_token = 0
-
-        try:
-            # Validate rate limit and load (AD-22, AD-24)
-            if rejection := await self._check_rate_and_load(
-                client_id, submission.job_id
-            ):
-                return rejection
-
-            # Validate protocol version (AD-25)
-            rejection, negotiated_caps = self._check_protocol_version(submission)
-            if rejection:
-                return rejection
-
-            lease_result = await self._job_lease_manager.acquire(submission.job_id)
-            if not lease_result.success:
-                current_owner = lease_result.current_owner or "unknown"
-                error_message = (
-                    f"Job lease held by {current_owner} "
-                    f"(expires in {lease_result.expires_in:.1f}s)"
-                )
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=error_message,
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                    capabilities=negotiated_caps,
-                )
-
-            lease = lease_result.lease
-            if lease is None:
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error="Lease acquisition did not return a lease",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                    capabilities=negotiated_caps,
-                )
-
-            lease_acquired = True
-            lease_duration = lease.lease_duration
-            fence_token = lease.fence_token
-
-            # Check circuit breaker and quorum
-            if rejection := self._check_circuit_and_quorum(submission.job_id):
-                await self._release_job_lease(submission.job_id)
-                return rejection
-
-            # Select datacenters (AD-36)
-            primary_dcs, _, worst_health = self._select_datacenters(
-                submission.datacenter_count,
-                submission.datacenters if submission.datacenters else None,
-                job_id=submission.job_id,
-            )
-
-            if worst_health == "initializing":
-                await self._release_job_lease(submission.job_id)
-                return JobAck(
-                    job_id=submission.job_id, accepted=False, error="initializing"
-                )
-            if not primary_dcs:
-                await self._release_job_lease(submission.job_id)
-                # A dc-pinned submission fails LOUDLY when its placement
-                # constraint is unsatisfiable — never silently runs in a
-                # datacenter the client excluded.
-                if submission.datacenters:
-                    constraint_error = (
-                        "No available datacenters among requested placement "
-                        f"constraint {sorted(submission.datacenters)}"
-                    )
-                else:
-                    constraint_error = "No available datacenters"
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=constraint_error,
-                )
-
-            # Setup job tracking
-            self._setup_job_tracking(submission, primary_dcs, fence_token)
-
-            # Assume and broadcast leadership
-            self._assume_leadership(
-                submission.job_id,
-                len(primary_dcs),
-                initial_token=fence_token,
-            )
-            await self._broadcast_leadership(
-                submission.job_id,
-                len(primary_dcs),
-                submission.callback_addr,
-            )
-            self._quorum_circuit.record_success()
-
-            # Dispatch in background
-            self._task_runner.run(self.dispatch_job, submission, primary_dcs)
-
-            if submission.job_id not in self._state._job_lease_renewal_tokens:
-                run = self._task_runner.run(
-                    self._renew_job_lease,
-                    submission.job_id,
-                    lease_duration,
-                    alias=f"job-lease-renewal-{submission.job_id}",
-                )
-                if run:
-                    self._state._job_lease_renewal_tokens[submission.job_id] = run.token
-
-            return JobAck(
-                job_id=submission.job_id,
-                accepted=True,
-                queued_position=self._job_manager.job_count(),
-                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                capabilities=negotiated_caps,
-            )
-        except Exception as error:
-            if lease_acquired:
-                await self._release_job_lease(submission.job_id)
-            await self._logger.log(
-                ServerError(
-                    message=f"Job submission error: {error}",
-                    node_host=self._get_node_host(),
-                    node_port=self._get_node_port(),
-                    node_id=self._get_node_id_short(),
-                )
-            )
-            return JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error=str(error),
-                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                capabilities=negotiated_caps,
             )
 
     async def dispatch_job(
