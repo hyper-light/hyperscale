@@ -6904,6 +6904,17 @@ class ManagerServer(HealthAwareServer):
             ),
         )
 
+    def _is_known_terminal_job(self, job_id: str) -> bool:
+        """Whether this manager knows ``job_id`` ended: its tracked job is
+        terminal, or (after the tracked job's retention cleanup) the
+        ledger records it terminal."""
+        if (job := self._job_manager.get_job(job_id)) is not None:
+            return JobStatusOrder().is_terminal(job.status)
+        if self._job_ledger is not None:
+            ledger_job = self._job_ledger.get_job(job_id)
+            return ledger_job is not None and ledger_job.is_terminal
+        return False
+
     def _workflow_final_result_ack(
         self,
         *,
@@ -6989,6 +7000,17 @@ class ManagerServer(HealthAwareServer):
     ) -> bytes:
         try:
             result = WorkflowFinalResult.load(data)
+            # A result for a job that already ended cannot change it --
+            # whichever manager leads it, and after its lease is gone.
+            # Ack it stale so the worker drops it instead of retrying
+            # it against a job nobody leads any more.
+            if self._is_known_terminal_job(result.job_id):
+                return self._workflow_final_result_ack(
+                    accepted=True,
+                    stale=True,
+                    leader_addr=(self._host, self._tcp_port),
+                    reason="job_terminal",
+                )
             is_leader = self._leases.is_job_leader(result.job_id)
 
             if not is_leader:
