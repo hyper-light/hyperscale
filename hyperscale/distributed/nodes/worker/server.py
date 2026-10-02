@@ -1572,31 +1572,6 @@ class WorkerServer(HealthAwareServer):
         """
         self._probe_scheduler.add_member(peer_udp_addr)
 
-    def _invalidate_tcp_client_transport(
-        self, manager_addr: tuple[str, int]
-    ) -> None:
-        """Drop any cached TCP client transport to ``manager_addr``.
-
-        The base server caches one ``asyncio.Transport`` per remote
-        address and reuses it across ``send_tcp`` calls; reuse is
-        keyed on ``is_closing()``, which only returns True once the
-        loop has observed ``connection_lost``. In the kill+restart
-        case at the same address, asyncio on the surviving worker
-        has no way to observe that the original listener died — the
-        peer's accepted protocol just stops responding. Dropping the
-        cached transport here forces the next ``_connect_tcp_client``
-        to open a fresh socket against whoever is listening on the
-        port at that moment, which is the only way the worker can
-        recover after the cluster reforms.
-        """
-        cached = self._tcp_client_transports.pop(manager_addr, None)
-        if cached is None:
-            return
-        try:
-            cached.abort()
-        except Exception:
-            pass
-
     def _on_registry_healthy_changed(self) -> None:
         """Signal handler for ``WorkerRegistry._on_healthy_set_changed``.
 

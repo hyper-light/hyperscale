@@ -6124,11 +6124,42 @@ class ManagerServer(HealthAwareServer):
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
+            # A different node id at this worker's address is a previous
+            # incarnation of the process now registering (a node id embeds
+            # its process start time, so a restart always registers anew).
+            # SWIM never declares it dead -- the new process answers its
+            # probes -- so the work it held must be recovered here.
+            superseded_worker_ids = {
+                worker_id
+                for address in (
+                    (registration.node.host, registration.node.port),
+                    worker_udp_addr,
+                )
+                if (worker_id := self._manager_state.get_worker_id_from_addr(address))
+                is not None
+                and worker_id != registration.node.node_id
+            }
+
             # Register worker
             self._registry.register_worker(registration)
 
             # Add to worker pool
             await self._worker_pool.register_worker(registration)
+
+            # Recover each superseded incarnation as a dead worker: its pool
+            # entry goes and its unfinished workflows are reassigned. The
+            # registry already dropped it, so no eviction notice is owed to
+            # the address the new process now holds, and the new worker is
+            # counted, so this never fails the cluster's work as workerless.
+            if superseded_worker_ids:
+                # The cached transport to this address belongs to the dead
+                # incarnation; the reassigned work must not wait out a send
+                # timeout on it.
+                self._invalidate_tcp_client_transport(
+                    (registration.node.host, registration.node.port)
+                )
+            for superseded_worker_id in sorted(superseded_worker_ids):
+                await self._handle_worker_failure(superseded_worker_id)
 
             # Add to SWIM
             if is_same_worker_registration and not needs_fresh_liveness:

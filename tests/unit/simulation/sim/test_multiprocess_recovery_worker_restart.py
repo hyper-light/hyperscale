@@ -25,15 +25,20 @@ Probed timelines (seed 101):
 * IN-FLIGHT scenario (restart at 9.5, down 20): dispatch 9.25, the
   gen-1 worker dies with the workflow ACTIVE (its generation log ends
   ``workflows-active 1`` — restarts, unlike kills, preserve the
-  victim's milestones). The silence window [9.5, ~29.6] stays under
-  the ~38s SWIM detection bound and the SAME-NodeId gen-2 re-registers
-  at ~29.6-33.2, so the death-triggered retry path NEVER fires; the
-  orphan scan (30s cadence) loses the race to the unified-timeout tick
-  (30s cadence: 30.03, 60.03), which declares the job ``timeout`` at
-  60.03 — the first tick past the deadline. The rebooted worker never
-  executes (zero activations in gen-2's log) — pinned as TRUE current
-  behavior: when an in-flight-reassignment path lands, the
-  no-execution assertion is the one it flips.
+  victim's milestones). Gen-2 re-registers at 33.13 under a NEW node
+  id (a node id embeds its process start time) at the SAME address,
+  inside the ~38s SWIM detection bound -- SWIM never declares gen-1
+  dead, because gen-2 answers its probes. The manager recognizes the
+  different id at the address as gen-1's successor: it recovers gen-1
+  as a dead worker (pool entry dropped, unfinished workflow
+  reassigned) and drops the cached transport to the address, so the
+  reassigned workflow dispatches to gen-2 at once (33.16) and the
+  client observes ``completed`` at 33.743419 -- inside the job's
+  budget. (Before the in-flight reassignment landed, the stale id kept
+  the workflow forever and the job timed out at 60.03; with the
+  reassignment but without the transport drop, the first re-dispatch
+  rode gen-1's dead socket for a full send timeout and completion
+  slipped to 43.74.)
 
 FIXED BUG (scenario 3 below pins the fix): submitting a job ~8s AFTER
 the rebooted worker re-registered used to drive the MANAGER's
@@ -75,12 +80,9 @@ _FRESH_CEILING = 90.0
 _INFLIGHT_RESTART_AT = 9.5
 _INFLIGHT_DOWN_SECONDS = 20.0
 _INFLIGHT_CEILING = 90.0
-# The job-level timeout (submit ~9.213 + 30s) is declared by the
-# unified-timeout loop's 30s-cadence tick: earliest the deadline
-# itself, latest one full tick later (measured: 60.03).
+# The job's budget (submit ~9.213 + 30s): the in-flight recovery must
+# complete the job inside it rather than surface as a timeout.
 _JOB_TIMEOUT_SECONDS = 30.0
-_TIMEOUT_TICK_SECONDS = 30.0
-_TERMINAL_SLACK_SECONDS = 1.5
 
 
 def _run_worker_restart(
@@ -251,19 +253,11 @@ def _run_worker_restart_mid_workflow() -> dict:
     )
 
 
-def test_inflight_job_reaches_loud_timeout_across_worker_restart():
-    """TRUE current behavior, pinned: a job in flight when its worker
-    host power-cycles ends in a LOUD client-observed ``timeout`` — not
-    a retry onto the rebooted worker.
-
-    Mechanism (traced): the sub-detection silence window plus the
-    same-NodeId re-registration means SWIM never declares the worker
-    dead, so the death-triggered requeue never fires; the 30s-cadence
-    orphan scan loses the race to the 30s-cadence unified-timeout tick,
-    which declares the job at the first tick past its deadline
-    (submit 9.213 + 30s -> declared 60.03). When an in-flight
-    reassignment path lands, the no-execution assertion below is the
-    one it flips."""
+def test_inflight_job_completes_on_the_rebooted_worker():
+    """A job in flight when its worker host power-cycles completes on the
+    rebooted worker, inside the job's own budget: the manager recovers
+    the dead incarnation's in-flight workflow when its successor
+    registers at the same address, and re-dispatches it there."""
     results = _run_worker_restart_mid_workflow()
     client_log = results["client"]
 
@@ -284,24 +278,27 @@ def test_inflight_job_reaches_loud_timeout_across_worker_restart():
         generation_one_log,
     )
 
-    # Loud terminal inside the unified-timeout design bound.
-    (_tag, final_status, finished_time) = _finished(client_log)
-    assert final_status == "timeout", client_log
-    earliest = submitted_time + _JOB_TIMEOUT_SECONDS
-    latest = earliest + _TIMEOUT_TICK_SECONDS + _TERMINAL_SLACK_SECONDS
-    assert earliest <= finished_time <= latest, (
-        f"in-flight terminal at {finished_time} outside the "
-        f"unified-timeout design bound [{earliest}, {latest}] "
-        f"(measured 60.03): {client_log}"
-    )
-
-    # The rebooted worker re-attached (its registry observed a healthy
-    # manager) but never executed — no silent half-retry.
+    # The rebooted worker re-attached and ran the reassigned workflow
+    # exactly once.
     generation_two_log = results["worker"]
     assert any(
         entry[0] == "manager-healthy" for entry in generation_two_log
     ), generation_two_log
-    assert not _activation_times(generation_two_log), generation_two_log
+    generation_two_activations = _activation_times(generation_two_log)
+    assert len(generation_two_activations) == 1, generation_two_log
+    reboot_time = _INFLIGHT_RESTART_AT + _INFLIGHT_DOWN_SECONDS
+    assert generation_two_activations[0] > reboot_time, generation_two_log
+
+    # Exactly one loud ``completed``, after the reboot and before the
+    # job's deadline -- the recovery fits the job's budget instead of
+    # surfacing as a timeout.
+    (_tag, final_status, finished_time) = _finished(client_log)
+    assert final_status == "completed", client_log
+    deadline = submitted_time + _JOB_TIMEOUT_SECONDS
+    assert reboot_time < finished_time < deadline, (
+        f"in-flight completion at {finished_time} outside "
+        f"({reboot_time}, {deadline}) (measured 33.743419): {client_log}"
+    )
 
     _assert_oracle_clean(client_log)
     _assert_no_unswapped_imports(results)

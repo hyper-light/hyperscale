@@ -982,6 +982,21 @@ class MercurySyncBaseServer(Generic[T]):
 
         return ssl_ctx
 
+    def _invalidate_tcp_client_transport(self, address: tuple[str, int]) -> None:
+        """Drop the cached TCP client transport to ``address``.
+
+        ``send_tcp`` reuses one cached transport per remote address while
+        it is not ``is_closing()``, which only turns True once the loop
+        has observed ``connection_lost``. When the process at an address
+        dies and a new one starts there, nothing observes the old
+        listener's death -- the cached transport just stops being
+        answered, and the next send waits out its full timeout on it.
+        Callers that learn the process at an address was replaced drop
+        the transport here so the next send dials whoever listens now.
+        """
+        if (cached := self._tcp_client_transports.pop(address, None)) is not None:
+            cached.abort()
+
     async def send_tcp(
         self,
         address: tuple[str, int],
