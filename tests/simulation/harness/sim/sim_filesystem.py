@@ -439,15 +439,18 @@ class SimFilesystem:
         # failing device still made the caller wait), then the device
         # can fail with EIO (before any budget accounting — a failed
         # write never reached the platter), then the byte budget.
+        await self._charge_latency_and_device_faults()
+        if write_bytes > 0 and self._disk_full_remaining is not None:
+            if write_bytes > self._disk_full_remaining:
+                raise OSError(28, "No space left on device")
+            self._disk_full_remaining -= write_bytes
+
+    async def _charge_latency_and_device_faults(self) -> None:
         if self._slow_disk_delay > 0.0:
             await self._clock.sleep(self._slow_disk_delay)
         if self._io_error_random is not None and self._io_error_window_active():
             if self._io_error_random.random() < self._io_error_probability:
                 raise OSError(5, "Input/output error")
-        if write_bytes > 0 and self._disk_full_remaining is not None:
-            if write_bytes > self._disk_full_remaining:
-                raise OSError(28, "No space left on device")
-            self._disk_full_remaining -= write_bytes
 
     def _io_error_window_active(self) -> bool:
         """Whether virtual time is inside the armed EIO window.
@@ -582,7 +585,14 @@ class SimFilesystem:
         return None
 
     async def append_fsync(self, path: str | Path, data: bytes) -> None:
-        await self._charge_operation(write_bytes=len(data))
+        await self._charge_latency_and_device_faults()
+        # A full device takes what fits and THEN fails, like a real
+        # short write followed by ENOSPC: the written prefix sits in the
+        # page cache (visible, never fsynced -- power loss drops it).
+        fitting_bytes = len(data)
+        if self._disk_full_remaining is not None:
+            fitting_bytes = min(fitting_bytes, self._disk_full_remaining)
+            self._disk_full_remaining -= fitting_bytes
         key = str(path)
         # Misdirected IO (armed via ``set_misdirect``): the append —
         # bytes AND durability barrier — lands on a seeded sibling; the
@@ -596,8 +606,20 @@ class SimFilesystem:
             state = _SimFileState()
             self._files[key] = state
             self._register_parents(Path(key))
+        if fitting_bytes < len(data):
+            state.volatile_segments.append(bytes(data[:fitting_bytes]))
+            raise OSError(28, "No space left on device")
         state.volatile_segments.append(bytes(data))
         state.promote_volatile()
+
+    async def truncate(self, path: str | Path, length: int) -> None:
+        await self._charge_latency_and_device_faults()
+        key = str(path)
+        state = self._files.get(key)
+        if state is None:
+            raise FileNotFoundError(2, "No such file or directory", key)
+        state.durable_content = state.visible_content[:length]
+        state.volatile_segments.clear()
 
     async def atomic_write(self, path: str | Path, data: bytes) -> None:
         await self._charge_operation(write_bytes=len(data))

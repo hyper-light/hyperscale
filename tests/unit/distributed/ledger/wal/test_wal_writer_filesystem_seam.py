@@ -22,19 +22,46 @@ from hyperscale.distributed.ledger.wal.wal_writer import (
 
 
 class RecordingFilesystem:
-    """Captures append_fsync calls; optionally fails them."""
+    """Captures append_fsync calls over an in-memory file; can be told
+    to fail appends (after writing a partial prefix, like a short write
+    followed by ENOSPC) or to fail the rollback truncate."""
 
-    def __init__(self, fail_with: Exception | None = None) -> None:
+    def __init__(
+        self,
+        fail_with: OSError | None = None,
+        partial_bytes_before_failure: int = 0,
+        fail_truncate_with: OSError | None = None,
+    ) -> None:
         self.append_calls: list[tuple[Path, bytes]] = []
-        self._fail_with = fail_with
+        self.truncate_calls: list[int] = []
+        self.content = b""
+        self.created = False
+        self.fail_with = fail_with
+        self._partial_bytes_before_failure = partial_bytes_before_failure
+        self._fail_truncate_with = fail_truncate_with
 
     async def mkdir(self, path, *, parents=False, exist_ok=False) -> None:
         return None
 
+    async def exists(self, path) -> bool:
+        return self.created
+
+    async def file_size(self, path) -> int:
+        return len(self.content)
+
     async def append_fsync(self, path, data: bytes) -> None:
-        if self._fail_with is not None:
-            raise self._fail_with
+        self.created = True
+        if self.fail_with is not None:
+            self.content += bytes(data[: self._partial_bytes_before_failure])
+            raise self.fail_with
         self.append_calls.append((Path(path), bytes(data)))
+        self.content += bytes(data)
+
+    async def truncate(self, path, length: int) -> None:
+        self.truncate_calls.append(length)
+        if self._fail_truncate_with is not None:
+            raise self._fail_truncate_with
+        self.content = self.content[:length]
 
 
 async def _submit_and_wait(writer: WALWriter, payload: bytes) -> None:
@@ -96,23 +123,60 @@ async def test_group_commit_is_one_durable_unit(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_filesystem_failure_propagates_to_submitters(tmp_path):
-    """A storage fault (the disk_full shape: OSError from the seam)
-    must fail every submitter's future loudly — never a silent drop."""
-    failing = RecordingFilesystem(fail_with=OSError(28, "No space left on device"))
+async def test_a_storage_fault_fails_its_batch_rolls_back_and_the_writer_recovers(tmp_path):
+    """A storage fault (the disk_full shape: OSError from the seam after
+    a short write) fails that batch's submitters loudly, cuts the torn
+    prefix back to the last committed record, and leaves the writer
+    serving: once the fault clears, the next write commits."""
+    filesystem = RecordingFilesystem()
     writer = WALWriter(
         path=tmp_path / "full.wal",
         config=WALWriterConfig(batch_timeout_microseconds=100),
-        filesystem=failing,
+        filesystem=filesystem,
     )
     await writer.start()
     try:
-        future: asyncio.Future[None] = (
-            asyncio.get_running_loop().create_future()
-        )
-        writer.submit(WriteRequest(data=b"doomed", future=future))
+        await _submit_and_wait(writer, b"committed|")
+
+        filesystem.fail_with = OSError(28, "No space left on device")
+        filesystem._partial_bytes_before_failure = 3
         with pytest.raises(OSError):
-            await asyncio.wait_for(future, timeout=5.0)
+            await _submit_and_wait(writer, b"doomed|")
+        assert filesystem.content == b"committed|", "the torn prefix was cut back"
+        assert filesystem.truncate_calls == [len(b"committed|")]
+        assert not writer.has_error
+        assert writer.storage_failure is not None
+        assert writer.storage_failure.errno == 28
+
+        filesystem.fail_with = None
+        await _submit_and_wait(writer, b"after|")
+        assert filesystem.content == b"committed|after|"
+        assert writer.storage_failure is None
+    finally:
+        await writer.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rollback_latches_the_writer(tmp_path):
+    """If the torn tail cannot be cut, the log is unusable: the writer
+    latches and every later submit fails."""
+    filesystem = RecordingFilesystem(
+        fail_with=OSError(28, "No space left on device"),
+        partial_bytes_before_failure=2,
+        fail_truncate_with=OSError(5, "Input/output error"),
+    )
+    writer = WALWriter(
+        path=tmp_path / "broken.wal",
+        config=WALWriterConfig(batch_timeout_microseconds=100),
+        filesystem=filesystem,
+    )
+    await writer.start()
+    try:
+        with pytest.raises(OSError):
+            await _submit_and_wait(writer, b"doomed|")
+        await asyncio.sleep(0)
         assert writer.has_error
+        with pytest.raises(OSError):
+            await _submit_and_wait(writer, b"after|")
     finally:
         await writer.stop()

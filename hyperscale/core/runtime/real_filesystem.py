@@ -154,6 +154,9 @@ class RealFilesystem:
     async def append_fsync(self, path: str | Path, data: bytes) -> None:
         await self._run(self._append_fsync_sync, path, data)
 
+    async def truncate(self, path: str | Path, length: int) -> None:
+        await self._run(self._truncate_sync, path, length)
+
     async def atomic_write(self, path: str | Path, data: bytes) -> None:
         await self._run(self._atomic_write_sync, path, data)
 
@@ -244,6 +247,15 @@ class RealFilesystem:
                 if written == 0:
                     raise OSError(errno.EIO, "append made no progress", str(path))
                 remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _truncate_sync(path: str | Path, length: int) -> None:
+        descriptor = os.open(path, os.O_WRONLY)
+        try:
+            os.ftruncate(descriptor, length)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)

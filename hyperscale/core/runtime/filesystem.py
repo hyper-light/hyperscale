@@ -136,6 +136,13 @@ class Filesystem(Protocol):
 
     async def append_fsync(self, path: str | Path, data: bytes) -> None: ...
 
+    async def truncate(self, path: str | Path, length: int) -> None:
+        """Shrink ``path`` to its first ``length`` bytes, durably (the
+        shrink is fsynced before returning). Allocates nothing, so it
+        works when the device is full -- the way a log drops a torn tail
+        a failed append left behind."""
+        ...
+
     async def atomic_write(self, path: str | Path, data: bytes) -> None: ...
 
     async def read_bytes(self, path: str | Path) -> bytes: ...

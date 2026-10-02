@@ -110,8 +110,15 @@ async def test_disk_full_budget_raises_enospc():
         await filesystem.append_fsync("/data/a.bin", b"6789012345")  # > 5 left
     assert exception_info.value.errno == 28
 
-    # The failed write consumed nothing; the remaining budget still fits.
-    await filesystem.append_fsync("/data/a.bin", b"67890")
+    # Like a real short write before ENOSPC, the bytes that fit landed
+    # (visible, never fsynced) and the budget is spent.
+    assert await filesystem.read_bytes("/data/a.bin") == b"1234567890"
+    with pytest.raises(OSError):
+        await filesystem.append_fsync("/data/a.bin", b"x")
+
+    # Truncation cuts the torn tail without allocating.
+    await filesystem.truncate("/data/a.bin", 5)
+    assert await filesystem.read_bytes("/data/a.bin") == b"12345"
 
     filesystem.clear_disk_full()
     await filesystem.append_fsync("/data/a.bin", b"unbounded again")

@@ -125,6 +125,9 @@ class WALWriter:
         "_state_change_task",
         "_logger",
         "_filesystem",
+        "_committed_length",
+        "_storage_failure",
+        "_storage_failed_at",
     )
 
     def __init__(
@@ -166,6 +169,14 @@ class WALWriter:
         self._state_change_callback = state_change_callback
         self._pending_state_change: tuple[QueueState, BackpressureSignal] | None = None
         self._state_change_task: asyncio.Task[None] | None = None
+        # Bytes durably committed to the log file. A failed append can
+        # leave a torn partial record past this point; it is cut back
+        # here before the writer continues.
+        self._committed_length = 0
+        # The most recent storage failure a group commit hit (cleared by
+        # the next successful commit) and when it began.
+        self._storage_failure: OSError | None = None
+        self._storage_failed_at: float | None = None
 
     def _create_background_task(self, coro, name: str) -> asyncio.Task:
         # Phase 6b: explicit ``self._loop.create_task`` instead of
@@ -211,6 +222,11 @@ class WALWriter:
         self._running = True
         await self._filesystem.mkdir(
             self._path.parent, parents=True, exist_ok=True
+        )
+        self._committed_length = (
+            await self._filesystem.file_size(self._path)
+            if await self._filesystem.exists(self._path)
+            else 0
         )
 
         self._writer_task = self._create_background_task(
@@ -315,6 +331,17 @@ class WALWriter:
     @property
     def error(self) -> BaseException | None:
         return self._error
+
+    @property
+    def storage_failure(self) -> OSError | None:
+        """The storage error the latest group commit hit, or None once a
+        later commit succeeded."""
+        return self._storage_failure
+
+    @property
+    def storage_failed_at(self) -> float | None:
+        """When the current storage failure began (monotonic), or None."""
+        return self._storage_failed_at
 
     @property
     def metrics(self) -> WALWriterMetrics:
@@ -452,6 +479,9 @@ class WALWriter:
             # seam — the same append+flush+fsync sequence as before, as
             # a single job on the filesystem's own executor.
             await self._filesystem.append_fsync(self._path, combined_data)
+            self._committed_length += len(combined_data)
+            self._storage_failure = None
+            self._storage_failed_at = None
 
             self._metrics.total_written += len(requests)
             self._metrics.total_batches += 1
@@ -466,6 +496,18 @@ class WALWriter:
                 if not request.future.done():
                     request.future.set_result(None)
 
+        except OSError as storage_error:
+            # The device refused the append (full, read-only, I/O error).
+            # The batch fails; the log is cut back to its last committed
+            # record so the torn tail cannot cost later records at
+            # recovery; the writer keeps serving -- the condition may
+            # clear. Only if the cut itself fails is the log unusable.
+            self._metrics.total_errors += 1
+            for request in requests:
+                if not request.future.done():
+                    request.future.set_exception(storage_error)
+            await self._discard_failed_append(storage_error)
+
         except BaseException as exception:
             self._error = exception
             self._metrics.total_errors += 1
@@ -478,6 +520,32 @@ class WALWriter:
 
         finally:
             self._current_batch.clear()
+
+    async def _discard_failed_append(self, storage_error: OSError) -> None:
+        """Cut the log back to its committed length after a failed append
+        and record the storage failure; a failed cut latches the writer."""
+        try:
+            # A device fault can strike before the append created the
+            # file; then there is nothing to cut.
+            if await self._filesystem.exists(self._path):
+                await self._filesystem.truncate(self._path, self._committed_length)
+        except BaseException as truncate_error:
+            self._error = truncate_error
+            raise truncate_error from storage_error
+        if self._storage_failure is None:
+            self._storage_failed_at = _DEFAULT_CLOCK.monotonic()
+        self._storage_failure = storage_error
+        if self._logger is not None:
+            await self._logger.log(
+                WALError(
+                    message=(
+                        f"WAL append failed and was rolled back to "
+                        f"{self._committed_length} bytes: {storage_error}"
+                    ),
+                    path=str(self._path),
+                    error_type=type(storage_error).__name__,
+                )
+            )
 
     async def _drain_remaining(self) -> None:
         while not self._queue.empty():
