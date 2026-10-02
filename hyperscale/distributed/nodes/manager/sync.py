@@ -1,61 +1,43 @@
 """
-Manager state sync module.
+Manager state synchronization.
 
-Handles state synchronization with workers and peer managers during
-leader election and recovery scenarios. Uses AD-21 jitter strategies
-for retry delays to prevent thundering herd.
+The single implementation of the manager's state sync: pulling worker
+state from the workers (re-hydrating active workflows), pulling a peer
+manager's snapshot -- its workers, job leadership, fences, layer
+versions and job states -- and answering peers' state_sync_request.
+The cluster-leader takeover forces a full sync through here.
 """
 
-import asyncio
-from typing import Any, Callable, Coroutine, TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Awaitable, Callable
 
-from hyperscale.distributed.jobs.worker_pool import WorkerPool
 from hyperscale.distributed.models import (
+    ManagerState as ManagerStateEnum,
     ManagerStateSnapshot,
     NodeInfo,
-    NodeRole,
     StateSyncRequest,
     StateSyncResponse,
-    WorkerHeartbeat,
     WorkerRegistration,
     WorkerState,
     WorkerStateSnapshot,
-    WorkerStatus,
 )
-from hyperscale.distributed.reliability import (
-    calculate_jittered_delay,
-    JitterStrategy,
-)
-from hyperscale.logging.hyperscale_logging_models import (
-    ServerInfo,
-    ServerDebug,
-    ServerWarning,
-)
-
-from hyperscale.distributed.runtime import Clock, RealClock
-
-
-_DEFAULT_CLOCK: Clock = RealClock()
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
 
 if TYPE_CHECKING:
-    from hyperscale.distributed.nodes.manager.state import ManagerState
+    from hyperscale.distributed.jobs import JobManager
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator
     from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
+    from hyperscale.distributed.nodes.manager.state import ManagerState
+    from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
-SendFunc = Callable[..., Coroutine[Any, Any, tuple[bytes, float] | None]]
-
 
 class ManagerStateSync:
-    """
-    Manages state synchronization with workers and peers.
+    """Owns the manager's state sync (see the module docstring).
 
-    Handles:
-    - Worker state sync (workers are source of truth for workflows)
-    - Peer manager state sync (for job metadata)
-    - Retry logic with exponential backoff
-    - Snapshot generation and application
+    Server operations it relies on (job state sync messages, callback
+    lookup, mTLS validation, leadership and term) are injected.
     """
 
     def __init__(
@@ -63,131 +45,53 @@ class ManagerStateSync:
         state: "ManagerState",
         config: "ManagerConfig",
         registry: "ManagerRegistry",
+        leases: "ManagerLeaseCoordinator",
+        job_manager: "JobManager",
         logger: "Logger",
-        node_id: str,
+        node_id: "NodeId",
+        node_host: str,
+        node_port: int,
         task_runner: "TaskRunner",
-        send_tcp: SendFunc,
-        is_leader_fn: Callable[[], bool] | None = None,
-        get_term_fn: Callable[[], int] | None = None,
-        handle_elected_fn: Callable[[tuple[str, int], int], Coroutine[Any, Any, None]]
-        | None = None,
-        should_yield_fn: Callable[[tuple[str, int], int], bool] | None = None,
-        step_down_fn: Callable[[], Coroutine[Any, Any, None]] | None = None,
-        set_dc_leader_fn: Callable[[str | None], None] | None = None,
-        export_stats_checkpoint_fn: Callable[[], list[tuple[float, float]]] | None = None,
-        import_stats_checkpoint_fn: Callable[
-            [list[tuple[float, float]]], Coroutine[Any, Any, int]
-        ]
-        | None = None,
+        send_tcp: Callable[..., Awaitable],
+        is_cluster_leader: Callable[[], bool],
+        get_current_term: Callable[[], int],
+        build_job_state_sync_message: Callable[..., object],
+        apply_job_state_sync_message: Callable[..., Awaitable],
+        get_job_callback_addr: Callable[..., "tuple[str, int] | None"],
+        validate_mtls_claims: Callable[..., Awaitable["str | None"]],
     ) -> None:
-        self._state: "ManagerState" = state
-        self._config: "ManagerConfig" = config
-        self._registry: "ManagerRegistry" = registry
-        self._logger: "Logger" = logger
-        self._node_id: str = node_id
-        self._task_runner: "TaskRunner" = task_runner
-        self._send_tcp: SendFunc = send_tcp
-        self._is_leader: Callable[[], bool] = is_leader_fn or (lambda: False)
-        self._get_term: Callable[[], int] = get_term_fn or (lambda: 0)
-        self._handle_elected: Callable[
-            [tuple[str, int], int], Coroutine[Any, Any, None]
-        ] = handle_elected_fn or self._noop_async
-        self._should_yield_to_peer: Callable[[tuple[str, int], int], bool] = (
-            should_yield_fn or (lambda _peer_addr, _peer_term: False)
-        )
-        self._step_down: Callable[[], Coroutine[Any, Any, None]] = (
-            step_down_fn or self._noop_async
-        )
-        self._set_dc_leader: Callable[[str | None], None] = set_dc_leader_fn or (
-            lambda _leader_id: None
-        )
-        self._export_stats_checkpoint: Callable[[], list[tuple[float, float]]] = (
-            export_stats_checkpoint_fn or (lambda: [])
-        )
-        self._import_stats_checkpoint: Callable[
-            [list[tuple[float, float]]], Coroutine[Any, Any, int]
-        ] = import_stats_checkpoint_fn or self._noop_import_checkpoint
-        self._worker_state_lock: asyncio.Lock = asyncio.Lock()
-
-    async def _noop_import_checkpoint(
-        self, _checkpoint: list[tuple[float, float]]
-    ) -> int:
-        return 0
-
-    async def _noop_async(self, *_: Any) -> None:
-        return None
-
-    def _normalize_job_leader_addr(
-        self,
-        leader_addr: tuple[str, int] | list[str | int] | None,
-    ) -> tuple[str, int] | None:
-        if leader_addr is None:
-            return None
-
-        if isinstance(leader_addr, list):
-            if len(leader_addr) != 2:
-                return None
-            return (str(leader_addr[0]), int(leader_addr[1]))
-
-        return cast(tuple[str, int], leader_addr)
+        self._state = state
+        self._config = config
+        self._registry = registry
+        self._leases = leases
+        self._job_manager = job_manager
+        self._logger = logger
+        self._node_id = node_id
+        self._node_host = node_host
+        self._node_port = node_port
+        self._task_runner = task_runner
+        self._send_tcp = send_tcp
+        self._is_cluster_leader = is_cluster_leader
+        self._get_current_term = get_current_term
+        self._build_job_state_sync_message = build_job_state_sync_message
+        self._apply_job_state_sync_message = apply_job_state_sync_message
+        self._get_job_callback_addr = get_job_callback_addr
+        self._validate_mtls_claims = validate_mtls_claims
 
     async def sync_state_from_workers(self) -> None:
-        """
-        Synchronize state from all known workers.
-
-        Called during leader election to rebuild workflow state.
-        Workers are the source of truth for active workflows.
-        """
-        workers = self._registry.get_all_workers()
-        if not workers:
-            return
-
-        self._task_runner.run(
-            self._logger.log,
-            ServerInfo(
-                message=f"Starting state sync from {len(workers)} workers",
-                node_host=self._config.host,
-                node_port=self._config.tcp_port,
-                node_id=self._node_id,
-            ),
-        )
-
-        request = StateSyncRequest(
-            requester_id=self._node_id,
-            requester_role="manager",
-            cluster_id=self._config.cluster_id,
-            environment_id=self._config.environment_id,
-            since_version=self._state.state_version,
-        )
-
-        for worker_id, worker in workers.items():
-            worker_addr = (worker.node.host, worker.node.port)
-            snapshot = await self._request_worker_state(worker_addr, request)
-            if snapshot:
-                await self._apply_worker_state(snapshot)
-
-    async def _request_worker_state(
-        self,
-        worker_addr: tuple[str, int],
-        request: StateSyncRequest,
-    ) -> WorkerStateSnapshot | None:
-        """
-        Request state from a single worker with retry.
-
-        Args:
-            worker_addr: Worker address
-            request: Sync request
-
-        Returns:
-            WorkerStateSnapshot or None on failure
-        """
-        max_retries = self._config.state_sync_retries
-        base_delay = 0.5
-        max_delay = 30.0
-
-        for attempt in range(max_retries):
+        """Sync state from all workers."""
+        for worker_id, worker in self._state.iter_workers():
             try:
-                response = await self._send_tcp(
+                request = StateSyncRequest(
+                    requester_id=self._node_id.full,
+                    requester_role="manager",
+                    cluster_id=self._config.cluster_id,
+                    environment_id=self._config.environment_id,
+                    since_version=self._state.state_version,
+                )
+
+                worker_addr = (worker.node.host, worker.node.port)
+                response, _clock = await self._send_tcp(
                     worker_addr,
                     "state_sync_request",
                     request.dump(),
@@ -196,372 +100,71 @@ class ManagerStateSync:
 
                 if response and not isinstance(response, Exception):
                     sync_response = StateSyncResponse.load(response)
-                    if sync_response.responder_ready and sync_response.worker_state:
-                        return sync_response.worker_state
+                    if sync_response.worker_state and sync_response.responder_ready:
+                        worker_snapshot = sync_response.worker_state
+                        if self._state.has_worker(worker_id):
+                            worker_reg = self._state.get_worker(worker_id)
+                            if worker_reg:
+                                worker_reg.available_cores = (
+                                    worker_snapshot.available_cores
+                                )
+                        await self._hydrate_active_workflows_from_worker_snapshot(
+                            worker_snapshot
+                        )
 
-            except Exception as sync_error:
-                self._task_runner.run(
-                    self._logger.log,
+            except Exception as error:
+                await self._logger.log(
                     ServerWarning(
-                        message=f"Worker state sync attempt {attempt + 1} failed: {sync_error}",
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
+                        message=f"State sync from worker {worker_id[:8]}... failed: {error}",
+                        node_host=self._node_host,
+                        node_port=self._node_port,
+                        node_id=self._node_id.short,
+                    )
                 )
 
-            if attempt < max_retries - 1:
-                delay = calculate_jittered_delay(
-                    attempt=attempt,
-                    base_delay=base_delay,
-                    max_delay=max_delay,
-                    jitter=JitterStrategy.FULL,
-                )
-                await _DEFAULT_CLOCK.sleep(delay)
-
-        return None
-
-    def _derive_worker_health_state(self, snapshot: WorkerStateSnapshot) -> str:
-        if snapshot.state == WorkerState.HEALTHY.value:
-            return "healthy" if snapshot.available_cores > 0 else "busy"
-        if snapshot.state == WorkerState.DEGRADED.value:
-            return "stressed"
-        return "overloaded"
-
-    def _build_worker_registration_from_snapshot(
+    async def _hydrate_active_workflows_from_worker_snapshot(
         self,
-        snapshot: WorkerStateSnapshot,
-    ) -> WorkerRegistration | None:
-        if not snapshot.host or snapshot.tcp_port <= 0:
-            self._task_runner.run(
-                self._logger.log,
-                ServerWarning(
-                    message=(
-                        f"Worker sync missing address info for {snapshot.node_id[:8]}..."
-                    ),
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
-            return None
-
-        node_info = NodeInfo(
-            node_id=snapshot.node_id,
-            role=NodeRole.WORKER,
-            host=snapshot.host,
-            port=snapshot.tcp_port,
-            udp_port=snapshot.udp_port or snapshot.tcp_port,
-            datacenter=self._config.datacenter_id,
-            version=snapshot.version,
-        )
-
-        return WorkerRegistration(
-            node=node_info,
-            total_cores=snapshot.total_cores,
-            available_cores=snapshot.available_cores,
-            memory_mb=0,
-            available_memory_mb=0,
-            cluster_id=self._config.cluster_id,
-            environment_id=self._config.environment_id,
-        )
-
-    def _update_registration_from_snapshot(
-        self,
-        registration: WorkerRegistration,
-        snapshot: WorkerStateSnapshot,
-        should_update_mapping: bool,
+        worker_snapshot: WorkerStateSnapshot,
     ) -> None:
-        registration.total_cores = snapshot.total_cores
-        registration.available_cores = snapshot.available_cores
-        registration.node.version = snapshot.version
+        """Rebuild active job/sub-workflow indexes from worker-owned state."""
+        leader_addr = (self._node_host, self._node_port)
+        for progress in worker_snapshot.active_workflows.values():
+            if not self._leases.is_job_leader(progress.job_id):
+                continue
 
-        if snapshot.host and snapshot.tcp_port > 0:
-            incoming_udp_port = snapshot.udp_port or snapshot.tcp_port
-            if (
-                registration.node.host != snapshot.host
-                or registration.node.port != snapshot.tcp_port
-                or registration.node.udp_port != incoming_udp_port
-            ):
-                if should_update_mapping:
-                    old_tcp_addr = (registration.node.host, registration.node.port)
-                    old_udp_addr = (registration.node.host, registration.node.udp_port)
-                    self._state._worker_addr_to_id.pop(old_tcp_addr, None)
-                    self._state._worker_addr_to_id.pop(old_udp_addr, None)
-
-                registration.node.host = snapshot.host
-                registration.node.port = snapshot.tcp_port
-                registration.node.udp_port = incoming_udp_port
-
-                if should_update_mapping:
-                    new_tcp_addr = (registration.node.host, registration.node.port)
-                    new_udp_addr = (registration.node.host, registration.node.udp_port)
-                    self._state._worker_addr_to_id[new_tcp_addr] = snapshot.node_id
-                    self._state._worker_addr_to_id[new_udp_addr] = snapshot.node_id
-
-    def _resolve_worker_registration(
-        self,
-        snapshot: WorkerStateSnapshot,
-        worker_status: WorkerStatus | None,
-    ) -> WorkerRegistration | None:
-        registration = self._registry.get_worker(snapshot.node_id)
-        if registration:
-            self._update_registration_from_snapshot(
-                registration,
-                snapshot,
-                should_update_mapping=True,
-            )
-            return registration
-
-        if worker_status and worker_status.registration:
-            registration = worker_status.registration
-            self._update_registration_from_snapshot(
-                registration,
-                snapshot,
-                should_update_mapping=False,
-            )
-            self._registry.register_worker(registration)
-            return registration
-
-        registration = self._build_worker_registration_from_snapshot(snapshot)
-        if registration is None:
-            return None
-
-        self._registry.register_worker(registration)
-        return registration
-
-    async def _apply_worker_pool_snapshot(
-        self,
-        worker_pool: WorkerPool,
-        worker_status: WorkerStatus,
-        registration: WorkerRegistration,
-        snapshot: WorkerStateSnapshot,
-        health_state: str,
-    ) -> None:
-        queue_depth = len(snapshot.active_workflows)
-        heartbeat = WorkerHeartbeat(
-            node_id=snapshot.node_id,
-            state=snapshot.state,
-            available_cores=snapshot.available_cores,
-            queue_depth=queue_depth,
-            cpu_percent=0.0,
-            memory_percent=0.0,
-            version=snapshot.version,
-            active_workflows={
-                workflow_id: progress.status
-                for workflow_id, progress in snapshot.active_workflows.items()
-            },
-            tcp_host=registration.node.host,
-            tcp_port=registration.node.port,
-        )
-
-        async with worker_pool._cores_condition:
-            old_available = worker_status.available_cores
-            worker_status.heartbeat = heartbeat
-            worker_status.last_seen = _DEFAULT_CLOCK.monotonic()
-            worker_status.state = snapshot.state
-            worker_status.available_cores = snapshot.available_cores
-            worker_status.total_cores = snapshot.total_cores
-            worker_status.queue_depth = queue_depth
-            worker_status.cpu_percent = 0.0
-            worker_status.memory_percent = 0.0
-            worker_status.reserved_cores = 0
-            worker_status.overload_state = health_state
-
-            if worker_status.available_cores > old_available:
-                worker_pool._cores_condition.notify_all()
-
-            pool_health = worker_pool._worker_health.get(worker_status.worker_id)
-            if pool_health:
-                accepting = (
-                    snapshot.state == WorkerState.HEALTHY.value
-                    and worker_status.available_cores > 0
-                )
-                pool_health.update_liveness(success=True)
-                pool_health.update_readiness(
-                    accepting=accepting,
-                    capacity=worker_status.available_cores,
-                )
-
-    async def _remove_worker_from_sync(
-        self,
-        worker_id: str,
-        worker_key: str,
-        snapshot_version: int,
-        worker_pool: WorkerPool | None,
-    ) -> None:
-        registration = self._registry.get_worker(worker_id)
-        if registration:
-            self._registry.unregister_worker(worker_id)
-
-        if worker_pool:
-            await worker_pool.deregister_worker(worker_id)
-
-        await self._state._versioned_clock.update_entity(worker_key, snapshot_version)
-
-        self._task_runner.run(
-            self._logger.log,
-            ServerWarning(
-                message=f"Removed offline worker {worker_id[:8]}... from sync",
-                node_host=self._config.host,
-                node_port=self._config.tcp_port,
-                node_id=self._node_id,
-            ),
-        )
-
-    async def _apply_worker_state(self, snapshot: WorkerStateSnapshot) -> None:
-        """
-        Apply worker state snapshot to local state.
-
-        Args:
-            snapshot: Worker state snapshot
-        """
-        worker_id = snapshot.node_id
-        worker_key = f"worker:{worker_id}"
-
-        async with self._worker_state_lock:
-            worker_pool = self._registry._worker_pool
-            worker_status = worker_pool.get_worker(worker_id) if worker_pool else None
-
-            if snapshot.state == WorkerState.OFFLINE.value:
-                await self._remove_worker_from_sync(
-                    worker_id,
-                    worker_key,
-                    snapshot.version,
-                    worker_pool,
-                )
-                return
-
-            if (
-                worker_status
-                and worker_status.heartbeat
-                and snapshot.version <= worker_status.heartbeat.version
-            ):
-                self._task_runner.run(
-                    self._logger.log,
-                    ServerDebug(
-                        message=(
-                            f"Ignoring stale worker state from {worker_id[:8]}... "
-                            f"(version {snapshot.version})"
-                        ),
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
-                )
-                return
-
-            if not await self._state._versioned_clock.should_accept_update(
-                worker_key,
-                snapshot.version,
-            ):
-                self._task_runner.run(
-                    self._logger.log,
-                    ServerDebug(
-                        message=(
-                            f"Rejected worker state conflict for {worker_id[:8]}... "
-                            f"(version {snapshot.version})"
-                        ),
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
-                )
-                return
-
-            registration = self._resolve_worker_registration(snapshot, worker_status)
-            if registration is None:
-                return
-
-            health_state = self._derive_worker_health_state(snapshot)
-            self._state._worker_health_states[worker_id] = health_state
-
-            if snapshot.state == WorkerState.HEALTHY.value:
-                self._state.clear_worker_unhealthy_since(worker_id)
-
-            if worker_pool:
-                worker_status = await worker_pool.register_worker(registration)
-                await self._apply_worker_pool_snapshot(
-                    worker_pool,
-                    worker_status,
-                    registration,
-                    snapshot,
-                    health_state,
-                )
-
-            await self._state._versioned_clock.update_entity(
-                worker_key, snapshot.version
+            await self._job_manager.hydrate_worker_active_workflow(
+                progress=progress,
+                worker_id=worker_snapshot.node_id,
+                leader_node_id=self._node_id.full,
+                leader_addr=leader_addr,
+                fencing_token=self._leases.get_fence_token(progress.job_id),
+                callback_addr=self._get_job_callback_addr(progress.job_id),
             )
 
-            self._task_runner.run(
-                self._logger.log,
-                ServerDebug(
-                    message=(
-                        f"Applied worker state from {worker_id[:8]}... "
-                        f"cores={snapshot.available_cores}/{snapshot.total_cores}"
-                    ),
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
-
-    async def sync_state_from_manager_peers(self) -> None:
-        """
-        Synchronize state from peer managers.
-
-        Called during leader election to get job metadata
-        (retry counts, context versions, etc).
-        """
-        peers = list(self._state._active_manager_peers)
-        if not peers:
-            return
-
-        self._task_runner.run(
-            self._logger.log,
-            ServerInfo(
-                message=f"Starting state sync from {len(peers)} manager peers",
-                node_host=self._config.host,
-                node_port=self._config.tcp_port,
-                node_id=self._node_id,
-            ),
-        )
-
-        request = StateSyncRequest(
-            requester_id=self._node_id,
-            requester_role="manager",
-            cluster_id=self._config.cluster_id,
-            environment_id=self._config.environment_id,
-            since_version=self._state.state_version,
-        )
-
-        for peer_addr in peers:
-            snapshot = await self._request_manager_peer_state(peer_addr, request)
-            if snapshot:
-                await self._apply_manager_peer_state(peer_addr, snapshot)
-
-    async def _request_manager_peer_state(
-        self,
-        peer_addr: tuple[str, int],
-        request: StateSyncRequest,
-    ) -> ManagerStateSnapshot | None:
-        """
-        Request state from a single peer manager with retry.
-
-        Args:
-            peer_addr: Peer address
-            request: Sync request
-
-        Returns:
-            ManagerStateSnapshot or None on failure
-        """
-        max_retries = self._config.state_sync_retries
-        base_delay = 0.5
-        max_delay = 30.0
-
-        for attempt in range(max_retries):
+    async def sync_state_from_manager_peers(self, *, force_full: bool = False) -> None:
+        """Sync state from peer managers."""
+        # Snapshot the live set before iterating. Each loop iteration
+        # awaits ``send_tcp`` and now also routes through
+        # ``_apply_peer_worker_snapshots``, both of which yield to the
+        # event loop. A concurrent ``_handle_manager_peer_death``
+        # (which calls ``remove_active_peer`` → ``discard``) can
+        # mutate ``_active_manager_peers`` mid-iteration and raise
+        # ``Set changed size during iteration``. The cancel handler
+        # catches that on the takeover path and the client surfaces
+        # it as ``Job cancellation failed: Set changed size during
+        # iteration`` — a permanent failure that aborts the request.
+        for peer_addr in list(self._state.get_active_manager_peers()):
             try:
-                response = await self._send_tcp(
+                since_version = -1 if force_full else self._state.state_version
+                request = StateSyncRequest(
+                    requester_id=self._node_id.full,
+                    requester_role="manager",
+                    cluster_id=self._config.cluster_id,
+                    environment_id=self._config.environment_id,
+                    since_version=since_version,
+                )
+
+                response, _clock = await self._send_tcp(
                     peer_addr,
                     "state_sync_request",
                     request.dump(),
@@ -570,214 +173,269 @@ class ManagerStateSync:
 
                 if response and not isinstance(response, Exception):
                     sync_response = StateSyncResponse.load(response)
-                    if sync_response.responder_ready and sync_response.manager_state:
-                        return sync_response.manager_state
+                    if sync_response.manager_state and sync_response.responder_ready:
+                        peer_snapshot = sync_response.manager_state
+                        self._apply_peer_worker_snapshots(peer_snapshot.workers)
+                        for job_id, fence_token in peer_snapshot.job_fence_tokens.items():
+                            leader_id = peer_snapshot.job_leaders.get(job_id)
+                            leader_addr = peer_snapshot.job_leader_addrs.get(job_id)
+                            if leader_id is None or leader_addr is None:
+                                continue
+                            self._leases.apply_job_leadership(
+                                job_id=job_id,
+                                leader_id=leader_id,
+                                leader_addr=tuple(leader_addr),
+                                fencing_token=fence_token,
+                                layer_version=peer_snapshot.job_layer_versions.get(job_id),
+                            )
+                        for sync_msg in peer_snapshot.job_states.values():
+                            await self._apply_job_state_sync_message(
+                                sync_msg,
+                                peer_addr,
+                            )
 
-            except Exception as sync_error:
-                self._task_runner.run(
-                    self._logger.log,
+            except Exception as error:
+                await self._logger.log(
                     ServerWarning(
-                        message=f"Peer state sync attempt {attempt + 1} failed: {sync_error}",
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
+                        message=f"State sync from peer {peer_addr} failed: {error}",
+                        node_host=self._node_host,
+                        node_port=self._node_port,
+                        node_id=self._node_id.short,
+                    )
                 )
 
-            if attempt < max_retries - 1:
-                delay = calculate_jittered_delay(
-                    attempt=attempt,
-                    base_delay=base_delay,
-                    max_delay=max_delay,
-                    jitter=JitterStrategy.FULL,
-                )
-                await _DEFAULT_CLOCK.sleep(delay)
+    def build_peer_worker_snapshots(self) -> list[WorkerStateSnapshot]:
+        """Serialize this manager's worker registry for a peer sync.
 
-        return None
-
-    async def _reconcile_peer_leadership(
-        self,
-        peer_addr: tuple[str, int],
-        snapshot: ManagerStateSnapshot,
-    ) -> None:
-        if not snapshot.is_leader:
-            return
-
-        peer_term = snapshot.term
-        local_term = self._get_term()
-
-        if peer_term < local_term:
-            self._task_runner.run(
-                self._logger.log,
-                ServerDebug(
-                    message=(
-                        f"State sync ignored peer leader {snapshot.node_id[:8]}... "
-                        f"term {peer_term} < local {local_term}"
-                    ),
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
-            return
-
-        if self._is_leader():
-            should_yield = self._should_yield_to_peer(peer_addr, peer_term)
-            if should_yield:
-                self._task_runner.run(
-                    self._logger.log,
-                    ServerWarning(
-                        message=(
-                            f"Split-brain resolved: yielding to peer leader "
-                            f"{snapshot.node_id[:8]}... term {peer_term}"
-                        ),
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
-                )
-                await self._step_down()
-                self._set_dc_leader(snapshot.node_id)
-            else:
-                self._task_runner.run(
-                    self._logger.log,
-                    ServerWarning(
-                        message=(
-                            f"Split-brain detected: retaining leadership over "
-                            f"peer {snapshot.node_id[:8]}... term {peer_term}"
-                        ),
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
-                )
-            return
-
-        await self._handle_elected(peer_addr, peer_term)
-        self._set_dc_leader(snapshot.node_id)
-        self._task_runner.run(
-            self._logger.log,
-            ServerInfo(
-                message=(
-                    f"State sync updated leader to {snapshot.node_id[:8]}... "
-                    f"term {peer_term}"
-                ),
-                node_host=self._config.host,
-                node_port=self._config.tcp_port,
-                node_id=self._node_id,
-            ),
-        )
-
-    async def _apply_manager_peer_state(
-        self,
-        peer_addr: tuple[str, int],
-        snapshot: ManagerStateSnapshot,
-    ) -> None:
-        await self._reconcile_peer_leadership(peer_addr, snapshot)
-
-        for job_id, fence_token in snapshot.job_fence_tokens.items():
-            current_token = self._state._job_fencing_tokens.get(job_id, -1)
-            previous_leader = self._state._job_leaders.get(job_id)
-            previous_addr = self._state._job_leader_addrs.get(job_id)
-            leader_id = snapshot.job_leaders.get(job_id)
-            leader_addr = snapshot.job_leader_addrs.get(job_id)
-            leader_addr_tuple = self._normalize_job_leader_addr(leader_addr)
-            if leader_id is None or leader_addr_tuple is None:
-                continue
-
-            accepted = self._state.apply_job_leadership(
-                job_id=job_id,
-                leader_id=leader_id,
-                leader_addr=leader_addr_tuple,
-                fencing_token=fence_token,
-                layer_version=snapshot.job_layer_versions.get(job_id),
-            )
-            if accepted:
-
-                self._task_runner.run(
-                    self._logger.log,
-                    ServerDebug(
-                        message=(
-                            f"State sync accepted job {job_id[:8]}... "
-                            f"fence {current_token} -> {fence_token}, "
-                            f"leader {previous_leader} -> {leader_id}, "
-                            f"addr {previous_addr} -> {leader_addr_tuple}"
-                        ),
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
-                )
-            else:
-                self._task_runner.run(
-                    self._logger.log,
-                    ServerDebug(
-                        message=(
-                            f"State sync rejected stale fence for job {job_id[:8]}... "
-                            f"token {fence_token} <= {current_token}"
-                        ),
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
-                )
-
-        if self._state.set_state_version_if_higher(snapshot.version):
-            self._task_runner.run(
-                self._logger.log,
-                ServerDebug(
-                    message=f"State sync updated state version to {snapshot.version}",
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
-
-        if snapshot.pending_stats_checkpoint:
-            await self._import_stats_checkpoint(snapshot.pending_stats_checkpoint)
-
-        self._task_runner.run(
-            self._logger.log,
-            ServerDebug(
-                message=f"Applied manager peer state (version {snapshot.version})",
-                node_host=self._config.host,
-                node_port=self._config.tcp_port,
-                node_id=self._node_id,
-            ),
-        )
-
-    def get_state_snapshot(
-        self,
-        datacenter: str,
-        is_leader: bool,
-        term: int,
-    ) -> ManagerStateSnapshot:
-        worker_snapshots = [
+        The exact inverse of ``_apply_peer_worker_snapshots``: it
+        rebuilds a ``NodeInfo`` plus ``WorkerRegistration`` from
+        ``node_id``/``host``/``tcp_port``/``udp_port``/``version`` and
+        the two core counts, so those are the fields that have to
+        round-trip. ``active_workflows`` is left empty because nothing
+        reads it on the receiving side; shipping it would be cost
+        without a consumer.
+        """
+        return [
             WorkerStateSnapshot(
-                worker_id=worker_id,
-                host=reg.node.host,
-                tcp_port=reg.node.port,
-                udp_port=reg.node.udp_port or reg.node.port,
-                active_workflows={
-                    wf_id: wf
-                    for wf_id, wf in self._state._workflow_progress.items()
-                    if wf.worker_id == worker_id
-                },
+                node_id=registration.node.node_id,
+                state=self._state._worker_health_states.get(
+                    worker_id, WorkerState.HEALTHY.value
+                ),
+                total_cores=registration.total_cores,
+                available_cores=registration.available_cores,
+                version=registration.node.version,
+                host=registration.node.host,
+                tcp_port=registration.node.port,
+                udp_port=registration.node.udp_port or registration.node.port,
             )
-            for worker_id, reg in self._state._workers.items()
+            for worker_id, registration in self._state.iter_workers()
         ]
 
-        return ManagerStateSnapshot(
-            node_id=self._node_id,
-            datacenter=datacenter,
-            is_leader=is_leader,
-            term=term,
-            version=self._state._state_version,
-            workers=worker_snapshots,
-            jobs=dict(self._state._job_progress),
-            job_leaders=dict(self._state._job_leaders),
-            job_leader_addrs=dict(self._state._job_leader_addrs),
-            job_fence_tokens=dict(self._state._job_fencing_tokens),
-            job_layer_versions=dict(self._state._job_layer_version),
-            pending_stats_checkpoint=self._export_stats_checkpoint(),
-        )
+    def _apply_peer_worker_snapshots(
+        self,
+        worker_snapshots: list[WorkerStateSnapshot],
+    ) -> None:
+        """Reconstruct worker registrations from a peer's state snapshot.
+
+        Workers register with managers via the ``worker_register`` RPC,
+        which is delivered only to the seed managers configured on each
+        worker. After a leader-kill the elected new leader may have
+        zero entries in ``_manager_state._workers`` until each surviving
+        worker independently re-registers — at minute-scale jitter.
+
+        ``ManagerStateSnapshot.workers`` is shipped on every peer sync
+        precisely so the new leader can recover that registry without
+        waiting for worker-side re-registration. Replicating the
+        snapshot to the registry is what makes the takeover-side
+        ``_get_running_workflows_to_cancel`` succeed: it resolves
+        ``sub_workflow.token.worker_id`` through
+        ``ManagerState.get_worker`` to obtain a worker address; without
+        a populated registry the lookup returns ``None``, every
+        running workflow is silently skipped, ``workflows_to_cancel``
+        ends up empty, no ``workflow_cancellation_complete`` ever
+        decrements the pending tracker to zero, and the client times
+        out on ``await_job_cancellation`` because the
+        ``job_cancellation_complete`` push that the manager fires only
+        from that zero-pending branch is never scheduled.
+
+        Only the snapshot fields the cancel and dispatch paths
+        actually consume are reconstructed: identity (host/tcp/udp
+        ports) for addressing, cores for capacity gating, and the
+        manager's own ``cluster_id`` / ``environment_id`` so a future
+        ``WorkerRegistration`` consumer that inspects them sees
+        consistent values. SWIM/probe/disseminator wiring deliberately
+        stays untouched — those channels rejoin under the worker's
+        own re-registration, where SWIM incarnation and rejoin gating
+        are authoritative.
+        """
+        if not worker_snapshots:
+            return
+
+        for snapshot in worker_snapshots:
+            if not snapshot.node_id or not snapshot.host or snapshot.tcp_port <= 0:
+                continue
+            if self._state.has_worker(snapshot.node_id):
+                continue
+
+            node = NodeInfo(
+                node_id=snapshot.node_id,
+                role="worker",
+                host=snapshot.host,
+                port=snapshot.tcp_port,
+                datacenter=self._node_id.datacenter,
+                udp_port=snapshot.udp_port,
+                version=snapshot.version,
+            )
+            registration = WorkerRegistration(
+                node=node,
+                total_cores=snapshot.total_cores,
+                available_cores=snapshot.available_cores,
+                memory_mb=0,
+                cluster_id=self._config.cluster_id,
+                environment_id=self._config.environment_id,
+            )
+            self._registry.register_worker(registration)
+
+    async def sync_full_state_from_manager_peers(self) -> None:
+        """Force a full peer-manager state sync after leadership changes."""
+        await self.sync_state_from_manager_peers(force_full=True)
+
+    async def handle_state_sync_request(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle state sync request from peer managers or workers."""
+        try:
+            request = StateSyncRequest.load(data)
+
+            if request.cluster_id != self._config.cluster_id:
+                reason = (
+                    "State sync cluster_id mismatch: "
+                    f"{request.cluster_id} != {self._config.cluster_id}"
+                )
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"State sync requester {request.requester_id} rejected: {reason}"
+                        ),
+                        node_host=self._node_host,
+                        node_port=self._node_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return StateSyncResponse(
+                    responder_id=self._node_id.full,
+                    current_version=self._state.state_version,
+                    responder_ready=False,
+                ).dump()
+
+            if request.environment_id != self._config.environment_id:
+                reason = (
+                    "State sync environment_id mismatch: "
+                    f"{request.environment_id} != {self._config.environment_id}"
+                )
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"State sync requester {request.requester_id} rejected: {reason}"
+                        ),
+                        node_host=self._node_host,
+                        node_port=self._node_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return StateSyncResponse(
+                    responder_id=self._node_id.full,
+                    current_version=self._state.state_version,
+                    responder_ready=False,
+                ).dump()
+
+            mtls_error = await self._validate_mtls_claims(
+                addr,
+                "State sync requester",
+                request.requester_id,
+            )
+            if mtls_error:
+                return StateSyncResponse(
+                    responder_id=self._node_id.full,
+                    current_version=self._state.state_version,
+                    responder_ready=False,
+                ).dump()
+
+            self._task_runner.run(
+                # ``_udp_logger`` is this class's logger; ``_logger``
+                # has never existed in its MRO, so evaluating this
+                # argument raised AttributeError and took the whole
+                # state_sync_request handler with it — peer state sync
+                # answered an error for every request that got past
+                # mTLS validation.
+                self._logger.log,
+                ServerInfo(
+                    message=f"State sync request from {request.requester_id[:8]}... role={request.requester_role} since_version={request.since_version}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+
+            current_version = self._state.state_version
+            # A manager still syncing its own state has none to vouch for
+            # (ManagerState has no INITIALIZING member: naming it raised on
+            # every full sync).
+            is_ready = (
+                self._state.manager_state_enum != ManagerStateEnum.SYNCING
+            )
+
+            if request.since_version >= current_version:
+                return StateSyncResponse(
+                    responder_id=self._node_id.full,
+                    current_version=current_version,
+                    responder_ready=is_ready,
+                ).dump()
+
+            snapshot = ManagerStateSnapshot(
+                node_id=self._node_id.full,
+                datacenter=self._config.datacenter_id,
+                is_leader=self._is_cluster_leader(),
+                term=self._get_current_term(),
+                version=current_version,
+                # Job state travels in ``job_states`` (consumed by the
+                # receiver); ``jobs`` read a ManagerState attribute that
+                # never existed, so every full snapshot raised and peers
+                # got responder_ready=False -- no peer sync, including the
+                # takeover's forced full sync, ever delivered state.
+                workers=self.build_peer_worker_snapshots(),
+                job_leaders=dict(self._state._job_leaders),
+                job_leader_addrs=dict(self._state._job_leader_addrs),
+                job_fence_tokens=dict(self._state._job_fencing_tokens),
+                job_layer_versions=dict(self._state._job_layer_version),
+                job_states={
+                    job.job_id: self._build_job_state_sync_message(job.job_id, job)
+                    for job in self._job_manager.iter_jobs()
+                },
+            )
+
+            return StateSyncResponse(
+                responder_id=self._node_id.full,
+                current_version=current_version,
+                responder_ready=is_ready,
+                manager_state=snapshot,
+            ).dump()
+
+        except Exception as error:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"State sync request failed: {error}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+            return StateSyncResponse(
+                responder_id=self._node_id.full,
+                current_version=0,
+                responder_ready=False,
+            ).dump()

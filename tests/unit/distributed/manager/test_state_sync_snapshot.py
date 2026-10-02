@@ -8,7 +8,8 @@ error path answered ``responder_ready=False, current_version=0``: no peer
 sync (the cluster-leader takeover's forced full sync included) ever
 delivered state.
 
-Driven through the real handler over a real ManagerState: a requester
+Driven through the real handler (ManagerStateSync, where state sync now
+lives) over a real ManagerState: a requester
 behind the responder's version receives a snapshot carrying the
 responder's job leadership and fence tokens.
 """
@@ -18,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from hyperscale.distributed.models import StateSyncRequest, StateSyncResponse
-from hyperscale.distributed.nodes.manager.server import ManagerServer
+from hyperscale.distributed.nodes.manager.sync import ManagerStateSync
 from hyperscale.distributed.nodes.manager.state import ManagerState
 
 CLUSTER_ID = "hyperscale"
@@ -33,26 +34,32 @@ class RecordingTaskRunner:
         self.calls.append((call, args))
 
 
-def make_manager(state: ManagerState) -> tuple[ManagerServer, RecordingTaskRunner]:
-    manager = object.__new__(ManagerServer)
+def make_state_sync(state: ManagerState) -> tuple[ManagerStateSync, RecordingTaskRunner]:
     task_runner = RecordingTaskRunner()
 
     async def no_mtls_error(addr, role, requester_id):
         return None
 
-    manager._manager_state = state
-    manager._config = SimpleNamespace(
-        cluster_id=CLUSTER_ID, environment_id=ENVIRONMENT_ID, datacenter_id="dc-east"
+    state_sync = ManagerStateSync(
+        state=state,
+        config=SimpleNamespace(cluster_id=CLUSTER_ID, environment_id=ENVIRONMENT_ID, datacenter_id="dc-east"),
+        registry=None,
+        leases=None,
+        job_manager=SimpleNamespace(iter_jobs=lambda: []),
+        logger=SimpleNamespace(log=None),
+        node_id=SimpleNamespace(full="manager-a-full", short="manager-a"),
+        node_host="127.0.0.1",
+        node_port=9000,
+        task_runner=task_runner,
+        send_tcp=None,
+        is_cluster_leader=lambda: True,
+        get_current_term=lambda: 3,
+        build_job_state_sync_message=lambda job_id, job: None,
+        apply_job_state_sync_message=None,
+        get_job_callback_addr=lambda job_id: None,
+        validate_mtls_claims=no_mtls_error,
     )
-    manager._node_id = SimpleNamespace(full="manager-a-full", short="manager-a")
-    manager._host, manager._tcp_port = "127.0.0.1", 9000
-    manager._validate_mtls_claims = no_mtls_error
-    manager._task_runner = task_runner
-    manager._udp_logger = SimpleNamespace(log=None)
-    manager.is_leader = lambda: True
-    manager._leader_election = SimpleNamespace(state=SimpleNamespace(current_term=3))
-    manager._job_manager = SimpleNamespace(iter_jobs=lambda: [])
-    return manager, task_runner
+    return state_sync, task_runner
 
 
 @pytest.mark.asyncio
@@ -62,10 +69,9 @@ async def test_a_requester_behind_the_responders_version_gets_a_full_snapshot() 
     state._job_leaders["job-1"] = "manager-a-full"
     state._job_leader_addrs["job-1"] = ("127.0.0.1", 9000)
     state._job_fencing_tokens["job-1"] = 4
-    manager, task_runner = make_manager(state)
+    state_sync, task_runner = make_state_sync(state)
 
-    reply = await ManagerServer.state_sync_request(
-        manager,
+    reply = await state_sync.handle_state_sync_request(
         ("127.0.0.1", 9100),
         StateSyncRequest(
             requester_id="manager-b-full",
