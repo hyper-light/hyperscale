@@ -786,6 +786,7 @@ class GateServer(HealthAwareServer):
             send_tcp=self._send_tcp,
             get_active_peers=lambda: self._modular_state.get_active_peers_list(),
             get_cluster_size=self._configured_gate_count,
+            peer_rpc_timeout_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
         )
 
         self._dispatch_coordinator = GateDispatchCoordinator(
@@ -2197,7 +2198,7 @@ class GateServer(HealthAwareServer):
 
             return JobLeadershipAck(
                 job_id=announcement.job_id,
-                accepted=True,
+                accepted=accepted,
                 responder_id=self._node_id.full,
             ).dump()
 

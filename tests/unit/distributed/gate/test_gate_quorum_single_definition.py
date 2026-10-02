@@ -58,6 +58,7 @@ def make_gate(configured_peers: int, known_gates: int, active_peers: int) -> Gat
         send_tcp=None,
         get_active_peers=None,
         get_cluster_size=gate._configured_gate_count,
+        peer_rpc_timeout_seconds=1.0,
     )
     gate._consecutive_quorum_failures = 0
     gate._quorum_stepdown_consecutive_failures = 1
