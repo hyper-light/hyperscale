@@ -15,7 +15,6 @@ from hyperscale.distributed.models import (
     GateHeartbeat,
     GateInfo,
 )
-from hyperscale.distributed.health import GateHealthConfig, GateHealthState
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -63,7 +62,6 @@ class GatePeerCoordinator:
         job_forwarding_tracker: "JobForwardingTracker",
         job_leadership_tracker: "JobLeadershipTracker",
         versioned_clock: "VersionedStateClock",
-        gate_health_config: "GateHealthConfig",
         recovery_semaphore: asyncio.Semaphore,
         recovery_jitter_min: float,
         recovery_jitter_max: float,
@@ -88,7 +86,6 @@ class GatePeerCoordinator:
             job_forwarding_tracker: Tracks cross-gate job forwarding
             job_leadership_tracker: Tracks per-job leadership
             versioned_clock: Version tracking for stale update rejection
-            gate_health_config: Configuration for gate health states
             recovery_semaphore: Limits concurrent recovery operations
             recovery_jitter_min: Minimum jitter for recovery delay
             recovery_jitter_max: Maximum jitter for recovery delay
@@ -108,7 +105,6 @@ class GatePeerCoordinator:
         self._job_forwarding_tracker: "JobForwardingTracker" = job_forwarding_tracker
         self._job_leadership_tracker: "JobLeadershipTracker" = job_leadership_tracker
         self._versioned_clock: "VersionedStateClock" = versioned_clock
-        self._gate_health_config: "GateHealthConfig" = gate_health_config
         self._recovery_semaphore: asyncio.Semaphore = recovery_semaphore
         self._recovery_jitter_min: float = recovery_jitter_min
         self._recovery_jitter_max: float = recovery_jitter_max
@@ -337,82 +333,6 @@ class GatePeerCoordinator:
         )
 
         return gate_ids_to_remove
-
-    async def handle_gate_heartbeat(
-        self,
-        heartbeat: GateHeartbeat,
-        source_addr: tuple[str, int],
-    ) -> None:
-        """
-        Handle GateHeartbeat received from peer gates via SWIM.
-
-        Updates peer tracking, discovery service, hash ring, and health states.
-
-        Args:
-            heartbeat: Received gate heartbeat
-            source_addr: UDP source address of the heartbeat
-        """
-        if await self._versioned_clock.is_entity_stale(
-            heartbeat.node_id, heartbeat.version
-        ):
-            return
-
-        peer_tcp_host = heartbeat.tcp_host if heartbeat.tcp_host else source_addr[0]
-        peer_tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1]
-        peer_tcp_addr = (peer_tcp_host, peer_tcp_port)
-
-        await self._confirm_peer(source_addr)
-
-        udp_addr = source_addr
-        if udp_addr not in self._state._gate_udp_to_tcp:
-            self._state._gate_udp_to_tcp[udp_addr] = peer_tcp_addr
-        elif self._state._gate_udp_to_tcp[udp_addr] != peer_tcp_addr:
-            old_tcp_addr = self._state._gate_udp_to_tcp[udp_addr]
-            await self._state.remove_active_peer(old_tcp_addr)
-            self._state.cleanup_peer_udp_tracking(old_tcp_addr)
-            self._state.cleanup_peer_tcp_tracking(old_tcp_addr)
-            self._state._gate_udp_to_tcp[udp_addr] = peer_tcp_addr
-
-        self._state._gate_peer_info[source_addr] = heartbeat
-
-        self._peer_discovery.add_peer(
-            peer_id=heartbeat.node_id,
-            host=peer_tcp_host,
-            port=peer_tcp_port,
-            role="gate",
-        )
-
-        await self._job_hash_ring.add_node(
-            node_id=heartbeat.node_id,
-            tcp_host=peer_tcp_host,
-            tcp_port=peer_tcp_port,
-        )
-
-        self._job_forwarding_tracker.register_peer(
-            gate_id=heartbeat.node_id,
-            tcp_host=peer_tcp_host,
-            tcp_port=peer_tcp_port,
-        )
-
-        gate_id = heartbeat.node_id
-        health_state = self._state._gate_peer_health.get(gate_id)
-        if not health_state:
-            health_state = GateHealthState(
-                gate_id=gate_id,
-                config=self._gate_health_config,
-            )
-            self._state._gate_peer_health[gate_id] = health_state
-
-        health_state.update_liveness(success=True)
-        health_state.update_readiness(
-            has_dc_connectivity=heartbeat.connected_dc_count > 0,
-            connected_dc_count=heartbeat.connected_dc_count,
-            overload_state=getattr(heartbeat, "overload_state", "healthy"),
-        )
-
-        self._task_runner.run(
-            self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
-        )
 
     def get_healthy_gates(self) -> list[GateInfo]:
         gates: list[GateInfo] = []

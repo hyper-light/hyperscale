@@ -32,7 +32,6 @@ class TestGateRuntimeStateInitialization:
         assert state._peer_state_epoch == {}
         assert state._gate_peer_info == {}
         assert state._known_gates == {}
-        assert state._gate_peer_health == {}
 
         # Datacenter/manager state
         assert state._dc_registration_states == {}

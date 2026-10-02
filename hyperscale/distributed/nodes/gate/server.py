@@ -135,7 +135,6 @@ from hyperscale.distributed.swim.core import (
 from hyperscale.distributed.swim.detection import HierarchicalConfig
 from hyperscale.distributed.health import (
     ManagerHealthConfig,
-    GateHealthConfig,
     CircuitBreakerManager,
     LatencyTracker,
 )
@@ -358,7 +357,6 @@ class GateServer(HealthAwareServer):
         # times, health and negotiated capabilities live in
         # GateRuntimeState (_modular_state).
         self._manager_health_config = ManagerHealthConfig()
-        self._gate_health_config = GateHealthConfig()
 
         # Latency tracking
         self._peer_gate_latency_tracker = LatencyTracker(
@@ -833,7 +831,6 @@ class GateServer(HealthAwareServer):
             job_forwarding_tracker=self._job_forwarding_tracker,
             job_leadership_tracker=self._job_leadership_tracker,
             versioned_clock=self._versioned_clock,
-            gate_health_config=self._gate_health_config,
             recovery_semaphore=self._recovery_semaphore,
             recovery_jitter_min=0.0,
             recovery_jitter_max=getattr(self.env, "GATE_RECOVERY_JITTER_MAX", 1.0),
@@ -3801,7 +3798,6 @@ class GateServer(HealthAwareServer):
 
         for stale_gate_id in stale_gate_ids:
             self._modular_state.remove_known_gate(stale_gate_id)
-            self._modular_state._gate_peer_health.pop(stale_gate_id, None)
             await self._versioned_clock.remove_entity(stale_gate_id)
             await self._job_hash_ring.remove_node(stale_gate_id)
             self._job_forwarding_tracker.unregister_peer(stale_gate_id)

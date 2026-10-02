@@ -103,7 +103,6 @@ class TwoPassGate:
             job_forwarding_tracker=SimpleNamespace(unregister_peer=lambda gate_id: None),
             job_leadership_tracker=None,
             versioned_clock=None,
-            gate_health_config=None,
             recovery_semaphore=asyncio.Semaphore(1),
             recovery_jitter_min=0.0,
             recovery_jitter_max=0.0,

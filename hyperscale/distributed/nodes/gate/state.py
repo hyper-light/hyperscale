@@ -22,7 +22,6 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.health import (
     ManagerHealthState,
-    GateHealthState,
 )
 from hyperscale.distributed.reliability import BackpressureLevel
 
@@ -77,7 +76,6 @@ class GateRuntimeState:
         self._peer_state_epoch: dict[tuple[str, int], int] = {}
         self._gate_peer_info: dict[tuple[str, int], GateHeartbeat] = {}
         self._known_gates: dict[str, GateInfo] = {}
-        self._gate_peer_health: dict[str, GateHealthState] = {}
 
         # Datacenter/manager state
         self._dc_registration_states: dict[str, DatacenterRegistrationState] = {}
@@ -687,7 +685,6 @@ class GateRuntimeState:
 
         # Clean up gate_id-keyed structures
         for gate_id in gate_ids_to_remove:
-            self._gate_peer_health.pop(gate_id, None)
             self._known_gates.pop(gate_id, None)
 
         return gate_ids_to_remove
