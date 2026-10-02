@@ -18,6 +18,7 @@ from hyperscale.distributed.nodes.gate.handlers.tcp_cancellation import (
     GateCancellationHandler,
 )
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
+from hyperscale.distributed.jobs.gates.gate_job_manager import GateJobManager
 from hyperscale.distributed.models import (
     CancelJob,
     CancelAck,
@@ -74,6 +75,10 @@ class MockGateJobManager:
 
     jobs: dict = field(default_factory=dict)
     callbacks: dict = field(default_factory=dict)
+    target_dcs: dict = field(default_factory=dict)
+
+    def get_target_dcs(self, job_id: str) -> set[str]:
+        return self.target_dcs.get(job_id, set())
 
     def get_job(self, job_id: str):
         return self.jobs.get(job_id)
@@ -100,7 +105,6 @@ def create_mock_handler(
     job_manager: MockGateJobManager = None,
     rate_limit_allowed: bool = True,
     rate_limit_retry: float = 0.0,
-    available_dcs: list[str] = None,
     datacenter_managers: dict = None,
     send_tcp_response: bytes = None,
 ) -> GateCancellationHandler:
@@ -109,8 +113,6 @@ def create_mock_handler(
         state = GateRuntimeState()
     if job_manager is None:
         job_manager = MockGateJobManager()
-    if available_dcs is None:
-        available_dcs = ["dc-east", "dc-west"]
     if datacenter_managers is None:
         datacenter_managers = {
             "dc-east": [("10.0.0.1", 8000)],
@@ -141,7 +143,6 @@ def create_mock_handler(
         get_tcp_port=lambda: 9000,
         check_rate_limit=mock_check_rate_limit,
         send_tcp=mock_send_tcp,
-        get_available_datacenters=lambda: available_dcs,
         record_cancellation=record_cancellation_noop,
     )
 
@@ -443,7 +444,6 @@ class TestHandleCancelJobFailureModes:
             get_tcp_port=lambda: 9000,
             check_rate_limit=mock_check_rate_limit,
             send_tcp=failing_send,
-            get_available_datacenters=lambda: ["dc-east"],
             record_cancellation=record_cancellation_noop,
         )
 
@@ -598,8 +598,8 @@ class TestEdgeCases:
         assert isinstance(result, bytes)
 
     @pytest.mark.asyncio
-    async def test_no_available_datacenters(self):
-        """Handles cancel when no DCs are available."""
+    async def test_no_known_datacenters(self):
+        """Handles cancel when the job has no targets and no DC is known."""
         job_manager = MockGateJobManager()
         job_manager.jobs["job-123"] = GlobalJobStatus(
             job_id="job-123",
@@ -610,7 +610,6 @@ class TestEdgeCases:
 
         handler = create_mock_handler(
             job_manager=job_manager,
-            available_dcs=[],
             datacenter_managers={},
         )
 
@@ -743,3 +742,68 @@ __all__ = [
     "TestConcurrency",
     "TestEdgeCases",
 ]
+
+
+# =============================================================================
+# Cancellation targets the job's datacenters
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_reaches_exactly_the_jobs_datacenters() -> None:
+    """A cancel goes to every DC the job was dispatched to and no other.
+
+    It used to go to every DC not classified UNHEALTHY: DCs that never
+    ran the job got a cancel, and a DC that was running the job but
+    momentarily unhealthy was skipped -- the job kept running there
+    until it timed out. Driven through the real handler over the real
+    GateJobManager."""
+    job_manager = GateJobManager()
+    job_manager.set_job(
+        "job-123",
+        GlobalJobStatus(
+            job_id="job-123",
+            status=JobStatus.RUNNING.value,
+            datacenters=[],
+            timestamp=1234567890.0,
+        ),
+    )
+    job_manager.set_target_dcs("job-123", {"dc-west", "dc-south"})
+    datacenter_managers = {
+        "dc-east": [("10.0.0.1", 8000)],
+        "dc-west": [("10.0.0.2", 8000)],
+        "dc-south": [("10.0.0.3", 8000)],
+    }
+    sent_to: list[tuple[str, int]] = []
+
+    async def recording_send(addr, msg_type, data, timeout=None):
+        sent_to.append(addr)
+        return (CancelAck(job_id="job-123", cancelled=True, workflows_cancelled=1).dump(), None)
+
+    async def allow(client_id, op):
+        return (True, 0)
+
+    handler = GateCancellationHandler(
+        state=GateRuntimeState(),
+        logger=MockLogger(),
+        task_runner=MockTaskRunner(),
+        job_manager=job_manager,
+        datacenter_managers=datacenter_managers,
+        get_node_id=lambda: MockNodeId(),
+        get_host=lambda: "127.0.0.1",
+        get_tcp_port=lambda: 9000,
+        check_rate_limit=allow,
+        send_tcp=recording_send,
+        record_cancellation=record_cancellation_noop,
+    )
+
+    async def raise_exception(error, context):
+        raise error
+
+    await handler.handle_cancel_job(
+        addr=("10.0.0.9", 8000),
+        data=CancelJob(job_id="job-123", reason="user_requested").dump(),
+        handle_exception=raise_exception,
+    )
+
+    assert sorted(set(sent_to)) == [("10.0.0.2", 8000), ("10.0.0.3", 8000)]

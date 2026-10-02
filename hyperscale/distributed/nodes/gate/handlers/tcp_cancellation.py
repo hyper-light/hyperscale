@@ -70,7 +70,6 @@ class GateCancellationHandler:
         get_tcp_port: Callable[[], int],
         check_rate_limit: Callable[[str, str], tuple[bool, float]],
         send_tcp: Callable,
-        get_available_datacenters: Callable[[], list[str]],
         record_cancellation: Callable[
             [str, str, str, list[tuple[str, int]]], Awaitable[None]
         ],
@@ -89,7 +88,6 @@ class GateCancellationHandler:
             get_tcp_port: Callback to get this gate's TCP port
             check_rate_limit: Callback to check rate limit
             send_tcp: Callback to send TCP messages
-            get_available_datacenters: Callback to get available DCs
             record_cancellation: Durably records a confirmed cancel as
                 (job_id, reason, requester_id, [(datacenter, cancelled)])
                 — AD-38 JobCancellationRequested + one JobCancellationAcked
@@ -112,9 +110,6 @@ class GateCancellationHandler:
             check_rate_limit
         )
         self._send_tcp: Callable = send_tcp
-        self._get_available_datacenters: Callable[[], list[str]] = (
-            get_available_datacenters
-        )
 
     def _build_cancel_response(
         self,
@@ -150,6 +145,15 @@ class GateCancellationHandler:
             return True
         except Exception:
             return False
+
+    def _cancellation_target_datacenters(self, job_id: str) -> list[str]:
+        """The datacenters a cancel must reach: every DC the job was
+        dispatched to, whatever its current health -- a DC that is
+        momentarily unhealthy may still be running the job, and a DC
+        the job never ran in has nothing to cancel. A job with no
+        recorded targets falls back to every known DC."""
+        target_datacenters = self._job_manager.get_target_dcs(job_id)
+        return sorted(target_datacenters or self._datacenter_managers.keys())
 
     async def handle_cancel_job(
         self,
@@ -252,7 +256,7 @@ class GateCancellationHandler:
             any_dc_confirmed = False
             confirmed_datacenters: list[tuple[str, int]] = []
 
-            for dc in self._get_available_datacenters():
+            for dc in self._cancellation_target_datacenters(job_id):
                 managers = self._datacenter_managers.get(dc, [])
                 dc_cancelled_count, dc_confirmed, dc_error = (
                     await self._cancel_job_in_dc_with_redirects(

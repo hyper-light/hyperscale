@@ -1053,7 +1053,6 @@ class GateServer(HealthAwareServer):
             get_tcp_port=lambda: self._tcp_port,
             check_rate_limit=self._check_rate_limit_for_operation,
             send_tcp=self._send_tcp,
-            get_available_datacenters=self._get_available_datacenters,
             record_cancellation=self._record_cancellation_durable,
         )
 
@@ -4508,15 +4507,6 @@ class GateServer(HealthAwareServer):
                             node_id=self._node_id.full if self._node_id else "unknown",
                         ),
                     )
-
-    def _get_available_datacenters(self) -> list[str]:
-        """Get list of available datacenters."""
-        healthy = []
-        for dc_id in self._datacenter_managers.keys():
-            status = self._classify_datacenter_health(dc_id)
-            if status.health != DatacenterHealth.UNHEALTHY.value:
-                healthy.append(dc_id)
-        return healthy
 
     def _select_datacenters_with_fallback(
         self,
