@@ -34,7 +34,6 @@ import asyncio
 import dataclasses
 import hashlib
 import statistics
-from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -89,7 +88,6 @@ from hyperscale.distributed.models import (
     CancelAck,
     JobCancelResponse,
     GateStateSnapshot,
-    DatacenterLease,
     DatacenterHealth,
     DatacenterRegistrationState,
     DatacenterStatus,
@@ -137,7 +135,6 @@ from hyperscale.distributed.swim.core import (
 from hyperscale.distributed.swim.detection import HierarchicalConfig
 from hyperscale.distributed.health import (
     ManagerHealthConfig,
-    GateHealthState,
     GateHealthConfig,
     CircuitBreakerManager,
     LatencyTracker,
@@ -362,7 +359,6 @@ class GateServer(HealthAwareServer):
         # times, health and negotiated capabilities live in
         # GateRuntimeState (_modular_state).
         self._manager_health_config = ManagerHealthConfig()
-        self._gate_peer_health: dict[str, GateHealthState] = {}
         self._gate_health_config = GateHealthConfig()
 
         # Latency tracking
@@ -454,14 +450,6 @@ class GateServer(HealthAwareServer):
             cleanup_interval=env.JOB_LEASE_CLEANUP_INTERVAL,
         )
 
-        # Per-job per-DC manager tracking
-
-        # Cancellation tracking
-        self._cancellation_completion_events: dict[str, asyncio.Event] = {}
-        self._cancellation_errors: dict[str, list[str]] = defaultdict(list)
-
-        # Progress callbacks
-
         self._partition_detected_callbacks: list[Callable[[list[str]], None]] = []
         self._partition_healed_callbacks: list[Callable[[list[str]], None]] = []
 
@@ -492,10 +480,6 @@ class GateServer(HealthAwareServer):
         )
         self._leadership_refusals.append(self._is_clock_fenced)
 
-        # Job submissions
-
-        # Reporter tasks
-        self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
         self._job_aggregated_workflow_stats: dict[
             str, dict[str, list[WorkflowStats]]
         ] = {}
@@ -570,16 +554,9 @@ class GateServer(HealthAwareServer):
             max_forward_attempts=3,
         )
 
-        # Legacy leases
-        self._leases: dict[str, DatacenterLease] = {}
-        self._fence_token = 0
-
         # Orphan job tracking
-        self._dead_job_leaders: set[tuple[str, int]] = set()
-        self._orphaned_jobs: dict[str, float] = {}
         self._orphan_grace_period: float = env.GATE_ORPHAN_GRACE_PERIOD
         self._orphan_check_interval: float = env.GATE_ORPHAN_CHECK_INTERVAL
-        self._orphan_check_task: asyncio.Task | None = None
         self._resource_sampling_token: str | None = None
 
         self._dead_peer_reap_interval: float = env.GATE_DEAD_PEER_REAP_INTERVAL
@@ -2361,8 +2338,6 @@ class GateServer(HealthAwareServer):
             self._modular_state.set_job_dc_manager(
                 transfer.job_id, transfer.datacenter_id, transfer.new_manager_addr
             )
-
-            self._clear_orphaned_job(transfer.job_id, transfer.new_manager_addr)
 
             self._task_runner.run(
                 self._udp_logger.log,
@@ -6627,14 +6602,6 @@ class GateServer(HealthAwareServer):
 
         return fallback_addr
 
-    def _clear_orphaned_job(
-        self,
-        job_id: str,
-        new_manager_addr: tuple[str, int],
-    ) -> None:
-        """Clear orphaned status when a new manager takes over a job."""
-        self._orphaned_jobs.pop(job_id, None)
-
     async def _wait_for_cluster_stabilization(self) -> None:
         """Wait for SWIM cluster to stabilize."""
         expected_peers = len(self._gate_udp_peers)
@@ -6849,13 +6816,6 @@ class GateServer(HealthAwareServer):
                 await self._clock.sleep(self._lease_timeout / 2)
                 self._dc_lease_manager.cleanup_expired()
 
-                now = self._clock.monotonic()
-                expired = [
-                    key for key, lease in self._leases.items() if lease.expires_at < now
-                ]
-                for key in expired:
-                    self._leases.pop(key, None)
-
             except asyncio.CancelledError:
                 break
             except Exception as error:
@@ -6918,9 +6878,6 @@ class GateServer(HealthAwareServer):
         self._job_leadership_tracker.release_leadership(job_id)
         await self._best_effort_manager.cleanup(job_id)
 
-        reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
-        self._cancel_reporter_tasks(reporter_tasks)
-
         self._job_stats_crdt.pop(job_id, None)
 
         state_reporter_tasks = self._modular_state.pop_job_reporter_tasks(job_id)
@@ -6945,6 +6902,11 @@ class GateServer(HealthAwareServer):
 
                 for job_id in jobs_to_remove:
                     await self._cleanup_single_job(job_id)
+
+                # Prepared replicas whose leader died mid-prepare (no
+                # commit or abort will come) and expired commit-rollback
+                # records: retained at most TTL + one cleanup interval.
+                await self._replication_coordinator.reap_expired_prepared()
 
             except asyncio.CancelledError:
                 break
