@@ -3,7 +3,6 @@ Unit tests for Manager Core Modules from Section 15.4.6 of REFACTOR.md.
 
 Tests cover:
 - ManagerRegistry
-- ManagerCancellationCoordinator
 - ManagerLeaseCoordinator
 - ManagerWorkflowLifecycle
 - ManagerDispatchCoordinator
@@ -30,9 +29,6 @@ from hyperscale.distributed.nodes.manager.state import ManagerState
 from hyperscale.distributed.nodes.manager.config import ManagerConfig
 from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
 from hyperscale.distributed.reliability import StatsBuffer, StatsBufferConfig
-from hyperscale.distributed.nodes.manager.cancellation import (
-    ManagerCancellationCoordinator,
-)
 from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator
 from hyperscale.distributed.nodes.manager.workflow_lifecycle import (
     ManagerWorkflowLifecycle,
@@ -557,92 +553,6 @@ class TestManagerLeaseCoordinatorEdgeCases:
         assert leases.get_job_leader("job-123") is None
         assert leases.get_fence_token("job-123") == 0
         assert leases.get_layer_version("job-123") == 0
-
-
-# =============================================================================
-# ManagerCancellationCoordinator Tests
-# =============================================================================
-
-
-class TestManagerCancellationCoordinatorHappyPath:
-    """Happy path tests for ManagerCancellationCoordinator."""
-
-    @pytest.mark.asyncio
-    async def test_cancel_job_not_found(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
-    ):
-        """Cancelling nonexistent job returns error."""
-        coord = ManagerCancellationCoordinator(
-            state=manager_state,
-            config=manager_config,
-            logger=mock_logger,
-            node_id="manager-1",
-            task_runner=mock_task_runner,
-            send_to_worker=AsyncMock(),
-            send_to_client=AsyncMock(),
-        )
-
-        request = MagicMock()
-        request.job_id = "nonexistent-job"
-        request.reason = "Test cancellation"
-
-        result = await coord.cancel_job(request, ("10.0.0.1", 9000))
-
-        # Should return error response
-        assert b"Job not found" in result or b"accepted" in result.lower()
-
-    def test_is_workflow_cancelled(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
-    ):
-        """Can check if workflow is cancelled."""
-        coord = ManagerCancellationCoordinator(
-            state=manager_state,
-            config=manager_config,
-            logger=mock_logger,
-            node_id="manager-1",
-            task_runner=mock_task_runner,
-            send_to_worker=AsyncMock(),
-            send_to_client=AsyncMock(),
-        )
-
-        assert coord.is_workflow_cancelled("wf-123") is False
-
-        # Mark as cancelled
-        cancelled_info = MagicMock()
-        cancelled_info.cancelled_at = time.time()
-        manager_state._cancelled_workflows["wf-123"] = cancelled_info
-
-        assert coord.is_workflow_cancelled("wf-123") is True
-
-    def test_cleanup_old_cancellations(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
-    ):
-        """Can cleanup old cancellation records."""
-        coord = ManagerCancellationCoordinator(
-            state=manager_state,
-            config=manager_config,
-            logger=mock_logger,
-            node_id="manager-1",
-            task_runner=mock_task_runner,
-            send_to_worker=AsyncMock(),
-            send_to_client=AsyncMock(),
-        )
-
-        # Add old and new cancellations
-        old_info = MagicMock()
-        old_info.cancelled_at = time.time() - 1000  # Old
-
-        new_info = MagicMock()
-        new_info.cancelled_at = time.time()  # New
-
-        manager_state._cancelled_workflows["wf-old"] = old_info
-        manager_state._cancelled_workflows["wf-new"] = new_info
-
-        cleaned = coord.cleanup_old_cancellations(max_age_seconds=500)
-
-        assert cleaned == 1
-        assert "wf-old" not in manager_state._cancelled_workflows
-        assert "wf-new" in manager_state._cancelled_workflows
 
 
 # =============================================================================

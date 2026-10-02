@@ -11,8 +11,10 @@ from .worker_sync_state import WorkerSyncState
 from .job_sync_state import JobSyncState
 from .workflow_lifecycle_state import WorkflowLifecycleState
 from .provision_state import ProvisionState
+from .parsed_cancel_request import ParsedCancelRequest
 
 __all__ = [
+    "ParsedCancelRequest",
     "WorkerEvictionNoticeState",
     "PeerState",
     "GatePeerState",
