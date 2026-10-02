@@ -86,11 +86,6 @@ class MercurySyncHTTPConnection:
 
         self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
         self._connections: List[HTTPConnection] = []
-        # Connections taken from the pool by an in-flight request. A
-        # request cancelled mid-flight (every in-flight request when a
-        # run's duration ends) never returns its connection, so close()
-        # must reach these too or their sockets stay open.
-        self._checked_out_connections: set[HTTPConnection] = set()
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
@@ -674,7 +669,7 @@ class MercurySyncHTTPConnection:
         self._url_cache[optimized_url.optimized.hostname] = url
         self._optimized[optimized_url.call_name] = url
 
-        self._return_connection(connection)
+        self._connections.append(connection)
         
     async def _request(
         self,
@@ -860,7 +855,6 @@ class MercurySyncHTTPConnection:
         if redirect_url:
             request_url = redirect_url
 
-        connection: HTTPConnection | None = None
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
@@ -916,7 +910,11 @@ class MercurySyncHTTPConnection:
                     )
 
                 timings["connect_end"] = time.monotonic()
-                self._replace_connection(connection)
+                self._connections.append(
+                    HTTPConnection(
+                        reset_connections=self.reset_connections,
+                    )
+                )
 
                 return (
                     HTTPResponse(
@@ -973,7 +971,7 @@ class MercurySyncHTTPConnection:
                         headers=headers,
                     )
 
-                self._return_connection(connection)
+                self._connections.append(connection)
 
                 return (
                     HTTPResponse(
@@ -1128,7 +1126,7 @@ class MercurySyncHTTPConnection:
 
             if status >= 300 and status < 400:
                 timings["read_end"] = time.monotonic()
-                self._return_connection(connection)
+                self._connections.append(connection)
 
                 return (
                     HTTPResponse(
@@ -1150,7 +1148,7 @@ class MercurySyncHTTPConnection:
                 )
 
             timings["read_end"] = time.monotonic()
-            self._return_connection(connection)
+            self._connections.append(connection)
 
             if span and self.trace.enabled:
                 span = await self.trace.on_request_end(
@@ -1186,7 +1184,11 @@ class MercurySyncHTTPConnection:
             Exception,
             socket.error
         ) as err:
-            self._replace_connection(connection)
+            self._connections.append(
+                HTTPConnection(
+                    reset_connections=self.reset_connections,
+                )
+            )
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -1325,7 +1327,6 @@ class MercurySyncHTTPConnection:
             )
 
         connection = self._connections.pop()
-        self._checked_out_connections.add(connection)
         connection_error: Optional[Exception] = None
 
         if url.address is None or ssl_redirect_url:
@@ -1347,7 +1348,6 @@ class MercurySyncHTTPConnection:
 
                 except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(err):
-                        self._return_connection(connection)
                         return (
                             None,
                             parsed_url,
@@ -1694,25 +1694,6 @@ class MercurySyncHTTPConnection:
         
         mime_type, _ = mimetypes.guess_file_type(path)
 
-    def _return_connection(self, connection: HTTPConnection) -> None:
-        """Give a request's connection back to the pool."""
-        self._checked_out_connections.discard(connection)
-        self._connections.append(connection)
-
-    def _replace_connection(self, connection: HTTPConnection | None) -> None:
-        """A request failed on ``connection`` (None: it never got one):
-        close it -- its socket would otherwise leak -- and give the pool
-        a fresh connection in its place."""
-        if connection is not None:
-            self._checked_out_connections.discard(connection)
-            connection.close()
-        self._connections.append(
-            HTTPConnection(
-                reset_connections=self.reset_connections,
-            )
-        )
-
     def close(self):
-        for connection in [*self._connections, *self._checked_out_connections]:
+        for connection in self._connections:
             connection.close()
-        self._checked_out_connections.clear()
