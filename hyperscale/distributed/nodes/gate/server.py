@@ -797,7 +797,7 @@ class GateServer(HealthAwareServer):
             get_node_addr=lambda: (self._host, self._tcp_port),
             send_tcp=self._send_tcp,
             get_active_peers=lambda: self._modular_state.get_active_peers_list(),
-            configured_gate_count=self._configured_gate_count(),
+            get_cluster_size=self._configured_gate_count,
         )
 
         self._dispatch_coordinator = GateDispatchCoordinator(
@@ -4651,11 +4651,13 @@ class GateServer(HealthAwareServer):
             self._task_runner.run(self._leader_election._step_down)
 
     def _configured_gate_count(self) -> int:
-        """Return the static gate cluster size used for quorum decisions."""
+        """The gate cluster size every quorum decision uses: this gate plus
+        every peer it is configured with, knows of, or holds active."""
         return max(
             1,
             self._modular_state.get_known_gate_count() + 1,
             len(self._gate_peers) + 1,
+            self._modular_state.get_active_peer_count() + 1,
         )
 
     def _get_healthy_gates(self) -> list[GateInfo]:
@@ -7244,7 +7246,7 @@ class GateServer(HealthAwareServer):
     async def _check_quorum_status(self) -> None:
         active_peer_count = self._modular_state.get_active_peer_count() + 1
         known_gate_count = self._configured_gate_count()
-        quorum_size = known_gate_count // 2 + 1
+        quorum_size = self._quorum_size()
 
         if active_peer_count < quorum_size:
             self._consecutive_quorum_failures += 1

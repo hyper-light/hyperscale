@@ -54,7 +54,7 @@ class GateLeadershipCoordinator:
         get_node_addr: Callable,
         send_tcp: Callable,
         get_active_peers: Callable,
-        configured_gate_count: int = 1,
+        get_cluster_size: Callable[[], int],
     ) -> None:
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
@@ -64,7 +64,7 @@ class GateLeadershipCoordinator:
         self._get_node_addr: Callable = get_node_addr
         self._send_tcp: Callable = send_tcp
         self._get_active_peers: Callable = get_active_peers
-        self._configured_gate_count = max(1, configured_gate_count)
+        self._get_cluster_size: Callable[[], int] = get_cluster_size
 
     def is_job_leader(self, job_id: str) -> bool:
         """
@@ -447,12 +447,9 @@ class GateLeadershipCoordinator:
         self._state.clear_orphaned_job(job_id)
 
     def get_quorum_size(self) -> int:
-        total_gates = max(
-            self._configured_gate_count,
-            self._state.get_known_gate_count() + 1,
-            self._state.get_active_peer_count() + 1,
-        )
-        return (total_gates // 2) + 1
+        """Majority of the gate cluster (the server's one cluster-size
+        definition, read live)."""
+        return (self._get_cluster_size() // 2) + 1
 
     def has_quorum(self, gate_state_value: str) -> bool:
         if gate_state_value != "active":

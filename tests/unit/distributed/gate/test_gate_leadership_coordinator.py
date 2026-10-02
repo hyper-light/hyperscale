@@ -119,6 +119,7 @@ class TestIsJobLeaderHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         assert coordinator.is_job_leader("job-1") is True
@@ -137,6 +138,7 @@ class TestIsJobLeaderHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         assert coordinator.is_job_leader("job-1") is False
@@ -164,6 +166,7 @@ class TestAssumeLeadershipHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         coordinator.assume_leadership("job-1", 3)
@@ -198,6 +201,7 @@ class TestBroadcastLeadershipHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: peers,
+            get_cluster_size=lambda: 1,
         )
 
         await coordinator.broadcast_leadership("job-1", 2)
@@ -222,6 +226,7 @@ class TestBroadcastLeadershipHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],  # No peers
+            get_cluster_size=lambda: 1,
         )
 
         await coordinator.broadcast_leadership("job-1", 2)
@@ -251,6 +256,7 @@ class TestHandleLeadershipAnnouncementHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         ack = coordinator.handle_leadership_announcement(
@@ -279,6 +285,7 @@ class TestHandleLeadershipAnnouncementHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         ack = coordinator.handle_leadership_announcement(
@@ -310,6 +317,7 @@ class TestHandleLeadershipAnnouncementNegativePath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         ack = coordinator.handle_leadership_announcement(
@@ -338,6 +346,7 @@ class TestHandleLeadershipAnnouncementNegativePath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         ack = coordinator.handle_leadership_announcement(
@@ -389,6 +398,7 @@ class TestTransferLeadershipHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=mock_send,
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         # The actual test depends on JobLeaderGateTransferAck
@@ -419,6 +429,7 @@ class TestTransferLeadershipHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         result = await coordinator.transfer_leadership(
@@ -452,6 +463,7 @@ class TestTransferLeadershipFailureMode:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=failing_send,
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         result = await coordinator.transfer_leadership(
@@ -485,6 +497,7 @@ class TestHandleLeadershipTransferHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         ack = coordinator.handle_leadership_transfer(
@@ -516,6 +529,7 @@ class TestHandleLeadershipTransferNegativePath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         ack = coordinator.handle_leadership_transfer(
@@ -553,6 +567,7 @@ class TestGetJobLeaderHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         result = coordinator.get_job_leader("job-1")
@@ -582,6 +597,7 @@ class TestGetJobLeaderHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         result = coordinator.get_job_leader("job-1")
@@ -605,6 +621,7 @@ class TestGetJobLeaderHappyPath:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         result = coordinator.get_job_leader("unknown-job")
@@ -634,6 +651,7 @@ class TestOrphanJobManagement:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         coordinator.mark_job_orphaned("job-1")
@@ -655,6 +673,7 @@ class TestOrphanJobManagement:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         coordinator.clear_orphaned_job("job-1")
@@ -685,6 +704,7 @@ class TestConcurrency:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         # Send many concurrent announcements for different jobs
@@ -723,6 +743,7 @@ class TestConcurrency:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: peers,
+            get_cluster_size=lambda: 1,
         )
 
         # Broadcast for all jobs concurrently
@@ -757,6 +778,7 @@ class TestEdgeCases:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         ack = coordinator.handle_leadership_announcement(
@@ -783,6 +805,7 @@ class TestEdgeCases:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         ack = coordinator.handle_leadership_announcement(
@@ -809,6 +832,7 @@ class TestEdgeCases:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         special_ids = [
@@ -842,6 +866,7 @@ class TestEdgeCases:
             get_node_addr=lambda: ("127.0.0.1", 9000),
             send_tcp=AsyncMock(),
             get_active_peers=lambda: [],
+            get_cluster_size=lambda: 1,
         )
 
         ack = coordinator.handle_leadership_announcement(
