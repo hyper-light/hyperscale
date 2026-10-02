@@ -138,6 +138,7 @@ from hyperscale.distributed.jobs.job_status_order import JobStatusOrder
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
+from hyperscale.distributed.ledger.storage_health import StorageHealth
 from hyperscale.distributed.ledger.pipeline.commit_pipeline import CommitResult
 from hyperscale.distributed.raft import LedgerReplicator
 from hyperscale.distributed.resources.resource_budget import ResourceBudget
@@ -307,6 +308,10 @@ class ManagerServer(HealthAwareServer):
 
         self._node_wal: NodeWAL | None = None
         self._job_ledger: JobLedger | None = None
+        # One storage-health tracker for every durable store this manager
+        # keeps (job ledger WAL + checkpoints, idempotency ledger,
+        # persisted submissions): they share a device.
+        self._storage_health = StorageHealth()
         # Storage seam for submission-payload persistence (borrowed,
         # never shut down here; swap_defaults rebinds it under SIM).
         self._storage_filesystem: Filesystem = _DEFAULT_FILESYSTEM
@@ -884,6 +889,7 @@ class ManagerServer(HealthAwareServer):
             ),
             get_known_gates=self._get_known_gates_for_heartbeat,
             get_job_leaderships=self._get_job_leaderships_for_heartbeat,
+            get_storage_writable=self._is_storage_writable,
         )
 
     # =========================================================================
@@ -993,6 +999,7 @@ class ManagerServer(HealthAwareServer):
                 regional_replicator=self._ledger_replicator.replicate,
                 logger=self._udp_logger,
                 clock=self._hlc,
+                storage_health=self._storage_health,
             )
             self._node_wal = self._job_ledger._wal
 
@@ -1007,6 +1014,7 @@ class ManagerServer(HealthAwareServer):
             wal_path=ledger_path,
             task_runner=self._task_runner,
             logger=self._udp_logger,
+            storage_health=self._storage_health,
         )
         await self._idempotency_ledger.start()
 
@@ -3035,8 +3043,41 @@ class ManagerServer(HealthAwareServer):
         caller the WAL never compacts: pending entries accumulate for
         the process lifetime and recovery replays from LSN 0.
         """
-        if self._job_ledger is not None:
-            await self._job_ledger.maybe_checkpoint()
+        if self._job_ledger is None:
+            return
+        # While storage is unwritable gates route jobs away, so nothing
+        # writes on its own: probe it here, on the same cadence, so the
+        # recovery is noticed and placement returns.
+        if not self._storage_health.writable:
+            await self._probe_storage()
+            return
+        await self._job_ledger.maybe_checkpoint()
+
+    def _is_storage_writable(self) -> bool:
+        """What this manager's heartbeats report: whether its durable
+        storage can take its writes. Only a manager with a durable tier
+        is storage-gated."""
+        if self._job_ledger is None:
+            return True
+        return self._storage_health.writable
+
+    async def _probe_storage(self) -> None:
+        """Prove the data directory can again take the largest write it
+        refused: write a file of exactly that size, durably, then remove
+        it. A smaller write could fit where the refused one cannot."""
+        unproven_bytes = self._storage_health.unproven_bytes
+        if unproven_bytes is None or self._config.wal_data_dir is None:
+            return
+        probe_path = self._config.wal_data_dir / ".storage-probe"
+        try:
+            await self._storage_filesystem.atomic_write(
+                probe_path, bytes(unproven_bytes)
+            )
+        except OSError as probe_error:
+            self._storage_health.record_failure(probe_error, unproven_bytes)
+            return
+        self._storage_health.record_success(unproven_bytes)
+        await self._storage_filesystem.remove(probe_path)
 
     def _get_manager_tracked_workflow_ids_for_worker(self, worker_id: str) -> set[str]:
         """Get workflow tokens that the manager thinks are running on a specific worker."""
@@ -4436,6 +4477,7 @@ class ManagerServer(HealthAwareServer):
             slo_routing_factor=slo_summary.routing_factor,
             slo_updated_at=slo_summary.updated_at,
             resource_report=self._build_resource_report(),
+            storage_writable=self._is_storage_writable(),
         )
 
     async def _build_xprobe_response(
@@ -9109,10 +9151,16 @@ class ManagerServer(HealthAwareServer):
         await self._storage_filesystem.mkdir(
             submissions_dir, parents=True, exist_ok=True
         )
-        await self._storage_filesystem.atomic_write(
-            submissions_dir / f"{submission.job_id}.bin",
-            submission.dump(),
-        )
+        payload = submission.dump()
+        try:
+            await self._storage_filesystem.atomic_write(
+                submissions_dir / f"{submission.job_id}.bin",
+                payload,
+            )
+        except OSError as storage_error:
+            self._storage_health.record_failure(storage_error, len(payload))
+            raise
+        self._storage_health.record_success(len(payload))
 
     async def _discard_persisted_submission(self, job_id: str) -> None:
         """Remove a terminal job's persisted submission payload —

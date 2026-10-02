@@ -25,6 +25,8 @@ from hyperscale.distributed.runtime import (
 )
 
 
+from hyperscale.distributed.ledger.storage_health import StorageHealth
+
 _DEFAULT_CLOCK: Clock = RealClock()
 
 # Module-level storage seam (Phase 7). The writer BORROWS this
@@ -127,7 +129,7 @@ class WALWriter:
         "_filesystem",
         "_committed_length",
         "_storage_failure",
-        "_storage_failed_at",
+        "_storage_health",
     )
 
     def __init__(
@@ -140,8 +142,12 @@ class WALWriter:
         | None = None,
         logger: Logger | None = None,
         filesystem: Filesystem | None = None,
+        storage_health: StorageHealth | None = None,
     ) -> None:
         self._path = path
+        # Shared node storage health this writer records its commit
+        # outcomes into (None: the owner does not track storage health).
+        self._storage_health = storage_health
         self._config = config or WALWriterConfig()
         self._logger = logger
         # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
@@ -174,9 +180,8 @@ class WALWriter:
         # here before the writer continues.
         self._committed_length = 0
         # The most recent storage failure a group commit hit (cleared by
-        # the next successful commit) and when it began.
+        # the next successful commit).
         self._storage_failure: OSError | None = None
-        self._storage_failed_at: float | None = None
 
     def _create_background_task(self, coro, name: str) -> asyncio.Task:
         # Phase 6b: explicit ``self._loop.create_task`` instead of
@@ -338,10 +343,6 @@ class WALWriter:
         later commit succeeded."""
         return self._storage_failure
 
-    @property
-    def storage_failed_at(self) -> float | None:
-        """When the current storage failure began (monotonic), or None."""
-        return self._storage_failed_at
 
     @property
     def metrics(self) -> WALWriterMetrics:
@@ -481,7 +482,8 @@ class WALWriter:
             await self._filesystem.append_fsync(self._path, combined_data)
             self._committed_length += len(combined_data)
             self._storage_failure = None
-            self._storage_failed_at = None
+            if self._storage_health is not None:
+                self._storage_health.record_success(len(combined_data))
 
             self._metrics.total_written += len(requests)
             self._metrics.total_batches += 1
@@ -506,7 +508,7 @@ class WALWriter:
             for request in requests:
                 if not request.future.done():
                     request.future.set_exception(storage_error)
-            await self._discard_failed_append(storage_error)
+            await self._discard_failed_append(storage_error, len(combined_data))
 
         except BaseException as exception:
             self._error = exception
@@ -521,7 +523,9 @@ class WALWriter:
         finally:
             self._current_batch.clear()
 
-    async def _discard_failed_append(self, storage_error: OSError) -> None:
+    async def _discard_failed_append(
+        self, storage_error: OSError, attempted_bytes: int
+    ) -> None:
         """Cut the log back to its committed length after a failed append
         and record the storage failure; a failed cut latches the writer."""
         try:
@@ -532,9 +536,9 @@ class WALWriter:
         except BaseException as truncate_error:
             self._error = truncate_error
             raise truncate_error from storage_error
-        if self._storage_failure is None:
-            self._storage_failed_at = _DEFAULT_CLOCK.monotonic()
         self._storage_failure = storage_error
+        if self._storage_health is not None:
+            self._storage_health.record_failure(storage_error, attempted_bytes)
         if self._logger is not None:
             await self._logger.log(
                 WALError(

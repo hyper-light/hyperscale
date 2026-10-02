@@ -74,9 +74,15 @@ async def _open_ledger_with_archive(
     )
     from hyperscale.distributed.ledger.wal.node_wal import NodeWAL
 
+    from hyperscale.distributed.ledger.storage_health import StorageHealth
+
     clock = new_hybrid_logical_clock()
+    storage_health = StorageHealth()
     wal = await NodeWAL.open(
-        path=Path("/manager/ledger/wal"), clock=clock, filesystem=filesystem
+        path=Path("/manager/ledger/wal"),
+        clock=clock,
+        filesystem=filesystem,
+        storage_health=storage_health,
     )
     pipeline = CommitPipeline(wal=wal)
     checkpoint_manager = CheckpointManager(
@@ -97,6 +103,7 @@ async def _open_ledger_with_archive(
         checkpoint_manager=checkpoint_manager,
         job_id_generator=JobIdGenerator(region_code="dc-east", gate_id="mgr-1"),
         archive_store=archive_store,
+        storage_health=storage_health,
     )
     await ledger._recover()
     return ledger, archive_store

@@ -193,6 +193,15 @@ class DatacenterHealthManager:
         if not best_heartbeat:
             return self._build_unhealthy_status(dc_id, alive_count, 0)
 
+        # The authoritative manager cannot write durably (full or failing
+        # disk): any job placed here fails at its first ledger write.
+        # Route around it until its storage probe succeeds again.
+        if not best_heartbeat.storage_writable:
+            self._record_health_transition(dc_id, DatacenterHealth.UNHEALTHY.value)
+            return self._build_unhealthy_status(
+                dc_id, alive_count, best_heartbeat.worker_count
+            )
+
         # Live managers, zero workers: no capacity right now, but the
         # tier that accepts and queues work is up. Per the
         # DatacenterHealth contract that is BUSY ("transient, will clear

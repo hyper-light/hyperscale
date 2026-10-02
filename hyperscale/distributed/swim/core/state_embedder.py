@@ -387,6 +387,9 @@ class ManagerStateEmbedder:
     get_known_gates: Callable[[], dict[str, tuple[str, int, str, int]]] | None = None
     # Job leadership tracking for worker notification
     get_job_leaderships: Callable[[], dict[str, tuple[int, int]]] | None = None
+    # Whether the manager's durable storage can take its writes (gates
+    # route around a manager that cannot)
+    get_storage_writable: Callable[[], bool] | None = None
 
     def get_state(self) -> bytes | None:
         """Get ManagerHeartbeat to embed in SWIM messages."""
@@ -439,6 +442,9 @@ class ManagerStateEmbedder:
             job_leaderships=self.get_job_leaderships()
             if self.get_job_leaderships
             else {},
+            storage_writable=self.get_storage_writable()
+            if self.get_storage_writable
+            else True,
         )
         return heartbeat.dump()
 

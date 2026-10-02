@@ -44,7 +44,9 @@ def apply_storage_fault_schedule(context, storage_fault_schedule) -> None:
     ``("slow_disk", at_time, delay_seconds, until_time)`` — every
     storage operation costs ``delay_seconds`` of virtual time inside
     the window; ``("disk_full", at_time, remaining_bytes)`` — writes
-    beyond the byte budget raise ``OSError(ENOSPC)`` from then on.
+    beyond the byte budget raise ``OSError(ENOSPC)`` from then on;
+    ``("disk_full_window", at_time, remaining_bytes, until_time)`` — the
+    same budget, freed again at ``until_time`` (space reclaimed).
     """
     filesystem = context.filesystem
     for event in storage_fault_schedule:
@@ -60,6 +62,12 @@ def apply_storage_fault_schedule(context, storage_fault_schedule) -> None:
             context.loop.call_at(
                 at_time, filesystem.set_disk_full, remaining_bytes
             )
+        elif kind == "disk_full_window":
+            _kind, at_time, remaining_bytes, until_time = event
+            context.loop.call_at(
+                at_time, filesystem.set_disk_full, remaining_bytes
+            )
+            context.loop.call_at(until_time, filesystem.clear_disk_full)
         else:
             raise ValueError(f"unknown storage fault kind: {kind}")
 

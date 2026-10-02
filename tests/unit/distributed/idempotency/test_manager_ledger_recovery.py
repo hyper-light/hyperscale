@@ -98,8 +98,9 @@ async def test_entries_survive_restart_through_the_seam(tmp_path, filesystem):
 
 @pytest.mark.asyncio
 async def test_torn_tail_is_recovered_not_a_boot_loop(tmp_path, filesystem):
-    """The headline fix: crash debris at the WAL tail must not prevent
-    startup — across ANY number of restarts."""
+    """Crash debris at the WAL tail must not prevent startup, and once
+    recovered it is cut: entries appended afterwards survive every
+    later restart."""
     wal_path = tmp_path / "idempotency.wal"
 
     ledger = _ledger(wal_path, filesystem)
@@ -114,18 +115,32 @@ async def test_torn_tail_is_recovered_not_a_boot_loop(tmp_path, filesystem):
     with open(wal_path, "ab") as wal_file:
         wal_file.write(struct.pack(">I", 500) + b"short")
 
-    for restart_round in range(2):
-        recording_logger = _RecordingLogger()
-        restarted = _ledger(wal_path, filesystem, logger=recording_logger)
-        await restarted.start()  # previously raised ValueError forever
+    # The first restart recovers past the debris (previously it raised
+    # ValueError forever), reports it, and cuts it from the file.
+    recording_logger = _RecordingLogger()
+    restarted = _ledger(wal_path, filesystem, logger=recording_logger)
+    await restarted.start()
+    recovered = restarted.get_by_key(_key(1))
+    assert recovered is not None
+    assert recovered.status == IdempotencyStatus.COMMITTED
+    assert any(
+        "torn tail" in message for message in recording_logger.messages
+    ), recording_logger.messages
+    # An entry appended after recovering the debris must survive the
+    # next restart -- left in place, the torn frame would hide it.
+    await restarted.check_or_reserve(_key(2), "job-2")
+    await restarted.commit(_key(2), b"result-2")
+    await restarted.close()
 
-        recovered = restarted.get_by_key(_key(1))
-        assert recovered is not None, f"restart {restart_round}"
-        assert recovered.status == IdempotencyStatus.COMMITTED
-        assert any(
-            "torn tail" in message for message in recording_logger.messages
-        ), recording_logger.messages
-        await restarted.close()
+    second_logger = _RecordingLogger()
+    second_restart = _ledger(wal_path, filesystem, logger=second_logger)
+    await second_restart.start()
+    assert second_restart.get_by_key(_key(1)).status == IdempotencyStatus.COMMITTED
+    after_debris = second_restart.get_by_key(_key(2))
+    assert after_debris is not None, "the entry appended after the debris was lost"
+    assert after_debris.status == IdempotencyStatus.COMMITTED
+    assert not any("torn tail" in message for message in second_logger.messages)
+    await second_restart.close()
 
 
 @pytest.mark.asyncio

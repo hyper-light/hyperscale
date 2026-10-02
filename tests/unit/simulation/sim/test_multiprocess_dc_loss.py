@@ -35,6 +35,7 @@ anchors; see the per-scenario docstrings for the measured timelines):
 
 
 
+from hyperscale.distributed.env import Env
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.gate_cluster_demo import (
     gate_tier_entry,
@@ -676,10 +677,9 @@ def _run_disk_full_dispatch_failure() -> dict:
     Measured: the client observes a LOUD ``failed`` at 8.017 — right
     after the dispatch attempt hit ENOSPC. Neither worker ever runs
     the workflow (no silent cross-DC re-route of a dispatch-time
-    storage failure), and the disk-full manager keeps classifying
-    HEALTHY (storage state is invisible to DC health — placement
-    cannot route around a full disk; the loud failure is the
-    protection)."""
+    storage failure). The refused write makes the manager report its
+    storage unwritable, and the gate classifies dc-west UNHEALTHY from
+    the next heartbeat (8.5) for as long as the disk stays full."""
     coordinator = SimulationCoordinator(
         latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
@@ -713,13 +713,17 @@ def test_disk_full_manager_fails_job_loudly_without_cross_dc_retry():
         "worker-dc-east"
     ]
 
-    # Storage exhaustion is invisible to health classification: both
-    # DCs still end healthy — pinned so a future storage-aware
-    # classifier flips this assertion consciously.
+    # Storage-aware classification: the manager that cannot write
+    # durably reports it, and its datacenter stays UNHEALTHY for
+    # placement while the disk stays full (dc-east is untouched).
     assert _final_health(results["sim-gate-a"]) == {
         "dc-east": "healthy",
-        "dc-west": "healthy",
+        "dc-west": "unhealthy",
     }, results["sim-gate-a"]
+    west_unhealthy_times = _health_times(results["sim-gate-a"], "dc-west", "unhealthy")
+    assert west_unhealthy_times and west_unhealthy_times[0] <= finished_time + _HEARTBEAT_INTERVAL_SECONDS, (
+        results["sim-gate-a"]
+    )
 
     _assert_oracle_clean(client_log)
     _assert_no_unswapped_imports(results)
@@ -729,6 +733,83 @@ def test_disk_full_failure_is_replay_deterministic():
     assert (
         _run_disk_full_dispatch_failure() == _run_disk_full_dispatch_failure()
     )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 6b: storage-aware placement -- route around a full disk, return
+# when it frees
+# ---------------------------------------------------------------------------
+
+# dc-west's disk fills before the first job's dispatch-time writes (as in
+# scenario 6) and frees at _DISK_FREED_AT. A second, UNPINNED job is
+# submitted while the disk is full.
+_DISK_FREED_AT = 40.0
+_DISK_FULL_WINDOW_SCHEDULE = (("disk_full_window", _DISK_FULL_ARM_AT, 1024, _DISK_FREED_AT),)
+_SECOND_JOB_SUBMIT_AT = 15.0
+# The manager probes its storage on its dead-node check cadence and the
+# gate learns the outcome from the next manager heartbeat.
+_STORAGE_PROBE_INTERVAL_SECONDS = float(Env().MANAGER_DEAD_NODE_CHECK_INTERVAL)
+_HEARTBEAT_INTERVAL_SECONDS = float(Env().MANAGER_HEARTBEAT_INTERVAL)
+
+
+def _run_full_disk_then_freed() -> dict:
+    """Measured: the pinned job fails loudly at 8.017 and dc-west goes
+    UNHEALTHY at 8.5; the unpinned job submitted at 15.08 is placed in
+    dc-east (running 15.25-16.5) and completes at 16.22; the disk frees
+    at 40.0, the manager's next storage probe (60.0) proves the refused
+    size fits, and dc-west is HEALTHY again at 60.5."""
+    coordinator = SimulationCoordinator(
+        latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
+    )
+    _add_multi_dc_topology(
+        coordinator, storage_schedule_by_dc={"dc-west": _DISK_FULL_WINDOW_SCHEDULE}
+    )
+    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
+    _add_soak_client(coordinator, "client-b", "sim-cli-b", 120.0, submit_at=_SECOND_JOB_SUBMIT_AT)
+    return coordinator.run()
+
+
+def test_placement_routes_around_a_full_disk_and_returns_when_it_frees():
+    """A datacenter whose manager cannot write durably takes no new jobs
+    while the condition lasts -- an unpinned job goes to the healthy
+    datacenter and completes -- and it takes jobs again once its manager
+    proves the storage writable."""
+    results = _run_full_disk_then_freed()
+    gate_log = results["sim-gate-a"]
+
+    (_tag, pinned_status, pinned_finished) = _finished(results["client-a"])
+    assert pinned_status == "failed", results["client-a"]
+    west_unhealthy_times = _health_times(gate_log, "dc-west", "unhealthy")
+    assert west_unhealthy_times, gate_log
+    assert west_unhealthy_times[0] <= pinned_finished + _HEARTBEAT_INTERVAL_SECONDS, gate_log
+
+    second_client_log = results["client-b"]
+    assert _submitted_at(second_client_log) > west_unhealthy_times[0], second_client_log
+    (_tag, second_status, _second_finished) = _finished(second_client_log)
+    assert second_status == "completed", second_client_log
+    assert _active_rise_times(results["worker-dc-east"]), results["worker-dc-east"]
+    assert not _active_rise_times(results["worker-dc-west"]), results["worker-dc-west"]
+
+    west_recovered_times = [
+        time for time in _health_times(gate_log, "dc-west", "healthy") if time > _DISK_FREED_AT
+    ]
+    assert west_recovered_times, gate_log
+    recovery_deadline = (
+        _DISK_FREED_AT + _STORAGE_PROBE_INTERVAL_SECONDS + _HEARTBEAT_INTERVAL_SECONDS
+    )
+    assert west_recovered_times[0] <= recovery_deadline, (
+        f"dc-west recovered at {west_recovered_times[0]}, past one probe "
+        f"interval + one heartbeat after the disk freed ({recovery_deadline}): {gate_log}"
+    )
+    assert _final_health(gate_log) == {"dc-east": "healthy", "dc-west": "healthy"}, gate_log
+
+    _assert_oracle_clean(results["client-a"])
+    _assert_oracle_clean(second_client_log)
+    _assert_no_unswapped_imports(results)
+
+
+def test_full_disk_then_freed_is_replay_deterministic():
+    assert _run_full_disk_then_freed() == _run_full_disk_then_freed()
 
 
 # ---------------------------------------------------------------------------

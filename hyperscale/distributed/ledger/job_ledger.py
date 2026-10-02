@@ -48,6 +48,7 @@ from .job_commit_sequencer import JobCommitSequencer
 from .job_id import JobIdGenerator
 from .unsatisfiable_durability_error import UnsatisfiableDurabilityError
 from .job_state import JobState
+from .storage_health import StorageHealth
 from .wal.node_wal import NodeWAL, WALAppendResult
 from .wal.wal_entry import WALEntry
 from .pipeline.commit_pipeline import (
@@ -160,6 +161,7 @@ class JobLedger:
         "_checkpoint_max_interval_seconds",
         "_checkpoint_retention_count",
         "_last_checkpoint_at",
+        "_storage_health",
     )
 
     def __init__(
@@ -170,6 +172,7 @@ class JobLedger:
         checkpoint_manager: CheckpointManager,
         job_id_generator: JobIdGenerator,
         archive_store: JobArchiveStore,
+        storage_health: StorageHealth,
         completed_cache_size: int = DEFAULT_COMPLETED_CACHE_SIZE,
         logger: Logger | None = None,
         checkpoint_wal_ratio: int = WAL_TO_ACTIVE_STATE_RATIO,
@@ -178,6 +181,8 @@ class JobLedger:
         checkpoint_retention_count: int = CHECKPOINT_RETENTION_COUNT,
     ) -> None:
         self._clock = clock
+        # The same tracker ``wal`` records its commits into.
+        self._storage_health = storage_health
         self._wal = wal
         self._pipeline = pipeline
         self._checkpoint_manager = checkpoint_manager
@@ -203,6 +208,7 @@ class JobLedger:
         # clock read that predates its own existence.
         self._last_checkpoint_at = _DEFAULT_CLOCK.time()
 
+
     @classmethod
     async def open(
         cls,
@@ -223,13 +229,24 @@ class JobLedger:
         min_checkpoint_wal_entries: int = MIN_CHECKPOINT_WAL_ENTRIES,
         checkpoint_max_interval_seconds: float = CHECKPOINT_MAX_INTERVAL_SECONDS,
         checkpoint_retention_count: int = CHECKPOINT_RETENTION_COUNT,
+        storage_health: StorageHealth | None = None,
     ) -> JobLedger:
         """``clock`` is the owning node's HLC, so ledger events are
         causally ordered against its other WAL/Raft writes;
         ``filesystem`` is the Phase 7 storage seam (None binds each
         component's module default)."""
+        # One storage-health tracker per node: the owner injects its own
+        # to share with the node's other durable stores, or the ledger
+        # owns one.
+        node_storage_health = (
+            storage_health if storage_health is not None else StorageHealth()
+        )
         wal = await NodeWAL.open(
-            path=wal_path, clock=clock, logger=logger, filesystem=filesystem
+            path=wal_path,
+            clock=clock,
+            logger=logger,
+            filesystem=filesystem,
+            storage_health=node_storage_health,
         )
 
         pipeline = CommitPipeline(
@@ -263,6 +280,7 @@ class JobLedger:
             checkpoint_manager=checkpoint_manager,
             job_id_generator=job_id_generator,
             archive_store=archive_store,
+            storage_health=node_storage_health,
             completed_cache_size=completed_cache_size,
             logger=logger,
             checkpoint_wal_ratio=checkpoint_wal_ratio,
@@ -989,7 +1007,22 @@ class JobLedger:
         """
         if not self._checkpoint_is_due():
             return None
+        return await self._checkpoint_contained()
 
+    @property
+    def storage_health(self) -> StorageHealth:
+        """The node storage health this ledger records into -- shared
+        with the node's other durable stores on the same device."""
+        return self._storage_health
+
+    @property
+    def storage_writable(self) -> bool:
+        """Whether the node's storage last proved writable."""
+        return self._storage_health.writable
+
+    async def _checkpoint_contained(self) -> Path | None:
+        """Checkpoint now with storage failures CONTAINED (see
+        ``maybe_checkpoint``)."""
         pending_before = self._wal.pending_count
 
         try:

@@ -14,6 +14,7 @@ from hyperscale.distributed.reliability.backpressure import (
     BackpressureSignal,
 )
 
+from hyperscale.distributed.ledger.storage_health import StorageHealth
 from hyperscale.distributed.ledger.events.event_type import JobEventType
 from .entry_state import WALEntryState, TransitionResult
 from hyperscale.distributed.ledger.storage_format import (
@@ -97,6 +98,7 @@ class NodeWAL:
         config: WALWriterConfig | None = None,
         logger: Logger | None = None,
         filesystem: Filesystem | None = None,
+        storage_health: StorageHealth | None = None,
     ) -> None:
         self._path = path
         self._clock = clock
@@ -110,6 +112,7 @@ class NodeWAL:
             config=config,
             logger=logger,
             filesystem=self._filesystem,
+            storage_health=storage_health,
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pending_entries_internal: dict[int, WALEntry] = {}
@@ -131,6 +134,7 @@ class NodeWAL:
         config: WALWriterConfig | None = None,
         logger: Logger | None = None,
         filesystem: Filesystem | None = None,
+        storage_health: StorageHealth | None = None,
     ) -> NodeWAL:
         wal = cls(
             path=path,
@@ -138,6 +142,7 @@ class NodeWAL:
             config=config,
             logger=logger,
             filesystem=filesystem,
+            storage_health=storage_health,
         )
         await wal._initialize()
         return wal

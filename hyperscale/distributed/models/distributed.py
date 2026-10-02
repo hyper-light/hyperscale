@@ -881,6 +881,12 @@ class ManagerHeartbeat(Message):
     # heartbeat further past the datagram budget); None elsewhere, and
     # gates keep the last report a manager sent rather than clearing it.
     resource_report: "ManagerResourceReport | None" = None
+    # Whether this manager's durable storage (its job ledger) last proved
+    # writable. A manager that cannot write durably cannot accept jobs:
+    # gates classify a datacenter whose authoritative manager reports
+    # False as UNHEALTHY, so placement routes around a full or failing
+    # disk. Managers without a durable tier always report True.
+    storage_writable: bool = True
 
 
 # =============================================================================

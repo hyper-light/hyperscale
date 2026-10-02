@@ -5,6 +5,7 @@ from pathlib import Path
 import struct
 from typing import Generic, TypeVar
 
+from hyperscale.distributed.ledger.storage_health import StorageHealth
 from hyperscale.distributed.runtime import Runner
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import IdempotencyError
@@ -43,9 +44,16 @@ class ManagerIdempotencyLedger(Generic[T]):
         task_runner: Runner,
         logger: Logger,
         filesystem: Filesystem | None = None,
+        storage_health: StorageHealth | None = None,
     ) -> None:
         self._config = config
         self._wal_path = Path(wal_path)
+        # The node's storage health this ledger records its appends into
+        # (None: the owner does not track storage health).
+        self._storage_health = storage_health
+        # Bytes of complete entries in the WAL file: a failed append is
+        # cut back to here so its torn record cannot hide later entries.
+        self._committed_length = 0
         self._task_runner = task_runner
         self._logger = logger
         # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
@@ -171,7 +179,20 @@ class ManagerIdempotencyLedger(Generic[T]):
         # One durable unit per entry through the storage seam — the
         # same append+flush+fsync sequence as before, off-loop on the
         # filesystem's own executor.
-        await self._filesystem.append_fsync(self._wal_path, record)
+        try:
+            await self._filesystem.append_fsync(self._wal_path, record)
+        except OSError as storage_error:
+            # The device refused the append: cut the torn record back
+            # (replay stops at the first incomplete frame, so it would
+            # hide every later entry) and report the failure.
+            if await self._filesystem.exists(self._wal_path):
+                await self._filesystem.truncate(self._wal_path, self._committed_length)
+            if self._storage_health is not None:
+                self._storage_health.record_failure(storage_error, len(record))
+            raise
+        self._committed_length += len(record)
+        if self._storage_health is not None:
+            self._storage_health.record_success(len(record))
 
     async def _replay_wal(self) -> None:
         if not await self._filesystem.exists(self._wal_path):
@@ -183,7 +204,11 @@ class ManagerIdempotencyLedger(Generic[T]):
             self._index[entry.idempotency_key] = entry
             self._job_to_key[entry.job_id] = entry.idempotency_key
 
+        self._committed_length = len(data) if torn_at_offset is None else torn_at_offset
         if torn_at_offset is not None:
+            # Cut the debris so entries appended from now on are not
+            # stranded behind it at the next replay.
+            await self._filesystem.truncate(self._wal_path, torn_at_offset)
             await self._logger.log(
                 IdempotencyError(
                     message=(
