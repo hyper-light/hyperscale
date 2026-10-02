@@ -240,6 +240,12 @@ class WorkerRegistrationHandler:
                     )
                 return (False, None)
 
+            # The responder is direct evidence for its own address; the
+            # rest of its manager list is hearsay.
+            for manager in response.healthy_managers:
+                if manager.node_id == response.manager_id:
+                    self._registry.confirm_manager(manager.node_id, manager)
+
             # Update known managers
             await self._update_known_managers(
                 response.healthy_managers,
@@ -329,8 +335,8 @@ class WorkerRegistrationHandler:
         try:
             registration = ManagerToWorkerRegistration.load(data)
 
-            # Add this manager to known managers
-            self._registry.add_manager(
+            # The registering manager is direct evidence for its address.
+            self._registry.confirm_manager(
                 registration.manager.node_id,
                 registration.manager,
             )

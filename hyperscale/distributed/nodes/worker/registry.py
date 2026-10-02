@@ -66,6 +66,12 @@ class WorkerRegistry:
 
         # Manager tracking
         self._known_managers: dict[str, ManagerInfo] = {}
+        # The manager id directly confirmed at each TCP address. A
+        # restarted manager comes back at the same address under a new
+        # id; only direct evidence (its registration exchange, its own
+        # heartbeat) moves the address to the new id, so hearsay manager
+        # lists cannot resurrect a dead incarnation.
+        self._manager_id_by_addr: dict[tuple[str, int], str] = {}
         self._manager_leave_udp_addrs: dict[tuple[str, int], None] = {}
         self._healthy_manager_ids: set[str] = set()
         self._primary_manager_id: str | None = None
@@ -86,7 +92,42 @@ class WorkerRegistry:
         self._counter_lock: asyncio.Lock = asyncio.Lock()
 
     def add_manager(self, manager_id: str, manager_info: ManagerInfo) -> None:
-        """Add or update a known manager."""
+        """Add or update a manager learned second-hand (a peer's manager
+        list). Ignored when its address is directly confirmed as another
+        manager -- the listing describes an incarnation that address no
+        longer runs."""
+        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+        confirmed_id = self._manager_id_by_addr.get(manager_addr)
+        if confirmed_id is not None and confirmed_id != manager_id:
+            return
+        self._known_managers[manager_id] = manager_info
+        self._record_manager_leave_udp_addr(manager_info)
+
+    def is_confirmed_at(self, manager_id: str, manager_addr: tuple[str, int]) -> bool:
+        """Whether ``manager_id`` is the directly confirmed manager at
+        ``manager_addr``."""
+        return self._manager_id_by_addr.get(manager_addr) == manager_id
+
+    def confirm_manager(self, manager_id: str, manager_info: ManagerInfo) -> None:
+        """Record a manager from direct evidence (its registration
+        exchange or its own heartbeat). Any other manager id known at the
+        same TCP address is a previous incarnation of that process: it is
+        superseded -- its breakers, health, locks and info dropped, and the
+        primary role handed over if it held it -- so sends to the address
+        resolve to the live incarnation."""
+        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+        superseded_ids = [
+            known_id
+            for known_id, known_manager in self._known_managers.items()
+            if known_id != manager_id
+            and (known_manager.tcp_host, known_manager.tcp_port) == manager_addr
+        ]
+        for superseded_id in superseded_ids:
+            was_primary = self._primary_manager_id == superseded_id
+            self.remove_manager_state(superseded_id, manager_addr)
+            if was_primary:
+                self._primary_manager_id = manager_id
+        self._manager_id_by_addr[manager_addr] = manager_id
         self._known_managers[manager_id] = manager_info
         self._record_manager_leave_udp_addr(manager_info)
 
@@ -123,7 +164,11 @@ class WorkerRegistry:
         return list(self._manager_leave_udp_addrs.keys())
 
     def get_manager_by_addr(self, addr: tuple[str, int]) -> ManagerInfo | None:
-        """Get manager info by TCP address."""
+        """Get manager info by TCP address (the directly confirmed
+        incarnation when there is one)."""
+        if (confirmed_id := self._manager_id_by_addr.get(addr)) is not None:
+            if (confirmed := self._known_managers.get(confirmed_id)) is not None:
+                return confirmed
         for manager in self._known_managers.values():
             if (manager.tcp_host, manager.tcp_port) == addr:
                 return manager
@@ -201,7 +246,11 @@ class WorkerRegistry:
         circuit breaker, and health/registry entries. Without this cleanup the
         per-manager state dicts would grow unbounded under manager churn.
         """
-        self._known_managers.pop(manager_id, None)
+        removed_manager = self._known_managers.pop(manager_id, None)
+        if removed_manager is not None:
+            removed_addr = (removed_manager.tcp_host, removed_manager.tcp_port)
+            if self._manager_id_by_addr.get(removed_addr) == manager_id:
+                del self._manager_id_by_addr[removed_addr]
         self._healthy_manager_ids.discard(manager_id)
         self._manager_unhealthy_since.pop(manager_id, None)
         self._manager_circuits.pop(manager_id, None)

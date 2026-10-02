@@ -136,6 +136,11 @@ class WorkerHeartbeatHandler:
         task_runner_run: callable,
     ) -> None:
         """Update existing manager info from heartbeat if leadership changed."""
+        # The manager's own heartbeat is direct evidence for its address.
+        if not self._registry.is_confirmed_at(
+            manager_id, (existing_manager.tcp_host, existing_manager.tcp_port)
+        ):
+            self._registry.confirm_manager(manager_id, existing_manager)
         if heartbeat.is_leader == existing_manager.is_leader:
             return
 
@@ -149,7 +154,7 @@ class WorkerHeartbeatHandler:
             datacenter=heartbeat.datacenter,
             is_leader=heartbeat.is_leader,
         )
-        self._registry.add_manager(manager_id, updated_manager)
+        self._registry.confirm_manager(manager_id, updated_manager)
 
         # If this manager became the leader, switch primary
         if heartbeat.is_leader and self._registry._primary_manager_id != manager_id:
@@ -190,7 +195,7 @@ class WorkerHeartbeatHandler:
             datacenter=heartbeat.datacenter,
             is_leader=heartbeat.is_leader,
         )
-        self._registry.add_manager(manager_id, new_manager)
+        self._registry.confirm_manager(manager_id, new_manager)
 
         if self._logger:
             task_runner_run(

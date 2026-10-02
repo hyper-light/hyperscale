@@ -23,21 +23,21 @@ placements of the second crash:
   dead manager (its active entry lingers to 83.25) and gen-3 resumes a
   THIRD dispatch (86.25-86.75). Execution is at-least-once times
   three; the client outcome is exactly-once: one ``completed``,
-  delivered at 130.910856. Re-probed 2026-10-02: gen-2's recovery got
+  delivered at 86.620758 -- the third run's result reaches gen-3 0.08s
+  after the run ends. Re-probed 2026-10-02: gen-2's recovery got
   3.0s faster (re-dispatch 62.25 -> 59.25, completion record ~62.61 ->
   ~59.7), so the old 62.5 landed AFTER the completion and the job
   finished under gen-2; 59.5 keeps the crash inside the same window.
 
-MEASURED PRODUCTION GAP (second placement, reported for the worklist):
-gen-3's completion is NOT prompt — the client's 5s-cadence manager
-polls stay non-terminal from the third drain (~86.75) until ~130.9,
-i.e. the resumed job's completion AGGREGATION takes ~44s (a stale
-result redelivery from the worker's retry loop plus the fresh third
-result leave accounting that only a periodic reconciliation resolves;
-gen-3 boot 84.5 + ~46.4). The pin asserts the loud exactly-once
-outcome and brackets delivery under the ceiling; when prompt
-completion after crash-during-re-dispatch lands, the delivery bound
-here is the one to tighten.
+FIXED GAP (second placement): gen-3's completion used to arrive ~44s
+late (130.9). Every manager generation re-registers under a new node id
+at the same address, and the worker kept them all: its final-result
+send resolved the address to gen-1's dead id, whose circuit breaker the
+failed sends to the downed manager had opened, so the fresh result was
+skipped and queued until that breaker half-opened on its own. The
+worker now treats direct evidence (the registration exchange, the
+manager's own heartbeat) as superseding a previous incarnation at the
+same address, so the result goes to gen-3 at once.
 """
 
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
@@ -291,19 +291,17 @@ def test_second_crash_after_redispatch_never_double_delivers():
         results["worker"]
     )
 
-    # Exactly-once, loud, correct terminal — delivered under the
-    # ceiling despite the measured ~47s completion-aggregation delay
-    # (see the module docstring's production-gap note).
+    # Exactly-once, loud, correct terminal -- delivered within the
+    # resume leg of gen-3's boot (see the module docstring's fixed-gap
+    # note).
     (_tag, final_status, finished_time) = _finished(client_log)
     assert final_status == "completed", client_log
-    assert (
-        _GENERATION_THREE_LATE_BOOT
-        < finished_time
-        < _MID_REDISPATCH_CEILING
-    ), (
+    resume_deadline = _GENERATION_THREE_LATE_BOOT + _RESUME_LEG_CEILING_SECONDS
+    assert _GENERATION_THREE_LATE_BOOT < finished_time < resume_deadline, (
         f"exactly-once completion at {finished_time} outside "
-        f"({_GENERATION_THREE_LATE_BOOT}, {_MID_REDISPATCH_CEILING}) "
-        f"(measured 130.910856): {client_log}"
+        f"({_GENERATION_THREE_LATE_BOOT}, {resume_deadline}) -- the resumed "
+        f"job's result must reach the live generation promptly "
+        f"(measured 86.620758): {client_log}"
     )
 
     _assert_oracle_clean(client_log)
