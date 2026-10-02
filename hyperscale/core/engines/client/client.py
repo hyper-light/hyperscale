@@ -172,5 +172,14 @@ class Client(Generic[Unpack[T]]):
             self.websocket,
         ]
 
+        # Every engine is closed even if one fails -- a failure partway
+        # through used to leave every later engine's connections open --
+        # and the failures surface together.
+        close_errors: list[Exception] = []
         for client in clients:
-            client.close()
+            try:
+                client.close()
+            except Exception as close_error:
+                close_errors.append(close_error)
+        if close_errors:
+            raise ExceptionGroup("engine clients failed to close", close_errors)

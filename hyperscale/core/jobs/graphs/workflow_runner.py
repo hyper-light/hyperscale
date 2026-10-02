@@ -550,8 +550,9 @@ class WorkflowRunner:
 
                 self._running_workflows[run_id][workflow.name] = workflow
 
+                run_task: asyncio.Future | None = None
                 try:
-                    self._run_tasks[run_id][workflow_name] = asyncio.ensure_future(
+                    run_task = asyncio.ensure_future(
                         self._run_workflow(
                             run_id,
                             workflow,
@@ -559,10 +560,9 @@ class WorkflowRunner:
                             vus,
                         )
                     )
+                    self._run_tasks[run_id][workflow_name] = run_task
 
-                    (results, updated_context) = await self._run_tasks[run_id][
-                        workflow_name
-                    ]
+                    (results, updated_context) = await run_task
 
                     await ctx.log_prepared(
                         message=f"Run {run_id} of Workflow {workflow.name} successfully halted run",
@@ -633,6 +633,43 @@ class WorkflowRunner:
                         err,
                         WorkflowStatus.FAILED,
                     )
+
+                finally:
+                    # However the run ended (completed, failed, cancelled,
+                    # replaced), release it: its workflow and finished task
+                    # leave the runner and its engine clients close.
+                    # Previously a finished run's workflow stayed in
+                    # _running_workflows and its connections stayed open
+                    # for the executor's lifetime.
+                    try:
+                        self._release_workflow(run_id, workflow, run_task)
+                    except ExceptionGroup as close_errors:
+                        await ctx.log_prepared(
+                            message=(
+                                f"Run {run_id} of Workflow {workflow.name} failed to "
+                                f"close its engine clients: {close_errors!r}"
+                            ),
+                            name="error",
+                        )
+
+    def _release_workflow(
+        self,
+        run_id: int,
+        workflow: Workflow,
+        run_task: asyncio.Future | None,
+    ) -> None:
+        """Drop this run's workflow and run task from the runner -- only
+        if they are still THIS run's (a ``replace`` may already have
+        registered a successor under the same name) -- and close this
+        run's engine clients. Close failures surface as an
+        ExceptionGroup after every client was attempted."""
+        running_workflows = self._running_workflows.get(run_id)
+        if running_workflows is not None and running_workflows.get(workflow.name) is workflow:
+            del running_workflows[workflow.name]
+        run_tasks = self._run_tasks.get(run_id)
+        if run_tasks is not None and run_task is not None and run_tasks.get(workflow.name) is run_task:
+            del run_tasks[workflow.name]
+        workflow.client.close()
 
     async def _run_workflow(
         self,

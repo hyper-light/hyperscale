@@ -80,3 +80,7 @@ class SCPConnection:
         writer, reader, _ = await self.connection.open_session(command, encoding=None)
 
         return SCPHandler(reader, writer), self.connection_type
+
+    def close(self):
+        if self.connection:
+            self.connection.close()

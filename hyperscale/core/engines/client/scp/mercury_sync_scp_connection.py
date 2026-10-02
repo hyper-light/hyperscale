@@ -759,3 +759,7 @@ class MercurySyncSCPConnection:
             )
 
         return attributes
+
+    def close(self):
+        for connection in [*self._source_connections, *self._destination_connections]:
+            connection.close()
