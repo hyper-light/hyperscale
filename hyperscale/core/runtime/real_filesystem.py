@@ -20,6 +20,7 @@ commit shape ``WALWriter`` and ``CheckpointManager`` already had.
 """
 
 import asyncio
+import errno
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -231,10 +232,21 @@ class RealFilesystem:
 
     @staticmethod
     def _append_fsync_sync(path: str | Path, data: bytes) -> None:
-        with open(path, "ab", buffering=0) as append_file:
-            append_file.write(data)
-            append_file.flush()
-            os.fsync(append_file.fileno())
+        # A raw write may be SHORT (near ENOSPC the kernel writes what
+        # fits and returns the count; only the next write raises), so
+        # every byte is written or the error surfaces -- a single
+        # unchecked write reported success for a torn record.
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+        try:
+            remaining = memoryview(data)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written == 0:
+                    raise OSError(errno.EIO, "append made no progress", str(path))
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     @classmethod
     def _atomic_write_sync(cls, path: str | Path, data: bytes) -> None:
