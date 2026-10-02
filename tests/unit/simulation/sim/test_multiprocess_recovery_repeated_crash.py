@@ -17,21 +17,24 @@ placements of the second crash:
   again, re-admits the worker (85.5 sample), re-dispatches
   (85.5-86.0) and the client observes exactly one ``completed`` at
   85.974191 — prompt: boot + 3.97s.
-* R2 = 62.5 — AFTER gen-2's re-dispatch, BEFORE the completion record
-  (~62.61). Gen-2 re-admitted the worker (62.4) and re-dispatched
-  (62.25); the crash lands mid-execution, so the worker's second run
-  drains into a dead manager (its active entry lingers to 86.25) and
-  gen-3 resumes a THIRD dispatch (88.25-88.75). Execution is
-  at-least-once times three; the client outcome is exactly-once:
-  one ``completed``, delivered at 135.910856.
+* R2 = 59.5 — AFTER gen-2's re-dispatch, BEFORE the completion record.
+  Gen-2 re-admitted the worker (59.4) and re-dispatched (59.25); the
+  crash lands mid-execution, so the worker's second run drains into a
+  dead manager (its active entry lingers to 83.25) and gen-3 resumes a
+  THIRD dispatch (86.25-86.75). Execution is at-least-once times
+  three; the client outcome is exactly-once: one ``completed``,
+  delivered at 130.910856. Re-probed 2026-10-02: gen-2's recovery got
+  3.0s faster (re-dispatch 62.25 -> 59.25, completion record ~62.61 ->
+  ~59.7), so the old 62.5 landed AFTER the completion and the job
+  finished under gen-2; 59.5 keeps the crash inside the same window.
 
 MEASURED PRODUCTION GAP (second placement, reported for the worklist):
 gen-3's completion is NOT prompt — the client's 5s-cadence manager
-polls stay non-terminal from the third drain (~88.75) until ~135.9,
-i.e. the resumed job's completion AGGREGATION takes ~47s (a stale
+polls stay non-terminal from the third drain (~86.75) until ~130.9,
+i.e. the resumed job's completion AGGREGATION takes ~44s (a stale
 result redelivery from the worker's retry loop plus the fresh third
 result leave accounting that only a periodic reconciliation resolves;
-gen-3 boot 87.5 + ~48.4). The pin asserts the loud exactly-once
+gen-3 boot 84.5 + ~46.4). The pin asserts the loud exactly-once
 outcome and brackets delivery under the ceiling; when prompt
 completion after crash-during-re-dispatch lands, the delivery bound
 here is the one to tighten.
@@ -66,11 +69,11 @@ _MID_RECOVERY_CEILING = 140.0
 # plus slack.
 _RESUME_LEG_CEILING_SECONDS = 12.0
 
-_MID_REDISPATCH_RESTART_AT = 62.5
+_MID_REDISPATCH_RESTART_AT = 59.5
 _MID_REDISPATCH_DOWN_SECONDS = 25.0
 _GENERATION_THREE_LATE_BOOT = (
     _MID_REDISPATCH_RESTART_AT + _MID_REDISPATCH_DOWN_SECONDS
-)  # 87.5
+)  # 84.5
 _MID_REDISPATCH_CEILING = 160.0
 
 
@@ -300,7 +303,7 @@ def test_second_crash_after_redispatch_never_double_delivers():
     ), (
         f"exactly-once completion at {finished_time} outside "
         f"({_GENERATION_THREE_LATE_BOOT}, {_MID_REDISPATCH_CEILING}) "
-        f"(measured 135.910856): {client_log}"
+        f"(measured 130.910856): {client_log}"
     )
 
     _assert_oracle_clean(client_log)
