@@ -97,3 +97,14 @@ class ClientSSLProtocol(SSLProtocol):
 
         except Exception as ex:
             self._fatal_error(ex, "Fatal error on SSL protocol")
+
+    def _control_app_writing(self):
+        # Called after every read and write. Unpaused and under the high-water
+        # mark, asyncio's version neither pauses nor resumes: nothing to do.
+        if (
+            not self._app_writing_paused
+            and self._outgoing.pending + self._write_buffer_size < self._outgoing_high_water
+        ):
+            return
+
+        super()._control_app_writing()

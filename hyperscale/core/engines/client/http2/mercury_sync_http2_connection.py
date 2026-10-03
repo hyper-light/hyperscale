@@ -1032,16 +1032,27 @@ class MercurySyncHTTP2Connection:
 
             # Reuses the connection's transport when it reaches one of the
             # host's addresses; otherwise races a new one across them.
-            address, socket_config, new_transport = await connection.connect_to_any(
-                url.hostname,
-                url.ip_addresses,
-                url.port,
-                url.address_rotation,
-                ssl=self._client_ssl_context
-                if url.is_ssl or ssl_redirect_url
-                else None,
-                ssl_upgrade=ssl_redirect_url is not None,
-            )
+            if (
+                reused := connection.reuse_transport(
+                    url.ip_addresses,
+                    url.port,
+                    ssl_upgrade=ssl_redirect_url is not None,
+                )
+            ) is not None:
+                address, socket_config = reused
+                new_transport = False
+
+            else:
+                address, socket_config, new_transport = await connection.connect_to_any(
+                    url.hostname,
+                    url.ip_addresses,
+                    url.port,
+                    url.address_rotation,
+                    ssl=self._client_ssl_context
+                    if url.is_ssl or ssl_redirect_url
+                    else None,
+                    ssl_upgrade=ssl_redirect_url is not None,
+                )
 
             if new_transport:
                 url.address = address

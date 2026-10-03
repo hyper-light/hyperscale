@@ -75,6 +75,26 @@ class HTTP2Connection:
         else:
             self.stream.update_stream_id()
 
+    def reuse_transport(
+        self,
+        addresses: Sequence[Tuple[str, SocketConfig]],
+        port: int,
+        ssl_upgrade: bool = False,
+    ) -> Optional[Tuple[str, SocketConfig]]:
+        """
+        When this connection's transport already reaches one of ``addresses``
+        on ``port``, move to the next stream and return that address and its
+        socket config; otherwise None. Synchronous, so the common case -- a
+        request on an open connection -- awaits nothing.
+        """
+        if self.connected and ssl_upgrade is False and self.port == port:
+            for address, socket_config in addresses:
+                if address == self.dns_address:
+                    self.stream.update_stream_id()
+                    return address, socket_config
+
+        return None
+
     async def connect_to_any(
         self,
         hostname: str,
@@ -93,11 +113,8 @@ class HTTP2Connection:
         Returns the address and socket config connected to, and whether the
         transport is new.
         """
-        if self.connected and ssl_upgrade is False and self.port == port:
-            for address, socket_config in addresses:
-                if address == self.dns_address:
-                    self.stream.update_stream_id()
-                    return address, socket_config, False
+        if (reused := self.reuse_transport(addresses, port, ssl_upgrade)) is not None:
+            return *reused, False
 
         if not addresses:
             raise ConnectionError(f"No addresses to connect to for {hostname}")

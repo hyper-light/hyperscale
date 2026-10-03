@@ -136,18 +136,16 @@ class HTTP2Pipe:
         data: Optional[bytes],
         connection: HTTP2Connection,
     ):
+        remote_initial_window_size = self.remote_settings.initial_window_size
+
         connection.stream.inbound = WindowManager(
             self.local_settings.initial_window_size
         )
-        connection.stream.outbound = WindowManager(
-            self.remote_settings.initial_window_size
-        )
+        connection.stream.outbound = WindowManager(remote_initial_window_size)
 
         connection.stream.max_inbound_frame_size = self.local_settings.max_frame_size
         connection.stream.max_outbound_frame_size = self.remote_settings.max_frame_size
-        connection.stream.current_outbound_window_size = (
-            self.remote_settings.initial_window_size
-        )
+        connection.stream.current_outbound_window_size = remote_initial_window_size
 
         stream_id = connection.stream.stream_id
 
