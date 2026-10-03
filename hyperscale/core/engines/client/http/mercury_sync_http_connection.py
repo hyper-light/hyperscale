@@ -47,6 +47,7 @@ from hyperscale.core.engines.client.shared.protocols import (
     ProtocolMap,
 )
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
+from hyperscale.core.engines.client.shared.phase_timeout import PhaseTimeout, within_timeout
 from hyperscale.core.testing.models import (
     URL,
     Auth,
@@ -88,6 +89,8 @@ class MercurySyncHTTPConnection:
 
         self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
         self._connections: List[HTTPConnection] = []
+        # One per in-flight request; see _execute.
+        self._phase_timeouts: List[PhaseTimeout] = []
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
@@ -135,7 +138,7 @@ class MercurySyncHTTPConnection:
                 if span and self.trace.enabled:
                     span = await self.trace.on_request_queued_end(span)
 
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "HEAD",
@@ -207,7 +210,7 @@ class MercurySyncHTTPConnection:
                 if span and self.trace.enabled:
                     span = await self.trace.on_request_queued_end(span)
 
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "OPTIONS",
@@ -279,7 +282,7 @@ class MercurySyncHTTPConnection:
                 if span and self.trace.enabled:
                     span = await self.trace.on_request_queued_end(span)
 
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "GET",
@@ -356,7 +359,7 @@ class MercurySyncHTTPConnection:
                 if span and self.trace.enabled:
                     span = await self.trace.on_request_queued_end(span)
 
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "POST",
@@ -434,7 +437,7 @@ class MercurySyncHTTPConnection:
                 if span and self.trace.enabled:
                     span = await self.trace.on_request_queued_end(span)
 
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "PUT",
@@ -512,7 +515,7 @@ class MercurySyncHTTPConnection:
                 if span and self.trace.enabled:
                     span = await self.trace.on_request_queued_end(span)
 
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "PATCH",
@@ -586,7 +589,7 @@ class MercurySyncHTTPConnection:
                 if span and self.trace.enabled:
                     span = await self.trace.on_request_queued_end(span)
 
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "DELETE",
@@ -868,6 +871,10 @@ class MercurySyncHTTPConnection:
 
         connection: HTTPConnection | None = None
 
+        # Bounds each phase below by request_timeout, as wait_for did, with a
+        # timer reused across requests rather than a new one per phase.
+        phase_timeout = self._phase_timeouts.pop() if self._phase_timeouts else PhaseTimeout()
+
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
@@ -878,7 +885,7 @@ class MercurySyncHTTPConnection:
                 url,
                 upgrade_ssl,
                 span,
-            ) = await asyncio.wait_for(
+            ) = await phase_timeout.run(
                 self._connect_to_url_location(
                     connection,
                     request_url,
@@ -897,7 +904,7 @@ class MercurySyncHTTPConnection:
                     url,
                     _,
                     span,
-                ) = await asyncio.wait_for(
+                ) = await phase_timeout.run(
                     self._connect_to_url_location(
                         connection,
                         request_url,
@@ -1049,7 +1056,7 @@ class MercurySyncHTTPConnection:
             if timings["read_start"] is None:
                 timings["read_start"] = time.monotonic()
 
-            response_code = await asyncio.wait_for(
+            response_code = await phase_timeout.run(
                 connection.reader.readline(),
                 timeout=self.timeouts.request_timeout,
             )
@@ -1063,7 +1070,7 @@ class MercurySyncHTTPConnection:
             status_string: List[bytes] = response_code.split()
             status = int(status_string[1])
 
-            response_headers: Dict[bytes, bytes] = await asyncio.wait_for(
+            response_headers: Dict[bytes, bytes] = await phase_timeout.run(
                 connection.reader.read_header_block(),
                 timeout=self.timeouts.request_timeout,
             )
@@ -1091,7 +1098,7 @@ class MercurySyncHTTPConnection:
             body = b''
 
             if content_length:
-                body = await asyncio.wait_for(
+                body = await phase_timeout.run(
                     connection.readexactly(int(content_length)),
                     timeout=self.timeouts.request_timeout,
                 )
@@ -1109,7 +1116,7 @@ class MercurySyncHTTPConnection:
                 while True and not all_chunks_read:
                     chunk_size = int(
                         (
-                            await asyncio.wait_for(
+                            await phase_timeout.run(
                                 connection.readline(),
                                 timeout=self.timeouts.request_timeout,
                             )
@@ -1119,13 +1126,13 @@ class MercurySyncHTTPConnection:
 
                     if not chunk_size:
                         # read last CRLF
-                        await asyncio.wait_for(
+                        await phase_timeout.run(
                             connection.readline(),
                             timeout=self.timeouts.request_timeout,
                         )
                         break
 
-                    chunk = await asyncio.wait_for(
+                    chunk = await phase_timeout.run(
                         connection.readexactly(chunk_size + 2),
                         timeout=self.timeouts.request_timeout,
                     )
@@ -1245,7 +1252,10 @@ class MercurySyncHTTPConnection:
                 timings,
                 span,
             )
-        
+
+        finally:
+            self._phase_timeouts.append(phase_timeout)
+
     async def _connect_to_url_location(
         self,
         connection: HTTPConnection | None,
@@ -1713,3 +1723,8 @@ class MercurySyncHTTPConnection:
     def close(self):
         for connection in self._connections:
             connection.close()
+
+        for phase_timeout in self._phase_timeouts:
+            phase_timeout.cancel()
+
+        self._phase_timeouts.clear()

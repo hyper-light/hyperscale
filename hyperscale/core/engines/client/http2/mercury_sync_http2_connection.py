@@ -37,6 +37,7 @@ from hyperscale.core.engines.client.shared.protocols import (
     ProtocolMap,
 )
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
+from hyperscale.core.engines.client.shared.phase_timeout import PhaseTimeout, within_timeout
 from hyperscale.core.testing.models import (
     URL,
     Auth,
@@ -80,6 +81,8 @@ class MercurySyncHTTP2Connection:
         self._dns_waiters: Dict[str, asyncio.Future] = defaultdict(asyncio.Future)
 
         self._connections: List[HTTP2Connection] = []
+        # One per in-flight request; see _execute.
+        self._phase_timeouts: List[PhaseTimeout] = []
 
         self._pipes: List[HTTP2Pipe] = []
 
@@ -111,7 +114,7 @@ class MercurySyncHTTP2Connection:
     ):
         async with self._semaphore:
             try:
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "HEAD",
@@ -157,7 +160,7 @@ class MercurySyncHTTP2Connection:
     ):
         async with self._semaphore:
             try:
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "OPTIONS",
@@ -203,7 +206,7 @@ class MercurySyncHTTP2Connection:
     ):
         async with self._semaphore:
             try:
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "GET",
@@ -258,7 +261,7 @@ class MercurySyncHTTP2Connection:
     ):
         async with self._semaphore:
             try:
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "POST",
@@ -314,7 +317,7 @@ class MercurySyncHTTP2Connection:
     ):
         async with self._semaphore:
             try:
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "PUT",
@@ -370,7 +373,7 @@ class MercurySyncHTTP2Connection:
     ):
         async with self._semaphore:
             try:
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "PATCH",
@@ -417,7 +420,7 @@ class MercurySyncHTTP2Connection:
     ):
         async with self._semaphore:
             try:
-                return await asyncio.wait_for(
+                return await within_timeout(
                     self._request(
                         url,
                         "DELETE",
@@ -630,11 +633,15 @@ class MercurySyncHTTP2Connection:
         connection: HTTP2Connection = None
         reading_response = False
 
+        # Bounds each phase below by request_timeout, as wait_for did, with a
+        # timer reused across requests rather than a new one per phase.
+        phase_timeout = self._phase_timeouts.pop() if self._phase_timeouts else PhaseTimeout()
+
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
-            (error, connection, pipe, url, upgrade_ssl) = await asyncio.wait_for(
+            (error, connection, pipe, url, upgrade_ssl) = await phase_timeout.run(
                 self._connect_to_url_location(
                     connection,
                     request_url,
@@ -646,7 +653,7 @@ class MercurySyncHTTP2Connection:
             if upgrade_ssl:
                 ssl_redirect_url = request_url.replace("http://", "https://")
 
-                (error, connection, pipe, url, _) = await asyncio.wait_for(
+                (error, connection, pipe, url, _) = await phase_timeout.run(
                     self._connect_to_url_location(
                         connection,
                         request_url,
@@ -712,7 +719,7 @@ class MercurySyncHTTP2Connection:
             if data:
                 encoded_data = self._encode_data(data)
 
-                connection = await asyncio.wait_for(
+                connection = await phase_timeout.run(
                     pipe.submit_request_body(
                         encoded_data,
                         connection,
@@ -726,7 +733,7 @@ class MercurySyncHTTP2Connection:
                 timings["read_start"] = time.monotonic()
 
             reading_response = True
-            (status, headers, body, error) = await asyncio.wait_for(
+            (status, headers, body, error) = await phase_timeout.run(
                 pipe.receive_response(connection),
                 timeout=self.timeouts.request_timeout,
             )
@@ -836,6 +843,9 @@ class MercurySyncHTTP2Connection:
                 False,
                 timings,
             )
+
+        finally:
+            self._phase_timeouts.append(phase_timeout)
 
     def _encode_data(
         self,
@@ -1122,3 +1132,8 @@ class MercurySyncHTTP2Connection:
     def close(self):
         for connection in self._connections:
             connection.close()
+
+        for phase_timeout in self._phase_timeouts:
+            phase_timeout.cancel()
+
+        self._phase_timeouts.clear()

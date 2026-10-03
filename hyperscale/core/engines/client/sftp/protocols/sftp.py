@@ -2071,9 +2071,10 @@ class SFTPGlob:
 
         self._scandir_cache[path] = entries
 
-    async def _match_exact(self, path: bytes, pattern: Sequence[bytes],
-                           patlist: _SFTPPatList) -> None:
-        """Match on an exact portion of a path"""
+    async def _match_exact(
+        self, path: bytes, pattern: Sequence[bytes], patlist: _SFTPPatList
+    ) -> AsyncIterator[Tuple[bytes, SFTPAttrs, _SFTPPatList]]:
+        """Match on an exact portion of a path, yielding what to match below it"""
 
         newpath = posixpath.join(path, *pattern)
         newpatlist = patlist[1:]
@@ -2085,19 +2086,20 @@ class SFTPGlob:
 
         if newpatlist:
             if attrs.type == FILEXFER_TYPE_DIRECTORY:
-                await self._match(newpath, attrs, newpatlist)
+                yield newpath, attrs, newpatlist
         else:
             self._report_match(newpath, attrs)
 
-    async def _match_pattern(self, path: bytes, attrs: SFTPAttrs,
-                             pattern: bytes, patlist: _SFTPPatList) -> None:
-        """Match on a pattern portion of a path"""
+    async def _match_pattern(
+        self, path: bytes, attrs: SFTPAttrs, pattern: bytes, patlist: _SFTPPatList
+    ) -> AsyncIterator[Tuple[bytes, SFTPAttrs, _SFTPPatList]]:
+        """Match on a pattern portion of a path, yielding what to match below it"""
 
         newpatlist = patlist[1:]
 
         if pattern == b'**':
             if newpatlist:
-                await self._match(path, attrs, newpatlist)
+                yield path, attrs, newpatlist
             else:
                 self._report_match(path, attrs)
 
@@ -2112,23 +2114,43 @@ class SFTPGlob:
                 attrs = entry.attrs
 
                 if pattern == b'**' and attrs.type == FILEXFER_TYPE_DIRECTORY:
-                    await self._match(newpath, attrs, patlist)
+                    yield newpath, attrs, patlist
                 elif newpatlist:
                     if attrs.type == FILEXFER_TYPE_DIRECTORY:
-                        await self._match(newpath, attrs, newpatlist)
+                        yield newpath, attrs, newpatlist
                 else:
                     self._report_match(newpath, attrs)
 
-    async def _match(self, path: bytes, attrs: SFTPAttrs,
-                     patlist: _SFTPPatList) -> None:
-        """Recursively match against a glob pattern"""
+    def _match_portion(
+        self, path: bytes, attrs: SFTPAttrs, patlist: _SFTPPatList
+    ) -> AsyncIterator[Tuple[bytes, SFTPAttrs, _SFTPPatList]]:
+        """Start matching the first portion of a glob pattern at a path"""
 
         pattern = patlist[0]
 
         if isinstance(pattern, list):
-            await self._match_exact(path, pattern, patlist)
+            return self._match_exact(path, pattern, patlist)
         else:
-            await self._match_pattern(path, attrs, pattern, patlist)
+            return self._match_pattern(path, attrs, pattern, patlist)
+
+    async def _match(self, path: bytes, attrs: SFTPAttrs,
+                     patlist: _SFTPPatList) -> None:
+        """Match against a glob pattern, depth first"""
+
+        # Each portion match reports the names it completes and yields
+        # what remains to match below them. Running the newest one first
+        # keeps the depth-first order of the names without recursion.
+        portion_matches = [self._match_portion(path, attrs, patlist)]
+
+        while portion_matches:
+            try:
+                submatch = await anext(portion_matches[-1])
+
+            except StopAsyncIteration:
+                portion_matches.pop()
+
+            else:
+                portion_matches.append(self._match_portion(*submatch))
 
     async def match(
         self,

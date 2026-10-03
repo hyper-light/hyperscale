@@ -32,7 +32,7 @@
 
 """
 
-from typing import Dict, Sequence, Tuple, Type, TypeVar, Union
+from typing import Dict, List, Sequence, Tuple, Type, TypeVar, Union
 
 _DERClass = Type['DERType']
 _DERClassVar = TypeVar('_DERClassVar', bound='_DERClass')
@@ -522,8 +522,13 @@ def der_encode(value: object) -> bytes:
     return identifier + len_bytes + content
 
 
-def der_decode_partial(data: bytes) -> Tuple[object, int]:
-    """Decode a value in DER format and return the number of bytes consumed"""
+def _decode_header(data: bytes) -> Tuple[int, bool, int, bytes, int]:
+    """Decode the identifier and length of a value in DER format
+
+       This returns the value's ASN.1 class, whether it is constructed,
+       its tag, its content octets, and the number of bytes it uses.
+
+    """
 
     if len(data) < 2:
         raise ASN1DecodeError('Incomplete data')
@@ -563,13 +568,38 @@ def der_decode_partial(data: bytes) -> Tuple[object, int]:
     if end > len(data):
         raise ASN1DecodeError('Incomplete data')
 
+    return asn1_class, constructed, tag, content, end
+
+
+def der_decode_partial(data: bytes) -> Tuple[object, int]:
+    """Decode a value in DER format and return the number of bytes consumed"""
+
+    asn1_class, constructed, tag, content, end = _decode_header(data)
+
+    # A constructed value with no universal type is an explicit tag,
+    # holding one value that must fill its content. These are the tags
+    # around the value, outermost first, each with the length of its
+    # content and the number of bytes its value used.
+    explicit_tags: List[Tuple[int, int, int, int]] = []
+
+    while constructed and not (asn1_class == UNIVERSAL and tag in _der_class_by_tag):
+        content_length = len(content)
+        tagged_class, tagged_tag = asn1_class, tag
+
+        asn1_class, constructed, tag, content, used = _decode_header(content)
+        explicit_tags.append((tagged_class, tagged_tag, content_length, used))
+
     if asn1_class == UNIVERSAL and tag in _der_class_by_tag:
         cls = _der_class_by_tag[tag]
         value = cls.decode(constructed, content)
-    elif constructed:
-        value = TaggedDERObject(tag, der_decode(content), asn1_class)
     else:
         value = RawDERObject(tag, content, asn1_class)
+
+    for tagged_class, tagged_tag, content_length, used in reversed(explicit_tags):
+        if used < content_length:
+            raise ASN1DecodeError('Data contains unexpected bytes at end')
+
+        value = TaggedDERObject(tagged_tag, value, tagged_class)
 
     return value, end
 
