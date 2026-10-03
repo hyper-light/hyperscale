@@ -202,12 +202,12 @@ class MercurySyncUDPConnection:
                     _,
                     connection,
                     url,
-                    upgrade_ssl,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
             if upgrade_ssl:
@@ -219,12 +219,12 @@ class MercurySyncUDPConnection:
                     _,
                     connection,
                     url,
-                    _,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
             self._url_cache[url.optimized.hostname] = url
@@ -264,6 +264,8 @@ class MercurySyncUDPConnection:
             "request_end": None,
         }
 
+        connection: UDPConnection | None = None
+
         try:
 
             timings["connect_start"] = time.monotonic()
@@ -273,17 +275,16 @@ class MercurySyncUDPConnection:
                 connection,
                 url,
             ) = await asyncio.wait_for(
-                self._connect_to_url_location(request_url),
+                self._connect_to_url_location(connection, request_url),
                 timeout=self.timeouts.connect_timeout,
             )
 
-            if connection.reader is None:
+            if error or connection is None or connection.reader is None:
                 timings["connect_end"] = time.monotonic()
-                self._connections.append(
-                    UDPConnection(
-                        reset_connections=self.reset_connections,
-                    )
-                )
+
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
 
                 return UDPResponse(
                     url=URLMetadata(
@@ -310,10 +311,10 @@ class MercurySyncUDPConnection:
                     timings["write_start"] = time.monotonic()
                     if isinstance(raw_data, (Iterator, list)):
                         for chunk in raw_data:
-                            connection.writer.write(chunk)
+                            connection.writer.send(chunk)
 
                     else:
-                        connection.writer.write(raw_data)
+                        connection.writer.send(raw_data)
 
                     timings["write_end"] = time.monotonic()
                     timings["read_start"] = time.monotonic()
@@ -341,10 +342,10 @@ class MercurySyncUDPConnection:
                     timings["write_start"] = time.monotonic()
                     if isinstance(raw_data, (Iterator, list)):
                         for chunk in raw_data:
-                            connection.writer.write(chunk)
+                            connection.writer.send(chunk)
 
                     else:
-                        connection.writer.write(raw_data)
+                        connection.writer.send(raw_data)
 
                     timings["write_end"] = time.monotonic()
 
@@ -387,7 +388,10 @@ class MercurySyncUDPConnection:
                 timings=timings,
             )
 
-        except Exception as err:
+        except (
+            BaseException,
+            Exception,
+        ) as err:
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
 
@@ -397,11 +401,9 @@ class MercurySyncUDPConnection:
             elif isinstance(request_url, URL):
                 request_url: ParseResult = urlparse(request_url.data)
 
-            self._connections.append(
-                UDPConnection(
-                    reset_connections=self.reset_connections,
-                )
-            )
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
             return UDPResponse(
                 url=URLMetadata(
@@ -414,6 +416,7 @@ class MercurySyncUDPConnection:
 
     async def _connect_to_url_location(
         self,
+        connection: UDPConnection | None,
         request_url: str | URL,
         ssl_redirect_url=None,
     ) -> Tuple[
@@ -440,22 +443,27 @@ class MercurySyncUDPConnection:
         do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup()
+            try:
+                async with dns_lock:
+                    url = parsed_url
+                    await url.lookup()
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[parsed_url.hostname] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
-
-            dns_lock.release()
+                if parsed_url.hostname not in self._url_cache:
+                    del self._dns_waiters[parsed_url.hostname]
 
         elif do_dns_lookup:
-            await dns_waiter
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
             url = self._url_cache.get(parsed_url.hostname)
 
         elif has_optimized_url:
@@ -468,17 +476,28 @@ class MercurySyncUDPConnection:
             for address, ip_info in url:
                 try:
                     await connection.make_connection(
-                        url.address,
+                        address,
                         url.port,
-                        url.socket_config,
+                        ip_info,
                         tls=self._udp_ssl_context if "wss" in url.scheme else None,
                     )
 
                     url.address = address
                     url.socket_config = ip_info
+                    connection_error = None
+                    break
 
-                except Exception:
-                    pass
+                except asyncio.CancelledError as err:
+                    return (
+                        err,
+                        connection,
+                        parsed_url,
+                    )
+
+                except Exception as err:
+                    # Close this attempt's socket before trying the next address.
+                    connection_error = err
+                    connection.reset()
 
         else:
             try:
@@ -487,6 +506,13 @@ class MercurySyncUDPConnection:
                     url.port,
                     url.socket_config,
                     tls=self._udp_ssl_context if "wss" in url.scheme else None,
+                )
+
+            except asyncio.CancelledError as err:
+                return (
+                    err,
+                    connection,
+                    parsed_url,
                 )
 
             except Exception as err:

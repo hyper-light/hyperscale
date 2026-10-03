@@ -82,3 +82,10 @@ class TCPConnectionFactory:
 
         except Exception:
             pass
+
+    def reset(self):
+        self.close()
+        self.transport = None
+        self._connection = None
+        self.socket: socket.socket = None
+        self._writer = None

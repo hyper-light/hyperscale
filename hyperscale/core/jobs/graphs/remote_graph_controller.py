@@ -97,6 +97,9 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             # Host-telemetry monitors sample through run_in_executor —
             # banned and non-deterministic under SIM (see WorkflowRunner).
             monitors_enabled=transport_factory is None,
+            # Byte-identical replay needs a fixed step order; real runs
+            # skip the per-request sorting (see WorkflowRunner).
+            deterministic_step_order=transport_factory is not None,
         )
 
         self.acknowledged_starts: set[str] = set()

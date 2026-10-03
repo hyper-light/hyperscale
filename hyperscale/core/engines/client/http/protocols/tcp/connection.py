@@ -28,10 +28,10 @@ class TCPConnection:
 
         self.socket = socket.socket(family=family, type=type_, proto=proto)
         self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        await asyncio.to_thread(self.socket.connect, address)
-
         self.socket.setblocking(False)
+
+        # Connect on the loop, not in a pool thread.
+        await self.loop.sock_connect(self.socket, address)
 
         reader = Reader(limit=limit, loop=self.loop)
         reader_protocol = TCPProtocol(reader, loop=self.loop)
@@ -82,3 +82,10 @@ class TCPConnection:
 
         except Exception:
             pass
+
+    def reset(self):
+        self.close()
+        self.transport = None
+        self._connection = None
+        self.socket: socket.socket = None
+        self._writer = None

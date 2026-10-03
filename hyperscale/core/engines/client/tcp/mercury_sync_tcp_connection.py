@@ -202,12 +202,12 @@ class MercurySyncTCPConnection:
                     _,
                     connection,
                     url,
-                    upgrade_ssl,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
             if upgrade_ssl:
@@ -219,12 +219,12 @@ class MercurySyncTCPConnection:
                     _,
                     connection,
                     url,
-                    _,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
             self._url_cache[url.optimized.hostname] = url
@@ -266,6 +266,8 @@ class MercurySyncTCPConnection:
         }
 
 
+        connection: TCPConnection | None = None
+
         try:
             timings["connect_start"] = time.monotonic()
 
@@ -274,17 +276,16 @@ class MercurySyncTCPConnection:
                 connection,
                 url,
             ) = await asyncio.wait_for(
-                self._connect_to_url_location(request_url),
+                self._connect_to_url_location(connection, request_url),
                 timeout=self.timeouts.connect_timeout,
             )
 
-            if connection.reader is None:
+            if error or connection is None or connection.reader is None:
                 timings["connect_end"] = time.monotonic()
-                self._connections.append(
-                    TCPConnection(
-                        reset_connections=self.reset_connections,
-                    )
-                )
+
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
 
                 if error is None:
                     error = Exception('Err. - no connection')
@@ -393,7 +394,10 @@ class MercurySyncTCPConnection:
                 timings=timings,
             )
 
-        except Exception as err:
+        except (
+            BaseException,
+            Exception,
+        ) as err:
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
 
@@ -403,11 +407,9 @@ class MercurySyncTCPConnection:
             elif isinstance(request_url, URL):
                 request_url: ParseResult = urlparse(request_url.data)
 
-            self._connections.append(
-                TCPConnection(
-                    reset_connections=self.reset_connections,
-                )
-            )
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
             timings["request_end"] = time.monotonic()
 
@@ -422,6 +424,7 @@ class MercurySyncTCPConnection:
 
     async def _connect_to_url_location(
         self,
+        connection: TCPConnection | None,
         request_url: str | URL,
         ssl_redirect_url=None,
     ) -> Tuple[
@@ -448,22 +451,27 @@ class MercurySyncTCPConnection:
         do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup()
+            try:
+                async with dns_lock:
+                    url = parsed_url
+                    await url.lookup()
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[parsed_url.hostname] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
-
-            dns_lock.release()
+                if parsed_url.hostname not in self._url_cache:
+                    del self._dns_waiters[parsed_url.hostname]
 
         elif do_dns_lookup:
-            await dns_waiter
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
             url = self._url_cache.get(parsed_url.hostname)
 
         elif has_optimized_url:
@@ -486,8 +494,22 @@ class MercurySyncTCPConnection:
                     url.address = address
                     url.socket_config = ip_info
 
-                except Exception:
-                    pass
+                    # One connection: the first address that connects.
+                    connection_error = None
+                    break
+
+                except asyncio.CancelledError as err:
+                    return (
+                        err,
+                        connection,
+                        parsed_url,
+                    )
+
+                except Exception as err:
+                    # Keep the error to return if no address connects, and
+                    # close this attempt's socket before trying the next.
+                    connection_error = err
+                    connection.reset()
                 
         else:
             try:
@@ -497,6 +519,13 @@ class MercurySyncTCPConnection:
                     url.port,
                     url.socket_config,
                     ssl=self._tcp_ssl_context if  url.scheme in ['ssl', 'tls', 'https'] else None,
+                )
+
+            except asyncio.CancelledError as err:
+                return (
+                    err,
+                    connection,
+                    parsed_url,
                 )
 
             except Exception as err:

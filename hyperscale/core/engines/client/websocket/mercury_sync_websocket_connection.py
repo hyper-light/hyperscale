@@ -198,10 +198,11 @@ class MercurySyncWebsocketConnection:
                     url,
                     upgrade_ssl,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
             if upgrade_ssl:
@@ -215,10 +216,11 @@ class MercurySyncWebsocketConnection:
                     url,
                     _,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
             self._url_cache[url.optimized.hostname] = url
@@ -354,6 +356,8 @@ class MercurySyncWebsocketConnection:
         if redirect_url:
             request_url = redirect_url
 
+        connection: WebsocketConnection | None = None
+
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
@@ -365,7 +369,9 @@ class MercurySyncWebsocketConnection:
                 upgrade_ssl,
             ) = await asyncio.wait_for(
                 self._connect_to_url_location(
-                    request_url, ssl_redirect_url=request_url if upgrade_ssl else None
+                    connection,
+                    request_url,
+                    ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
                 timeout=self.timeouts.connect_timeout,
             )
@@ -380,20 +386,21 @@ class MercurySyncWebsocketConnection:
                     _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(
-                        request_url, ssl_redirect_url=ssl_redirect_url
+                        connection,
+                        request_url,
+                        ssl_redirect_url=ssl_redirect_url,
                     ),
                     timeout=self.timeouts.connect_timeout,
                 )
 
                 request_url = ssl_redirect_url
 
-            if connection.reader is None or error:
+            if error or connection is None or connection.reader is None:
                 timings["connect_end"] = time.monotonic()
-                self._connections.append(
-                    WebsocketConnection(
-                        reset_connections=self.reset_connections,
-                    )
-                )
+
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
 
                 return (
                     WebsocketResponse(
@@ -458,9 +465,7 @@ class MercurySyncWebsocketConnection:
             response_headers: dict[bytes, bytes] = {}
 
             raw_headers = b""
-            async for key, value, header_line in connection.reader.iter_headers(
-                connection
-            ):
+            async for key, value, header_line in connection.reader.iter_headers():
                 response_headers[key] = value
                 raw_headers += header_line
 
@@ -496,6 +501,7 @@ class MercurySyncWebsocketConnection:
 
             body_size = min(16384, header_content_length)
 
+            body = b''
             if body_size > 0:
                 body = await asyncio.wait_for(
                     connection.readexactly(body_size), self.timeouts.request_timeout
@@ -520,14 +526,15 @@ class MercurySyncWebsocketConnection:
                 timings,
             )
 
-        except Exception as request_exception:
+        except (
+            BaseException,
+            Exception,
+        ) as request_exception:
             timings["read_end"] = time.monotonic()
 
-            self._connections.append(
-                WebsocketConnection(
-                    reset_connection=self.reset_connections,
-                )
-            )
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -555,6 +562,7 @@ class MercurySyncWebsocketConnection:
 
     async def _connect_to_url_location(
         self,
+        connection: WebsocketConnection | None,
         request_url: str | URL,
         ssl_redirect_url: Optional[str] = None,
     ) -> Tuple[
@@ -580,22 +588,27 @@ class MercurySyncWebsocketConnection:
         do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup()
+            try:
+                async with dns_lock:
+                    url = parsed_url
+                    await url.lookup()
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[parsed_url.hostname] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
-
-            dns_lock.release()
+                if parsed_url.hostname not in self._url_cache:
+                    del self._dns_waiters[parsed_url.hostname]
 
         elif do_dns_lookup:
-            await dns_waiter
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
             url = self._url_cache.get(parsed_url.hostname)
 
         elif has_optimized_url:
@@ -621,14 +634,31 @@ class MercurySyncWebsocketConnection:
                     url.address = address
                     url.socket_config = ip_info
 
+                    # One connection: the first address that connects.
+                    connection_error = None
+                    break
+
+                except asyncio.CancelledError as err:
+                    return (
+                        err,
+                        connection,
+                        parsed_url,
+                        False,
+                    )
+
                 except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(err):
                         return (
-                            None,
-                            None,
+                            err,
+                            connection,
                             parsed_url,
                             True,
                         )
+
+                    # Keep the error to return if no address connects, and
+                    # close this attempt's socket before trying the next.
+                    connection_error = err
+                    connection.reset()
 
         else:
             try:
@@ -643,11 +673,19 @@ class MercurySyncWebsocketConnection:
                     ssl_upgrade=ssl_redirect_url is not None,
                 )
 
+            except asyncio.CancelledError as err:
+                return (
+                    err,
+                    connection,
+                    parsed_url,
+                    False,
+                )
+
             except Exception as err:
                 if "server_hostname is only meaningful with ssl" in str(err):
                     return (
-                        None,
-                        None,
+                        err,
+                        connection,
                         parsed_url,
                         True,
                     )

@@ -13,7 +13,7 @@ def parse_bool_envar(value: str) -> bool:
 
 
 class Env(BaseModel):
-    MERCURY_SYNC_CONNECT_SECONDS: StrictStr = "5s"
+    MERCURY_SYNC_CONNECT_SECONDS: StrictStr = "30s"
     MERCURY_SYNC_SERVER_URL: StrictStr | None = None
     MERCURY_SYNC_API_VERISON: StrictStr = "0.0.1"
     MERCURY_SYNC_TASK_EXECUTOR_TYPE: Literal["thread", "process", "none"] = "thread"

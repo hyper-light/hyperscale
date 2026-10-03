@@ -36,6 +36,26 @@ class TCPConnection:
 
         family, type_, proto, _, address = socket_config
 
+        if connection_type == 'tls' and self.transport:
+            reader = Reader(limit=SMTP_LIMIT, loop=self.loop)
+            reader_protocol = TCPProtocol(reader, loop=self.loop)
+
+            self.transport = await self.loop.start_tls(
+                cast(asyncio.WriteTransport, self.transport),
+                reader_protocol,
+                ssl,
+                server_side=False,
+                server_hostname=hostname if ssl else None,
+                ssl_handshake_timeout=timeout,
+            )
+
+            self._writer = self.transport
+
+            return (
+                reader,
+                self._writer,
+                address[1],
+            )
 
         socket_family = socket.AF_INET
         if len(address) == 4:
@@ -59,34 +79,22 @@ class TCPConnection:
             if ssl is None:
                 hostname = None
 
-            if self.transport:
- 
-                self.transport = await self.loop.start_tls(
-                    cast(asyncio.WriteTransport, self.transport),
-                    reader_protocol,
-                    ssl,
-                    server_side=False,
-                    server_hostname=hostname,
-                    ssl_handshake_timeout=timeout,
-                )
+            self.transport, _ = await self.loop.create_connection(
+                lambda: reader_protocol,
+                sock=self.socket,
+                family=family,
+                server_hostname=hostname,
+                ssl=ssl,
+            )
 
-            else:
-                self.transport, _ = await self.loop.create_connection(
-                    lambda: reader_protocol,
-                    sock=self.socket,
-                    family=family,
-                    server_hostname=hostname,
-                    ssl=ssl,
-                )
-
-                self.transport = await self.loop.start_tls(
-                    cast(asyncio.WriteTransport, self.transport),
-                    reader_protocol,
-                    ssl,
-                    server_side=False,
-                    server_hostname=hostname,
-                    ssl_handshake_timeout=timeout,
-                )
+            self.transport = await self.loop.start_tls(
+                cast(asyncio.WriteTransport, self.transport),
+                reader_protocol,
+                ssl,
+                server_side=False,
+                server_hostname=hostname,
+                ssl_handshake_timeout=timeout,
+            )
 
 
             self._writer = self.transport
@@ -144,3 +152,10 @@ class TCPConnection:
 
         except Exception:
             pass
+
+    def reset(self):
+        self.close()
+        self.transport = None
+        self._connection = None
+        self.socket: socket.socket = None
+        self._writer = None

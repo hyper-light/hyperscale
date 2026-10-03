@@ -77,7 +77,7 @@ class UDPConnection:
                     pass
         # connect
         self.loop = asyncio.get_event_loop()
-        _, protocol = await self.loop.create_datagram_endpoint(
+        self.transport, protocol = await self.loop.create_datagram_endpoint(
             lambda: QuicProtocol(
                 connection, 
                 stream_handler=stream_handler, 
@@ -122,3 +122,10 @@ class UDPConnection:
 
         except Exception:
             pass
+
+    def reset(self):
+        self.close()
+        self.transport = None
+        self._connection = None
+        self.socket: socket.socket = None
+        self._writer = None

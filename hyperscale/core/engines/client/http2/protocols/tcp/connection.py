@@ -38,10 +38,13 @@ class TCPConnection:
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        await self.loop.run_in_executor(None, self.socket.connect, address)
-
+        
         self.socket.setblocking(False)
+
+        # The socket is non-blocking: connect on the loop, not in a pool thread.
+        await self.loop.sock_connect(self.socket, address)
+
+
 
         reader = Reader(limit=HTTP2_LIMIT, loop=self.loop)
 
@@ -68,9 +71,9 @@ class TCPConnection:
 
         self.transport.set_protocol(ssl_protocol)
 
-        await self.loop.run_in_executor(
-            None, ssl_protocol.connection_made, self.transport
-        )
+        # Starts the handshake without blocking. It must run on the loop's
+        # thread: it schedules timers and writes to the transport.
+        ssl_protocol.connection_made(self.transport)
         self.transport.resume_reading()
 
         self.transport = ssl_protocol._app_transport
@@ -115,3 +118,10 @@ class TCPConnection:
 
         except Exception:
             pass
+
+    def reset(self):
+        self.close()
+        self.transport = None
+        self._connection = None
+        self.socket: socket.socket = None
+        self._writer = None

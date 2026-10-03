@@ -96,7 +96,24 @@ class HTTP2Connection:
         return self.stream.reader.read_headers()
 
     def close(self):
+        if self.stream.reader:
+            self.stream.reader = None
+
+        if self.stream.writer:
+            self.stream.writer.clear()
+
         try:
             self._connection_factory.close()
         except Exception:
             pass
+
+    def reset(self):
+        self.connected = False
+
+        if self.stream.reader:
+            self.stream.reader = None
+
+        if self.stream.writer:
+            self.stream.writer.clear()
+
+        self._connection_factory.reset()

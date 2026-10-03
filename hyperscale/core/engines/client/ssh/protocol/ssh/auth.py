@@ -87,8 +87,7 @@ class Auth(SSHPacketHandler):
                     trivial: bool = True) -> None:
         """Send an auth packet"""
 
-        self._conn.send_userauth_packet(pkttype, *args, handler=self,
-                                        trivial=trivial)
+        self._conn.send_userauth_packet(pkttype, *args, trivial=trivial)
         
     def create_task(self, coro: Awaitable[None]) -> None:
         """Create an asynchronous auth task"""

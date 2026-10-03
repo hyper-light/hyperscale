@@ -64,4 +64,20 @@ class HTTP3Connection:
             except Exception:
                 pass
 
+            self.protocol = None
+
         self._connection_factory.close()
+
+    def reset(self):
+        self.connected = False
+
+        if self.protocol:
+            try:
+                self.protocol.close()
+
+            except Exception:
+                pass
+
+            self.protocol = None
+
+        self._connection_factory.reset()

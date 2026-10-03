@@ -90,4 +90,13 @@ class SFTPConnection:
         if self.connection:
             self.connection.close()
 
+    def reset(self):
+        """Drop the SSH connection (and any SFTP session on it); the next
+        request connects afresh."""
+        if self.connection:
+            self.connection.abort()
+
+        self.connection = None
+        self.connected = False
+
 

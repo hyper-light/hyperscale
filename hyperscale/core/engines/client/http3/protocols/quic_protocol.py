@@ -554,6 +554,12 @@ class QuicProtocol(asyncio.DatagramProtocol):
 
     # asyncio.Transport
 
+    def connection_lost(self, exc: Optional[Exception]) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+            self._timer_at = None
+
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = cast(asyncio.DatagramTransport, transport)
 

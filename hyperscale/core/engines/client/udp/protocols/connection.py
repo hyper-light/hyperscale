@@ -65,7 +65,24 @@ class UDPConnection:
                 raise e
 
     def close(self):
+        if self.reader:
+            self.reader = None
+
+        if self.writer:
+            self.writer.clear()
+
         try:
             self._connection_factory.close()
         except Exception:
             pass
+
+    def reset(self):
+        self.connected = False
+
+        if self.reader:
+            self.reader = None
+
+        if self.writer:
+            self.writer.clear()
+
+        self._connection_factory.reset()

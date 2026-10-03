@@ -351,64 +351,68 @@ class LocalRunner:
         error: Exception | None = None,
         terminal_mode: TerminalMode = "full",
     ):
-        async with self._logger.context(
-            name="local_runner",
-        ) as ctx:
-            if error is None:
-                await ctx.log_prepared(
-                    f"Runner type {self._runner_type} received a call to abort and is now aborting all running tests",
-                    name="fatal",
-                )
+        try:
+            async with self._logger.context(
+                        name="local_runner",
+                    ) as ctx:
+                        if error is None:
+                            await ctx.log_prepared(
+                                f"Runner type {self._runner_type} received a call to abort and is now aborting all running tests",
+                                name="fatal",
+                            )
+            
+                        else:
+                            await ctx.log_prepared(
+                                f"Runner type {self._runner_type} encountered exception {str(error)} is now aborting all running tests",
+                                name="fatal",
+                            )
+            
+                        try:
+                            if terminal_mode in ["ci", "full"]:
+                                await ctx.log_prepared(
+                                    "Aborting Hyperscale Terminal UI", name="debug"
+                                )
+                                await self._interface.abort()
+            
+                        except Exception as e:
+                            await ctx.log_prepared(
+                                f"Encountered error {str(e)} aborting Hyperscale Terminal UI",
+                                name="trace",
+                            )
+            
+            
+                        except asyncio.CancelledError:
+                            pass
+            
+                        try:
+                            self._remote_manger.abort()
+                            await ctx.log_prepared(
+                                "Aborting Hyperscale Remote Manager", name="debug"
+                            )
+            
+                        except Exception as e:
+                            await ctx.log_prepared(
+                                f"Encountered error {str(e)} aborting Hyperscale Remote Manager",
+                                name="trace",
+                            )
+            
+                        except asyncio.CancelledError:
+                            pass
+            
+                        try:
+                            await ctx.log_prepared("Aborting Hyperscale Server Pool", name="debug")
+                            self._server_pool.abort()
+                        except Exception as e:
+                            await ctx.log_prepared(
+                                f"Encountered error {str(e)} aborting Hyperscale Server Pool",
+                                name="debug",
+                            )
+            
+                        except asyncio.CancelledError:
+                            pass
 
-            else:
-                await ctx.log_prepared(
-                    f"Runner type {self._runner_type} encountered exception {str(error)} is now aborting all running tests",
-                    name="fatal",
-                )
-
-            try:
-                if terminal_mode in ["ci", "full"]:
-                    await ctx.log_prepared(
-                        "Aborting Hyperscale Terminal UI", name="debug"
-                    )
-                    await self._interface.abort()
-
-            except Exception as e:
-                await ctx.log_prepared(
-                    f"Encountered error {str(e)} aborting Hyperscale Terminal UI",
-                    name="trace",
-                )
-
-
-            except asyncio.CancelledError:
-                pass
-
-            try:
-                self._remote_manger.abort()
-                await ctx.log_prepared(
-                    "Aborting Hyperscale Remote Manager", name="debug"
-                )
-
-            except Exception as e:
-                await ctx.log_prepared(
-                    f"Encountered error {str(e)} aborting Hyperscale Remote Manager",
-                    name="trace",
-                )
-
-            except asyncio.CancelledError:
-                pass
-
-            try:
-                await ctx.log_prepared("Aborting Hyperscale Server Pool", name="debug")
-                self._server_pool.abort()
-            except Exception as e:
-                await ctx.log_prepared(
-                    f"Encountered error {str(e)} aborting Hyperscale Server Pool",
-                    name="debug",
-                )
-
-            except asyncio.CancelledError:
-                pass
+        except KeyboardInterrupt:
+            pass
 
     def _bin_and_check_socket_range(self):
         base_worker_port = self.port + self._workers

@@ -29,6 +29,8 @@ from .models import (
     TransferResult,
 )
 from .protocols.sftp import (
+    SFTPAttrs,
+    SFTPNoSuchFile,
     SFTPGlob,
     SFTPBadMessage,
     SFTPPermissionDenied,
@@ -175,11 +177,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('rb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(
-                        srcpath, 
-                        options.flags,
-                        attributes,
-                    )
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs())
 
                     src = SFTPClientFile(
                         srcpath,
@@ -247,14 +245,14 @@ class SFTPCommand:
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
         if isinstance(data, str):
-            data: bytes = await data.encode()
+            data: bytes = data.encode()
 
         elif isinstance(data, File):
             (
                 dstpath,
                 data,
                 attributes,
-            ) = await data.optimized
+            ) = data.optimized
 
         if self._base_directory and self._base_directory not in dstpath:
             dstpath = posixpath.join(self._base_directory, dstpath)
@@ -300,11 +298,7 @@ class SFTPCommand:
             pflags, _ = mode_to_pflags('wb')
 
             if self._handler.version < 5:
-                handle = await self._handler.open(
-                    dstpath, 
-                    options.flags,
-                    attributes,
-                )
+                handle = await self._handler.open(dstpath, pflags, SFTPAttrs.from_file_attributes(attributes))
 
                 dst = SFTPClientFile(
                     dstpath,
@@ -452,11 +446,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('rb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(
-                        srcpath,
-                        options.flags,
-                        attributes,
-                    )
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs())
 
                     src = SFTPClientFile(
                         srcpath,
@@ -504,11 +494,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('wb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(
-                        srcpath,
-                        options.flags,
-                        attributes,
-                    )
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs.from_file_attributes(attributes))
 
                     dst = SFTPClientFile(
                         srcpath,
@@ -644,7 +630,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('rb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(srcpath, options.flags, attributes)
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs())
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
@@ -707,7 +693,7 @@ class SFTPCommand:
         transferred: dict[bytes, TransferResult] = {}
 
         if isinstance(data, (FileGlob, Directory)):
-            found = await data.optimized
+            found = data.optimized
 
         else:
 
@@ -772,15 +758,10 @@ class SFTPCommand:
 
             else:
                 pflags, _ = mode_to_pflags('wb')
-                handle = await self._handler.open(
-                    dstpath,
-                    pflags,
-                    block_size=0,
-                )
 
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(dstpath, options.flags, attrs)
+                    handle = await self._handler.open(dstpath, pflags, SFTPAttrs.from_file_attributes(attrs))
                     dst = SFTPClientFile(
                         dstpath,
                         self._handler,
@@ -925,7 +906,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('rb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(srcpath, options.flags, attributes)
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs())
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
@@ -972,7 +953,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('wb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(srcpath, options.flags, attributes)
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs.from_file_attributes(attributes))
                     dst = SFTPClientFile(
                         srcpath,
                         copy_handler,
@@ -1096,7 +1077,7 @@ class SFTPCommand:
             dstpath = posixpath.join(self._base_directory, dstpath)
 
         transferred: dict[bytes, TransferResult] = {}
-        operation_start = time.monotonic() - start
+        operation_start = time.monotonic()
 
         if attributes is None:
             attributes = self._create_default_attributes()
@@ -1515,11 +1496,26 @@ class SFTPCommand:
 
         start = time.monotonic()
         
-        attrs = await self._handler.stat(
-            dstpath,
-            flags=options.flags,
-            follow_symlinks=options.follow_symlinks,
-        )
+        try:
+            attrs = await self._handler.stat(
+                dstpath,
+                flags=options.flags,
+                follow_symlinks=options.follow_symlinks,
+            )
+
+        except SFTPNoSuchFile:
+            # Not existing is an answer, not an error: no type, no attributes.
+            elapsed = time.monotonic() - start
+            return (
+                elapsed,
+                {
+                    dstpath: TransferResult(
+                        file_path=dstpath,
+                        file_type=None,
+                        file_transfer_elapsed=elapsed,
+                    ),
+                }
+            )
 
         elapsed = time.monotonic() - start
         return (
@@ -1550,10 +1546,25 @@ class SFTPCommand:
 
         start = time.monotonic()
         
-        attrs = await self._handler.lstat(
-            dstpath,
-            flags=options.flags,
-        )
+        try:
+            attrs = await self._handler.lstat(
+                dstpath,
+                flags=options.flags,
+            )
+
+        except SFTPNoSuchFile:
+            # Not existing is an answer, not an error: no type, no attributes.
+            elapsed = time.monotonic() - start
+            return (
+                elapsed,
+                {
+                    dstpath: TransferResult(
+                        file_path=dstpath,
+                        file_type=None,
+                        file_transfer_elapsed=elapsed,
+                    ),
+                }
+            )
 
         elapsed = time.monotonic() - start
         return (
@@ -2433,22 +2444,20 @@ class SFTPCommand:
         encoded_data: bytes | None = None,
     ):
 
-        created = time.monotonic()
-        created_ns = time.monotonic_ns()
+        # Wire form: whole seconds since the epoch plus a nanosecond fraction.
+        created, created_ns = divmod(time.time_ns(), 1_000_000_000)
 
         return FileAttributes(
             type=TransferResult.to_file_type_int("FILE"),
             size=len(encoded_data) if encoded_data else 0,
-            uid=1000,
-            gid=1000,
-            permissions=644,
+            permissions=0o644,
             crtime=created,
             crtime_ns=created_ns,
             atime=created,
             atime_ns=created_ns,
             ctime=created,
             ctime_ns=created_ns,
-            created=created,
+            mtime=created,
             mtime_ns=created_ns,
             mime_type="application/octet-stream",
         )

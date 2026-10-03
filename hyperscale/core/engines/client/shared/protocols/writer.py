@@ -58,6 +58,10 @@ class Writer:
     def get_extra_info(self, name, default=None):
         return self._transport.get_extra_info(name, default)
 
+    def clear(self):
+        if self._protocol:
+            self._protocol.eof_received()
+
     async def drain(self):
         """Flush the write buffer.
         The intended use is to write

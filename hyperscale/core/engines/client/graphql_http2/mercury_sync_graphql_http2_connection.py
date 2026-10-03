@@ -2,7 +2,6 @@ import asyncio
 import base64
 import time
 import uuid
-from random import randrange
 from typing import (
     Dict,
     List,
@@ -205,9 +204,10 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                     url,
                     upgrade_ssl,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
+                connection.reset()
                 self._connections.append(connection)
                 self._pipes.append(pipe)
 
@@ -223,10 +223,11 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                     url,
                     _,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
                 self._pipes.append(pipe)
 
@@ -392,7 +393,9 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
 
             (error, connection, pipe, url, upgrade_ssl) = await asyncio.wait_for(
                 self._connect_to_url_location(
-                    request_url, ssl_redirect_url=request_url if upgrade_ssl else None
+                    connection,
+                    request_url,
+                    ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
                 timeout=self.timeouts.connect_timeout,
             )
@@ -402,24 +405,22 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
 
                 (error, connection, pipe, url, _) = await asyncio.wait_for(
                     self._connect_to_url_location(
-                        request_url, ssl_redirect_url=ssl_redirect_url
+                        connection,
+                        request_url,
+                        ssl_redirect_url=ssl_redirect_url,
                     ),
                     timeout=self.timeouts.connect_timeout,
                 )
 
                 request_url = ssl_redirect_url
 
-            if error:
+            if error or connection is None or connection.stream.reader is None:
                 timings["connect_end"] = time.monotonic()
 
-                self._connections.append(
-                    HTTP2Connection(
-                        stream_id=randrange(1, 2**20 + 2, 2),
-                        reset_connections=self._reset_connections,
-                    )
-                )
-
-                self._pipes.append(HTTP2Pipe(self._concurrency))
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
+                    self._pipes.append(HTTP2Pipe(self._concurrency))
 
                 return (
                     GraphQLHTTP2Response(
@@ -500,13 +501,8 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             if status >= 300 and status < 400:
                 timings["read_end"] = time.monotonic()
 
-                self._connections.append(
-                    HTTP2Connection(
-                        stream_id=randrange(1, 2**20 + 2, 2),
-                        reset_connections=self._reset_connections,
-                    )
-                )
-                self._pipes.append(HTTP2Pipe(self._concurrency))
+                self._connections.append(connection)
+                self._pipes.append(pipe)
 
                 return (
                     GraphQLHTTP2Response(
@@ -554,15 +550,14 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                 timings,
             )
 
-        except Exception as request_exception:
-            self._connections.append(
-                HTTP2Connection(
-                    stream_id=randrange(1, 2**20 + 2, 2),
-                    reset_connections=self._reset_connections,
-                )
-            )
-
-            self._pipes.append(HTTP2Pipe(self._concurrency))
+        except (
+            BaseException,
+            Exception,
+        ) as request_exception:
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
+                self._pipes.append(HTTP2Pipe(self._concurrency))
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)

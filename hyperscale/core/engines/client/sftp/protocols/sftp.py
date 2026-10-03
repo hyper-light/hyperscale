@@ -1464,6 +1464,31 @@ class SFTPAttrs(Record):
             nlink=self.nlink,
         )
 
+    @classmethod
+    def from_file_attributes(cls, attributes: FileAttributes) -> 'SFTPAttrs':
+        """The SFTP wire form of hyperscale's FileAttributes (the inverse
+        of to_file_attributes)."""
+        return cls(
+            type=attributes.type if attributes.type is not None else FILEXFER_TYPE_UNKNOWN,
+            size=attributes.size,
+            alloc_size=attributes.alloc_size,
+            uid=attributes.uid,
+            gid=attributes.gid,
+            owner=attributes.owner,
+            group=attributes.group,
+            permissions=attributes.permissions,
+            atime=attributes.atime,
+            atime_ns=attributes.atime_ns,
+            crtime=attributes.crtime,
+            crtime_ns=attributes.crtime_ns,
+            mtime=attributes.mtime,
+            mtime_ns=attributes.mtime_ns,
+            ctime=attributes.ctime,
+            ctime_ns=attributes.ctime_ns,
+            mime_type=attributes.mime_type,
+            nlink=attributes.nlink,
+        )
+
     def _format_ns(self, k: str):
         """Convert epoch seconds & nanoseconds to a string date & time"""
 

@@ -647,8 +647,12 @@ class MercurySyncHTTPConnection:
             connection,
             url,
             upgrade_ssl,
+            _
         ) = await asyncio.wait_for(
-            self._connect_to_url_location(optimized_url),
+            self._connect_to_url_location(
+                None,
+                optimized_url,
+            ),
             timeout=self.timeouts.connect_timeout,
         )
         if upgrade_ssl:
@@ -661,14 +665,19 @@ class MercurySyncHTTPConnection:
                 connection,
                 url,
                 _,
+                _,
             ) = await asyncio.wait_for(
-                self._connect_to_url_location(optimized_url),
+                self._connect_to_url_location(
+                    None,
+                    optimized_url,
+                ),
                 timeout=self.timeouts.connect_timeout,
             )
 
         self._url_cache[optimized_url.optimized.hostname] = url
         self._optimized[optimized_url.call_name] = url
 
+        connection.reset()
         self._connections.append(connection)
         
     async def _request(
@@ -855,6 +864,8 @@ class MercurySyncHTTPConnection:
         if redirect_url:
             request_url = redirect_url
 
+        connection: HTTPConnection | None = None
+
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
@@ -867,6 +878,7 @@ class MercurySyncHTTPConnection:
                 span,
             ) = await asyncio.wait_for(
                 self._connect_to_url_location(
+                    connection,
                     request_url,
                     ssl_redirect_url=request_url if upgrade_ssl else None,
                     span=span,
@@ -885,6 +897,7 @@ class MercurySyncHTTPConnection:
                     span,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(
+                        connection,
                         request_url,
                         ssl_redirect_url=ssl_redirect_url,
                         span=span,
@@ -897,7 +910,7 @@ class MercurySyncHTTPConnection:
             encoded_data: Optional[bytes | List[bytes]] = None
             content_type: Optional[str] = None
 
-            if connection.reader is None or error:
+            if error or connection is None or connection.reader is None:
 
                 if span and self.trace.enabled:
                     span = await self.trace.on_request_exception(
@@ -909,12 +922,11 @@ class MercurySyncHTTPConnection:
                         headers=headers,
                     )
 
-                timings["connect_end"] = time.monotonic()
-                self._connections.append(
-                    HTTPConnection(
-                        reset_connections=self.reset_connections,
-                    )
-                )
+                timings["connect_end"] = time.monotonic()       
+
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
 
                 return (
                     HTTPResponse(
@@ -1179,16 +1191,16 @@ class MercurySyncHTTPConnection:
                 timings,
                 span,
             )
-
+        
         except (
+            BaseException,
             Exception,
             socket.error
         ) as err:
-            self._connections.append(
-                HTTPConnection(
-                    reset_connections=self.reset_connections,
-                )
-            )
+
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -1232,6 +1244,7 @@ class MercurySyncHTTPConnection:
         
     async def _connect_to_url_location(
         self,
+        connection: HTTPConnection | None,
         request_url: str | URL,
         ssl_redirect_url: Optional[str | URL] = None,
         span: Span | None = None
@@ -1284,29 +1297,34 @@ class MercurySyncHTTPConnection:
             if span and self.trace.enabled:
                 span = await self.trace.on_dns_resolve_host_start(span)
 
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup()
+            try:
+                async with dns_lock:
+                    url = parsed_url
+                    await url.lookup()
 
-            if span and self.trace.enabled:
-                span = await self.trace.on_dns_resolve_host_end(
-                    span,
-                    [address for address, _ in url],
-                    url.port,
-                )
+                    if span and self.trace.enabled:
+                        span = await self.trace.on_dns_resolve_host_end(
+                            span,
+                            [address for address, _ in url],
+                            url.port,
+                        )
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[parsed_url.hostname] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
-
-            dns_lock.release()
+                if parsed_url.hostname not in self._url_cache:
+                    del self._dns_waiters[parsed_url.hostname]
 
         elif do_dns_lookup:
-            await dns_waiter
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
             url = self._url_cache.get(parsed_url.hostname)
 
             if span and self.trace.enabled:
@@ -1346,14 +1364,33 @@ class MercurySyncHTTPConnection:
                     url.address = address
                     url.socket_config = ip_info
 
+                    # One connection: the first address that connects.
+                    connection_error = None
+                    break
+
+                except asyncio.CancelledError as err:
+                    return (
+                        err,
+                        connection,
+                        parsed_url,
+                        False,
+                        span,
+                    )
+                    
                 except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(err):
                         return (
-                            None,
+                            err,
+                            connection,
                             parsed_url,
                             True,
                             span,
                         )
+
+                    # Keep the error to return if no address connects, and
+                    # close this attempt's socket before trying the next.
+                    connection_error = err
+                    connection.reset()
 
         else:
 
@@ -1376,10 +1413,20 @@ class MercurySyncHTTPConnection:
                     ssl_upgrade=ssl_redirect_url is not None,
                 )
 
+            except asyncio.CancelledError as err:
+                return (
+                    err,
+                    connection,
+                    parsed_url,
+                    False,
+                    span,
+                )
+
             except Exception as err:
                 if "server_hostname is only meaningful with ssl" in str(err):
                     return (
-                        None, 
+                        err,
+                        connection, 
                         parsed_url, 
                         True,
                         span,

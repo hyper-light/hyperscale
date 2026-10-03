@@ -2279,6 +2279,10 @@ class MercurySyncSFTPConnction:
         connection: SFTPConnection | None = None
         
         try:
+            # Held from here on, so every exit -- including cancellation --
+            # returns it.
+            connection = self._connections.pop()
+
             timings["connect_start"] = time.monotonic()
 
             default_connection_options = self._connection_options.to_dict()
@@ -2301,13 +2305,16 @@ class MercurySyncSFTPConnction:
                 connection,
                 url,
             ) = await self._connect(
+                connection,
                 request_url,
                 **default_connection_options,
             )
 
             if err:
                 timings["connect_end"] = time.monotonic()
-                self._connections.append(SFTPConnection())
+
+                connection.reset()
+                self._connections.append(connection)
                 
                 return SFTPResponse(
                     url=URLMetadata(
@@ -2506,12 +2513,15 @@ class MercurySyncSFTPConnction:
 
             )
 
-        except Exception as err:
+        except (
+            BaseException,
+            Exception,
+        ) as err:
             timings["request_end"] = time.monotonic()
 
-            self._connections.append(
-                SFTPConnection()
-            )
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
 
             if isinstance(request_url, str):
@@ -2536,6 +2546,7 @@ class MercurySyncSFTPConnction:
 
     async def _connect(
         self,
+        sftp_connection: SFTPConnection,
         request_url: str | URL,
         **kwargs: dict[str, Any],
 
@@ -2563,29 +2574,31 @@ class MercurySyncSFTPConnction:
         do_dns_lookup = url is None and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup_ssh()
+            try:
+                async with dns_lock:
+                    url = parsed_url
+                    await url.lookup_ssh()
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[parsed_url.hostname] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
-
-            dns_lock.release()
+                if parsed_url.hostname not in self._url_cache:
+                    del self._dns_waiters[parsed_url.hostname]
 
         elif do_dns_lookup:
-            await dns_waiter
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
             url = self._url_cache.get(parsed_url.hostname)
 
         elif has_optimized_url:
             url = request_url.optimized
-
-
-        sftp_connection = self._connections.pop()
 
         connection_error: Exception | None = None
 
@@ -2599,10 +2612,13 @@ class MercurySyncSFTPConnction:
 
                     url.address = address
                     url.socket_config = ip_info
+                    connection_error = None
                     break
 
                 except Exception as err:
+                    # Close this attempt's socket before trying the next address.
                     connection_error = err
+                    sftp_connection.reset()
 
         else:
             try:

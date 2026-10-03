@@ -31,6 +31,8 @@ class SMTPConnection:
         "reset_connection",
         "server_name",
         "command_encoding",
+        "session_key",
+        "session_options",
     )
 
     def __init__(self, reset_connections: bool = False) -> None:
@@ -57,6 +59,10 @@ class SMTPConnection:
         self._connection_factory = TCPConnection()
         self.server_name: str | None = None
         self.command_encoding: Literal['ascii', 'utf-8'] = 'ascii'
+        # The open SMTP session: the (server, auth) it was established for
+        # and its EHLO options. None until a session completes its handshake.
+        self.session_key: tuple[str, tuple[str, str] | None] | None = None
+        self.session_options: dict[str, str] | None = None
         
     async def make_connection(
         self,
@@ -123,4 +129,20 @@ class SMTPConnection:
         return self.reader.read_headers()
 
     def close(self):
+        self._reader_and_writer.clear()
+        self.reader = None
+        self.writer = None
+        self.session_key = None
+        self.session_options = None
+
         self._connection_factory.close()
+
+    def reset(self):
+        self._reader_and_writer.clear()
+        self.reader = None
+        self.writer = None
+        self.session_key = None
+        self.session_options = None
+        self.command_encoding = 'ascii'
+
+        self._connection_factory.reset()

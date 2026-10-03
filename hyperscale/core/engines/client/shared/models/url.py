@@ -102,7 +102,7 @@ class URL:
 
         port = self.parsed.port
 
-        if port:
+        if not port:
             port = 22
 
         self.port = port
@@ -359,7 +359,7 @@ class URL:
                         address,
                         (
                             socket_family,
-                            socket.SOCK_STREAM,
+                            self.protocol if self.protocol is not None else socket.SOCK_STREAM,
                             0,
                             "",
                             address_info,
@@ -389,7 +389,7 @@ class URL:
                         address,
                         (
                             socket_family,
-                            socket.SOCK_STREAM,
+                            self.protocol if self.protocol is not None else socket.SOCK_STREAM,
                             0,
                             "",
                             address_info,

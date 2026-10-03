@@ -4,7 +4,6 @@ import ssl
 import time
 import uuid
 from collections import defaultdict
-from random import randrange
 from typing import (
     Dict,
     Iterator,
@@ -470,7 +469,7 @@ class MercurySyncHTTP2Connection:
                 optimized_url,
                 upgrade_ssl,
             ) = await asyncio.wait_for(
-                self._connect_to_url_location(url),
+                self._connect_to_url_location(None, url),
                 timeout=self.timeouts.connect_timeout,
             )
 
@@ -486,10 +485,11 @@ class MercurySyncHTTP2Connection:
                     optimized_url,
                     _,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+            connection.reset()
             self._connections.append(connection)
             self._pipes.append(pipe)
 
@@ -633,7 +633,9 @@ class MercurySyncHTTP2Connection:
 
             (error, connection, pipe, url, upgrade_ssl) = await asyncio.wait_for(
                 self._connect_to_url_location(
-                    request_url, ssl_redirect_url=request_url if upgrade_ssl else None
+                    connection,
+                    request_url,
+                    ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
                 timeout=self.timeouts.connect_timeout,
             )
@@ -643,6 +645,7 @@ class MercurySyncHTTP2Connection:
 
                 (error, connection, pipe, url, _) = await asyncio.wait_for(
                     self._connect_to_url_location(
+                        connection,
                         request_url,
                         ssl_redirect_url=ssl_redirect_url,
                     ),
@@ -651,17 +654,13 @@ class MercurySyncHTTP2Connection:
 
                 request_url = ssl_redirect_url
 
-            if error:
+            if error or connection is None or connection.stream.reader is None:
                 timings["connect_end"] = time.monotonic()
 
-                self._connections.append(
-                    HTTP2Connection(
-                        stream_id=randrange(1, 2**20 + 2, 2),
-                        reset_connections=self._reset_connections,
-                    )
-                )
-
-                self._pipes.append(HTTP2Pipe(self._concurrency))
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
+                    self._pipes.append(HTTP2Pipe(self._concurrency))
 
                 return (
                     HTTP2Response(
@@ -780,14 +779,14 @@ class MercurySyncHTTP2Connection:
                 timings,
             )
 
-        except Exception:
-            self._connections.append(
-                HTTP2Connection(
-                    stream_id=randrange(1, 2**20 + 2, 2),
-                    reset_connections=self._reset_connections,
-                )
-            )
-            self._pipes.append(HTTP2Pipe(self._concurrency))
+        except (
+            BaseException,
+            Exception,
+        ):
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
+                self._pipes.append(HTTP2Pipe(self._concurrency))
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -944,6 +943,7 @@ class MercurySyncHTTP2Connection:
 
     async def _connect_to_url_location(
         self,
+        connection: HTTP2Connection | None,
         request_url: str | URL,
         ssl_redirect_url: Optional[str] = None,
     ) -> Tuple[
@@ -979,22 +979,27 @@ class MercurySyncHTTP2Connection:
         do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup()
+            try:
+                async with dns_lock:
+                    url = parsed_url
+                    await url.lookup()
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[parsed_url.hostname] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
-
-            dns_lock.release()
+                if parsed_url.hostname not in self._url_cache:
+                    del self._dns_waiters[parsed_url.hostname]
 
         elif do_dns_lookup:
-            await dns_waiter
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
             url = self._url_cache.get(parsed_url.hostname)
 
         elif has_optimized_url:
@@ -1022,15 +1027,33 @@ class MercurySyncHTTP2Connection:
                     url.address = address
                     url.socket_config = ip_info
 
+                    # One connection: the first address that connects.
+                    connection_error = None
+                    break
+
+                except asyncio.CancelledError as err:
+                    return (
+                        err,
+                        connection,
+                        pipe,
+                        parsed_url,
+                        False,
+                    )
+
                 except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(err):
                         return (
-                            None,
-                            None,
-                            None,
+                            err,
+                            connection,
+                            pipe,
                             parsed_url,
                             True,
                         )
+
+                    # Keep the error to return if no address connects, and
+                    # close this attempt's socket before trying the next.
+                    connection_error = err
+                    connection.reset()
 
         else:
             try:
@@ -1045,12 +1068,21 @@ class MercurySyncHTTP2Connection:
                     ssl_upgrade=ssl_redirect_url is not None,
                 )
 
+            except asyncio.CancelledError as err:
+                return (
+                    err,
+                    connection,
+                    pipe,
+                    parsed_url,
+                    False,
+                )
+
             except Exception as err:
                 if "server_hostname is only meaningful with ssl" in str(err):
                     return (
-                        None,
-                        None,
-                        None,
+                        err,
+                        connection,
+                        pipe,
                         parsed_url,
                         True,
                     )

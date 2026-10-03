@@ -84,3 +84,11 @@ class SCPConnection:
     def close(self):
         if self.connection:
             self.connection.close()
+
+    def reset(self):
+        """Drop the SSH connection; the next request connects afresh."""
+        if self.connection:
+            self.connection.abort()
+
+        self.connection = None
+        self.connected = False

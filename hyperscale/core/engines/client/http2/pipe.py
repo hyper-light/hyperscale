@@ -1,3 +1,4 @@
+import struct
 from typing import (
     Dict,
     List,
@@ -8,24 +9,23 @@ from typing import (
 from .config import H2Configuration
 from .errors import (
     ErrorCodes,
-    StreamClosedError,
     StreamError,
 )
 from .events import (
     ConnectionTerminated,
-    DataReceived,
     StreamReset,
     WindowUpdated,
-    PingReceived,
-    PingAckReceived,
-    SettingsAcknowledged,
-    RemoteSettingsChanged,
 )
 from .fast_hpack import Decoder, Encoder
+from .frames.types.attributes import _STRUCT_HBBBL
 from .frames.types.base_frame import Frame
 from .protocols import HTTP2Connection
 from .settings import SettingCodes, Settings, StreamClosedBy
 from .windows import WindowManager
+
+# A whole frame whose payload is one 32-bit word, packed inline: WINDOW_UPDATE
+# (the increment) or RST_STREAM (the error code). RFC 9113 4.1, 6.4, 6.9.
+_FRAME_WITH_UINT32 = struct.Struct(">HBBBLL")
 
 
 class HTTP2Pipe:
@@ -41,6 +41,8 @@ class HTTP2Pipe:
         "_inbound_flow_control_window_manager",
         "local_settings_dict",
         "remote_settings_dict",
+        "closed_by",
+        "_early_response",
     )
 
     CONFIG = H2Configuration(
@@ -54,12 +56,17 @@ class HTTP2Pipe:
         self._decoder = Decoder()
         self._decoder.max_allowed_table_size = self._decoder.header_table.maxsize
         self._init_sent = False
+        self.closed_by: StreamClosedBy | ErrorCodes | None = None
+        self._early_response: Tuple[int, Dict[bytes, bytes], bytes, Optional[Exception]] | None = None
 
         self.local_settings = Settings(
             client=True,
             initial_values={
                 SettingCodes.MAX_CONCURRENT_STREAMS: concurrency,
                 SettingCodes.MAX_HEADER_LIST_SIZE: 2**16,
+                # The pipe reads only the request's own stream and has no
+                # PUSH_PROMISE handling, so servers must not push.
+                SettingCodes.ENABLE_PUSH: 0,
             },
         )
         self.remote_settings = Settings(client=False)
@@ -88,13 +95,12 @@ class HTTP2Pipe:
         new_size = current + increment
 
         if new_size > LARGEST_FLOW_CONTROL_WINDOW:
-            self.outbound_flow_control_window = self.remote_settings.initial_window_size
-
-            self._inbound_flow_control_window_manager = WindowManager(
-                max_window_size=self.local_settings.initial_window_size
+            # RFC 9113 6.9.1: a FLOW_CONTROL_ERROR, which fails the request.
+            raise StreamError(
+                f"Flow control window may not exceed {LARGEST_FLOW_CONTROL_WINDOW}"
             )
 
-        return LARGEST_FLOW_CONTROL_WINDOW - current
+        return new_size
 
     def send_preamble(self, connection: HTTP2Connection):
         if self._init_sent is False:
@@ -106,7 +112,13 @@ class HTTP2Pipe:
             for setting, value in self.local_settings.items():
                 settings_frame.settings[setting] = value
 
-            connection.write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + settings_frame.serialize())
+            # The WINDOW_UPDATE grants the window_increment recorded above, so
+            # the connection window the server sees matches ours.
+            connection.write(
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                + settings_frame.serialize()
+                + _FRAME_WITH_UINT32.pack(0, 4, 0x08, 0, 0, window_increment)
+            )
             self._init_sent = True
 
             self.outbound_flow_control_window = self.remote_settings.initial_window_size
@@ -142,15 +154,37 @@ class HTTP2Pipe:
 
         connection.stream.inbound.window_opened(65536)
 
-        connection.write(headers_frame.serialize())
+        # The WINDOW_UPDATE grants the 65,536 bytes just recorded, so the
+        # stream window the server sees matches ours.
+        connection.write(
+            headers_frame.serialize()
+            + _FRAME_WITH_UINT32.pack(0, 4, 0x08, 0, connection.stream.stream_id, 65536)
+        )
 
         return connection
 
-    async def receive_response(self, connection: HTTP2Connection):
+    async def receive_response(
+        self,
+        connection: HTTP2Connection,
+        until_window_open: bool = False,
+    ):
+        if (early_response := self._early_response) is not None:
+            # submit_request_body already read this response: the server sent
+            # it before taking the whole request body.
+            self._early_response = None
+            return early_response
+
         body_data = bytearray()
         status_code: Optional[int] = 200
         headers_dict: Dict[bytes, bytes] = {}
         error: Optional[Exception] = None
+
+        stream = connection.stream
+        stream_id = stream.stream_id
+        frame_buffer = stream.frame_buffer
+        connection_window = self._inbound_flow_control_window_manager
+        stream_window = stream.inbound
+        response_started = False
 
         done = False
         while done is False:
@@ -163,57 +197,61 @@ class HTTP2Pipe:
                 return (400, headers_dict, body_data, err)
 
             if data == b"":
+                # HTTP/2 ends a response with END_STREAM, never by closing the
+                # connection, so this response is incomplete.
+                error = Exception(
+                    f"Connection - {stream_id} err: connection closed before the stream ended"
+                )
                 done = True
 
-            connection.stream.frame_buffer.data.extend(data)
-            connection.stream.frame_buffer.max_frame_size = (
-                connection.stream.max_outbound_frame_size
-            )
+            frame_buffer.data.extend(data)
+            frame_buffer.max_frame_size = stream.max_outbound_frame_size
 
-            write_data = bytearray()
             frames = None
-            stream_events: List[Frame] = []
 
+            for frame in frame_buffer:
+                if frame.type == 0x0:
+                    # DATA, inlined: this is the hot path.
+                    flow_controlled_length = frame.flow_controlled_length
 
-            for frame in connection.stream.frame_buffer:
-                try:
-                    if frame.type == 0x0:
-                        # DATA
-
-                        end_stream = "END_STREAM" in frame.flags
-                        flow_controlled_length = frame.flow_controlled_length
-                        frame_data = frame.data
-
-                        frames = []
-                        self._inbound_flow_control_window_manager.window_consumed(
-                            flow_controlled_length
+                    connection_window.window_consumed(flow_controlled_length)
+                    if connection_increment := connection_window.process_bytes(
+                        flow_controlled_length
+                    ):
+                        stream.write_window_update_frame(
+                            stream_id=0, window_increment=connection_increment
                         )
 
-                        try:
-                            connection.stream.inbound.window_consumed(
-                                flow_controlled_length
-                            )
+                    if frame.stream_id != stream_id:
+                        # DATA for an earlier stream on this connection only
+                        # consumed connection-level window.
+                        continue
 
-                            event = DataReceived()
-                            event.stream_id = connection.stream.stream_id
+                    response_started = True
+                    stream_window.window_consumed(flow_controlled_length)
+                    body_data.extend(frame.data)
 
-                            stream_events.append(event)
+                    if "END_STREAM" in frame.flags:
+                        done = True
 
-                            if end_stream:
-                                done = True
+                    # A closed stream receives no more DATA, and RFC 9113 5.1
+                    # forbids sending WINDOW_UPDATE on it.
+                    elif stream_increment := stream_window.process_bytes(
+                        flow_controlled_length
+                    ):
+                        stream.write_window_update_frame(
+                            window_increment=stream_increment
+                        )
 
-                            stream_events[0].data = frame_data
-                            stream_events[
-                                0
-                            ].flow_controlled_length = flow_controlled_length
+                    continue
 
-                        except StreamClosedError as e:
-                            status_code = status_code or 400
-                            error = Exception(
-                                f"Connection - {connection.stream.stream_id} err: {str(e._events[0])}"
-                            )
+                if frame.stream_id and frame.stream_id != stream_id:
+                    # A late frame for an earlier stream on this connection,
+                    # e.g. a RST_STREAM sent after its response ended.
+                    continue
 
-                    elif frame.type == 0x07:
+                try:
+                    if frame.type == 0x07:
                         # GOAWAY
 
                         new_event = ConnectionTerminated()
@@ -224,10 +262,19 @@ class HTTP2Pipe:
                             new_event.additional_data = frame.additional_data
 
                         frames = []
-                        done = True
+
+                        # The server still finishes streams up to last_stream_id;
+                        # a later one was never processed and never will be.
+                        if done is False and frame.last_stream_id < stream_id:
+                            status_code = 400
+                            error = Exception(
+                                f"Connection - {stream_id} err: {str(new_event)}"
+                            )
+                            done = True
 
                     elif frame.type == 0x01:
                         # HEADERS
+                        response_started = True
                         headers: List[Tuple[bytes, bytes]] = {}
                         
                         try:
@@ -250,7 +297,7 @@ class HTTP2Pipe:
 
                         frames = []
 
-                    elif frame.type == 0x03:
+                    elif frame.type == 0x03 and done is False:
                         # RESET
 
                         self.closed_by = StreamClosedBy.RECV_RST_STREAM
@@ -263,6 +310,7 @@ class HTTP2Pipe:
                         error = Exception(
                             f"Connection - {connection.stream.stream_id} - err: {str(reset_event)}"
                         )
+                        done = True
 
                     elif frame.type == 0x04:
                         # SETTINGS
@@ -293,18 +341,9 @@ class HTTP2Pipe:
                                 self._decoder.max_allowed_table_size = setting.new_value
 
 
-                            ack_event = SettingsAcknowledged()
-                            ack_event.changed_settings = changes
-                            stream_events.append(ack_event)
 
                         else:
                             self.remote_settings.update(frame.settings)
-                            stream_events.append(
-                                RemoteSettingsChanged(
-                                    self.remote_settings, 
-                                    frame.settings,
-                                ),
-                            )
 
                             changes = self.remote_settings.acknowledge()
 
@@ -334,21 +373,13 @@ class HTTP2Pipe:
                             frames = [settings_frame]
 
                     elif frame.type == 0x06:
-                        # PING
-                        
-                        if "ACK" in frame.flags:
-                            event = PingAckReceived()
+                        # PING: answer it. Its opaque data is not response body.
 
-                        else:
-                            event = PingReceived()
+                        if "ACK" not in frame.flags:
                             ping_frame = Frame(0, 0x06)
                             ping_frame.flags.add("ACK")
                             ping_frame.opaque_data = frame.opaque_data
-                            frames.append(ping_frame)
-
-                        event.data = frame.opaque_data
-                        stream_events.append(event)
-
+                            frames = [ping_frame]
 
                     elif frame.type == 0x08:
                         # WINDOW UPDATE
@@ -387,6 +418,7 @@ class HTTP2Pipe:
                                     error = Exception(
                                         f"Connection - {connection.stream.stream_id} err: {str(event)}"
                                     )
+                                    done = True
 
                             except Exception:
                                 frames = []
@@ -410,63 +442,87 @@ class HTTP2Pipe:
                     error = Exception(
                         f"Connection - {connection.stream.stream_id} err- {str(e)}"
                     )
+                    done = True
 
                 if frames:
+                    # Each reply is written once.
                     for f in frames:
-                        write_data.extend(f.serialize())
+                        connection.write(f.serialize())
 
-                    connection.write(write_data)
-
-            for event in stream_events:
-                amount = event.flow_controlled_length
-
-                conn_increment = (
-                    self._inbound_flow_control_window_manager.process_bytes(amount)
-                )
-
-                if conn_increment:
-                    connection.stream.write_window_update_frame(
-                        stream_id=0, window_increment=conn_increment
-                    )
-
-                if event.data is None:
-                    event.data = b""
-
-                body_data.extend(event.data)
+                    frames = None
 
             if done:
                 break
 
+            if (
+                until_window_open
+                and response_started is False
+                and stream.current_outbound_window_size > 0
+                and self.outbound_flow_control_window > 0
+            ):
+                # Nothing of the response yet, and the body may flow again.
+                return None
+
         return (status_code, headers_dict, bytes(body_data), error)
 
     async def submit_request_body(self, data: bytes, connection: HTTP2Connection):
-        while data:
-            local_flow = connection.stream.current_outbound_window_size
-            max_frame_size = self.max_outbound_frame_size
-            flow = min(local_flow, max_frame_size)
-            while flow == 0:
-                await self.receive_response(connection)
+        stream = connection.stream
+        stream_id = stream.stream_id
+        body = memoryview(data)
+        remaining = len(body)
+        offset = 0
 
-                local_flow = connection.stream.current_outbound_window_size
-                max_frame_size = self.max_outbound_frame_size
-                flow = min(local_flow, max_frame_size)
+        while remaining:
+            # A DATA frame may exceed neither flow control window nor the
+            # server's frame size limit (RFC 9113 6.9.1, 4.2).
+            flow = stream.current_outbound_window_size
+            if (connection_window := self.outbound_flow_control_window) < flow:
+                flow = connection_window
 
-            max_flow = flow
-            chunk_size = min(len(data), max_flow)
-            chunk, data = data[:chunk_size], data[chunk_size:]
+            if (max_frame_size := stream.max_outbound_frame_size) < flow:
+                flow = max_frame_size
 
-            df = Frame(connection.stream.stream_id, 0x0)
-            df.data = chunk
+            if flow <= 0:
+                # Blocked: process what the server sends until it opens a
+                # window, or until it answers without taking the whole body.
+                if (
+                    early_response := await self.receive_response(
+                        connection, until_window_open=True
+                    )
+                ) is not None:
+                    if early_response[3] is None:
+                        # The response completed, so abandon the rest of the
+                        # body. A server that already reset the stream ignores
+                        # this (RFC 9113 5.1).
+                        connection.write(
+                            _FRAME_WITH_UINT32.pack(0, 4, 0x03, 0, stream_id, ErrorCodes.CANCEL)
+                        )
 
-            # Subtract flow_controlled_length to account for possible padding
-            self.outbound_flow_control_window -= df.flow_controlled_length
-            assert self.outbound_flow_control_window >= 0
+                    self._early_response = early_response
+                    return connection
 
-            connection.write(df.serialize())
+                continue
 
-        df = Frame(connection.stream.stream_id, 0x0)
-        df.flags.add("END_STREAM")
+            chunk_size = flow if flow < remaining else remaining
+            remaining -= chunk_size
+            stream.current_outbound_window_size -= chunk_size
+            self.outbound_flow_control_window -= chunk_size
 
-        connection.write(df.serialize())
+            # END_STREAM (0x1) rides on the last DATA frame.
+            connection.write(
+                _STRUCT_HBBBL.pack(
+                    chunk_size >> 8,
+                    chunk_size & 0xFF,
+                    0x0,
+                    0x0 if remaining else 0x1,
+                    stream_id,
+                )
+                + body[offset : offset + chunk_size]
+            )
+            offset += chunk_size
+
+        if offset == 0:
+            # An empty body still has to end the stream.
+            connection.write(_STRUCT_HBBBL.pack(0, 0, 0x0, 0x1, stream_id))
 
         return connection

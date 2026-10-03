@@ -431,10 +431,11 @@ class MercurySyncHTTP3Connection:
                     url,
                     upgrade_ssl,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
             if upgrade_ssl:
@@ -448,10 +449,11 @@ class MercurySyncHTTP3Connection:
                     url,
                     _,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
             self._url_cache[url.optimized.hostname] = url
@@ -599,13 +601,16 @@ class MercurySyncHTTP3Connection:
         if redirect_url:
             request_url = redirect_url
 
+        connection: HTTP3Connection | None = None
+
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
             (error, connection, url, upgrade_ssl) = await asyncio.wait_for(
                 self._connect_to_url_location(
-                    request_url, 
+                    connection,
+                    request_url,
                     ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
                 timeout=self.timeouts.connect_timeout,
@@ -616,7 +621,8 @@ class MercurySyncHTTP3Connection:
 
                 (error, connection, url, _) = await asyncio.wait_for(
                     self._connect_to_url_location(
-                        request_url, 
+                        connection,
+                        request_url,
                         ssl_redirect_url=ssl_redirect_url,
                     ),
                     timeout=self.timeouts.connect_timeout,
@@ -624,13 +630,12 @@ class MercurySyncHTTP3Connection:
 
                 request_url = ssl_redirect_url
 
-            if connection.protocol is None or error:
+            if error or connection is None or connection.protocol is None:
                 timings["connect_end"] = time.monotonic()
-                self._connections.append(
-                    HTTP3Connection(
-                        reset_connections=self.reset_connections,
-                    )
-                )
+
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
 
                 return (
                     HTTP3Response(
@@ -775,10 +780,13 @@ class MercurySyncHTTP3Connection:
                 timings,
             )
 
-        except Exception as request_exception:
-            self._connections.append(
-                HTTP3Connection(reset_connections=self.reset_connections)
-            )
+        except (
+            BaseException,
+            Exception,
+        ) as request_exception:
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -810,6 +818,7 @@ class MercurySyncHTTP3Connection:
 
     async def _connect_to_url_location(
         self,
+        connection: HTTP3Connection | None,
         request_url: str | URL,
         ssl_redirect_url: Optional[str] = None,
     ) -> Tuple[
@@ -836,22 +845,27 @@ class MercurySyncHTTP3Connection:
         do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup()
+            try:
+                async with dns_lock:
+                    url = parsed_url
+                    await url.lookup()
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[parsed_url.hostname] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
-
-            dns_lock.release()
+                if parsed_url.hostname not in self._url_cache:
+                    del self._dns_waiters[parsed_url.hostname]
 
         elif do_dns_lookup:
-            await dns_waiter
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
             url = self._url_cache.get(parsed_url.hostname)
 
         elif has_optimized_url:
@@ -873,14 +887,31 @@ class MercurySyncHTTP3Connection:
                     url.address = address
                     url.socket_config = ip_info
 
+                    # One connection: the first address that connects.
+                    connection_error = None
+                    break
+
+                except asyncio.CancelledError as err:
+                    return (
+                        err,
+                        connection,
+                        parsed_url,
+                        False,
+                    )
+
                 except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(err):
                         return (
-                            None,
-                            None,
+                            err,
+                            connection,
                             parsed_url,
                             True,
                         )
+
+                    # Keep the error to return if no address connects, and
+                    # close this attempt's socket before trying the next.
+                    connection_error = err
+                    connection.reset()
 
         else:
             try:
@@ -891,9 +922,22 @@ class MercurySyncHTTP3Connection:
                     server_name=url.hostname,
                 )
 
+            except asyncio.CancelledError as err:
+                return (
+                    err,
+                    connection,
+                    parsed_url,
+                    False,
+                )
+
             except Exception as err:
                 if "server_hostname is only meaningful with ssl" in str(err):
-                    return None, parsed_url, True
+                    return (
+                        err,
+                        connection,
+                        parsed_url,
+                        True,
+                    )
 
                 connection_error = err
 

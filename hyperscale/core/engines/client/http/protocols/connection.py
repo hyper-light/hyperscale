@@ -102,4 +102,27 @@ class HTTPConnection:
         return self.reader.read_headers()
 
     def close(self):
+        self._reader_and_writer.clear()
+
+        if self.reader:
+            self.reader = None
+
+        if self.writer:
+            self.writer.clear()
+
         self._connection_factory.close()
+
+    def reset(self, hostname: str | None = None):
+        if hostname:
+            self._reader_and_writer[hostname] = None
+        else:
+            self._reader_and_writer.clear()
+
+        if self.reader:
+            self.reader = None
+
+        if self.writer:
+            self.writer.clear()
+
+        self._connection_factory.reset()
+

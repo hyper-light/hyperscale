@@ -38,7 +38,7 @@ class TCPResponse(CallResult):
 
     @classmethod
     def response_type(cls):
-        return RequestType.UDP
+        return RequestType.TCP
 
     def json(self):
         if self.content:
