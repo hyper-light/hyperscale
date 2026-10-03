@@ -1,11 +1,12 @@
 import asyncio
 import functools
+import itertools
 import socket
 from socket import AddressFamily, SocketKind
 from asyncio.events import get_event_loop
 from ipaddress import IPv4Address, ip_address, IPv6Address
 from typing import List, Tuple, Union, Literal
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 import aiodns
 
@@ -13,11 +14,26 @@ from .ip_address_info import IpAddressInfo
 from .types import SocketProtocols, SocketTypes
 
 
+def request_target_path(parsed: ParseResult) -> str:
+    """The path and query, or path and params, a request names."""
+    url_path = parsed.path or "/"
+
+    if parsed.query:
+        return f"{url_path}?{parsed.query}"
+
+    if parsed.params:
+        return url_path + parsed.params
+
+    return url_path
+
+
 class URL:
     __slots__ = (
         "resolver",
         "ip_addr",
-        "parsed",
+        "_parsed",
+        "_hostname",
+        "_path",
         "is_ssl",
         "port",
         "full",
@@ -28,6 +44,7 @@ class URL:
         "loop",
         "ip_addresses",
         "address",
+        "address_rotation",
     )
 
     def __init__(
@@ -61,6 +78,9 @@ class URL:
         self.socket_config: Union[Tuple[str, int], Tuple[str, int, int, int], None] = (
             None
         )
+        # Each new connection to this host starts at the next address, so a
+        # pool's connections spread across all of them.
+        self.address_rotation = itertools.count()
 
     async def replace(self, url: str):
         self.full = url
@@ -414,8 +434,20 @@ class URL:
         self.parsed = self.parsed._replace(scheme=value)
 
     @property
+    def parsed(self) -> ParseResult:
+        return self._parsed
+
+    @parsed.setter
+    def parsed(self, value: ParseResult) -> None:
+        # Every request reads the hostname and path; derive them once per
+        # parse rather than re-splitting the netloc on each read.
+        self._parsed = value
+        self._hostname = value.hostname
+        self._path = request_target_path(value)
+
+    @property
     def hostname(self):
-        return self.parsed.hostname
+        return self._hostname
 
     @hostname.setter
     def hostname(self, value):
@@ -423,20 +455,7 @@ class URL:
 
     @property
     def path(self):
-        url_path = self.parsed.path
-        url_query = self.parsed.query
-        url_params = self.parsed.params
-
-        if not url_path or len(url_path) == 0:
-            url_path = "/"
-
-        if url_query and len(url_query) > 0:
-            url_path += f"?{self.parsed.query}"
-
-        elif url_params and len(url_params) > 0:
-            url_path += self.parsed.params
-
-        return url_path
+        return self._path
 
     @path.setter
     def path(self, value):
@@ -452,7 +471,7 @@ class URL:
 
     @property
     def authority(self):
-        return self.parsed.hostname
+        return self._hostname
 
     @authority.setter
     def authority(self, value):

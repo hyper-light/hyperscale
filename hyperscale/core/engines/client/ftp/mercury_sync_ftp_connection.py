@@ -31,11 +31,13 @@ class MercurySyncFTPConnection:
         pool_size: int | None = None,
         cert_path: str | None = None,
         key_path: str | None = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ):
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._cert_path = cert_path
@@ -1751,6 +1753,7 @@ class MercurySyncFTPConnection:
             command,
             data,
             block_size=block_size,
+            timings=timings,
         )
 
         if err:
@@ -1808,6 +1811,7 @@ class MercurySyncFTPConnection:
             command,
             data,
             block_size=block_size,
+            timings=timings,
         )
         
         if err:
@@ -1989,7 +1993,11 @@ class MercurySyncFTPConnection:
         for offset in range(0, total_bytes, block_size):
             chunk = data[offset: offset + block_size]
             data_connection.write(chunk)
-        
+
+        # The server stores the upload once its data connection closes:
+        # close it gracefully, which sends what is still buffered first.
+        data_connection.writer.close()
+
         timings['write_end'] = time.monotonic()
         if timings['read_start'] is None:
             timings['read_start'] = time.monotonic()
@@ -2092,7 +2100,11 @@ class MercurySyncFTPConnection:
         for offset in range(0, total_bytes, block_size):
             chunk = data[offset: offset + block_size]
             data_connection.write(chunk)
-        
+
+        # The server stores the upload once its data connection closes:
+        # close it gracefully, which sends what is still buffered first.
+        data_connection.writer.close()
+
         timings['write_end'] = time.monotonic()
         if timings['read_start'] is None:
             timings['read_start'] = time.monotonic()
@@ -2943,68 +2955,43 @@ class MercurySyncFTPConnection:
 
         connection_error: Exception | None = None
 
-        if url.address is None:
-            for address, ip_info in url:
-                try:
-                    port = await connection.make_connection(
-                        url.hostname,
-                        ip_info,
-                        url.port,
-                        ssl=self._ssl_context if use_ssl else None,
-                        timeout=self.timeouts.connect_timeout,
-                    )
+        try:
+            # Reuses the connection's transport for this host; otherwise
+            # races a new one across the host's addresses.
+            address, socket_config, new_transport = await connection.connect_to_any(
+                url.hostname,
+                url.ip_addresses,
+                url.address_rotation,
+                ssl=self._ssl_context if use_ssl else None,
+                timeout=self.timeouts.connect_timeout,
+            )
 
-                    # Resolved addresses are host strings; literal ones
-                    # are (host, port) tuples.
-                    connection.host = address if isinstance(address, str) else address[0]
-                    connection.socket_family = url.family
-                    parsed_url.address = address
-                    parsed_url.socket_config = ip_info
-                    parsed_url.port = port
-                    connection_error = None
-
-                    break
-
-                except asyncio.CancelledError as err:
-                    return (
-                        err,
-                        connection,
-                        parsed_url,
-                    )
-
-                except Exception as err:
-                    connection_error = err
-                    # Close this attempt's socket before trying the next address.
-                    connection.reset()
-
-        else:
-
-            try:
-                await connection.make_connection(
-                    url.hostname,
-                    url.socket_config,
-                    url.port,
-                    ssl=self._ssl_context if use_ssl else None,
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                connection.host = (
-                    url.address if isinstance(url.address, str) else url.address[0]
-                )
+            if new_transport:
+                # Resolved addresses are host strings; literal ones
+                # are (host, port) tuples.
+                connection.host = address if isinstance(address, str) else address[0]
                 connection.socket_family = url.family
+                url.address = address
+                url.socket_config = socket_config
 
-            except asyncio.CancelledError as err:
-                return (
-                    err,
-                    connection,
-                    parsed_url,
-                )
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                parsed_url,
+            )
 
-            except Exception as err:
-                connection_error = err
+        except Exception as err:
+            connection_error = err
 
-        return (
-            connection_error,
-            connection,
-            parsed_url,
-        )
+        try:
+            return (
+                connection_error,
+                connection,
+                parsed_url,
+            )
+
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None

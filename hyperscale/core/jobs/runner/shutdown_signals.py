@@ -34,14 +34,22 @@ class ShutdownSignals:
         return self._received
 
     def __enter__(self) -> "ShutdownSignals":
+        self.route()
+
+        return self
+
+    def route(self) -> None:
+        """
+        Claim the routed signals for this task's cancellation. Call it again
+        after starting any component that registers its own handler: the
+        loop keeps only the latest handler per signal.
+        """
         for routed_signal in self.ROUTED_SIGNALS:
             self._loop.add_signal_handler(
                 routed_signal,
                 self._on_signal,
                 routed_signal,
             )
-
-        return self
 
     def __exit__(self, *exc_info) -> None:
         if self._loop.is_closed():

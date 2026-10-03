@@ -8,7 +8,7 @@ from hyperscale.logging import LoggingConfig, LogLevelName
 
 from .node_address import parse_node_address
 from .shared import get_default_workers, get_default_config, node_env, resolve_auth_secret
-from .shutdown_signals import ShutdownSignals
+from hyperscale.core.jobs.runner.shutdown_signals import ShutdownSignals
 
 
 @command(

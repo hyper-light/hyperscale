@@ -16,7 +16,7 @@ from .events import (
     StreamReset,
     WindowUpdated,
 )
-from .fast_hpack import Decoder, Encoder
+from .fast_hpack import ConnectionEncoder, Decoder
 from .frames.types.attributes import _STRUCT_HBBBL
 from .frames.types.base_frame import Frame
 from .protocols import HTTP2Connection
@@ -26,6 +26,10 @@ from .windows import WindowManager
 # A whole frame whose payload is one 32-bit word, packed inline: WINDOW_UPDATE
 # (the increment) or RST_STREAM (the error code). RFC 9113 4.1, 6.4, 6.9.
 _FRAME_WITH_UINT32 = struct.Struct(">HBBBLL")
+
+# HEADERS frame flags (RFC 9113 6.2).
+_END_STREAM = 0x01
+_END_HEADERS = 0x04
 
 
 class HTTP2Pipe:
@@ -52,7 +56,8 @@ class HTTP2Pipe:
     def __init__(self, concurrency: int):
         self.connected = False
         self.concurrency = concurrency
-        self._encoder = Encoder()
+        # One per connection: its dynamic table mirrors this peer's decoder.
+        self._encoder = ConnectionEncoder()
         self._decoder = Decoder()
         self._decoder.max_allowed_table_size = self._decoder.header_table.maxsize
         self._init_sent = False
@@ -144,21 +149,25 @@ class HTTP2Pipe:
             self.remote_settings.initial_window_size
         )
 
-        headers_frame = Frame(connection.stream.stream_id, 0x01)
-        headers_frame.flags.add("END_HEADERS")
-
-        headers_frame.data = headers
-
-        if data is None:
-            headers_frame.flags.add("END_STREAM")
+        stream_id = connection.stream.stream_id
 
         connection.stream.inbound.window_opened(65536)
 
-        # The WINDOW_UPDATE grants the 65,536 bytes just recorded, so the
-        # stream window the server sees matches ours.
+        # The HEADERS frame is packed directly, byte for byte what
+        # Frame.serialize() builds: END_HEADERS, plus END_STREAM when no body
+        # follows. The WINDOW_UPDATE grants the 65,536 bytes just recorded,
+        # so the stream window the server sees matches ours.
+        header_block_length = len(headers)
         connection.write(
-            headers_frame.serialize()
-            + _FRAME_WITH_UINT32.pack(0, 4, 0x08, 0, connection.stream.stream_id, 65536)
+            _STRUCT_HBBBL.pack(
+                (header_block_length >> 8) & 0xFFFF,
+                header_block_length & 0xFF,
+                0x01,
+                _END_HEADERS if data is not None else _END_HEADERS | _END_STREAM,
+                stream_id & 0x7FFFFFFF,
+            )
+            + headers
+            + _FRAME_WITH_UINT32.pack(0, 4, 0x08, 0, stream_id, 65536)
         )
 
         return connection
@@ -247,7 +256,20 @@ class HTTP2Pipe:
 
                 if frame.stream_id and frame.stream_id != stream_id:
                     # A late frame for an earlier stream on this connection,
-                    # e.g. a RST_STREAM sent after its response ended.
+                    # e.g. a cancelled stream's response. Its header block
+                    # still passes through the connection-wide HPACK decoder,
+                    # or the dynamic table falls out of step with the server.
+                    if frame.type == 0x01:
+                        try:
+                            self._decoder.decode(frame.data, raw=True)
+
+                        except Exception as headers_read_err:
+                            status_code = 400
+                            error = Exception(
+                                f"Connection - {stream_id} err: HPACK state lost on stream {frame.stream_id}: {headers_read_err}"
+                            )
+                            done = True
+
                     continue
 
                 try:
@@ -464,6 +486,19 @@ class HTTP2Pipe:
                 return None
 
         return (status_code, headers_dict, bytes(body_data), error)
+
+    def cancel_stream(self, connection: HTTP2Connection):
+        """
+        End the request's stream with RST_STREAM(CANCEL) (RFC 9113 6.4, 7) when
+        its response is abandoned, so the connection can carry the next request.
+        Frames that still arrive for it are discarded (see ``receive_response``).
+        """
+        if connection.stream.writer is not None:
+            connection.write(
+                _FRAME_WITH_UINT32.pack(
+                    0, 4, 0x03, 0, connection.stream.stream_id, ErrorCodes.CANCEL
+                )
+            )
 
     async def submit_request_body(self, data: bytes, connection: HTTP2Connection):
         stream = connection.stream

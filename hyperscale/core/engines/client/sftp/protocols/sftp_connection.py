@@ -9,7 +9,7 @@ from .sftp import (
 
 import asyncio
 import pathlib
-from typing import Any, Literal
+from typing import Any, Iterator, Literal, Sequence
 from hyperscale.core.engines.client.ssh.protocol.ssh.connection import (
     SSHClientConnection,
 )
@@ -57,6 +57,53 @@ class SFTPConnection:
             )
 
             self.connected = True
+
+    async def connect_to_any(
+        self,
+        addresses: Sequence[tuple[str, tuple[str | int | tuple[str, int], ...]]],
+        address_rotation: Iterator[int],
+        **kwargs: dict[str, Any],
+    ) -> tuple[str | None, tuple[str | int | tuple[str, int], ...] | None, bool]:
+        """
+        Reuse this connection's open SSH connection. Otherwise open a new one,
+        trying the host's ``addresses`` one at a time from the next offset in
+        ``address_rotation`` so a pool's connections spread across all of
+        them; the first to connect wins.
+
+        Returns the address and socket config of a new connection (``None``
+        for both on reuse), and whether the connection is new.
+        """
+        if self.connected:
+            return None, None, False
+
+        if not addresses:
+            raise ConnectionError("No addresses to connect to")
+
+        offset = next(address_rotation) % len(addresses)
+        connection_error: Exception | None = None
+
+        for address, socket_config in (*addresses[offset:], *addresses[:offset]):
+            try:
+                await self.make_connection(
+                    socket_config,
+                    **kwargs,
+                )
+
+            except Exception as err:
+                # Close this attempt's connection before trying the next address.
+                connection_error = err
+                self.reset()
+                continue
+
+            return address, socket_config, True
+
+        try:
+            raise connection_error
+
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     async def create_session(
         self,

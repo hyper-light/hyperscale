@@ -377,28 +377,45 @@ class LocalServerPool:
 
                 config = LoggingConfig()
 
-                self._pool_task = asyncio.gather(
-                    *[
-                        self._loop.run_in_executor(
-                            self._executor,
-                            functools.partial(
-                                run_thread,
-                                idx,
-                                leader_address,
-                                worker_ip,
-                                env.model_dump(),
-                                config.directory,
-                                log_level=config.level.name.lower(),
-                                cert_path=cert_path,
-                                key_path=key_path,
-                                enable_server_cleanup=enable_server_cleanup,
-                                
-                            ),
-                        )
-                        for idx, worker_ip in enumerate(worker_ips)
-                    ],
-                    return_exceptions=True,
+                # Ctrl+C belongs to the leader, which shuts the workers down.
+                # Spawned with SIGINT blocked, the workers (and the executor
+                # thread that later replaces them) inherit the mask through
+                # fork and exec, so the terminal's SIGINT never interrupts their
+                # imports or their run. A SIGINT that arrives meanwhile stays
+                # pending and reaches the leader once unblocked.
+                leader_signal_mask = (
+                    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+                    if hasattr(signal, "pthread_sigmask")
+                    else None
                 )
+
+                try:
+                    self._pool_task = asyncio.gather(
+                        *[
+                            self._loop.run_in_executor(
+                                self._executor,
+                                functools.partial(
+                                    run_thread,
+                                    idx,
+                                    leader_address,
+                                    worker_ip,
+                                    env.model_dump(),
+                                    config.directory,
+                                    log_level=config.level.name.lower(),
+                                    cert_path=cert_path,
+                                    key_path=key_path,
+                                    enable_server_cleanup=enable_server_cleanup,
+                                
+                                ),
+                            )
+                            for idx, worker_ip in enumerate(worker_ips)
+                        ],
+                        return_exceptions=True,
+                    )
+
+                finally:
+                    if leader_signal_mask is not None:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, leader_signal_mask)
 
             except (Exception, KeyboardInterrupt):
                 pass

@@ -1,5 +1,6 @@
 import asyncio
 import os
+from contextlib import ExitStack
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import (
     ProcessError,
@@ -24,6 +25,7 @@ from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
 from hyperscale.ui.actions import update_active_workflow_message
 
 from .local_server_pool import LocalServerPool
+from .shutdown_signals import ShutdownSignals
 
 
 async def abort(
@@ -159,7 +161,15 @@ class LocalRunner:
             if timeout is None:
                 timeout = self._worker_connect_timeout
 
+            # SIGINT/SIGTERM cancel this run (see ShutdownSignals) from here until
+            # it has fully shut down. Components register abort handlers of their
+            # own as they start, so the routing is re-claimed after each of them.
+            shutdown_signals = ShutdownSignals(asyncio.current_task())
+            signal_routing = ExitStack()
+
             try:
+                signal_routing.enter_context(shutdown_signals)
+
                 await update_active_workflow_message(
                     "initializing",
                     "Starting worker servers...",
@@ -172,6 +182,7 @@ class LocalRunner:
                     name="info",
                 )
                 await self._server_pool.setup()
+                shutdown_signals.route()
 
                 await self._remote_manger.start(
                     self.host,
@@ -180,6 +191,7 @@ class LocalRunner:
                     cert_path=cert_path,
                     key_path=key_path,
                 )
+                shutdown_signals.route()
 
                 await self._server_pool.run_pool(
                     (self.host, self.port),
@@ -345,6 +357,9 @@ class LocalRunner:
                     pass
 
                 return err
+
+            finally:
+                signal_routing.close()
 
     async def abort(
         self,

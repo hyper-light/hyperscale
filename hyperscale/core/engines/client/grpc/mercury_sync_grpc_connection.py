@@ -34,7 +34,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
     def __init__(
         self,
         pool_size: int = 10**3,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ) -> None:
         super(MercurySyncGRPCConnection, self).__init__(
@@ -106,7 +106,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     upgrade_ssl,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 connection.reset()
@@ -126,7 +126,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 connection.reset()
@@ -206,6 +206,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
             request_url = redirect_url
 
         connection: HTTP2Connection | None = None
+        reading_response = False
 
         try:
             if timings["connect_start"] is None:
@@ -217,7 +218,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     request_url,
                     ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
-                timeout=self.timeouts.connect_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
             if upgrade_ssl:
@@ -235,7 +236,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                         request_url,
                         ssl_redirect_url=ssl_redirect_url,
                     ),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 request_url = ssl_redirect_url
@@ -287,7 +288,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     encoded_data,
                     connection,
                 ),
-                timeout=self.timeouts.write_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
             timings["write_end"] = time.monotonic()
@@ -295,14 +296,18 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
             if timings["read_start"] is None:
                 timings["read_start"] = time.monotonic()
 
+            reading_response = True
             (
                 status,
                 headers,
                 body,
                 error,
             ) = await asyncio.wait_for(
-                pipe.receive_response(connection), timeout=self.timeouts.read_timeout
+                pipe.receive_response(connection),
+                timeout=self.timeouts.request_timeout,
             )
+            reading_response = False
+            connection.consecutive_read_timeouts = 0
 
             if error:
                 raise error
@@ -333,9 +338,23 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
             Exception,
         ) as request_exception:
             if connection:
-                connection.reset()
-                self._connections.append(connection)
-                self._pipes.append(HTTP2Pipe(self._concurrency))
+                if (
+                    reading_response
+                    and isinstance(request_exception, asyncio.TimeoutError)
+                    and connection.consecutive_read_timeouts == 0
+                ):
+                    # A slow response, not a dead connection: cancel only this
+                    # stream and keep the connection. A second timeout in a row
+                    # on it means the connection itself is dead.
+                    pipe.cancel_stream(connection)
+                    connection.consecutive_read_timeouts += 1
+                    self._connections.append(connection)
+                    self._pipes.append(pipe)
+
+                else:
+                    connection.reset()
+                    self._connections.append(connection)
+                    self._pipes.append(HTTP2Pipe(self._concurrency))
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -424,93 +443,65 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
         connection_error: Optional[Exception] = None
 
-        if url.address is None or ssl_redirect_url:
-            for address, ip_info in url:
-                try:
-                    await connection.make_connection(
-                        url.hostname,
-                        address,
-                        url.port,
-                        ip_info,
-                        ssl=self._client_ssl_context
-                        if url.is_ssl or ssl_redirect_url
-                        else None,
-                        ssl_upgrade=ssl_redirect_url is not None,
-                    )
+        try:
+            was_connected = connection.connected
 
-                    url.address = address
-                    url.socket_config = ip_info
+            # Reuses the connection's transport when it reaches one of the
+            # host's addresses; otherwise races a new one across them.
+            address, socket_config, new_transport = await connection.connect_to_any(
+                url.hostname,
+                url.ip_addresses,
+                url.port,
+                url.address_rotation,
+                ssl=self._client_ssl_context
+                if url.is_ssl or ssl_redirect_url
+                else None,
+                ssl_upgrade=ssl_redirect_url is not None,
+            )
 
-                    # One connection: the first address that connects.
-                    connection_error = None
-                    break
+            if new_transport:
+                url.address = address
+                url.socket_config = socket_config
 
-                except asyncio.CancelledError as err:
-                    return (
-                        err,
-                        connection,
-                        pipe,
-                        parsed_url,
-                        False,
-                    )
+                if was_connected:
+                    # The pipe's HPACK and flow-control state belong to the
+                    # transport just replaced.
+                    pipe = HTTP2Pipe(self._concurrency)
 
-                except Exception as err:
-                    if "server_hostname is only meaningful with ssl" in str(err):
-                        return (
-                            err,
-                            connection,
-                            pipe,
-                            parsed_url,
-                            True,
-                        )
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                pipe,
+                parsed_url,
+                False,
+            )
 
-                    # Close this attempt's socket before trying the next address.
-                    connection_error = err
-                    connection.reset()
-
-        else:
-            try:
-                await connection.make_connection(
-                    url.hostname,
-                    url.address,
-                    url.port,
-                    url.socket_config,
-                    ssl=self._client_ssl_context
-                    if url.is_ssl or ssl_redirect_url
-                    else None,
-                    ssl_upgrade=ssl_redirect_url is not None,
-                )
-
-            except asyncio.CancelledError as err:
+        except Exception as err:
+            if "server_hostname is only meaningful with ssl" in str(err):
                 return (
                     err,
                     connection,
                     pipe,
                     parsed_url,
-                    False,
+                    True,
                 )
 
-            except Exception as err:
-                if "server_hostname is only meaningful with ssl" in str(
-                    connection_error
-                ):
-                    return (
-                        err,
-                        connection,
-                        pipe,
-                        parsed_url,
-                        True,
-                    )
+            connection_error = err
 
-                connection_error = err
+        try:
+            return (
+                connection_error,
+                connection,
+                pipe,
+                parsed_url,
+                False,
+            )
 
-        return (
-            connection_error,
-            connection,
-            pipe,
-            parsed_url,
-            False,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     def _encode_data(
         self,

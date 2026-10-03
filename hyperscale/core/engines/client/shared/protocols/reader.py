@@ -1,8 +1,35 @@
 import asyncio
 from asyncio import AbstractEventLoop, Future, Transport, get_event_loop
 from asyncio.exceptions import LimitOverrunError
+from typing import Dict, Optional, Tuple
 
 from .constants import _DEFAULT_LIMIT
+
+# RFC 9112 5.2: an obs-fold continuation line starts with SP or HTAB.
+_FOLD_LINE_STARTS = (0x20, 0x09)
+
+
+def parse_header_section(section: bytes) -> Dict[bytes, bytes]:
+    """
+    Parses HTTP/1.1 field lines (RFC 9112 5) into fields by lower-cased name,
+    a repeated name keeping its last value. An obs-fold continuation is joined
+    to its field with a space (RFC 9112 5.2); a line without a colon that is
+    not a continuation is skipped.
+    """
+    headers: Dict[bytes, bytes] = {}
+    field_name: Optional[bytes] = None
+
+    for line in section.split(b"\n"):
+        if field_name is not None and line and line[0] in _FOLD_LINE_STARTS:
+            headers[field_name] += b" " + line.strip()
+            continue
+
+        name, separator, value = line.strip().partition(b":")
+        if separator:
+            field_name = name.lower()
+            headers[field_name] = value.strip()
+
+    return headers
 
 
 class Reader:
@@ -130,11 +157,67 @@ class Reader:
         finally:
             self._waiter = None
 
+    async def read_header_block(self) -> Dict[bytes, bytes]:
+        """
+        Reads an HTTP/1.1 response's header section -- the field lines after
+        the status line, through the empty line that ends them -- and returns
+        its fields (see ``parse_header_section``). Lines may end in CRLF or a
+        bare LF (RFC 9112 2.2).
+
+        The section is located with one search however the transport split
+        it, then parsed in a single pass.
+        """
+        while (section_end := self._find_header_section_end()) is None:
+            if self._exception is not None:
+                raise self._exception
+
+            if self._eof:
+                raise asyncio.IncompleteReadError(bytes(self._buffer), None)
+
+            if len(self._buffer) > self._limit:
+                raise LimitOverrunError("Header section exceeds the limit", len(self._buffer))
+
+            await self._wait_for_data("read_header_block")
+
+        section_length, consumed_length = section_end
+        section = bytes(self._buffer[:section_length])
+        del self._buffer[:consumed_length]
+        self._maybe_resume_transport()
+
+        return parse_header_section(section)
+
+    def _find_header_section_end(self) -> Optional[Tuple[int, int]]:
+        """
+        The length of the header section's field lines and of the section
+        with its ending empty line, or None until the empty line arrives.
+        """
+        buffer = self._buffer
+
+        if buffer.startswith(b"\r\n"):
+            return 0, 2
+
+        if buffer.startswith(b"\n"):
+            return 0, 1
+
+        crlf_end = buffer.find(b"\n\r\n")
+
+        # A bare-LF empty line only matters before the first CRLF one, so the
+        # body after the section is never scanned.
+        lf_end = buffer.find(b"\n\n", 0, len(buffer) if crlf_end == -1 else crlf_end + 1)
+        if lf_end != -1:
+            return lf_end + 1, lf_end + 2
+
+        if crlf_end != -1:
+            return crlf_end + 1, crlf_end + 3
+
+        return None
+
     async def read(self, n=-1):
         if not self._buffer and not self._eof:
             await self._wait_for_data("read")
 
-        data = bytes(self._buffer[:n])
+        # One copy: slicing the bytearray first would copy the data twice.
+        data = bytes(memoryview(self._buffer)[:n])
         del self._buffer[:n]
 
         self._maybe_resume_transport()

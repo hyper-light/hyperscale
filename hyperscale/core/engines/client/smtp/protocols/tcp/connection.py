@@ -2,11 +2,14 @@ import asyncio
 import ssl
 import socket
 from asyncio.constants import SSL_HANDSHAKE_TIMEOUT
-from asyncio.sslproto import SSLProtocol
-from typing import Literal
+from typing import Literal, Sequence
 from hyperscale.core.engines.client.shared.protocols import (
     Reader,
     Writer,
+)
+from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import (
+    SocketConfig,
+    connect_first_responding,
 )
 from typing import cast
 from .limits import SMTP_LIMIT
@@ -32,11 +35,33 @@ class TCPConnection:
         timeout: int | None = None
 
     ):
+        reader, writer, port, _ = await self.create_racing(
+            hostname,
+            (socket_config,),
+            ssl=ssl,
+            connection_type=connection_type,
+            timeout=timeout,
+        )
+
+        return (
+            reader,
+            writer,
+            port,
+        )
+
+    async def create_racing(
+        self,
+        hostname: str = None,
+        socket_configs: Sequence[SocketConfig] = (),
+        ssl: ssl.SSLContext = None,
+        connection_type: Literal['insecure', 'ssl', 'tls'] = 'tls',
+        timeout: int | None = None,
+    ):
         self.loop = asyncio.get_event_loop()
 
-        family, type_, proto, _, address = socket_config
-
         if connection_type == 'tls' and self.transport:
+            # An upgrade of the open transport (STARTTLS), not a new connection.
+            _, _, _, _, address = socket_configs[0]
             reader = Reader(limit=SMTP_LIMIT, loop=self.loop)
             reader_protocol = TCPProtocol(reader, loop=self.loop)
 
@@ -55,22 +80,16 @@ class TCPConnection:
                 reader,
                 self._writer,
                 address[1],
+                0,
             )
 
-        socket_family = socket.AF_INET
-        if len(address) == 4:
-            socket_family = socket.AF_INET6
-            
-
-        self.socket = socket.socket(family=socket_family, type=type_, proto=proto)
-        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        await asyncio.wait_for(
-            self.loop.run_in_executor(None, self.socket.connect, address),
+        # RFC 8305: the first address to answer gets the connection.
+        self.socket, winner_index = await asyncio.wait_for(
+            connect_first_responding(self.loop, socket_configs),
             timeout=timeout,
         )
 
-        self.socket.setblocking(False)
+        family, _, _, _, address = socket_configs[winner_index]
         reader = Reader(limit=SMTP_LIMIT, loop=self.loop)
 
         if connection_type == 'tls':
@@ -119,22 +138,19 @@ class TCPConnection:
             reader,
             self._writer,
             address[1],
+            winner_index,
         )
 
     def close(self):
         try:
-            if hasattr(self.transport, "_ssl_protocol") and isinstance(
-                self.transport._ssl_protocol, SSLProtocol
-            ):
-                self.transport._ssl_protocol.pause_writing()
+
+            self.transport.abort()
 
         except Exception:
             pass
 
         try:
-            if self.transport and not self.transport.is_closing():
-                self.transport.pause_reading()
-                self.transport.close()
+            self.transport.close()
 
         except Exception:
             pass

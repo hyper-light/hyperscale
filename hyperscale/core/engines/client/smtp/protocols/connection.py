@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from ssl import SSLContext
-from typing import Dict, Optional, Tuple, Literal
+from typing import Dict, Iterator, Optional, Sequence, Tuple, Literal
 
 from hyperscale.core.engines.client.shared.protocols import (
     _DEFAULT_LIMIT,
     Reader,
     Writer,
 )
+from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import SocketConfig
 from .tcp import SMTP_LIMIT
 
 from .tcp import TCPConnection
@@ -102,6 +103,86 @@ class SMTPConnection:
             self.writer = writer
 
         return port
+
+    async def connect_to_any(
+        self,
+        hostname: str,
+        socket_configs: Sequence[SocketConfig],
+        address_rotation: Iterator[int],
+        ssl: Optional[SSLContext] = None,
+        connection_type: Literal['insecure', 'ssl', 'tls'] = 'tls',
+        ssl_upgrade: bool = False,
+        timeout: int | None = None,
+    ) -> Tuple[Optional[SocketConfig], Optional[int], bool]:
+        """
+        Reuse this connection's cached transport for ``hostname`` (unless
+        upgrading it). Otherwise open a new one: the server's lookup lists
+        its addresses once per port, in the order to try those ports, so
+        race each port's addresses (RFC 8305) from the next offset in
+        ``address_rotation``, so a pool's connections spread across all of
+        them, and fall back to the next port only if all of them fail.
+
+        Returns the socket config and port of a new transport (``None`` for
+        both on reuse), and whether the transport is new.
+        """
+        if ssl_upgrade is False and (cached := self._reader_and_writer.get(hostname)) is not None:
+            self.reader, self.writer = cached
+            return None, None, False
+
+        if not socket_configs:
+            raise ConnectionError(f"No addresses to connect to for {hostname}")
+
+        offset = next(address_rotation)
+        connection_error: Exception | None = None
+
+        for port_configs in self._port_groups(socket_configs):
+            start = offset % len(port_configs)
+            ordered = [*port_configs[start:], *port_configs[:start]]
+
+            try:
+                reader, writer, port, winner_index = await self._connection_factory.create_racing(
+                    hostname,
+                    ordered,
+                    ssl=ssl,
+                    connection_type=connection_type,
+                    timeout=timeout,
+                )
+
+            except Exception as err:
+                # Close what this port's attempt left open before the next port.
+                connection_error = err
+                self._connection_factory.reset()
+                continue
+
+            self.reader = reader
+            self.writer = writer
+
+            self._reader_and_writer[hostname] = (reader, writer)
+
+            self.address_info = ordered[winner_index]
+            self.port = port
+            self.ssl = ssl
+
+            return self.address_info, port, True
+
+        try:
+            raise connection_error
+
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
+
+    @staticmethod
+    def _port_groups(socket_configs: Sequence[SocketConfig]):
+        """The configs of each port, in the lookup's order (consecutive runs of one port)."""
+        group_start = 0
+        for index in range(1, len(socket_configs)):
+            if socket_configs[index][4][1] != socket_configs[group_start][4][1]:
+                yield socket_configs[group_start:index]
+                group_start = index
+
+        yield socket_configs[group_start:]
 
     @property
     def empty(self):

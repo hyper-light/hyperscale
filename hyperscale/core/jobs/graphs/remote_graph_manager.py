@@ -130,6 +130,7 @@ class RemoteGraphManager:
             defaultdict(list)
         )
         self._workflow_last_elapsed: Dict[str, float] = {}
+        self._workflow_last_completed: Dict[str, int] = {}
 
         self._threads = workers
         self._status_update_poll_interval = status_update_poll_interval
@@ -1036,6 +1037,10 @@ class RemoteGraphManager:
 
                 self._workflow_timers[workflow.name] = _DEFAULT_MONOTONIC_SOURCE()
 
+                # Each run measures its rate intervals from its own start.
+                self._workflow_last_elapsed.pop(workflow.name, None)
+                self._workflow_last_completed.pop(workflow.name, None)
+
                 # Register for event-driven completion tracking
                 completion_state = self._controller.register_workflow_completion(
                     run_id,
@@ -1230,8 +1235,6 @@ class RemoteGraphManager:
 
                     reporters.extend(custom_reporters)
 
-                await asyncio.sleep(1)
-
                 selected_reporters = ", ".join(
                     [config.reporter_type.name for config in configs]
                 )
@@ -1271,13 +1274,11 @@ class RemoteGraphManager:
                         return_exceptions=True,
                     )
 
-                await asyncio.sleep(1)
-
+                # Delivered to the TUI before this returns, and painted by its
+                # next render (Terminal.stop renders the final frame).
                 await update_active_workflow_message(
                     workflow_slug, f"Complete - {workflow.name}"
                 )
-
-                await asyncio.sleep(1)
 
                 await ctx.log_prepared(
                     message=f"Workflow {workflow.name} run {run_id} complete",
@@ -1417,14 +1418,21 @@ class RemoteGraphManager:
 
             if self._workflow_last_elapsed.get(workflow_name) is None:
                 self._workflow_last_elapsed[workflow_name] = _DEFAULT_MONOTONIC_SOURCE()
+                self._workflow_last_completed[workflow_name] = completed_count
 
-            last_sampled = (
-                _DEFAULT_MONOTONIC_SOURCE() - self._workflow_last_elapsed[workflow_name]
-            )
+            sampled_at = _DEFAULT_MONOTONIC_SOURCE()
+            last_sampled = sampled_at - self._workflow_last_elapsed[workflow_name]
 
             if last_sampled > 1:
+                # Each point is the rate over its own sample interval. The
+                # average since the workflow's timer started also counts
+                # dispatch and setup, so it draws a ramp under a flat load.
+                interval_completed = (
+                    completed_count - self._workflow_last_completed[workflow_name]
+                )
+
                 self._workflow_completion_rates[workflow_name].append(
-                    (int(elapsed), int(completed_count / elapsed) if elapsed > 0 else 0)
+                    (int(elapsed), int(interval_completed / last_sampled))
                 )
 
                 await update_workflow_executions_rates(
@@ -1435,7 +1443,8 @@ class RemoteGraphManager:
                     workflow_slug, update.step_stats
                 )
 
-                self._workflow_last_elapsed[workflow_name] = _DEFAULT_MONOTONIC_SOURCE()
+                self._workflow_last_elapsed[workflow_name] = sampled_at
+                self._workflow_last_completed[workflow_name] = completed_count
 
             # Store update for external consumers
             self._graph_updates[run_id][workflow_name].put_nowait(update)
@@ -1853,19 +1862,22 @@ class RemoteGraphManager:
                 )
             )
 
-            await self._controller.submit_stop_request()
+            if self._controller:
+                await self._controller.submit_stop_request()
 
     async def close(self):
-        self._controller.stop()
-        await self._controller.close()
+        if self._controller:
+            self._controller.stop()
+            await self._controller.close()
 
         # Clear all tracking data to prevent memory leaks
         self._cleanup_tracking_data()
 
     def abort(self):
         try:
-            self._logger.abort()
-            self._controller.abort()
+            if self._controller:
+                self._logger.abort()
+                self._controller.abort()
 
         except Exception:
             pass
@@ -1879,6 +1891,7 @@ class RemoteGraphManager:
         self._workflow_timers.clear()
         self._workflow_completion_rates.clear()
         self._workflow_last_elapsed.clear()
+        self._workflow_last_completed.clear()
         self._graph_updates.clear()
         self._workflow_statuses.clear()
         self._cancellation_updates.clear()

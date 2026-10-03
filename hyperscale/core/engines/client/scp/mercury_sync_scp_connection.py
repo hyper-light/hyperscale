@@ -6,6 +6,7 @@ from typing import Any, Literal
 from urllib.parse import ParseResult, urlparse
 
 from hyperscale.core.engines.client.shared.models import (
+    AddressRotation,
     URL as SFTPUrl,
     RequestType,
     URLMetadata,
@@ -45,11 +46,13 @@ class MercurySyncSCPConnection:
     def __init__(
         self,
         pool_size: int | None = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ):
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._dns_lock: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -59,6 +62,11 @@ class MercurySyncSCPConnection:
         self._client_waiters: dict[asyncio.Transport, asyncio.Future] = {}
         self._destination_connections: list[SCPConnection] = []
         self._source_connections: list[SCPConnection] = []
+        # A transfer connects a source and a destination together; each
+        # role rotates on its own, or with an even number of addresses the
+        # two would split the host's addresses between them.
+        self._source_address_rotation = AddressRotation()
+        self._destination_address_rotation = AddressRotation()
 
         self._hosts: dict[str, tuple[str, int]] = {}
 
@@ -332,6 +340,9 @@ class MercurySyncSCPConnection:
                 username=username,
                 password=password,
                 disable_host_check=insecure,
+                must_be_dir=must_be_dir,
+                preserve=preserve,
+                recurse=recurse,
             )
 
             if src_err or dest_err:
@@ -673,47 +684,40 @@ class MercurySyncSCPConnection:
 
         connection_error: Exception | None = None
 
-        if url.address is None:
-            for address, ip_info in url:
-                try:
-                    await scp_connection.make_connection(
-                        command,
-                        ip_info,
-                        must_be_dir=must_be_dir,
-                        preserve=preserve,
-                        recurse=recurse,
-                        **kwargs,
-                    )
+        try:
+            # Reuses the connection's SSH connection; otherwise opens a new
+            # one across the host's addresses.
+            address, socket_config, new_connection = await scp_connection.connect_to_any(
+                command,
+                url.ip_addresses,
+                (
+                    self._source_address_rotation
+                    if connection_type == "SOURCE"
+                    else self._destination_address_rotation
+                ),
+                must_be_dir=must_be_dir,
+                preserve=preserve,
+                recurse=recurse,
+                **kwargs,
+            )
 
-                    url.address = address
-                    url.socket_config = ip_info
-                    connection_error = None
-                    break
+            if new_connection:
+                url.address = address
+                url.socket_config = socket_config
 
-                except Exception as err:
-                    # Close this attempt's socket before trying the next address.
-                    connection_error = err
-                    scp_connection.reset()
+        except Exception as err:
+            connection_error = err
 
-        else:
-            try:
-                await scp_connection.make_connection(
-                    command,
-                    url.socket_config,
-                    must_be_dir=must_be_dir,
-                    preserve=preserve,
-                    recurse=recurse,
-                    **kwargs,
-                )
+        try:
+            return (
+                connection_error,
+                parsed_url,
+            )
 
-
-            except Exception as err:
-                connection_error = err
-
-        return (
-            connection_error,
-            parsed_url,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     def _get_or_create_attributes(
         self,

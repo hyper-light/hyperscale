@@ -49,11 +49,13 @@ class MercurySyncSFTPConnction:
     def __init__(
         self,
         pool_size: int | None = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ):
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._dns_lock: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -2412,7 +2414,7 @@ class MercurySyncSFTPConnction:
                     result = await command.lexists(*command_args, options)
 
                 case "link":
-                    result = await command.link(*command_args, options)
+                    result = await command.link(*command_args)
 
                 case "listdir":
                     result = await command.scandir(path=command_args[0])
@@ -2478,7 +2480,7 @@ class MercurySyncSFTPConnction:
                     result = await command.symlink(*command_args)
 
                 case "truncate":
-                    result = await command.truncate(*command_args)
+                    result = await command.truncate(*command_args, options)
 
                 case "unlink":
                     result = await command.unlink(*command_args)
@@ -2602,40 +2604,33 @@ class MercurySyncSFTPConnction:
 
         connection_error: Exception | None = None
 
-        if url.address is None:
-            for address, ip_info in url:
-                try:
-                    await sftp_connection.make_connection(
-                        ip_info,
-                        **kwargs,
-                    )
+        try:
+            # Reuses the connection's SSH connection; otherwise opens a new
+            # one across the host's addresses.
+            address, socket_config, new_connection = await sftp_connection.connect_to_any(
+                url.ip_addresses,
+                url.address_rotation,
+                **kwargs,
+            )
 
-                    url.address = address
-                    url.socket_config = ip_info
-                    connection_error = None
-                    break
+            if new_connection:
+                url.address = address
+                url.socket_config = socket_config
 
-                except Exception as err:
-                    # Close this attempt's socket before trying the next address.
-                    connection_error = err
-                    sftp_connection.reset()
+        except Exception as err:
+            connection_error = err
 
-        else:
-            try:
-                await sftp_connection.make_connection(
-                    url.socket_config,
-                    **kwargs,
-                )
+        try:
+            return (
+                connection_error,
+                sftp_connection,
+                parsed_url,
+            )
 
-
-            except Exception as err:
-                connection_error = err
-
-        return (
-            connection_error,
-            sftp_connection,
-            parsed_url,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
     
     def close(self):
         for connection in self._connections:

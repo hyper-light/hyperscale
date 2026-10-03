@@ -6,7 +6,14 @@ hpack/hpack
 Implements the HPACK header compression algorithm as detailed by the IETF.
 """
 
+from .decoder_header_table import (
+    ENTRY_OVERHEAD,
+    STATIC_ENTRIES,
+    STATIC_LENGTH,
+    DecoderHeaderTable,
+)
 from .huffman import HuffmanEncoder
+from .huffman_byte_decoder import HuffmanByteDecoder
 from .table import HeaderTable
 
 # Precompute 2^i for 1-8 for use in prefix calcs.
@@ -4497,55 +4504,95 @@ class Encoder:
         return bytes(field)
 
 
-class Decoder:
-    __slots__ = ("header_table", "max_header_list_size", "max_allowed_table_size")
+_HUFFMAN_BYTE_DECODER = HuffmanByteDecoder(_HUFFMAN_TABLE)
+
+# RFC 7541 6: the leading bits that select a header field representation.
+_INDEXED_FIELD = 0x80
+_LITERAL_WITH_INDEXING = 0x40
+_TABLE_SIZE_UPDATE = 0x20
+# RFC 7541 5.2: the H bit of a string literal.
+_HUFFMAN_ENCODED = 0x80
+# RFC 7541 5.1: each representation's integer prefix, as a mask.
+_INDEX_PREFIX = 0x7F
+_NAME_INDEX_WITH_INDEXING_PREFIX = 0x3F
+_TABLE_SIZE_PREFIX = 0x1F
+_NAME_INDEX_WITHOUT_INDEXING_PREFIX = 0x0F
+_STRING_LENGTH_PREFIX = 0x7F
+
+
+def _decode_integer(data, position, prefix_mask):
     """
-    An HPACK decoder object.
+    Decodes the integer (RFC 7541 5.1) whose prefix is the bits of
+    ``data[position]`` under ``prefix_mask``. Returns the integer and the
+    position after it.
+    """
+    number = data[position] & prefix_mask
+    position += 1
 
-    .. versionchanged:: 2.3.0
-       Added ``max_header_list_size`` argument.
+    if number < prefix_mask:
+        return number, position
 
-    :param max_header_list_size: The maximum decompressed size we will allow
-        for any single header block. This is a protection against DoS attacks
-        that attempt to force the application to expand a relatively small
-        amount of data into a really large header list, allowing enormous
-        amounts of memory to be allocated.
+    shift = 0
+    while True:
+        next_byte = data[position]
+        position += 1
+        number += (next_byte & 0x7F) << shift
 
-        If this amount of data is exceeded, a `OversizedHeaderListError
-        <hpack.OversizedHeaderListError>` exception will be raised. At this
-        point the connection should be shut down, as the HPACK state will no
-        longer be usable.
+        if next_byte < 0x80:
+            return number, position
 
-        Defaults to 64kB.
-    :type max_header_list_size: ``int``
+        shift += 7
+
+
+def _octet_length(text):
+    if type(text) is bytes or text.isascii():
+        return len(text)
+
+    return len(text.encode())
+
+
+def _octets(text):
+    return text if type(text) is bytes else text.encode()
+
+
+def _raise_on_undecodable(headers):
+    for name, value in headers:
+        for text in (name, value):
+            if type(text) is not str:
+                # Raises the UnicodeDecodeError a non-UTF-8 header raises.
+                str(text, "utf-8")
+
+
+class Decoder:
+    __slots__ = (
+        "header_table",
+        "max_header_list_size",
+        "max_allowed_table_size",
+        "_undecodable_literal",
+    )
+    """
+    An HPACK decoder (RFC 7541).
+
+    The header table holds decoded names and values, so an indexed header is
+    a lookup, and Huffman strings decode a byte per step. Names and values
+    are UTF-8: ``decode(data, raw=True)`` returns them as ``str``, and raises
+    UnicodeDecodeError -- after applying the whole block to the header table,
+    which stays in step with the encoder's -- when one is not UTF-8.
+
+    :param max_header_list_size: The largest decompressed header list the
+        peer is told to send (SETTINGS_MAX_HEADER_LIST_SIZE). Defaults to
+        64kB.
     """
 
     def __init__(self, max_header_list_size=2**16):
-        #: The maximum decompressed size we will allow for any single header
-        #: block. This is a protection against DoS attacks that attempt to
-        #: force the application to expand a relatively small amount of data
-        #: into a really large header list, allowing enormous amounts of memory
-        #: to be allocated.
-        #:
-        #: If this amount of data is exceeded, a `OversizedHeaderListError
-        #: <hpack.OversizedHeaderListError>` exception will be raised. At this
-        #: point the connection should be shut down, as the HPACK state will no
-        #: longer be usable.
-        #:
-        #: Defaults to 64kB.
-        #:
-        #: .. versionadded:: 2.3.0
-        self.header_table = HeaderTable()
+        self.header_table = DecoderHeaderTable()
         self.max_header_list_size = max_header_list_size
 
-        #: Maximum allowed header table size.
-        #:
-        #: A HTTP/2 implementation should set this to the most recent value of
-        #: SETTINGS_HEADER_TABLE_SIZE that it sent *and has received an ACK
-        #: for*. Once this setting is set, the actual header table size will be
-        #: checked at the end of each decoding run and whenever it is changed,
-        #: to confirm that it fits in this size.
+        #: Maximum allowed header table size: the most recent
+        #: SETTINGS_HEADER_TABLE_SIZE sent *and acknowledged*. A dynamic table
+        #: size update larger than this is a decoding error.
         self.max_allowed_table_size = self.header_table.maxsize
+        self._undecodable_literal = False
 
     @property
     def header_table_size(self):
@@ -4560,208 +4607,113 @@ class Decoder:
 
     def decode(self, data, raw=False):
         """
-        Takes an HPACK-encoded header block and decodes it into a header set.
-
-        :param data: A bytestring representing a complete HPACK-encoded header
-                     block.
-        :param raw: (optional) Whether to return the headers as tuples of raw
-                    byte strings or to decode them as UTF-8 before returning
-                    them. The default value is False, which returns tuples of
-                    Unicode strings
-        :returns: A list of two-tuples of ``(name, value)`` representing the
-                  HPACK-encoded headers, in the order they were decoded.
-        :raises HPACKDecodingError: If an error is encountered while decoding
-                                    the header block.
+        Decodes an HPACK header block into a list of ``(name, value)``
+        tuples, in order: ``str`` when ``raw`` is true, else bytes.
         """
-
-        data_mem = memoryview(data)
+        header_table = self.header_table
+        dynamic_entries = header_table.entries
         headers = []
-        data_len = len(data)
-        inflated_size = 0
-        current_index = 0
+        append_header = headers.append
+        position = 0
+        data_length = len(data)
+        self._undecodable_literal = False
 
-        while current_index < data_len:
-            # Work out what kind of header we're decoding.
-            # If the high bit is 1, it's an indexed field.
-            current = data[current_index]
-            indexed = True if current & 0x80 else False
+        while position < data_length:
+            representation = data[position]
 
-            # Otherwise, if the second-highest bit is 1 it's a field that does
-            # alter the header table.
-            literal_index = True if current & 0x40 else False
+            if representation & _INDEXED_FIELD:
+                index = representation & _INDEX_PREFIX
+                position += 1
 
-            # Otherwise, if the third-highest bit is 1 it's an encoding context
-            # update.
-            encoding_update = True if current & 0x20 else False
+                if index == _INDEX_PREFIX:
+                    index, position = _decode_integer(data, position - 1, _INDEX_PREFIX)
 
-            if indexed:
-                index, consumed = self._decode_integer(data_mem[current_index:], 7)
-                header = self.header_table.get_by_index(index)
+                # The table lookup, inlined: most of a response's headers are
+                # indexed, and a call per header is a measurable share.
+                if 0 < index <= STATIC_LENGTH:
+                    append_header(STATIC_ENTRIES[index - 1])
+                elif 0 <= (dynamic_index := index - STATIC_LENGTH - 1) < len(dynamic_entries):
+                    append_header(dynamic_entries[dynamic_index])
+                else:
+                    raise Exception(f"Invalid table index {index}")
 
-            elif literal_index:
-                # It's a literal header that does affect the header table.
-                header, consumed = self._decode_literal(data_mem[current_index:], True)
-            elif encoding_update:
-                new_size, consumed = self._decode_integer(data_mem[current_index:], 5)
+            elif representation & _LITERAL_WITH_INDEXING:
+                header, size, position = self._decode_literal(
+                    data, position, _NAME_INDEX_WITH_INDEXING_PREFIX
+                )
+                header_table.add(header, size)
+                append_header(header)
+
+            elif representation & _TABLE_SIZE_UPDATE:
+                new_size, position = _decode_integer(data, position, _TABLE_SIZE_PREFIX)
                 if new_size > self.max_allowed_table_size:
                     raise Exception("Encoder exceeded max allowable table size")
 
-                self.header_table_size = new_size
-                header = None
+                header_table.maxsize = new_size
+
             else:
-                # It's a literal header that does not affect the header table.
-                header, consumed = self._decode_literal(data_mem[current_index:], False)
+                # Literal without indexing or never indexed: not added to the
+                # table (RFC 7541 6.2.2, 6.2.3).
+                header, _, position = self._decode_literal(
+                    data, position, _NAME_INDEX_WITHOUT_INDEXING_PREFIX
+                )
+                append_header(header)
 
-            if header:
-                headers.append(header)
-                name, value = header
-                inflated_size += 32 + len(name) + len(value)
+        if not raw:
+            return [(_octets(name), _octets(value)) for name, value in headers]
 
-            current_index += consumed
+        if self._undecodable_literal or header_table.undecodable_entry_count:
+            _raise_on_undecodable(headers)
 
-        return [
-            (str(header[0], "utf-8"), str(header[1], "utf-8")) if raw else header
-            for header in headers
-        ]
+        return headers
 
-    def _decode_integer(self, data, prefix_bits):
+    def _decode_literal(self, data, position, name_prefix_mask):
         """
-        This decodes an integer according to the wacky integer encoding rules
-        defined in the HPACK spec. Returns a tuple of the decoded integer and the
-        number of bytes that were consumed from ``data`` in order to get that
-        integer.
+        Decodes the literal header field (RFC 7541 6.2) at ``position``.
+        Returns the header, its size in octets (RFC 7541 4.1) and the position
+        after it.
         """
-        if prefix_bits < 1 or prefix_bits > 8:
-            raise ValueError(
-                "Prefix bits must be between 1 and 8, got %s" % prefix_bits
-            )
-
-        max_number = _PREFIX_BIT_MAX_NUMBERS[prefix_bits]
-        index = 1
-        shift = 0
-        mask = 0xFF >> (8 - prefix_bits)
-
-        number = data[0] & mask
-        if number == max_number:
-            while True:
-                next_byte = data[index]
-                index += 1
-
-                if next_byte >= 128:
-                    number += (next_byte - 128) << shift
-                else:
-                    number += next_byte << shift
-                    break
-                shift += 7
-
-        return number, index
-
-    def _decode_literal(self, data, should_index):
-        """
-        Decodes a header represented with a literal.
-        """
-        total_consumed = 0
-
-        # When should_index is true, if the low six bits of the first byte are
-        # nonzero, the header name is indexed.
-        # When should_index is false, if the low four bits of the first byte
-        # are nonzero the header name is indexed.
-        if should_index:
-            indexed_name = data[0] & 0x3F
-            name_len = 6
-            not_indexable = False
+        name_index = data[position] & name_prefix_mask
+        if name_index == name_prefix_mask:
+            name_index, position = _decode_integer(data, position, name_prefix_mask)
         else:
-            high_byte = data[0]
-            indexed_name = high_byte & 0x0F
-            name_len = 4
-            not_indexable = high_byte & 0x10
+            position += 1
 
-        if indexed_name:
-            # Indexed header name.
-            index, consumed = self._decode_integer(data, name_len)
-            name = self.header_table.get_by_index(index)[0]
-
-            total_consumed = consumed
-            length = 0
+        if name_index:
+            name = self.header_table.get_by_index(name_index)[0]
+            name_length = _octet_length(name)
         else:
-            # Literal header name. The first byte was consumed, so we need to
-            # move forward.
-            data = data[1:]
+            name, name_length, position = self._decode_string(data, position)
 
-            length, consumed = self._decode_integer(data, 7)
-            name = data[consumed : consumed + length]
+        value, value_length, position = self._decode_string(data, position)
 
-            if data[0] & 0x80:
-                if not name:
-                    name = b""
+        return (name, value), ENTRY_OVERHEAD + name_length + value_length, position
 
-                state = 0
-                flags = 0
-                decoded_bytes = bytearray()
-                # This loop is unrolled somewhat. Because we use a nibble, not a byte, we
-                # need to handle each nibble twice. We unroll that: it makes the loop body
-                # a bit longer, but that's ok.
-                for input_byte in name:
-                    index = (state * 16) + (input_byte >> 4)
-                    state, flags, output_byte = _HUFFMAN_TABLE[index]
-
-                    if flags & (1 << 1):
-                        decoded_bytes.append(output_byte)
-
-                    index = (state * 16) + (input_byte & 0x0F)
-                    state, flags, output_byte = _HUFFMAN_TABLE[index]
-
-                    if flags & (1 << 1):
-                        decoded_bytes.append(output_byte)
-
-                name = bytes(decoded_bytes)
-
-            total_consumed = consumed + length + 1  # Since we moved forward 1.
-
-        data = data[consumed + length :]
-
-        # The header value is definitely length-based.
-        length, consumed = self._decode_integer(data, 7)
-        value = data[consumed : consumed + length]
-
-        if data[0] & 0x80:
-            if not value:
-                value = b""
-
-            state = 0
-            flags = 0
-            decoded_bytes = bytearray()
-
-            # This loop is unrolled somewhat. Because we use a nibble, not a byte, we
-            # need to handle each nibble twice. We unroll that: it makes the loop body
-            # a bit longer, but that's ok.
-            for input_byte in value:
-                index = (state * 16) + (input_byte >> 4)
-                state, flags, output_byte = _HUFFMAN_TABLE[index]
-
-                if flags & (1 << 1):
-                    decoded_bytes.append(output_byte)
-
-                index = (state * 16) + (input_byte & 0x0F)
-                state, flags, output_byte = _HUFFMAN_TABLE[index]
-
-                if flags & (1 << 1):
-                    decoded_bytes.append(output_byte)
-
-            value = bytes(decoded_bytes)
-
-        # Updated the total consumed length.
-        total_consumed += length + consumed
-
-        # If we have been told never to index the header field, encode that in
-        # the tuple we use.
-        if not_indexable:
-            header = (name, value)
+    def _decode_string(self, data, position):
+        """
+        Decodes the string literal (RFC 7541 5.2) at ``position``. Returns its
+        text, its length in octets and the position after it.
+        """
+        first = data[position]
+        length = first & _STRING_LENGTH_PREFIX
+        if length == _STRING_LENGTH_PREFIX:
+            length, position = _decode_integer(data, position, _STRING_LENGTH_PREFIX)
         else:
-            header = (name, value)
+            position += 1
 
-        # If we've been asked to index this, add it to the header table.
-        if should_index:
-            self.header_table.add(name, value)
+        end = position + length
+        if end > len(data):
+            raise Exception("String literal overruns the header block")
 
-        return header, total_consumed
+        octets = data[position:end]
+        if first & _HUFFMAN_ENCODED:
+            octets = _HUFFMAN_BYTE_DECODER.decode(octets)
+
+        try:
+            return str(octets, "utf-8"), len(octets), end
+
+        except UnicodeDecodeError:
+            # Kept as octets so the header table stays in step with the
+            # encoder's; decode() raises once the whole block is applied.
+            self._undecodable_literal = True
+            return bytes(octets), len(octets), end

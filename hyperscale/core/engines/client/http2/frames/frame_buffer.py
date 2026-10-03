@@ -39,44 +39,27 @@ class FrameBuffer:
     def __iter__(self):
         while len(self.data) >= 9:
             try:
-                fields = _STRUCT_HBBBL.unpack(self.data[:9])
-
-                # First 24 bits are frame length.
-                length = (fields[0] << 8) + fields[1]
-                type = fields[2]
-                flags = fields[3]
-                stream_id = fields[4] & 0x7FFFFFFF
-
-                frame = Frame(stream_id, type, parsed_flag_byte=flags)
+                length_high, length_low, frame_type, flags, stream_id = (
+                    _STRUCT_HBBBL.unpack_from(self.data)
+                )
 
             except (InvalidDataError, InvalidFrameError) as e:  # pragma: no cover
                 raise Exception("Received frame with invalid header: %s" % str(e))
 
+            # First 24 bits are frame length.
+            length = (length_high << 8) + length_low
+
             # Next, check that we have enough length to parse the frame body. If
             # not, bail, leaving the frame header data in the buffer for next time.
+            # The frame is only built once its whole body is here.
             if len(self.data) < length + 9:
                 break
 
+            frame = Frame(stream_id & 0x7FFFFFFF, frame_type, parsed_flag_byte=flags)
             body_data = self.data[9 : 9 + length]
 
-            if frame.type == 0xA:
-                # ALTSVC
-
-                origin_len = _STRUCT_H.unpack(body_data[0:2])[0]
-                frame.origin = body_data[2 : 2 + origin_len]
-
-                if len(frame.origin) != origin_len:
-                    raise Exception("Invalid ALTSVC frame body.")
-
-                frame.field = body_data[2 + origin_len :]
-                frame.body_len = len(body_data)
-
-            elif frame.type == 0x09:
-                # CONTINUATION
-                frame.data = body_data
-                frame.body_len = len(body_data)
-
-            elif frame.type == 0x0:
+            # The most frequent frame types first.
+            if frame_type == 0x0:
                 # DATA
                 padding_data_offset = 0
                 frame.pad_length = 0
@@ -86,23 +69,15 @@ class FrameBuffer:
                     padding_data_offset = 1
 
                 data_length = len(body_data)
-                frame.data = body_data[
-                    padding_data_offset : data_length - frame.pad_length
-                ]
+                # Unpadded, the frame body is the data: no second copy.
+                frame.data = (
+                    body_data[padding_data_offset : data_length - frame.pad_length]
+                    if padding_data_offset
+                    else body_data
+                )
                 frame.body_len = data_length
 
-            elif frame.type == 0x07:
-                # GOAWAY
-
-                frame.last_stream_id, frame.error_code = _STRUCT_LL.unpack(
-                    body_data[:8]
-                )
-                frame.body_len = len(body_data)
-
-                if len(body_data) > 8:
-                    frame.additional_data = body_data[8:]
-
-            elif frame.type == 0x01:
+            elif frame_type == 0x01:
                 # HEADERS
                 padding_data_offset = 0
 
@@ -110,7 +85,8 @@ class FrameBuffer:
                     frame.pad_length = struct.unpack("!B", body_data[:1])[0]
                     padding_data_offset = 1
 
-                body_data = body_data[padding_data_offset:]
+                if padding_data_offset:
+                    body_data = body_data[padding_data_offset:]
 
                 if "PRIORITY" in frame.flags:
                     frame.depends_on, frame.stream_weight = _STRUCT_LB.unpack(
@@ -125,16 +101,20 @@ class FrameBuffer:
 
                 data_length = len(body_data)
                 frame.body_len = data_length
-                frame.data = body_data[
-                    padding_data_offset : data_length - frame.pad_length
-                ]
+                # Without padding or priority fields, the body is the header
+                # block: no second copy.
+                frame.data = (
+                    body_data[padding_data_offset : data_length - frame.pad_length]
+                    if padding_data_offset or frame.pad_length
+                    else body_data
+                )
 
-            elif frame.type == 0x06:
+            elif frame_type == 0x06:
                 # PING
                 frame.opaque_data = body_data
                 frame.body_len = 8
 
-            elif frame.type == 0x02:
+            elif frame_type == 0x02:
                 # PRIORITY
 
                 try:
@@ -149,7 +129,7 @@ class FrameBuffer:
 
                 frame.body_len = 5
 
-            elif frame.type == 0x05:
+            elif frame_type == 0x05:
                 # PUSH PROMISE
                 padding_data_offset = 0
                 frame.pad_length = 0
@@ -170,12 +150,12 @@ class FrameBuffer:
                 ]
                 frame.body_len = data_len
 
-            elif frame.type == 0x03:
+            elif frame_type == 0x03:
                 # RESET
                 frame.error_code = _STRUCT_L.unpack(body_data)[0]
                 frame.body_len = 4
 
-            elif frame.type == 0x04:
+            elif frame_type == 0x04:
                 # SETTINGS
                 body_len = 0
                 for i in range(0, len(body_data), 6):
@@ -186,10 +166,38 @@ class FrameBuffer:
 
                 frame.body_len = body_len
 
-            elif frame.type == 0x08:
+            elif frame_type == 0x08:
                 # WINDOW UPDATE
                 frame.window_increment = _STRUCT_L.unpack(body_data)[0]
                 frame.body_len = 4
+
+            elif frame_type == 0x07:
+                # GOAWAY
+
+                frame.last_stream_id, frame.error_code = _STRUCT_LL.unpack(
+                    body_data[:8]
+                )
+                frame.body_len = len(body_data)
+
+                if len(body_data) > 8:
+                    frame.additional_data = body_data[8:]
+
+            elif frame_type == 0x09:
+                # CONTINUATION
+                frame.data = body_data
+                frame.body_len = len(body_data)
+
+            elif frame_type == 0xA:
+                # ALTSVC
+
+                origin_len = _STRUCT_H.unpack(body_data[0:2])[0]
+                frame.origin = body_data[2 : 2 + origin_len]
+
+                if len(frame.origin) != origin_len:
+                    raise Exception("Invalid ALTSVC frame body.")
+
+                frame.field = body_data[2 + origin_len :]
+                frame.body_len = len(body_data)
 
             # At this point, as we know we'll use or discard the entire frame, we
             # can update the data.
@@ -197,15 +205,13 @@ class FrameBuffer:
 
             # Pass the frame through the heaer buffer.
             # f = self._update_header_buffer(f)
-            is_headers_or_push_promise = (
-                frame.frame_type == "HEADERS" or frame.frame_type == "PUSHPROMISE"
-            )
+            is_headers_or_push_promise = frame_type == 0x01 or frame_type == 0x05
 
             if self._headers_buffer:
                 stream_id = self._headers_buffer[0].stream_id
                 valid_frame = (
                     frame is not None
-                    and frame.frame_type == "CONTINUATION"
+                    and frame_type == 0x09
                     and frame.stream_id == stream_id
                 )
 
@@ -225,7 +231,7 @@ class FrameBuffer:
 
                     frame_data = bytearray()
                     for header_frame in self._headers_buffer:
-                        frame_data.extend(header_frame)
+                        frame_data.extend(header_frame.data)
 
                     frame.data = frame_data
                     self._headers_buffer = []

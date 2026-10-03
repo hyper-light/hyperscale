@@ -68,7 +68,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
     def __init__(
         self,
         pool_size: int = 10**3,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ) -> None:
         super(MercurySyncGraphQLConnection, self).__init__(
@@ -205,7 +205,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 connection.reset()
@@ -224,7 +224,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 connection.reset()
@@ -413,7 +413,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     request_url,
                     ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
-                timeout=self.timeouts.connect_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
             if upgrade_ssl:
@@ -425,7 +425,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                         request_url,
                         ssl_redirect_url=ssl_redirect_url,
                     ),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 request_url = ssl_redirect_url
@@ -493,12 +493,13 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                 timings["read_start"] = time.monotonic()
 
             response_code = await asyncio.wait_for(
-                connection.reader.readline(), timeout=self.timeouts.read_timeout
+                connection.reader.readline(),
+                timeout=self.timeouts.request_timeout,
             )
 
             response_headers: Dict[bytes, bytes] = await asyncio.wait_for(
                 connection.read_headers(),
-                timeout=self.timeouts.read_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
             status_string: List[bytes] = response_code.split()
@@ -539,7 +540,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             if content_length:
                 body = await asyncio.wait_for(
                     connection.readexactly(int(content_length)),
-                    timeout=self.timeouts.read_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
             elif transfer_encoding:
@@ -551,7 +552,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                         (
                             await asyncio.wait_for(
                                 connection.readline(),
-                                timeout=self.timeouts.read_timeout,
+                                timeout=self.timeouts.request_timeout,
                             )
                         ).rstrip(),
                         16,
@@ -560,13 +561,14 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     if not chunk_size:
                         # read last CRLF
                         await asyncio.wait_for(
-                            connection.readline(), timeout=self.timeouts.read_timeout
+                            connection.readline(),
+                            timeout=self.timeouts.request_timeout,
                         )
                         break
 
                     chunk = await asyncio.wait_for(
                         connection.readexactly(chunk_size + 2),
-                        self.timeouts.read_timeout,
+                        timeout=self.timeouts.request_timeout,
                     )
                     body.extend(chunk[:-2])
 

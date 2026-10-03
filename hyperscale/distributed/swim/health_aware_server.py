@@ -4666,9 +4666,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             )
 
         except Exception:
-            import traceback
-
-            print(traceback.format_exc())
+            pass
 
     async def _join_node(self, target_addr: tuple[str, int]) -> None:
         """Register with the node at ``target_addr`` (operator join).

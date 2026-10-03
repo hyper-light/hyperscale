@@ -1,10 +1,9 @@
 import asyncio
 import inspect
 import math
-import socket
 import warnings
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Coroutine, Dict, List, Literal, Tuple
+from typing import Any, AsyncGenerator, Coroutine, Dict, List, Literal, Set, Tuple
 
 import networkx
 import psutil
@@ -42,7 +41,6 @@ StepStatsType = Literal[
 
 
 warnings.simplefilter("ignore")
-
 
 async def guard_optimize_call(optimize_call: Coroutine[Any, Any, None]):
     try:
@@ -742,6 +740,7 @@ class WorkflowRunner:
 
                 self._concurrency_gated[run_id].add(workflow.name)
                 try:
+
                     results = await self._execute_test_workflow(
                         run_id,
                         workflow,
@@ -750,6 +749,7 @@ class WorkflowRunner:
                         context,
                         config,
                     )
+
                 finally:
                     self._end_concurrency_gate(run_id, workflow.name)
 
@@ -1028,65 +1028,86 @@ class WorkflowRunner:
         # host-dependent wall time.
         start = loop.time()
 
-        if config.get("interval") is None:
-            completed, pending = await asyncio.wait(
-                [
-                    loop.create_task(
-                        self._spawn_vu(
-                            run_id,
-                            workflow_name,
-                            traversal_order,
-                            remaining,
-                            workflow_context,
-                        ),
-                        name=workflow.name,
-                    )
-                    async for remaining in self._generate(
-                        run_id,
-                        workflow_name,
-                        config,
-                    )
-                ],
-                timeout=1,
-            )
+        # Each VU's results are reduced into the step aggregates as the VU
+        # finishes, and the VU is dropped: a run holds only the VUs still in
+        # flight, not every VU it ran, so nothing is left to sweep at the end.
+        workflow_results = Results(hooks)
+        step_aggregates = workflow_results.create_aggregates(hooks)
+        in_flight: Set[asyncio.Task] = set()
+        vu_errors: List[BaseException] = []
 
-        else:
-            completed, pending = await asyncio.wait(
-                [
-                    loop.create_task(
-                        self._spawn_vu(
-                            run_id,
-                            workflow_name,
-                            traversal_order,
-                            remaining,
-                            workflow_context,
-                        ),
-                        name=workflow.name,
+        def collect_vu(vu_task: asyncio.Task) -> None:
+            if vu_task not in in_flight:
+                # Already collected, or abandoned at the deadline.
+                return
+
+            in_flight.discard(vu_task)
+
+            if vu_task.cancelled():
+                return
+
+            if (vu_error := vu_task.exception()) is not None:
+                vu_errors.append(vu_error)
+                return
+
+            for hook_task in vu_task.result():
+                if (result := guard_result(hook_task)) is not None:
+                    workflow_results.aggregate_result(
+                        step_aggregates,
+                        hook_task.get_name(),
+                        result,
                     )
-                    async for remaining in self._generate_constant(
-                        run_id,
-                        workflow_name,
-                        config,
-                    )
-                ],
-                timeout=1,
+
+        generator = (
+            self._generate(
+                run_id,
+                workflow_name,
+                config,
             )
+            if config.get("interval") is None
+            else self._generate_constant(
+                run_id,
+                workflow_name,
+                config,
+            )
+        )
+
+        async for remaining in generator:
+            vu_task = loop.create_task(
+                self._spawn_vu(
+                    run_id,
+                    workflow_name,
+                    traversal_order,
+                    remaining,
+                    workflow_context,
+                ),
+                name=workflow.name,
+            )
+            in_flight.add(vu_task)
+            vu_task.add_done_callback(collect_vu)
+
+        if in_flight:
+            await asyncio.wait(in_flight, timeout=1)
 
         elapsed = loop.time() - start
 
         if not self._is_stopped.set():
             self._is_stopped.set()
 
-        await asyncio.gather(*completed, return_exceptions=True)
-
         # Cancel and release all pending tasks
         for pend in self._pending[run_id][workflow.name]:
             cancel_and_release_task(pend)
         self._pending[run_id][workflow.name].clear()
 
-        # Cancel tasks from asyncio.wait that didn't complete
-        for pend in pending:
-            cancel_and_release_task(pend)
+        # A VU done by the deadline counts even if its callback has yet to
+        # run; one still running is cancelled and does not.
+        for vu_task in list(in_flight):
+            if vu_task.done():
+                collect_vu(vu_task)
+
+            else:
+                in_flight.discard(vu_task)
+                cancel_and_release_task(vu_task)
 
         if len(self._failed[run_id][workflow_name]) > 0:
             await asyncio.gather(
@@ -1094,24 +1115,12 @@ class WorkflowRunner:
                 return_exceptions=True,
             )
 
-        workflow_results_set: Dict[str, List[Any]] = {
-            hook_name: [] for hook_name in hooks
-        }
+        if vu_errors:
+            raise vu_errors[0]
 
-        [
-            workflow_results_set[result.get_name()].append(
-                guard_result(result),
-            )
-            for complete in completed
-            for result in complete.result()
-            if guard_result(result) is not None
-        ]
-
-        workflow_results = Results(hooks)
-
-        processed_results = workflow_results.process(
+        processed_results = workflow_results.process_aggregates(
             workflow_name,
-            workflow_results_set,
+            step_aggregates,
             elapsed,
         )
 

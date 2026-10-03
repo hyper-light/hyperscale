@@ -1015,7 +1015,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 name="info",
             )
 
-            self.stop()
+            # Stop once this request's reply has gone out: stopping here cancels
+            # every pending reply, this one included, which leaves the sender
+            # retrying until its timeouts and backoff run out (11s by default).
+            asyncio.current_task().add_done_callback(lambda _: self.stop())
 
     @receive()
     async def start_workflow(

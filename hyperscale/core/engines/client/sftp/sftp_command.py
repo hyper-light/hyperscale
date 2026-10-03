@@ -39,6 +39,7 @@ from .protocols.sftp import (
     SFTPClientFile,
     SFTPError,
     SFTPNotADirectory,
+    SFTPEOFError,
     SFTPLimits,
     mode_to_pflags,
     utime_to_attrs,
@@ -47,6 +48,7 @@ from .protocols.sftp import (
     valid_attr_flags,
     SFTPClientHandler,
 )
+from .sftp_glob_filesystem import SFTPGlobFilesystem
 
 
 
@@ -555,7 +557,7 @@ class SFTPCommand:
 
         operation_start = time.monotonic()
 
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
         found = await self._glob_remote_paths(
             pattern,
             glob,
@@ -820,7 +822,7 @@ class SFTPCommand:
     ):
       
         transferred: dict[bytes, TransferResult] = {}
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
         found = await self._glob_remote_paths(
             pattern,
             glob,
@@ -1009,7 +1011,7 @@ class SFTPCommand:
         self,
         pattern: str | pathlib.Path,
     ):
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
 
         start = time.monotonic()
 
@@ -1037,7 +1039,7 @@ class SFTPCommand:
         self,
         pattern: str | pathlib.PurePath,
     ):
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
 
         start = time.monotonic()
 
@@ -1080,14 +1082,15 @@ class SFTPCommand:
         operation_start = time.monotonic()
 
         if attributes is None:
-            attributes = self._create_default_attributes()
+            # No attributes given: change nothing (asyncssh's empty SFTPAttrs()).
+            attributes = FileAttributes()
 
         start = time.monotonic()
 
         await self._make_directories(
             dstpath,
             attributes,
-            exist_ok=options.exist_ok,
+            options,
         )
         transferred[dstpath] = TransferResult(
             file_path=dstpath,
@@ -1104,7 +1107,7 @@ class SFTPCommand:
         self, 
         pattern: str | pathlib.Path,
     ):
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
 
         start = time.monotonic()
 
@@ -1118,7 +1121,10 @@ class SFTPCommand:
             for path, attrs in discovered if attrs.type != FILEXFER_TYPE_SYMLINK
         ])
 
-        candidates: list[tuple[bytes, FileAttributes]] = []
+        # The matched directories go too, once everything in them has.
+        candidates: list[tuple[bytes, FileAttributes]] = [
+            (path, attrs) for path, attrs in found if attrs.type == FILEXFER_TYPE_DIRECTORY
+        ]
 
         while len(found):
             (
@@ -1152,25 +1158,25 @@ class SFTPCommand:
                     attrs,
                 ))
 
-        tasks = []
-        for path, attrs, in candidates:
-            
-            if attrs.type == FILEXFER_TYPE_DIRECTORY:
-                tasks.append(asyncio.ensure_future(
-                    self._handler.rmdir(path),
-                ))
-
-            else:
-                tasks.append(asyncio.ensure_future(
-                    self._handler.remove(path),
-                ))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Files together, then directories deepest first: a directory can
+        # only be removed once everything in it has been.
+        results = await asyncio.gather(
+            *[
+                self._handler.remove(path)
+                for path, attrs in candidates
+                if attrs.type != FILEXFER_TYPE_DIRECTORY
+            ],
+            return_exceptions=True,
+        )
 
         for res in results:
             if isinstance(res, Exception):
                 raise res
-            
+
+        for path, attrs in reversed(candidates):
+            if attrs.type == FILEXFER_TYPE_DIRECTORY:
+                await self._handler.rmdir(path)
+
         elapsed = time.monotonic() - start
         return (
             elapsed,
@@ -1260,12 +1266,13 @@ class SFTPCommand:
         last = len(parts) - 1
 
         exists = True
+        directory_attributes = SFTPAttrs.from_file_attributes(attrs)
 
         for i, part in enumerate(parts):
             curpath = posixpath.join(curpath, part)
 
             try:
-                await self._handler.mkdir(path, attrs)
+                await self._handler.mkdir(curpath, directory_attributes)
                 exists = False
 
             except (SFTPFailure, SFTPFileAlreadyExists):
@@ -1275,7 +1282,7 @@ class SFTPCommand:
                     follow_symlinks=options.follow_symlinks,
                 )
 
-                if filetype != FILEXFER_TYPE_DIRECTORY:
+                if filetype.type != FILEXFER_TYPE_DIRECTORY:
                     curpath_str = curpath.decode('utf-8', 'backslashreplace')
 
                     exc = SFTPNotADirectory if self._handler.version >= 6 \
@@ -1286,11 +1293,13 @@ class SFTPCommand:
                 if i == last:
                     raise
 
-            if exists and not options.exist_ok:
-                exc = SFTPFileAlreadyExists if self._handler.version >= 6 else SFTPFailure
+        # Only a path that already existed in full is an error, and only
+        # without exist_ok.
+        if exists and not options.exist_ok:
+            exc = SFTPFileAlreadyExists if self._handler.version >= 6 else SFTPFailure
 
-                raise exc(curpath.decode('utf-8', 'backslashreplace') +
-                        ' already exists')
+            raise exc(curpath.decode('utf-8', 'backslashreplace') +
+                    ' already exists')
 
         return path
 
@@ -1376,13 +1385,14 @@ class SFTPCommand:
             dstpath = posixpath.join(self._base_directory, dstpath)
 
         if attributes is None:
-            attributes = self._create_default_attributes()
+            # No attributes given: change nothing (asyncssh's empty SFTPAttrs()).
+            attributes = FileAttributes()
 
         start = time.monotonic()
 
         await self._handler.setstat(
-            path,
-            attributes,
+            dstpath,
+            SFTPAttrs.from_file_attributes(attributes),
             follow_symlinks=options.follow_symlinks,
         )
         
@@ -1726,7 +1736,7 @@ class SFTPCommand:
         start = time.monotonic()
 
         crtime_ns: float | None = None
-        if attrs.atime is not None:
+        if attrs.crtime is not None:
             crtime_ns = tuple_to_nsec(attrs.crtime, attrs.crtime_ns)
 
         elapsed = time.monotonic() - start
@@ -2111,12 +2121,19 @@ class SFTPCommand:
         handle = await self._handler.opendir(dirpath)
         at_end = False
 
+        try:
+            while not at_end:
+                names, at_end = await self._handler.readdir(handle)
 
-        while not at_end:
-            names, at_end = await self._handler.readdir(handle)
+                for entry in names:
+                    yield entry
 
-            for entry in names:
-                yield entry
+        except SFTPEOFError:
+            # Servers may end a listing with an EOF status instead.
+            pass
+
+        finally:
+            await self._handler.close(handle)
 
     async def mkdir(
         self,
@@ -2131,10 +2148,11 @@ class SFTPCommand:
             dstpath = posixpath.join(self._base_directory, dstpath)
 
         if attributes is None:
-            attributes = self._create_default_attributes()
+            # No attributes given: change nothing (asyncssh's empty SFTPAttrs()).
+            attributes = FileAttributes()
 
         start = time.monotonic()   
-        await self._handler.mkdir(path, attributes)
+        await self._handler.mkdir(dstpath, SFTPAttrs.from_file_attributes(attributes))
 
         elapsed = time.monotonic() - start
         return (

@@ -103,8 +103,10 @@ class Table:
 
             columns_count = min(max_headers, columns_count)
 
+            # At least one position: with only the fixed columns visible
+            # there is nothing to rotate, and the offset stays at 0.
             self._headers_rotate_count = max(
-                columns_count - self._fixed_headers_count, 0
+                columns_count - self._fixed_headers_count, 1
             )
 
             column_width = int(math.floor(max_width / columns_count))

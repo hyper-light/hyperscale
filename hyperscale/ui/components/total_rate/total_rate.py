@@ -100,7 +100,9 @@ class TotalRate:
 
         amount, run_timer = update
 
-        if self._start is None:
+        # The rate's clock starts with the first running count, not with
+        # the first paint (which happens during worker startup).
+        if self._start is None and run_timer:
             self._start = time.monotonic()
 
         if run_timer:
@@ -145,9 +147,6 @@ class TotalRate:
         return self._last_frame, rerender
 
     async def _rerender(self, count: int | float):
-        if self._start is None:
-            self._start = time.monotonic()
-
         rate = self._format_rate(count)
 
         rate = f"{rate}/s"
@@ -190,9 +189,11 @@ class TotalRate:
             reverse=True,
         )
 
-        self._elapsed = time.monotonic() - self._start
+        self._elapsed = (
+            time.monotonic() - self._start if self._start is not None else 0
+        )
 
-        last_rate = count / self._elapsed
+        last_rate = count / self._elapsed if self._elapsed > 0 else 0
 
         adjustment_idx = 0
         for place_unit, adjustment in sorted_places:

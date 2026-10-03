@@ -1,25 +1,18 @@
 from __future__ import annotations
 
+import importlib
 import os
 import threading
 import uuid
 from typing import Generic, List, TypeVar
 
-from .aws_lambda import AWSLambda as AWSLambda
 from .aws_lambda import AWSLambdaConfig as AWSLambdaConfig
-from .aws_timestream import (
-    AWSTimestream as AWSTimestream,
-)
 from .aws_timestream import (
     AWSTimestreamConfig as AWSTimestreamConfig,
 )
-from .bigquery import BigQuery as BigQuery
 from .bigquery import BigQueryConfig as BigQueryConfig
-from .bigtable import BigTable as BigTable
 from .bigtable import BigTableConfig as BigTableConfig
-from .cassandra import Cassandra as Cassandra
 from .cassandra import CassandraConfig as CassandraConfig
-from .cloudwatch import Cloudwatch as Cloudwatch
 from .cloudwatch import CloudwatchConfig as CloudwatchConfig
 from .common import (
     ReporterTypes as ReporterTypes,
@@ -34,68 +27,38 @@ from .common.results_types import (
     ResultSet,
     WorkflowStats,
 )
-from .cosmosdb import CosmosDB as CosmosDB
 from .cosmosdb import CosmosDBConfig as CosmosDBConfig
 from .custom import CustomReporter as CustomReporter
-from .csv import CSV as CSV
 from .csv import CSVConfig as CSVConfig
-from .datadog import Datadog as Datadog
 from .datadog import DatadogConfig as DatadogConfig
-from .dogstatsd import DogStatsD as DogStatsD
 from .dogstatsd import DogStatsDConfig as DogStatsDConfig
-from .google_cloud_storage import (
-    GoogleCloudStorage as GoogleCloudStorage,
-)
 from .google_cloud_storage import (
     GoogleCloudStorageConfig as GoogleCloudStorageConfig,
 )
-from .graphite import Graphite as Graphite
 from .graphite import GraphiteConfig as GraphiteConfig
-from .honeycomb import Honeycomb as Honeycomb
 from .honeycomb import HoneycombConfig as HoneycombConfig
-from .influxdb import InfluxDB as InfluxDB
 from .influxdb import InfluxDBConfig as InfluxDBConfig
 from .json import JSON as JSON
 from .json import JSONConfig as JSONConfig
-from .kafka import Kafka as Kafka
 from .kafka import KafkaConfig as KafkaConfig
-from .mongodb import MongoDB as MongoDB
 from .mongodb import MongoDBConfig as MongoDBConfig
-from .mysql import MySQL as MySQL
 from .mysql import MySQLConfig as MySQLConfig
-from .netdata import Netdata as Netdata
 from .netdata import NetdataConfig as NetdataConfig
-from .newrelic import NewRelic as NewRelic
 from .newrelic import NewRelicConfig as NewRelicConfig
-from .postgres import Postgres as Postgres
 from .postgres import PostgresConfig as PostgresConfig
-from .prometheus import Prometheus as Prometheus
 from .prometheus import PrometheusConfig as PrometheusConfig
-from .redis import Redis as Redis
 from .redis import RedisConfig as RedisConfig
-from .s3 import S3 as S3
 from .s3 import S3Config as S3Config
-from .snowflake import Snowflake as Snowflake
 from .snowflake import SnowflakeConfig as SnowflakeConfig
-from .sqlite import SQLite as SQLite
 from .sqlite import SQLiteConfig as SQLiteConfig
-from .statsd import StatsD as StatsD
 from .statsd import StatsDConfig as StatsDConfig
-from .telegraf import Telegraf as Telegraf
 from .telegraf import TelegrafConfig as TelegrafConfig
-from .telegraf_statsd import (
-    TelegrafStatsD as TelegrafStatsD,
-)
 from .telegraf_statsd import (
     TelegrafStatsDConfig as TelegrafStatsDConfig,
 )
 from .timescaledb import (
-    TimescaleDB as TimescaleDB,
-)
-from .timescaledb import (
     TimescaleDBConfig as TimescaleDBConfig,
 )
-from .xml import XML as XML
 from .xml import XMLConfig as XMLConfig
 
 ReporterConfig = (
@@ -133,42 +96,95 @@ ReporterConfig = (
     | XMLConfig
 )
 
+# Each backend's reporter class, by the subpackage that defines it. A reporter
+# imports its client library, so it is loaded only when one is created.
+REPORTER_SUBPACKAGES: dict[str, str] = {
+    "AWSLambda": "aws_lambda",
+    "AWSTimestream": "aws_timestream",
+    "BigQuery": "bigquery",
+    "BigTable": "bigtable",
+    "CSV": "csv",
+    "Cassandra": "cassandra",
+    "Cloudwatch": "cloudwatch",
+    "CosmosDB": "cosmosdb",
+    "Datadog": "datadog",
+    "DogStatsD": "dogstatsd",
+    "GoogleCloudStorage": "google_cloud_storage",
+    "Graphite": "graphite",
+    "Honeycomb": "honeycomb",
+    "InfluxDB": "influxdb",
+    "JSON": "json",
+    "Kafka": "kafka",
+    "MongoDB": "mongodb",
+    "MySQL": "mysql",
+    "Netdata": "netdata",
+    "NewRelic": "newrelic",
+    "Postgres": "postgres",
+    "Prometheus": "prometheus",
+    "Redis": "redis",
+    "S3": "s3",
+    "SQLite": "sqlite",
+    "Snowflake": "snowflake",
+    "StatsD": "statsd",
+    "Telegraf": "telegraf",
+    "TelegrafStatsD": "telegraf_statsd",
+    "TimescaleDB": "timescaledb",
+    "XML": "xml",
+}
+
+
+def load_reporter_class(class_name: str):
+    """A backend's reporter class, imported with its client library on first use."""
+    return getattr(
+        importlib.import_module(f"{__package__}.{REPORTER_SUBPACKAGES[class_name]}"),
+        class_name,
+    )
+
+
+def __getattr__(name: str):
+    # The reporter classes this module exported when it imported them eagerly.
+    if name in REPORTER_SUBPACKAGES:
+        return load_reporter_class(name)
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 T = TypeVar("T")
 
 
 class Reporter(Generic[T]):
     reporters = {
-        ReporterTypes.AWSLambda: lambda config: AWSLambda(config),
-        ReporterTypes.AWSTimestream: lambda config: AWSTimestream(config),
-        ReporterTypes.BigQuery: lambda config: BigQuery(config),
-        ReporterTypes.BigTable: lambda config: BigTable(config),
-        ReporterTypes.Cassandra: lambda config: Cassandra(config),
-        ReporterTypes.Cloudwatch: lambda config: Cloudwatch(config),
-        ReporterTypes.CosmosDB: lambda config: CosmosDB(config),
-        ReporterTypes.CSV: lambda config: CSV(config),
-        ReporterTypes.Datadog: lambda config: Datadog(config),
-        ReporterTypes.DogStatsD: lambda config: DogStatsD(config),
-        ReporterTypes.GCS: lambda config: GoogleCloudStorage(config),
-        ReporterTypes.Graphite: lambda config: Graphite(config),
-        ReporterTypes.Honeycomb: lambda config: Honeycomb(config),
-        ReporterTypes.InfluxDB: lambda config: InfluxDB(config),
+        ReporterTypes.AWSLambda: lambda config: load_reporter_class("AWSLambda")(config),
+        ReporterTypes.AWSTimestream: lambda config: load_reporter_class("AWSTimestream")(config),
+        ReporterTypes.BigQuery: lambda config: load_reporter_class("BigQuery")(config),
+        ReporterTypes.BigTable: lambda config: load_reporter_class("BigTable")(config),
+        ReporterTypes.Cassandra: lambda config: load_reporter_class("Cassandra")(config),
+        ReporterTypes.Cloudwatch: lambda config: load_reporter_class("Cloudwatch")(config),
+        ReporterTypes.CosmosDB: lambda config: load_reporter_class("CosmosDB")(config),
+        ReporterTypes.CSV: lambda config: load_reporter_class("CSV")(config),
+        ReporterTypes.Datadog: lambda config: load_reporter_class("Datadog")(config),
+        ReporterTypes.DogStatsD: lambda config: load_reporter_class("DogStatsD")(config),
+        ReporterTypes.GCS: lambda config: load_reporter_class("GoogleCloudStorage")(config),
+        ReporterTypes.Graphite: lambda config: load_reporter_class("Graphite")(config),
+        ReporterTypes.Honeycomb: lambda config: load_reporter_class("Honeycomb")(config),
+        ReporterTypes.InfluxDB: lambda config: load_reporter_class("InfluxDB")(config),
         ReporterTypes.JSON: lambda config: JSON(config),
-        ReporterTypes.Kafka: lambda config: Kafka(config),
-        ReporterTypes.MongoDB: lambda config: MongoDB(config),
-        ReporterTypes.MySQL: lambda config: MySQL(config),
-        ReporterTypes.Netdata: lambda config: Netdata(config),
-        ReporterTypes.NewRelic: lambda config: NewRelic(config),
-        ReporterTypes.Postgres: lambda config: Postgres(config),
-        ReporterTypes.Prometheus: lambda config: Prometheus(config),
-        ReporterTypes.Redis: lambda config: Redis(config),
-        ReporterTypes.S3: lambda config: S3(config),
-        ReporterTypes.Snowflake: lambda config: Snowflake(config),
-        ReporterTypes.SQLite: lambda config: SQLite(config),
-        ReporterTypes.StatsD: lambda config: StatsD(config),
-        ReporterTypes.Telegraf: lambda config: Telegraf(config),
-        ReporterTypes.TelegrafStatsD: lambda config: TelegrafStatsD(config),
-        ReporterTypes.TimescaleDB: lambda config: TimescaleDB(config),
-        ReporterTypes.XML: lambda config: XML(config),
+        ReporterTypes.Kafka: lambda config: load_reporter_class("Kafka")(config),
+        ReporterTypes.MongoDB: lambda config: load_reporter_class("MongoDB")(config),
+        ReporterTypes.MySQL: lambda config: load_reporter_class("MySQL")(config),
+        ReporterTypes.Netdata: lambda config: load_reporter_class("Netdata")(config),
+        ReporterTypes.NewRelic: lambda config: load_reporter_class("NewRelic")(config),
+        ReporterTypes.Postgres: lambda config: load_reporter_class("Postgres")(config),
+        ReporterTypes.Prometheus: lambda config: load_reporter_class("Prometheus")(config),
+        ReporterTypes.Redis: lambda config: load_reporter_class("Redis")(config),
+        ReporterTypes.S3: lambda config: load_reporter_class("S3")(config),
+        ReporterTypes.Snowflake: lambda config: load_reporter_class("Snowflake")(config),
+        ReporterTypes.SQLite: lambda config: load_reporter_class("SQLite")(config),
+        ReporterTypes.StatsD: lambda config: load_reporter_class("StatsD")(config),
+        ReporterTypes.Telegraf: lambda config: load_reporter_class("Telegraf")(config),
+        ReporterTypes.TelegrafStatsD: lambda config: load_reporter_class("TelegrafStatsD")(config),
+        ReporterTypes.TimescaleDB: lambda config: load_reporter_class("TimescaleDB")(config),
+        ReporterTypes.XML: lambda config: load_reporter_class("XML")(config),
     }
 
     def __init__(self, reporter_config: T) -> None:

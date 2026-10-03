@@ -70,7 +70,8 @@ class MercurySyncSMTPConnection:
         "_executor",
         "_ehlo_command",
         "_check_start_tls_command",
-        "_emails",
+        "_email_key",
+        "_email_document",
         "does_esmtp",
     )
 
@@ -79,11 +80,13 @@ class MercurySyncSMTPConnection:
         pool_size: int | None = None,
         cert_path: str | None = None,
         key_path: str | None = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ):
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._cert_path = cert_path
@@ -120,7 +123,9 @@ class MercurySyncSMTPConnection:
         self._ehlo_command = f"ehlo [127.0.0.1]{CRLF}".encode('ascii') 
         self._check_start_tls_command = f"STARTTLS{CRLF}".encode('ascii')
 
-        self._emails: dict[str, str] = {}
+        # The last message built, and everything that shaped it.
+        self._email_key: tuple | None = None
+        self._email_document: str | None = None
 
     async def send(
         self,
@@ -138,20 +143,35 @@ class MercurySyncSMTPConnection:
             try:
 
                 if isinstance(email, Email):
-                    self._emails[subject] = email.optimized
+                    email_document = email.optimized
 
-                email_document = self._emails.get(subject)
-
-                if email_document is None:
-                    email_document = await self.create_email(
+                else:
+                    # Reuse the last message built only while sends repeat
+                    # everything that shapes it.
+                    email_key = (
                         sender,
-                        recipients,
+                        recipients if isinstance(recipients, str) else tuple(recipients),
                         subject,
                         email,
-                        attachments=attachements,
+                        ((attachements.path, attachements.mime_type),)
+                        if isinstance(attachements, EmailAttachment)
+                        else tuple((attachment.path, attachment.mime_type) for attachment in attachements or ()),
                     )
 
-                    self._emails[subject] = email_document
+                    if email_key == self._email_key:
+                        email_document = self._email_document
+
+                    else:
+                        email_document = await self.create_email(
+                            sender,
+                            recipients,
+                            subject,
+                            email,
+                            attachments=attachements,
+                        )
+
+                        self._email_key = email_key
+                        self._email_document = email_document
 
                 return await asyncio.wait_for(
                     self._execute(
@@ -1201,65 +1221,44 @@ class MercurySyncSMTPConnection:
         connection_error: Exception | None = None
         connection = self._connections.pop()
 
+        try:
+            # Reuses the connection's transport for this server; otherwise
+            # races a new one across the server's addresses.
+            socket_config, port, new_transport = await connection.connect_to_any(
+                url.full,
+                url.ip_addresses,
+                url.address_rotation,
+                ssl=self._ssl_context if connection_type in ['ssl', 'tls'] else None,
+                connection_type=connection_type,
+                ssl_upgrade=is_upgrade,
+                timeout=self.timeouts.connect_timeout,
+            )
 
-        if url.address is None:
-            for address_info in url:
-                try:
-                    port = await connection.make_connection(
-                        url.full,
-                        address_info,
-                        ssl=self._ssl_context if connection_type  in ['ssl', 'tls'] else None,
-                        connection_type=connection_type,
-                        timeout=self.timeouts.connect_timeout,
-                        ssl_upgrade=is_upgrade,
-                    )
+            if new_transport:
+                parsed_url.address = socket_config
+                parsed_url.port = port
 
-                    parsed_url.address = address_info
-                    parsed_url.port = port
-                    connection_error = None
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                parsed_url,
+            )
 
-                    break
+        except Exception as err:
+            connection_error = err
 
-                except asyncio.CancelledError as err:
-                    return (
-                        err,
-                        connection,
-                        parsed_url,
-                    )
+        try:
+            return (
+                connection_error if parsed_url.address is None else None,
+                connection,
+                parsed_url,
+            )
 
-                except Exception as err:
-                    connection_error = err
-                    # Close this attempt's socket before trying the next address.
-                    connection.reset()
-                
-        else:
-            try:
-                
-                await connection.make_connection(
-                    url.full,
-                    url.address,
-                    ssl=self._ssl_context if connection_type  in ['ssl', 'tls'] else None,
-                    connection_type=connection_type,
-                    timeout=self.timeouts.connect_timeout,
-                    ssl_upgrade=is_upgrade,
-                )
-
-            except asyncio.CancelledError as err:
-                return (
-                    err,
-                    connection,
-                    parsed_url,
-                )
-
-            except Exception as err:
-                connection_error = err
-
-        
-        return (
-            connection_error if parsed_url.address is None else None,
-            connection,
-            parsed_url,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     def close(self):
 

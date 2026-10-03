@@ -36,6 +36,9 @@ class MultilineText:
         self._last_rendered_frames: list[str] = []
         self._last_state: list[str] = []
 
+        # The first row shown when the text is taller than the component.
+        self.offset = 0
+
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
     @property

@@ -4,6 +4,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     List,
     Literal,
     Optional,
@@ -51,6 +52,44 @@ from hyperscale.reporting.common.results_types import (
     StatsResults,
     StatTypes,
     WorkflowStats,
+)
+
+
+from .timings_aggregate import TimingsAggregate
+
+# A TEST step's result: a client's response, or the error raised instead.
+TestResult = (
+    CustomResult
+    | FTPResponse
+    | GraphQLResponse
+    | GraphQLHTTP2Response
+    | GRPCResponse
+    | HTTPResponse
+    | HTTP2Response
+    | HTTP3Response
+    | PlaywrightResult
+    | SCPResponse
+    | SFTPResponse
+    | SMTPResponse
+    | TCPResponse
+    | UDPResponse
+    | WebsocketResponse
+    | Exception
+)
+
+# Clients whose responses carry a status code (HTTP, gRPC, the WebSocket
+# handshake, SMTP replies). Other clients do not produce one.
+STATUS_REQUEST_TYPES = frozenset(
+    {
+        RequestType.GRAPHQL,
+        RequestType.GRAPHQL_HTTP2,
+        RequestType.GRPC,
+        RequestType.HTTP,
+        RequestType.HTTP2,
+        RequestType.HTTP3,
+        RequestType.SMTP,
+        RequestType.WEBSOCKET,
+    }
 )
 
 
@@ -116,6 +155,60 @@ class Results:
         elapsed: float,
         run_id: Optional[int] = None,
     ) -> WorkflowStats:
+        aggregates = self.create_aggregates(results)
+
+        for step, step_results in results.items():
+            for result in step_results:
+                self.aggregate_result(aggregates, step, result)
+
+        return self.process_aggregates(
+            workflow,
+            aggregates,
+            elapsed,
+            run_id=run_id,
+        )
+
+    def create_aggregates(
+        self,
+        steps: Iterable[str],
+    ) -> Dict[str, TimingsAggregate | List[Any]]:
+        """
+        One aggregate per step: a TEST step's results are reduced as they are
+        added (``aggregate_result``); any other step keeps its results.
+        """
+        return {
+            step: TimingsAggregate()
+            if self._hooks[step].hook_type == HookType.TEST
+            else []
+            for step in steps
+        }
+
+    def aggregate_result(
+        self,
+        aggregates: Dict[str, TimingsAggregate | List[Any]],
+        step: str,
+        result: TestResult | Metric | Exception | None,
+    ) -> None:
+        """Add one of a step's results to that step's aggregate."""
+        hook = self._hooks[step]
+
+        if hook.hook_type == HookType.TEST:
+            self._aggregate_test_result(
+                aggregates[step],
+                hook.engine_type,
+                result,
+            )
+
+        else:
+            aggregates[step].append(result)
+
+    def process_aggregates(
+        self,
+        workflow: str,
+        aggregates: Dict[str, TimingsAggregate | List[Any]],
+        elapsed: float,
+        run_id: Optional[int] = None,
+    ) -> WorkflowStats:
         workflow_stats: WorkflowStats = {
             "workflow": workflow,
             "elapsed": elapsed,
@@ -128,8 +221,8 @@ class Results:
         if run_id:
             workflow_stats["run"] = run_id
 
-        for step in results:
-            step_results = results[step]
+        for step in aggregates:
+            step_aggregate = aggregates[step]
 
             hook = self._hooks[step]
             hook_type = hook.hook_type
@@ -138,11 +231,10 @@ class Results:
 
             match hook_type:
                 case HookType.TEST:
-                    test_results = self._process_timings_set(
-                        workflow, 
-                        step, 
-                        hook.engine_type,
-                        step_results,
+                    test_results = self._process_timings_aggregate(
+                        workflow,
+                        step,
+                        step_aggregate,
                     )
 
                     workflow_stats["results"].append(test_results)
@@ -164,7 +256,7 @@ class Results:
                             step,
                             hook.metric_type,
                             hook.tags,
-                            step_results,
+                            step_aggregate,
                         )
                     )
 
@@ -173,7 +265,7 @@ class Results:
                         self._process_check_set(
                             workflow,
                             step,
-                            step_results,
+                            step_aggregate,
                         )
                     )
 
@@ -314,103 +406,80 @@ class Results:
             "mad": float(np.mean([abs(el - mean) for el in values])),
         }
 
-    def _process_timings_set(
+    def _aggregate_test_result(
         self,
-        workflow: str,
-        step_name: str,
+        aggregate: TimingsAggregate,
         result_type: RequestType | str,
-        results: List[FTPResponse]
-        | List[GraphQLResponse]
-        | List[GraphQLHTTP2Response]
-        | List[GRPCResponse]
-        | List[HTTPResponse]
-        | List[HTTP2Response]
-        | List[HTTP3Response]
-        | List[PlaywrightResult]
-        | List[SCPResponse]
-        | List[SFTPResponse]
-        | List[SMTPResponse]
-        | List[TCPResponse]
-        | List[UDPResponse]
-        | List[WebsocketResponse],
-    ) -> ResultSet:
-        errors = [error for error in results if isinstance(error, Exception)]
-
-        results = [result for result in results if result not in errors]
+        result: TestResult,
+    ) -> None:
+        if isinstance(result, Exception):
+            aggregate.errors += 1
+            aggregate.error_contexts[str(result)] += 1
+            return
 
         match result_type:
-
             case RequestType.PLAYWRIGHT:
-                timing_results_set = [
-                    self._process_playwright_timings(result)
-                    for result in results
-                    if result not in errors
-                ]
-
-                timing_stats: Dict[
-                    Literal["total"],
-                    Dict[StatTypes, int | float],
-                ] = {}
-
-                results_types = ["total"]
+                timings = self._process_playwright_timings(result)
 
             case RequestType.CUSTOM:
-                timing_results_set = [
+                timings = (
                     result.process_timings()
-                    for result in results
                     if isinstance(result, CustomResult)
-                ]
-
-                timing_stats: dict[
-                    str,
-                    dict[StatTypes, int | float]
-                ] = {}
-
-                results_types = list(timing_results_set[0].keys())
+                    else None
+                )
 
             case RequestType.SCP:
-                timing_results_set = [
-                    self._process_scp_timings(result)
-                    for result in results
-                    if result not in errors
-                ]
+                timings = self._process_scp_timings(result)
 
-                timing_stats: Dict[
-                    Literal[
-                        "total",
-                        "connecting",
-                        "initialzing",
-                        "transferring",
-                    ],
-                    Dict[StatTypes, int | float],
-                ] = {}
+            case RequestType.SFTP:
+                timings = self._process_sftp_timings(result)
 
-                results_types = [
+            case RequestType.SMTP:
+                timings = self._process_smtp_timings(result)
+
+            case _:
+                timings = self._process_http_or_udp_timings(result)
+
+        if timings is not None:
+            if aggregate.timing_types is None:
+                aggregate.timing_types = self._timing_types(result_type, timings)
+
+            timing_values = aggregate.timing_values
+            for timing_type in aggregate.timing_types:
+                if (value := timings.get(timing_type)) is not None:
+                    timing_values[timing_type].append(value)
+
+        aggregate.successes[result.successful] += 1
+
+        if result_type in STATUS_REQUEST_TYPES:
+            aggregate.statuses[result.status] += 1
+
+        if (context := result.context()) is not None:
+            aggregate.result_contexts[context] += 1
+
+    def _timing_types(
+        self,
+        result_type: RequestType | str,
+        timings: Dict[str, int | float],
+    ) -> List[str]:
+        match result_type:
+            case RequestType.PLAYWRIGHT:
+                return ["total"]
+
+            case RequestType.CUSTOM:
+                # A custom result names its own timings.
+                return list(timings.keys())
+
+            case RequestType.SCP:
+                return [
                     "total",
                     "connecting",
-                    "initialzing",
+                    "initializing",
                     "transferring",
                 ]
 
             case RequestType.SFTP:
-                timing_results_set = [
-                    self._process_sftp_timings(result)
-                    for result in results
-                    if result not in errors
-                ]
-
-                timing_stats: Dict[
-                    Literal[
-                        "total",
-                        "connecting",
-                        "initializing",
-                        "executing",
-                        "closing",
-                    ],
-                    Dict[StatTypes, int | float],
-                ] = {}
-
-                results_types = [
+                return [
                     "total",
                     "connecting",
                     "initializing",
@@ -419,27 +488,7 @@ class Results:
                 ]
 
             case RequestType.SMTP:
-                timing_results_set = [
-                    self._process_smtp_timings(result)
-                    for result in results
-                    if result not in errors
-                ]
-
-                timing_stats: Dict[
-                    Literal[
-                        "total",
-                        "connecting",
-                        "ehlo",
-                        "tls_check",
-                        "tls_upgrade",
-                        "ehlo_tls",
-                        "login",
-                        "send_mail",
-                    ],
-                    Dict[StatTypes, int | float],
-                ] = {}
-
-                results_types = [
+                return [
                     "total",
                     "connecting",
                     "ehlo",
@@ -450,68 +499,47 @@ class Results:
                     "send_mail",
                 ]
 
-
             case _:
-                timing_results_set = [
-                    self._process_http_or_udp_timings(result)
-                    for result in results
-                    if result not in errors
-                ]
-
-                timing_stats: Dict[
-                    Literal[
-                        "total",
-                        "connecting",
-                        "writing",
-                        "reading",
-                    ],
-                    Dict[StatTypes, int | float],
-                ] = {}
-
-                results_types = [
+                return [
                     "total",
                     "connecting",
                     "writing",
                     "reading",
                 ]
 
-        for result_type in results_types:
-            results_set = [
-                timing_result[result_type]
-                for timing_result in timing_results_set
-                if timing_result.get(result_type) is not None
-            ]
+    def _process_timings_aggregate(
+        self,
+        workflow: str,
+        step_name: str,
+        aggregate: TimingsAggregate,
+    ) -> ResultSet:
+        timing_stats: Dict[str, Dict[StatTypes, int | float]] = {}
 
-            if len(results_set) > 0:
-                timing_stats[result_type] = self._calculate_stats(results_set)
-                timing_stats[result_type].update(
-                    self._calculate_quantiles(results_set),
+        for timing_type in aggregate.timing_types or ():
+            if timing_values := aggregate.timing_values.get(timing_type):
+                timing_stats[timing_type] = self._calculate_stats(timing_values)
+                timing_stats[timing_type].update(
+                    self._calculate_quantiles(timing_values),
                 )
 
-        checks = Counter([result.successful for result in results])
-        statuses = Counter([
-            result.status for result in results
-            if not result_type == RequestType.PLAYWRIGHT and not isinstance(result_type, str)
-        ])
+        succeeded = aggregate.successes.get(True, 0)
+        unsucceeded = aggregate.successes.get(False, 0)
 
-        result_contexts = [
-            result.context() for result in results if result.context() is not None
-        ]
-        errors_count = len(errors)
-        error_contexts = [str(error) for error in errors]
-        result_contexts.extend(error_contexts)
-
-        contexts = Counter(result_contexts)
+        # Results' contexts are listed before errors' contexts.
+        contexts = Counter(aggregate.result_contexts)
+        contexts.update(aggregate.error_contexts)
 
         return {
             "workflow": workflow,
             "step": step_name,
             "timings": timing_stats,
             "counts": {
-                "executed": checks.get(True, 0) + checks.get(False, 0) + errors_count,
-                "succeeded": checks.get(True, 0),
-                "failed": checks.get(False, 0) + errors_count,
-                "statuses": {code: count for code, count in statuses.items()},
+                "executed": succeeded + unsucceeded + aggregate.errors,
+                "succeeded": succeeded,
+                "failed": unsucceeded + aggregate.errors,
+                "statuses": {
+                    code: count for code, count in aggregate.statuses.items()
+                },
             },
             "contexts": [
                 {
@@ -927,7 +955,7 @@ class Results:
         Literal[
             "total",
             "connecting",
-            "initialzing",
+            "initializing",
             "transferring",
         ],
         int | float
@@ -937,7 +965,7 @@ class Results:
             Literal[
                 "total",
                 "connecting",
-                "initialzing",
+                "initializing",
                 "transferring",
             ],
             int | float,
@@ -956,7 +984,7 @@ class Results:
         if (initialization_end := timings.get("initialization_end")) and (
             initialization_start := timings.get("initialization_start")
         ):
-            timing_results["initialzing"] = initialization_end - initialization_start
+            timing_results["initializing"] = initialization_end - initialization_start
 
         if (transfer_end := timings.get("transfer_end")) and (
             transfer_start := timings.get("transfer_start")
@@ -1004,7 +1032,7 @@ class Results:
         if (initialization_end := timings.get("initialization_end")) and (
             initialization_start := timings.get("initialization_start")
         ):
-            timing_results["initialzing"] = initialization_end - initialization_start
+            timing_results["initializing"] = initialization_end - initialization_start
 
         if (execution_end := timings.get("exectution_end")) and (
             execution_start := timings.get("execution_start")

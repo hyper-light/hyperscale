@@ -46,7 +46,7 @@ from hyperscale.core.testing.models import (
     Params,
 )
 
-from .fast_hpack import Encoder
+from .fast_hpack import ConnectionEncoder, Encoder
 from .models.http2 import (
     HTTP2Response,
 )
@@ -62,11 +62,13 @@ class MercurySyncHTTP2Connection:
     def __init__(
         self,
         pool_size: int = 128,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ) -> None:
         self.session_id = str(uuid.uuid4())
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
 
         self.closed = False
         self._concurrency = pool_size
@@ -470,7 +472,7 @@ class MercurySyncHTTP2Connection:
                 upgrade_ssl,
             ) = await asyncio.wait_for(
                 self._connect_to_url_location(None, url),
-                timeout=self.timeouts.connect_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
             if upgrade_ssl:
@@ -486,7 +488,7 @@ class MercurySyncHTTP2Connection:
                     _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
             connection.reset()
@@ -626,6 +628,7 @@ class MercurySyncHTTP2Connection:
             request_url = redirect_url
 
         connection: HTTP2Connection = None
+        reading_response = False
 
         try:
             if timings["connect_start"] is None:
@@ -637,7 +640,7 @@ class MercurySyncHTTP2Connection:
                     request_url,
                     ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
-                timeout=self.timeouts.connect_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
             if upgrade_ssl:
@@ -649,7 +652,7 @@ class MercurySyncHTTP2Connection:
                         request_url,
                         ssl_redirect_url=ssl_redirect_url,
                     ),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 request_url = ssl_redirect_url
@@ -693,6 +696,7 @@ class MercurySyncHTTP2Connection:
             encoded_headers = self._encode_headers(
                 url,
                 method,
+                pipe._encoder,
                 auth=auth,
                 params=params,
                 headers=headers,
@@ -713,7 +717,7 @@ class MercurySyncHTTP2Connection:
                         encoded_data,
                         connection,
                     ),
-                    timeout=self.timeouts.write_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
             timings["write_end"] = time.monotonic()
@@ -721,10 +725,13 @@ class MercurySyncHTTP2Connection:
             if timings["read_start"] is None:
                 timings["read_start"] = time.monotonic()
 
+            reading_response = True
             (status, headers, body, error) = await asyncio.wait_for(
                 pipe.receive_response(connection),
-                timeout=self.timeouts.read_timeout,
+                timeout=self.timeouts.request_timeout,
             )
+            reading_response = False
+            connection.consecutive_read_timeouts = 0
 
             if error:
                 raise error
@@ -782,11 +789,25 @@ class MercurySyncHTTP2Connection:
         except (
             BaseException,
             Exception,
-        ):
+        ) as request_exception:
             if connection:
-                connection.reset()
-                self._connections.append(connection)
-                self._pipes.append(HTTP2Pipe(self._concurrency))
+                if (
+                    reading_response
+                    and isinstance(request_exception, asyncio.TimeoutError)
+                    and connection.consecutive_read_timeouts == 0
+                ):
+                    # A slow response, not a dead connection: cancel only this
+                    # stream and keep the connection. A second timeout in a row
+                    # on it means the connection itself is dead.
+                    pipe.cancel_stream(connection)
+                    connection.consecutive_read_timeouts += 1
+                    self._connections.append(connection)
+                    self._pipes.append(pipe)
+
+                else:
+                    connection.reset()
+                    self._connections.append(connection)
+                    self._pipes.append(HTTP2Pipe(self._concurrency))
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -855,6 +876,7 @@ class MercurySyncHTTP2Connection:
         self,
         url: HTTPUrl,
         method: str,
+        header_encoder: ConnectionEncoder,
         auth: tuple[str, str] | Auth | None = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -904,14 +926,6 @@ class MercurySyncHTTP2Connection:
                 ]
             )
 
-        else:
-            encoded_headers: List[Tuple[bytes, bytes]] = [
-                (b":method", method.encode()),
-                (b":authority", url.hostname.encode()),
-                (b":scheme", url.scheme.encode()),
-                (b":path", url_path.encode()),
-            ]
-
         if isinstance(cookies, Cookies):
             encoded_headers.append(cookies.optimized)
 
@@ -933,7 +947,10 @@ class MercurySyncHTTP2Connection:
                 )
             )
 
-        encoded_headers: bytes = self._encoder.encode(encoded_headers)
+        encoded_headers: bytes = header_encoder.encode(encoded_headers)
+        if len(encoded_headers) <= self._settings.max_frame_size:
+            return encoded_headers
+
         encoded_headers: List[bytes] = [
             encoded_headers[i : i + self._settings.max_frame_size]
             for i in range(0, len(encoded_headers), self._settings.max_frame_size)
@@ -1010,92 +1027,65 @@ class MercurySyncHTTP2Connection:
 
         connection_error: Optional[Exception] = None
 
-        if url.address is None or ssl_redirect_url:
-            for address, ip_info in url:
-                try:
-                    await connection.make_connection(
-                        url.hostname,
-                        address,
-                        url.port,
-                        ip_info,
-                        ssl=self._client_ssl_context
-                        if url.is_ssl or ssl_redirect_url
-                        else None,
-                        ssl_upgrade=ssl_redirect_url is not None,
-                    )
+        try:
+            was_connected = connection.connected
 
-                    url.address = address
-                    url.socket_config = ip_info
+            # Reuses the connection's transport when it reaches one of the
+            # host's addresses; otherwise races a new one across them.
+            address, socket_config, new_transport = await connection.connect_to_any(
+                url.hostname,
+                url.ip_addresses,
+                url.port,
+                url.address_rotation,
+                ssl=self._client_ssl_context
+                if url.is_ssl or ssl_redirect_url
+                else None,
+                ssl_upgrade=ssl_redirect_url is not None,
+            )
 
-                    # One connection: the first address that connects.
-                    connection_error = None
-                    break
+            if new_transport:
+                url.address = address
+                url.socket_config = socket_config
 
-                except asyncio.CancelledError as err:
-                    return (
-                        err,
-                        connection,
-                        pipe,
-                        parsed_url,
-                        False,
-                    )
+                if was_connected:
+                    # The pipe's HPACK and flow-control state belong to the
+                    # transport just replaced.
+                    pipe = HTTP2Pipe(self._concurrency)
 
-                except Exception as err:
-                    if "server_hostname is only meaningful with ssl" in str(err):
-                        return (
-                            err,
-                            connection,
-                            pipe,
-                            parsed_url,
-                            True,
-                        )
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                pipe,
+                parsed_url,
+                False,
+            )
 
-                    # Keep the error to return if no address connects, and
-                    # close this attempt's socket before trying the next.
-                    connection_error = err
-                    connection.reset()
-
-        else:
-            try:
-                await connection.make_connection(
-                    url.hostname,
-                    url.address,
-                    url.port,
-                    url.socket_config,
-                    ssl=self._client_ssl_context
-                    if url.is_ssl or ssl_redirect_url
-                    else None,
-                    ssl_upgrade=ssl_redirect_url is not None,
-                )
-
-            except asyncio.CancelledError as err:
+        except Exception as err:
+            if "server_hostname is only meaningful with ssl" in str(err):
                 return (
                     err,
                     connection,
                     pipe,
                     parsed_url,
-                    False,
+                    True,
                 )
 
-            except Exception as err:
-                if "server_hostname is only meaningful with ssl" in str(err):
-                    return (
-                        err,
-                        connection,
-                        pipe,
-                        parsed_url,
-                        True,
-                    )
+            connection_error = err
 
-                connection_error = err
+        try:
+            return (
+                connection_error,
+                connection,
+                pipe,
+                parsed_url,
+                False,
+            )
 
-        return (
-            connection_error,
-            connection,
-            pipe,
-            parsed_url,
-            False,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
     
     def _encode_auth_headers(
         self,

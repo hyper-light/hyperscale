@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from ssl import SSLContext
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterator, Optional, Sequence, Tuple
 
 from hyperscale.core.engines.client.shared.protocols import (
     _DEFAULT_LIMIT,
     Reader,
     Writer,
 )
+from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import SocketConfig
 
 from .tcp import TCPConnection
 
@@ -75,6 +76,55 @@ class HTTPConnection:
 
             self.reader = reader
             self.writer = writer
+
+    async def connect_to_any(
+        self,
+        hostname: str,
+        addresses: Sequence[Tuple[str, SocketConfig]],
+        port: int,
+        address_rotation: Iterator[int],
+        ssl: Optional[SSLContext] = None,
+        ssl_upgrade: bool = False,
+    ) -> Tuple[Optional[str], Optional[SocketConfig], bool]:
+        """
+        Reuse this connection's cached transport for ``hostname``. Otherwise
+        open a new one, racing the host's ``addresses`` (RFC 8305) from the
+        next offset in ``address_rotation`` so a pool's connections spread
+        across all of them.
+
+        Returns the address and socket config of a new transport (``None``
+        for both on reuse), and whether the transport is new.
+        """
+        if ssl_upgrade is False and (
+            cached := self._reader_and_writer.get(hostname)
+        ) is not None:
+            self.reader, self.writer = cached
+            return None, None, False
+
+        if not addresses:
+            raise ConnectionError(f"No addresses to connect to for {hostname}")
+
+        offset = next(address_rotation) % len(addresses)
+        ordered = [*addresses[offset:], *addresses[:offset]]
+
+        reader, writer, winner_index = await self._connection_factory.create_racing(
+            hostname,
+            [socket_config for _, socket_config in ordered],
+            ssl=ssl,
+        )
+
+        address, socket_config = ordered[winner_index]
+
+        self.reader = reader
+        self.writer = writer
+
+        self._reader_and_writer[hostname] = (reader, writer)
+
+        self.dns_address = address
+        self.port = port
+        self.ssl = ssl
+
+        return address, socket_config, True
 
     @property
     def empty(self):

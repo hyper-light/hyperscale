@@ -36,11 +36,13 @@ class MercurySyncTCPConnection:
         pool_size: Optional[int] = None,
         cert_path: Optional[str] = None,
         key_path: Optional[str] = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ) -> None:
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._cert_path = cert_path
@@ -204,7 +206,7 @@ class MercurySyncTCPConnection:
                     url,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 connection.reset()
@@ -221,7 +223,7 @@ class MercurySyncTCPConnection:
                     url,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 connection.reset()
@@ -277,7 +279,7 @@ class MercurySyncTCPConnection:
                 url,
             ) = await asyncio.wait_for(
                 self._connect_to_url_location(connection, request_url),
-                timeout=self.timeouts.connect_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
             if error or connection is None or connection.reader is None:
@@ -329,7 +331,7 @@ class MercurySyncTCPConnection:
                             connection.reader.readexactly(
                                 response_size
                             ),
-                            timeout=self.timeouts.read_timeout
+                            timeout=self.timeouts.request_timeout,
                         )
 
                     else:
@@ -337,7 +339,7 @@ class MercurySyncTCPConnection:
                             connection.reader.readuntil(
                                 separator=delimiter
                             ),
-                            timeout=self.timeouts.read_timeout
+                            timeout=self.timeouts.request_timeout,
                         )
 
                     timings["read_end"] = time.monotonic()
@@ -480,62 +482,42 @@ class MercurySyncTCPConnection:
         connection_error: Optional[Exception] = None
         connection = self._connections.pop()
 
-        if url.address is None:
-            for address, ip_info in url:
-                try:
-                    await connection.make_connection(
-                        url.hostname,
-                        address,
-                        url.port,
-                        ip_info,
-                        ssl=self._tcp_ssl_context if url.scheme in ['ssl', 'tls', 'https'] else None,
-                    )
+        try:
+            # Reuses the connection's transport for this host; otherwise
+            # races a new one across the host's addresses.
+            address, socket_config, new_transport = await connection.connect_to_any(
+                url.hostname,
+                url.ip_addresses,
+                url.port,
+                url.address_rotation,
+                ssl=self._tcp_ssl_context if url.scheme in ['ssl', 'tls', 'https'] else None,
+            )
 
-                    url.address = address
-                    url.socket_config = ip_info
+            if new_transport:
+                url.address = address
+                url.socket_config = socket_config
 
-                    # One connection: the first address that connects.
-                    connection_error = None
-                    break
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                parsed_url,
+            )
 
-                except asyncio.CancelledError as err:
-                    return (
-                        err,
-                        connection,
-                        parsed_url,
-                    )
+        except Exception as err:
+            connection_error = err
 
-                except Exception as err:
-                    # Keep the error to return if no address connects, and
-                    # close this attempt's socket before trying the next.
-                    connection_error = err
-                    connection.reset()
-                
-        else:
-            try:
-                await connection.make_connection(
-                    url.hostname,
-                    url.address,
-                    url.port,
-                    url.socket_config,
-                    ssl=self._tcp_ssl_context if  url.scheme in ['ssl', 'tls', 'https'] else None,
-                )
+        try:
+            return (
+                connection_error,
+                connection,
+                parsed_url,
+            )
 
-            except asyncio.CancelledError as err:
-                return (
-                    err,
-                    connection,
-                    parsed_url,
-                )
-
-            except Exception as err:
-                connection_error = err
-
-        return (
-            connection_error,
-            connection,
-            parsed_url,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     def _encode_data(
         self,

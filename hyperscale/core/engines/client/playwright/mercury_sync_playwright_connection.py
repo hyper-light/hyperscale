@@ -40,7 +40,7 @@ class MercurySyncPlaywrightConnection:
         self,
         pool_size: int = 10**3,
         pages: int = 1,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
     ) -> None:
         self._concurrency = pool_size
         self._max_pages = pages
@@ -48,7 +48,9 @@ class MercurySyncPlaywrightConnection:
         self.context: Optional[BrowserContext] = None
         self.sessions: Deque[BrowserSession] = deque()
         self._semaphore: asyncio.Semaphore = None
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.results: List[PlaywrightResult] = []
         self._active: Deque[Tuple[BrowserSession, BrowserPage]] = deque()
 

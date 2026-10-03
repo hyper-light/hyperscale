@@ -62,14 +62,16 @@ class MercurySyncHTTP3Connection:
     def __init__(
         self,
         pool_size: Optional[int] = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ) -> None:
         if pool_size is None:
             pool_size = 100
 
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._client_ssl_context: Optional[ssl.SSLContext] = None
@@ -432,7 +434,7 @@ class MercurySyncHTTP3Connection:
                     upgrade_ssl,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 connection.reset()
@@ -450,7 +452,7 @@ class MercurySyncHTTP3Connection:
                     _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 connection.reset()
@@ -613,7 +615,7 @@ class MercurySyncHTTP3Connection:
                     request_url,
                     ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
-                timeout=self.timeouts.connect_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
             if upgrade_ssl:
@@ -625,7 +627,7 @@ class MercurySyncHTTP3Connection:
                         request_url,
                         ssl_redirect_url=ssl_redirect_url,
                     ),
-                    timeout=self.timeouts.connect_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
                 request_url = ssl_redirect_url
@@ -874,79 +876,51 @@ class MercurySyncHTTP3Connection:
         connection = self._connections.pop()
         connection_error: Optional[Exception] = None
 
-        if url.address is None or ssl_redirect_url:
-            for address, ip_info in url:
-                try:
-                    await connection.make_connection(
-                        address,
-                        url.port,
-                        ip_info,
-                        server_name=url.hostname,
-                    )
+        try:
+            # Reuses the connection's QUIC connection to this host; otherwise
+            # opens a new one across the host's addresses.
+            address, socket_config, new_connection = await connection.connect_to_any(
+                url.ip_addresses,
+                url.port,
+                url.address_rotation,
+                server_name=url.hostname,
+            )
 
-                    url.address = address
-                    url.socket_config = ip_info
+            if new_connection:
+                url.address = address
+                url.socket_config = socket_config
 
-                    # One connection: the first address that connects.
-                    connection_error = None
-                    break
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                parsed_url,
+                False,
+            )
 
-                except asyncio.CancelledError as err:
-                    return (
-                        err,
-                        connection,
-                        parsed_url,
-                        False,
-                    )
-
-                except Exception as err:
-                    if "server_hostname is only meaningful with ssl" in str(err):
-                        return (
-                            err,
-                            connection,
-                            parsed_url,
-                            True,
-                        )
-
-                    # Keep the error to return if no address connects, and
-                    # close this attempt's socket before trying the next.
-                    connection_error = err
-                    connection.reset()
-
-        else:
-            try:
-                await connection.make_connection(
-                    url.address,
-                    url.port,
-                    url.socket_config,
-                    server_name=url.hostname,
-                )
-
-            except asyncio.CancelledError as err:
+        except Exception as err:
+            if "server_hostname is only meaningful with ssl" in str(err):
                 return (
                     err,
                     connection,
                     parsed_url,
-                    False,
+                    True,
                 )
 
-            except Exception as err:
-                if "server_hostname is only meaningful with ssl" in str(err):
-                    return (
-                        err,
-                        connection,
-                        parsed_url,
-                        True,
-                    )
+            connection_error = err
 
-                connection_error = err
+        try:
+            return (
+                connection_error,
+                connection,
+                parsed_url,
+                False,
+            )
 
-        return (
-            connection_error,
-            connection,
-            parsed_url,
-            False,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     def _encode_headers(
         self,

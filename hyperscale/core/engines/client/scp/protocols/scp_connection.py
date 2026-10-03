@@ -1,6 +1,6 @@
 import asyncio
 import pathlib
-from typing import Any, Literal
+from typing import Any, Iterator, Literal, Sequence
 from hyperscale.core.engines.client.ssh.protocol.ssh.connection import (
     SSHClientConnection,
 )
@@ -57,18 +57,85 @@ class SCPConnection:
                 **kwargs,
             )
 
-            if must_be_dir:
-                command += b'-d '
-
-            if preserve:
-                command += b'-p '
-
-            if recurse:
-                command += b'-r '
-
-            self._base_command = command
-
             self.connected = True
+
+        self._set_command(command, must_be_dir, preserve, recurse)
+
+    def _set_command(
+        self,
+        command: bytes,
+        must_be_dir: bool,
+        preserve: bool,
+        recurse: bool,
+    ) -> None:
+        """This request's scp command: its flags belong to the request, not the connection."""
+        if must_be_dir:
+            command += b'-d '
+
+        if preserve:
+            command += b'-p '
+
+        if recurse:
+            command += b'-r '
+
+        self._base_command = command
+
+    async def connect_to_any(
+        self,
+        command: bytes,
+        addresses: Sequence[tuple[str, tuple[str | int | tuple[str, int], ...]]],
+        address_rotation: Iterator[int],
+        must_be_dir: bool = False,
+        preserve: bool = False,
+        recurse: bool = False,
+        **kwargs: dict[str, Any],
+    ) -> tuple[str | None, tuple[str | int | tuple[str, int], ...] | None, bool]:
+        """
+        Reuse this connection's open SSH connection. Otherwise open a new one,
+        trying the host's ``addresses`` one at a time from the next offset in
+        ``address_rotation`` so a pool's connections spread across all of
+        them; the first to connect wins.
+
+        Returns the address and socket config of a new connection (``None``
+        for both on reuse), and whether the connection is new.
+        """
+        if self.connected:
+            # A reused connection still takes this request's flags.
+            self._set_command(command, must_be_dir, preserve, recurse)
+            return None, None, False
+
+        if not addresses:
+            raise ConnectionError("No addresses to connect to")
+
+        offset = next(address_rotation) % len(addresses)
+        connection_error: Exception | None = None
+
+        for address, socket_config in (*addresses[offset:], *addresses[:offset]):
+            try:
+                await self.make_connection(
+                    command,
+                    socket_config,
+                    must_be_dir=must_be_dir,
+                    preserve=preserve,
+                    recurse=recurse,
+                    **kwargs,
+                )
+
+            except Exception as err:
+                # Close this attempt's connection before trying the next address.
+                connection_error = err
+                self.reset()
+                continue
+
+            return address, socket_config, True
+
+        try:
+            raise connection_error
+
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     async def create_session(
         self,

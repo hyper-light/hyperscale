@@ -59,10 +59,8 @@ class Stream:
         if self.stream_id % 2 == 0:
             self.stream_id += 1
 
-        self.window_frame.stream_id = self.stream_id
-        self.frame_buffer = FrameBuffer()
-
-        self.window_frame = Frame(self.stream_id, 0x08, window_increment=65536)
+        # The frame buffer carries over: a read cancelled mid-frame leaves the
+        # rest of that frame to arrive on this transport.
 
     def write(self, data: bytes):
         self.writer._transport.write(data)

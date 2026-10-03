@@ -508,10 +508,10 @@ class UDPProtocol(Generic[T, K]):
                     run_start = False
                     self.connected = True
 
-            except (Exception, asyncio.CancelledError, socket.error, OSError):
-                pass
-
-            await asyncio.sleep(self._retry_interval)
+            except (Exception, socket.error, OSError):
+                # Only a failed attempt waits before retrying; cancellation
+                # is not a failed attempt and propagates.
+                await asyncio.sleep(self._retry_interval)
 
         default_config = {
             "node_id": self._node_id_base,
@@ -702,8 +702,6 @@ class UDPProtocol(Generic[T, K]):
                 if attempt < self._retries:
                     await asyncio.sleep(self._retry_interval * (2 ** attempt))
             except Exception:
-                import traceback
-                print(traceback.format_exc())
                 await asyncio.sleep(self._retry_interval)
 
         return (
@@ -947,8 +945,6 @@ class UDPProtocol(Generic[T, K]):
             result: Tuple[str, int, Message] = restricted_loads(decrypted)
 
         except (SecurityError, Exception):
-            import traceback
-            print(traceback.format_exc())
             # Sanitized error - don't leak details about what was blocked
             self._pending_responses.append(
                 asyncio.ensure_future(
