@@ -38,31 +38,44 @@ if backend.poly1305_supported():
 
     _POLY1305_KEYBYTES = 32
 
+    # Block 0 of a packet's main key stream: its first bytes are the
+    # Poly1305 key, and the packet data is enciphered from block 1 on.
+    _POLY1305_KEY_BLOCK = bytes(64)
+
     def chacha20(key: bytes, data: bytes, nonce: bytes, ctr: int) -> bytes:
         """Encrypt/decrypt a block of data with the ChaCha20 cipher"""
 
         return Cipher(ChaCha20(key, (_CTR_1 if ctr else _CTR_0) + nonce),
                       mode=None).encryptor().update(data)
 
-    def poly1305_key(key: bytes, nonce: bytes) -> bytes:
-        """Derive a Poly1305 key"""
+    def seal(key: bytes, adkey: bytes, header: bytes, data: bytes,
+             nonce: bytes) -> Tuple[bytes, bytes]:
+        """Encrypt a packet's header and data, and sign them"""
 
-        return chacha20(key, _POLY1305_KEYBYTES * b'\0', nonce, 0)
+        counter_nonce = _CTR_0 + nonce
+        packet = Cipher(ChaCha20(adkey, counter_nonce),
+                        mode=None).encryptor().update(header)
 
-    def poly1305(key: bytes, data: bytes, nonce: bytes) -> bytes:
-        """Compute a Poly1305 tag for a block of data"""
+        # One key stream gives both the Poly1305 key and the data cipher.
+        stream = Cipher(ChaCha20(key, counter_nonce), mode=None).encryptor()
+        polykey = stream.update(_POLY1305_KEY_BLOCK)[:_POLY1305_KEYBYTES]
+        packet += stream.update(data)
 
-        return Poly1305.generate_tag(poly1305_key(key, nonce), data)
+        return packet, Poly1305.generate_tag(polykey, packet)
 
-    def poly1305_verify(key: bytes, data: bytes,
-                        nonce: bytes, tag: bytes) -> bool:
-        """Verify a Poly1305 tag for a block of data"""
+    def unseal(key: bytes, header: bytes, data: bytes, nonce: bytes,
+               tag: bytes) -> Optional[bytes]:
+        """Verify a packet's signature, then decrypt its data"""
+
+        stream = Cipher(ChaCha20(key, _CTR_0 + nonce), mode=None).encryptor()
+        polykey = stream.update(_POLY1305_KEY_BLOCK)[:_POLY1305_KEYBYTES]
 
         try:
-            Poly1305.verify_tag(poly1305_key(key, nonce), data, tag)
-            return True
+            Poly1305.verify_tag(polykey, header + data, tag)
         except InvalidSignature:
-            return False
+            return None
+
+        return stream.update(data)
 
     chacha_available = True
 else: # pragma: no cover
@@ -120,6 +133,24 @@ else: # pragma: no cover
 
             return _poly1305_verify(tag, data, ull_datalen, polykey) == 0
 
+        def seal(key: bytes, adkey: bytes, header: bytes, data: bytes,
+                 nonce: bytes) -> Tuple[bytes, bytes]:
+            """Encrypt a packet's header and data, and sign them"""
+
+            packet = chacha20(adkey, header, nonce, 0) + \
+                chacha20(key, data, nonce, 1)
+
+            return packet, poly1305(key, packet, nonce)
+
+        def unseal(key: bytes, header: bytes, data: bytes, nonce: bytes,
+                   tag: bytes) -> Optional[bytes]:
+            """Verify a packet's signature, then decrypt its data"""
+
+            if poly1305_verify(key, header + data, nonce, tag):
+                return chacha20(key, data, nonce, 1)
+            else:
+                return None
+
         chacha_available = True
     except (ImportError, OSError, AttributeError):
         chacha_available = False
@@ -137,11 +168,7 @@ class ChachaCipher:
                          nonce: bytes) -> Tuple[bytes, bytes]:
         """Encrypt and sign a block of data"""
 
-        header = chacha20(self._adkey, header, nonce, 0)
-        data = chacha20(self._key, data, nonce, 1)
-        tag = poly1305(self._key, header + data, nonce)
-
-        return header + data, tag
+        return seal(self._key, self._adkey, header, data, nonce)
 
     def decrypt_header(self, header: bytes, nonce: bytes) -> bytes:
         """Decrypt header data"""
@@ -152,10 +179,7 @@ class ChachaCipher:
                            nonce: bytes, tag: bytes) -> Optional[bytes]:
         """Verify the signature of and decrypt a block of data"""
 
-        if poly1305_verify(self._key, header + data, nonce, tag):
-            return chacha20(self._key, data, nonce, 1)
-        else:
-            return None
+        return unseal(self._key, header, data, nonce, tag)
 
 
 if chacha_available: # pragma: no branch

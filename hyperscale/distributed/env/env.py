@@ -424,6 +424,9 @@ class Env(BaseModel):
         5.0  # Standard timeout for job dispatch, result forwarding
     )
     GATE_TCP_TIMEOUT_FORWARD: StrictFloat = 3.0  # Timeout for forwarding to peers
+    # Seconds without a manager heartbeat before a gate counts a datacenter's
+    # health as stale.
+    GATE_DATACENTER_HEARTBEAT_STALENESS_THRESHOLD: StrictFloat = 30.0
     GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS: StrictFloat = 300.0
     GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS: StrictBool = False
 
@@ -972,6 +975,7 @@ class Env(BaseModel):
             "GATE_TCP_TIMEOUT_SHORT": float,
             "GATE_TCP_TIMEOUT_STANDARD": float,
             "GATE_TCP_TIMEOUT_FORWARD": float,
+            "GATE_DATACENTER_HEARTBEAT_STALENESS_THRESHOLD": float,
             "GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS": float,
             "GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS": parse_bool_envar,
             # Gate orphan grace period settings (Section 7)

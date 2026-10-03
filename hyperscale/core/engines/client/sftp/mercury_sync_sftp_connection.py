@@ -2366,7 +2366,14 @@ class MercurySyncSFTPConnction:
         optimized_param: URL | Data | File,
     ):
         if isinstance(optimized_param, URL):
-            self._url_cache[optimized_param.optimized.hostname] = optimized_param
+            optimized_url = optimized_param.optimized
+
+            # Plain-string requests for the same address reuse this lookup:
+            # cache the resolved URL itself, under the address as given, and
+            # only once the lookup actually resolved it.
+            if optimized_url is not None and optimized_url.ip_addresses:
+                self._url_cache[optimized_param.data] = optimized_url
+
             self._optimized[optimized_param.call_name] = optimized_param
 
         else:
@@ -2463,10 +2470,13 @@ class MercurySyncSFTPConnction:
             timings["connect_end"] = time.monotonic()
             timings["initialization_start"] = time.monotonic()
 
-            handler = await connection.create_session(
-                env=self.env,
-                sftp_version=self.sftp_version,
-            )
+            # One SFTP session serves every request on its connection until
+            # it ends (its writer is cleared) or the connection is reset.
+            if (handler := connection.session) is None or handler._writer is None:
+                handler = await connection.create_session(
+                    env=self.env,
+                    sftp_version=self.sftp_version,
+                )
 
             timings["initialization_end"] = time.monotonic()
 
@@ -2619,20 +2629,16 @@ class MercurySyncSFTPConnction:
                 case "utime":
                     result = await command.utime(*command_args, options)
 
-            elapsed, transferred = result
+            _, transferred = result
+
+            timings["execution_end"] = time.monotonic()
 
             if command_type == "chdir" and transferred:
                 # A chdir's response carries the directory it resolved.
                 response_cwd = next(iter(transferred.values())).file_path.decode(self.path_encoding)
-            
-            timings["exectution_end"] = elapsed
-            timings["close_start"] = time.monotonic()
 
-            command.exit()
-            await command.wait_closed()
-
-            timings["close_end"] = time.monotonic()
-            
+            # The session stays open for the connection's next request; a
+            # failed request resets the connection, session included.
             self._connections.append(connection)
 
             timings["request_end"] = time.monotonic()
@@ -2706,9 +2712,14 @@ class MercurySyncSFTPConnction:
                 protocol=self.address_protocol,
             )
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+        # The address as given decides what a lookup resolves: the hostname
+        # alone is shared by every port on a host, and is None for an
+        # address without a scheme.
+        cache_key = request_url.data if has_optimized_url else request_url
+
+        url = self._url_cache.get(cache_key)
+        dns_lock = self._dns_lock[cache_key]
+        dns_waiter = self._dns_waiters[cache_key]
 
         do_dns_lookup = url is None and has_optimized_url is False
 
@@ -2718,7 +2729,7 @@ class MercurySyncSFTPConnction:
                     url = parsed_url
                     await url.lookup_ssh()
 
-                    self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[cache_key] = url
 
             finally:
                 # However the lookup ended, release its waiters; after a
@@ -2727,14 +2738,14 @@ class MercurySyncSFTPConnction:
                 if dns_waiter.done() is False:
                     dns_waiter.set_result(None)
 
-                if parsed_url.hostname not in self._url_cache:
-                    del self._dns_waiters[parsed_url.hostname]
+                if cache_key not in self._url_cache:
+                    del self._dns_waiters[cache_key]
 
         elif do_dns_lookup:
             # Shielded: a waiter's cancellation must not cancel the
             # lookup future every other waiter shares.
             await asyncio.shield(dns_waiter)
-            url = self._url_cache.get(parsed_url.hostname)
+            url = self._url_cache.get(cache_key)
 
         elif has_optimized_url:
             url = request_url.optimized
@@ -2745,6 +2756,7 @@ class MercurySyncSFTPConnction:
             # Reuses the connection's SSH connection; otherwise opens a new
             # one across the host's addresses.
             address, socket_config, new_connection = await sftp_connection.connect_to_any(
+                cache_key,
                 url.ip_addresses,
                 url.address_rotation,
                 **kwargs,

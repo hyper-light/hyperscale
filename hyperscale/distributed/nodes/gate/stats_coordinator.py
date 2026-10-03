@@ -19,10 +19,9 @@ from hyperscale.distributed.models import (
 from hyperscale.distributed.jobs import WindowedStatsCollector
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerError
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock
 
 
-_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
@@ -62,8 +61,11 @@ class GateStatsCoordinator:
         get_all_running_jobs: Callable[[], list[tuple[str, GlobalJobStatus]]],
         has_job: Callable[[str], bool],
         send_tcp: Callable,
+        client_push_timeout_seconds: float,
+        clock: Clock,
         forward_status_push_to_peers: ForwardStatusPushFunc | None = None,
     ) -> None:
+        self._clock: Clock = clock
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
         self._node_host: str = node_host
@@ -80,6 +82,7 @@ class GateStatsCoordinator:
         )
         self._has_job: Callable[[str], bool] = has_job
         self._send_tcp: Callable = send_tcp
+        self._client_push_timeout_seconds: float = client_push_timeout_seconds
         self._forward_status_push_to_peers: ForwardStatusPushFunc | None = (
             forward_status_push_to_peers
         )
@@ -163,6 +166,7 @@ class GateStatsCoordinator:
             job_id,
             "job_status_push",
             push_data,
+            self._clock.monotonic(),
         )
 
         delivered = await self._send_status_push_with_retry(
@@ -205,7 +209,7 @@ class GateStatsCoordinator:
                         self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
                         self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
                     )
-                    await _DEFAULT_CLOCK.sleep(delay)
+                    await self._clock.sleep(delay)
 
         if allow_peer_forwarding and self._forward_status_push_to_peers:
             peer_forward_attempted = True
@@ -254,7 +258,7 @@ class GateStatsCoordinator:
                         self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
                         self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
                     )
-                    await _DEFAULT_CLOCK.sleep(delay)
+                    await self._clock.sleep(delay)
 
         await self._logger.log(
             ServerError(
@@ -330,6 +334,7 @@ class GateStatsCoordinator:
             job_id,
             "job_batch_push",
             payload,
+            self._clock.monotonic(),
         )
 
         for callback in unique_callbacks:
@@ -337,7 +342,7 @@ class GateStatsCoordinator:
                 callback,
                 "job_batch_push",
                 payload,
-                timeout=2.0,
+                timeout=self._client_push_timeout_seconds,
             )
             if delivered:
                 await self._state.set_client_update_position(job_id, callback, sequence)
@@ -473,6 +478,7 @@ class GateStatsCoordinator:
                 job_id,
                 "windowed_stats_push",
                 payload,
+                self._clock.monotonic(),
             )
             delivered = await self._send_periodic_push_with_retry(
                 callback,

@@ -10,10 +10,15 @@ import pytest
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock
 
+from hyperscale.distributed.runtime import RealClock
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.gate.stats_coordinator import GateStatsCoordinator
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 from hyperscale.distributed.models import JobStatus, UpdateTier
 from hyperscale.distributed.reliability import BackpressureLevel
+
+# The gate's configured TCP timeouts, as a default Env gives them.
+GATE_SETTINGS = Env()
 
 
 # =============================================================================
@@ -92,6 +97,8 @@ def create_coordinator(
     windowed_stats=None,
 ) -> GateStatsCoordinator:
     return GateStatsCoordinator(
+        clock=RealClock(),
+        client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_SHORT,
         state=state or GateRuntimeState(),
         logger=MockLogger(),
         node_host="127.0.0.1",

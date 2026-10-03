@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.nodes.gate.replication_coordinator import GateJobReplicationCoordinator
 from hyperscale.distributed.nodes.gate.server import GateServer
 
@@ -26,6 +27,7 @@ LONG_TTL_SECONDS = 3600.0
 
 def make_coordinator() -> GateJobReplicationCoordinator:
     return GateJobReplicationCoordinator(
+        clock=RealClock(),
         logger=SimpleNamespace(log=None),
         task_runner=SimpleNamespace(run=None),
         get_node_id=lambda: SimpleNamespace(full="gate-b"),

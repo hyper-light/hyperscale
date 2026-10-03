@@ -71,8 +71,8 @@ def load_data(data: str | None):
         return data
 
     try:
-        return load_data(data)
-    
+        return json.loads(data)
+
     except Exception:
         return data
     

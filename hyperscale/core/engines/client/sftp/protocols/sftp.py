@@ -23,6 +23,7 @@ from __future__ import annotations
 """SFTP handlers"""
 
 import asyncio
+from contextlib import aclosing
 from fnmatch import fnmatch
 import os
 from os import SEEK_SET, SEEK_CUR, SEEK_END
@@ -556,32 +557,53 @@ class _SFTPParallelIO(Generic[_T]):
 
         self._start_tasks()
 
-        while self._pending:
-            done, self._pending = await asyncio.wait(
-                self._pending, return_when=asyncio.FIRST_COMPLETED)
+        try:
+            while self._pending:
+                done, self._pending = await asyncio.wait(
+                    self._pending, return_when=asyncio.FIRST_COMPLETED)
 
-            exceptions = []
+                exceptions = []
 
-            for task in done:
-                try:
-                    offset, size, count, result = task.result()
-                    yield offset, result
+                for task in done:
+                    try:
+                        offset, size, count, result = task.result()
+                        yield offset, result
 
-                    if count and count < size:
-                        self._pending.add(asyncio.ensure_future(
-                            self._start_task(offset+count, size-count)))
-                except SFTPEOFError:
-                    self._bytes_left = 0
-                except (OSError, SFTPError) as exc:
-                    exceptions.append(exc)
+                        if count and count < size:
+                            self._pending.add(asyncio.ensure_future(
+                                self._start_task(offset+count, size-count)))
+                    except SFTPEOFError:
+                        self._bytes_left = 0
+                    except (OSError, SFTPError) as exc:
+                        exceptions.append(exc)
 
-            if exceptions:
-                for task in self._pending:
-                    task.cancel()
+                if exceptions:
+                    raise exceptions[0]
 
-                raise exceptions[0]
+                self._start_tasks()
 
-            self._start_tasks()
+        finally:
+            # However the transfer ends -- done, failed, or cancelled by
+            # the caller's timeout -- no request task outlives it.
+            await self._cancel_pending()
+
+    async def _cancel_pending(self) -> None:
+        """Cancel the I/O requests still in flight and wait for them"""
+
+        pending = self._pending
+        self._pending = set()
+
+        for task in pending:
+            task.cancel()
+
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _block_position(block: Tuple[int, bytes]) -> int:
+    """The position of a block read in parallel"""
+
+    return block[0]
 
 
 class _SFTPFileReader(_SFTPParallelIO[bytes]):
@@ -614,10 +636,30 @@ class _SFTPFileReader(_SFTPParallelIO[bytes]):
     async def run(self):
         """Reassemble and return data from parallel reads"""
 
+        arrivals: List[Tuple[int, bytes]] = []
+
+        async with aclosing(self.iter()) as blocks:
+            async for offset, data in blocks:
+                arrivals.append((offset - self._start, data))
+
+        # Reads cover disjoint ranges, so in position order they normally
+        # tile the file: join them, copying the data once.
+        by_position = sorted(arrivals, key=_block_position)
+        end = 0
+
+        for pos, data in by_position:
+            if pos != end:
+                break
+
+            end += len(data)
+        else:
+            return b''.join([data for _, data in by_position])
+
+        # A gap or an overlap: lay the blocks out in arrival order, gaps
+        # zero-filled and later data overwriting earlier.
         result = bytearray()
 
-        async for offset, data in self.iter():
-            pos = offset - self._start
+        for pos, data in arrivals:
             pad = pos - len(result)
 
             if pad > 0:
@@ -660,8 +702,9 @@ class _SFTPFileWriter(_SFTPParallelIO[int]):
     async def run(self):
         """Perform parallel writes"""
 
-        async for _ in self.iter():
-            pass
+        async with aclosing(self.iter()) as writes:
+            async for _ in writes:
+                pass
 
         return self._data
 

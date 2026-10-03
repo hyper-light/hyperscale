@@ -17,6 +17,7 @@ suspects is DEGRADED in every view.
 
 from types import SimpleNamespace
 
+from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.models import DatacenterStatus
 from hyperscale.distributed.nodes.gate.health_coordinator import GateHealthCoordinator
 from hyperscale.distributed.nodes.gate.server import GateServer
@@ -49,6 +50,7 @@ class FederatedProbes:
 def make_gate() -> GateServer:
     tcp_health = TcpHealthy()
     coordinator = GateHealthCoordinator(
+        clock=RealClock(),
         state=GateRuntimeState(),
         logger=None,
         task_runner=None,

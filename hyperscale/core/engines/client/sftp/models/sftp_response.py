@@ -18,7 +18,7 @@ SFTPTimings = Literal[
     "initialization_start",
     "initialization_end",
     "execution_start",
-    "exectution_end",
+    "execution_end",
     "close_start",
     "close_end",
     "request_end",

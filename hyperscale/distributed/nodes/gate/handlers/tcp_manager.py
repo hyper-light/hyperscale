@@ -38,10 +38,9 @@ from hyperscale.logging.hyperscale_logging_models import (
 
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock
 
 
-_DEFAULT_CLOCK: Clock = RealClock()
 
 RecordManagerHeartbeat = Callable[
     [str, tuple[str, int], str, int, int, bool],
@@ -83,6 +82,7 @@ class GateManagerHandler:
             [tuple[str, int], str], Awaitable[None]
         ],
         broadcast_manager_discovery: Callable,
+        clock: Clock,
         send_tcp: Callable | None = None,
         get_progress_callback: Callable[[str], tuple[str, int] | None] | None = None,
         ingest_manager_heartbeat: Callable[
@@ -113,6 +113,7 @@ class GateManagerHandler:
             get_progress_callback: Callback to get client callback for a job
             ingest_manager_heartbeat: Canonical manager heartbeat ingestion callback
         """
+        self._clock: Clock = clock
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
         self._task_runner: "TaskRunner" = task_runner
@@ -214,7 +215,7 @@ class GateManagerHandler:
             datacenter_id,
             manager_addr,
             heartbeat,
-            _DEFAULT_CLOCK.monotonic(),
+            self._clock.monotonic(),
         )
         self._record_manager_heartbeat(
             datacenter_id,
@@ -615,7 +616,7 @@ class GateManagerHandler:
                     callback_addr,
                     "reporter_result_push",
                     data,
-                    timeout=5.0,
+                    timeout=self._env.GATE_TCP_TIMEOUT_STANDARD,
                 )
                 return b"ok"
             except Exception as forward_error:

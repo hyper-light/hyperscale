@@ -530,29 +530,11 @@ class MercurySyncFTPConnection:
 
     async def _optimize_url(self, url: URL):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
-                    url,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                connection.reset()
-                self._control_connections.append(connection)
-
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
                     _,
-                    connection,
-                    url,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
@@ -561,7 +543,14 @@ class MercurySyncFTPConnection:
                 connection.reset()
                 self._control_connections.append(connection)
 
-            self._url_cache[url.optimized.hostname] = url
+            optimized_url = url.optimized
+
+            # Plain-string requests for the same address reuse this lookup:
+            # cache the resolved URL itself, under the key the connect path
+            # reads, and only once the lookup actually resolved it.
+            if optimized_url is not None and optimized_url.ip_addresses:
+                self._url_cache[url.data] = optimized_url
+
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -3015,24 +3004,28 @@ class MercurySyncFTPConnection:
         Exception | None,
         FTPConnection,
         FTPUrl,
-        bool,
     ]:
         has_optimized_url = isinstance(request_url, URL)
 
         if has_optimized_url:
             parsed_url = request_url.optimized
+            requested_url = request_url.data
 
+        else:
+            parsed_url = FTPUrl(
+                request_url,
+                family=self.address_family,
+                protocol=self.address_protocol,
+            )
+            requested_url = request_url
 
-        parsed_url = FTPUrl(
-            request_url,
-            family=self.address_family,
-            protocol=self.address_protocol,
-        )
-        
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
-        use_ssl = 'ftps' in request_url
+        # The address as given decides what a lookup resolves: the hostname
+        # alone is shared by every port on a host, and is None for an
+        # address without a scheme.
+        url = self._url_cache.get(requested_url)
+        dns_lock = self._dns_lock[requested_url]
+        dns_waiter = self._dns_waiters[requested_url]
+        use_ssl = 'ftps' in requested_url
 
         do_dns_lookup = (
             url is None
@@ -3044,7 +3037,7 @@ class MercurySyncFTPConnection:
                     url = parsed_url
                     await url.lookup_ftp(connection_type='control')
 
-                    self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[requested_url] = url
 
             finally:
                 # However the lookup ended, release its waiters; after a
@@ -3053,14 +3046,14 @@ class MercurySyncFTPConnection:
                 if dns_waiter.done() is False:
                     dns_waiter.set_result(None)
 
-                if parsed_url.hostname not in self._url_cache:
-                    del self._dns_waiters[parsed_url.hostname]
+                if requested_url not in self._url_cache:
+                    del self._dns_waiters[requested_url]
 
         elif do_dns_lookup:
             # Shielded: a waiter's cancellation must not cancel the
             # lookup future every other waiter shares.
             await asyncio.shield(dns_waiter)
-            url = self._url_cache.get(parsed_url.hostname)
+            url = self._url_cache.get(requested_url)
 
         elif has_optimized_url:
             url = request_url.optimized
@@ -3074,6 +3067,7 @@ class MercurySyncFTPConnection:
             # Reuses the connection's transport for this host; otherwise
             # races a new one across the host's addresses.
             address, socket_config, new_transport = await connection.connect_to_any(
+                requested_url,
                 url.hostname,
                 url.ip_addresses,
                 url.address_rotation,
@@ -3085,7 +3079,9 @@ class MercurySyncFTPConnection:
                 # Resolved addresses are host strings; literal ones
                 # are (host, port) tuples.
                 connection.host = address if isinstance(address, str) else address[0]
-                connection.socket_family = url.family
+                # The family of the address that connected: it picks PASV or
+                # EPSV and shapes the data connection's address.
+                connection.socket_family = socket_config[0]
                 url.address = address
                 url.socket_config = socket_config
 

@@ -22,6 +22,8 @@ class SCPConnection:
         "_factory",
         "_base_command",
         "connection_type",
+        "target",
+        "connection_options",
     )
 
     def __init__(
@@ -29,6 +31,10 @@ class SCPConnection:
         connection_type: ConnectionType,
     ):
         self.connected: bool = False
+        # The address (as the request named it) the open connection serves,
+        # and the options -- credentials included -- it was opened with.
+        self.target: str | None = None
+        self.connection_options: dict[str, Any] | None = None
         self.connection: SSHClientConnection | None = None
 
         self.lock = asyncio.Lock()
@@ -83,6 +89,7 @@ class SCPConnection:
     async def connect_to_any(
         self,
         command: bytes,
+        target: str,
         addresses: Sequence[tuple[str, tuple[str | int | tuple[str, int], ...]]],
         address_rotation: Iterator[int],
         must_be_dir: bool = False,
@@ -91,7 +98,9 @@ class SCPConnection:
         **kwargs: dict[str, Any],
     ) -> tuple[str | None, tuple[str | int | tuple[str, int], ...] | None, bool]:
         """
-        Reuse this connection's open SSH connection. Otherwise open a new one,
+        Reuse this connection's open SSH connection when it was opened for
+        ``target``, the address the request names, with the same options
+        (credentials included); any other open connection is dropped first. Otherwise open a new one,
         trying the host's ``addresses`` one at a time from the next offset in
         ``address_rotation`` so a pool's connections spread across all of
         them; the first to connect wins.
@@ -100,9 +109,12 @@ class SCPConnection:
         for both on reuse), and whether the connection is new.
         """
         if self.connected:
-            # A reused connection still takes this request's flags.
-            self._set_command(command, must_be_dir, preserve, recurse)
-            return None, None, False
+            if self.target == target and self.connection_options == kwargs:
+                # A reused connection still takes this request's flags.
+                self._set_command(command, must_be_dir, preserve, recurse)
+                return None, None, False
+
+            self.reset()
 
         if not addresses:
             raise ConnectionError("No addresses to connect to")
@@ -126,6 +138,9 @@ class SCPConnection:
                 connection_error = err
                 self.reset()
                 continue
+
+            self.target = target
+            self.connection_options = kwargs
 
             return address, socket_config, True
 
@@ -159,3 +174,5 @@ class SCPConnection:
 
         self.connection = None
         self.connected = False
+        self.target = None
+        self.connection_options = None

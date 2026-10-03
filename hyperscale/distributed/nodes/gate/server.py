@@ -504,7 +504,7 @@ class GateServer(HealthAwareServer):
         # Zero-worker / no-heartbeat unhealth is untouched (those are
         # structural signals, not capacity).
         self._dc_health_manager = DatacenterHealthManager(
-            heartbeat_timeout=30.0,
+            heartbeat_timeout=env.GATE_DATACENTER_HEARTBEAT_STALENESS_THRESHOLD,
             get_configured_managers=lambda dc: self._datacenter_managers.get(dc, []),
             overload_config=DatacenterOverloadConfig(
                 capacity_utilization_unhealthy_threshold=float("inf"),
@@ -532,7 +532,7 @@ class GateServer(HealthAwareServer):
 
         # Manager dispatcher
         self._manager_dispatcher = ManagerDispatcher(
-            dispatch_timeout=5.0,
+            dispatch_timeout=env.GATE_TCP_TIMEOUT_STANDARD,
             max_retries_per_dc=2,
         )
         for datacenter_id, manager_addrs in self._datacenter_managers.items():
@@ -547,7 +547,7 @@ class GateServer(HealthAwareServer):
         # Job forwarding tracker
         self._job_forwarding_tracker = JobForwardingTracker(
             local_gate_id="",
-            forward_timeout=3.0,
+            forward_timeout=env.GATE_TCP_TIMEOUT_FORWARD,
             max_forward_attempts=3,
         )
 
@@ -758,6 +758,8 @@ class GateServer(HealthAwareServer):
             completion_handler=self._complete_best_effort_job,
         )
         self._stats_coordinator = GateStatsCoordinator(
+            clock=self._clock,
+            client_push_timeout_seconds=self._tcp_timeout_short,
             state=self._modular_state,
             logger=self._udp_logger,
             node_host=self._host,
@@ -788,6 +790,8 @@ class GateServer(HealthAwareServer):
         )
 
         self._dispatch_coordinator = GateDispatchCoordinator(
+            clock=self._clock,
+            client_push_timeout_seconds=self._tcp_timeout_standard,
             state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
@@ -823,6 +827,7 @@ class GateServer(HealthAwareServer):
         )
 
         self._peer_coordinator = GatePeerCoordinator(
+            clock=self._clock,
             state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
@@ -845,6 +850,7 @@ class GateServer(HealthAwareServer):
         )
 
         self._health_coordinator = GateHealthCoordinator(
+            clock=self._clock,
             state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
@@ -877,6 +883,7 @@ class GateServer(HealthAwareServer):
         )
 
         self._replication_coordinator = GateJobReplicationCoordinator(
+            clock=self._clock,
             logger=self._udp_logger,
             task_runner=self._task_runner,
             get_node_id=lambda: self._node_id,
@@ -890,6 +897,7 @@ class GateServer(HealthAwareServer):
         )
 
         self._orphan_job_coordinator = GateOrphanJobCoordinator(
+            clock=self._clock,
             state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
@@ -985,6 +993,8 @@ class GateServer(HealthAwareServer):
         )
 
         self._job_handler = GateJobHandler(
+            clock=self._clock,
+            client_push_timeout_seconds=self._tcp_timeout_standard,
             state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
@@ -1018,6 +1028,7 @@ class GateServer(HealthAwareServer):
         )
 
         self._manager_handler = GateManagerHandler(
+            clock=self._clock,
             state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
@@ -1040,6 +1051,8 @@ class GateServer(HealthAwareServer):
         )
 
         self._cancellation_handler = GateCancellationHandler(
+            client_push_timeout_seconds=self._tcp_timeout_short,
+            manager_request_timeout_seconds=self._tcp_timeout_standard,
             state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
@@ -1054,6 +1067,7 @@ class GateServer(HealthAwareServer):
         )
 
         self._state_sync_handler = GateStateSyncHandler(
+            peer_forward_timeout_seconds=self._tcp_timeout_forward,
             state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
@@ -1779,7 +1793,7 @@ class GateServer(HealthAwareServer):
                     callback,
                     "workflow_result_push",
                     push.dump(),
-                    timeout=5.0,
+                    timeout=self._tcp_timeout_standard,
                 )
                 return b"ok" if delivered else b"error"
 
@@ -2348,7 +2362,7 @@ class GateServer(HealthAwareServer):
                     callback,
                     "receive_manager_job_leader_transfer",
                     payload,
-                    timeout=5.0,
+                    timeout=self._tcp_timeout_standard,
                     log_failure=False,
                 )
                 if not delivered:
@@ -2506,7 +2520,7 @@ class GateServer(HealthAwareServer):
                 callback,
                 "job_status_push",
                 data,
-                timeout=5.0,
+                timeout=self._tcp_timeout_standard,
             )
             return b"ok" if delivered else b"error"
 
@@ -2625,6 +2639,7 @@ class GateServer(HealthAwareServer):
             job_id,
             message_type,
             payload,
+            self._clock.monotonic(),
         )
         return await self._deliver_client_update(
             job_id,
@@ -3402,7 +3417,7 @@ class GateServer(HealthAwareServer):
                     manager_addr,
                     "cancel_job",
                     cancel_payload,
-                    timeout=5.0,
+                    timeout=self._tcp_timeout_standard,
                 )
             except Exception as error:
                 errors.append(f"DC {dc_id} cancel error: {error}")
@@ -3578,7 +3593,7 @@ class GateServer(HealthAwareServer):
             callback,
             "receive_global_job_result",
             payload,
-            timeout=5.0,
+            timeout=self._tcp_timeout_standard,
             log_failure=False,
         )
         if delivered:
@@ -4874,7 +4889,7 @@ class GateServer(HealthAwareServer):
                         owner_addr,
                         "receive_job_progress",
                         progress.dump(),
-                        timeout=3.0,
+                        timeout=self._tcp_timeout_forward,
                     )
                     circuit.record_success()
                     return True
@@ -5172,7 +5187,7 @@ class GateServer(HealthAwareServer):
                     peer_addr,
                     "manager_discovery",
                     broadcast.dump(),
-                    timeout=2.0,
+                    timeout=self._tcp_timeout_short,
                 )
                 circuit.record_success()
             except Exception as discovery_error:
@@ -5268,7 +5283,7 @@ class GateServer(HealthAwareServer):
     async def _send_xprobe(self, target: tuple[str, int], data: bytes) -> bool:
         """Send cross-cluster probe."""
         try:
-            response = await self.send(target, data, timeout=5)
+            response = await self.send(target, data, timeout=self.env.FEDERATED_PROBE_TIMEOUT)
             if not isinstance(response, bytes):
                 return True
 
@@ -5498,7 +5513,7 @@ class GateServer(HealthAwareServer):
                     peer_addr,
                     "dc_leader_announcement",
                     announcement.dump(),
-                    timeout=2.0,
+                    timeout=self._tcp_timeout_short,
                 )
                 circuit.record_success()
                 broadcast_count += 1
@@ -5541,7 +5556,7 @@ class GateServer(HealthAwareServer):
                     gate_addr,
                     "workflow_result_push",
                     push.dump(),
-                    timeout=3.0,
+                    timeout=self._tcp_timeout_forward,
                 )
                 if response not in (b"ok", b"stored", None):
                     raise RuntimeError(
@@ -5575,7 +5590,7 @@ class GateServer(HealthAwareServer):
                     gate_addr,
                     "workflow_result_push",
                     push.dump(),
-                    timeout=3.0,
+                    timeout=self._tcp_timeout_forward,
                 )
                 if response not in (b"ok", b"stored", None):
                     raise RuntimeError(
@@ -5612,7 +5627,7 @@ class GateServer(HealthAwareServer):
                     gate_addr,
                     "job_final_result",
                     data,
-                    timeout=3.0,
+                    timeout=self._tcp_timeout_forward,
                 )
                 if response in (b"ok", b"forwarded"):
                     circuit.record_success()
@@ -5650,7 +5665,7 @@ class GateServer(HealthAwareServer):
                     gate_addr,
                     "job_final_result_forward",
                     data,
-                    timeout=3.0,
+                    timeout=self._tcp_timeout_forward,
                 )
                 if response in (b"ok", b"forwarded"):
                     circuit.record_success()
@@ -5698,7 +5713,7 @@ class GateServer(HealthAwareServer):
                     gate_addr,
                     "job_status_push_forward",
                     push_data,
-                    timeout=3.0,
+                    timeout=self._tcp_timeout_forward,
                 )
                 if response in (b"ok", None):
                     circuit.record_success()
@@ -6481,7 +6496,7 @@ class GateServer(HealthAwareServer):
                 callback,
                 "workflow_result_push",
                 payload,
-                timeout=5.0,
+                timeout=self._tcp_timeout_standard,
                 log_failure=False,
             )
             if not delivered:
@@ -6519,7 +6534,7 @@ class GateServer(HealthAwareServer):
                     manager_addr,
                     "workflow_query",
                     request.dump(),
-                    timeout=5.0,
+                    timeout=self._tcp_timeout_standard,
                 )
                 if isinstance(response_data, Exception) or response_data == b"error":
                     return
@@ -6642,7 +6657,7 @@ class GateServer(HealthAwareServer):
                 peer_tcp_addr,
                 "state_sync",
                 request.dump(),
-                timeout=5.0,
+                timeout=self._tcp_timeout_standard,
             )
 
             if isinstance(result, bytes) and len(result) > 0:
@@ -6740,7 +6755,7 @@ class GateServer(HealthAwareServer):
             manager_addr,
             "gate_register",
             request.dump(),
-            timeout=5.0,
+            timeout=self._tcp_timeout_standard,
         )
         if isinstance(response, Exception):
             raise ClusterJoinError(

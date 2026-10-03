@@ -485,14 +485,13 @@ class Record(metaclass=_RecordMeta):
     __slots__: Mapping[str, object] = {}
 
     def __init__(self, *args: object, **kwargs: object):
-        for k, v in self.__slots__.items():
-            setattr(self, k, v)
-
-        for k, v in zip(self.__slots__, args):
-            setattr(self, k, v)
-
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+        # No Record field is a descriptor, and no Record defines __setattr__
+        # or real slots: filling the instance dict sets the same fields, in
+        # three calls rather than one per field.
+        fields = self.__dict__
+        fields.update(self.__slots__)
+        fields.update(zip(self.__slots__, args))
+        fields.update(kwargs)
 
     def __repr__(self) -> str:
         values = ', '.join(f'{k}={getattr(self, k)!r}' for k in self.__slots__)

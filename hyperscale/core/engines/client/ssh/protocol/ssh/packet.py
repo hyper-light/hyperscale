@@ -124,45 +124,99 @@ class SSHPacket:
 
         return self._packet
 
+    # The readers below are inlined (no reader calls another): they run for
+    # every field of every packet.
+
     def get_bytes(self, size: int) -> bytes:
         """Extract the requested number of bytes from the packet"""
 
-        if self._idx + size > self._len:
+        idx = self._idx
+        end = idx + size
+
+        if end > self._len:
             raise PacketDecodeError('Incomplete packet')
 
-        value = self._packet[self._idx:self._idx+size]
-        self._idx += size
-        return value
+        self._idx = end
+        return self._packet[idx:end]
 
     def get_byte(self) -> int:
         """Extract a single byte from the packet"""
 
-        return self.get_bytes(1)[0]
+        idx = self._idx
+
+        if idx + 1 > self._len:
+            raise PacketDecodeError('Incomplete packet')
+
+        self._idx = idx + 1
+        return self._packet[idx]
 
     def get_boolean(self) -> bool:
         """Extract a boolean from the packet"""
 
-        return bool(self.get_byte())
+        idx = self._idx
+
+        if idx + 1 > self._len:
+            raise PacketDecodeError('Incomplete packet')
+
+        self._idx = idx + 1
+        return bool(self._packet[idx])
 
     def get_uint16(self) -> int:
         """Extract a 16-bit integer from the packet"""
 
-        return int.from_bytes(self.get_bytes(2), 'big')
+        idx = self._idx
+        end = idx + 2
+
+        if end > self._len:
+            raise PacketDecodeError('Incomplete packet')
+
+        self._idx = end
+        return int.from_bytes(self._packet[idx:end], 'big')
 
     def get_uint32(self) -> int:
         """Extract a 32-bit integer from the packet"""
 
-        return int.from_bytes(self.get_bytes(4), 'big')
+        idx = self._idx
+        end = idx + 4
+
+        if end > self._len:
+            raise PacketDecodeError('Incomplete packet')
+
+        self._idx = end
+        return int.from_bytes(self._packet[idx:end], 'big')
 
     def get_uint64(self) -> int:
         """Extract a 64-bit integer from the packet"""
 
-        return int.from_bytes(self.get_bytes(8), 'big')
+        idx = self._idx
+        end = idx + 8
+
+        if end > self._len:
+            raise PacketDecodeError('Incomplete packet')
+
+        self._idx = end
+        return int.from_bytes(self._packet[idx:end], 'big')
 
     def get_string(self) -> bytes:
         """Extract a UTF-8 string from the packet"""
 
-        return self.get_bytes(self.get_uint32())
+        idx = self._idx
+        start = idx + 4
+
+        if start > self._len:
+            raise PacketDecodeError('Incomplete packet')
+
+        end = start + int.from_bytes(self._packet[idx:start], 'big')
+
+        # As when the length was read on its own: consumed even when the
+        # string itself is incomplete.
+        self._idx = start
+
+        if end > self._len:
+            raise PacketDecodeError('Incomplete packet')
+
+        self._idx = end
+        return self._packet[start:end]
 
     def get_mpint(self) -> int:
         """Extract a multiple precision integer from the packet"""

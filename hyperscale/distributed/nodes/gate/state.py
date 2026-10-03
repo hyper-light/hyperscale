@@ -25,10 +25,8 @@ from hyperscale.distributed.health import (
 )
 from hyperscale.distributed.reliability import BackpressureLevel
 
-from hyperscale.distributed.runtime import Clock, RealClock
 
 
-_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class GateRuntimeState:
@@ -590,12 +588,13 @@ class GateRuntimeState:
         job_id: str,
         message_type: str,
         payload: bytes,
+        recorded_at: float,
     ) -> int:
         async with self._get_counter_lock():
             sequence = self._job_update_sequences.get(job_id, 0) + 1
             self._job_update_sequences[job_id] = sequence
             history = self._job_update_history.setdefault(job_id, [])
-            history.append((sequence, message_type, payload, _DEFAULT_CLOCK.monotonic()))
+            history.append((sequence, message_type, payload, recorded_at))
             if self._client_update_history_limit > 0:
                 excess = len(history) - self._client_update_history_limit
                 if excess > 0:

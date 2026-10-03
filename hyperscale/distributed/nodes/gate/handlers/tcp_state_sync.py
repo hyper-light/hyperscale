@@ -68,6 +68,7 @@ class GateStateSyncHandler:
         get_term: Callable[[], int],
         get_state_snapshot: Callable[[], GateStateSnapshot],
         apply_state_snapshot: Callable[[GateStateSnapshot], None],
+        peer_forward_timeout_seconds: float,
         get_known_leader_manager_term: Callable[[str], int] | None = None,
     ) -> None:
         """
@@ -104,6 +105,7 @@ class GateStateSyncHandler:
         self._versioned_clock: "VersionedStateClock" = versioned_clock
         self._peer_circuit_breaker: CircuitBreakerManager = peer_circuit_breaker
         self._send_tcp: Callable = send_tcp
+        self._peer_forward_timeout_seconds: float = peer_forward_timeout_seconds
         self._get_node_id: Callable[[], "NodeId"] = get_node_id
         self._get_host: Callable[[], str] = get_host
         self._get_tcp_port: Callable[[], int] = get_tcp_port
@@ -303,7 +305,7 @@ class GateStateSyncHandler:
                 leader_addr,
                 "job_final_result",
                 data,
-                timeout=3.0,
+                timeout=self._peer_forward_timeout_seconds,
             )
             if response not in (b"ok", b"forwarded", b"already_completed"):
                 raise RuntimeError(

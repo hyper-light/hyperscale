@@ -73,6 +73,8 @@ class GateCancellationHandler:
         record_cancellation: Callable[
             [str, str, str, list[tuple[str, int]]], Awaitable[None]
         ],
+        client_push_timeout_seconds: float,
+        manager_request_timeout_seconds: float,
     ) -> None:
         """
         Initialize the cancellation handler.
@@ -110,6 +112,8 @@ class GateCancellationHandler:
             check_rate_limit
         )
         self._send_tcp: Callable = send_tcp
+        self._client_push_timeout_seconds: float = client_push_timeout_seconds
+        self._manager_request_timeout_seconds: float = manager_request_timeout_seconds
 
     def _build_cancel_response(
         self,
@@ -593,7 +597,7 @@ class GateCancellationHandler:
                 callback,
                 "job_cancellation_complete",
                 completion.dump(),
-                timeout=2.0,
+                timeout=self._client_push_timeout_seconds,
             )
         except Exception as error:
             await self._logger.log(
@@ -682,7 +686,7 @@ class GateCancellationHandler:
                         dc_addr,
                         "receive_cancel_single_workflow",
                         request.dump(),
-                        timeout=5.0,
+                        timeout=self._manager_request_timeout_seconds,
                     )
 
                     if response_data:

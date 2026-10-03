@@ -62,10 +62,9 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
 )
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock
 
 
-_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
@@ -76,6 +75,7 @@ class GateJobReplicationCoordinator:
     """Two-phase commit coordinator for gate job-state replication."""
 
     __slots__ = (
+        "_clock",
         "_logger",
         "_task_runner",
         "_get_node_id",
@@ -107,10 +107,12 @@ class GateJobReplicationCoordinator:
         ],
         apply_committed: Callable[[GateJobReplica], Awaitable[None]],
         drop_committed: Callable[[str], Awaitable[None]],
+        clock: Clock,
         prepared_ttl_seconds: float = 30.0,
         quorum_timeout_seconds: float = 5.0,
         peer_rpc_timeout_seconds: float = 5.0,
     ) -> None:
+        self._clock: Clock = clock
         self._logger = logger
         self._task_runner = task_runner
         self._get_node_id = get_node_id
@@ -499,7 +501,7 @@ class GateJobReplicationCoordinator:
 
             self._prepared[replica.job_id] = replica
             self._prepared_expires_at[replica.job_id] = (
-                _DEFAULT_CLOCK.monotonic() + self._prepared_ttl_seconds
+                self._clock.monotonic() + self._prepared_ttl_seconds
             )
             return GateJobReplicaStatus.PREPARED
 
@@ -593,7 +595,7 @@ class GateJobReplicationCoordinator:
             rollback_key = (replica.job_id, replica.sequence)
             self._commit_rollback_replicas.setdefault(rollback_key, previous)
             self._commit_rollback_expires_at[rollback_key] = (
-                _DEFAULT_CLOCK.monotonic() + self._prepared_ttl_seconds
+                self._clock.monotonic() + self._prepared_ttl_seconds
             )
 
         if previous is not None:
@@ -664,7 +666,7 @@ class GateJobReplicationCoordinator:
         job_id: str,
     ) -> GateJobReplicaAck | None:
         try:
-            response_tuple = await _DEFAULT_CLOCK.wait_for(
+            response_tuple = await self._clock.wait_for(
                 self._send_tcp(
                     peer_addr,
                     "gate_job_replica_prepare",
@@ -703,7 +705,7 @@ class GateJobReplicationCoordinator:
         job_id: str,
     ) -> GateJobReplicaAck | None:
         try:
-            response_tuple = await _DEFAULT_CLOCK.wait_for(
+            response_tuple = await self._clock.wait_for(
                 self._send_tcp(
                     peer_addr,
                     "gate_job_replica_commit",
@@ -757,7 +759,7 @@ class GateJobReplicationCoordinator:
         job_id: str,
     ) -> None:
         try:
-            await _DEFAULT_CLOCK.wait_for(
+            await self._clock.wait_for(
                 self._send_tcp(
                     peer_addr,
                     "gate_job_replica_abort",
@@ -789,7 +791,7 @@ class GateJobReplicationCoordinator:
         expected_leader_addr: tuple[str, int] | None,
     ) -> GateJobReplicaFetchResponse | None:
         try:
-            response_tuple = await _DEFAULT_CLOCK.wait_for(
+            response_tuple = await self._clock.wait_for(
                 self._send_tcp(
                     peer_addr,
                     "gate_job_replica_fetch",
@@ -867,7 +869,7 @@ class GateJobReplicationCoordinator:
         prepared state held after a leader-died-mid-prepare event
         eventually frees memory even when no explicit abort arrives.
         """
-        now = _DEFAULT_CLOCK.monotonic()
+        now = self._clock.monotonic()
         reaped: list[str] = []
         async with self._lock:
             for job_id, expires_at in list(self._prepared_expires_at.items()):

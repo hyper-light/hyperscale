@@ -25,10 +25,9 @@ from hyperscale.logging.hyperscale_logging_models import (
 
 from .state import GateRuntimeState
 
-from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
+from hyperscale.distributed.runtime import Clock, Random, RealRandom
 
 
-_DEFAULT_CLOCK: Clock = RealClock()
 _DEFAULT_RANDOM: Random = RealRandom()
 
 if TYPE_CHECKING:
@@ -72,6 +71,7 @@ class GatePeerCoordinator:
         confirm_peer: Callable[[tuple[str, int]], Awaitable[None]],
         handle_job_leader_failure: Callable[[tuple[str, int]], "asyncio.Task"],
         remove_peer_circuit: Callable[[tuple[str, int]], Awaitable[None]],
+        clock: Clock,
         is_leader: Callable[[], bool] | None = None,
     ) -> None:
         """
@@ -97,6 +97,7 @@ class GatePeerCoordinator:
             handle_job_leader_failure: Callback to handle job leader failure
             remove_peer_circuit: Callback to clear peer circuit breakers
         """
+        self._clock: Clock = clock
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
         self._task_runner: "TaskRunner" = task_runner
@@ -165,7 +166,7 @@ class GatePeerCoordinator:
         async with peer_lock:
             await self._state.increment_peer_epoch(tcp_addr)
             await self._state.remove_active_peer(tcp_addr)
-            self._state.mark_peer_unhealthy(tcp_addr, _DEFAULT_CLOCK.monotonic())
+            self._state.mark_peer_unhealthy(tcp_addr, self._clock.monotonic())
 
             peer_host, peer_port = tcp_addr
             peer_id = f"{peer_host}:{peer_port}"
@@ -231,7 +232,7 @@ class GatePeerCoordinator:
                 jitter = _DEFAULT_RANDOM.uniform(
                     self._recovery_jitter_min, self._recovery_jitter_max
                 )
-                await _DEFAULT_CLOCK.sleep(jitter)
+                await self._clock.sleep(jitter)
 
             async with peer_lock:
                 current_epoch = await self._state.get_peer_epoch(tcp_addr)

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 from enum import Enum
 
+from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.nodes.gate.handlers.tcp_manager import GateManagerHandler
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 from hyperscale.distributed.models import (
@@ -122,6 +123,7 @@ def create_mock_handler(
     validator._validate_result = validate_role
 
     return GateManagerHandler(
+        clock=RealClock(),
         state=state,
         logger=MockLogger(),
         task_runner=MockTaskRunner(),
@@ -201,6 +203,7 @@ class TestHandleStatusUpdateHappyPath:
             )
 
         handler = GateManagerHandler(
+            clock=RealClock(),
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -277,6 +280,7 @@ class TestHandleStatusUpdateBackpressure:
             updated_dcs.append(dc_id)
 
         handler = GateManagerHandler(
+            clock=RealClock(),
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -402,6 +406,7 @@ class TestHandleRegisterHappyPath:
         healthy_gates = [MockGateInfo("gate-001", ("127.0.0.1", 9000))]
 
         handler = GateManagerHandler(
+            clock=RealClock(),
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -878,6 +883,7 @@ class TestFailureModes:
             raise Exception("Recording failed")
 
         handler = GateManagerHandler(
+            clock=RealClock(),
             state=GateRuntimeState(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -932,6 +938,7 @@ class TestFailureModes:
         broadcast_mock = AsyncMock(side_effect=Exception("Broadcast failed"))
 
         handler = GateManagerHandler(
+            clock=RealClock(),
             state=GateRuntimeState(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),

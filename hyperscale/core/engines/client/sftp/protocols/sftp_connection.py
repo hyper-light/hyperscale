@@ -30,10 +30,19 @@ class SFTPConnection:
         "_loop",
         "_factory",
         "_base_command",
+        "target",
+        "connection_options",
+        "session",
     )
 
     def __init__(self):
         self.connected: bool = False
+        # The address (as the request named it) the open connection serves,
+        # and the options -- credentials included -- it was opened with.
+        self.target: str | None = None
+        self.connection_options: dict[str, Any] | None = None
+        # The SFTP session requests on this connection share.
+        self.session: SFTPClientHandler | None = None
         self.connection: SSHClientConnection | None = None
 
         self.lock = asyncio.Lock()
@@ -60,12 +69,15 @@ class SFTPConnection:
 
     async def connect_to_any(
         self,
+        target: str,
         addresses: Sequence[tuple[str, tuple[str | int | tuple[str, int], ...]]],
         address_rotation: Iterator[int],
         **kwargs: dict[str, Any],
     ) -> tuple[str | None, tuple[str | int | tuple[str, int], ...] | None, bool]:
         """
-        Reuse this connection's open SSH connection. Otherwise open a new one,
+        Reuse this connection's open SSH connection when it was opened for
+        ``target``, the address the request names, with the same options
+        (credentials included); any other open connection is dropped first. Otherwise open a new one,
         trying the host's ``addresses`` one at a time from the next offset in
         ``address_rotation`` so a pool's connections spread across all of
         them; the first to connect wins.
@@ -74,7 +86,10 @@ class SFTPConnection:
         for both on reuse), and whether the connection is new.
         """
         if self.connected:
-            return None, None, False
+            if self.target == target and self.connection_options == kwargs:
+                return None, None, False
+
+            self.reset()
 
         if not addresses:
             raise ConnectionError("No addresses to connect to")
@@ -94,6 +109,9 @@ class SFTPConnection:
                 connection_error = err
                 self.reset()
                 continue
+
+            self.target = target
+            self.connection_options = kwargs
 
             return address, socket_config, True
 
@@ -131,6 +149,8 @@ class SFTPConnection:
 
         await handler.request_limits()
 
+        self.session = handler
+
         return handler
     
     def close(self):
@@ -145,5 +165,8 @@ class SFTPConnection:
 
         self.connection = None
         self.connected = False
+        self.target = None
+        self.connection_options = None
+        self.session = None
 
 

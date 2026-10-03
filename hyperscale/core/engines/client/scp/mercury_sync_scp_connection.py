@@ -274,7 +274,14 @@ class MercurySyncSCPConnection:
         optimized_param: URL | Data | File,
     ):
         if isinstance(optimized_param, URL):
-            self._url_cache[optimized_param.optimized.hostname] = optimized_param
+            optimized_url = optimized_param.optimized
+
+            # Plain-string requests for the same address reuse this lookup:
+            # cache the resolved URL itself, under the address as given, and
+            # only once the lookup actually resolved it.
+            if optimized_url is not None and optimized_url.ip_addresses:
+                self._url_cache[optimized_param.data] = optimized_url
+
             self._optimized[optimized_param.call_name] = optimized_param
 
         else:
@@ -647,9 +654,14 @@ class MercurySyncSCPConnection:
                 protocol=self.address_protocol,
             )
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+        # The address as given decides what a lookup resolves: the hostname
+        # alone is shared by every port on a host, and is None for an
+        # address without a scheme.
+        cache_key = request_url.data if has_optimized_url else request_url
+
+        url = self._url_cache.get(cache_key)
+        dns_lock = self._dns_lock[cache_key]
+        dns_waiter = self._dns_waiters[cache_key]
 
         do_dns_lookup = url is None and has_optimized_url is False
 
@@ -659,7 +671,7 @@ class MercurySyncSCPConnection:
                     url = parsed_url
                     await url.lookup_ssh()
 
-                    self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[cache_key] = url
 
             finally:
                 # However the lookup ended, release its waiters; after a
@@ -668,14 +680,14 @@ class MercurySyncSCPConnection:
                 if dns_waiter.done() is False:
                     dns_waiter.set_result(None)
 
-                if parsed_url.hostname not in self._url_cache:
-                    del self._dns_waiters[parsed_url.hostname]
+                if cache_key not in self._url_cache:
+                    del self._dns_waiters[cache_key]
 
         elif do_dns_lookup:
             # Shielded: a waiter's cancellation must not cancel the
             # lookup future every other waiter shares.
             await asyncio.shield(dns_waiter)
-            url = self._url_cache.get(parsed_url.hostname)
+            url = self._url_cache.get(cache_key)
 
         elif has_optimized_url:
             url = request_url.optimized
@@ -689,6 +701,7 @@ class MercurySyncSCPConnection:
             # one across the host's addresses.
             address, socket_config, new_connection = await scp_connection.connect_to_any(
                 command,
+                cache_key,
                 url.ip_addresses,
                 (
                     self._source_address_rotation

@@ -971,7 +971,7 @@ class Results:
             int | float,
         ] = {}
 
-        if (request_end := timings.get("read_end")) and (
+        if (request_end := timings.get("request_end")) and (
             request_start := timings.get("request_start")
         ):
             timing_results["total"] = request_end - request_start
@@ -1019,7 +1019,7 @@ class Results:
             int | float,
         ] = {}
 
-        if (request_end := timings.get("read_end")) and (
+        if (request_end := timings.get("request_end")) and (
             request_start := timings.get("request_start")
         ):
             timing_results["total"] = request_end - request_start
@@ -1034,7 +1034,7 @@ class Results:
         ):
             timing_results["initializing"] = initialization_end - initialization_start
 
-        if (execution_end := timings.get("exectution_end")) and (
+        if (execution_end := timings.get("execution_end")) and (
             execution_start := timings.get("execution_start")
         ):
             timing_results["executing"] = execution_end - execution_start

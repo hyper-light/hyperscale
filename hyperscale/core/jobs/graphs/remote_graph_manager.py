@@ -1021,25 +1021,14 @@ class RemoteGraphManager:
 
                 workflow_slug = workflow.name.lower()
 
-                await asyncio.gather(
-                    *[
-                        update_active_workflow_message(
-                            workflow_slug, f"Starting - {workflow.name}"
-                        ),
-                        update_workflow_run_timer(workflow_slug, True),
-                    ]
+                await update_active_workflow_message(
+                    workflow_slug, f"Starting - {workflow.name}"
                 )
 
                 await ctx.log_prepared(
                     message=f"Submitting Workflow {workflow.name} with run id {run_id}",
                     name="trace",
                 )
-
-                self._workflow_timers[workflow.name] = _DEFAULT_MONOTONIC_SOURCE()
-
-                # Each run measures its rate intervals from its own start.
-                self._workflow_last_elapsed.pop(workflow.name, None)
-                self._workflow_last_completed.pop(workflow.name, None)
 
                 # Register for event-driven completion tracking
                 completion_state = self._controller.register_workflow_completion(
@@ -1048,7 +1037,12 @@ class RemoteGraphManager:
                     threads,
                 )
 
-                # Submit workflow to workers with explicit node targeting
+                # The run's time budget starts at submission: setup and the
+                # synchronized start count against it, as setup always has.
+                submitted_at = _DEFAULT_MONOTONIC_SOURCE()
+
+                # Submit workflow to workers with explicit node targeting.
+                # Returns once the workers have set up and started together.
                 await self._controller.submit_workflow_to_workers(
                     run_id,
                     workflow,
@@ -1056,6 +1050,19 @@ class RemoteGraphManager:
                     threads,
                     workflow_vus,
                     node_ids,
+                )
+
+                # The run's clocks start with its load: setup and the
+                # synchronized start fall outside its elapsed time and rate.
+                self._workflow_timers[workflow.name] = _DEFAULT_MONOTONIC_SOURCE()
+
+                # Each run measures its rate intervals from its own start.
+                self._workflow_last_elapsed.pop(workflow.name, None)
+                self._workflow_last_completed.pop(workflow.name, None)
+
+                await asyncio.gather(
+                    update_workflow_run_timer(workflow_slug, True),
+                    update_workflow_executions_total_rate(workflow_slug, 0, True),
                 )
 
                 await ctx.log_prepared(
@@ -1075,6 +1082,7 @@ class RemoteGraphManager:
                     workflow_timeout,
                     completion_state,
                     threads,
+                    submitted_at,
                 )
 
                 # Get results from controller
@@ -1306,16 +1314,19 @@ class RemoteGraphManager:
         timeout: int,
         completion_state: WorkflowCompletionState,
         threads: int,
+        budget_started_at: float,
     ) -> Exception | None:
         """
         Wait for workflow completion while processing status updates.
 
         Uses event-driven completion signaling from the controller.
         Processes status updates from the queue to update UI.
+        ``timeout`` is measured from ``budget_started_at``, the run's
+        submission.
         """
 
         timeout_error: Exception | None = None
-        start_time = _DEFAULT_MONOTONIC_SOURCE()
+        start_time = budget_started_at
 
         while not completion_state.completion_event.is_set():
             remaining_timeout = timeout - (_DEFAULT_MONOTONIC_SOURCE() - start_time)

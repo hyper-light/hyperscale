@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.models import GateHeartbeat, GateInfo
 from hyperscale.distributed.nodes.gate.peer_coordinator import GatePeerCoordinator
 from hyperscale.distributed.nodes.gate.server import GateServer
@@ -95,6 +96,7 @@ class TwoPassGate:
         gate._log_health_transitions = lambda: None
         gate._checkpoint_ledger_if_due = AsyncMock()
         gate._peer_coordinator = GatePeerCoordinator(
+            clock=RealClock(),
             state=state,
             logger=SimpleNamespace(log=None),
             task_runner=SimpleNamespace(run=lambda *args, **kwargs: None),

@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import os
 import statistics
 from collections import Counter, defaultdict
@@ -15,6 +16,7 @@ from hyperscale.core.jobs.hooks import (
 from hyperscale.core.jobs.models import (
     Env,
     JobContext,
+    Message,
     ReceivedReceipt,
     Response,
     StepStatsUpdate,
@@ -25,7 +27,10 @@ from hyperscale.core.jobs.models import (
     WorkflowThrottleUpdate,
     WorkflowCompletionState,
     WorkflowJob,
+    WorkflowReady,
+    WorkflowRelease,
     WorkflowResults,
+    WorkflowStartBarrier,
     WorkflowStatusUpdate,
     WorkflowStopSignal
 )
@@ -195,6 +200,13 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         self._cancellation_expected_nodes: Dict[int, Dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
         # Collect errors from nodes that reported FAILED status
         self._cancellation_errors: Dict[int, Dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+
+        # Synchronized run start, keyed by (run_id, workflow_name). The
+        # leader holds each run's start barrier only until it releases the
+        # run; a node holds its run's start gate only while the run waits
+        # at it. Plain dicts: a lookup for an unknown run creates nothing.
+        self._workflow_start_barriers: Dict[tuple[int, str], WorkflowStartBarrier] = {}
+        self._workflow_start_gates: Dict[tuple[int, str], asyncio.Event] = {}
 
     async def start_server(
         self,
@@ -384,6 +396,11 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         Status updates are pushed to the WorkflowCompletionState queue
         and completion is signaled via the completion_event.
 
+        Returns once the run has started: every node sets up, reports
+        ready, and waits, and the leader starts them together -- or, past
+        the workflow's timeout, starts those ready so far and each later
+        one as it reports (see ``_release_workflow_start``).
+
         Args:
             run_id: The run identifier
             workflow: The workflow to submit
@@ -453,21 +470,120 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 workflow.name,
             )
 
-            # If explicit node_ids provided, target specific nodes
-            # Otherwise fall back to round-robin (for backward compatibility)
-            results = await asyncio.gather(
+            # Registered before the first submission: a node can finish
+            # setting up before the last submission has been answered.
+            start_barrier = WorkflowStartBarrier(set(node_ids))
+            self._workflow_start_barriers[(run_id, workflow.name)] = start_barrier
+
+            try:
+                # If explicit node_ids provided, target specific nodes
+                # Otherwise fall back to round-robin (for backward compatibility)
+                results = await asyncio.gather(
+                    *[
+                        self.submit(
+                            run_id,
+                            workflow,
+                            workflow_vus[idx],
+                            node_id,
+                            context,
+                        )
+                        for idx, node_id in enumerate(node_ids)
+                    ]
+                )
+
+                await self._release_workflow_start(
+                    run_id,
+                    workflow.name,
+                    start_barrier,
+                    TimeParser(workflow.timeout).time,
+                )
+
+            finally:
+                self._remove_workflow_start_barrier(
+                    run_id,
+                    workflow.name,
+                    start_barrier,
+                )
+
+            return results
+
+    async def _release_workflow_start(
+        self,
+        run_id: int,
+        workflow_name: str,
+        start_barrier: WorkflowStartBarrier,
+        setup_timeout: float,
+    ) -> None:
+        """
+        Wait until every node the run was submitted to has set up -- or
+        has already finished, as a node whose setup failed has -- then
+        start the ready nodes together. Waits at most ``setup_timeout``,
+        the workflow's timeout: past it, the nodes ready so far start, and
+        each later one starts as soon as it reports ready.
+        """
+        async with self._logger.context(
+            name=f"workflow_run_{run_id}",
+        ) as ctx:
+            try:
+                await asyncio.wait_for(
+                    start_barrier.all_reported.wait(),
+                    timeout=setup_timeout,
+                )
+
+            except asyncio.TimeoutError:
+                await ctx.log_prepared(
+                    message=(
+                        f"Workflow {workflow_name} run {run_id} starting {len(start_barrier.ready_nodes)} of "
+                        f"{len(start_barrier.expected_nodes)} nodes after its {setup_timeout}s setup timeout; "
+                        "the rest start as they report ready"
+                    ),
+                    name="error",
+                )
+
+            # Removed before releasing: a node reporting ready from here on
+            # is answered released and starts at once, so none is missed
+            # between this snapshot and the releases below.
+            self._remove_workflow_start_barrier(run_id, workflow_name, start_barrier)
+
+            # Sorted for a deterministic release order (SIM replay).
+            ready_nodes = sorted(start_barrier.ready_nodes)
+
+            releases = await asyncio.gather(
                 *[
-                    self.submit(
-                        run_id,
-                        workflow,
-                        workflow_vus[idx],
-                        node_id,
-                        context,
-                    )
-                    for idx, node_id in enumerate(node_ids)
+                    self.request_workflow_release(run_id, workflow_name, node_id)
+                    for node_id in ready_nodes
                 ]
             )
-            return results
+
+            for node_id, (_, reply) in zip(ready_nodes, releases):
+                if not isinstance(reply, JobContext):
+                    await ctx.log_prepared(
+                        message=(
+                            f"Workflow {workflow_name} run {run_id} could not release Node {node_id} "
+                            f"({reply.error if isinstance(reply, Message) else 'no reply'}); "
+                            "it starts once its own wait expires"
+                        ),
+                        name="error",
+                    )
+
+            await ctx.log_prepared(
+                message=(
+                    f"Workflow {workflow_name} run {run_id} released {len(ready_nodes)} of "
+                    f"{len(start_barrier.expected_nodes)} nodes"
+                ),
+                name="info",
+            )
+
+    def _remove_workflow_start_barrier(
+        self,
+        run_id: int,
+        workflow_name: str,
+        start_barrier: WorkflowStartBarrier,
+    ) -> None:
+        # Only this run's barrier, never one registered after it.
+        barrier_key = (run_id, workflow_name)
+        if self._workflow_start_barriers.get(barrier_key) is start_barrier:
+            del self._workflow_start_barriers[barrier_key]
 
     async def submit_workflow_throttle(
         self,
@@ -960,6 +1076,13 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             self._completions[run_id][workflow_name].add(node_id)
 
+            # A node that finishes before reporting ready -- its setup
+            # failed -- no longer holds back the run's start.
+            if (
+                start_barrier := self._workflow_start_barriers.get((run_id, workflow_name))
+            ) is not None:
+                start_barrier.mark_finished(node_id)
+
             await ctx.log_prepared(
                 message=f"Node {self._node_id_base} at {self.host}:{self.port} successfull registered completion for Workflow {workflow_name} run {run_id} from Node {node_id}",
                 name="info",
@@ -1153,6 +1276,159 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             )
         return JobContext(data=update, run_id=run_id)
 
+    @send()
+    async def acknowledge_workflow_ready(
+        self,
+        leader_node_id: int,
+        run_id: int,
+        workflow_name: str,
+    ) -> Response[JobContext[WorkflowRelease]]:
+        return await self.send(
+            "receive_workflow_ready",
+            JobContext(
+                data=WorkflowReady(workflow_name),
+                run_id=run_id,
+            ),
+            node_id=leader_node_id,
+        )
+
+    @send()
+    async def request_workflow_release(
+        self,
+        run_id: int,
+        workflow_name: str,
+        node_id: int,
+    ) -> Response[JobContext[ReceivedReceipt]]:
+        return await self.send(
+            "release_workflow",
+            JobContext(
+                data=WorkflowRelease(workflow_name, released=True),
+                run_id=run_id,
+            ),
+            node_id=node_id,
+        )
+
+    @receive()
+    async def receive_workflow_ready(
+        self,
+        shard_id: int,
+        ready: JobContext[WorkflowReady],
+    ) -> JobContext[WorkflowRelease]:
+        """
+        A node finished setting up its run of the workflow and waits to
+        start. Recorded on the run's start barrier; when the run has none
+        -- already released, or submitted without one -- the answer
+        releases the node at once.
+        """
+        run_id = ready.run_id
+        workflow_name = ready.data.workflow_name
+
+        start_barrier = self._workflow_start_barriers.get((run_id, workflow_name))
+        if start_barrier is not None:
+            start_barrier.mark_ready(ready.node_id)
+
+        return JobContext(
+            data=WorkflowRelease(
+                workflow_name,
+                released=start_barrier is None,
+            ),
+            run_id=run_id,
+        )
+
+    @receive()
+    async def release_workflow(
+        self,
+        shard_id: int,
+        release: JobContext[WorkflowRelease],
+    ) -> JobContext[ReceivedReceipt]:
+        """
+        Start this node's run of the workflow, waiting at its start gate.
+        A release for a run no longer waiting -- started, finished,
+        cancelled, or a retried release -- changes nothing.
+        """
+        run_id = release.run_id
+        workflow_name = release.data.workflow_name
+
+        self._open_workflow_start_gate(run_id, workflow_name)
+
+        return JobContext(
+            data=ReceivedReceipt(
+                workflow_name,
+                release.node_id,
+            ),
+            run_id=run_id,
+        )
+
+    def _open_workflow_start_gate(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ) -> None:
+        if (start_gate := self._workflow_start_gates.get((run_id, workflow_name))) is not None:
+            start_gate.set()
+
+    async def _await_workflow_release(
+        self,
+        leader_node_id: int,
+        run_id: int,
+        workflow_name: str,
+        release_timeout: float,
+    ) -> None:
+        """
+        This node's start gate for its run of the workflow: report the run
+        set up to the leader, then wait for the leader to start every
+        node's run together. Starts at once when the leader answers that
+        the run is already released. Waits at most ``release_timeout`` --
+        the workflow's timeout, which also bounds the leader's wait -- for
+        a release that never arrives: past it the run starts unreleased
+        rather than never.
+        """
+        gate_key = (run_id, workflow_name)
+        start_gate = asyncio.Event()
+        self._workflow_start_gates[gate_key] = start_gate
+
+        async with self._logger.context(
+            name=f"workflow_run_{run_id}",
+        ) as ctx:
+            try:
+                _, reply = await self.acknowledge_workflow_ready(
+                    leader_node_id,
+                    run_id,
+                    workflow_name,
+                )
+
+                if isinstance(reply, JobContext) and reply.data.released:
+                    return
+
+                if not isinstance(reply, JobContext):
+                    await ctx.log_prepared(
+                        message=(
+                            f"Workflow {workflow_name} run {run_id} on Node {self._node_id_base} could not "
+                            f"report ready to Node {leader_node_id} "
+                            f"({reply.error if isinstance(reply, Message) else 'no reply'}); waiting for its release"
+                        ),
+                        name="error",
+                    )
+
+                await asyncio.wait_for(
+                    start_gate.wait(),
+                    timeout=release_timeout,
+                )
+
+            except asyncio.TimeoutError:
+                await ctx.log_prepared(
+                    message=(
+                        f"Workflow {workflow_name} run {run_id} on Node {self._node_id_base} received no "
+                        f"release from Node {leader_node_id} within {release_timeout}s and is starting without one"
+                    ),
+                    name="error",
+                )
+
+            finally:
+                # Only this run's gate: a replacing run may have registered its own.
+                if self._workflow_start_gates.get(gate_key) is start_gate:
+                    del self._workflow_start_gates[gate_key]
+
     @receive()
     async def cancel_workflow(
         self,
@@ -1261,14 +1537,13 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         shard_id: int,
         stop_signal: JobContext[WorkflowStopSignal]
     ) -> JobContext[WorkflowStopSignal]:
+        # Use full 64-bit node_id from JobContext instead of 10-bit snowflake instance
+        node_id = stop_signal.node_id
+
+        run_id = stop_signal.run_id
+        workflow_name = stop_signal.data.workflow
+
         try:
-
-            # Use full 64-bit node_id from JobContext instead of 10-bit snowflake instance
-            node_id = stop_signal.node_id
-
-            run_id = stop_signal.run_id
-            workflow_name = stop_signal.data.workflow
-
             # Remove node from expected set and check for completion
             expected_nodes = self._stop_expected_nodes[run_id][workflow_name]
             expected_nodes.discard(node_id)
@@ -1281,24 +1556,27 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
                     await update_workflow_executions_total_rate(workflow_slug, None, False)
 
-
-
-            return JobContext(
-                data=WorkflowStopSignal(
-                    workflow_name=workflow_name,
-                    node_id=node_id,
-                ),
-                run_id=run_id,
-            )
-
         except Exception as err:
-            return JobContext(
-                data=WorkflowStopSignal(
-                    workflow_name=workflow_name,
-                    node_id=node_id,
-                ),
-                run_id=run_id,
-            )
+            async with self._logger.context(
+                name=f"workflow_run_{run_id}",
+            ) as ctx:
+                await ctx.log_prepared(
+                    message=(
+                        f"Node {self._node_id_base} at {self.host}:{self.port} failed to record the stop of "
+                        f"Workflow {workflow_name} run {run_id} on Node {node_id}: {err}"
+                    ),
+                    name="error",
+                )
+
+        # Always answered: a handler that raises sends no reply, and the
+        # stopping node retries until its send times out.
+        return JobContext(
+            data=WorkflowStopSignal(
+                workflow=workflow_name,
+                node_id=node_id,
+            ),
+            run_id=run_id,
+        )
 
     @receive()
     async def receive_status_update(
@@ -1397,6 +1675,13 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     job.workflow,
                     job.context,
                     job.vus,
+                    await_start=functools.partial(
+                        self._await_workflow_release,
+                        node_id,
+                        run_id,
+                        job.workflow.name,
+                        TimeParser(job.workflow.timeout).time,
+                    ),
                 )
 
                 if context is None:
@@ -1477,6 +1762,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         try:
 
             self._workflows.request_cancellation()
+            # A run still waiting at its start gate would hold the
+            # cancellation until its release: open the gate so it starts
+            # with cancellation already requested and winds down at once.
+            self._open_workflow_start_gate(run_id, workflow_name)
             try:
                 await asyncio.wait_for(
                     self._workflows.await_cancellation(),

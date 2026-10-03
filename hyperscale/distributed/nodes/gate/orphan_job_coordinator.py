@@ -30,10 +30,9 @@ from hyperscale.logging.hyperscale_logging_models import (
 
 from .state import GateRuntimeState
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock
 
 
-_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
@@ -71,6 +70,7 @@ class GateOrphanJobCoordinator:
     CALLBACK_PUSH_MAX_DELAY_SECONDS: float = 2.0
 
     __slots__ = (
+        "_clock",
         "_state",
         "_finalize_failed_job",
         "_logger",
@@ -110,6 +110,7 @@ class GateOrphanJobCoordinator:
         get_node_addr: Callable[[], tuple[str, int]],
         send_tcp: Callable[[tuple[str, int], str, bytes, float], Awaitable[bytes]],
         get_active_peers: Callable[[], set[tuple[str, int]]],
+        clock: Clock,
         forward_status_push_to_peers: Callable[[str, bytes], Awaitable[bool]]
         | None = None,
         state_repair_callback: Callable[[str], Awaitable[bool]] | None = None,
@@ -147,6 +148,7 @@ class GateOrphanJobCoordinator:
             takeover_jitter_min_seconds: Minimum random jitter before takeover
             takeover_jitter_max_seconds: Maximum random jitter before takeover
         """
+        self._clock: Clock = clock
         self._state = state
         self._finalize_failed_job = finalize_failed_job
         self._logger = logger
@@ -235,7 +237,7 @@ class GateOrphanJobCoordinator:
             failed_gate_addr
         )
 
-        now = _DEFAULT_CLOCK.monotonic()
+        now = self._clock.monotonic()
         for job_id in orphaned_job_ids:
             self._state.mark_job_orphaned(job_id, now)
 
@@ -308,7 +310,7 @@ class GateOrphanJobCoordinator:
         if owner_node == self._get_node_id().full:
             return
 
-        now = _DEFAULT_CLOCK.monotonic()
+        now = self._clock.monotonic()
         if not self._state.is_job_orphaned(job_id):
             self._state.mark_job_orphaned(job_id, now)
 
@@ -347,7 +349,7 @@ class GateOrphanJobCoordinator:
                         self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
                         self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
                     )
-                    await _DEFAULT_CLOCK.sleep(delay)
+                    await self._clock.sleep(delay)
 
         if allow_peer_forwarding and self._forward_status_push_to_peers:
             try:
@@ -382,7 +384,7 @@ class GateOrphanJobCoordinator:
         """
         while self._running:
             try:
-                await _DEFAULT_CLOCK.sleep(self._orphan_check_interval_seconds)
+                await self._clock.sleep(self._orphan_check_interval_seconds)
 
                 if not self._running:
                     break
@@ -391,7 +393,7 @@ class GateOrphanJobCoordinator:
                 if not orphaned_jobs:
                     continue
 
-                now = _DEFAULT_CLOCK.monotonic()
+                now = self._clock.monotonic()
                 jobs_to_evaluate: list[tuple[str, float]] = []
 
                 for job_id, orphaned_at in orphaned_jobs.items():
@@ -453,7 +455,7 @@ class GateOrphanJobCoordinator:
             job = await self._get_or_repair_job(job_id)
 
             if not job:
-                time_orphaned = _DEFAULT_CLOCK.monotonic() - orphaned_at
+                time_orphaned = self._clock.monotonic() - orphaned_at
                 if time_orphaned >= self._orphan_timeout_seconds:
                     self._clear_orphaned_job(job_id)
                 return
@@ -462,7 +464,7 @@ class GateOrphanJobCoordinator:
             self._clear_orphaned_job(job_id)
             return
 
-        time_orphaned = _DEFAULT_CLOCK.monotonic() - orphaned_at
+        time_orphaned = self._clock.monotonic() - orphaned_at
         if time_orphaned >= self._orphan_timeout_seconds:
             await self._fail_orphaned_job(job_id, job, time_orphaned)
             return
@@ -504,7 +506,7 @@ class GateOrphanJobCoordinator:
         """Fail an orphaned job that exceeded the takeover timeout."""
         job.status = JobStatus.FAILED.value
         if job.timestamp > 0:
-            job.elapsed_seconds = _DEFAULT_CLOCK.monotonic() - job.timestamp
+            job.elapsed_seconds = self._clock.monotonic() - job.timestamp
         self._job_manager.set_job(job_id, job)
         self._clear_orphaned_job(job_id)
         await self._finalize_failed_job(
@@ -728,7 +730,7 @@ class GateOrphanJobCoordinator:
             Dict with orphan counts and timing information
         """
         orphaned_jobs = self._state.get_orphaned_jobs()
-        now = _DEFAULT_CLOCK.monotonic()
+        now = self._clock.monotonic()
 
         past_grace_period = sum(
             1

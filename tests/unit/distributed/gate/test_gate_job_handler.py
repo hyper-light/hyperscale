@@ -17,6 +17,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from enum import Enum
 
+from hyperscale.distributed.runtime import RealClock
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.gate.handlers.tcp_job import GateJobHandler
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 from hyperscale.distributed.models import (
@@ -25,6 +27,9 @@ from hyperscale.distributed.models import (
     JobProgress,
     GlobalJobStatus,
 )
+
+# The gate's configured TCP timeouts, as a default Env gives them.
+GATE_SETTINGS = Env()
 
 
 # =============================================================================
@@ -238,6 +243,8 @@ def create_mock_handler(
         return (rate_limit_allowed, rate_limit_retry)
 
     return GateJobHandler(
+        clock=RealClock(),
+        client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         state=state,
         logger=MockLogger(),
         task_runner=MockTaskRunner(),
@@ -308,6 +315,8 @@ class TestHandleSubmissionHappyPath:
         """Submission records job in manager."""
         job_manager = MockGateJobManager()
         handler = GateJobHandler(
+            clock=RealClock(),
+            client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
             state=GateRuntimeState(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -368,6 +377,8 @@ class TestHandleSubmissionHappyPath:
         """Submission sets target datacenters."""
         job_manager = MockGateJobManager()
         handler = GateJobHandler(
+            clock=RealClock(),
+            client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
             state=GateRuntimeState(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -463,6 +474,8 @@ class TestHandleSubmissionRateLimiting:
             return (True, 0.0)
 
         handler = GateJobHandler(
+            clock=RealClock(),
+            client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
             state=GateRuntimeState(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -767,6 +780,8 @@ class TestHandleProgressHappyPath:
         )
 
         handler = GateJobHandler(
+            clock=RealClock(),
+            client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -839,6 +854,8 @@ class TestHandleProgressFencingTokens:
         job_manager.set_fence_token("job-123", 10)
 
         handler = GateJobHandler(
+            clock=RealClock(),
+            client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -907,6 +924,8 @@ class TestHandleProgressFencingTokens:
         job_manager.set_fence_token("job-123", 5)
 
         handler = GateJobHandler(
+            clock=RealClock(),
+            client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -1187,6 +1206,8 @@ class TestFailureModes:
         broadcast_mock = AsyncMock(side_effect=Exception("Broadcast failed"))
 
         handler = GateJobHandler(
+            clock=RealClock(),
+            client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
             state=GateRuntimeState(),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),

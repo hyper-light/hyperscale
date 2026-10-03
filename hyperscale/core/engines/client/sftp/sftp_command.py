@@ -206,7 +206,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -231,7 +231,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -326,7 +326,7 @@ class SFTPCommand:
                     bool(pflags & FXF_APPEND),
                     None,
                     'strict',
-                    0,
+                    -1,
                     -1,
                 )
 
@@ -350,7 +350,7 @@ class SFTPCommand:
                     ),
                     None,
                     'strict',
-                    0,
+                    -1,
                     -1,
                 )
 
@@ -474,7 +474,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -499,7 +499,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -522,7 +522,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -546,7 +546,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -657,7 +657,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -682,7 +682,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -787,7 +787,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -811,7 +811,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -932,7 +932,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -957,7 +957,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -979,7 +979,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -1003,7 +1003,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 

@@ -142,6 +142,7 @@ class FTPConnection:
 
     async def connect_to_any(
         self,
+        target: str,
         hostname: str,
         addresses: Sequence[Tuple[str | Tuple[str, int], SocketConfig]],
         address_rotation: Iterator[int],
@@ -149,7 +150,8 @@ class FTPConnection:
         timeout: int | None = None,
     ) -> Tuple[str | Tuple[str, int] | None, Optional[SocketConfig], bool]:
         """
-        Reuse this connection's cached transport for ``hostname``. Otherwise
+        Reuse this connection's cached transport for ``target``, the
+        address the request names (``hostname`` is the TLS server name). Otherwise
         open a new one, racing the host's ``addresses`` (RFC 8305) from the
         next offset in ``address_rotation`` so a pool's connections spread
         across all of them.
@@ -157,9 +159,14 @@ class FTPConnection:
         Returns the address and socket config of a new transport (``None``
         for both on reuse), and whether the transport is new.
         """
-        if (cached := self._reader_and_writer.get(hostname)) is not None:
+        if (cached := self._reader_and_writer.get(target)) is not None:
             self.reader, self.writer = cached
             return None, None, False
+
+        if self._reader_and_writer:
+            # Open to another address: its session (login, TLS, TYPE) and
+            # transport belong to that server, so close them first.
+            self.reset()
 
         if not addresses:
             raise ConnectionError(f"No addresses to connect to for {hostname}")
@@ -179,7 +186,7 @@ class FTPConnection:
         self.reader = reader
         self.writer = writer
 
-        self._reader_and_writer[hostname] = (reader, writer)
+        self._reader_and_writer[target] = (reader, writer)
 
         self.address_info = socket_config
         self.port = port

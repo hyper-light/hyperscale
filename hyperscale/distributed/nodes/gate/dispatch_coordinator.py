@@ -36,10 +36,9 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerError,
 )
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock
 
 
-_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
@@ -88,11 +87,13 @@ class GateDispatchCoordinator:
         get_node_host: Callable[[], str],
         get_node_port: Callable[[], int],
         get_node_id_short: Callable[[], str],
+        manager_dispatch_timeout_seconds: float,
+        client_push_timeout_seconds: float,
+        clock: Clock,
         capacity_aggregator: DatacenterCapacityAggregator | None = None,
         spillover_evaluator: SpilloverEvaluator | None = None,
         observed_latency_tracker: "ObservedLatencyTracker | None" = None,
         record_dispatch_failure: Callable[[str, str], None] | None = None,
-        manager_dispatch_timeout_seconds: float = 5.0,
         persist_accepted_job=None,
         *,
         manager_selector: DatacenterManagerSelector,
@@ -101,6 +102,7 @@ class GateDispatchCoordinator:
     ) -> None:
         # Told which datacenters actually accepted a job (AD-44 best-effort
         # tracking starts from exactly those).
+        self._clock: Clock = clock
         self._on_job_dispatched = on_job_dispatched
         # Every terminal transition goes through the gate's terminal hook:
         # the AD-38 terminal record (these two FAILED paths never wrote
@@ -133,6 +135,7 @@ class GateDispatchCoordinator:
             [str, int, tuple[str, int] | None], Awaitable[None]
         ] = broadcast_leadership
         self._send_tcp: Callable = send_tcp
+        self._client_push_timeout_seconds: float = client_push_timeout_seconds
         self._increment_version: Callable = increment_version
         self._confirm_manager_for_dc: Callable = confirm_manager_for_dc
         self._suspect_manager_for_dc: Callable = suspect_manager_for_dc
@@ -190,7 +193,7 @@ class GateDispatchCoordinator:
         overall_rate = 0.0
         if job is not None:
             if job.timestamp > 0:
-                elapsed_seconds = max(0.0, _DEFAULT_CLOCK.monotonic() - job.timestamp)
+                elapsed_seconds = max(0.0, self._clock.monotonic() - job.timestamp)
             total_completed = job.total_completed
             total_failed = job.total_failed
             overall_rate = job.overall_rate
@@ -212,6 +215,7 @@ class GateDispatchCoordinator:
             job_id,
             "job_status_push",
             payload,
+            self._clock.monotonic(),
         )
 
         try:
@@ -219,7 +223,7 @@ class GateDispatchCoordinator:
                 callback,
                 "job_status_push",
                 payload,
-                timeout=5.0,
+                timeout=self._client_push_timeout_seconds,
             )
             if isinstance(response, Exception):
                 raise response
@@ -553,7 +557,7 @@ class GateDispatchCoordinator:
         )
 
         for manager_addr in managers:
-            dispatch_started = _DEFAULT_CLOCK.monotonic()
+            dispatch_started = self._clock.monotonic()
             success, error = await self._try_dispatch_to_manager(
                 manager_addr, submission
             )
@@ -563,7 +567,7 @@ class GateDispatchCoordinator:
                 self._manager_selector.record_success(
                     datacenter,
                     manager_addr,
-                    (_DEFAULT_CLOCK.monotonic() - dispatch_started) * 1000.0,
+                    (self._clock.monotonic() - dispatch_started) * 1000.0,
                 )
                 self._task_runner.run(
                     self._confirm_manager_for_dc, datacenter, manager_addr

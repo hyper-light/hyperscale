@@ -51,10 +51,9 @@ from hyperscale.logging.hyperscale_logging_models import (
 
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock
 
 
-_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId, ErrorStats
@@ -106,6 +105,8 @@ class GateJobHandler:
         record_request_latency: Callable[[float], None],
         record_dc_job_stats: Callable,
         handle_update_by_tier: Callable,
+        client_push_timeout_seconds: float,
+        clock: Clock,
         replication_coordinator: "GateJobReplicationCoordinator | None" = None,
         get_active_peer_addrs: Callable[[], list[tuple[str, int]]] | None = None,
     ) -> None:
@@ -140,6 +141,7 @@ class GateJobHandler:
             record_dc_job_stats: Callback to record DC stats
             handle_update_by_tier: Callback for tiered update handling
         """
+        self._clock: Clock = clock
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
         self._task_runner: "TaskRunner" = task_runner
@@ -149,6 +151,7 @@ class GateJobHandler:
         self._load_shedder: "LoadShedder" = load_shedder
         self._job_lease_manager: JobLeaseManager = job_lease_manager
         self._send_tcp: Callable = send_tcp
+        self._client_push_timeout_seconds: float = client_push_timeout_seconds
         self._idempotency_cache: GateIdempotencyCache[bytes] | None = idempotency_cache
         self._get_node_id: Callable[[], "NodeId"] = get_node_id
         self._get_host: Callable[[], str] = get_host
@@ -261,7 +264,7 @@ class GateJobHandler:
 
         try:
             while True:
-                await _DEFAULT_CLOCK.sleep(renewal_interval)
+                await self._clock.sleep(renewal_interval)
                 job = self._job_manager.get_job(job_id)
                 if job is None or self._is_terminal_status(job.status):
                     await self._release_job_lease(job_id, cancel_renewal=False)
@@ -518,7 +521,7 @@ class GateJobHandler:
                 target_dcs=list(target_dcs),
                 target_dc_count=len(target_dcs),
                 status_seed=JobStatus.SUBMITTED.value,
-                submitted_at=_DEFAULT_CLOCK.monotonic(),
+                submitted_at=self._clock.monotonic(),
                 workflow_ids=list(workflow_ids),
                 submission_payload=data,
             )
@@ -658,7 +661,7 @@ class GateJobHandler:
         Returns:
             Serialized GlobalJobStatus or empty bytes
         """
-        start_time = _DEFAULT_CLOCK.monotonic()
+        start_time = self._clock.monotonic()
         try:
             client_id = f"{addr[0]}:{addr[1]}"
             allowed, retry_after = await self._check_rate_limit(client_id, "job_status")
@@ -686,7 +689,7 @@ class GateJobHandler:
             )
             return b""
         finally:
-            latency_ms = (_DEFAULT_CLOCK.monotonic() - start_time) * 1000
+            latency_ms = (self._clock.monotonic() - start_time) * 1000
             self._record_request_latency(latency_ms)
 
     async def handle_progress(
@@ -708,7 +711,7 @@ class GateJobHandler:
         Returns:
             Serialized JobProgressAck
         """
-        start_time = _DEFAULT_CLOCK.monotonic()
+        start_time = self._clock.monotonic()
         try:
             if self._load_shedder.should_shed_handler("receive_job_progress"):
                 return JobProgressAck(
@@ -791,7 +794,7 @@ class GateJobHandler:
                 job.total_completed = sum(p.total_completed for p in job.datacenters)
                 job.total_failed = sum(p.total_failed for p in job.datacenters)
                 job.overall_rate = sum(p.overall_rate for p in job.datacenters)
-                job.timestamp = _DEFAULT_CLOCK.monotonic()
+                job.timestamp = self._clock.monotonic()
 
                 target_dcs = self._job_manager.get_target_dcs(progress.job_id)
                 target_dc_count = (
@@ -914,7 +917,7 @@ class GateJobHandler:
             )
             return b"error"
         finally:
-            latency_ms = (_DEFAULT_CLOCK.monotonic() - start_time) * 1000
+            latency_ms = (self._clock.monotonic() - start_time) * 1000
             self._record_request_latency(latency_ms)
 
     async def handle_job_leader_gate_transfer(
@@ -1027,7 +1030,7 @@ class GateJobHandler:
                         callback_addr,
                         "receive_gate_job_leader_transfer",
                         notification.dump(),
-                        timeout=5.0,
+                        timeout=self._client_push_timeout_seconds,
                     )
                 except Exception as error:
                     await self._logger.log(

@@ -14,6 +14,7 @@ import inspect
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.gate.handlers.tcp_cancellation import (
     GateCancellationHandler,
 )
@@ -29,6 +30,9 @@ from hyperscale.distributed.models import (
     JobStatus,
     SingleWorkflowCancelRequest,
 )
+
+# The gate's configured TCP timeouts, as a default Env gives them.
+GATE_SETTINGS = Env()
 
 
 # =============================================================================
@@ -133,6 +137,8 @@ def create_mock_handler(
         return (rate_limit_allowed, rate_limit_retry)
 
     return GateCancellationHandler(
+        client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_SHORT,
+        manager_request_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         state=state,
         logger=MockLogger(),
         task_runner=MockTaskRunner(),
@@ -434,6 +440,8 @@ class TestHandleCancelJobFailureModes:
 
         state = GateRuntimeState()
         handler = GateCancellationHandler(
+            client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_SHORT,
+            manager_request_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
             state=state,
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
@@ -784,6 +792,8 @@ async def test_a_cancel_reaches_exactly_the_jobs_datacenters() -> None:
         return (True, 0)
 
     handler = GateCancellationHandler(
+        client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_SHORT,
+        manager_request_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         state=GateRuntimeState(),
         logger=MockLogger(),
         task_runner=MockTaskRunner(),

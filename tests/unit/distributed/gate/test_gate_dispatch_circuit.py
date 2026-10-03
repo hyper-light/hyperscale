@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.gate.datacenter_manager_selector import DatacenterManagerSelector
@@ -29,6 +30,10 @@ from hyperscale.distributed.health.circuit_breaker_manager import CircuitBreaker
 from hyperscale.distributed.models import JobAck, JobSubmission
 from hyperscale.distributed.nodes.gate.dispatch_coordinator import GateDispatchCoordinator
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
+
+# The gate's configured TCP timeouts, as a default Env gives them.
+GATE_SETTINGS = Env()
+
 
 def make_manager_selector(state: GateRuntimeState) -> DatacenterManagerSelector:
     """A real AD-28 selector reading the test's runtime state."""
@@ -144,6 +149,9 @@ RETRIES_PER_ROUND = 2
 def make_coordinator(send_tcp: AsyncMock, breakers: CircuitBreakerManager) -> GateDispatchCoordinator:
     state = GateRuntimeState()
     return GateDispatchCoordinator(
+        clock=RealClock(),
+        manager_dispatch_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
+        client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         state=state,
         manager_selector=make_manager_selector(state),
         finalize_failed_job=AsyncMock(),

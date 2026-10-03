@@ -401,17 +401,17 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
                     result = False
 
                 if result is not None:
-                    self._report_response(result)
+                    self._send_response(result)
 
-                if self._request_queue and self._request_queue[0] is head:
+                elif self._request_queue and self._request_queue[0] is head:
                     # Its handler answers later, through _report_response.
                     return
 
         finally:
             self._servicing_requests = False
 
-    def _report_response(self, result: bool) -> None:
-        """Report back the response to a previously issued channel request"""
+    def _send_response(self, result: bool) -> None:
+        """Send back the response to the oldest queued channel request"""
 
         request, _, want_reply = self._request_queue.pop(0)
 
@@ -426,8 +426,15 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
             self._session.session_started()
             self.resume_reading()
 
-        # An answer given while the queue is being serviced lets that loop
-        # go on; one given later restarts it.
+    def _report_response(self, result: bool) -> None:
+        """Report back the response to a previously issued channel request
+           that its handler answered later, then process the requests
+           queued behind it"""
+
+        self._send_response(result)
+
+        # An answer given while the queue is being serviced leaves the
+        # rest to that loop.
         if self._request_queue and not self._servicing_requests:
             self._service_next_request()
 

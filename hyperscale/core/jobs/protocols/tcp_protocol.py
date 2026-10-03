@@ -482,12 +482,7 @@ class TCPProtocol(Generic[T, K]):
                 self._client_transports[address] = client_transport
 
                 result: Tuple[int, Message[None]] = await asyncio.wait_for(
-                    self.send(
-                        None,
-                        None,
-                        target_address=address,
-                        request_type="connect",
-                    ),
+                    self._request_connect(client_transport),
                     timeout=attempt_timeout,
                 )
 
@@ -610,6 +605,54 @@ class TCPProtocol(Generic[T, K]):
                 for node in self.nodes
             ]
         )
+
+    async def _request_connect(
+        self,
+        client_transport: asyncio.Transport,
+    ) -> Tuple[int, Message[None]]:
+        """
+        Send the connect request over a new client transport, and wait
+        for the peer's answer. Unlike send(), this never reconnects:
+        when it raises, connect_client() retries the whole connection.
+        """
+        self._last_call.append(None)
+
+        item = cloudpickle.dumps(
+            (
+                "connect",
+                self.id_generator.generate(),
+                Message(
+                    self.node_id,
+                    None,
+                    data=None,
+                    service_host=self.host,
+                    service_port=self.port,
+                ),
+            ),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+        encrypted_message = self._encryptor.encrypt(item)
+        compressed = self._compressor.compress(encrypted_message)
+
+        client_transport.write(compressed)
+
+        waiter = self._loop.create_future()
+        self._waiters[None].append(waiter)
+
+        try:
+            (_, shard_id, response) = await asyncio.wait_for(
+                waiter,
+                timeout=self._request_timeout,
+            )
+
+        finally:
+            # Only an answer removes a waiter, so one that timed out
+            # would otherwise stay queued for good.
+            if waiter in self._waiters[None]:
+                self._waiters[None].remove(waiter)
+
+        return (shard_id, response)
 
     async def send(
         self,

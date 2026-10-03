@@ -168,6 +168,9 @@ if TYPE_CHECKING:
 _ClientFactory = Callable[[], SSHClient]
 _ProtocolFactory = _ClientFactory
 
+# The arguments of an empty ignore packet.
+_IGNORE_ARGS = (String(b''),)
+
 _Conn = TypeVar('_Conn', bound='SSHConnection')
 _Options = TypeVar('_Options', bound='SSHConnectionOptions')
 
@@ -394,9 +397,8 @@ async def open_tunnel(tunnels: object, options: _Options,
                 port = ()
 
             last_conn = conn
-            conn = await connect(host, port, username=username,
-                                 passphrase=options.passphrase, tunnel=conn,
-                                 config=config)
+            conn = await _connect_tunnel_hop(host, port, username,
+                                             options.passphrase, conn, config)
             conn.set_tunnel(last_conn)
 
             if options.canonicalize_hostname != 'always':
@@ -407,11 +409,65 @@ async def open_tunnel(tunnels: object, options: _Options,
         return None
 
 
+async def _connect_tunnel_hop(host: str, port: DefTuple[int],
+                              username: DefTuple[str],
+                              passphrase: Optional[BytesOrStr],
+                              tunnel: Optional['SSHClientConnection'],
+                              config: DefTuple[ConfigPaths]) -> \
+        'SSHClientConnection':
+    """Make the SSH connection for one hop of a tunnel
+
+       This connects the way connect() does, over the hop before it. A
+       hop's tunnel is that connection, or none for the first hop, so
+       there is never another tunnel to open for it.
+
+    """
+
+    def conn_factory() -> SSHClientConnection:
+        """Return an SSH client connection factory"""
+
+        return SSHClientConnection(loop, hop_options, wait='auth')
+
+    loop = asyncio.get_event_loop()
+
+    hop_options: SSHClientConnectionOptions = await SSHClientConnectionOptions.construct(
+        None, config=config, host=host, port=port, tunnel=tunnel,
+        family=(), local_addr=(), username=username, passphrase=passphrase)
+
+    return await asyncio.wait_for(
+        _connect_tunnel_hop_with_options(hop_options, loop, conn_factory),
+        timeout=hop_options.connect_timeout)
+
+
+async def _connect_tunnel_hop_with_options(
+        options: 'SSHClientConnectionOptions',
+        loop: asyncio.AbstractEventLoop,
+        conn_factory: Callable[[], 'SSHClientConnection']) -> \
+        'SSHClientConnection':
+    """Make the outbound connection for one hop of a tunnel"""
+
+    await _prepare_connection(options, loop)
+
+    return await _open_connection(options, loop, 0, None, conn_factory, None)
+
+
 async def connect_with_options(options: _Options, config: DefTuple[ConfigPaths],
                    loop: asyncio.AbstractEventLoop, flags: int,
                    sock: Optional[socket.socket],
                    conn_factory: Callable[[], _Conn], msg: str) -> _Conn:
     """Make outbound TCP or SSH tunneled connection"""
+
+    await _prepare_connection(options, loop)
+
+    new_tunnel = await open_tunnel(options.tunnel, options, config)
+
+    return await _open_connection(options, loop, flags, sock, conn_factory,
+                                  new_tunnel)
+
+
+async def _prepare_connection(options: _Options,
+                              loop: asyncio.AbstractEventLoop) -> None:
+    """Create the waiter for a connection, and canonicalize its host"""
 
     options.waiter = loop.create_future()
 
@@ -424,6 +480,15 @@ async def connect_with_options(options: _Options, config: DefTuple[ConfigPaths],
     if canonical or final:
         options.update(host=host, reload=True, canonical=canonical, final=final)
 
+
+async def _open_connection(options: _Options,
+                           loop: asyncio.AbstractEventLoop, flags: int,
+                           sock: Optional[socket.socket],
+                           conn_factory: Callable[[], _Conn],
+                           new_tunnel: Optional['SSHClientConnection']) -> _Conn:
+    """Make an outbound TCP or SSH tunneled connection, once any tunnel
+       it names is open, and wait for it to be ready"""
+
     host = options.host
     port = options.port
     tunnel: TunnelConnectorProtocol = options.tunnel
@@ -431,8 +496,6 @@ async def connect_with_options(options: _Options, config: DefTuple[ConfigPaths],
     local_addr = options.local_addr
     proxy_command = options.proxy_command
     free_conn = True
-
-    new_tunnel = await open_tunnel(tunnel, options, config)
 
     try:
         if sock:
@@ -823,7 +886,10 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._owner: Optional[SSHClient] = None
         self._extra: Dict[str, object] = {}
 
+        # Received data not yet parsed starts at _inpbuf_offset: parsing
+        # advances the offset rather than re-slicing the buffer per packet.
         self._inpbuf = b''
+        self._inpbuf_offset = 0
         self._packet = b''
         self._pktlen = 0
         self._banner_lines = 0
@@ -1023,6 +1089,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._close_event.set()
 
         self._inpbuf = b''
+        self._inpbuf_offset = 0
 
         if self._tunnel:
             self._tunnel.close()
@@ -1331,7 +1398,12 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         # pylint: disable=unused-argument
 
-        self._inpbuf += data
+        if self._inpbuf_offset:
+            # One copy of the unparsed tail per receive.
+            self._inpbuf = self._inpbuf[self._inpbuf_offset:] + data
+            self._inpbuf_offset = 0
+        else:
+            self._inpbuf += data
 
         self._recv_data()
     # pylint: enable=arguments-differ
@@ -1433,7 +1505,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         # pylint: disable=broad-except
         try:
-            while self._inpbuf and self._recv_handler():
+            while len(self._inpbuf) > self._inpbuf_offset and self._recv_handler():
                 pass
         except DisconnectError as exc:
             self._send_disconnect(exc.code, exc.reason, exc.lang)
@@ -1444,18 +1516,19 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
     def _recv_version(self) -> bool:
         """Receive and parse the remote SSH version"""
 
-        idx = self._inpbuf.find(b'\n', 0, _MAX_BANNER_LINE_LEN)
+        offset = self._inpbuf_offset
+        idx = self._inpbuf.find(b'\n', offset, offset + _MAX_BANNER_LINE_LEN)
         if idx < 0:
-            if len(self._inpbuf) >= _MAX_BANNER_LINE_LEN:
+            if len(self._inpbuf) - offset >= _MAX_BANNER_LINE_LEN:
                 self._force_close(ProtocolError('Banner line too long'))
 
             return False
 
-        version = self._inpbuf[:idx]
+        version = self._inpbuf[offset:idx]
         if version.endswith(b'\r'):
             version = version[:-1]
 
-        self._inpbuf = self._inpbuf[idx+1:]
+        self._inpbuf_offset = idx + 1
 
         if version.startswith(b'SSH-2.0-' or version.startswith(b'SSH-1.99-')):
             if len(version) > _MAX_VERSION_LINE_LEN:
@@ -1485,11 +1558,14 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
     def _recv_pkthdr(self) -> bool:
         """Receive and parse an SSH packet header"""
 
-        if len(self._inpbuf) < self._recv_blocksize:
+        offset = self._inpbuf_offset
+        end = offset + self._recv_blocksize
+
+        if len(self._inpbuf) < end:
             return False
 
-        self._packet = self._inpbuf[:self._recv_blocksize]
-        self._inpbuf = self._inpbuf[self._recv_blocksize:]
+        self._packet = self._inpbuf[offset:end]
+        self._inpbuf_offset = end
 
         if self._recv_encryption:
             self._packet, pktlen = \
@@ -1505,13 +1581,15 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
     def _recv_packet(self) -> bool:
         """Receive the remainder of an SSH packet and process it"""
 
-        rem = 4 + self._pktlen + self._recv_macsize - self._recv_blocksize
-        if len(self._inpbuf) < rem:
+        offset = self._inpbuf_offset
+        end = offset + 4 + self._pktlen + self._recv_macsize - self._recv_blocksize
+        if len(self._inpbuf) < end:
             return False
 
         seq = self._recv_seq
-        rest = self._inpbuf[:rem-self._recv_macsize]
-        mac = self._inpbuf[rem-self._recv_macsize:rem]
+        mac_start = end - self._recv_macsize
+        rest = self._inpbuf[offset:mac_start]
+        mac = self._inpbuf[mac_start:end]
 
         if self._recv_encryption:
             packet_data = self._recv_encryption.decrypt_packet(
@@ -1522,7 +1600,13 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         else:
             packet_data = self._packet[4:] + rest
 
-        self._inpbuf = self._inpbuf[rem:]
+        if end == len(self._inpbuf):
+            # Drained: an idle connection keeps no received data.
+            self._inpbuf = b''
+            self._inpbuf_offset = 0
+        else:
+            self._inpbuf_offset = end
+
         self._packet = b''
 
         orig_payload = packet_data[1:-packet_data[0]]
@@ -1629,7 +1713,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         self._recv_handler = self._recv_pkthdr
 
-        if is_async and self._inpbuf:
+        if is_async and len(self._inpbuf) > self._inpbuf_offset:
             self._recv_data()
 
     def send_packet(self, pkttype: int, *args: bytes) -> None:
@@ -1651,17 +1735,24 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
             return
 
         # If we're encrypting and we have no data outstanding, insert an
-        # ignore packet into the stream. It is written directly: an ignore
-        # packet is never deferred, and the rekey check was just made.
+        # ignore packet into the stream. It is framed directly (an ignore
+        # packet is never deferred, and the rekey check was just made), and
+        # both packets go out in one write.
         if self._send_encryption and pkttype > MSG_KEX_LAST:
-            self._write_packet(MSG_IGNORE, (String(b''),))
-
-        self._write_packet(pkttype, args)
+            self._send(self._frame_packet(MSG_IGNORE, _IGNORE_ARGS) +
+                       self._frame_packet(pkttype, args))
+        else:
+            self._send(self._frame_packet(pkttype, args))
 
     def _write_packet(self, pkttype: int, args: Tuple[bytes, ...]) -> None:
         """Frame, encrypt, and send one SSH packet now"""
 
-        orig_payload = Byte(pkttype) + b''.join(args)
+        self._send(self._frame_packet(pkttype, args))
+
+    def _frame_packet(self, pkttype: int, args: Tuple[bytes, ...]) -> bytes:
+        """Frame and encrypt one SSH packet, advancing the send sequence"""
+
+        orig_payload = bytes((pkttype,)) + b''.join(args)
 
         if self._compressor and (self._auth_complete or
                                  not self._compress_after_auth):
@@ -1676,18 +1767,16 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         if padlen < 4:
             padlen += self._send_blocksize
 
-        packet = Byte(padlen) + payload + os.urandom(padlen)
+        packet = bytes((padlen,)) + payload + os.urandom(padlen)
         pktlen = len(packet)
-        hdr = UInt32(pktlen)
         seq = self._send_seq
 
         if self._send_encryption:
-            packet, mac = self._send_encryption.encrypt_packet(seq, hdr, packet)
+            packet, mac = self._send_encryption.encrypt_packet(
+                seq, pktlen.to_bytes(4, 'big'), packet)
+            framed = packet + mac
         else:
-            packet = hdr + packet
-            mac = b''
-
-        self._send(packet + mac)
+            framed = pktlen.to_bytes(4, 'big') + packet
 
         if self._send_seq == 0xffffffff and not self._send_encryption:
             self._send_seq = 0
@@ -1700,6 +1789,8 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         if self._kex_complete:
             self._rekey_bytes_sent += pktlen
+
+        return framed
 
     def _send_deferred_packets(self) -> None:
         """Send packets deferred due to key exchange or auth"""
@@ -1944,8 +2035,8 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         return await waiter
 
-    def _report_global_response(self, result: Union[bool, bytes]) -> None:
-        """Report back the response to a previously issued global request"""
+    def _send_global_response(self, result: Union[bool, bytes]) -> None:
+        """Send back the response to the oldest queued global request"""
 
         _, _, want_reply = self._global_request_queue.pop(0)
 
@@ -1956,8 +2047,15 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
             else:
                 self.send_packet(MSG_REQUEST_FAILURE)
 
-        # An answer given while the queue is being serviced lets that loop
-        # go on; one given later restarts it.
+    def _report_global_response(self, result: Union[bool, bytes]) -> None:
+        """Report back the response to a previously issued global request
+           that its handler answered later, then process the requests
+           queued behind it"""
+
+        self._send_global_response(result)
+
+        # An answer given while the queue is being serviced leaves the
+        # rest to that loop.
         if self._global_request_queue and not self._servicing_global_requests:
             self._service_next_global_request()
 
@@ -1974,7 +2072,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
                 if callable(handler):
                     handler(packet)
                 else:
-                    self._report_global_response(False)
+                    self._send_global_response(False)
 
                 if self._global_request_queue and self._global_request_queue[0] is head:
                     # Its handler answers later, through _report_global_response.
@@ -2415,7 +2513,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         """Process an incoming OpenSSH keepalive request"""
 
         packet.check_end()
-        self._report_global_response(True)
+        self._send_global_response(True)
 
     _packet_handlers = {
         MSG_DISCONNECT:                 _process_disconnect,

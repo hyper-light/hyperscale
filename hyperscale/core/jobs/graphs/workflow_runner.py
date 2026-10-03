@@ -3,7 +3,18 @@ import inspect
 import math
 import warnings
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Coroutine, Dict, List, Literal, Set, Tuple
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Dict,
+    List,
+    Literal,
+    Set,
+    Tuple,
+)
 
 import networkx
 import psutil
@@ -394,6 +405,7 @@ class WorkflowRunner:
         workflow: Workflow,
         workflow_context: Dict[str, Any],
         vus: int,
+        await_start: Callable[[], Awaitable[None]] | None = None,
     ) -> Tuple[
         int,
         WorkflowStats
@@ -406,6 +418,15 @@ class WorkflowRunner:
         Exception | None,
         WorkflowStatus,
     ]:
+        """
+        Run the workflow on this node and return its results, context,
+        error, and terminal status.
+
+        ``await_start``, when given, is awaited once the run is set up and
+        before it executes: the node's start gate, which lets every node
+        running the workflow start together however long each one's
+        setup took.
+        """
         # Reset cancellation state for new workflow run
         self._running = True
         self._is_cancelled.clear()
@@ -564,6 +585,7 @@ class WorkflowRunner:
                             workflow,
                             context,
                             vus,
+                            await_start,
                         )
                     )
                     self._run_tasks[run_id][workflow_name] = run_task
@@ -683,6 +705,7 @@ class WorkflowRunner:
         workflow: Workflow,
         context: Context,
         vus: int,
+        await_start: Callable[[], Awaitable[None]] | None,
     ) -> Tuple[
         WorkflowStats
         | Dict[
@@ -740,6 +763,10 @@ class WorkflowRunner:
 
                 self._concurrency_gated[run_id].add(workflow.name)
                 try:
+                    # Inside the concurrency gate: a throttle that arrives
+                    # while the run waits to start applies once it does.
+                    if await_start is not None:
+                        await await_start()
 
                     results = await self._execute_test_workflow(
                         run_id,
@@ -758,6 +785,9 @@ class WorkflowRunner:
                     message=f"Run {run_id} of non test Workflow {workflow.name} beginning execution",
                     name="debug",
                 )
+
+                if await_start is not None:
+                    await await_start()
 
                 results = await self._execute_non_test_workflow(
                     run_id,

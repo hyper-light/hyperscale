@@ -273,29 +273,11 @@ class MercurySyncSMTPConnection:
 
     async def _optimize_url(self, url: URL):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
-                    url,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                connection.reset()
-                self._connections.append(connection)
-
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
                     _,
-                    connection,
-                    url,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
@@ -304,7 +286,14 @@ class MercurySyncSMTPConnection:
                 connection.reset()
                 self._connections.append(connection)
 
-            self._url_cache[url.optimized.hostname] = url
+            optimized_url = url.optimized
+
+            # Plain-string requests for the same address reuse this lookup:
+            # cache the resolved URL itself, under the key the connect path
+            # reads, and only once the lookup actually resolved it.
+            if optimized_url is not None and optimized_url.ip_addresses:
+                self._url_cache[(url.data, None)] = optimized_url
+
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -1182,9 +1171,14 @@ class MercurySyncSMTPConnection:
                 protocol=self.address_protocol,
             )
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+        # The address and the connection type decide what a lookup resolves:
+        # neither the hostname alone (bare server names have none, and the
+        # connection type picks the port) nor any looser key may share it.
+        cache_key = (request_url.data if has_optimized_url else request_url, connection_type)
+
+        url = self._url_cache.get(cache_key)
+        dns_lock = self._dns_lock[cache_key]
+        dns_waiter = self._dns_waiters[cache_key]
 
         do_dns_lookup = url is None and has_optimized_url is False
 
@@ -1199,7 +1193,7 @@ class MercurySyncSMTPConnection:
                         connection_type=connection_type,
                     )
 
-                    self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[cache_key] = url
 
             finally:
                 # However the lookup ended, release its waiters; after a
@@ -1208,14 +1202,14 @@ class MercurySyncSMTPConnection:
                 if dns_waiter.done() is False:
                     dns_waiter.set_result(None)
 
-                if parsed_url.hostname not in self._url_cache:
-                    del self._dns_waiters[parsed_url.hostname]
+                if cache_key not in self._url_cache:
+                    del self._dns_waiters[cache_key]
 
         elif do_dns_lookup:
             # Shielded: a waiter's cancellation must not cancel the
             # lookup future every other waiter shares.
             await asyncio.shield(dns_waiter)
-            url = self._url_cache.get(parsed_url.hostname)
+            url = self._url_cache.get(cache_key)
 
         elif has_optimized_url:
             url = request_url.optimized

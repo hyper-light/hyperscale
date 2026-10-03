@@ -47,10 +47,8 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarni
 
 from .state import GateRuntimeState
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock
 
-
-_DEFAULT_CLOCK: Clock = RealClock()
 
 
 RecordManagerHeartbeat = Callable[
@@ -95,6 +93,7 @@ class GateHealthCoordinator:
         get_tcp_port: Callable[[], int],
         confirm_manager_for_dc: Callable[[str, tuple[str, int]], "asyncio.Task"],
         record_manager_heartbeat: RecordManagerHeartbeat,
+        clock: Clock,
         capacity_aggregator: DatacenterCapacityAggregator | None = None,
         on_partition_healed: Callable[[list[str]], None] | None = None,
         on_partition_detected: Callable[[list[str]], None] | None = None,
@@ -102,6 +101,7 @@ class GateHealthCoordinator:
         resource_aggregator: DatacenterResourceAggregator,
         resource_predictor: ResourceAwareSLOPredictor,
     ) -> None:
+        self._clock: Clock = clock
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
         self._task_runner: "TaskRunner" = task_runner
@@ -194,7 +194,7 @@ class GateHealthCoordinator:
             datacenter_id,
             resolved_manager_addr,
             heartbeat,
-            _DEFAULT_CLOCK.monotonic(),
+            self._clock.monotonic(),
         )
 
         if self._capacity_aggregator is not None:
@@ -554,7 +554,7 @@ class GateHealthCoordinator:
             Tuple of (best_heartbeat, alive_manager_count, total_manager_count)
         """
         manager_statuses = self._state._datacenter_manager_status.get(datacenter_id, {})
-        now = _DEFAULT_CLOCK.monotonic()
+        now = self._clock.monotonic()
         heartbeat_timeout = 30.0
 
         best_heartbeat: ManagerHeartbeat | None = None
