@@ -8,6 +8,9 @@ from hyperscale.core.engines.client.shared.protocols import (
     Reader,
     Writer,
 )
+from hyperscale.core.engines.client.shared.protocols.client_ssl_protocol import (
+    ClientSSLProtocol,
+)
 from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import (
     SocketConfig,
     connect_first_responding,
@@ -58,19 +61,52 @@ class TCPConnection:
         reader_protocol = TCPProtocol(reader, loop=self.loop)
 
         if ssl is None:
-            hostname = None
+            self.transport, _ = await self.loop.create_connection(
+                lambda: reader_protocol,
+                sock=self.socket,
+                family=family,
+            )
 
-        self.transport, _ = await self.loop.create_connection(
-            lambda: reader_protocol,
-            sock=self.socket,
-            family=family,
-            server_hostname=hostname,
-            ssl=ssl,
-        )
+        else:
+            self.transport = await self._connect_tls(reader_protocol, family, hostname, ssl)
 
         self._writer = Writer(self.transport, reader_protocol, reader, self.loop)
 
         return reader, self._writer, winner_index
+
+    async def _connect_tls(self, app_protocol, family, hostname, ssl):
+        """
+        What ``loop.create_connection(ssl=...)`` does, with ClientSSLProtocol
+        in place of asyncio's SSLProtocol: TLS over the connected socket,
+        returning the TLS transport once the handshake completes.
+        """
+        if hostname is None:
+            raise ValueError("You must set server_hostname when using ssl without a host")
+
+        handshake_complete = self.loop.create_future()
+        ssl_protocol = ClientSSLProtocol(
+            self.loop,
+            app_protocol,
+            ssl,
+            handshake_complete,
+            False,
+            hostname,
+        )
+
+        await self.loop.create_connection(
+            lambda: ssl_protocol,
+            sock=self.socket,
+            family=family,
+        )
+
+        try:
+            await handshake_complete
+
+        except BaseException:
+            ssl_protocol._app_transport.close()
+            raise
+
+        return ssl_protocol._app_transport
 
     def close(self):
         try:

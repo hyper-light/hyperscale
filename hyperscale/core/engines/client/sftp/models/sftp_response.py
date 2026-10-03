@@ -30,6 +30,7 @@ class SFTPResponse(CallResult):
     operation: CommandType | None = None
     error: Exception | None = None
     transferred: dict[bytes, TransferResult] | None = None
+    cwd: str | None = None
     timings: dict[
         SFTPTimings,
         float | None,

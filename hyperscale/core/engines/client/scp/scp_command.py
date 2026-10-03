@@ -274,26 +274,19 @@ class SCPCommand:
         
         return bytes(buffer)
         
-    async def _recv_dir(self, dstpath: bytes) -> None:
-        if not self._recurse:
-            raise scp_error(SFTPBadMessage,
-                             'Directory received without recurse')
-
-        if self._filesystem.get(dstpath) and pathlib.Path(str(dstpath)).suffix:
-            raise scp_error(SFTPFailure, 'Not a directory', dstpath)
-        
-
-        await self._recv_files(dstpath)
-
     async def _recv_files(
         self,
         dstpath: bytes,
     ):
-
+        # The sink's ready signal; the source then streams its records. A
+        # recursive receive's directories arrive bracketed by D ... E records,
+        # so the stream is walked with a stack of the directories it is
+        # inside: the source does the recursing, this loop never does.
         self._source.send_ok()
 
         attrs = SFTPAttrs()
         transferred: dict[bytes, TransferResult] = {}
+        directories: list[tuple[bytes, float, FileAttributes | None]] = []
 
         operation_start = time.monotonic()
 
@@ -319,40 +312,59 @@ class SCPCommand:
                     self._source.send_ok()
                 elif action == b'E':
                     self._source.send_ok()
-                    break
+
+                    if not directories:
+                        break
+
+                    # The innermost directory is complete.
+                    (
+                        directory_path,
+                        directory_start,
+                        directory_attrs,
+                    ) = directories.pop()
+
+                    transferred[directory_path] = TransferResult(
+                        file_path=directory_path,
+                        file_type="DIRECTORY",
+                        file_transfer_elapsed=time.monotonic() - directory_start,
+                        file_attribues=directory_attrs,
+                    )
                 elif action in b'CD':
                     try:
                         attrs.permissions, size, name = parse_cd_args(args)
 
-                        if not pathlib.Path(str(dstpath)).suffix:
-                            new_dstpath = posixpath.join(dstpath, name)
-                        else:
-                            new_dstpath = dstpath
+                        # The source's top-level record is the requested path
+                        # itself; records inside a directory go under it.
+                        new_dstpath = (
+                            posixpath.join(directories[-1][0], name)
+                            if directories
+                            else dstpath
+                        )
 
-                        transfer_type: TransferType = "FILE"
-                        data: bytes | None = None    
-
-                        if action == b'D':
-                            await self._recv_dir(new_dstpath)
-
-                            transfer_type = "DIRECTORY"
-
-                        else:
-                            data = await self._recv_file(size)
-
-                        
                         file_attrs: FileAttributes | None = None
                         if self._preserve:
                             file_attrs = TransferResult.to_attributes(attrs)
 
-                        
-                        transferred[dstpath] = TransferResult(
-                            file_path=dstpath,
-                            file_type=transfer_type,
-                            file_data=data,
-                            file_transfer_elapsed=time.monotonic() - start,
-                            file_attribues=file_attrs,
-                        )
+                        if action == b'D':
+                            if not self._recurse:
+                                raise scp_error(SFTPBadMessage,
+                                                 'Directory received without recurse')
+
+                            if self._filesystem.get(new_dstpath) and pathlib.Path(str(new_dstpath)).suffix:
+                                raise scp_error(SFTPFailure, 'Not a directory', new_dstpath)
+
+                            # Accept the directory: its records follow until its E.
+                            self._source.send_ok()
+                            directories.append((new_dstpath, start, file_attrs))
+
+                        else:
+                            transferred[new_dstpath] = TransferResult(
+                                file_path=new_dstpath,
+                                file_type="FILE",
+                                file_data=await self._recv_file(size),
+                                file_transfer_elapsed=time.monotonic() - start,
+                                file_attribues=file_attrs,
+                            )
 
                     finally:
                         attrs = SFTPAttrs()

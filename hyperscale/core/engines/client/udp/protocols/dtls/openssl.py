@@ -1569,7 +1569,7 @@ def SSL_set1_sigalgs_list(ssl, s):
 def SSL_get1_curves(ssl, curves=None):
     assert curves is None or isinstance(curves, list)
     if curves is not None:
-        cnt = SSL_get1_curves(ssl, None)
+        cnt = _SSL_ctrl(ssl, SSL_CTRL_GET_CURVES, 0, None)
         if cnt:
             mem = create_string_buffer(sizeof(POINTER(c_int)) * cnt)
             _SSL_ctrl(ssl, SSL_CTRL_GET_CURVES, 0, mem)

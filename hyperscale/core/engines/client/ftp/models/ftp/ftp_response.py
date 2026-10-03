@@ -26,6 +26,7 @@ FTPActionType = Literal[
 class FTPResponse(CallResult):
     action: FTPActionType
     data: int | bytes | bytearray | memoryview | None = None
+    cwd: str | None = None
     error: Exception | None = None
     timings: dict[
         Literal[

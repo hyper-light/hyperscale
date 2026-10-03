@@ -1,4 +1,5 @@
 import asyncio
+import posixpath
 import ssl
 import re
 import socket
@@ -101,6 +102,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
 
     ):
         async with self._semaphore:
@@ -113,6 +115,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         data=password,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -122,6 +125,7 @@ class MercurySyncFTPConnection:
                     action='CREATE_ACCOUNT',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def change_directory(
@@ -131,6 +135,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -142,6 +147,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -151,6 +157,7 @@ class MercurySyncFTPConnection:
                     action='CHANGE_DIRECTORY',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
     
     async def list_path(
@@ -160,6 +167,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -171,6 +179,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -180,6 +189,7 @@ class MercurySyncFTPConnection:
                     action='LIST',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def list_directory(
@@ -189,6 +199,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -200,6 +211,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -209,6 +221,7 @@ class MercurySyncFTPConnection:
                     action='LIST_DIRECTORY',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def list_details(
@@ -219,6 +232,7 @@ class MercurySyncFTPConnection:
         options: list[str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -231,6 +245,7 @@ class MercurySyncFTPConnection:
                         destination_path=path,
                         options=options,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -240,6 +255,7 @@ class MercurySyncFTPConnection:
                     action='LIST_DETAILS',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def make_directory(
@@ -249,6 +265,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -260,6 +277,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -269,6 +287,7 @@ class MercurySyncFTPConnection:
                     action='MAKE_DIRECTORY',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
 
     async def pwd(
@@ -277,6 +296,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -287,6 +307,7 @@ class MercurySyncFTPConnection:
                         action='PWD',
                         auth=auth,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -296,6 +317,7 @@ class MercurySyncFTPConnection:
                     action='PWD',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
 
     async def receive(
@@ -307,6 +329,7 @@ class MercurySyncFTPConnection:
         chunk_size: int = 8192,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -324,6 +347,7 @@ class MercurySyncFTPConnection:
                         destination_path=path,
                         chunk_size=chunk_size,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -333,6 +357,7 @@ class MercurySyncFTPConnection:
                     action=action,
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def remove(
@@ -343,6 +368,7 @@ class MercurySyncFTPConnection:
         filetype: Literal['FILE', 'DIRECTORY'] = 'FILE',
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -359,6 +385,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -368,6 +395,7 @@ class MercurySyncFTPConnection:
                     action=action,
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
     
     async def rename(
@@ -378,6 +406,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -391,6 +420,7 @@ class MercurySyncFTPConnection:
                         source_path=from_name,
                         destination_path=to_name,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -400,6 +430,7 @@ class MercurySyncFTPConnection:
                     action='RENAME',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
 
     async def send(
@@ -412,6 +443,7 @@ class MercurySyncFTPConnection:
         filetype: Literal['BINARY', 'LINES'] = 'BINARY',
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -430,6 +462,7 @@ class MercurySyncFTPConnection:
                         action=action,
                         chunk_size=chunk_size,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -439,6 +472,7 @@ class MercurySyncFTPConnection:
                     action=action,
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def size(
@@ -448,6 +482,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -460,6 +495,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -469,6 +505,7 @@ class MercurySyncFTPConnection:
                     action='SIZE',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     def close(self):
@@ -557,6 +594,7 @@ class MercurySyncFTPConnection:
         options: list[str] | None = None,
         chunk_size: int = 8192,
         secure_connection: bool = True,
+        cwd: str | None = None,
     ):
         timings: dict[
             Literal[
@@ -581,6 +619,18 @@ class MercurySyncFTPConnection:
             "request_end": None,
         }
         timings["request_start"] = time.monotonic()
+
+        # The request's own working directory: its relative paths resolve
+        # against it here, so no session's server-side directory is relied
+        # on. Absolute paths stand as given.
+        if cwd is not None:
+            if source_path is not None:
+                source_path = posixpath.join(cwd, source_path)
+
+            if destination_path is not None:
+                destination_path = posixpath.join(cwd, destination_path)
+
+        response_cwd = cwd
         
         control_connection: FTPConnection | None = None
         data_connection: FTPConnection | None = None
@@ -637,6 +687,7 @@ class MercurySyncFTPConnection:
 
                 return FTPResponse(
                     action=action,
+                    cwd=response_cwd,
                     error=err,
                     timings=timings,
                 )
@@ -677,12 +728,16 @@ class MercurySyncFTPConnection:
                 case 'CHANGE_DIRECTORY':
                     (
                         result,
+                        resolved_directory,
                         err,
-                    ) = await self._change_directory(
+                    ) = await self._resolve_directory(
                         control_connection,
                         destination_path,
                         timings=timings,
                     )
+
+                    if resolved_directory is not None:
+                        response_cwd = resolved_directory
                 
                 case 'LIST':
                     (
@@ -840,6 +895,7 @@ class MercurySyncFTPConnection:
 
                     return FTPResponse(
                         action=action,
+                        cwd=response_cwd,
                         error=Exception('Unsupported action'),
                         timings=timings,
                     )
@@ -858,6 +914,7 @@ class MercurySyncFTPConnection:
             if err:
                 return FTPResponse(
                     action=action,
+                    cwd=response_cwd,
                     error=err,
                     data=result,
                     timings=timings,
@@ -865,6 +922,7 @@ class MercurySyncFTPConnection:
             
             return FTPResponse(
                 action=action,
+                cwd=response_cwd,
                 data=result,
                 timings=timings,
             )
@@ -881,6 +939,7 @@ class MercurySyncFTPConnection:
 
             return FTPResponse(
                 action=action,
+                cwd=response_cwd,
                 error=err,
                 timings=timings,
             )
@@ -2730,6 +2789,62 @@ class MercurySyncFTPConnection:
 
         return host, port
         
+    async def _resolve_directory(
+        self,
+        connection: FTPConnection,
+        directory: str,
+        timings: dict[
+            Literal[
+                "request_start",
+                "connect_start",
+                "connect_end",
+                "data_connect_start",
+                "data_connect_end",
+                "write_start",
+                "write_end",
+                "read_start",
+                "read_end",
+                "request_end",
+            ],
+            float | None,
+        ] = None,
+    ):
+        """
+        Resolve ``directory`` on the server and confirm it is one, leaving the
+        session's directory as it was: a pooled control connection goes back
+        to the pool in the directory it came out in. Returns the CWD reply,
+        the resolved absolute directory, and any error.
+        """
+        (
+            session_directory,
+            err,
+        ) = await self._pwd(connection, timings=timings)
+        if err:
+            return (None, None, err)
+
+        (
+            result,
+            err,
+        ) = await self._change_directory(connection, directory, timings=timings)
+        if err:
+            return (result, None, err)
+
+        (
+            resolved_directory,
+            err,
+        ) = await self._pwd(connection, timings=timings)
+        if err:
+            return (result, None, err)
+
+        (
+            _,
+            err,
+        ) = await self._change_directory(connection, session_directory.decode(), timings=timings)
+        if err:
+            return (result, None, err)
+
+        return (result, resolved_directory.decode(), None)
+
     async def _change_directory(
         self,
         connection: FTPConnection,

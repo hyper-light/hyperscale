@@ -145,15 +145,21 @@ def _pbkdf1(hash_alg: HashType, passphrase: BytesOrStr, salt: bytes,
     if isinstance(passphrase, str):
         passphrase = passphrase.encode('utf-8')
 
-    key = passphrase + salt
-    for _ in range(count):
-        key = hash_alg(key).digest()
+    # Each further block derives from the last block followed by the input
+    # that produced it, until a block covers the key bytes still needed.
+    derived = b''
 
-    if len(key) <= key_size:
-        return key + _pbkdf1(hash_alg, key + passphrase, salt, count,
-                             key_size - len(key))
-    else:
-        return key[:key_size]
+    while True:
+        key = passphrase + salt
+        for _ in range(count):
+            key = hash_alg(key).digest()
+
+        if len(key) > key_size:
+            return derived + key[:key_size]
+
+        derived += key
+        key_size -= len(key)
+        passphrase = key + passphrase
 
 
 def _pbkdf_p12(hash_alg: HashType, passphrase: BytesOrStr, salt: bytes,

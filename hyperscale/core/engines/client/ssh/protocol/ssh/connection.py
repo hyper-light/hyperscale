@@ -937,6 +937,8 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._next_recv_chan = 0
 
         self._global_request_queue: List[_GlobalRequest] = []
+        # Whether _service_next_global_request's loop is running.
+        self._servicing_global_requests = False
         self._global_request_waiters: \
             'List[asyncio.Future[_GlobalRequestResult]]' = []
 
@@ -1649,9 +1651,15 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
             return
 
         # If we're encrypting and we have no data outstanding, insert an
-        # ignore packet into the stream
+        # ignore packet into the stream. It is written directly: an ignore
+        # packet is never deferred, and the rekey check was just made.
         if self._send_encryption and pkttype > MSG_KEX_LAST:
-            self.send_packet(MSG_IGNORE, String(b''))
+            self._write_packet(MSG_IGNORE, (String(b''),))
+
+        self._write_packet(pkttype, args)
+
+    def _write_packet(self, pkttype: int, args: Tuple[bytes, ...]) -> None:
+        """Frame, encrypt, and send one SSH packet now"""
 
         orig_payload = Byte(pkttype) + b''.join(args)
 
@@ -1743,7 +1751,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         self._client_kexinit = packet
 
-        self.send_packet(MSG_KEXINIT, packet[1:])
+        # Kex is now incomplete, so send_packet would neither rekey nor
+        # defer this packet: it is written directly.
+        self._write_packet(MSG_KEXINIT, (packet[1:],))
 
     def _send_ext_info(self) -> None:
         """Send extension information"""
@@ -1946,17 +1956,32 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
             else:
                 self.send_packet(MSG_REQUEST_FAILURE)
 
-        if self._global_request_queue:
+        # An answer given while the queue is being serviced lets that loop
+        # go on; one given later restarts it.
+        if self._global_request_queue and not self._servicing_global_requests:
             self._service_next_global_request()
 
     def _service_next_global_request(self) -> None:
-        """Process next item on global request queue"""
+        """Process queued global requests in order, until one is answered later"""
 
-        handler, packet, _ = self._global_request_queue[0]
-        if callable(handler):
-            handler(packet)
-        else:
-            self._report_global_response(False)
+        self._servicing_global_requests = True
+
+        try:
+            while self._global_request_queue:
+                head = self._global_request_queue[0]
+                handler, packet, _ = head
+
+                if callable(handler):
+                    handler(packet)
+                else:
+                    self._report_global_response(False)
+
+                if self._global_request_queue and self._global_request_queue[0] is head:
+                    # Its handler answers later, through _report_global_response.
+                    return
+
+        finally:
+            self._servicing_global_requests = False
 
     def _connection_made(self) -> None:
         """Handle the opening of a new connection"""
@@ -6715,7 +6740,7 @@ async def get_server_host_key(
         client_version=client_version)
 
     conn = await asyncio.wait_for(
-        connect_with_optionsf(new_options, config, loop, flags, sock, conn_factory,
+        connect_with_options(new_options, config, loop, flags, sock, conn_factory,
                  'Fetching server host key from'),
         timeout=new_options.connect_timeout)
 

@@ -521,7 +521,9 @@ class MercurySyncSMTPConnection:
 
         resend_ehlo = False
 
-        if 'starttls' in options and url.port == 587:
+        # The connection's own port and address: every connect sets them, so a
+        # session reopened on a reused connection still upgrades to TLS.
+        if 'starttls' in options and connection.port == 587:
 
             timings["tls_check_start"] = time.monotonic()
 
@@ -536,7 +538,7 @@ class MercurySyncSMTPConnection:
 
                 await connection.make_connection(
                     server,
-                    url.address,
+                    connection.address_info,
                     ssl=self._ssl_context,
                     connection_type='tls',
                     ssl_upgrade=True,
@@ -550,13 +552,13 @@ class MercurySyncSMTPConnection:
             else:
                 err = Exception(f'Err. - {code} {message}')
 
-        elif  'starttls' in options and url.port == 465:
+        elif  'starttls' in options and connection.port == 465:
 
             timings["tls_upgrade_start"] = time.monotonic()
 
             await connection.make_connection(
                 server,
-                url.address,
+                connection.address_info,
                 ssl=self._ssl_context,
                 connection_type='ssl',
                 ssl_upgrade=True,
