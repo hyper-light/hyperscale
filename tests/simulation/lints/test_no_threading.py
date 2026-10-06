@@ -5,12 +5,12 @@ of a threading item").
 
 Every module under ``hyperscale/`` is checked for ``import threading``
 and ``from threading import ...``, at any depth (an import inside a
-function counts too).
-
-The client engines under ``hyperscale/core/engines`` are not checked:
-their executors and vendored SSH tunnelling use threads, and whether they
-get a carve-out or a conversion is the owner's open decision (G-70).
-Everywhere else the count is zero, and stays zero.
+function counts too). The count is zero, and stays zero, with one file
+excepted: the vendored asyncssh tun/tap transport
+(``hyperscale/core/engines/client/ssh/protocol/ssh/tuntap.py``), whose
+macOS reader runs on a thread because kqueue cannot watch a tuntaposx
+device. It is upstream vendored code that hyperscale's engines never call
+(tun/tap forwarding), so it is left as vendored (decided 2026-10-06, G-70).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import ast
 
 from tests.simulation.lints.ratchet import production_modules
 
-UNDECIDED_PREFIX = "hyperscale/core/engines/"
+VENDORED_TUNTAP = "hyperscale/core/engines/client/ssh/protocol/ssh/tuntap.py"
 
 
 def threading_imports(module: ast.Module) -> list[int]:
@@ -41,7 +41,7 @@ def test_no_production_module_imports_threading() -> None:
     violations = [
         f"{path}:{line}"
         for path, module in production_modules()
-        if not path.startswith(UNDECIDED_PREFIX)
+        if path != VENDORED_TUNTAP
         for line in threading_imports(module)
     ]
-    assert not violations, "threading imported outside the engines:\n    " + "\n    ".join(violations)
+    assert not violations, "threading imported:\n    " + "\n    ".join(violations)

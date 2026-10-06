@@ -7518,6 +7518,12 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 
 ### Encryption & Authentication
 
+**Trust boundary (decided 2026-10-06).** Workflows travel as cloudpickle by-value code, and running a workflow
+means running its submitter's code. The boundary is therefore the authenticated frame, not the unpickler: a frame
+is accepted only if it authenticates under the cluster secret (weak secrets refused; a per-user 0600 cookie or a
+per-run secret when none is configured) and passes replay checks. `RestrictedUnpickler` remains defense in depth
+for non-workflow payloads. Anyone holding the cluster secret can run code on the cluster, by design.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                   SECURITY ARCHITECTURE                          │
@@ -7534,9 +7540,11 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │                                                                  │
 │  Replay Protection:                                              │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ • Snowflake IDs with embedded timestamps                  │  │
-│  │ • Sliding window detection (configurable)                 │  │
-│  │ • Rejects duplicate and stale messages                    │  │
+│  │ • Every frame (TCP and UDP) carries a per-send Snowflake  │  │
+│  │   frame id inside its AES-GCM-authenticated body          │  │
+│  │ • Duplicates keyed on the frame's encryption nonce        │  │
+│  │ • Eviction watermark refuses anything forgettable;        │  │
+│  │   starts at guard start minus max age (2026-10-06)        │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  Rate Limiting:                                                  │

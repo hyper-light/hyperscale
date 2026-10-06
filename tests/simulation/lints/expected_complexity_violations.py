@@ -900,7 +900,6 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/core/engines/client/udp/protocols/dtls/sslconnection.py::SSLContext.get_ec_available': 4,
     'hyperscale/core/engines/client/udp/protocols/dtls/sslconnection.py::SSLContext.set_ecdh_curve': 4,
     'hyperscale/core/engines/client/udp/protocols/dtls/sslconnection.py::_ssl_logging_cb': 14,
-    'hyperscale/core/engines/client/udp/protocols/dtls/tlock.py::tlock_init': 4,
     'hyperscale/core/engines/client/udp/protocols/dtls/wrapper.py::DtlsSocket.__init__': 4,
     'hyperscale/core/engines/client/udp/protocols/dtls/wrapper.py::DtlsSocket._clientAccept': 4,
     'hyperscale/core/engines/client/udp/protocols/dtls/wrapper.py::DtlsSocket._clientDoHandshake': 7,

@@ -107,7 +107,6 @@ EXPECTED_SWALLOWED_EXCEPTION_VIOLATIONS: dict[str, int] = {
     'hyperscale/core/engines/client/udp/protocols/dtls/patch.py::_SSLSocket_real_connect': 1,
     'hyperscale/core/engines/client/udp/protocols/dtls/patch.py::_SSLSocket_settimeout': 1,
     'hyperscale/core/engines/client/udp/protocols/dtls/sslconnection.py::_UnwrappedSocket.__init__': 1,
-    'hyperscale/core/engines/client/udp/protocols/dtls/tlock.py::<module>': 1,
     'hyperscale/core/engines/client/udp/protocols/dtls/wrapper.py::DtlsSocket._recvfrom_on_server_side': 1,
     'hyperscale/core/engines/client/udp/protocols/udp/connection.py::UDPConnection.close': 4,
     'hyperscale/core/engines/client/udp/protocols/udp/protocol.py::UDPProtocol.__del__': 1,

@@ -13,6 +13,8 @@ through the real client against a local TLS HTTP/2 server (h2).
   the next request reconnects and succeeds.
 * A redirect is followed with the request's own headers -- not the
   redirect response's -- and a chain stops at the redirect limit.
+* The server's certificate is verified, as every engine client's is: the
+  client trusts the test certificate authority that signed it.
 * The buffer itself: an empty buffer hands out its whole view; the unparsed
   bytes -- a frame not yet whole -- move to the front to make room; a full
   buffer pauses reading, and waiting for more resumes it.
@@ -27,7 +29,7 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from h2.config import H2Configuration
 from h2.connection import H2Connection
 from h2.events import ConnectionTerminated, RequestReceived, StreamReset, WindowUpdated
@@ -52,15 +54,48 @@ def body_of(size: int) -> bytes:
     return (PATTERN * (size // len(PATTERN) + 1))[:size]
 
 
-def write_self_signed_certificate(directory: Path) -> tuple[str, str]:
-    """A certificate for 127.0.0.1 and localhost, its own CA."""
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hyperscale-test")])
+def write_certificates(directory: Path) -> tuple[str, str]:
+    """
+    A certificate authority (ca.pem, which the client trusts) and the
+    server certificate it signs for 127.0.0.1 and localhost: verified as any
+    server is (RFC 9110 4.3.4), with the extensions strict X.509 checking
+    requires.
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
+    authority_key = ec.generate_private_key(ec.SECP256R1())
+    authority_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hyperscale-test-ca")])
+    authority = (
+        x509.CertificateBuilder()
+        .subject_name(authority_name)
+        .issuer_name(authority_name)
+        .public_key(authority_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(authority_key.public_key()), critical=False)
+        .sign(authority_key, hashes.SHA256())
+    )
+
+    key = ec.generate_private_key(ec.SECP256R1())
     certificate = (
         x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hyperscale-test")]))
+        .issuer_name(authority_name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(minutes=1))
@@ -71,8 +106,17 @@ def write_self_signed_certificate(directory: Path) -> tuple[str, str]:
             ),
             critical=False,
         )
-        .sign(key, hashes.SHA256())
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(authority_key.public_key()),
+            critical=False,
+        )
+        .sign(authority_key, hashes.SHA256())
     )
+
+    (directory / "ca.pem").write_bytes(authority.public_bytes(serialization.Encoding.PEM))
     certificate_path = directory / "server.pem"
     key_path = directory / "server.key"
     certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
@@ -98,7 +142,7 @@ class H2Target:
     """
 
     def __init__(self, directory: Path) -> None:
-        certificate_path, key_path = write_self_signed_certificate(directory)
+        certificate_path, key_path = write_certificates(directory)
         self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._context.load_cert_chain(certificate_path, key_path)
         self._context.set_alpn_protocols(["h2"])
@@ -200,16 +244,19 @@ class H2Target:
             writer.close()
 
 
-def make_client(pool_size: int) -> MercurySyncHTTP2Connection:
-    return setup_client(
+def make_client(pool_size: int, directory: Path) -> MercurySyncHTTP2Connection:
+    """The client, verifying the server against the test certificate authority."""
+    client = setup_client(
         MercurySyncHTTP2Connection(pool_size=pool_size, timeouts=Timeouts(request_timeout=HANG_SECONDS)),
         pool_size,
     )
+    client._client_ssl_context.load_verify_locations(directory / "ca.pem")
+    return client
 
 
 async def test_bodies_of_every_size_arrive_whole(tmp_path: Path) -> None:
     async with H2Target(tmp_path) as target:
-        client = make_client(1)
+        client = make_client(1, tmp_path)
         for size in BODY_SIZES * 2:  # the second pass on the reused connection
             response = await client.get(f"{target}/bytes/{size}")
 
@@ -219,7 +266,7 @@ async def test_bodies_of_every_size_arrive_whole(tmp_path: Path) -> None:
 
 async def test_concurrent_requests_each_get_their_own_body(tmp_path: Path) -> None:
     async with H2Target(tmp_path) as target:
-        client = make_client(8)
+        client = make_client(8, tmp_path)
         sizes = [BODY_SIZES[index % len(BODY_SIZES)] for index in range(64)]
         async with asyncio.timeout(HANG_SECONDS * 4):
             responses = await asyncio.gather(*[client.get(f"{target}/bytes/{size}") for size in sizes])
@@ -231,7 +278,7 @@ async def test_concurrent_requests_each_get_their_own_body(tmp_path: Path) -> No
 
 async def test_frames_between_requests_wait_for_the_next_one(tmp_path: Path) -> None:
     async with H2Target(tmp_path) as target:
-        client = make_client(1)
+        client = make_client(1, tmp_path)
         first = await client.get(f"{target}/ping-after/300")
         # The PING and SETTINGS frames arrive after the first response ended.
         await asyncio.sleep(0.05)
@@ -243,7 +290,7 @@ async def test_frames_between_requests_wait_for_the_next_one(tmp_path: Path) -> 
 
 async def test_a_server_closing_midway_fails_that_request_and_the_next_reconnects(tmp_path: Path) -> None:
     async with H2Target(tmp_path) as target:
-        client = make_client(1)
+        client = make_client(1, tmp_path)
         failed = await client.get(f"{target}/close-midway/100000")
         recovered = await client.get(f"{target}/bytes/300")
 
@@ -253,7 +300,7 @@ async def test_a_server_closing_midway_fails_that_request_and_the_next_reconnect
 
 async def test_a_redirect_is_followed_with_the_requests_own_headers(tmp_path: Path) -> None:
     async with H2Target(tmp_path) as target:
-        client = make_client(1)
+        client = make_client(1, tmp_path)
         followed = await client.get(f"{target}/redirect/1", headers={"x-probe": "from-the-request"})
         stopped = await client.get(f"{target}/redirect/5", headers={"x-probe": "from-the-request"}, redirects=2)
 
