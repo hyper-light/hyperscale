@@ -39,6 +39,7 @@ from hyperscale.distributed.resources.resource_budget import ResourceBudget
 from hyperscale.graph import Workflow, step
 from hyperscale.testing import URL, HTTPResponse
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
     BOOT_TIMEOUT_SECONDS,
     LOCALHOST,
     NODE_BLOCK,
@@ -108,19 +109,19 @@ GUARDS_DISABLED_ENVIRONMENT = {"RESOURCE_GUARD_ENABLED": "false"}
 # The same tight limits, carried by the job instead of the manager's env.
 JOB_BUDGET = ResourceBudget(
     max_cpu_percent=CPU_BUDGET_PERCENT,
-    max_memory_bytes=Env().RESOURCE_GUARD_MAX_MEMORY_BYTES,
-    warning_threshold=Env().RESOURCE_GUARD_WARNING_THRESHOLD,
-    throttle_threshold=Env().RESOURCE_GUARD_THROTTLE_THRESHOLD,
-    kill_threshold=Env().RESOURCE_GUARD_KILL_THRESHOLD,
+    max_memory_bytes=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET).RESOURCE_GUARD_MAX_MEMORY_BYTES,
+    warning_threshold=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET).RESOURCE_GUARD_WARNING_THRESHOLD,
+    throttle_threshold=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET).RESOURCE_GUARD_THROTTLE_THRESHOLD,
+    kill_threshold=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET).RESOURCE_GUARD_KILL_THRESHOLD,
     warning_grace_seconds=WARNING_GRACE_SECONDS,
     kill_grace_seconds=KILL_GRACE_SECONDS,
 )
 GUARDS_DISABLED_REJECTION = "resource guards are disabled"
 THROTTLE_BUDGET = ResourceBudget(
     max_cpu_percent=THROTTLE_CPU_BUDGET_PERCENT,
-    max_memory_bytes=Env().RESOURCE_GUARD_MAX_MEMORY_BYTES,
-    warning_threshold=Env().RESOURCE_GUARD_WARNING_THRESHOLD,
-    throttle_threshold=Env().RESOURCE_GUARD_THROTTLE_THRESHOLD,
+    max_memory_bytes=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET).RESOURCE_GUARD_MAX_MEMORY_BYTES,
+    warning_threshold=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET).RESOURCE_GUARD_WARNING_THRESHOLD,
+    throttle_threshold=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET).RESOURCE_GUARD_THROTTLE_THRESHOLD,
     kill_threshold=UNREACHABLE_KILL_THRESHOLD,
     warning_grace_seconds=WARNING_GRACE_SECONDS,
     kill_grace_seconds=KILL_GRACE_SECONDS,
@@ -183,7 +184,7 @@ async def test_over_budget_workflow_is_killed_before_it_would_finish(
     client = HyperscaleClient(
         host=LOCALHOST,
         port=client_start,
-        env=Env(),
+        env=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET),
         managers=[(LOCALHOST, manager.tcp_port)],
     )
     try:
@@ -239,7 +240,7 @@ async def test_workflow_over_its_throttle_line_is_throttled_and_completes(run_ma
     client = HyperscaleClient(
         host=LOCALHOST,
         port=client_start,
-        env=Env(),
+        env=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET),
         managers=[(LOCALHOST, manager.tcp_port)],
     )
     load_workflow = load_workflow_class(f"http://{LOCALHOST}:{http_start}/")
@@ -289,7 +290,7 @@ async def test_job_budget_is_rejected_when_guards_are_disabled(run_marker: str) 
     client = HyperscaleClient(
         host=LOCALHOST,
         port=client_start,
-        env=Env(),
+        env=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET),
         managers=[(LOCALHOST, manager.tcp_port)],
     )
     try:

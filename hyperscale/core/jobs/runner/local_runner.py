@@ -1,5 +1,4 @@
 import asyncio
-import os
 from contextlib import ExitStack
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import (
@@ -25,6 +24,7 @@ from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
 from hyperscale.ui.actions import update_active_workflow_message
 
 from .local_server_pool import LocalServerPool
+from .run_secret import env_with_run_secret
 from .shutdown_signals import ShutdownSignals
 
 
@@ -69,12 +69,9 @@ class LocalRunner:
         env: Env | None = None,
         workers: int | None = None,
     ) -> None:
-        if env is None:
-            env = Env(
-                MERCURY_SYNC_AUTH_SECRET=os.getenv(
-                    "MERCURY_SYNC_AUTH_SECRET", "hyperscale-secret"
-                ),
-            )
+        # A configured secret wins; otherwise this run gets a random secret
+        # of its own, shared with the workers it spawns through ``self._env``.
+        env = env_with_run_secret(env if env is not None else Env())
 
         if workers is None:
             workers = psutil.cpu_count(logical=False)

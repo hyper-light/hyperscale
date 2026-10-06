@@ -22,6 +22,7 @@ import pytest
 
 from hyperscale.distributed.env import Env
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
     BOOT_TIMEOUT_SECONDS,
     LOCALHOST,
     NODE_BLOCK,
@@ -33,7 +34,7 @@ from tests.integration.cli.node_processes import (
     run_resize,
 )
 
-ENV = Env()
+ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
 DATACENTER = "dc-gate-follows"
 COHORT_SIZE = 3
 CLIENT_BLOCK = 2  # a CLI client's tcp + its udp (port + 1)

@@ -49,7 +49,7 @@ async def status(
     @param timeout How long to wait on each node (defaults to its tier's standard TCP timeout)
     @param consistency How current the status must be: eventual (what the node asked holds), session, bounded_staleness (the job leader's view, no older than --max-staleness) or strong (the job leader's view, confirmed with a quorum)
     @param max_staleness The oldest view a bounded_staleness read accepts (e.g. 5s)
-    @param acm_secret The shared cluster secret (defaults to MERCURY_SYNC_AUTH_SECRET)
+    @param acm_secret The shared cluster secret (defaults to MERCURY_SYNC_AUTH_SECRET, else the per-user cluster cookie)
     @param log_level The log level to use
     """
     if not job_id:
@@ -64,7 +64,7 @@ async def status(
 
     LoggingConfig().update(log_level=log_level.data, log_output="stderr")
     env = HyperscaleEnv(
-        MERCURY_SYNC_AUTH_SECRET=resolve_auth_secret(acm_secret),
+        MERCURY_SYNC_AUTH_SECRET=await resolve_auth_secret(acm_secret),
         MERCURY_SYNC_LOG_LEVEL=log_level.data,
     )
     targets = [(address, env.GATE_TCP_TIMEOUT_STANDARD) for address in gate_addrs] + [

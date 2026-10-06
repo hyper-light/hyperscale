@@ -28,6 +28,8 @@ import pytest
 
 from hyperscale.distributed.env import Env
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
+    command_environment,
     BOOT_TIMEOUT_SECONDS,
     HYPERSCALE,
     LOCALHOST,
@@ -41,7 +43,7 @@ from tests.integration.cli.node_processes import (
     run_resize,
 )
 
-ENV = Env()
+ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
 DATACENTER = "dc-resize"
 COHORT_SIZE = 3
 CLIENT_BLOCK = 2  # `hyperscale resize` client tcp + its udp (port + 1)
@@ -84,6 +86,7 @@ async def test_the_cohort_grows_by_one_manager(run_marker: str) -> None:
             HYPERSCALE, "cluster", "--node", founders[0].address, "--watch", "--port", str(watch_client),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=command_environment(),
         )
 
         returncode, output = await run_resize(founders[0].address, "add", added.address, first_client)

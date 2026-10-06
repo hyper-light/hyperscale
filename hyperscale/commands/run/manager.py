@@ -1,22 +1,30 @@
-import asyncio
+import functools
+
 from hyperscale.commands.cli import JsonFile, command, AssertSet
 from hyperscale.distributed.nodes import ManagerServer
 from hyperscale.core.engines.client.time_parser import TimeParser
 
 from hyperscale.core.jobs.models import HyperscaleConfig
-from hyperscale.logging import LoggingConfig, LogLevelName
+from hyperscale.logging import Logger, LoggingConfig, LogLevelName
+from hyperscale.ui.node_dashboard import (
+    ManagerDashboardReader,
+    NodeDashboard,
+    NodeDashboardConfig,
+    StderrLogRedirect,
+)
 
 from .node_address import parse_node_host, parse_peer_addresses
+from .node_lifecycle import run_node_until_stopped
 from .seed_locators import is_dynamic_locator, resolve_cohort_addresses
 from .shared import (
     opened_raft_store,
     get_default_config,
     node_data_directory,
     node_env,
-    drain_cluster_membership,
+    node_log_path,
+    node_terminal_mode,
     resolve_auth_secret,
 )
-from hyperscale.core.jobs.runner.shutdown_signals import ShutdownSignals
 
 
 @command(
@@ -48,6 +56,7 @@ async def manager(
     leader_lease_enabled: bool = False,
     config: JsonFile[HyperscaleConfig] = get_default_config,
     log_level: AssertSet[LogLevelName] = "fatal",
+    quiet: bool = False,
 ):
     """
     Run a Hyperscale manager. Its datacenter's managers form one election
@@ -61,7 +70,7 @@ async def manager(
     @param datacenter The datacenter this manager belongs to
     @param boot_timeout How long to wait for the manager to boot
     @param shutdown_timeout How long to wait for the manager to shut down
-    @param acm_secret The shared cluster secret (defaults to MERCURY_SYNC_AUTH_SECRET)
+    @param acm_secret The shared cluster secret (defaults to MERCURY_SYNC_AUTH_SECRET, else the per-user cluster cookie)
     @param data_directory Where the manager keeps its durable state (defaults to a directory per manager under data/ beside the logs directory)
     @param managers The TCP host:port of every manager in this datacenter's cohort (this manager's own entry is skipped)
     @param manager_udp The UDP host:port of the same managers, in the same order
@@ -71,6 +80,7 @@ async def manager(
     @param gate_udp The UDP host:port of the same gates, in the same order
     @param config A path to a valid .hyperscale.json config file
     @param log_level The log level to use
+    @param quiet If specified, the live node dashboard is disabled
     """
     logging_config = LoggingConfig()
     logging_config.update(
@@ -85,7 +95,7 @@ async def manager(
     )
 
     env = node_env(
-        MERCURY_SYNC_AUTH_SECRET=resolve_auth_secret(acm_secret),
+        MERCURY_SYNC_AUTH_SECRET=await resolve_auth_secret(acm_secret),
         MERCURY_SYNC_LOG_LEVEL=log_level.data,
         # Given only when set, so an operator's exported setting stands.
         **({"RAFT_LEADER_LEASES_ENABLED": True} if leader_lease_enabled else {}),
@@ -122,44 +132,44 @@ async def manager(
     start_timeout_sec = TimeParser(boot_timeout).time
     shutdown_timeout_sec = TimeParser(shutdown_timeout).time
 
-    # D1: the node runs as the identity its Raft store holds, its Raft
-    # groups resumed from it when its disk is its own and intact.
-    async with opened_raft_store(node_directory, env, datacenter, host, udp_port) as raft_store:
-        manager = ManagerServer(
-            host=host,
-            tcp_port=tcp_port,
-            udp_port=udp_port,
-            env=env,
-            dc_id=datacenter,
-            gate_addrs=gate_tcp_addresses,
-            gate_udp_addrs=gate_udp_addresses,
-            seed_managers=peer_tcp_addresses,
-            manager_udp_peers=peer_udp_addresses,
-            wal_data_dir=node_directory,
-            # A restarted manager returns at the same address; its persisted
-            # incarnation keeps peers from refusing it as a zombie.
-            incarnation_storage_dir=str(node_directory / "incarnation"),
-            raft_store=raft_store,
-        )
+    terminal_mode = await node_terminal_mode(config.data.terminal_mode, quiet)
+    log_path = node_log_path(config.data.logs_directory, "manager", datacenter, host, tcp_port)
 
-        try:
-            await manager.start(timeout=start_timeout_sec)
+    # While the dashboard renders, stderr (the node's logs) goes to the log
+    # file -- redirected before the Raft store opens its first log stream.
+    async with StderrLogRedirect(log_path, enabled=terminal_mode != "disabled"):
+        # D1: the node runs as the identity its Raft store holds, its Raft
+        # groups resumed from it when its disk is its own and intact.
+        async with opened_raft_store(node_directory, env, datacenter, host, udp_port) as raft_store:
+            manager = ManagerServer(
+                host=host,
+                tcp_port=tcp_port,
+                udp_port=udp_port,
+                env=env,
+                dc_id=datacenter,
+                gate_addrs=gate_tcp_addresses,
+                gate_udp_addrs=gate_udp_addresses,
+                seed_managers=peer_tcp_addresses,
+                manager_udp_peers=peer_udp_addresses,
+                wal_data_dir=node_directory,
+                # A restarted manager returns at the same address; its persisted
+                # incarnation keeps peers from refusing it as a zombie.
+                incarnation_storage_dir=str(node_directory / "incarnation"),
+                raft_store=raft_store,
+            )
 
-        except BaseException:
-            await manager.abort_and_wait(timeout=shutdown_timeout_sec)
-            raise
-
-        try:
-            with ShutdownSignals(asyncio.current_task()):
-                await manager.wait()
-
-        except (
-                KeyboardInterrupt,
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-        ):
-                await drain_cluster_membership(manager, shutdown_timeout_sec)
-                await manager.abort_and_wait(
-                    timeout=shutdown_timeout_sec,
-                )
+            await run_node_until_stopped(
+                manager,
+                functools.partial(manager.start, timeout=start_timeout_sec),
+                NodeDashboard(
+                    ManagerDashboardReader(manager),
+                    manager,
+                    terminal_mode,
+                    env,
+                    log_path,
+                    NodeDashboardConfig(),
+                    Logger(),
+                ),
+                drain_before_stop=True,
+                shutdown_timeout_seconds=shutdown_timeout_sec,
+            )

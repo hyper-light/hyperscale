@@ -167,6 +167,33 @@ You have officially created and run your first workflow!
 ___________
 
 
+## <b>Cluster security</b>
+
+Every message between Hyperscale processes is authenticated and encrypted (AES-256-GCM) with a key derived from one shared secret, and workflows travel between processes as code. Whoever knows the secret can run code on every node, so Hyperscale has no default secret and refuses a weak one.
+
+- __Local runs__ (`hyperscale run <test>.py`) need no configuration: each run generates a random secret (`secrets.token_urlsafe(32)`) and shares it only with the worker processes it starts. If `MERCURY_SYNC_AUTH_SECRET` is set, the run uses it instead.
+- __Cluster nodes and commands__ (`hyperscale run worker|manager|gate`, `hyperscale run workflow --managers/--gates`, `hyperscale cluster`, `join`, `remove`, `resize`, `membership`, `job status|cancel`) take the secret from, in order:
+  1. the `--acm-secret` flag,
+  2. the `MERCURY_SYNC_AUTH_SECRET` environment variable,
+  3. the per-user __cluster cookie__, created on first use (as Erlang's `~/.erlang.cookie` is) with 32 random bytes, readable by its owner only (mode 0600):
+     - Linux, macOS and other POSIX systems: `$XDG_CONFIG_HOME/hyperscale/cluster_cookie`, or `~/.config/hyperscale/cluster_cookie` when `XDG_CONFIG_HOME` is unset.
+     - Windows: `%APPDATA%\hyperscale\cluster_cookie`.
+
+  All the nodes one user starts on one host therefore share a secret with no configuration. For a cluster that spans hosts or users, give every node the same secret: set `MERCURY_SYNC_AUTH_SECRET`, pass `--acm-secret`, or copy one cookie to each host (keeping mode 0600).
+
+Generate a strong secret with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+A secret shorter than 16 characters, or a known weak or default value such as `hyperscale-secret`, is refused whatever `HYPERSCALE_ENV` is set to. The same rules apply to `MERCURY_SYNC_AUTH_SECRET_PREVIOUS`, which keeps the previous secret valid for decryption while the nodes rotate to a new one. Hyperscale also refuses a cluster cookie that its group or other users can access (fix it with `chmod 600 <path>`). If the cookie can't be created or read, for example because there is no home directory or the filesystem is read-only, the command exits and tells you to set `MERCURY_SYNC_AUTH_SECRET` or pass `--acm-secret`. It never runs without a secret.
+
+<br/>
+
+___________
+
+
 ## <b>Running in Docker</b>
 
 Hyperscale offers a Docker image that allows you to create and run tests in any Docker compatible environment. To run the Hyperscale Docker image run:

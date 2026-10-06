@@ -32,6 +32,7 @@ from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.manager.config import create_manager_config_from_env
 from hyperscale.distributed.raft.raft_node import ELECTION_TIMEOUT_MAX
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
     BOOT_TIMEOUT_SECONDS,
     LOCALHOST,
     NODE_BLOCK,
@@ -43,7 +44,7 @@ from tests.integration.cli.node_processes import (
     run_remove,
 )
 
-ENV = Env()
+ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
 DATACENTER = "dc-departures"
 COHORT_SIZE = 3
 CLIENT_BLOCK = 2  # `hyperscale remove` client tcp + its udp (port + 1)

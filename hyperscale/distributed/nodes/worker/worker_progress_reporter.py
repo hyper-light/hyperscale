@@ -4,6 +4,7 @@
 from typing import TYPE_CHECKING
 import asyncio
 from collections import deque
+from collections.abc import Iterator
 from hyperscale.distributed.models import (
     RateLimitResponse,
     WorkflowFinalResult,
@@ -21,6 +22,7 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerError, ServerWarning
 from hyperscale.distributed.runtime import Clock, RealClock, SendTcp, RunTask
+from hyperscale.distributed.swim.core import ErrorStats
 
 from .pending_result import PendingResult
 
@@ -125,14 +127,47 @@ class WorkerProgressReporter:
             return
 
         primary_id = self._registry._primary_manager_id
-        if primary_id and self._registry.is_circuit_open(primary_id):
+        if self._is_primary_circuit_open(primary_id):
             return
 
-        circuit = (
-            self._registry.get_or_create_circuit(primary_id)
-            if primary_id
+        await self._send_progress_with_retries(
+            progress,
+            send_tcp,
+            manager_addr,
+            primary_id,
+            node_host,
+            node_port,
+            node_id_short,
+            max_retries,
+            base_delay,
+        )
+
+    def _is_primary_circuit_open(self, primary_id: str | None) -> bool:
+        """Whether the known primary manager's circuit is open."""
+        return bool(primary_id) and self._registry.is_circuit_open(primary_id)
+
+    def _circuit_for_manager(self, manager_id: str | None, manager_addr: tuple[str, int]) -> ErrorStats:
+        """The circuit of ``manager_id`` when known, else of ``manager_addr``."""
+        return (
+            self._registry.get_or_create_circuit(manager_id)
+            if manager_id
             else self._registry.get_or_create_circuit_by_addr(manager_addr)
         )
+
+    async def _send_progress_with_retries(
+        self,
+        progress: WorkflowProgress,
+        send_tcp: SendTcp,
+        manager_addr: tuple[str, int],
+        primary_id: str | None,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        max_retries: int,
+        base_delay: float,
+    ) -> None:
+        """Send progress to the primary under retry with backoff, accounting the outcome on its circuit."""
+        circuit = self._circuit_for_manager(primary_id, manager_addr)
 
         retry_config = RetryConfig(
             max_attempts=max_retries + 1,
@@ -158,22 +193,39 @@ class WorkerProgressReporter:
             await executor.execute(attempt_send, "progress_update")
             circuit.record_success()
         except Exception as send_error:
-            record_circuit, category = _classify_send_error(send_error)
-            if record_circuit:
-                circuit.record_error()
-            if self._logger:
-                log_model = ServerError if category == "local_bug" else ServerWarning
-                await self._logger.log(
-                    log_model(
-                        message=(
-                            f"Failed to send progress update [{category}]: "
-                            f"{type(send_error).__name__}: {send_error}"
-                        ),
-                        node_host=node_host,
-                        node_port=node_port,
-                        node_id=node_id_short,
-                    )
+            await self._report_direct_progress_failure(
+                circuit,
+                send_error,
+                node_host,
+                node_port,
+                node_id_short,
+            )
+
+    async def _report_direct_progress_failure(
+        self,
+        circuit: ErrorStats,
+        send_error: Exception,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Count a failed direct progress send against the circuit when the peer's fault, and log it."""
+        record_circuit, category = _classify_send_error(send_error)
+        if record_circuit:
+            circuit.record_error()
+        if self._logger:
+            log_model = _SEND_FAILURE_LOG_MODELS.get(category, ServerWarning)
+            await self._logger.log(
+                log_model(
+                    message=(
+                        f"Failed to send progress update [{category}]: "
+                        f"{type(send_error).__name__}: {send_error}"
+                    ),
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
                 )
+            )
 
     async def send_progress_to_job_leader(
         self,
@@ -203,41 +255,105 @@ class WorkerProgressReporter:
         job_leader_addr = self._state.get_workflow_job_leader(workflow_id)
 
         # Try job leader first
-        if job_leader_addr:
-            success = await self._try_send_to_addr(
-                progress, job_leader_addr, send_tcp, workflow_id
-            )
-            if success:
-                return True
-
-            if self._logger:
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"Job leader {job_leader_addr} failed for workflow {workflow_id[:16]}..., discovering new leader",
-                        node_host=node_host,
-                        node_port=node_port,
-                        node_id=node_id_short,
-                    )
-                )
+        if await self._try_send_progress_to_job_leader(
+            progress,
+            job_leader_addr,
+            send_tcp,
+            workflow_id,
+            node_host,
+            node_port,
+            node_id_short,
+        ):
+            return True
 
         # Try other healthy managers
+        return await self._try_send_progress_to_fallbacks(
+            progress,
+            job_leader_addr,
+            send_tcp,
+            workflow_id,
+        )
+
+    async def _try_send_progress_to_job_leader(
+        self,
+        progress: WorkflowProgress,
+        job_leader_addr: tuple[str, int] | None,
+        send_tcp: SendTcp,
+        workflow_id: str,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> bool:
+        """Send progress to the workflow's known job leader; log when it fails."""
+        if not job_leader_addr:
+            return False
+
+        if await self._try_send_to_addr(progress, job_leader_addr, send_tcp, workflow_id):
+            return True
+
+        await self._log_job_leader_failed(job_leader_addr, workflow_id, node_host, node_port, node_id_short)
+        return False
+
+    async def _log_job_leader_failed(
+        self,
+        job_leader_addr: tuple[str, int],
+        workflow_id: str,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log that the job leader failed a progress send, so a new leader is sought."""
+        if self._logger:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Job leader {job_leader_addr} failed for workflow {workflow_id[:16]}..., discovering new leader",
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                )
+            )
+
+    def _healthy_manager_addresses(self) -> Iterator[tuple[str, tuple[str, int]]]:
+        """Yield ``(manager_id, tcp_addr)`` for each known healthy manager, snapshotting the healthy set first."""
         for manager_id in list(self._registry._healthy_manager_ids):
             if manager := self._registry.get_manager(manager_id):
-                manager_addr = (manager.tcp_host, manager.tcp_port)
+                yield manager_id, (manager.tcp_host, manager.tcp_port)
 
-                if manager_addr == job_leader_addr:
-                    continue
-
-                if self._registry.is_circuit_open(manager_id):
-                    continue
-
-                success = await self._try_send_to_addr(
-                    progress, manager_addr, send_tcp, workflow_id
-                )
-                if success:
-                    return True
+    async def _try_send_progress_to_fallbacks(
+        self,
+        progress: WorkflowProgress,
+        job_leader_addr: tuple[str, int] | None,
+        send_tcp: SendTcp,
+        workflow_id: str,
+    ) -> bool:
+        """Send progress to the first healthy manager other than the job leader that takes it."""
+        for manager_id, manager_addr in self._healthy_manager_addresses():
+            if await self._try_send_progress_to_fallback(
+                progress,
+                manager_id,
+                manager_addr,
+                job_leader_addr,
+                send_tcp,
+                workflow_id,
+            ):
+                return True
 
         return False
+
+    async def _try_send_progress_to_fallback(
+        self,
+        progress: WorkflowProgress,
+        manager_id: str,
+        manager_addr: tuple[str, int],
+        job_leader_addr: tuple[str, int] | None,
+        send_tcp: SendTcp,
+        workflow_id: str,
+    ) -> bool:
+        """Send progress to one fallback manager, skipping the job leader and an open circuit."""
+        if manager_addr == job_leader_addr or self._registry.is_circuit_open(manager_id):
+            return False
+
+        return await self._try_send_to_addr(progress, manager_addr, send_tcp, workflow_id)
 
     async def _try_send_to_addr(
         self,
@@ -262,6 +378,17 @@ class WorkerProgressReporter:
         if self._is_refusing(manager_addr):
             return True
 
+        return await self._send_progress_to_addr(progress, manager_addr, send_tcp, workflow_id, circuit)
+
+    async def _send_progress_to_addr(
+        self,
+        progress: WorkflowProgress,
+        manager_addr: tuple[str, int],
+        send_tcp: SendTcp,
+        workflow_id: str,
+        circuit: ErrorStats,
+    ) -> bool:
+        """Send progress to ``manager_addr`` once, accounting the answer on its circuit."""
         try:
             response, _ = await send_tcp(
                 manager_addr,
@@ -273,31 +400,50 @@ class WorkerProgressReporter:
             if isinstance(response, Exception):
                 raise response
 
-            if self._accept_response(manager_addr, response, workflow_id):
-                circuit.record_success()
-                return True
-
-            circuit.record_error()
-            return False
+            return self._settle_progress_response(manager_addr, response, workflow_id, circuit)
 
         except Exception as error:
-            record_circuit, category = _classify_send_error(error)
-            if record_circuit:
-                circuit.record_error()
-            if self._logger:
-                log_model = ServerError if category == "local_bug" else ServerDebug
-                await self._logger.log(
-                    log_model(
-                        message=(
-                            f"Progress send to {manager_addr} failed [{category}]: "
-                            f"{type(error).__name__}: {error}"
-                        ),
-                        node_host="worker",
-                        node_port=0,
-                        node_id="worker",
-                    )
+            return await self._report_progress_send_failure(manager_addr, error, circuit)
+
+    def _settle_progress_response(
+        self,
+        manager_addr: tuple[str, int],
+        response: bytes | None,
+        workflow_id: str,
+        circuit: ErrorStats,
+    ) -> bool:
+        """Record a progress answer on the circuit: success when accepted, an error otherwise."""
+        if self._accept_response(manager_addr, response, workflow_id):
+            circuit.record_success()
+            return True
+
+        circuit.record_error()
+        return False
+
+    async def _report_progress_send_failure(
+        self,
+        manager_addr: tuple[str, int],
+        error: Exception,
+        circuit: ErrorStats,
+    ) -> bool:
+        """Count a failed progress send against the circuit when the peer's fault, and log it; always False."""
+        record_circuit, category = _classify_send_error(error)
+        if record_circuit:
+            circuit.record_error()
+        if self._logger:
+            log_model = _SEND_FAILURE_LOG_MODELS.get(category, ServerDebug)
+            await self._logger.log(
+                log_model(
+                    message=(
+                        f"Progress send to {manager_addr} failed [{category}]: "
+                        f"{type(error).__name__}: {error}"
+                    ),
+                    node_host="worker",
+                    node_port=0,
+                    node_id="worker",
                 )
-            return False
+            )
+        return False
 
     async def send_final_result(
         self,
@@ -329,132 +475,57 @@ class WorkerProgressReporter:
         target_addrs, seen_addrs = self._final_result_targets(final_result)
 
         if not target_addrs:
-            if self._logger:
-                task_runner_run(
-                    self._logger.log,
-                    ServerWarning(
-                        message=(
-                            f"Cannot send final result for {final_result.workflow_id}: "
-                            "no healthy managers"
-                        ),
-                        node_host=node_host,
-                        node_port=node_port,
-                        node_id=node_id_short,
-                    ),
-                )
+            self._log_no_final_result_targets(final_result, node_host, node_port, node_id_short, task_runner_run)
             return
 
-        async def send_once(
-            manager_addr: tuple[str, int],
-        ) -> tuple[bool, tuple[str, int] | None, str | None]:
-            response, _ = await send_tcp(
-                manager_addr,
-                "workflow_final_result",
-                final_result.dump(),
-                timeout=self._config.tcp_timeout_standard_seconds,
-            )
-            if isinstance(response, Exception):
-                raise response
-            if not response or not isinstance(response, bytes):
-                raise ConnectionError("Invalid empty response")
-            if response == b"ok":
-                return True, None, None
-            if response == b"error":
-                return False, None, "error response"
-
-            # An AD-24 refusal: the manager asks for the result again after
-            # its retry-after -- backpressure from a live manager, not an
-            # answer about the result (and not an ack to read).
-            if (refused_until := self._note_refusal(manager_addr, response)) is not None:
-                return False, None, f"rate limited until {refused_until:.3f}"
-
-            ack = WorkflowFinalResultAck.load(response)
-            settled, leader_addr = self._take_final_result_ack(final_result.workflow_id, ack)
-            if settled:
-                return True, leader_addr, None
-            return False, leader_addr, ack.error or ack.reason or "not accepted"
-
-        target_index = 0
-        while target_index < len(target_addrs):
-            manager_id, manager_addr = target_addrs[target_index]
-            target_index += 1
-
-            if manager_id and self._registry.is_circuit_open(manager_id):
-                continue
-
-            circuit = (
-                self._registry.get_or_create_circuit(manager_id)
-                if manager_id
-                else self._registry.get_or_create_circuit_by_addr(manager_addr)
-            )
-
-            for attempt in range(max_retries + 1):
-                try:
-                    accepted, redirect_addr, error_message = await send_once(
-                        manager_addr
-                    )
-                    if accepted:
-                        circuit.record_success()
-
-                        if self._logger:
-                            task_runner_run(
-                                self._logger.log,
-                                ServerDebug(
-                                    message=(
-                                        f"Sent final result for {final_result.workflow_id} "
-                                        f"status={final_result.status}"
-                                    ),
-                                    node_host=node_host,
-                                    node_port=node_port,
-                                    node_id=node_id_short,
-                                ),
-                            )
-                        return
-
-                    self._insert_redirect(target_addrs, seen_addrs, target_index, redirect_addr)
-                    if self._logger:
-                        await self._logger.log(
-                            ServerDebug(
-                                message=(
-                                    f"Final result rejected by {manager_addr}: "
-                                    f"{error_message or 'not accepted'}"
-                                ),
-                                node_host=node_host,
-                                node_port=node_port,
-                                node_id=node_id_short,
-                            )
-                        )
-                    break
-
-                except Exception as err:
-                    record_circuit, category = _classify_send_error(err)
-                    if record_circuit:
-                        circuit.record_error()
-                    if attempt < max_retries:
-                        delay = min(
-                            base_delay * (2**attempt),
-                            base_delay * (2**max_retries),
-                        )
-                        await _DEFAULT_CLOCK.sleep(
-                            delay
-                        )
-                        continue
-                    if self._logger:
-                        await self._logger.log(
-                            ServerError(
-                                message=(
-                                    "Failed to send final result for "
-                                    f"{final_result.workflow_id} to {manager_addr} "
-                                    f"[{category}]: {type(err).__name__}: {err}"
-                                ),
-                                node_host=node_host,
-                                node_port=node_port,
-                                node_id=node_id_short,
-                            )
-                        )
-                    break
+        if await self._deliver_final_result(
+            final_result,
+            send_tcp,
+            target_addrs,
+            seen_addrs,
+            node_host,
+            node_port,
+            node_id_short,
+            task_runner_run,
+            max_retries,
+            base_delay,
+        ):
+            return
 
         self._enqueue_pending_result(final_result)
+        await self._log_final_result_queued(final_result, node_host, node_port, node_id_short)
+
+    def _log_no_final_result_targets(
+        self,
+        final_result: WorkflowFinalResult,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: RunTask,
+    ) -> None:
+        """Log that a final result has no healthy manager to go to."""
+        if self._logger:
+            task_runner_run(
+                self._logger.log,
+                ServerWarning(
+                    message=(
+                        f"Cannot send final result for {final_result.workflow_id}: "
+                        "no healthy managers"
+                    ),
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                ),
+            )
+
+    async def _log_final_result_queued(
+        self,
+        final_result: WorkflowFinalResult,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log that an undelivered final result was queued for background retry."""
         if self._logger:
             await self._logger.log(
                 ServerWarning(
@@ -468,6 +539,339 @@ class WorkerProgressReporter:
                     node_id=node_id_short,
                 )
             )
+
+    async def _deliver_final_result(
+        self,
+        final_result: WorkflowFinalResult,
+        send_tcp: SendTcp,
+        target_addrs: list[tuple[str | None, tuple[str, int]]],
+        seen_addrs: set[tuple[str, int]],
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: RunTask,
+        max_retries: int,
+        base_delay: float,
+    ) -> bool:
+        """Offer a final result to each target in turn (redirects inserted next); whether one took it."""
+        target_index = 0
+        while target_index < len(target_addrs):
+            manager_id, manager_addr = target_addrs[target_index]
+            target_index += 1
+
+            if await self._deliver_final_result_to(
+                final_result,
+                send_tcp,
+                target_addrs,
+                seen_addrs,
+                target_index,
+                manager_id,
+                manager_addr,
+                node_host,
+                node_port,
+                node_id_short,
+                task_runner_run,
+                max_retries,
+                base_delay,
+            ):
+                return True
+
+        return False
+
+    async def _deliver_final_result_to(
+        self,
+        final_result: WorkflowFinalResult,
+        send_tcp: SendTcp,
+        target_addrs: list[tuple[str | None, tuple[str, int]]],
+        seen_addrs: set[tuple[str, int]],
+        target_index: int,
+        manager_id: str | None,
+        manager_addr: tuple[str, int],
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: RunTask,
+        max_retries: int,
+        base_delay: float,
+    ) -> bool:
+        """Offer a final result to one manager, skipping an open circuit; whether it took it."""
+        if manager_id and self._registry.is_circuit_open(manager_id):
+            return False
+
+        return await self._attempt_final_result_delivery(
+            final_result,
+            send_tcp,
+            target_addrs,
+            seen_addrs,
+            target_index,
+            manager_addr,
+            self._circuit_for_manager(manager_id, manager_addr),
+            node_host,
+            node_port,
+            node_id_short,
+            task_runner_run,
+            max_retries,
+            base_delay,
+        )
+
+    async def _attempt_final_result_delivery(
+        self,
+        final_result: WorkflowFinalResult,
+        send_tcp: SendTcp,
+        target_addrs: list[tuple[str | None, tuple[str, int]]],
+        seen_addrs: set[tuple[str, int]],
+        target_index: int,
+        manager_addr: tuple[str, int],
+        circuit: ErrorStats,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: RunTask,
+        max_retries: int,
+        base_delay: float,
+    ) -> bool:
+        """Send a final result to one manager up to ``max_retries + 1`` times; whether it took it."""
+        for attempt in range(max_retries + 1):
+            if (
+                outcome := await self._final_result_attempt(
+                    final_result,
+                    send_tcp,
+                    target_addrs,
+                    seen_addrs,
+                    target_index,
+                    manager_addr,
+                    circuit,
+                    attempt,
+                    node_host,
+                    node_port,
+                    node_id_short,
+                    task_runner_run,
+                    max_retries,
+                    base_delay,
+                )
+            ) is not None:
+                return outcome
+
+        return False
+
+    async def _final_result_attempt(
+        self,
+        final_result: WorkflowFinalResult,
+        send_tcp: SendTcp,
+        target_addrs: list[tuple[str | None, tuple[str, int]]],
+        seen_addrs: set[tuple[str, int]],
+        target_index: int,
+        manager_addr: tuple[str, int],
+        circuit: ErrorStats,
+        attempt: int,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: RunTask,
+        max_retries: int,
+        base_delay: float,
+    ) -> bool | None:
+        """One send of a final result: True when taken, False to move on, None to retry after backoff."""
+        try:
+            accepted, redirect_addr, error_message = await self._send_final_result_once(
+                final_result,
+                send_tcp,
+                manager_addr,
+            )
+            if accepted:
+                circuit.record_success()
+                self._log_final_result_sent(final_result, node_host, node_port, node_id_short, task_runner_run)
+                return True
+
+            self._insert_redirect(target_addrs, seen_addrs, target_index, redirect_addr)
+            await self._log_final_result_rejected(manager_addr, error_message, node_host, node_port, node_id_short)
+            return False
+
+        except Exception as err:
+            return await self._handle_final_result_send_error(
+                final_result,
+                manager_addr,
+                circuit,
+                err,
+                attempt,
+                node_host,
+                node_port,
+                node_id_short,
+                max_retries,
+                base_delay,
+            )
+
+    def _log_final_result_sent(
+        self,
+        final_result: WorkflowFinalResult,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: RunTask,
+    ) -> None:
+        """Log a delivered final result."""
+        if self._logger:
+            task_runner_run(
+                self._logger.log,
+                ServerDebug(
+                    message=(
+                        f"Sent final result for {final_result.workflow_id} "
+                        f"status={final_result.status}"
+                    ),
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                ),
+            )
+
+    async def _log_final_result_rejected(
+        self,
+        manager_addr: tuple[str, int],
+        error_message: str | None,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log a manager's refusal of a final result."""
+        if self._logger:
+            await self._logger.log(
+                ServerDebug(
+                    message=(
+                        f"Final result rejected by {manager_addr}: "
+                        f"{error_message or 'not accepted'}"
+                    ),
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                )
+            )
+
+    async def _handle_final_result_send_error(
+        self,
+        final_result: WorkflowFinalResult,
+        manager_addr: tuple[str, int],
+        circuit: ErrorStats,
+        err: Exception,
+        attempt: int,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        max_retries: int,
+        base_delay: float,
+    ) -> bool | None:
+        """Account a failed final-result send; back off and retry (None) while attempts remain, else False."""
+        record_circuit, category = _classify_send_error(err)
+        if record_circuit:
+            circuit.record_error()
+        if attempt < max_retries:
+            delay = min(
+                base_delay * (2**attempt),
+                base_delay * (2**max_retries),
+            )
+            await _DEFAULT_CLOCK.sleep(
+                delay
+            )
+            return None
+        await self._log_final_result_send_failure(
+            final_result,
+            manager_addr,
+            category,
+            err,
+            node_host,
+            node_port,
+            node_id_short,
+        )
+        return False
+
+    async def _log_final_result_send_failure(
+        self,
+        final_result: WorkflowFinalResult,
+        manager_addr: tuple[str, int],
+        category: str,
+        err: Exception,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log a final result that failed its last attempt at a manager."""
+        if self._logger:
+            await self._logger.log(
+                ServerError(
+                    message=(
+                        "Failed to send final result for "
+                        f"{final_result.workflow_id} to {manager_addr} "
+                        f"[{category}]: {type(err).__name__}: {err}"
+                    ),
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                )
+            )
+
+    async def _send_final_result_once(
+        self,
+        final_result: WorkflowFinalResult,
+        send_tcp: SendTcp,
+        manager_addr: tuple[str, int],
+    ) -> tuple[bool, tuple[str, int] | None, str | None]:
+        """Send a final result once: ``(accepted, leader it redirects to, error)``; raises on a transport error."""
+        response, _ = await send_tcp(
+            manager_addr,
+            "workflow_final_result",
+            final_result.dump(),
+            timeout=self._config.tcp_timeout_standard_seconds,
+        )
+        if isinstance(response, Exception):
+            raise response
+        return self._read_final_result_response(final_result, manager_addr, response)
+
+    def _read_final_result_response(
+        self,
+        final_result: WorkflowFinalResult,
+        manager_addr: tuple[str, int],
+        response: bytes | None,
+    ) -> tuple[bool, tuple[str, int] | None, str | None]:
+        """Read a manager's answer to a final result; ConnectionError when it is empty."""
+        if not response or not isinstance(response, bytes):
+            raise ConnectionError("Invalid empty response")
+        return self._read_final_result_answer(final_result, manager_addr, response)
+
+    def _read_final_result_answer(
+        self,
+        final_result: WorkflowFinalResult,
+        manager_addr: tuple[str, int],
+        response: bytes,
+    ) -> tuple[bool, tuple[str, int] | None, str | None]:
+        """Read a legacy ``ok``/``error`` answer, else an AD-24 refusal or an ack."""
+        if response == b"ok":
+            return True, None, None
+        if response == b"error":
+            return False, None, "error response"
+        return self._read_final_result_ack(final_result, manager_addr, response)
+
+    def _read_final_result_ack(
+        self,
+        final_result: WorkflowFinalResult,
+        manager_addr: tuple[str, int],
+        response: bytes,
+    ) -> tuple[bool, tuple[str, int] | None, str | None]:
+        """Read an AD-24 refusal or a final-result ack."""
+        # An AD-24 refusal: the manager asks for the result again after
+        # its retry-after -- backpressure from a live manager, not an
+        # answer about the result (and not an ack to read).
+        if (refused_until := self._note_refusal(manager_addr, response)) is not None:
+            return False, None, f"rate limited until {refused_until:.3f}"
+
+        ack = WorkflowFinalResultAck.load(response)
+        settled, leader_addr = self._take_final_result_ack(final_result.workflow_id, ack)
+        if settled:
+            return True, leader_addr, None
+        return False, leader_addr, self._final_result_rejection_reason(ack)
+
+    @staticmethod
+    def _final_result_rejection_reason(ack: WorkflowFinalResultAck) -> str:
+        """Why an ack did not settle a final result."""
+        return ack.error or ack.reason or "not accepted"
 
     async def send_cancellation_complete(
         self,
@@ -510,58 +914,154 @@ class WorkerProgressReporter:
 
         job_leader_addr = self._state.get_workflow_job_leader(workflow_id)
 
+        if await self._push_cancellation_to_job_leader(
+            completion,
+            job_leader_addr,
+            send_tcp,
+            node_host,
+            node_port,
+            node_id_short,
+        ) or await self._push_cancellation_to_fallbacks(
+            completion,
+            job_leader_addr,
+            send_tcp,
+            node_host,
+            node_port,
+            node_id_short,
+        ):
+            return
+
+        await self._log_cancellation_unreachable(workflow_id, node_host, node_port, node_id_short)
+
+    async def _push_cancellation_to_job_leader(
+        self,
+        completion: WorkflowCancellationComplete,
+        job_leader_addr: tuple[str, int] | None,
+        send_tcp: SendTcp,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> bool:
+        """Push a cancellation completion to the workflow's job leader, when one is known."""
         if job_leader_addr:
-            try:
-                response, _ = await send_tcp(
-                    job_leader_addr,
-                    "workflow_cancellation_complete",
-                    completion.dump(),
-                    timeout=self._config.tcp_timeout_standard_seconds,
+            return await self._push_cancellation_completion(
+                completion,
+                job_leader_addr,
+                "job leader",
+                send_tcp,
+                node_host,
+                node_port,
+                node_id_short,
+            )
+        return False
+
+    async def _push_cancellation_to_fallbacks(
+        self,
+        completion: WorkflowCancellationComplete,
+        job_leader_addr: tuple[str, int] | None,
+        send_tcp: SendTcp,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> bool:
+        """Push a cancellation completion to the first healthy manager other than the job leader that takes it."""
+        for _, manager_addr in self._healthy_manager_addresses():
+            if await self._push_cancellation_to_fallback(
+                completion,
+                manager_addr,
+                job_leader_addr,
+                send_tcp,
+                node_host,
+                node_port,
+                node_id_short,
+            ):
+                return True
+
+        return False
+
+    async def _push_cancellation_to_fallback(
+        self,
+        completion: WorkflowCancellationComplete,
+        manager_addr: tuple[str, int],
+        job_leader_addr: tuple[str, int] | None,
+        send_tcp: SendTcp,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> bool:
+        """Push a cancellation completion to one fallback manager, skipping the job leader."""
+        if manager_addr == job_leader_addr:
+            return False
+
+        return await self._push_cancellation_completion(
+            completion,
+            manager_addr,
+            "fallback manager",
+            send_tcp,
+            node_host,
+            node_port,
+            node_id_short,
+        )
+
+    async def _push_cancellation_completion(
+        self,
+        completion: WorkflowCancellationComplete,
+        manager_addr: tuple[str, int],
+        target_label: str,
+        send_tcp: SendTcp,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> bool:
+        """Send a cancellation completion to ``manager_addr``; whether it went, logging a failure."""
+        try:
+            response, _ = await send_tcp(
+                manager_addr,
+                "workflow_cancellation_complete",
+                completion.dump(),
+                timeout=self._config.tcp_timeout_standard_seconds,
+            )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
+            return True
+        except Exception as cancel_error:
+            await self._log_cancellation_send_failure(
+                target_label,
+                cancel_error,
+                node_host,
+                node_port,
+                node_id_short,
+            )
+            return False
+
+    async def _log_cancellation_send_failure(
+        self,
+        target_label: str,
+        cancel_error: Exception,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log a cancellation completion that failed to reach the ``target_label`` manager."""
+        if self._logger:
+            await self._logger.log(
+                ServerDebug(
+                    message=f"Failed to send cancellation to {target_label}: {cancel_error}",
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
                 )
-                # send_tcp returns transport errors rather than raising.
-                if isinstance(response, Exception):
-                    raise response
-                return
-            except Exception as cancel_error:
-                if self._logger:
-                    await self._logger.log(
-                        ServerDebug(
-                            message=f"Failed to send cancellation to job leader: {cancel_error}",
-                            node_host=node_host,
-                            node_port=node_port,
-                            node_id=node_id_short,
-                        )
-                    )
+            )
 
-        for manager_id in list(self._registry._healthy_manager_ids):
-            if manager := self._registry.get_manager(manager_id):
-                manager_addr = (manager.tcp_host, manager.tcp_port)
-                if manager_addr == job_leader_addr:
-                    continue
-
-                try:
-                    response, _ = await send_tcp(
-                        manager_addr,
-                        "workflow_cancellation_complete",
-                        completion.dump(),
-                        timeout=self._config.tcp_timeout_standard_seconds,
-                    )
-                    # send_tcp returns transport errors rather than raising.
-                    if isinstance(response, Exception):
-                        raise response
-                    return
-                except Exception as fallback_error:
-                    if self._logger:
-                        await self._logger.log(
-                            ServerDebug(
-                                message=f"Failed to send cancellation to fallback manager: {fallback_error}",
-                                node_host=node_host,
-                                node_port=node_port,
-                                node_id=node_id_short,
-                            )
-                        )
-                    continue
-
+    async def _log_cancellation_unreachable(
+        self,
+        workflow_id: str,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log a cancellation completion no manager could be reached for."""
         if self._logger:
             await self._logger.log(
                 ServerWarning(
@@ -598,7 +1098,7 @@ class WorkerProgressReporter:
         sending to that manager until its retry-after passes -- not a
         failure to fail over from. False for no answer or an error.
         """
-        if not response or not isinstance(response, bytes) or response == b"error":
+        if self._is_unusable_answer(response):
             return False
 
         if self._note_refusal(manager_addr, response) is not None:
@@ -606,6 +1106,11 @@ class WorkerProgressReporter:
 
         self._process_ack(response, workflow_id)
         return True
+
+    @staticmethod
+    def _is_unusable_answer(response: bytes | Exception | None) -> bool:
+        """Whether a manager's answer is missing, not bytes, or the legacy ``error``."""
+        return not response or not isinstance(response, bytes) or response == b"error"
 
     def _process_ack(
         self,
@@ -623,47 +1128,74 @@ class WorkerProgressReporter:
         """
         try:
             ack = WorkflowProgressAck.load(data)
-
-            # Update primary manager if leadership changed
-            if ack.is_leader and self._registry._primary_manager_id != ack.manager_id:
-                self._registry.set_primary_manager(ack.manager_id)
-
-            job_leader_addr = ack.job_leader_addr
-            if isinstance(job_leader_addr, list):
-                job_leader_addr = tuple(job_leader_addr)
-
-            # Update job leader routing
-            if workflow_id and job_leader_addr:
-                current_leader = self._state.get_workflow_job_leader(workflow_id)
-                if current_leader != job_leader_addr:
-                    self._state.set_workflow_job_leader(workflow_id, job_leader_addr)
-
-            # Handle backpressure signal (AD-23)
-            if ack.backpressure_level > 0:
-                signal = BackpressureSignal(
-                    level=BackpressureLevel(ack.backpressure_level),
-                    suggested_delay_ms=ack.backpressure_delay_ms,
-                    batch_only=ack.backpressure_batch_only,
-                )
-                self._state.set_manager_backpressure(ack.manager_id, signal.level)
-                self._state.set_backpressure_delay_ms(
-                    max(
-                        self._state.get_backpressure_delay_ms(),
-                        signal.suggested_delay_ms,
-                    )
-                )
+            self._apply_progress_ack(ack, workflow_id)
 
         except Exception as error:
-            if data != b"ok" and self._logger and self._task_runner_run:
-                self._task_runner_run(
-                    self._logger.log,
-                    ServerDebug(
-                        message=f"ACK parse failed (non-legacy payload): {error}",
-                        node_host="worker",
-                        node_port=0,
-                        node_id="worker",
-                    ),
+            self._log_unparsed_progress_ack(data, error)
+
+    def _apply_progress_ack(self, ack: WorkflowProgressAck, workflow_id: str | None) -> None:
+        """Apply an ack's primary-manager change, job-leader routing and AD-23 backpressure."""
+        # Update primary manager if leadership changed
+        if ack.is_leader and self._registry._primary_manager_id != ack.manager_id:
+            self._registry.set_primary_manager(ack.manager_id)
+
+        self._route_job_leader_from_ack(ack, workflow_id)
+        self._apply_ack_backpressure(ack)
+
+    def _route_job_leader_from_ack(self, ack: WorkflowProgressAck, workflow_id: str | None) -> None:
+        """Route the workflow to the job leader an ack names."""
+        job_leader_addr = self._ack_job_leader_addr(ack)
+
+        # Update job leader routing
+        if workflow_id and job_leader_addr:
+            self._update_workflow_job_leader(workflow_id, job_leader_addr)
+
+    @staticmethod
+    def _ack_job_leader_addr(ack: WorkflowProgressAck) -> tuple[str, int] | None:
+        """The job leader an ack names, as a tuple (wire lists converted)."""
+        job_leader_addr = ack.job_leader_addr
+        return tuple(job_leader_addr) if isinstance(job_leader_addr, list) else job_leader_addr
+
+    def _update_workflow_job_leader(self, workflow_id: str, job_leader_addr: tuple[str, int]) -> None:
+        """Record ``job_leader_addr`` as the workflow's job leader when it changed."""
+        current_leader = self._state.get_workflow_job_leader(workflow_id)
+        if current_leader != job_leader_addr:
+            self._state.set_workflow_job_leader(workflow_id, job_leader_addr)
+
+    def _apply_ack_backpressure(self, ack: WorkflowProgressAck) -> None:
+        """Apply an ack's backpressure signal (AD-23)."""
+        # Handle backpressure signal (AD-23)
+        if ack.backpressure_level > 0:
+            signal = BackpressureSignal(
+                level=BackpressureLevel(ack.backpressure_level),
+                suggested_delay_ms=ack.backpressure_delay_ms,
+                batch_only=ack.backpressure_batch_only,
+            )
+            self._state.set_manager_backpressure(ack.manager_id, signal.level)
+            self._state.set_backpressure_delay_ms(
+                max(
+                    self._state.get_backpressure_delay_ms(),
+                    signal.suggested_delay_ms,
                 )
+            )
+
+    def _log_unparsed_progress_ack(self, data: bytes, error: Exception) -> None:
+        """Log an ack that failed to parse, unless it is the legacy ``ok``."""
+        if data != b"ok":
+            self._log_ack_parse_failure(error)
+
+    def _log_ack_parse_failure(self, error: Exception) -> None:
+        """Log, through the task runner, an ack payload that failed to parse."""
+        if self._logger and self._task_runner_run:
+            self._task_runner_run(
+                self._logger.log,
+                ServerDebug(
+                    message=f"ACK parse failed (non-legacy payload): {error}",
+                    node_host="worker",
+                    node_port=0,
+                    node_id="worker",
+                ),
+            )
 
     def _enqueue_pending_result(self, final_result: WorkflowFinalResult) -> None:
         now = _DEFAULT_CLOCK.monotonic()
@@ -689,55 +1221,107 @@ class WorkerProgressReporter:
         Should be called periodically from a background loop.
         """
         now = _DEFAULT_CLOCK.monotonic()
-        sent_count = 0
-        expired_count = 0
+        # Results sent or expired.
+        removed_count = 0
         still_pending: list[PendingResult] = []
 
         while self._pending_results:
             pending = self._pending_results.popleft()
-
-            # A result is kept until delivered, not dropped by age: a worker
-            # isolated for longer than any fixed age would lose the job's
-            # output. Attempts happen only while a manager is reachable (the
-            # retry loop runs only then), so the attempt budget and the
-            # pending-result cap bound it; a manager answers a result for a
-            # job that ended stale, which settles it.
-            if pending.retry_count >= self._config.result_max_retries:
-                expired_count += 1
-                if self._logger:
-                    task_runner_run(
-                        self._logger.log,
-                        ServerError(
-                            message=f"Dropped result for {pending.final_result.workflow_id} after {pending.retry_count} retries",
-                            node_host=node_host,
-                            node_port=node_port,
-                            node_id=node_id_short,
-                        ),
-                    )
-                continue
-
-            if now < pending.next_retry_at:
-                still_pending.append(pending)
-                continue
-
-            sent, refused_until = await self._try_send_pending_result(
-                pending.final_result,
+            removed_count += await self._retry_pending_result(
+                pending,
+                now,
+                still_pending,
                 send_tcp,
                 node_host,
                 node_port,
                 node_id_short,
+                task_runner_run,
             )
 
-            if sent:
-                sent_count += 1
-                continue
-            self._reschedule_pending_result(pending, refused_until, now)
+        self._pending_results.extend(still_pending)
+
+        return removed_count
+
+    async def _retry_pending_result(
+        self,
+        pending: PendingResult,
+        now: float,
+        still_pending: list[PendingResult],
+        send_tcp: SendTcp,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: RunTask,
+    ) -> bool:
+        """Drop, defer or resend one pending result; whether it left the queue (sent or expired)."""
+        # A result is kept until delivered, not dropped by age: a worker
+        # isolated for longer than any fixed age would lose the job's
+        # output. Attempts happen only while a manager is reachable (the
+        # retry loop runs only then), so the attempt budget and the
+        # pending-result cap bound it; a manager answers a result for a
+        # job that ended stale, which settles it.
+        if pending.retry_count >= self._config.result_max_retries:
+            self._log_dropped_pending_result(pending, node_host, node_port, node_id_short, task_runner_run)
+            return True
+
+        if now < pending.next_retry_at:
             still_pending.append(pending)
+            return False
 
-        for item in still_pending:
-            self._pending_results.append(item)
+        return await self._resend_pending_result(
+            pending,
+            now,
+            still_pending,
+            send_tcp,
+            node_host,
+            node_port,
+            node_id_short,
+        )
 
-        return sent_count + expired_count
+    def _log_dropped_pending_result(
+        self,
+        pending: PendingResult,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: RunTask,
+    ) -> None:
+        """Log a pending result dropped after spending its attempts."""
+        if self._logger:
+            task_runner_run(
+                self._logger.log,
+                ServerError(
+                    message=f"Dropped result for {pending.final_result.workflow_id} after {pending.retry_count} retries",
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                ),
+            )
+
+    async def _resend_pending_result(
+        self,
+        pending: PendingResult,
+        now: float,
+        still_pending: list[PendingResult],
+        send_tcp: SendTcp,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> bool:
+        """Resend a due pending result; reschedule it when undelivered. Whether it was sent."""
+        sent, refused_until = await self._try_send_pending_result(
+            pending.final_result,
+            send_tcp,
+            node_host,
+            node_port,
+            node_id_short,
+        )
+
+        if sent:
+            return True
+        self._reschedule_pending_result(pending, refused_until, now)
+        still_pending.append(pending)
+        return False
 
     def _reschedule_pending_result(self, pending: PendingResult, refused_until: float | None, now: float) -> None:
         """When an undelivered result goes again. Refused (AD-24) by a live
@@ -782,40 +1366,142 @@ class WorkerProgressReporter:
         while target_index < len(target_addrs):
             manager_id, manager_addr = target_addrs[target_index]
             target_index += 1
-            if manager_id and self._registry.is_circuit_open(manager_id):
-                continue
-            if self._is_refusing(manager_addr):
-                refusals.append(self._refused_until[manager_addr])
-                continue
-            try:
-                response, _ = await send_tcp(
-                    manager_addr,
-                    "workflow_final_result",
-                    final_result.dump(),
-                    timeout=self._config.tcp_timeout_standard_seconds,
-                )
-                if isinstance(response, Exception):
-                    raise response
-                if not response or not isinstance(response, bytes) or response == b"error":
-                    continue
-                if response == b"ok":
-                    self._registry.get_or_create_circuit_by_addr(manager_addr).record_success()
-                    return True, None
-                if (refused_until := self._note_refusal(manager_addr, response)) is not None:
-                    refusals.append(refused_until)
-                    continue
-
-                settled, leader_addr = self._take_final_result_ack(
-                    final_result.workflow_id, WorkflowFinalResultAck.load(response)
-                )
-                self._insert_redirect(target_addrs, seen_addrs, target_index, leader_addr)
-                if settled:
-                    self._registry.get_or_create_circuit_by_addr(manager_addr).record_success()
-                    return True, None
-            except Exception as error:
-                await self._log_pending_result_send_failure(manager_addr, error)
+            if await self._deliver_pending_result_to(
+                final_result,
+                send_tcp,
+                target_addrs,
+                seen_addrs,
+                target_index,
+                manager_id,
+                manager_addr,
+                refusals,
+            ):
+                return True, None
 
         return False, min(refusals, default=None)
+
+    async def _deliver_pending_result_to(
+        self,
+        final_result: WorkflowFinalResult,
+        send_tcp: SendTcp,
+        target_addrs: list[tuple[str | None, tuple[str, int]]],
+        seen_addrs: set[tuple[str, int]],
+        target_index: int,
+        manager_id: str | None,
+        manager_addr: tuple[str, int],
+        refusals: list[float],
+    ) -> bool:
+        """Send a pending result to one target unless skipped; whether it settled there."""
+        if self._skips_pending_result_target(manager_id, manager_addr, refusals):
+            return False
+        try:
+            response, _ = await send_tcp(
+                manager_addr,
+                "workflow_final_result",
+                final_result.dump(),
+                timeout=self._config.tcp_timeout_standard_seconds,
+            )
+            return self._settle_pending_result_response(
+                final_result,
+                target_addrs,
+                seen_addrs,
+                target_index,
+                manager_addr,
+                response,
+                refusals,
+            )
+        except Exception as error:
+            await self._log_pending_result_send_failure(manager_addr, error)
+            return False
+
+    def _skips_pending_result_target(
+        self,
+        manager_id: str | None,
+        manager_addr: tuple[str, int],
+        refusals: list[float],
+    ) -> bool:
+        """Whether a target's circuit is open or it still refuses (AD-24), recording when it takes it again."""
+        if manager_id and self._registry.is_circuit_open(manager_id):
+            return True
+        return self._pending_result_refused(manager_addr, refusals)
+
+    def _pending_result_refused(self, manager_addr: tuple[str, int], refusals: list[float]) -> bool:
+        """Whether ``manager_addr`` still refuses (AD-24); records when it takes requests again."""
+        if self._is_refusing(manager_addr):
+            refusals.append(self._refused_until[manager_addr])
+            return True
+        return False
+
+    def _settle_pending_result_response(
+        self,
+        final_result: WorkflowFinalResult,
+        target_addrs: list[tuple[str | None, tuple[str, int]]],
+        seen_addrs: set[tuple[str, int]],
+        target_index: int,
+        manager_addr: tuple[str, int],
+        response: bytes | Exception | None,
+        refusals: list[float],
+    ) -> bool:
+        """Read a manager's answer to a pending result; raises a returned transport error."""
+        if isinstance(response, Exception):
+            raise response
+        if self._is_unusable_answer(response):
+            return False
+        return self._settle_pending_result_answer(
+            final_result,
+            target_addrs,
+            seen_addrs,
+            target_index,
+            manager_addr,
+            response,
+            refusals,
+        )
+
+    def _settle_pending_result_answer(
+        self,
+        final_result: WorkflowFinalResult,
+        target_addrs: list[tuple[str | None, tuple[str, int]]],
+        seen_addrs: set[tuple[str, int]],
+        target_index: int,
+        manager_addr: tuple[str, int],
+        response: bytes,
+        refusals: list[float],
+    ) -> bool:
+        """Settle on ``ok``; record an AD-24 refusal; else apply the ack and follow its redirect."""
+        if response == b"ok":
+            self._registry.get_or_create_circuit_by_addr(manager_addr).record_success()
+            return True
+        if (refused_until := self._note_refusal(manager_addr, response)) is not None:
+            refusals.append(refused_until)
+            return False
+
+        return self._settle_pending_result_ack(
+            final_result,
+            target_addrs,
+            seen_addrs,
+            target_index,
+            manager_addr,
+            response,
+        )
+
+    def _settle_pending_result_ack(
+        self,
+        final_result: WorkflowFinalResult,
+        target_addrs: list[tuple[str | None, tuple[str, int]]],
+        seen_addrs: set[tuple[str, int]],
+        target_index: int,
+        manager_addr: tuple[str, int],
+        response: bytes,
+    ) -> bool:
+        """Apply a pending result's ack and follow its redirect; whether it settled the result."""
+        settled, leader_addr = self._take_final_result_ack(
+            final_result.workflow_id, WorkflowFinalResultAck.load(response)
+        )
+        self._insert_redirect(target_addrs, seen_addrs, target_index, leader_addr)
+        if settled:
+            self._registry.get_or_create_circuit_by_addr(manager_addr).record_success()
+            return True
+        return False
 
     def _final_result_targets(
         self, final_result: WorkflowFinalResult

@@ -32,6 +32,7 @@ from tests.simulation.harness import (
     manager_has_n_peers,
     wait_until,
 )
+from tests.simulation.harness.harness_auth_secret import HARNESS_AUTH_SECRET
 
 
 def _l2_spec() -> ClusterSpec:
@@ -178,7 +179,7 @@ async def test_quorum_isolating_partition_rejects_submits() -> None:
         client = HyperscaleClient(
             host=cluster.spec.host,
             port=cluster.reserve_client_port(),
-            env=Env(MERCURY_SYNC_LOG_LEVEL="error"),
+            env=Env(MERCURY_SYNC_AUTH_SECRET=HARNESS_AUTH_SECRET, MERCURY_SYNC_LOG_LEVEL="error"),
             managers=[(isolated_manager.host, isolated_manager.tcp_port)],
         )
         await client.start()

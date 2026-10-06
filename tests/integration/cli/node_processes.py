@@ -35,6 +35,17 @@ BOOT_TIMEOUT_SECONDS = 90.0
 # alive past it has outlived the CLI's own shutdown contract — a leak.
 SHUTDOWN_TIMEOUT_SECONDS = 60.0
 RUN_MARKER_ENVAR = "HYPERSCALE_TEST_RUN_MARKER"
+# There is no default cluster secret: every node, CLI command and in-test
+# client of a CLI test shares this one, exported to each process as
+# MERCURY_SYNC_AUTH_SECRET (never the operator's per-user cluster cookie).
+AUTH_SECRET_ENVAR = "MERCURY_SYNC_AUTH_SECRET"
+CLI_TEST_AUTH_SECRET = "hyperscale-cli-test-cluster-secret-0123456789"
+
+
+def command_environment(**extra_variables: str) -> dict[str, str]:
+    """The environment a CLI test launches a ``hyperscale`` process with:
+    this process's, the shared test secret, then ``extra_variables``."""
+    return {**os.environ, AUTH_SECRET_ENVAR: CLI_TEST_AUTH_SECRET, **extra_variables}
 
 
 IANA_EPHEMERAL_PORT_RANGE = (49152, 65535)
@@ -160,7 +171,7 @@ class CommandNode:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
-            env={**os.environ, **self._environment, RUN_MARKER_ENVAR: self._marker},
+            env=command_environment(**self._environment, **{RUN_MARKER_ENVAR: self._marker}),
         )
         self._pump = asyncio.create_task(self._read_output())
 
@@ -306,6 +317,7 @@ async def run_join(node: str, target: str, client_port: int) -> tuple[int, str]:
         HYPERSCALE, "join", "--node", node, "--target", target, "--port", str(client_port),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=command_environment(),
     )
     output, _ = await asyncio.wait_for(
         process.communicate(), timeout=default_join_timeout_seconds(Env()) * 2
@@ -326,6 +338,7 @@ async def run_remove(node: str, member: str, client_port: int) -> tuple[int, str
         HYPERSCALE, "remove", "--node", node, "--member", member, "--port", str(client_port),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=command_environment(),
     )
     output, _ = await asyncio.wait_for(process.communicate(), timeout=remove_budget * 2 * 2)
     return process.returncode, output.decode(errors="replace")
@@ -344,6 +357,7 @@ async def run_membership_mode(node: str, mode: str, client_port: int) -> tuple[i
         HYPERSCALE, "membership", "--node", node, "--mode", mode, "--port", str(client_port),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=command_environment(),
     )
     output, _ = await asyncio.wait_for(process.communicate(), timeout=mode_budget * 2 * 2)
     return process.returncode, output.decode(errors="replace")
@@ -361,6 +375,7 @@ async def run_resize(node: str, change: str, member: str, client_port: int) -> t
         HYPERSCALE, "resize", "--node", node, f"--{change}", member, "--port", str(client_port),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=command_environment(),
     )
     output, _ = await asyncio.wait_for(process.communicate(), timeout=resize_budget * 2)
     return process.returncode, output.decode(errors="replace")
@@ -378,6 +393,7 @@ async def run_cluster_status(node: str, client_port: int) -> tuple[int, str]:
         HYPERSCALE, "cluster", "--node", node, "--port", str(client_port),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=command_environment(),
     )
     output, _ = await asyncio.wait_for(process.communicate(), timeout=status_budget * 2)
     return process.returncode, output.decode(errors="replace")
@@ -395,6 +411,7 @@ async def run_cluster_metrics(node: str, client_port: int) -> tuple[int, str]:
         HYPERSCALE, "cluster", "--node", node, "--metrics", "--port", str(client_port),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=command_environment(),
     )
     output, _ = await asyncio.wait_for(process.communicate(), timeout=metrics_budget * 2)
     return process.returncode, output.decode(errors="replace")
@@ -419,6 +436,7 @@ async def run_job_command(
         "--port", str(client_port),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=command_environment(),
     )
     output, _ = await asyncio.wait_for(process.communicate(), timeout=budget)
     return process.returncode, output.decode(errors="replace")

@@ -29,7 +29,7 @@ from hyperscale.distributed.raft.models import (
 )
 from hyperscale.distributed.raft.raft_node import HEARTBEAT_INTERVAL, RaftNode
 from hyperscale.distributed.raft.raft_peer_outbox import RaftPeerOutbox
-from hyperscale.distributed.raft.store.models import GroupReleasedRecord
+from hyperscale.distributed.raft.store.models import GroupReleasedRecord, RecoveredRaftGroup
 from hyperscale.distributed.raft.store.raft_storage import RaftStorage
 from hyperscale.distributed.raft.snapshot import InstallSnapshot, InstallSnapshotResponse
 from hyperscale.distributed.runtime import Clock
@@ -100,6 +100,23 @@ CLUSTER_MODE_FROZEN = "frozen"
 # Frozen, and the tier refuses job submissions.
 CLUSTER_MODE_READ_ONLY = "read-only"
 CLUSTER_MODES = (CLUSTER_MODE_OPEN, CLUSTER_MODE_FROZEN, CLUSTER_MODE_READ_ONLY)
+
+# A proposal's outcome as the logs name it, indexed by whether it committed.
+_PROPOSAL_OUTCOMES = ("not committed", "committed")
+# A held group's formation before it forms, indexed by whether it was joined.
+_ADOPTED_FORMATIONS = (FORMATION_FORMING, FORMATION_JOINING)
+# A watch event's kind for each address command (AD-52 section 9).
+_ADDRESS_EVENT_KINDS: Mapping[str, str] = MappingProxyType(
+    {CLAIM_ADDRESS_COMMAND: "claim", RELEASE_ADDRESS_COMMAND: "release"}
+)
+# The membership group's action for each Raft request type.
+_RAFT_REQUEST_ACTIONS: Mapping[type, str] = MappingProxyType(
+    {
+        RequestVote: CLUSTER_REQUEST_VOTE_ACTION,
+        AppendEntries: CLUSTER_APPEND_ENTRIES_ACTION,
+        InstallSnapshot: CLUSTER_INSTALL_SNAPSHOT_ACTION,
+    }
+)
 
 SendRequest = Callable[[tuple[str, int], str, bytes], Awaitable[bytes | Exception | None]]
 
@@ -407,7 +424,7 @@ class ClusterMembership:
             return FORMATION_DISCOVERING
         if self._formed:
             return FORMATION_FORMED
-        return FORMATION_JOINING if self._joined else FORMATION_FORMING
+        return _ADOPTED_FORMATIONS[self._joined]
 
     @property
     def voters(self) -> frozenset[str]:
@@ -459,14 +476,7 @@ class ClusterMembership:
         left -- then run formation and the group."""
         if self._running:
             return
-        recovered_groups = self._storage.take_recovered_groups(lambda group_id: group_id.startswith("cluster:"))
-        for group_id, recovered in sorted(recovered_groups.items()):
-            if self._group is None and recovered.member_id == self.member_id:
-                self._adopt(group_id.removeprefix("cluster:"), recovered.initial_voters, joined=True)
-                await self._group.recover(recovered)
-                await self._log_event("member_resumed", self.member_id)
-                continue
-            await self._storage.write([GroupReleasedRecord(group_id=group_id)])
+        await self._resume_recovered_groups()
         self._accepted_founders_digests = (self._cohort_digest, *({self._previous_cohort_digest} - {None}))
         self._admission_refusal = _COHORT_MISMATCH_REFUSAL
         self._running = True
@@ -476,6 +486,23 @@ class ClusterMembership:
             ).token,
             self._task_runner.run(self._raft_loop, alias=f"cluster-raft:{self._node_id}").token,
         ]
+
+    async def _resume_recovered_groups(self) -> None:
+        """Resume the cluster group this node's disk held as its current
+        member (D1); release every other one it recovered."""
+        recovered_groups = self._storage.take_recovered_groups(lambda group_id: group_id.startswith("cluster:"))
+        for group_id, recovered in sorted(recovered_groups.items()):
+            await self._resume_or_release(group_id, recovered)
+
+    async def _resume_or_release(self, group_id: str, recovered: RecoveredRaftGroup) -> None:
+        """Resume a recovered group this node took part in as its current
+        member, while it holds none; else release it for good (D1)."""
+        if self._group is None and recovered.member_id == self.member_id:
+            self._adopt(group_id.removeprefix("cluster:"), recovered.initial_voters, joined=True)
+            await self._group.recover(recovered)
+            await self._log_event("member_resumed", self.member_id)
+            return
+        await self._storage.write([GroupReleasedRecord(group_id=group_id)])
 
     async def stop(self) -> None:
         self._running = False
@@ -497,40 +524,71 @@ class ClusterMembership:
         group's leader also releases the addresses of holders it has not
         heard from for the tombstone retention."""
         while self._running:
-            group = self._group
-            if not (
-                self._formed
-                and group is not None
-                and (quorum_contact := group.last_quorum_contact) is not None
-                and self._clock.monotonic() - quorum_contact < self._formation_interval_seconds
-            ):
-                await self._advance_formation()
-            elif (
-                self._mode == CLUSTER_MODE_OPEN
-                and self._address in self._cohort
-                and self._address_holders.get(self._address) != self.member_id
-            ):
-                await self._reclaim_address(group)
-            elif group.is_leader() and self._mode == CLUSTER_MODE_OPEN:
-                for silent_holder in sorted(
-                    group.silent_members(self._tombstone_retention_seconds)
-                    & set(self._address_holders.values())
-                ):
-                    committed, _index = await group.propose(
-                        silent_holder.encode(), RELEASE_ADDRESS_COMMAND
-                    )
-                    await self._logger.log(
-                        RaftInfo(
-                            message=(
-                                f"Released {silent_holder}'s address: unheard for "
-                                f"{self._tombstone_retention_seconds}s "
-                                f"({'committed' if committed else 'not committed'})"
-                            ),
-                            node_id=self._node_id,
-                            job_id=self._cluster_uuid or "",
-                        )
-                    )
+            await self._formation_tick()
             await self._clock.sleep(self._formation_interval_seconds)
+
+    async def _formation_tick(self) -> None:
+        """One pass of the formation loop: a formation round unless the
+        formed group is operable, else that group's upkeep."""
+        group = self._group
+        if not self._group_operable(group):
+            await self._advance_formation()
+            return
+        await self._maintain_formed_group(group)
+
+    def _group_operable(self, group: RaftNode | None) -> bool:
+        """Whether this node's group formed and reached a quorum within the
+        last formation interval (``RaftNode.last_quorum_contact``)."""
+        return self._formed and group is not None and self._quorum_contact_recent(group)
+
+    def _quorum_contact_recent(self, group: RaftNode) -> bool:
+        """Whether ``group`` reached a quorum within the formation interval."""
+        return (
+            quorum_contact := group.last_quorum_contact
+        ) is not None and self._clock.monotonic() - quorum_contact < self._formation_interval_seconds
+
+    async def _maintain_formed_group(self, group: RaftNode) -> None:
+        """An operable group's upkeep: reclaim this member's released
+        address, or -- leading an open cluster -- release silent holders'."""
+        if self._address_unheld():
+            await self._reclaim_address(group)
+        elif self._releases_silent_holders(group):
+            await self._release_silent_holders(group)
+
+    def _address_unheld(self) -> bool:
+        """Whether an open cluster holds this cohort member's address for
+        no one, or for another process."""
+        return (
+            self._mode == CLUSTER_MODE_OPEN
+            and self._address in self._cohort
+            and self._address_holders.get(self._address) != self.member_id
+        )
+
+    def _releases_silent_holders(self, group: RaftNode) -> bool:
+        """Whether this member leads an open cluster's group (AD-52 section 8)."""
+        return group.is_leader() and self._mode == CLUSTER_MODE_OPEN
+
+    async def _release_silent_holders(self, group: RaftNode) -> None:
+        """Release, through the log, the address of every holder this leader
+        has not heard from for the tombstone retention (AD-52 section 8)."""
+        for silent_holder in sorted(
+            group.silent_members(self._tombstone_retention_seconds)
+            & set(self._address_holders.values())
+        ):
+            committed, _index = await group.propose(
+                silent_holder.encode(), RELEASE_ADDRESS_COMMAND
+            )
+            await self._logger.log(
+                RaftInfo(
+                    message=(
+                        f"Released {silent_holder}'s address: unheard for "
+                        f"{self._tombstone_retention_seconds}s "
+                        f"({_PROPOSAL_OUTCOMES[committed]})"
+                    ),
+                    node_id=self._node_id,
+                    job_id=self._log_job_id,
+                )
+            )
 
     async def _log_event(self, event: str, subject: str) -> None:
         await self._logger.log(
@@ -553,34 +611,43 @@ class ClusterMembership:
         quorum floor, could stall on it and every other departure."""
         if group.is_leader():
             committed, _index = await group.propose(self.member_id.encode(), CLAIM_ADDRESS_COMMAND)
-            outcome = "committed" if committed else "not committed"
+            outcome = _PROPOSAL_OUTCOMES[committed]
         elif (leader := group.current_leader) is None:
             return
         else:
-            response = await self._send_request(
-                ClusterMemberId.parse(leader).address,
-                CLUSTER_JOIN_ACTION,
-                ClusterJoinRequest(
-                member_id=self.member_id,
-                founders_digest=self._cohort_digest,
-                schema_version=self._schema_versions[1],
-            ).dump(),
-            )
-            if isinstance(response, Exception) or not response:
-                outcome = f"no answer from {leader}: {response!r}"
-            else:
-                try:
-                    reply = decode_join_message(response, ClusterJoinReply, "cluster join reply")
-                    outcome = "committed" if reply.accepted else f"refused: {reply.refusal}"
-                except ClusterJoinError as decode_error:
-                    outcome = f"answered with {decode_error}"
+            outcome = await self._reclaim_through_leader(leader)
         await self._logger.log(
             RaftInfo(
                 message=f"Reclaimed {self.member_id}'s address, released while it went unheard ({outcome})",
                 node_id=self._node_id,
-                job_id=self._cluster_uuid or "",
+                job_id=self._log_job_id,
             )
         )
+
+    async def _reclaim_through_leader(self, leader: str) -> str:
+        """Ask the group's leader to commit this member's claim again; the
+        outcome as the reclaim's log names it."""
+        response = await self._send_request(
+            ClusterMemberId.parse(leader).address,
+            CLUSTER_JOIN_ACTION,
+            ClusterJoinRequest(
+            member_id=self.member_id,
+            founders_digest=self._cohort_digest,
+            schema_version=self._schema_versions[1],
+        ).dump(),
+        )
+        if isinstance(response, Exception) or not response:
+            return f"no answer from {leader}: {response!r}"
+        return self._reclaim_reply_outcome(response)
+
+    @staticmethod
+    def _reclaim_reply_outcome(response: bytes) -> str:
+        """The leader's answer to a reclaim, as the reclaim's log names it."""
+        try:
+            reply = decode_join_message(response, ClusterJoinReply, "cluster join reply")
+            return "committed" if reply.accepted else f"refused: {reply.refusal}"
+        except ClusterJoinError as decode_error:
+            return f"answered with {decode_error}"
 
     async def _raft_loop(self) -> None:
         """One Raft tick every heartbeat interval: elections, replication,
@@ -588,60 +655,116 @@ class ClusterMembership:
         entries."""
         while self._running:
             if (group := self._group) is not None:
-                await group.tick()
-                if group.is_leader():
-                    if group.current_term != self._led_term:
-                        self._led_term = group.current_term
-                        await self._log_event("leader_elected", f"{self.member_id} term {group.current_term}")
-                    await group.replicate_to_followers()
-                    # Frozen: the configuration stays as it is.
-                    if self._mode == CLUSTER_MODE_OPEN:
-                        await group.reconcile_membership(
-                            frozenset(self._address_holders.values())
-                            | ({self.member_id} if self._address in self._cohort else set())
-                        )
-                await group.apply_committed_entries()
-                if group.last_applied_index != self._signalled_applied_index:
-                    self._signalled_applied_index = group.last_applied_index
-                    self._applied_progress.set()
-                    self._applied_progress = asyncio.Event()
-                if (configuration := group.configuration) is not self._addressed_configuration:
-                    if (previous := self._addressed_configuration) is not None:
-                        for added in sorted(configuration.learners - previous.members):
-                            await self._log_event("member_added", added)
-                        for promoted in sorted(configuration.voters & previous.learners):
-                            await self._log_event("member_promoted", promoted)
-                        for removed in sorted(previous.members - configuration.members):
-                            await self._log_event("member_removed", removed)
-                    self._addressed_configuration = configuration
-                    member_ids = {
-                        member: ClusterMemberId.parse(member) for member in configuration.members
-                    }
-                    group.update_member_addresses(
-                        {member: member_id.address for member, member_id in member_ids.items()}
-                    )
-                    self._node_addresses = MappingProxyType(
-                        {member_id.node_id: member_id.address for member_id in member_ids.values()}
-                    )
-                if (
-                    not self._formed
-                    and group.commit_index >= 1
-                    and self.member_id in configuration.members
-                ):
-                    self._formed = True
-                    self._formed_event.set()
-                    await self._log_event("cluster_formed", ",".join(sorted(configuration.voters)))
-                    await self._logger.log(
-                        RaftInfo(
-                            message=(
-                                f"Cluster {self._cluster_uuid} formed: member {self.member_id} "
-                                f"of {sorted(configuration.voters)}"
-                            ),
-                            node_id=self._node_id,
-                            job_id=self._cluster_uuid or "",
-                        )
-                    )
+                await self._raft_tick(group)
             await self._clock.sleep(HEARTBEAT_INTERVAL)
+
+    async def _raft_tick(self, group: RaftNode) -> None:
+        """One Raft tick of this node's group, then what it applied: wake
+        watches, readdress a changed configuration, mark the cluster formed."""
+        await group.tick()
+        if group.is_leader():
+            await self._lead_tick(group)
+        await group.apply_committed_entries()
+        self._signal_applied_progress(group)
+        configuration = group.configuration
+        await self._readdress_configuration(group, configuration)
+        await self._mark_formed_when_due(group, configuration)
+
+    async def _lead_tick(self, group: RaftNode) -> None:
+        """The leader's part of a tick: announce a new term's leadership,
+        replicate, and reconcile the configuration toward the holders."""
+        if group.current_term != self._led_term:
+            self._led_term = group.current_term
+            await self._log_event("leader_elected", f"{self.member_id} term {group.current_term}")
+        await group.replicate_to_followers()
+        await self._reconcile_open_membership(group)
+
+    async def _reconcile_open_membership(self, group: RaftNode) -> None:
+        """Reconcile the configuration toward the address holders -- and
+        this member, while the cohort holds its address."""
+        # Frozen: the configuration stays as it is.
+        if self._mode == CLUSTER_MODE_OPEN:
+            await group.reconcile_membership(
+                frozenset(self._address_holders.values())
+                | ({self.member_id} if self._address in self._cohort else set())
+            )
+
+    def _signal_applied_progress(self, group: RaftNode) -> None:
+        """Wake every watch waiting on the group to apply further (AD-52
+        section 9), once per newly applied index."""
+        if group.last_applied_index != self._signalled_applied_index:
+            self._signalled_applied_index = group.last_applied_index
+            self._applied_progress.set()
+            self._applied_progress = asyncio.Event()
+
+    async def _readdress_configuration(self, group: RaftNode, configuration: RaftConfiguration) -> None:
+        """On a new configuration, log its member changes and readdress its
+        members for the group and the rest of the node."""
+        if configuration is self._addressed_configuration:
+            return
+        if (previous := self._addressed_configuration) is not None:
+            await self._log_configuration_changes(previous, configuration)
+        self._addressed_configuration = configuration
+        self._address_members(group, configuration)
+
+    async def _log_configuration_changes(
+        self, previous: RaftConfiguration, configuration: RaftConfiguration
+    ) -> None:
+        """Log the members ``configuration`` added, promoted and removed."""
+        await self._log_member_events("member_added", configuration.learners - previous.members)
+        await self._log_member_events("member_promoted", configuration.voters & previous.learners)
+        await self._log_member_events("member_removed", previous.members - configuration.members)
+
+    async def _log_member_events(self, event: str, members: frozenset[str]) -> None:
+        """Log ``event`` for each of ``members``, in order."""
+        for member in sorted(members):
+            await self._log_event(event, member)
+
+    def _address_members(self, group: RaftNode, configuration: RaftConfiguration) -> None:
+        """Give the group each member's address, and the rest of the node
+        each member's node id and address (``node_addresses``)."""
+        member_ids = {
+            member: ClusterMemberId.parse(member) for member in configuration.members
+        }
+        group.update_member_addresses(
+            {member: member_id.address for member, member_id in member_ids.items()}
+        )
+        self._node_addresses = self._node_addresses_of(member_ids)
+
+    @staticmethod
+    def _node_addresses_of(member_ids: dict[str, ClusterMemberId]) -> Mapping[str, tuple[str, int]]:
+        """Each member's node id and address, read-only."""
+        return MappingProxyType(
+            {member_id.node_id: member_id.address for member_id in member_ids.values()}
+        )
+
+    async def _mark_formed_when_due(self, group: RaftNode, configuration: RaftConfiguration) -> None:
+        """Mark the cluster formed once its group committed with this node a
+        member of the configuration."""
+        if not self._formation_completed(group, configuration):
+            return
+        self._formed = True
+        self._formed_event.set()
+        await self._log_event("cluster_formed", ",".join(sorted(configuration.voters)))
+        await self._logger.log(
+            RaftInfo(
+                message=(
+                    f"Cluster {self._cluster_uuid} formed: member {self.member_id} "
+                    f"of {sorted(configuration.voters)}"
+                ),
+                node_id=self._node_id,
+                job_id=self._cluster_uuid or "",
+            )
+        )
+
+    def _formation_completed(self, group: RaftNode, configuration: RaftConfiguration) -> bool:
+        """Whether the cluster, not yet formed here, has formed: its group
+        committed and this node is a member of the configuration."""
+        return (
+            not self._formed
+            and group.commit_index >= 1
+            and self.member_id in configuration.members
+        )
 
     # =========================================================================
     # Formation
@@ -656,21 +779,42 @@ class ClusterMembership:
                 RaftWarning(
                     message=f"{self._address[0]}:{self._address[1]} is not in the cluster's cohort: not joining",
                     node_id=self._node_id,
-                    job_id=self._cluster_uuid or "",
+                    job_id=self._log_job_id,
                 )
             )
             return
-        replies = await self._greet_founders()
+        await self._judge_formation(await self._greet_founders())
 
+    async def _judge_formation(self, replies: dict[tuple[str, int], ClusterHelloReply]) -> None:
+        """Given the founders' answers: judge the group this node holds, or
+        join a cluster formed without it, or found one when due (AD-52)."""
         group = self._group
-        if group is not None:
-            if await self._abandon_if_voters_gone(group, replies):
-                return
-            if self._formed or self._joined:
-                await self._abandon_if_inoperable(group)
-                return
+        if group is not None and await self._settle_held_group(group, replies):
+            return
+        await self._join_or_found(group, replies)
 
-        accepted = {address: reply for address, reply in replies.items() if reply.refusal is None}
+    async def _settle_held_group(
+        self, group: RaftNode, replies: dict[tuple[str, int], ClusterHelloReply]
+    ) -> bool:
+        """Abandon a held group whose voters are gone, or a formed or joined
+        one inoperable too long; True when this round ends here."""
+        if await self._abandon_if_voters_gone(group, replies):
+            return True
+        if not self._holds_adopted_group():
+            return False
+        await self._abandon_if_inoperable(group)
+        return True
+
+    def _holds_adopted_group(self) -> bool:
+        """Whether the held group formed here, or was joined."""
+        return self._formed or self._joined
+
+    async def _join_or_found(
+        self, group: RaftNode | None, replies: dict[tuple[str, int], ClusterHelloReply]
+    ) -> None:
+        """Join a cluster formed without this node; else judge this node's
+        own founding, or -- holding none -- found one when due."""
+        accepted = self._accepted_replies(replies)
         if await self._join_cluster_formed_without_this_node(group, accepted):
             return
 
@@ -679,6 +823,13 @@ class ClusterMembership:
             return
 
         await self._found_cluster_when_due(accepted)
+
+    @staticmethod
+    def _accepted_replies(
+        replies: dict[tuple[str, int], ClusterHelloReply],
+    ) -> dict[tuple[str, int], ClusterHelloReply]:
+        """The founders' answers that did not refuse the greeting."""
+        return {address: reply for address, reply in replies.items() if reply.refusal is None}
 
     @property
     def _log_job_id(self) -> str:
@@ -1062,6 +1213,19 @@ class ClusterMembership:
                 schema_version=self._schema_versions[1],
             ).dump(),
         )
+        if (reply := await self._read_join_reply(formed_reply, target, response)) is not None:
+            self._adopt_joined_cluster(reply)
+
+    @staticmethod
+    def _job_id_of(cluster_uuid: str | None) -> str:
+        """A cluster uuid as the logs' job id: empty for none."""
+        return cluster_uuid or ""
+
+    async def _read_join_reply(
+        self, formed_reply: ClusterHelloReply, target: tuple[str, int], response: bytes | Exception | None
+    ) -> ClusterJoinReply | None:
+        """The join's accepting reply; None, logged, for no answer, an
+        undecodable one, or a refusal."""
         if isinstance(response, Exception) or not response:
             await self._logger.log(
                 RaftDebug(
@@ -1070,10 +1234,16 @@ class ClusterMembership:
                         f"{target[0]}:{target[1]}: {response!r}"
                     ),
                     node_id=self._node_id,
-                    job_id=formed_reply.cluster_uuid or "",
+                    job_id=self._job_id_of(formed_reply.cluster_uuid),
                 )
             )
-            return
+            return None
+        return await self._decode_join_reply(formed_reply, target, response)
+
+    async def _decode_join_reply(
+        self, formed_reply: ClusterHelloReply, target: tuple[str, int], response: bytes
+    ) -> ClusterJoinReply | None:
+        """Decode the join's reply; None, logged, for one that is not."""
         try:
             reply = decode_join_message(response, ClusterJoinReply, "cluster join reply")
         except ClusterJoinError as decode_error:
@@ -1081,22 +1251,34 @@ class ClusterMembership:
                 RaftWarning(
                     message=f"Join of cluster {formed_reply.cluster_uuid} answered with {decode_error}",
                     node_id=self._node_id,
-                    job_id=formed_reply.cluster_uuid or "",
+                    job_id=self._job_id_of(formed_reply.cluster_uuid),
                 )
             )
-            return
-        if not reply.accepted or reply.cluster_uuid is None:
-            await self._logger.log(
-                RaftDebug(
-                    message=(
-                        f"Join of cluster {formed_reply.cluster_uuid} not accepted by "
-                        f"{target[0]}:{target[1]}: {reply.refusal}"
-                    ),
-                    node_id=self._node_id,
-                    job_id=formed_reply.cluster_uuid or "",
-                )
+            return None
+        return await self._accepted_join_reply(formed_reply, target, reply)
+
+    async def _accepted_join_reply(
+        self, formed_reply: ClusterHelloReply, target: tuple[str, int], reply: ClusterJoinReply
+    ) -> ClusterJoinReply | None:
+        """``reply`` when it accepted the join with a cluster; else None,
+        logged."""
+        if reply.accepted and reply.cluster_uuid is not None:
+            return reply
+        await self._logger.log(
+            RaftDebug(
+                message=(
+                    f"Join of cluster {formed_reply.cluster_uuid} not accepted by "
+                    f"{target[0]}:{target[1]}: {reply.refusal}"
+                ),
+                node_id=self._node_id,
+                job_id=self._job_id_of(formed_reply.cluster_uuid),
             )
-            return
+        )
+        return None
+
+    def _adopt_joined_cluster(self, reply: ClusterJoinReply) -> None:
+        """Adopt the cluster an accepted join answered with, unless this
+        node already holds a group."""
         if self._group is not None:
             # A founding reached this node while it waited: the next round
             # sees the formed cluster again and leaves the founding for it.
@@ -1129,7 +1311,15 @@ class ClusterMembership:
 
     async def handle_found(self, data: bytes) -> bytes:
         founding = FoundCluster.load(data)
-        adopted = (
+        adopted = self._adopts_founding(founding)
+        if adopted:
+            self._adopt(founding.cluster_uuid, founding.founding_voters, joined=False)
+        return FoundClusterReply(member_id=self.member_id, adopted=adopted).dump()
+
+    def _adopts_founding(self, founding: FoundCluster) -> bool:
+        """Whether this node adopts ``founding``: of this cohort, holding no
+        group, and named among its voters."""
+        return (
             # This cohort's digest -- none before ``start`` resumed the
             # group this node's disk holds (adopting first would release
             # that group for a new cluster).
@@ -1137,9 +1327,29 @@ class ClusterMembership:
             and self._group is None
             and self.member_id in founding.founding_voters
         )
-        if adopted:
-            self._adopt(founding.cluster_uuid, founding.founding_voters, joined=False)
-        return FoundClusterReply(member_id=self.member_id, adopted=adopted).dump()
+
+    def _formed_group(self) -> RaftNode | None:
+        """This node's group once its cluster has formed; None before."""
+        return self._group if self._formed else None
+
+    async def _forward_to_leader(
+        self,
+        leader: str,
+        action: str,
+        payload: bytes,
+        unanswered: Callable[[bytes | Exception | None], bytes],
+    ) -> bytes:
+        """Pass an operator request on to the group's leader, once: its
+        answer, or ``unanswered``'s reply when it gave none."""
+        response = await self._send_request(ClusterMemberId.parse(leader).address, action, payload)
+        if isinstance(response, Exception) or not response:
+            return unanswered(response)
+        return response
+
+    @staticmethod
+    def _format_addresses(addresses: list[tuple[str, int]]) -> list[str]:
+        """Each address as ``host:port``, in order."""
+        return [f"{cohort_host}:{cohort_port}" for cohort_host, cohort_port in addresses]
 
     async def handle_join(self, data: bytes) -> bytes:
         request = ClusterJoinRequest.load(data)
@@ -1147,30 +1357,49 @@ class ClusterMembership:
             return ClusterJoinReply(
                 accepted=False, refusal=self._admission_refusal
             ).dump()
-        if not self._formed or (group := self._group) is None:
+        if (group := self._formed_group()) is None:
             return ClusterJoinReply(accepted=False, refusal="this member's cluster is not formed").dump()
+        return await self._admit_joiner(group, request)
+
+    async def _admit_joiner(self, group: RaftNode, request: ClusterJoinRequest) -> bytes:
+        """As the group's leader, admit a joiner the cluster may take in:
+        greet its address, then commit its claim."""
         if not group.is_leader():
             return ClusterJoinReply(
                 accepted=False,
                 leader_member_id=group.current_leader,
                 refusal="not the membership group's leader",
             ).dump()
+        if refusal := self._join_admission_refusal(group, request):
+            return ClusterJoinReply(accepted=False, refusal=refusal).dump()
+        return await self._admit_cohort_member(group, request)
+
+    def _join_admission_refusal(self, group: RaftNode, request: ClusterJoinRequest) -> str | None:
+        """Why the cluster cannot take the joiner in, in order: its mode,
+        the joiner's log schema; else None."""
         if self._mode != CLUSTER_MODE_OPEN:
-            return ClusterJoinReply(accepted=False, refusal=f"the cluster's membership is {self._mode}").dump()
+            return f"the cluster's membership is {self._mode}"
         if request.schema_version < group.write_schema_version:
-            return ClusterJoinReply(
-                accepted=False,
-                refusal=(
-                    f"the cluster writes log schema {group.write_schema_version}; "
-                    f"the joiner reads only up to {request.schema_version}"
-                ),
-            ).dump()
+            return (
+                f"the cluster writes log schema {group.write_schema_version}; "
+                f"the joiner reads only up to {request.schema_version}"
+            )
+        return None
+
+    async def _admit_cohort_member(self, group: RaftNode, request: ClusterJoinRequest) -> bytes:
+        """Refuse a joiner whose address is outside the cohort; verify and
+        claim one inside it."""
         if (claimant_address := ClusterMemberId.parse(request.member_id).address) not in self._cohort:
             return ClusterJoinReply(
                 accepted=False,
                 refusal=f"{claimant_address[0]}:{claimant_address[1]} is not in the cluster's cohort",
             ).dump()
+        return await self._verify_and_claim(group, request, claimant_address)
 
+    async def _verify_and_claim(
+        self, group: RaftNode, request: ClusterJoinRequest, claimant_address: tuple[str, int]
+    ) -> bytes:
+        """Greet the joiner's address, then commit its claim."""
         # The claim must come from the process at the address now -- not a
         # delayed request of one gone, whose claim would unseat the live
         # holder.
@@ -1179,22 +1408,31 @@ class ClusterMembership:
             CLUSTER_HELLO_ACTION,
             ClusterHello(member_id=self.member_id, founders_digest=self._cohort_digest).dump(),
         )
+        if refusal := self._claimant_presence_refusal(request, response):
+            return ClusterJoinReply(accepted=False, refusal=refusal).dump()
+        return await self._commit_claim(group, request)
+
+    def _claimant_presence_refusal(
+        self, request: ClusterJoinRequest, response: bytes | Exception | None
+    ) -> str | None:
+        """Why the joiner's address did not vouch for the joiner; else None."""
         if isinstance(response, Exception) or not response:
-            return ClusterJoinReply(
-                accepted=False, refusal=f"the joiner's address did not answer: {response!r}"
-            ).dump()
+            return f"the joiner's address did not answer: {response!r}"
+        return self._decoded_presence_refusal(request, response)
+
+    @staticmethod
+    def _decoded_presence_refusal(request: ClusterJoinRequest, response: bytes) -> str | None:
+        """Why the answer at the joiner's address is not the joiner's; else None."""
         try:
             present = decode_join_message(response, ClusterHelloReply, "cluster hello reply")
         except ClusterJoinError as decode_error:
-            return ClusterJoinReply(
-                accepted=False, refusal=f"the joiner's address answered with {decode_error}"
-            ).dump()
+            return f"the joiner's address answered with {decode_error}"
         if present.member_id != request.member_id:
-            return ClusterJoinReply(
-                accepted=False,
-                refusal=f"{present.member_id} answers at the joiner's address, not {request.member_id}",
-            ).dump()
+            return f"{present.member_id} answers at the joiner's address, not {request.member_id}"
+        return None
 
+    async def _commit_claim(self, group: RaftNode, request: ClusterJoinRequest) -> bytes:
+        """Commit the joiner's claim of its address, then accept it."""
         # The claim commits before the joiner hears it was accepted: every
         # member, and any later leader, then knows who holds the address.
         committed, _index = await group.propose(request.member_id.encode(), CLAIM_ADDRESS_COMMAND)
@@ -1228,29 +1466,40 @@ class ClusterMembership:
     async def handle_leave(self, data: bytes) -> bytes:
         request = ClusterLeaveRequest.load(data)
         self._operator_requests["leave:received"] = self._operator_requests.get("leave:received", 0) + 1
-        if not self._formed or (group := self._group) is None:
+        if (group := self._formed_group()) is None:
             return ClusterLeaveReply(released=False, refusal="this member's cluster is not formed").dump()
         if not group.is_leader():
-            leader = group.current_leader
-            if request.forwarded or request.member_id is None or leader is None:
-                return ClusterLeaveReply(
-                    released=False,
-                    leader_member_id=leader,
-                    refusal="not the membership group's leader",
-                ).dump()
-            response = await self._send_request(
-                ClusterMemberId.parse(leader).address,
-                CLUSTER_LEAVE_ACTION,
-                ClusterLeaveRequest(
-                    host=request.host, port=request.port, member_id=request.member_id, forwarded=True
-                ).dump(),
-            )
-            if isinstance(response, Exception) or not response:
-                return ClusterLeaveReply(
-                    released=False, refusal=f"the group's leader {leader} did not answer: {response!r}"
-                ).dump()
-            return response
+            return await self._forward_leave(group, request)
+        return await self._release_on_request(group, request)
 
+    async def _forward_leave(self, group: RaftNode, request: ClusterLeaveRequest) -> bytes:
+        """Pass a drain on to the group's leader, once; a force-remove, or
+        one with no leader known, is refused."""
+        leader = group.current_leader
+        if not self._leave_forwardable(request, leader):
+            return ClusterLeaveReply(
+                released=False,
+                leader_member_id=leader,
+                refusal="not the membership group's leader",
+            ).dump()
+        return await self._forward_to_leader(
+            leader,
+            CLUSTER_LEAVE_ACTION,
+            ClusterLeaveRequest(
+                host=request.host, port=request.port, member_id=request.member_id, forwarded=True
+            ).dump(),
+            lambda response: ClusterLeaveReply(
+                released=False, refusal=f"the group's leader {leader} did not answer: {response!r}"
+            ).dump(),
+        )
+
+    @staticmethod
+    def _leave_forwardable(request: ClusterLeaveRequest, leader: str | None) -> bool:
+        """Whether a leave goes on to ``leader``: a drain not yet forwarded."""
+        return not (request.forwarded or request.member_id is None or leader is None)
+
+    async def _release_on_request(self, group: RaftNode, request: ClusterLeaveRequest) -> bytes:
+        """As the group's leader, release the address a leave names."""
         if self._mode != CLUSTER_MODE_OPEN:
             return ClusterLeaveReply(
                 released=False, refusal=f"the cluster's membership is {self._mode}"
@@ -1260,44 +1509,76 @@ class ClusterMembership:
             return ClusterLeaveReply(
                 released=False, refusal=f"no member holds {request.host}:{request.port}"
             ).dump()
-        if request.member_id is not None and holder != request.member_id:
-            return ClusterLeaveReply(
-                released=False, refusal=f"{request.host}:{request.port} is held by {holder}"
-            ).dump()
-        if request.member_id is None:
-            # A force-remove is for a member that is gone: a live one
-            # would claim its address again at once.
-            if holder == self.member_id:
-                return ClusterLeaveReply(
-                    released=False, refusal="that is the group's leader, which is alive; stop it to drain it"
-                ).dump()
-            response = await self._send_request(
-                address,
-                CLUSTER_HELLO_ACTION,
-                ClusterHello(member_id=self.member_id, founders_digest=self._cohort_digest).dump(),
-            )
-            if not isinstance(response, Exception) and response:
-                try:
-                    present = decode_join_message(response, ClusterHelloReply, "cluster hello reply")
-                except ClusterJoinError as decode_error:
-                    return ClusterLeaveReply(
-                        released=False, refusal=f"{request.host}:{request.port} answered with {decode_error}"
-                    ).dump()
-                if present.member_id == holder:
-                    return ClusterLeaveReply(
-                        released=False, refusal=f"{holder} still answers at {request.host}:{request.port}"
-                    ).dump()
+        return await self._release_holder_on_request(group, request, address, holder)
 
+    async def _release_holder_on_request(
+        self, group: RaftNode, request: ClusterLeaveRequest, address: tuple[str, int], holder: str
+    ) -> bytes:
+        """Release ``holder``'s address unless the leave names another
+        holder, or force-removes one still alive."""
+        if refusal := self._holder_mismatch_refusal(request, holder) or await self._force_remove_refusal(
+            request, address, holder
+        ):
+            return ClusterLeaveReply(released=False, refusal=refusal).dump()
+        return await self._commit_release_on_request(group, request, holder)
+
+    @staticmethod
+    def _holder_mismatch_refusal(request: ClusterLeaveRequest, holder: str) -> str | None:
+        """Why a drain may not release the address: another member holds it."""
+        if request.member_id is not None and holder != request.member_id:
+            return f"{request.host}:{request.port} is held by {holder}"
+        return None
+
+    async def _force_remove_refusal(
+        self, request: ClusterLeaveRequest, address: tuple[str, int], holder: str
+    ) -> str | None:
+        """Why a force-remove may not release the address; None for a drain."""
+        if request.member_id is not None:
+            return None
+        # A force-remove is for a member that is gone: a live one
+        # would claim its address again at once.
+        if holder == self.member_id:
+            return "that is the group's leader, which is alive; stop it to drain it"
+        return await self._live_holder_refusal(request, address, holder)
+
+    async def _live_holder_refusal(
+        self, request: ClusterLeaveRequest, address: tuple[str, int], holder: str
+    ) -> str | None:
+        """Greet the address: why its holder is not gone; None when it is."""
+        response = await self._send_request(
+            address,
+            CLUSTER_HELLO_ACTION,
+            ClusterHello(member_id=self.member_id, founders_digest=self._cohort_digest).dump(),
+        )
+        if isinstance(response, Exception) or not response:
+            return None
+        return self._present_holder_refusal(request, response, holder)
+
+    @staticmethod
+    def _present_holder_refusal(request: ClusterLeaveRequest, response: bytes, holder: str) -> str | None:
+        """Why the answer at the address keeps its holder; else None."""
+        try:
+            present = decode_join_message(response, ClusterHelloReply, "cluster hello reply")
+        except ClusterJoinError as decode_error:
+            return f"{request.host}:{request.port} answered with {decode_error}"
+        if present.member_id == holder:
+            return f"{holder} still answers at {request.host}:{request.port}"
+        return None
+
+    async def _commit_release_on_request(
+        self, group: RaftNode, request: ClusterLeaveRequest, holder: str
+    ) -> bytes:
+        """Commit the release of ``holder``'s address through the log."""
         committed, _index = await group.propose(holder.encode(), RELEASE_ADDRESS_COMMAND)
         await self._logger.log(
             RaftInfo(
                 message=(
                     f"Released {holder}'s address on request "
                     f"({'drain' if request.member_id is not None else 'force-remove'}; "
-                    f"{'committed' if committed else 'not committed'})"
+                    f"{_PROPOSAL_OUTCOMES[committed]})"
                 ),
                 node_id=self._node_id,
-                job_id=self._cluster_uuid or "",
+                job_id=self._log_job_id,
             )
         )
         if not committed:
@@ -1314,35 +1595,44 @@ class ClusterMembership:
             return ClusterModeReply(
                 applied=False, refusal=f"unknown mode {request.mode!r}; one of {CLUSTER_MODES}"
             ).dump()
-        if not self._formed or (group := self._group) is None:
+        if (group := self._formed_group()) is None:
             return ClusterModeReply(applied=False, refusal="this member's cluster is not formed").dump()
-        if not group.is_leader():
-            leader = group.current_leader
-            if request.forwarded or leader is None:
-                return ClusterModeReply(
-                    applied=False,
-                    leader_member_id=leader,
-                    refusal="not the membership group's leader",
-                ).dump()
-            response = await self._send_request(
-                ClusterMemberId.parse(leader).address,
-                CLUSTER_MODE_ACTION,
-                ClusterModeRequest(mode=request.mode, forwarded=True).dump(),
-            )
-            if isinstance(response, Exception) or not response:
-                return ClusterModeReply(
-                    applied=False,
-                    leader_member_id=leader,
-                    refusal=f"the group's leader {leader} did not answer: {response!r}",
-                ).dump()
-            return response
+        return await self._set_mode_through_group(group, request)
 
+    async def _set_mode_through_group(self, group: RaftNode, request: ClusterModeRequest) -> bytes:
+        """Commit the mode as the group's leader; else pass it on."""
+        if not group.is_leader():
+            return await self._forward_mode(group, request)
+        return await self._commit_mode(group, request)
+
+    async def _forward_mode(self, group: RaftNode, request: ClusterModeRequest) -> bytes:
+        """Pass a mode change on to the group's leader, once."""
+        leader = group.current_leader
+        if request.forwarded or leader is None:
+            return ClusterModeReply(
+                applied=False,
+                leader_member_id=leader,
+                refusal="not the membership group's leader",
+            ).dump()
+        return await self._forward_to_leader(
+            leader,
+            CLUSTER_MODE_ACTION,
+            ClusterModeRequest(mode=request.mode, forwarded=True).dump(),
+            lambda response: ClusterModeReply(
+                applied=False,
+                leader_member_id=leader,
+                refusal=f"the group's leader {leader} did not answer: {response!r}",
+            ).dump(),
+        )
+
+    async def _commit_mode(self, group: RaftNode, request: ClusterModeRequest) -> bytes:
+        """Commit the mode through the group's log (AD-52 section 13)."""
         committed, _index = await group.propose(request.mode.encode(), CLUSTER_MODE_COMMAND)
         await self._logger.log(
             RaftInfo(
-                message=f"Cluster mode {request.mode} ({'committed' if committed else 'not committed'})",
+                message=f"Cluster mode {request.mode} ({_PROPOSAL_OUTCOMES[committed]})",
                 node_id=self._node_id,
-                job_id=self._cluster_uuid or "",
+                job_id=self._log_job_id,
             )
         )
         if not committed:
@@ -1362,104 +1652,152 @@ class ClusterMembership:
         it to the leader once)."""
         request = ClusterResizeRequest.load(data)
         self._operator_requests["resize:received"] = self._operator_requests.get("resize:received", 0) + 1
-        if not self._formed or (group := self._group) is None:
+        if (group := self._formed_group()) is None:
             return ClusterResizeReply(applied=False, refusal="this member's cluster is not formed").dump()
         if not group.is_leader():
-            leader = group.current_leader
-            if request.forwarded or leader is None:
-                return ClusterResizeReply(
-                    applied=False, leader_member_id=leader, refusal="not the membership group's leader"
-                ).dump()
-            response = await self._send_request(
-                ClusterMemberId.parse(leader).address,
-                CLUSTER_RESIZE_ACTION,
-                ClusterResizeRequest(
-                    host=request.host, port=request.port, add=request.add, forwarded=True
-                ).dump(),
-            )
-            if isinstance(response, Exception) or not response:
-                return ClusterResizeReply(
-                    applied=False,
-                    leader_member_id=leader,
-                    refusal=f"the group's leader {leader} did not answer: {response!r}",
-                ).dump()
-            return response
+            return await self._forward_resize(group, request)
+        return await self._resize_as_leader(group, request)
 
+    async def _forward_resize(self, group: RaftNode, request: ClusterResizeRequest) -> bytes:
+        """Pass a resize on to the group's leader, once."""
+        leader = group.current_leader
+        if request.forwarded or leader is None:
+            return ClusterResizeReply(
+                applied=False, leader_member_id=leader, refusal="not the membership group's leader"
+            ).dump()
+        return await self._forward_to_leader(
+            leader,
+            CLUSTER_RESIZE_ACTION,
+            ClusterResizeRequest(
+                host=request.host, port=request.port, add=request.add, forwarded=True
+            ).dump(),
+            lambda response: ClusterResizeReply(
+                applied=False,
+                leader_member_id=leader,
+                refusal=f"the group's leader {leader} did not answer: {response!r}",
+            ).dump(),
+        )
+
+    async def _resize_as_leader(self, group: RaftNode, request: ClusterResizeRequest) -> bytes:
+        """As the group's leader, commit a resize the cohort and its voters
+        allow (AD-52 ``ResizeCluster``)."""
         address = (request.host, request.port)
-        if refusal := (
-            f"the cluster's membership is {self._mode}"
-            if self._mode != CLUSTER_MODE_OPEN
-            else f"{request.host}:{request.port} is already in the cohort"
-            if request.add and address in self._cohort
-            else f"{request.host}:{request.port} is not in the cohort"
-            if not request.add and address not in self._cohort
-            else "the group's leader does not remove its own address: stop it (it drains), then ask again"
-            if not request.add and address == self._address
-            else "a cohort of one cannot shrink"
-            if not request.add and len(self._cohort) == 1
-            else None
-        ):
+        if refusal := self._resize_refusal(request, address) or await self._resize_readiness_refusal(group):
             return ClusterResizeReply(applied=False, refusal=refusal).dump()
+        return await self._commit_resize(group, request, address)
 
+    def _resize_refusal(self, request: ClusterResizeRequest, address: tuple[str, int]) -> str | None:
+        """Why the cohort cannot take this resize, in order: the cluster's
+        mode, then the address against the cohort; else None."""
+        if self._mode != CLUSTER_MODE_OPEN:
+            return f"the cluster's membership is {self._mode}"
+        return self._grow_refusal(request, address) if request.add else self._shrink_refusal(request, address)
+
+    def _grow_refusal(self, request: ClusterResizeRequest, address: tuple[str, int]) -> str | None:
+        """Why the cohort cannot grow by ``address``: it holds it already."""
+        return f"{request.host}:{request.port} is already in the cohort" if address in self._cohort else None
+
+    def _shrink_refusal(self, request: ClusterResizeRequest, address: tuple[str, int]) -> str | None:
+        """Why the cohort cannot shrink by ``address``, in order: not in it,
+        the leader's own, or a cohort of one; else None."""
+        if address not in self._cohort:
+            return f"{request.host}:{request.port} is not in the cohort"
+        return (
+            "the group's leader does not remove its own address: stop it (it drains), then ask again"
+            if address == self._address
+            else self._single_member_cohort_refusal()
+        )
+
+    def _single_member_cohort_refusal(self) -> str | None:
+        """Why the cohort cannot shrink at all: it has one address."""
+        return "a cohort of one cannot shrink" if len(self._cohort) == 1 else None
+
+    async def _resize_readiness_refusal(self, group: RaftNode) -> str | None:
+        """Why the cluster is not ready to resize; else None."""
         # One step at a time: every voter that answers -- a quorum of them
         # at least -- must run with the cohort the cluster holds, so no
         # process is configured more than one resize behind it.
         if self._configured_digest != self._cohort_digest:
-            return ClusterResizeReply(
-                applied=False,
-                refusal="the group's leader runs with an older cohort: relaunch it with the current one first",
-            ).dump()
+            return "the group's leader runs with an older cohort: relaunch it with the current one first"
+        return await self._voter_readiness_refusal(group)
+
+    async def _voter_readiness_refusal(self, group: RaftNode) -> str | None:
+        """Greet every other voter: why they are not ready -- one runs with
+        an older cohort, or no quorum answered; else None."""
         voters = sorted(group.configuration.voters - {self.member_id})
         hello = ClusterHello(member_id=self.member_id, founders_digest=self._cohort_digest).dump()
         answered = {self.member_id}
-        for voter, response in zip(
-            voters,
-            await asyncio.gather(
-                *(
-                    self._send_request(ClusterMemberId.parse(voter).address, CLUSTER_HELLO_ACTION, hello)
-                    for voter in voters
-                )
-            ),
-        ):
-            if isinstance(response, Exception) or not response:
-                continue
-            try:
-                reply = decode_join_message(response, ClusterHelloReply, "cluster hello reply")
-            except ClusterJoinError as decode_error:
-                return ClusterResizeReply(applied=False, refusal=f"{voter} answered with {decode_error}").dump()
-            if reply.member_id != voter:
-                continue
-            if reply.configured_digest != self._cohort_digest:
-                return ClusterResizeReply(
-                    applied=False,
-                    refusal=f"{voter} runs with an older cohort: relaunch it with the current one first",
-                ).dump()
-            answered.add(voter)
-        if not group.configuration.has_quorum(answered, self._quorum):
-            return ClusterResizeReply(
-                applied=False,
-                refusal=f"only {len(answered)} of {len(group.configuration.voters)} voters answered",
-            ).dump()
+        for voter, response in zip(voters, await self._greet_voters(voters, hello)):
+            if refusal := self._voter_answer_refusal(voter, response, answered):
+                return refusal
+        return self._answered_quorum_refusal(group, answered)
 
+    async def _greet_voters(self, voters: list[str], hello: bytes) -> list[bytes | Exception | None]:
+        """Greet every voter at once; each answer in order."""
+        return await self._send_to_all(
+            [ClusterMemberId.parse(voter).address for voter in voters], CLUSTER_HELLO_ACTION, hello
+        )
+
+    def _voter_answer_refusal(
+        self, voter: str, response: bytes | Exception | None, answered: set[str]
+    ) -> str | None:
+        """Why a voter's answer blocks the resize; else None, adding a voter
+        that answered as itself to ``answered``."""
+        if isinstance(response, Exception) or not response:
+            return None
+        return self._decoded_voter_refusal(voter, response, answered)
+
+    def _decoded_voter_refusal(self, voter: str, response: bytes, answered: set[str]) -> str | None:
+        """Decode a voter's answer: why it blocks the resize; else None."""
+        try:
+            reply = decode_join_message(response, ClusterHelloReply, "cluster hello reply")
+        except ClusterJoinError as decode_error:
+            return f"{voter} answered with {decode_error}"
+        return self._voter_digest_refusal(voter, reply, answered)
+
+    def _voter_digest_refusal(self, voter: str, reply: ClusterHelloReply, answered: set[str]) -> str | None:
+        """Why the voter's answer blocks the resize -- it runs with an older
+        cohort; else None, adding the voter when it answered as itself."""
+        if reply.member_id != voter:
+            return None
+        if reply.configured_digest != self._cohort_digest:
+            return f"{voter} runs with an older cohort: relaunch it with the current one first"
+        answered.add(voter)
+        return None
+
+    def _answered_quorum_refusal(self, group: RaftNode, answered: set[str]) -> str | None:
+        """Why too few voters answered for the resize; else None."""
+        if group.configuration.has_quorum(answered, self._quorum):
+            return None
+        return f"only {len(answered)} of {len(group.configuration.voters)} voters answered"
+
+    async def _commit_resize(
+        self, group: RaftNode, request: ClusterResizeRequest, address: tuple[str, int]
+    ) -> bytes:
+        """Commit the resized cohort through the group's log."""
         resized = sorted(self._cohort | {address} if request.add else self._cohort - {address})
         committed, _index = await group.propose(json.dumps(resized).encode(), CLUSTER_RESIZE_COMMAND)
-        await self._logger.log(
-            RaftInfo(
-                message=(
-                    f"Cohort {'grown by' if request.add else 'shrunk by'} {request.host}:{request.port} "
-                    f"({'committed' if committed else 'not committed'})"
-                ),
-                node_id=self._node_id,
-                job_id=self._cluster_uuid or "",
-            )
-        )
+        await self._log_resize(request, committed)
         if not committed:
             return ClusterResizeReply(applied=False, refusal="the resize did not commit; retry").dump()
         self._operator_requests["resize:committed"] = self._operator_requests.get("resize:committed", 0) + 1
         return ClusterResizeReply(
             applied=True,
-            cohort=[f"{cohort_host}:{cohort_port}" for cohort_host, cohort_port in resized],
+            cohort=self._format_addresses(resized),
         ).dump()
+
+    async def _log_resize(self, request: ClusterResizeRequest, committed: bool) -> None:
+        """Log a resize's proposal and whether it committed."""
+        await self._logger.log(
+            RaftInfo(
+                message=(
+                    f"Cohort {'grown by' if request.add else 'shrunk by'} {request.host}:{request.port} "
+                    f"({_PROPOSAL_OUTCOMES[committed]})"
+                ),
+                node_id=self._node_id,
+                job_id=self._cluster_uuid or "",
+            )
+        )
 
     async def handle_status(self, data: bytes) -> bytes:
         """The cluster's membership as of now (AD-52 section 11): the
@@ -1467,27 +1805,33 @@ class ClusterMembership:
         through the read index, and answers from its state; a member that
         is not the leader passes the request on once."""
         request = ClusterStatusRequest.load(data)
-        if not self._formed or (group := self._group) is None:
+        if (group := self._formed_group()) is None:
             return ClusterStatusReply(served=False, refusal="this member's cluster is not formed").dump()
         if not group.is_leader():
-            leader = group.current_leader
-            if request.forwarded or leader is None:
-                return ClusterStatusReply(
-                    served=False, leader_member_id=leader, refusal="not the membership group's leader"
-                ).dump()
-            response = await self._send_request(
-                ClusterMemberId.parse(leader).address,
-                CLUSTER_STATUS_ACTION,
-                ClusterStatusRequest(forwarded=True).dump(),
-            )
-            if isinstance(response, Exception) or not response:
-                return ClusterStatusReply(
-                    served=False,
-                    leader_member_id=leader,
-                    refusal=f"the group's leader {leader} did not answer: {response!r}",
-                ).dump()
-            return response
+            return await self._forward_status(group, request)
+        return await self._serve_status(group)
 
+    async def _forward_status(self, group: RaftNode, request: ClusterStatusRequest) -> bytes:
+        """Pass a status request on to the group's leader, once."""
+        leader = group.current_leader
+        if request.forwarded or leader is None:
+            return ClusterStatusReply(
+                served=False, leader_member_id=leader, refusal="not the membership group's leader"
+            ).dump()
+        return await self._forward_to_leader(
+            leader,
+            CLUSTER_STATUS_ACTION,
+            ClusterStatusRequest(forwarded=True).dump(),
+            lambda response: ClusterStatusReply(
+                served=False,
+                leader_member_id=leader,
+                refusal=f"the group's leader {leader} did not answer: {response!r}",
+            ).dump(),
+        )
+
+    async def _serve_status(self, group: RaftNode) -> bytes:
+        """As the confirmed leader, answer from state applied through the
+        read index (AD-52 section 11)."""
         if (read_index := await group.read_index()) is None:
             return ClusterStatusReply(
                 served=False, refusal="leadership could not be confirmed; retry"
@@ -1501,7 +1845,7 @@ class ClusterMembership:
             leader_member_id=self.member_id,
             voters=sorted(configuration.voters),
             learners=sorted(configuration.learners),
-            cohort=[f"{cohort_host}:{cohort_port}" for cohort_host, cohort_port in sorted(self._cohort)],
+            cohort=self._format_addresses(sorted(self._cohort)),
             holders=sorted(self._address_holders.values()),
             mode=self._mode,
             # The state read is as of everything applied here -- at least
@@ -1517,75 +1861,55 @@ class ClusterMembership:
         member's log compaction. Served by any member: a watch follows the
         log as applied, in commit order, with no gap."""
         request = ClusterWatchRequest.load(data)
-        if not self._formed or (group := self._group) is None:
-            return ClusterWatchReply(served=False, refusal="this member's cluster is not formed").dump()
-        if request.cluster_uuid == self._cluster_uuid and group.last_applied_index <= request.after_index:
-            progress = self._applied_progress
-            self._open_watches += 1
-            try:
-                # The watcher's wait, cut to this member's ceiling: no
-                # longer (an infinite wait parked the poll for good), and
-                # NaN or a negative answers at once (``max`` gives 0.0).
-                await self._clock.wait_for(
-                    progress.wait(),
-                    timeout=min(self._watch_wait_ceiling_seconds, max(0.0, request.wait_seconds)),
-                )
-            except asyncio.TimeoutError:
-                pass  # Nothing changed within the watcher's wait: say so.
-            finally:
-                self._open_watches -= 1
-            if (group := self._group) is None or not self._formed:
-                return ClusterWatchReply(served=False, refusal="this member left its cluster").dump()
+        if not self._watch_waits(request):
+            return self._answer_watch(request, "this member's cluster is not formed")
+        progress = self._applied_progress
+        self._open_watches += 1
+        try:
+            # The watcher's wait, cut to this member's ceiling: no
+            # longer (an infinite wait parked the poll for good), and
+            # NaN or a negative answers at once (``max`` gives 0.0).
+            await self._clock.wait_for(
+                progress.wait(),
+                timeout=min(self._watch_wait_ceiling_seconds, max(0.0, request.wait_seconds)),
+            )
+        except asyncio.TimeoutError:
+            pass  # Nothing changed within the watcher's wait: say so.
+        finally:
+            self._open_watches -= 1
+        return self._answer_watch(request, "this member left its cluster")
+
+    def _watch_waits(self, request: ClusterWatchRequest) -> bool:
+        """Whether a watch of this formed cluster has nothing new yet: it
+        waits for the group to apply further."""
+        group = self._formed_group()
+        return (
+            group is not None
+            and request.cluster_uuid == self._cluster_uuid
+            and group.last_applied_index <= request.after_index
+        )
+
+    def _answer_watch(self, request: ClusterWatchRequest, refusal: str) -> bytes:
+        """Answer a watch from this formed cluster's group; ``refusal`` when
+        it has none."""
+        if (group := self._formed_group()) is None:
+            return ClusterWatchReply(served=False, refusal=refusal).dump()
+        return self._watch_reply(group, request)
+
+    def _watch_reply(self, group: RaftNode, request: ClusterWatchRequest) -> bytes:
+        """The changes applied after the watcher's index; a snapshot when
+        the watcher is of another cluster or behind log compaction."""
         configuration = group.configuration
         if (
             request.cluster_uuid != self._cluster_uuid
             or (entries := group.applied_entries_after(request.after_index)) is None
         ):
-            return ClusterWatchReply(
-                served=True,
-                cluster_uuid=self._cluster_uuid,
-                applied_index=group.last_applied_index,
-                snapshot=True,
-                holders=sorted(self._address_holders.values()),
-                mode=self._mode,
-                cohort=[f"{cohort_host}:{cohort_port}" for cohort_host, cohort_port in sorted(self._cohort)],
-                voters=sorted(configuration.voters),
-                learners=sorted(configuration.learners),
-            ).dump()
-        events: list[tuple[int, str, str]] = []
-        for entry in entries:
-            if entry.command_type in (CLAIM_ADDRESS_COMMAND, RELEASE_ADDRESS_COMMAND):
-                events.append(
-                    (
-                        entry.index,
-                        "claim" if entry.command_type == CLAIM_ADDRESS_COMMAND else "release",
-                        entry.command.decode(),
-                    )
-                )
-            elif entry.command_type == CLUSTER_MODE_COMMAND:
-                events.append((entry.index, "mode", entry.command.decode()))
-            elif entry.command_type == CLUSTER_RESIZE_COMMAND:
-                events.append(
-                    (
-                        entry.index,
-                        "resize",
-                        " ".join(
-                            f"{cohort_host}:{cohort_port}"
-                            for cohort_host, cohort_port in json.loads(entry.command)
-                        ),
-                    )
-                )
-            elif entry.command_type == RAFT_CONFIGURATION_COMMAND:
-                entry_configuration = RaftConfiguration.load(entry.command)
-                events.append(
-                    (
-                        entry.index,
-                        "configuration",
-                        f"voters={','.join(sorted(entry_configuration.voters))} "
-                        f"learners={','.join(sorted(entry_configuration.learners))}"
-                        + (" joint" if entry_configuration.is_joint else ""),
-                    )
-                )
+            return self._watch_snapshot_reply(group, configuration)
+        return self._watch_events_reply(request, entries)
+
+    def _watch_events_reply(self, request: ClusterWatchRequest, entries: list["RaftLogEntry"]) -> bytes:
+        """The watch events among ``entries``, through the last of them."""
+        events = self._watch_events(entries)
         return ClusterWatchReply(
             served=True,
             cluster_uuid=self._cluster_uuid,
@@ -1595,12 +1919,66 @@ class ClusterMembership:
             events=events,
         ).dump()
 
+    def _watch_snapshot_reply(self, group: RaftNode, configuration: RaftConfiguration) -> bytes:
+        """The group's state to resume a watch from (AD-52 section 9)."""
+        return ClusterWatchReply(
+            served=True,
+            cluster_uuid=self._cluster_uuid,
+            applied_index=group.last_applied_index,
+            snapshot=True,
+            holders=sorted(self._address_holders.values()),
+            mode=self._mode,
+            cohort=self._format_addresses(sorted(self._cohort)),
+            voters=sorted(configuration.voters),
+            learners=sorted(configuration.learners),
+        ).dump()
+
+    def _watch_events(self, entries: list["RaftLogEntry"]) -> list[tuple[int, str, str]]:
+        """The watch events of the membership changes among ``entries``."""
+        return [event for entry in entries if (event := self._watch_event(entry)) is not None]
+
+    def _watch_event(self, entry: "RaftLogEntry") -> tuple[int, str, str] | None:
+        """``entry``'s watch event; None for an entry that changes nothing a
+        watch follows."""
+        if entry.command_type in _ADDRESS_EVENT_KINDS:
+            return (entry.index, _ADDRESS_EVENT_KINDS[entry.command_type], entry.command.decode())
+        if entry.command_type == CLUSTER_MODE_COMMAND:
+            return (entry.index, "mode", entry.command.decode())
+        return self._cohort_watch_event(entry)
+
+    def _cohort_watch_event(self, entry: "RaftLogEntry") -> tuple[int, str, str] | None:
+        """A resize's or configuration change's watch event; else None."""
+        if entry.command_type == CLUSTER_RESIZE_COMMAND:
+            return (entry.index, "resize", self._join_resized_cohort(entry.command))
+        return self._configuration_watch_event(entry) if entry.command_type == RAFT_CONFIGURATION_COMMAND else None
+
+    @staticmethod
+    def _join_resized_cohort(command: bytes) -> str:
+        """A resize command's cohort as space-separated ``host:port``."""
+        return " ".join(
+            f"{cohort_host}:{cohort_port}"
+            for cohort_host, cohort_port in json.loads(command)
+        )
+
+    @staticmethod
+    def _configuration_watch_event(entry: "RaftLogEntry") -> tuple[int, str, str]:
+        """A configuration change's watch event."""
+        entry_configuration = RaftConfiguration.load(entry.command)
+        return (
+            entry.index,
+            "configuration",
+            f"voters={','.join(sorted(entry_configuration.voters))} "
+            f"learners={','.join(sorted(entry_configuration.learners))}"
+            + (" joint" if entry_configuration.is_joint else ""),
+        )
+
     async def handle_metrics(self, data: bytes) -> bytes:
         """This member's metrics of its cluster's membership (AD-52 section
         18): local, never forwarded -- each member reports what it sees."""
         group = self._group
         raft_metrics = group.metrics() if group is not None else {"follower_lag": {}}
         follower_lag = raft_metrics.pop("follower_lag")
+        voters, learners = self._configuration_sizes(group)
         return ClusterMetricsReply(
             member_id=self.member_id,
             formation=self.formation,
@@ -1608,8 +1986,8 @@ class ClusterMembership:
             cluster_uuid=self._cluster_uuid,
             mode=self._mode,
             cohort_size=len(self._cohort),
-            voters=len(group.configuration.voters) if group is not None else 0,
-            learners=len(group.configuration.learners) if group is not None else 0,
+            voters=voters,
+            learners=learners,
             holders=len(self._address_holders),
             raft=raft_metrics,
             follower_lag=follower_lag,
@@ -1619,6 +1997,14 @@ class ClusterMembership:
             operator_requests=dict(self._operator_requests),
             open_watches=self._open_watches,
         ).dump()
+
+    @staticmethod
+    def _configuration_sizes(group: RaftNode | None) -> tuple[int, int]:
+        """How many voters and learners ``group``'s configuration holds;
+        none without a group."""
+        if group is None:
+            return 0, 0
+        return len(group.configuration.voters), len(group.configuration.learners)
 
     async def handle_request_vote(self, data: bytes) -> bytes | None:
         request = RequestVote.load(data)
@@ -1655,13 +2041,7 @@ class ClusterMembership:
         address: tuple[str, int],
         request: RequestVote | AppendEntries | InstallSnapshot,
     ) -> None:
-        match request:
-            case RequestVote():
-                action = CLUSTER_REQUEST_VOTE_ACTION
-            case AppendEntries():
-                action = CLUSTER_APPEND_ENTRIES_ACTION
-            case InstallSnapshot():
-                action = CLUSTER_INSTALL_SNAPSHOT_ACTION
+        action = _RAFT_REQUEST_ACTIONS[type(request)]
         response = await self._send_request(address, action, request.dump())
         if isinstance(response, Exception) or not response:
             # A lost message: Raft rebuilds the request on the next tick.
@@ -1674,19 +2054,38 @@ class ClusterMembership:
                 )
             )
             return
-        if (group := self._group) is None:
+        await self._deliver_raft_response(request, response)
+
+    async def _deliver_raft_response(
+        self, request: RequestVote | AppendEntries | InstallSnapshot, response: bytes
+    ) -> None:
+        """Hand a Raft response to the group still holding the request's
+        cluster; dropped once this node left it."""
+        if (group := self._group) is None or request.job_id != f"cluster:{self._cluster_uuid}":
             return
-        if request.job_id != f"cluster:{self._cluster_uuid}":
+        await self._dispatch_raft_response(group, request, response)
+
+    @staticmethod
+    async def _dispatch_raft_response(
+        group: RaftNode, request: RequestVote | AppendEntries | InstallSnapshot, response: bytes
+    ) -> None:
+        """Hand a Raft response to ``group``'s handler for its request type."""
+        if isinstance(request, RequestVote):
+            await group.handle_request_vote_response(RequestVoteResponse.load(response))
             return
-        match request:
-            case RequestVote():
-                await group.handle_request_vote_response(RequestVoteResponse.load(response))
-            case AppendEntries():
-                await group.handle_append_entries_response(AppendEntriesResponse.load(response))
-            case InstallSnapshot():
-                await group.handle_install_snapshot_response(
-                    InstallSnapshotResponse.load(response)
-                )
+        await ClusterMembership._deliver_replication_response(group, request, response)
+
+    @staticmethod
+    async def _deliver_replication_response(
+        group: RaftNode, request: AppendEntries | InstallSnapshot, response: bytes
+    ) -> None:
+        """Hand an AppendEntries or InstallSnapshot response to ``group``."""
+        if isinstance(request, AppendEntries):
+            await group.handle_append_entries_response(AppendEntriesResponse.load(response))
+        elif isinstance(request, InstallSnapshot):
+            await group.handle_install_snapshot_response(
+                InstallSnapshotResponse.load(response)
+            )
 
     async def _apply(self, entry: "RaftLogEntry") -> None:
         """Apply a committed claim -- its member now holds its address -- or
@@ -1699,26 +2098,43 @@ class ClusterMembership:
             CLUSTER_RESIZE_COMMAND,
         ):
             self._changes_applied[entry.command_type] = self._changes_applied.get(entry.command_type, 0) + 1
+        await self._apply_command(entry)
+
+    async def _apply_command(self, entry: "RaftLogEntry") -> None:
+        """Apply a committed mode, resize, claim or release."""
         if entry.command_type == CLUSTER_MODE_COMMAND:
             self._mode = entry.command.decode()
             await self._log_event("mode_changed", self._mode)
             return
         if entry.command_type == CLUSTER_RESIZE_COMMAND:
-            await self._log_event("cohort_resized", entry.command.decode())
-            self._adopt_cohort(
-                frozenset(
-                    (cohort_host, cohort_port) for cohort_host, cohort_port in json.loads(entry.command)
-                ),
-                self._cohort_digest,
-            )
+            await self._apply_resize(entry)
             return
+        self._apply_address_command(entry)
+
+    async def _apply_resize(self, entry: "RaftLogEntry") -> None:
+        """Adopt a committed resize's cohort (AD-52 ``ResizeCluster``)."""
+        await self._log_event("cohort_resized", entry.command.decode())
+        self._adopt_cohort(
+            frozenset(
+                (cohort_host, cohort_port) for cohort_host, cohort_port in json.loads(entry.command)
+            ),
+            self._cohort_digest,
+        )
+
+    def _apply_address_command(self, entry: "RaftLogEntry") -> None:
+        """Apply a committed claim or release; any other command is not one."""
         if entry.command_type not in (CLAIM_ADDRESS_COMMAND, RELEASE_ADDRESS_COMMAND):
             return
         member = entry.command.decode()
         member_address = ClusterMemberId.parse(member).address
         if entry.command_type == CLAIM_ADDRESS_COMMAND:
             self._address_holders[member_address] = member
-        elif self._address_holders.get(member_address) == member:
+            return
+        self._release_held_address(member_address, member)
+
+    def _release_held_address(self, member_address: tuple[str, int], member: str) -> None:
+        """Release ``member_address`` if ``member`` still holds it."""
+        if self._address_holders.get(member_address) == member:
             del self._address_holders[member_address]
 
     def _adopt_cohort(self, cohort: frozenset[tuple[str, int]], previous_digest: str | None) -> None:
@@ -1727,17 +2143,30 @@ class ClusterMembership:
         if cohort == self._cohort:
             return
         self._cohort = cohort
-        self._cohort_digest = hashlib.sha256(
-            ",".join(f"{cohort_host}:{cohort_port}" for cohort_host, cohort_port in sorted(cohort)).encode()
-        ).hexdigest()
+        self._cohort_digest = self._cohort_digest_of(cohort)
         self._previous_cohort_digest = previous_digest
         # A cohort changes only as the group's log applies -- while running,
         # or in ``start``'s recovery, which then opens admission itself.
         self._accepted_founders_digests = (self._cohort_digest, *({previous_digest} - {None}))
         self._quorum = len(cohort) // 2 + 1
-        self._address_holders = {
+        self._address_holders = self._holders_within(cohort)
+        self._announce_cohort_size(cohort)
+
+    @staticmethod
+    def _cohort_digest_of(cohort: frozenset[tuple[str, int]]) -> str:
+        """The founders digest of ``cohort``: its sorted addresses, hashed."""
+        return hashlib.sha256(
+            ",".join(f"{cohort_host}:{cohort_port}" for cohort_host, cohort_port in sorted(cohort)).encode()
+        ).hexdigest()
+
+    def _holders_within(self, cohort: frozenset[tuple[str, int]]) -> dict[tuple[str, int], str]:
+        """The address holders whose addresses ``cohort`` still holds."""
+        return {
             address: holder for address, holder in self._address_holders.items() if address in cohort
         }
+
+    def _announce_cohort_size(self, cohort: frozenset[tuple[str, int]]) -> None:
+        """Hand a changed cohort to the group's quorum and the node's."""
         if self._group is not None:
             self._group.set_cohort_size(len(cohort))
         if self._on_cohort_change is not None:

@@ -526,17 +526,11 @@ class RaftNode:
         async with self._lock:
             if self._destroyed:
                 return
-            await self._tick_locked()
-
-    async def _tick_locked(self) -> None:
-        """A leader checks it may still lead; a follower or candidate whose
-        election timeout passed starts a PreVote round (Raft section 5.2,
-        thesis 9.6). Lock must be held."""
-        match self._role:
-            case "leader":
-                self._tick_leader()
-            case "follower" | "candidate" if self._election_timed_out():
-                await self._start_pre_vote_locked()
+            match self._role:
+                case "leader":
+                    self._tick_leader()
+                case "follower" | "candidate" if self._election_timed_out():
+                    await self._start_pre_vote_locked()
 
     def _tick_leader(self) -> None:
         """Relinquish leadership when this node may no longer lead, or no
@@ -551,29 +545,18 @@ class RaftNode:
         if not self._may_lead():
             self._step_down(self._current_term)
             return
-        self._check_quorum()
-
-    def _check_quorum(self) -> None:
-        """CheckQuorum (Raft thesis 6.2): a leadership at least a window old
-        keeps leading only while a quorum of voters -- itself among them --
-        answered it within the window; otherwise it steps down, keeping the
-        term and its vote."""
         now = _DEFAULT_CLOCK.monotonic()
         if now - self._leadership_started_at < self._check_quorum_window:
             return
-        if self._configuration.has_quorum(self._members_answered_within_window(now), self._quorum_floor):
-            self._last_quorum_contact = now
-            return
-        self._step_down(self._current_term)
-
-    def _members_answered_within_window(self, now: float) -> set[str]:
-        """This leader and every member that answered it within the
-        CheckQuorum window before ``now``."""
-        return {self._node_id} | {
+        answered = {self._node_id} | {
             member
             for member, answered_at in self._last_response_at.items()
             if now - answered_at < self._check_quorum_window
         }
+        if self._configuration.has_quorum(answered, self._quorum_floor):
+            self._last_quorum_contact = now
+            return
+        self._step_down(self._current_term)
 
     def _election_timed_out(self) -> bool:
         return _DEFAULT_CLOCK.monotonic() >= self._election_deadline
@@ -919,33 +902,24 @@ class RaftNode:
         one), whose send time a quorum's answer turns into the lease."""
         self._last_heartbeat_sent = now = _DEFAULT_CLOCK.monotonic()
         if self._leader_lease_seconds is not None:
-            self._stamp_heartbeat_round(now)
-        for peer_id in self._other_members(self._configuration.ordered_members):
-            await self._send_append_entries_to(peer_id)
+            if self._read_round <= self._newest_stamped_round:
+                self._read_round += 1
+            self._newest_stamped_round = self._read_round
+            self._round_sent_at[self._read_round] = now
+            # A round older than a lease can grant none: answered or not,
+            # it goes.
+            for stale_round in [
+                sent_round
+                for sent_round, sent_at in self._round_sent_at.items()
+                if now - sent_at >= self._leader_lease_seconds
+            ]:
+                del self._round_sent_at[stale_round]
+        for peer_id in self._configuration.ordered_members:
+            if peer_id != self._node_id:
+                await self._send_append_entries_to(peer_id)
         # Entries new since the last round are written while they travel;
         # this leader counts itself for them once they are durable.
         await self._persist_locked()
-
-    def _stamp_heartbeat_round(self, now: float) -> None:
-        """Give this heartbeat a round number never stamped before and
-        record when it was sent (Raft thesis 6.4.1: a lease runs from the
-        send time of a round a quorum answered)."""
-        if self._read_round <= self._newest_stamped_round:
-            self._read_round += 1
-        self._newest_stamped_round = self._read_round
-        self._round_sent_at[self._read_round] = now
-        # A round older than a lease can grant none: answered or not,
-        # it goes.
-        for stale_round in self._rounds_older_than_lease(now):
-            del self._round_sent_at[stale_round]
-
-    def _rounds_older_than_lease(self, now: float) -> list[int]:
-        """The rounds sent a lease or more before ``now``."""
-        return [
-            sent_round
-            for sent_round, sent_at in self._round_sent_at.items()
-            if now - sent_at >= self._leader_lease_seconds
-        ]
 
     async def _send_append_entries_to(self, peer_id: str) -> None:
         """Build and send AppendEntries to one follower -- or, when the
@@ -955,30 +929,25 @@ class RaftNode:
             return
 
         next_idx = self._next_index.get(peer_id, 1)
-        if (install := self._install_snapshot_for(next_idx)) is not None:
+        if (
+            self._snapshots is not None
+            and next_idx <= self._log.snapshot_index
+            and (
+                install := self._snapshots.build_install_snapshot_message(
+                    self._job_id, self._current_term, self._node_id
+                )
+            )
+            is not None
+        ):
             self._snapshots_sent += 1
             await self._send_message(addr, install)
             return
-        await self._send_message(addr, self._append_entries_from(next_idx))
-
-    def _install_snapshot_for(self, next_idx: int) -> InstallSnapshot | None:
-        """The snapshot to send a member whose next entry was compacted away
-        (Raft section 7), or None when the log still holds it."""
-        if self._snapshots is None or next_idx > self._log.snapshot_index:
-            return None
-        return self._snapshots.build_install_snapshot_message(
-            self._job_id, self._current_term, self._node_id
-        )
-
-    def _append_entries_from(self, next_idx: int) -> AppendEntries:
-        """AppendEntries carrying the log from ``next_idx`` on, after the
-        entry before it (Raft section 5.3's consistency check)."""
         prev_index = next_idx - 1
         prev_term = self._log.term_at(prev_index) or 0
 
         entries = self._log.get_range(next_idx, self._log.last_index() + 1)
 
-        return AppendEntries(
+        request = AppendEntries(
             job_id=self._job_id,
             term=self._current_term,
             leader_id=self._node_id,
@@ -988,6 +957,7 @@ class RaftNode:
             leader_commit=self._commit_index,
             read_round=self._read_round,
         )
+        await self._send_message(addr, request)
 
     async def handle_append_entries(self, request: AppendEntries) -> AppendEntriesResponse:
         """Handle an incoming AppendEntries RPC."""
@@ -997,32 +967,69 @@ class RaftNode:
                 return self._append_response(success=False, match_index=0)
 
             try:
-                return await self._answer_append_entries_locked(request)
+                if request.term > self._current_term:
+                    self._step_down(request.term)
+
+                if request.term < self._current_term:
+                    return self._append_response(success=False, match_index=0)
+
+                # A same-term leader claim means this node's local leadership view
+                # is stale. Step down before applying the heartbeat so only one
+                # writer remains active for the term.
+                if self._role == "leader" and request.leader_id != self._node_id:
+                    self._step_down(request.term)
+
+                # Valid leader heartbeat -- reset election timer
+                self._current_leader = request.leader_id
+                self._last_leader_contact = _DEFAULT_CLOCK.monotonic()
+                self._last_quorum_contact = self._last_leader_contact
+                self._election_deadline = self._new_election_deadline()
+                self._pre_vote_term = None
+
+                if self._role == "candidate":
+                    self._role = "follower"
+
+                # Check log consistency
+                if not self._log_matches_at(request.prev_log_index, request.prev_log_term):
+                    conflict = self._find_conflict_info(request.prev_log_index)
+                    return self._append_response(
+                        success=False,
+                        match_index=0,
+                        conflict_term=conflict[0],
+                        conflict_index=conflict[1],
+                    )
+
+                # AD-39: refuse entries stamped further ahead of this node's
+                # clock than the offset bound -- they never reach this log, so
+                # a skewed leader cannot commit through this member.
+                if (offset_error := self._first_offset_violation(request.entries)) is not None:
+                    await self._logger.log(RaftWarning(
+                        message=f"Refused AppendEntries from {request.leader_id}: {offset_error}",
+                        node_id=self._node_id,
+                        job_id=self._job_id,
+                    ))
+                    return self._append_response(
+                        success=False, match_index=0, clock_offset_rejected=True
+                    )
+
+                # Append new entries (truncating conflicts)
+                self._apply_entries_from_leader(request.entries)
+                for entry in request.entries:
+                    self._clock.receive(entry.hlc)
+
+                # Advance commit index
+                if request.leader_commit > self._commit_index:
+                    self._commit_index = min(
+                        request.leader_commit, self._log.last_index()
+                    )
+                    await self._apply_committed_locked()
+
+                return self._append_response(
+                    success=True, match_index=self._log.last_index()
+                )
             finally:
                 # Whatever this answer speaks for -- term, entries, cuts -- is durable before it goes.
                 await self._persist_locked()
-
-    async def _answer_append_entries_locked(self, request: AppendEntries) -> AppendEntriesResponse:
-        """Answer a leader's AppendEntries (Raft section 5.3): refuse a stale
-        term, follow the leader, refuse at a log mismatch, else append.
-        Lock held; the caller persists before the answer goes."""
-        if not self._accept_leader_term(request.term, request.leader_id):
-            return self._append_response(success=False, match_index=0)
-
-        # Valid leader heartbeat -- reset election timer
-        self._follow_leader(request.leader_id)
-
-        # Check log consistency
-        if not self._log_matches_at(request.prev_log_index, request.prev_log_term):
-            conflict = self._find_conflict_info(request.prev_log_index)
-            return self._append_response(
-                success=False,
-                match_index=0,
-                conflict_term=conflict[0],
-                conflict_index=conflict[1],
-            )
-
-        return await self._append_from_leader_locked(request)
 
     def _accept_leader_term(self, term: int, leader_id: str) -> bool:
         """Whether a leader's message of ``term`` is to be followed (Raft
@@ -1057,48 +1064,6 @@ class RaftNode:
         if self._role == "candidate":
             self._role = "follower"
 
-    async def _append_from_leader_locked(self, request: AppendEntries) -> AppendEntriesResponse:
-        """Append a matching leader's entries and follow its commit index
-        (Raft section 5.3) -- unless their HLCs run ahead of this node's
-        clock beyond the offset bound (AD-39). Lock held."""
-        # AD-39: refuse entries stamped further ahead of this node's
-        # clock than the offset bound -- they never reach this log, so
-        # a skewed leader cannot commit through this member.
-        if (offset_error := self._first_offset_violation(request.entries)) is not None:
-            await self._logger.log(RaftWarning(
-                message=f"Refused AppendEntries from {request.leader_id}: {offset_error}",
-                node_id=self._node_id,
-                job_id=self._job_id,
-            ))
-            return self._append_response(
-                success=False, match_index=0, clock_offset_rejected=True
-            )
-
-        # Append new entries (truncating conflicts)
-        self._apply_entries_from_leader(request.entries)
-        self._receive_entry_clocks(request.entries)
-
-        # Advance commit index
-        await self._follow_leader_commit_locked(request.leader_commit)
-
-        return self._append_response(
-            success=True, match_index=self._log.last_index()
-        )
-
-    def _receive_entry_clocks(self, entries: list[RaftLogEntry]) -> None:
-        """Merge each appended entry's HLC into this node's clock (AD-39)."""
-        for entry in entries:
-            self._clock.receive(entry.hlc)
-
-    async def _follow_leader_commit_locked(self, leader_commit: int) -> None:
-        """Raft Figure 2: if leaderCommit > commitIndex, commitIndex =
-        min(leaderCommit, index of last new entry); then apply. Lock held."""
-        if leader_commit > self._commit_index:
-            self._commit_index = min(
-                leader_commit, self._log.last_index()
-            )
-            await self._apply_committed_locked()
-
     def _log_matches_at(self, prev_index: int, prev_term: int) -> bool:
         """Check if our log matches at the given position."""
         if prev_index == 0:
@@ -1131,53 +1096,37 @@ class RaftNode:
         configuration entry takes effect as it is appended; truncating the
         one in force falls back to the newest the log still holds."""
         for entry in entries:
-            self._take_entry_from_leader(entry)
-
-    def _take_entry_from_leader(self, entry: RaftLogEntry) -> None:
-        """Raft Figure 2 (AppendEntries receiver, steps 3-4): an entry that
-        conflicts with the log cuts it from its index; one past the log's
-        end is appended."""
-        if self._conflicts_with_log(entry):
-            self._truncate_conflicting_suffix(entry.index)
-        if self._log.last_index() < entry.index:
-            self._append_leader_entry(entry)
-
-    def _conflicts_with_log(self, entry: RaftLogEntry) -> bool:
-        """Whether the log holds a different term at ``entry``'s index
-        (Raft section 5.3: the entry and all that follow it are deleted)."""
-        existing_term = self._log.term_at(entry.index)
-        return existing_term is not None and existing_term != entry.term
-
-    def _truncate_conflicting_suffix(self, index: int) -> None:
-        """Delete the log from ``index`` (Raft section 5.3): what is not yet
-        written is dropped before it is, what is durable is cut on disk, and
-        a configuration cut away falls back to the newest still held."""
-        self._log.truncate_from(index)
-        # Only what is durable is cut on disk; what is not yet
-        # written is dropped before it is.
-        self._pending_entries = self._pending_entries_before(index)
-        if index <= self._durable_index:
-            self._cut_durable_log_from(index)
-        if index <= self._configuration_index:
-            self._configuration = self._snapshot_configuration
-            self._configuration_index = self._log.snapshot_index
-            self._adopt_newest_held_configuration()
-
-    def _pending_entries_before(self, index: int) -> list[RaftLogEntry]:
-        """The unwritten entries that precede ``index``."""
-        return [
-            pending_entry for pending_entry in self._pending_entries if pending_entry.index < index
-        ]
-
-    def _cut_durable_log_from(self, index: int) -> None:
-        """Queue a cut of the durable log from ``index`` -- the lowest cut
-        queued so far -- and count only what precedes it as durable."""
-        self._pending_truncate_from = (
-            index
-            if self._pending_truncate_from is None
-            else min(self._pending_truncate_from, index)
-        )
-        self._durable_index = index - 1
+            existing_term = self._log.term_at(entry.index)
+            if existing_term is not None and existing_term != entry.term:
+                self._log.truncate_from(entry.index)
+                # Only what is durable is cut on disk; what is not yet
+                # written is dropped before it is.
+                self._pending_entries = [
+                    pending_entry for pending_entry in self._pending_entries if pending_entry.index < entry.index
+                ]
+                if entry.index <= self._durable_index:
+                    self._pending_truncate_from = (
+                        entry.index
+                        if self._pending_truncate_from is None
+                        else min(self._pending_truncate_from, entry.index)
+                    )
+                    self._durable_index = entry.index - 1
+                if entry.index <= self._configuration_index:
+                    self._configuration = self._snapshot_configuration
+                    self._configuration_index = self._log.snapshot_index
+                    for index in range(self._log.last_index(), self._log.snapshot_index, -1):
+                        if (
+                            held_entry := self._log.get(index)
+                        ) is not None and held_entry.command_type == RAFT_CONFIGURATION_COMMAND:
+                            self._configuration = RaftConfiguration.load(held_entry.command)
+                            self._configuration_index = index
+                            break
+            if self._log.last_index() < entry.index:
+                self._log.append(entry)
+                self._pending_entries.append(entry)
+                if entry.command_type == RAFT_CONFIGURATION_COMMAND:
+                    self._configuration = RaftConfiguration.load(entry.command)
+                    self._configuration_index = entry.index
 
     def _adopt_newest_held_configuration(self) -> None:
         """Take the newest configuration entry the log holds after its
@@ -1195,13 +1144,6 @@ class RaftNode:
         for index in range(through_index, self._log.snapshot_index, -1):
             if (held_entry := self._log.get(index)) is not None:
                 yield index, held_entry
-
-    def _append_leader_entry(self, entry: RaftLogEntry) -> None:
-        """Append a leader's entry past the log's end and queue it to be
-        written; a configuration entry takes effect at once."""
-        self._log.append(entry)
-        self._pending_entries.append(entry)
-        self._adopt_if_configuration(entry)
 
     def _adopt_if_configuration(self, entry: RaftLogEntry) -> None:
         """A configuration entry takes effect as it enters the log (Raft
@@ -1245,10 +1187,85 @@ class RaftNode:
     async def handle_append_entries_response(self, response: AppendEntriesResponse) -> None:
         """Handle response from a follower."""
         async with self._lock:
-            if not self._admit_follower_response(response):
+            if self._destroyed or self._role != "leader":
                 return
-            self._record_follower_answer(response)
-            await self._act_on_replication_result_locked(response)
+            if response.term > self._current_term:
+                self._step_down(response.term)
+                return
+            if response.term != self._current_term:
+                return
+            # A member that has left the configuration is no longer
+            # replicated to: a late answer of its must not bring its
+            # progress back.
+            if response.follower_id not in self._next_index:
+                return
+            # Any answer of this term -- refusals too -- is the member
+            # standing behind this leader (CheckQuorum), and behind it in
+            # the read round it echoes (ReadIndex).
+            self._last_response_at[response.follower_id] = _DEFAULT_CLOCK.monotonic()
+            self._reported_schema_versions[response.follower_id] = response.schema_version
+            if response.read_round > self._acknowledged_read_rounds.get(response.follower_id, 0):
+                self._acknowledged_read_rounds[response.follower_id] = response.read_round
+                if self._leader_lease_seconds is not None and self._round_sent_at:
+                    # The newest round a quorum answered extends the lease
+                    # from when it was sent; it and every older round go.
+                    for sent_round in sorted(self._round_sent_at, reverse=True):
+                        if self._configuration.has_quorum(
+                            {self._node_id}
+                            | {
+                                member
+                                for member, acknowledged in self._acknowledged_read_rounds.items()
+                                if acknowledged >= sent_round
+                            },
+                            self._quorum_floor,
+                        ):
+                            self._lease_expires_at = max(
+                                self._lease_expires_at,
+                                self._round_sent_at[sent_round] + self._leader_lease_seconds,
+                            )
+                            for answered_round in [
+                                round_number for round_number in self._round_sent_at if round_number <= sent_round
+                            ]:
+                                del self._round_sent_at[answered_round]
+                            break
+                if self._read_waiters:
+                    pending_reads = []
+                    for read_round, read_waiter in self._read_waiters:
+                        if read_waiter.done():
+                            continue
+                        if self._configuration.has_quorum(
+                            {self._node_id}
+                            | {
+                                member
+                                for member, acknowledged in self._acknowledged_read_rounds.items()
+                                if acknowledged >= read_round
+                            },
+                            self._quorum_floor,
+                        ):
+                            read_waiter.set_result(True)
+                        else:
+                            pending_reads.append((read_round, read_waiter))
+                    self._read_waiters = pending_reads
+
+            if response.success:
+                self._next_index[response.follower_id] = response.match_index + 1
+                self._match_index[response.follower_id] = response.match_index
+                self._advance_commit_index()
+                await self._apply_committed_locked()
+            elif getattr(response, "clock_offset_rejected", False):
+                # Not a log conflict: this leader's clock is ahead of the
+                # follower's beyond the bound. Its log stays put; the entries
+                # are re-sent (and refused) until the clocks agree.
+                await self._logger.log(RaftWarning(
+                    message=(
+                        f"{response.follower_id} refused entries: this leader's clock is "
+                        "beyond the HLC offset bound of its own"
+                    ),
+                    node_id=self._node_id,
+                    job_id=self._job_id,
+                ))
+            else:
+                self._backtrack_next_index(response)
 
     def _admit_follower_response(self, response: AppendEntriesResponse | InstallSnapshotResponse) -> bool:
         """Whether a live leader acts on a member's answer: one of its own
@@ -1271,113 +1288,6 @@ class RaftNode:
         """Whether ``response`` is of this term, from a member still
         replicated to."""
         return response.term == self._current_term and response.follower_id in self._next_index
-
-    def _record_follower_answer(self, response: AppendEntriesResponse) -> None:
-        """Any answer of this term -- refusals too -- is the member standing
-        behind this leader (CheckQuorum, Raft thesis 6.2), and behind it in
-        the read round it echoes (ReadIndex, thesis 6.4)."""
-        self._last_response_at[response.follower_id] = _DEFAULT_CLOCK.monotonic()
-        self._reported_schema_versions[response.follower_id] = response.schema_version
-        if response.read_round > self._acknowledged_read_rounds.get(response.follower_id, 0):
-            self._acknowledged_read_rounds[response.follower_id] = response.read_round
-            self._extend_lease_from_answered_rounds()
-            self._resolve_confirmed_reads()
-
-    def _extend_lease_from_answered_rounds(self) -> None:
-        """With leases on, extend the lease from the newest stamped round a
-        quorum answered (Raft thesis 6.4.1)."""
-        if self._lease_rounds_outstanding():
-            self._extend_lease_to_newest_answered_round()
-
-    def _lease_rounds_outstanding(self) -> bool:
-        """Whether leases are on and some stamped round awaits a quorum."""
-        return self._leader_lease_seconds is not None and bool(self._round_sent_at)
-
-    def _extend_lease_to_newest_answered_round(self) -> None:
-        """The newest round a quorum answered extends the lease from when
-        it was sent; it and every older round go."""
-        for sent_round in sorted(self._round_sent_at, reverse=True):
-            if self._quorum_acknowledged_round(sent_round):
-                self._grant_lease_through(sent_round)
-                return
-
-    def _quorum_acknowledged_round(self, read_round: int) -> bool:
-        """Whether this leader and the members that answered ``read_round``
-        or a later one form a quorum (both voter sets while joint)."""
-        return self._configuration.has_quorum(
-            {self._node_id}
-            | {
-                member
-                for member, acknowledged in self._acknowledged_read_rounds.items()
-                if acknowledged >= read_round
-            },
-            self._quorum_floor,
-        )
-
-    def _grant_lease_through(self, sent_round: int) -> None:
-        """Extend the lease to ``sent_round``'s send time plus the lease,
-        never shortening it, and drop that round and every older one."""
-        self._lease_expires_at = max(
-            self._lease_expires_at,
-            self._round_sent_at[sent_round] + self._leader_lease_seconds,
-        )
-        for answered_round in self._stamped_rounds_through(sent_round):
-            del self._round_sent_at[answered_round]
-
-    def _stamped_rounds_through(self, sent_round: int) -> list[int]:
-        """The stamped rounds no newer than ``sent_round``."""
-        return [
-            round_number for round_number in self._round_sent_at if round_number <= sent_round
-        ]
-
-    def _resolve_confirmed_reads(self) -> None:
-        """ReadIndex (Raft thesis 6.4): resolve each read whose round a
-        quorum answered; keep the rest waiting."""
-        if self._read_waiters:
-            self._read_waiters = self._unconfirmed_reads()
-
-    def _unconfirmed_reads(self) -> list[tuple[int, asyncio.Future[bool]]]:
-        """The reads still waiting once every confirmed one is resolved."""
-        pending_reads = []
-        for read_round, read_waiter in self._read_waiters:
-            if self._read_still_waiting(read_round, read_waiter):
-                pending_reads.append((read_round, read_waiter))
-        return pending_reads
-
-    def _read_still_waiting(self, read_round: int, read_waiter: asyncio.Future[bool]) -> bool:
-        """Whether a read is still waiting: a done one is dropped, one a
-        quorum confirmed is resolved True and dropped."""
-        if read_waiter.done():
-            return False
-        if self._quorum_acknowledged_round(read_round):
-            read_waiter.set_result(True)
-            return False
-        return True
-
-    async def _act_on_replication_result_locked(self, response: AppendEntriesResponse) -> None:
-        """A success advances the member's progress and the commit index
-        (Raft section 5.3); a clock-offset refusal is reported; any other
-        refusal backs ``next_index`` off. Lock held."""
-        if response.success:
-            self._next_index[response.follower_id] = response.match_index + 1
-            self._match_index[response.follower_id] = response.match_index
-            self._advance_commit_index()
-            await self._apply_committed_locked()
-            return
-        if getattr(response, "clock_offset_rejected", False):
-            # Not a log conflict: this leader's clock is ahead of the
-            # follower's beyond the bound. Its log stays put; the entries
-            # are re-sent (and refused) until the clocks agree.
-            await self._logger.log(RaftWarning(
-                message=(
-                    f"{response.follower_id} refused entries: this leader's clock is "
-                    "beyond the HLC offset bound of its own"
-                ),
-                node_id=self._node_id,
-                job_id=self._job_id,
-            ))
-            return
-        self._backtrack_next_index(response)
 
     def _backtrack_next_index(self, response: AppendEntriesResponse) -> None:
         """Efficiently backtrack next_index using conflict info."""
@@ -1421,22 +1331,14 @@ class RaftNode:
         of the configuration holds (Sections 5.3/5.4; both voter sets while
         joint, Section 6)."""
         for candidate_index in range(self._log.last_index(), self._commit_index, -1):
-            if self._quorum_holds_entry_of_this_term(candidate_index):
+            if self._log.term_at(candidate_index) != self._current_term:
+                continue
+            holders = ({self._node_id} if candidate_index <= self._durable_index else set()) | {
+                member for member, match in self._match_index.items() if match >= candidate_index
+            }
+            if self._configuration.has_quorum(holders, self._quorum_floor):
                 self._commit_index = candidate_index
                 return
-
-    def _quorum_holds_entry_of_this_term(self, index: int) -> bool:
-        """Whether the entry at ``index`` is of the current term (Raft
-        section 5.4.2: only those commit by counting replicas) and a quorum
-        holds it."""
-        if self._log.term_at(index) != self._current_term:
-            return False
-        return self._configuration.has_quorum(self._holders_of(index), self._quorum_floor)
-
-    def _holders_of(self, index: int) -> set[str]:
-        """The members holding ``index``: this leader once it is durable
-        here (Raft thesis 10.2.1), and each follower that matched it."""
-        return ({self._node_id} if index <= self._durable_index else set()) | self._followers_holding(index)
 
     # =========================================================================
     # Client Interface
@@ -1830,114 +1732,79 @@ class RaftNode:
         configuration that leaves this member out steps it down (Section 6).
         """
         applied_count = 0
-        keep_applying = True
-        while keep_applying:
-            applied_now, halted = await self._apply_through_commit_locked()
-            applied_count += applied_now
-            keep_applying = not halted and await self._follow_committed_configuration_locked()
-        return applied_count
+        while True:
+            while self._last_applied < self._commit_index:
+                # An entry this member cannot read is never skipped -- its
+                # state would silently fork from every other member's.
+                # Applying stops there until the member runs code that
+                # reads it (AD-52 section 14).
+                if (
+                    next_entry := self._log.get(self._last_applied + 1)
+                ) is not None and not (
+                    self._schema_versions[0] <= next_entry.schema_version <= self._schema_versions[1]
+                ):
+                    if self._apply_halted_at != next_entry.index:
+                        self._apply_halted_at = next_entry.index
+                        await self._logger.log(RaftError(
+                            message=(
+                                f"Applying stopped at entry {next_entry.index} ({next_entry.command_type}): "
+                                f"schema version {next_entry.schema_version} is outside "
+                                f"{self._schema_versions[0]}-{self._schema_versions[1]} this member reads"
+                            ),
+                            node_id=self._node_id,
+                            job_id=self._job_id,
+                            term=self._current_term,
+                        ))
+                    return applied_count
+                self._last_applied += 1
+                if entry := self._log.get(self._last_applied):
+                    if entry.command_type not in (
+                        RAFT_CONFIGURATION_COMMAND,
+                        RAFT_NO_OP_COMMAND,
+                    ):
+                        await self._apply_command(entry)
+                    waiter = self._proposal_waiters.pop(self._last_applied, None)
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(True)
+                    applied_count += 1
 
-    async def _apply_through_commit_locked(self) -> tuple[int, bool]:
-        """Apply each committed entry in order: how many were applied, and
-        whether applying halted at one this member cannot read. Lock held."""
-        applied_count = 0
-        while self._last_applied < self._commit_index:
-            if await self._halt_at_unreadable_entry_locked():
-                return applied_count, True
-            applied_count += await self._apply_next_entry_locked()
-        return applied_count, False
+            if self._role != "leader" or self._configuration_index > self._commit_index:
+                return applied_count
 
-    async def _halt_at_unreadable_entry_locked(self) -> bool:
-        """An entry this member cannot read is never skipped -- its state
-        would silently fork from every other member's. Applying stops there
-        until the member runs code that reads it (AD-52 section 14); the
-        halt is reported once. Lock held."""
-        next_entry = self._log.get(self._last_applied + 1)
-        if not self._is_unreadable(next_entry):
-            return False
-        await self._report_apply_halt_locked(next_entry)
-        return True
+            if not self._configuration.is_joint:
+                if self._node_id not in self._configuration.voters:
+                    self._step_down(self._current_term)
+                return applied_count
 
-    def _is_unreadable(self, entry: RaftLogEntry | None) -> bool:
-        """Whether ``entry`` is held and its schema is outside the ones this
-        member reads."""
-        return entry is not None and not (
-            self._schema_versions[0] <= entry.schema_version <= self._schema_versions[1]
-        )
-
-    async def _report_apply_halt_locked(self, next_entry: RaftLogEntry) -> None:
-        """Record and log, once per entry, that applying stopped at it."""
-        if self._apply_halted_at != next_entry.index:
-            self._apply_halted_at = next_entry.index
-            await self._logger.log(RaftError(
-                message=(
-                    f"Applying stopped at entry {next_entry.index} ({next_entry.command_type}): "
-                    f"schema version {next_entry.schema_version} is outside "
-                    f"{self._schema_versions[0]}-{self._schema_versions[1]} this member reads"
-                ),
-                node_id=self._node_id,
-                job_id=self._job_id,
+            # The joint configuration committed: the final one follows, and
+            # members it leaves out are no longer replicated to once it does.
+            final_configuration = RaftConfiguration(
+                voters=self._configuration.voters,
+                learners=self._configuration.learners,
+            )
+            configuration_entry = RaftLogEntry(
                 term=self._current_term,
-            ))
-
-    async def _apply_next_entry_locked(self) -> int:
-        """Apply the entry after the last applied one, if the log holds it:
-        1 when applied, else 0. Lock held."""
-        self._last_applied += 1
-        if not (entry := self._log.get(self._last_applied)):
-            return 0
-        if entry.command_type not in (
-            RAFT_CONFIGURATION_COMMAND,
-            RAFT_NO_OP_COMMAND,
-        ):
-            await self._apply_command(entry)
-        self._resolve_proposal(self._last_applied)
-        return 1
-
-    def _resolve_proposal(self, index: int) -> None:
-        """Resolve the local proposal at ``index`` as committed."""
-        waiter = self._proposal_waiters.pop(index, None)
-        if waiter is not None and not waiter.done():
-            waiter.set_result(True)
-
-    async def _follow_committed_configuration_locked(self) -> bool:
-        """Raft section 6 on a leader whose configuration committed: a
-        joint one is followed by the final one (True: apply again); a
-        final one that leaves this leader out steps it down. Lock held."""
-        if not self._leads_with_committed_configuration():
-            return False
-
-        if not self._configuration.is_joint:
-            self._step_down_if_removed()
-            return False
-
-        await self._append_final_configuration_locked()
-        return True
-
-    def _leads_with_committed_configuration(self) -> bool:
-        """Whether this member leads and its configuration committed."""
-        return self._role == "leader" and self._configuration_index <= self._commit_index
-
-    def _step_down_if_removed(self) -> None:
-        """A leader the committed final configuration leaves out of its
-        voters steps down (Raft section 6)."""
-        if self._node_id not in self._configuration.voters:
-            self._step_down(self._current_term)
-
-    async def _append_final_configuration_locked(self) -> None:
-        """The joint configuration committed: the final one follows, and
-        members it leaves out are no longer replicated to once it does.
-        Lock held."""
-        final_configuration = RaftConfiguration(
-            voters=self._configuration.voters,
-            learners=self._configuration.learners,
-        )
-        configuration_entry = self._append_new_entry(final_configuration.dump(), RAFT_CONFIGURATION_COMMAND)
-        self._configuration = final_configuration
-        self._configuration_index = configuration_entry.index
-        self._forget_departed_members(final_configuration)
-        self._advance_commit_index()
-        await self._send_append_entries_to_followers()
+                index=self._log.last_index() + 1,
+                command=final_configuration.dump(),
+                command_type=RAFT_CONFIGURATION_COMMAND,
+                job_id=self._job_id,
+                hlc=self._clock.now(),
+                schema_version=self._write_schema_version(),
+            )
+            self._log.append(configuration_entry)
+            self._pending_entries.append(configuration_entry)
+            self._configuration = final_configuration
+            self._configuration_index = configuration_entry.index
+            for departed_member in [
+                member for member in self._next_index if member not in final_configuration.members
+            ]:
+                del self._next_index[departed_member]
+                self._match_index.pop(departed_member, None)
+                self._last_response_at.pop(departed_member, None)
+                self._reported_schema_versions.pop(departed_member, None)
+                self._acknowledged_read_rounds.pop(departed_member, None)
+            self._advance_commit_index()
+            await self._send_append_entries_to_followers()
 
     def _forget_departed_members(self, configuration: RaftConfiguration) -> None:
         """Stop replicating to the members ``configuration`` leaves out:
@@ -2235,100 +2102,43 @@ class RaftNode:
         """
         term = self._current_term
         voted_for = self._voted_for
-        hard_state_changed = self._hard_state_changed(term, voted_for)
-        if not hard_state_changed and not self._has_unwritten_log_changes():
-            return
-        await self._write_unwritten_locked(term, voted_for, hard_state_changed)
-        self._mark_written(term, voted_for)
-
-    def _hard_state_changed(self, term: int, voted_for: str | None) -> bool:
-        """Whether the term or vote differs from what storage holds."""
-        return term != self._persisted_term or voted_for != self._persisted_vote
-
-    def _has_unwritten_log_changes(self) -> bool:
-        """Whether entries, a cut of the durable log or a snapshot wait to
-        be written."""
-        return (
-            bool(self._pending_entries)
+        hard_state_changed = term != self._persisted_term or voted_for != self._persisted_vote
+        if not (
+            hard_state_changed
+            or self._pending_entries
             or self._pending_truncate_from is not None
             or self._pending_snapshot is not None
-        )
-
-    async def _write_unwritten_locked(self, term: int, voted_for: str | None, hard_state_changed: bool) -> None:
-        """Write the unwritten records to durable storage as one unit;
-        volatile storage holds nothing. Lock held.
-
-        Raises:
-            BaseException: the write failed -- the group was destroyed.
-        """
-        if not self._storage.durable:
+        ):
             return
-        records = self._creation_and_hard_state_records(term, voted_for, hard_state_changed)
-        records.extend(self._log_change_records())
-        await self._write_or_leave_group_locked(records, term)
-
-    def _creation_and_hard_state_records(
-        self, term: int, voted_for: str | None, hard_state_changed: bool
-    ) -> list[GroupCreatedRecord | HardStateRecord | TruncateFromRecord | EntriesRecord | SnapshotRecord]:
-        """The group's creation, if not yet written, then its hard state,
-        if changed."""
-        records: list[GroupCreatedRecord | HardStateRecord | TruncateFromRecord | EntriesRecord | SnapshotRecord] = []
-        if not self._creation_persisted:
-            records.append(
-                GroupCreatedRecord(
-                    group_id=self._job_id,
-                    member_id=self._node_id,
-                    initial_voters=sorted(self._initial_configuration.voters),
+        if self._storage.durable:
+            records: list[GroupCreatedRecord | HardStateRecord | TruncateFromRecord | EntriesRecord | SnapshotRecord] = []
+            if not self._creation_persisted:
+                records.append(
+                    GroupCreatedRecord(
+                        group_id=self._job_id,
+                        member_id=self._node_id,
+                        initial_voters=sorted(self._initial_configuration.voters),
+                    )
                 )
-            )
-        if hard_state_changed:
-            records.append(HardStateRecord(group_id=self._job_id, term=term, voted_for=voted_for))
-        return records
-
-    def _log_change_records(self) -> list[TruncateFromRecord | EntriesRecord | SnapshotRecord]:
-        """The cut of the durable log, the new entries, then the snapshot
-        -- each only if pending."""
-        records = self._cut_and_entries_records()
-        if self._pending_snapshot is not None:
-            records.append(self._pending_snapshot)
-        return records
-
-    def _cut_and_entries_records(self) -> list[TruncateFromRecord | EntriesRecord | SnapshotRecord]:
-        """The pending cut of the durable log, then the pending entries."""
-        records: list[TruncateFromRecord | EntriesRecord | SnapshotRecord] = []
-        if self._pending_truncate_from is not None:
-            records.append(TruncateFromRecord(group_id=self._job_id, index=self._pending_truncate_from))
-        if self._pending_entries:
-            records.append(EntriesRecord(group_id=self._job_id, entries=self._pending_entries))
-        return records
-
-    async def _write_or_leave_group_locked(
-        self,
-        records: list[GroupCreatedRecord | HardStateRecord | TruncateFromRecord | EntriesRecord | SnapshotRecord],
-        term: int,
-    ) -> None:
-        """Write ``records``; a failed write destroys the group (fail-stop),
-        is logged, and propagates. Lock held.
-
-        Raises:
-            BaseException: whatever the write raised.
-        """
-        try:
-            await self._storage.write(records)
-        except BaseException as storage_error:
-            self.destroy()
-            await self._logger.log(RaftError(
-                message=f"Raft state could not be written; this member left the group: {storage_error}",
-                node_id=self._node_id,
-                job_id=self._job_id,
-                term=term,
-            ))
-            raise
-
-    def _mark_written(self, term: int, voted_for: str | None) -> None:
-        """Storage now holds the creation, ``term``, ``voted_for`` and the
-        whole log; a leader counts itself for the entries now durable
-        (Raft thesis 10.2.1)."""
+            if hard_state_changed:
+                records.append(HardStateRecord(group_id=self._job_id, term=term, voted_for=voted_for))
+            if self._pending_truncate_from is not None:
+                records.append(TruncateFromRecord(group_id=self._job_id, index=self._pending_truncate_from))
+            if self._pending_entries:
+                records.append(EntriesRecord(group_id=self._job_id, entries=self._pending_entries))
+            if self._pending_snapshot is not None:
+                records.append(self._pending_snapshot)
+            try:
+                await self._storage.write(records)
+            except BaseException as storage_error:
+                self.destroy()
+                await self._logger.log(RaftError(
+                    message=f"Raft state could not be written; this member left the group: {storage_error}",
+                    node_id=self._node_id,
+                    job_id=self._job_id,
+                    term=term,
+                ))
+                raise
         self._creation_persisted = True
         self._persisted_term = term
         self._persisted_vote = voted_for

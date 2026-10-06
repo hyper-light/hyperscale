@@ -9,7 +9,7 @@ import sys
 import psutil
 
 
-from hyperscale.core.jobs.models import HyperscaleConfig
+from hyperscale.core.jobs.models import HyperscaleConfig, TerminalMode
 from hyperscale.distributed.env import Env, load_env
 from hyperscale.distributed.ledger.storage_health import StorageHealth
 from hyperscale.distributed.raft.store.raft_store import RaftStore
@@ -17,6 +17,9 @@ from hyperscale.distributed.runtime import RealClock, RealFilesystem, RealRandom
 from hyperscale.distributed.swim.core.node_id import NodeId
 from hyperscale.distributed.taskex import TaskRunner
 from hyperscale.logging import Logger
+
+from .cluster_cookie import ClusterCookie
+from .cluster_cookie_unavailable_error import ClusterCookieUnavailableError
 
 
 async def get_default_workers():
@@ -63,21 +66,35 @@ async def get_default_config():
 AUTH_SECRET_ENVAR = "MERCURY_SYNC_AUTH_SECRET"
 
 
-def resolve_auth_secret(acm_secret: str | None) -> str:
+async def resolve_auth_secret(acm_secret: str | None) -> str:
     """Resolve the cluster auth secret every node must share.
 
     Precedence: the ``--acm-secret`` flag, then ``MERCURY_SYNC_AUTH_SECRET``,
-    then the distributed ``Env`` default — the same env-then-default
-    resolution ``LocalRunner`` and ``ServerRunner`` use. The secret keys
-    message encryption, so it must be identical across the cluster; a
-    per-process random default made every multi-node cluster unable to
-    communicate.
+    then the per-user cluster cookie (``ClusterCookie``), created on first
+    use. The secret keys message authentication and encryption, so it must
+    be identical across the cluster and must never be a published default:
+    a cookie that cannot be created, read or trusted fails the command
+    (exit status 1, the reason and both ways to configure a secret on
+    stderr) rather than running without one.
     """
     if acm_secret:
         return acm_secret
 
-    return os.getenv(AUTH_SECRET_ENVAR) or Env().MERCURY_SYNC_AUTH_SECRET
-    
+    if environment_secret := os.getenv(AUTH_SECRET_ENVAR):
+        return environment_secret
+
+    return await cluster_cookie_secret()
+
+
+async def cluster_cookie_secret() -> str:
+    """The current user's cluster cookie secret; a cookie that cannot be
+    used ends the command with exit status 1 and the reason on stderr."""
+    try:
+        return await ClusterCookie.secret_for_current_user()
+    except ClusterCookieUnavailableError as cookie_error:
+        print(str(cookie_error), file=sys.stderr)
+        raise SystemExit(1) from cookie_error
+
 
 def node_env(**explicit_values) -> Env:
     """The ``Env`` a ``hyperscale run worker|manager|gate`` node runs with.
@@ -91,6 +108,38 @@ def node_env(**explicit_values) -> Env:
 
 
 _UNSAFE_PATH_CHARACTERS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+# A full-screen dashboard needs a terminal: with stdout a pipe (a process
+# supervisor, a log collector, a test capturing output) "full" renders
+# nothing and the node logs to stderr as it always has. "ci" -- asked for
+# explicitly -- renders plain frames to wherever stdout goes.
+NON_TERMINAL_MODES: dict[TerminalMode, TerminalMode] = {"full": "disabled"}
+
+
+async def node_terminal_mode(configured_mode: TerminalMode, quiet: bool) -> TerminalMode:
+    """The terminal mode a ``hyperscale run worker|manager|gate`` node's
+    dashboard runs in: none with ``--quiet`` (as ``run workflow``), "full"
+    only when stdout is a terminal, otherwise the configured mode."""
+    if quiet:
+        return "disabled"
+
+    stdout_is_terminal = await asyncio.get_running_loop().run_in_executor(None, sys.stdout.isatty)
+    return configured_mode if stdout_is_terminal else NON_TERMINAL_MODES.get(configured_mode, configured_mode)
+
+
+def node_log_path(
+    logs_directory: str,
+    role: str,
+    datacenter: str,
+    host: str,
+    tcp_port: int,
+) -> pathlib.Path:
+    """The file a node's stderr logs go to while its dashboard renders: one
+    per node identity in the configured logs directory, named as its data
+    directory is."""
+    node_name = _UNSAFE_PATH_CHARACTERS.sub("_", f"{role}-{datacenter}-{host}-{tcp_port}")
+    return pathlib.Path(logs_directory).absolute() / f"{node_name}.log"
 
 
 def _create_node_data_directory(

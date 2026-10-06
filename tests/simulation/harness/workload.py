@@ -25,6 +25,7 @@ from hyperscale.distributed.nodes.client import HyperscaleClient
 
 from tests.simulation.harness.conditions import dc_has_leader, wait_until
 from tests.simulation.harness.errors import HarnessError
+from tests.simulation.harness.harness_auth_secret import HARNESS_AUTH_SECRET
 from tests.simulation.harness.expectations import (
     Expectation,
     ExpectationResult,
@@ -120,7 +121,7 @@ class WorkloadDriver:
         self._client = HyperscaleClient(
             host=self.harness.spec.host,
             port=self.client_port,
-            env=Env(MERCURY_SYNC_LOG_LEVEL="error"),
+            env=Env(MERCURY_SYNC_AUTH_SECRET=HARNESS_AUTH_SECRET, MERCURY_SYNC_LOG_LEVEL="error"),
             **targets,
         )
         await self._client.start()

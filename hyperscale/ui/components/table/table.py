@@ -176,14 +176,16 @@ class Table:
 
         elapsed = time.monotonic() - self._start
 
+        # An empty update is a table with no rows, not "no update" (None):
+        # the last row leaving must clear the table.
         if (
-            data
+            data is not None
             and self._config.no_update_on_push
             and len(self._last_rendered_frames) > 0
         ):
             self._last_state = data
 
-        elif data:
+        elif data is not None:
             table_lines = await self._rerender(data)
             self._last_rendered_frames = table_lines
 

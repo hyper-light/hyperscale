@@ -7527,7 +7527,8 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  │ • HKDF key derivation from shared secret                  │  │
 │  │ • Per-message salt (never reuse nonces)                   │  │
 │  │ • Key rotation via MERCURY_SYNC_AUTH_SECRET_PREVIOUS      │  │
-│  │ • Weak secret detection and rejection                     │  │
+│  │ • Weak/default secrets always refused (no                 │  │
+│  │   HYPERSCALE_ENV escape hatch); no default secret         │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  Replay Protection:                                              │
@@ -7653,8 +7654,8 @@ hyperscale/distributed_rewrite/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MERCURY_SYNC_AUTH_SECRET` | (required) | Shared secret for encryption (min 16 chars) |
-| `MERCURY_SYNC_AUTH_SECRET_PREVIOUS` | None | Previous secret for key rotation |
+| `MERCURY_SYNC_AUTH_SECRET` | None (no published default) | Shared secret for encryption (min 16 chars; known weak values refused). Cluster commands resolve `--acm-secret`, then this variable, then the per-user cluster cookie (`$XDG_CONFIG_HOME/hyperscale/cluster_cookie`, `~/.config/hyperscale/cluster_cookie`, or `%APPDATA%\hyperscale\cluster_cookie`; created once, mode 0600). Local runs generate a per-run secret shared with their workers. |
+| `MERCURY_SYNC_AUTH_SECRET_PREVIOUS` | None | Previous secret for key rotation (same length and weak-value rules) |
 | `MERCURY_SYNC_TLS_VERIFY_HOSTNAME` | `true` | TLS hostname verification |
 | `MERCURY_SYNC_CLEANUP_INTERVAL` | `30s` | Background cleanup interval |
 | `MERCURY_SYNC_TASK_RUNNER_MAX_THREADS` | 4 | TaskRunner thread pool size |

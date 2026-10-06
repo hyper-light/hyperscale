@@ -169,6 +169,11 @@ class Terminal:
             for subscription in subscriptions:
                 self._updates.add_topic(subscription, [update])
 
+    @property
+    def refresh_interval(self) -> float:
+        """Seconds between the terminal's refreshes, from its refresh rate."""
+        return self._interval
+
     @classmethod
     def trigger_render(cls):
         """Signal the render loop to wake up and re-render immediately."""
@@ -259,6 +264,11 @@ class Terminal:
             )
 
             self._run_engine = asyncio.ensure_future(self._run())
+            # Return once the terminal has hidden the cursor, claimed its
+            # signals and started its render loop: a caller that routes
+            # SIGINT itself (ShutdownSignals) must claim it after this, not
+            # race the terminal's own registration.
+            await self._run_engine
 
     async def _dup_stdout(self):
         stdout_fileno = await self._loop.run_in_executor(None, sys.stdout.fileno)
@@ -577,9 +587,24 @@ class Terminal:
         await self._show_cursor()
 
     def _reset_signal_handlers(self):
+        # A resize after the terminal stopped must not restart its render
+        # loop (handle_resize resumes it).
+        self._loop.remove_signal_handler(signal.SIGWINCH)
+
         for sig, sig_handler in self._dfl_sigmap.items():
             if sig and sig_handler:
                 signal.signal(sig, sig_handler)
+
+    async def close(self):
+        """Release what the terminal holds past stop() or abort(): its
+        components' subscriptions to the actions, and its duplicate of
+        stdout. Call it once the terminal will render no more."""
+        self._updates.remove_updates(
+            [component.update for section in self.canvas.sections for component in section.components.values()]
+        )
+
+        self._writer.close()
+        await asyncio.sleep(0)
 
     def _register_signal_handlers(self):
         self._loop.add_signal_handler(

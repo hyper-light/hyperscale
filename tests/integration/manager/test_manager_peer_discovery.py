@@ -33,6 +33,10 @@ from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.models import ManagerHeartbeat, ManagerPeerRegistration, ManagerPeerRegistrationResponse
 from hyperscale.logging.config.logging_config import LoggingConfig
 
+# Every node and client of this test shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 # Initialize logging directory
 _logging_config = LoggingConfig()
 _logging_config.update(log_directory=os.getcwd())
@@ -122,6 +126,7 @@ async def scenario_manager_peer_discovery_cluster_size(cluster_size: int) -> boo
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),
@@ -223,6 +228,7 @@ async def scenario_manager_heartbeat_message_validation(cluster_size: int) -> bo
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),
@@ -407,6 +413,7 @@ async def scenario_manager_peer_discovery_failure_recovery(cluster_size: int) ->
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),
@@ -465,6 +472,7 @@ async def scenario_manager_peer_discovery_failure_recovery(cluster_size: int) ->
             tcp_port=manager_configs[failed_manager_index]["tcp"],
             udp_port=manager_configs[failed_manager_index]["udp"],
             env=Env(
+                MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                 MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                 MERCURY_SYNC_LOG_LEVEL="error",
             ),
@@ -550,6 +558,7 @@ async def scenario_manager_discovery_peer_selection(cluster_size: int) -> bool:
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),

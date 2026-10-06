@@ -185,6 +185,14 @@ class ManagerStateEmbedder:
                 if rtt_ms is not None:
                     self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
 
+    @staticmethod
+    def _call_or_default[ResultType](
+        getter: Callable[[], ResultType] | None,
+        default: ResultType,
+    ) -> ResultType:
+        """``getter()`` when a getter is set, else ``default``."""
+        return getter() if getter else default
+
     def get_health_piggyback(self) -> HealthPiggyback | None:
         """
         Get HealthPiggyback for gossip dissemination (Phase 6.1).
@@ -196,19 +204,11 @@ class ManagerStateEmbedder:
             node_id=self.get_node_id(),
             node_type="manager",
             is_alive=True,
-            accepting_work=self.get_health_accepting_jobs()
-            if self.get_health_accepting_jobs
-            else True,
+            accepting_work=self._call_or_default(self.get_health_accepting_jobs, True),
             capacity=self.get_available_cores(),
-            throughput=self.get_health_throughput()
-            if self.get_health_throughput
-            else 0.0,
-            expected_throughput=self.get_health_expected_throughput()
-            if self.get_health_expected_throughput
-            else 0.0,
-            overload_state=self.get_health_overload_state()
-            if self.get_health_overload_state
-            else "healthy",
+            throughput=self._call_or_default(self.get_health_throughput, 0.0),
+            expected_throughput=self._call_or_default(self.get_health_expected_throughput, 0.0),
+            overload_state=self._call_or_default(self.get_health_overload_state, "healthy"),
             timestamp=_DEFAULT_CLOCK.monotonic(),
         )
 

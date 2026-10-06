@@ -33,6 +33,7 @@ from hyperscale.distributed.models import ManagerPingResponse
 from hyperscale.distributed.nodes.client import HyperscaleClient
 from hyperscale.distributed.nodes.manager.config import create_manager_config_from_env
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
     BOOT_TIMEOUT_SECONDS,
     LOCALHOST,
     NODE_BLOCK,
@@ -48,7 +49,7 @@ from tests.integration.cli.test_cli_resource_guard import (
     _submit_until_accepted,
 )
 
-ENV = Env()
+ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
 DATACENTER = "dc-gateless"
 COHORT_SIZE = 3
 WORKER_CORES = 1

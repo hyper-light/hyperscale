@@ -45,6 +45,10 @@ class Canvas:
     def size(self):
         return self._total_size
 
+    @property
+    def sections(self) -> List[Section]:
+        return self._sections
+
     def get_section(self, component_name: str) -> Section | None:
         for section in self._sections:
             if component_name in section.component_names:

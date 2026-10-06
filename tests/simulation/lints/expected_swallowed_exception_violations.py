@@ -181,7 +181,6 @@ EXPECTED_SWALLOWED_EXCEPTION_VIOLATIONS: dict[str, int] = {
     'hyperscale/distributed/server/server/mercury_sync_base_server.py::MercurySyncBaseServer._close_tcp_server': 2,
     'hyperscale/distributed/server/server/mercury_sync_base_server.py::MercurySyncBaseServer._close_udp_transport': 1,
     'hyperscale/distributed/server/server/mercury_sync_base_server.py::MercurySyncBaseServer.abort': 5,
-    'hyperscale/distributed/swim/health_aware_server.py::HealthAwareServer._probe_with_timeout': 1,
     'hyperscale/distributed/swim/health_aware_server.py::HealthAwareServer.stop': 1,
     'hyperscale/distributed/swim/message_handling/membership/join_handler.py::JoinHandler._parse_join_message': 2,
     'hyperscale/distributed/taskex/run.py::Run.abort': 1,

@@ -13,6 +13,7 @@ Key responsibilities:
 """
 
 import asyncio
+from types import MappingProxyType
 from typing import Callable
 
 from hyperscale.distributed.models import (
@@ -46,6 +47,18 @@ from hyperscale.distributed.models import NodeInfo
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
+
+
+# The bucket a healthy worker's overload state puts it in; a state not
+# listed is HEALTHY.
+_BUCKET_BY_OVERLOAD_STATE: MappingProxyType[str, str] = MappingProxyType(
+    {
+        "healthy": "HEALTHY",
+        "busy": "BUSY",
+        "stressed": "DEGRADED",
+        "overloaded": "UNHEALTHY",
+    }
+)
 
 
 # Re-export for backwards compatibility
@@ -178,102 +191,138 @@ class WorkerPool:
             # around a worker power-cycle stranded to the AD-34
             # timeout against an idle, healthy gen-2).
             new_addr = (registration.node.host, registration.node.port)
-            stale_node_id = self._addr_to_worker.get(new_addr)
-            if stale_node_id is not None and stale_node_id != node_id:
-                self._workers.pop(stale_node_id, None)
-                self._dispatch_reservations.pop(stale_node_id, None)
-                self._applied_cores_versions.pop(stale_node_id, None)
-                self._worker_health.pop(stale_node_id, None)
-                self._dispatch_routing.pop(stale_node_id, None)
-                self._drain_intents.pop(stale_node_id, None)
-                self._addr_to_worker.pop(new_addr, None)
+            self._evict_stale_worker_at_addr(node_id, new_addr)
 
             # Check if already registered
             if node_id in self._workers:
-                worker = self._workers[node_id]
-                drain_intended = self.is_worker_drain_intended(node_id)
-                if worker.registration:
-                    old_addr = (
-                        worker.registration.node.host,
-                        worker.registration.node.port,
-                    )
-                    self._addr_to_worker.pop(old_addr, None)
-
-                worker.registration = registration
-                worker.last_seen = _DEFAULT_CLOCK.monotonic()
-                worker.total_cores = registration.total_cores or 0
-                worker.available_cores = registration.available_cores or 0
-                # A (re-)registration reports from scratch: nothing it has
-                # not seen is in flight to it any more.
-                worker.reserved_cores = 0
-                self._dispatch_reservations.pop(node_id, None)
-                self._applied_cores_versions.pop(node_id, None)
-                worker.health = (
-                    WorkerState.DRAINING if drain_intended else WorkerState.HEALTHY
-                )
-
-                health_state = self._worker_health.get(node_id)
-                if health_state:
-                    health_state.update_liveness(success=True)
-                    health_state.update_readiness(
-                        accepting=not drain_intended,
-                        capacity=(
-                            0
-                            if drain_intended
-                            else registration.available_cores or 0
-                        ),
-                    )
-
-                self._get_or_create_dispatch_routing_state(node_id).record_success()
-
-                addr = (registration.node.host, registration.node.port)
-                self._addr_to_worker[addr] = node_id
+                worker = self._reregister_worker(node_id, registration)
 
             else:
-                drain_intended = self.is_worker_drain_intended(node_id)
-
-                # Create new worker status
-                worker = WorkerStatus(
-                    worker_id=node_id,
-                    state=(
-                        WorkerState.DRAINING.value
-                        if drain_intended
-                        else WorkerState.HEALTHY.value
-                    ),
-                    registration=registration,
-                    last_seen=_DEFAULT_CLOCK.monotonic(),
-                    total_cores=registration.total_cores or 0,
-                    available_cores=registration.available_cores or 0,
-                )
-
-                self._workers[node_id] = worker
-
-                # Initialize three-signal health state (AD-19)
-                health_state = WorkerHealthState(
-                    worker_id=node_id,
-                    config=self._health_config,
-                )
-                health_state.update_liveness(success=True)
-                health_state.update_readiness(
-                    accepting=not drain_intended,
-                    capacity=(
-                        0
-                        if drain_intended
-                        else registration.available_cores or 0
-                    ),
-                )
-                self._worker_health[node_id] = health_state
-                self._get_or_create_dispatch_routing_state(node_id).record_success()
-
-                # Add address lookup
-                addr = (registration.node.host, registration.node.port)
-                self._addr_to_worker[addr] = node_id
+                worker = self._register_new_worker(node_id, registration)
 
         # Signal outside registration lock to avoid nested lock acquisition
         async with self._cores_condition:
             self.capacity_generation += 1
             self._cores_condition.notify_all()
 
+        return worker
+
+    def _evict_stale_worker_at_addr(self, node_id: str, new_addr: tuple[str, int]) -> None:
+        """Under the registration lock: forget a different node id that
+        holds the registering worker's address -- a dead generation."""
+        stale_node_id = self._addr_to_worker.get(new_addr)
+        if stale_node_id is not None and stale_node_id != node_id:
+            self._workers.pop(stale_node_id, None)
+            self._dispatch_reservations.pop(stale_node_id, None)
+            self._applied_cores_versions.pop(stale_node_id, None)
+            self._worker_health.pop(stale_node_id, None)
+            self._dispatch_routing.pop(stale_node_id, None)
+            self._drain_intents.pop(stale_node_id, None)
+            self._addr_to_worker.pop(new_addr, None)
+
+    @staticmethod
+    def _cores_or_zero(cores: int | None) -> int:
+        """A registration's core count, zero when it reports none."""
+        return cores or 0
+
+    def _refresh_registration_readiness(
+        self,
+        health_state: WorkerHealthState,
+        drain_intended: bool,
+        registration: WorkerRegistration,
+    ) -> None:
+        """AD-19 readiness from a registration: accepting with its free
+        cores, unless a drain is intended."""
+        health_state.update_readiness(
+            accepting=not drain_intended,
+            capacity=(
+                0
+                if drain_intended
+                else self._cores_or_zero(registration.available_cores)
+            ),
+        )
+
+    def _reregister_worker(self, node_id: str, registration: WorkerRegistration) -> WorkerStatus:
+        """Under the registration lock: take a known worker's new
+        registration, which reports its cores from scratch."""
+        worker = self._workers[node_id]
+        drain_intended = self.is_worker_drain_intended(node_id)
+        if worker.registration:
+            old_addr = (
+                worker.registration.node.host,
+                worker.registration.node.port,
+            )
+            self._addr_to_worker.pop(old_addr, None)
+
+        self._reset_worker_from_registration(node_id, worker, registration, drain_intended)
+
+        health_state = self._worker_health.get(node_id)
+        if health_state:
+            health_state.update_liveness(success=True)
+            self._refresh_registration_readiness(health_state, drain_intended, registration)
+
+        self._get_or_create_dispatch_routing_state(node_id).record_success()
+
+        addr = (registration.node.host, registration.node.port)
+        self._addr_to_worker[addr] = node_id
+        return worker
+
+    def _reset_worker_from_registration(
+        self,
+        node_id: str,
+        worker: WorkerStatus,
+        registration: WorkerRegistration,
+        drain_intended: bool,
+    ) -> None:
+        """Under the registration lock: reset a known worker's cores and
+        state from its new registration."""
+        worker.registration = registration
+        worker.last_seen = _DEFAULT_CLOCK.monotonic()
+        worker.total_cores = self._cores_or_zero(registration.total_cores)
+        worker.available_cores = self._cores_or_zero(registration.available_cores)
+        # A (re-)registration reports from scratch: nothing it has
+        # not seen is in flight to it any more.
+        worker.reserved_cores = 0
+        self._dispatch_reservations.pop(node_id, None)
+        self._applied_cores_versions.pop(node_id, None)
+        worker.health = (
+            WorkerState.DRAINING if drain_intended else WorkerState.HEALTHY
+        )
+
+    def _register_new_worker(self, node_id: str, registration: WorkerRegistration) -> WorkerStatus:
+        """Under the registration lock: track a worker registering for the
+        first time, with its AD-19 health state."""
+        drain_intended = self.is_worker_drain_intended(node_id)
+
+        # Create new worker status
+        worker = WorkerStatus(
+            worker_id=node_id,
+            state=(
+                WorkerState.DRAINING.value
+                if drain_intended
+                else WorkerState.HEALTHY.value
+            ),
+            registration=registration,
+            last_seen=_DEFAULT_CLOCK.monotonic(),
+            total_cores=self._cores_or_zero(registration.total_cores),
+            available_cores=self._cores_or_zero(registration.available_cores),
+        )
+
+        self._workers[node_id] = worker
+
+        # Initialize three-signal health state (AD-19)
+        health_state = WorkerHealthState(
+            worker_id=node_id,
+            config=self._health_config,
+        )
+        health_state.update_liveness(success=True)
+        self._refresh_registration_readiness(health_state, drain_intended, registration)
+        self._worker_health[node_id] = health_state
+        self._get_or_create_dispatch_routing_state(node_id).record_success()
+
+        # Add address lookup
+        addr = (registration.node.host, registration.node.port)
+        self._addr_to_worker[addr] = node_id
         return worker
 
     async def deregister_worker(self, node_id: str) -> bool:
@@ -368,27 +417,38 @@ class WorkerPool:
             drain_epoch = self._drain_epoch
 
             for node_id in worker_ids:
-                worker = self._workers.get(node_id)
-                if worker is None:
-                    continue
-
-                self._drain_intents[node_id] = WorkerDrainIntent(
-                    worker_id=node_id,
-                    epoch=drain_epoch,
-                    reason=reason,
-                )
-                worker.health = WorkerState.DRAINING
-
-                if health_state := self._worker_health.get(node_id):
-                    health_state.update_readiness(accepting=False, capacity=0)
-
-                marked_worker_ids.add(node_id)
+                self._mark_worker_draining(node_id, drain_epoch, reason, marked_worker_ids)
 
             if marked_worker_ids:
                 self.capacity_generation += 1
                 self._cores_condition.notify_all()
 
         return marked_worker_ids
+
+    def _mark_worker_draining(
+        self,
+        node_id: str,
+        drain_epoch: int,
+        reason: str,
+        marked_worker_ids: set[str],
+    ) -> None:
+        """Under the allocation lock: record a registered worker's drain
+        intent at ``drain_epoch`` and stop routing new work to it."""
+        worker = self._workers.get(node_id)
+        if worker is None:
+            return
+
+        self._drain_intents[node_id] = WorkerDrainIntent(
+            worker_id=node_id,
+            epoch=drain_epoch,
+            reason=reason,
+        )
+        worker.health = WorkerState.DRAINING
+
+        if health_state := self._worker_health.get(node_id):
+            health_state.update_readiness(accepting=False, capacity=0)
+
+        marked_worker_ids.add(node_id)
 
     def is_worker_drain_intended(self, node_id: str) -> bool:
         """Return whether the manager has explicit drain intent for a worker."""
@@ -477,16 +537,26 @@ class WorkerPool:
 
     def _next_dispatch_routing_ready_delay(self) -> float | None:
         now = _DEFAULT_CLOCK.monotonic()
-        cooldown_delays = [
+        positive_delays = [delay for delay in self._dispatch_routing_cooldown_delays(now) if delay > 0]
+        return min(positive_delays, default=None)
+
+    def _dispatch_routing_cooldown_delays(self, now: float) -> list[float]:
+        """The remaining dispatch routing cooldown of each registered worker
+        cooling down at ``now``."""
+        return [
             routing_state.remaining_cooldown_seconds(now)
             for node_id, routing_state in self._dispatch_routing.items()
-            if node_id in self._workers and not routing_state.is_routable(now)
+            if self._is_cooling_down(node_id, routing_state, now)
         ]
-        positive_delays = [delay for delay in cooldown_delays if delay > 0]
-        if not positive_delays:
-            return None
 
-        return min(positive_delays)
+    def _is_cooling_down(
+        self,
+        node_id: str,
+        routing_state: WorkerDispatchRoutingState,
+        now: float,
+    ) -> bool:
+        """Whether a registered worker's dispatch routing cools down at ``now``."""
+        return node_id in self._workers and not routing_state.is_routable(now)
 
     def update_health(self, node_id: str, health: WorkerState) -> bool:
         """
@@ -522,17 +592,22 @@ class WorkerPool:
         if not worker:
             return False
 
-        if self.is_worker_drain_intended(node_id):
-            return False
+        return self._may_take_new_work(node_id, worker) and self._passes_health_signals(node_id, worker)
 
-        if not self.is_worker_dispatch_routable(node_id):
-            return False
-
+    def _may_take_new_work(self, node_id: str, worker: WorkerStatus) -> bool:
+        """Whether no drain is intended, dispatch routing is not cooling the
+        worker down, and its lifecycle state allows new work."""
         # Lifecycle state is more specific than SWIM membership. A worker can
         # still be visible to UDP/SWIM while it is explicitly draining.
-        if worker.health in (WorkerState.DRAINING, WorkerState.OFFLINE):
-            return False
+        return (
+            not self.is_worker_drain_intended(node_id)
+            and self.is_worker_dispatch_routable(node_id)
+            and worker.health not in (WorkerState.DRAINING, WorkerState.OFFLINE)
+        )
 
+    def _passes_health_signals(self, node_id: str, worker: WorkerStatus) -> bool:
+        """Whether AD-19 routing neither drains nor evicts the worker, SWIM
+        does not report it down, and it is healthy or newly registered."""
         routing_decision = self.get_worker_routing_decision(node_id)
         if routing_decision in (RoutingDecision.DRAIN, RoutingDecision.EVICT):
             return False
@@ -548,16 +623,18 @@ class WorkerPool:
         if self._swim_reports_down(worker):
             return False
 
+        return self._is_healthy_or_in_grace(worker)
+
+    def _is_healthy_or_in_grace(self, worker: WorkerStatus) -> bool:
+        """Whether the worker is explicitly HEALTHY, or registered within the
+        grace period."""
         # Check explicit health status
         if worker.health == WorkerState.HEALTHY:
             return True
 
         # Grace period for newly registered workers
         now = _DEFAULT_CLOCK.monotonic()
-        if (now - worker.last_seen) < self._health_grace_period:
-            return True
-
-        return False
+        return (now - worker.last_seen) < self._health_grace_period
 
     def counts_toward_capacity(self, node_id: str) -> bool:
         """Whether a worker's cores are the datacenter's to use (AD-41).
@@ -571,66 +648,70 @@ class WorkerPool:
         """
         if (worker := self._workers.get(node_id)) is None:
             return False
-        if self.is_worker_drain_intended(node_id):
-            return False
-        if worker.health in (WorkerState.DRAINING, WorkerState.OFFLINE):
-            return False
-        if self.get_worker_routing_decision(node_id) == RoutingDecision.EVICT:
-            return False
-        return not self._swim_reports_down(worker)
+        return not self._is_leaving(node_id, worker) and self._is_not_evicted_or_down(node_id, worker)
+
+    def _is_leaving(self, node_id: str, worker: WorkerStatus) -> bool:
+        """Whether a drain is intended or the worker is DRAINING or OFFLINE."""
+        return self.is_worker_drain_intended(node_id) or worker.health in (
+            WorkerState.DRAINING,
+            WorkerState.OFFLINE,
+        )
+
+    def _is_not_evicted_or_down(self, node_id: str, worker: WorkerStatus) -> bool:
+        """Whether AD-19 routing does not evict the worker and SWIM does not
+        suspect it or hold it dead."""
+        return self.get_worker_routing_decision(node_id) != RoutingDecision.EVICT and not self._swim_reports_down(
+            worker
+        )
 
     def _swim_reports_down(self, worker: WorkerStatus) -> bool:
         """SWIM's negative verdict on a registered worker: SUSPECT or DEAD."""
         if not (self._get_swim_status and worker.registration):
             return False
-        addr = (
+        return self._get_swim_status(self._swim_addr(worker)) in ("SUSPECT", "DEAD")
+
+    @staticmethod
+    def _swim_addr(worker: WorkerStatus) -> tuple[str, int]:
+        """The address SWIM knows a registered worker by: its UDP port, else
+        its TCP port."""
+        return (
             worker.registration.node.host,
             worker.registration.node.udp_port or worker.registration.node.port,
         )
-        return self._get_swim_status(addr) in ("SUSPECT", "DEAD")
 
     def get_healthy_worker_ids(self) -> list[str]:
         return [node_id for node_id in self._workers if self.is_worker_healthy(node_id)]
 
     def get_worker_health_bucket(self, node_id: str) -> str:
         worker = self._workers.get(node_id)
-        if not worker:
+        if not worker or not self.is_worker_healthy(node_id):
             return "UNHEALTHY"
 
-        if not self.is_worker_healthy(node_id):
-            return "UNHEALTHY"
+        return self._healthy_worker_bucket(node_id, worker)
 
+    def _healthy_worker_bucket(self, node_id: str, worker: WorkerStatus) -> str:
+        """A healthy worker's bucket: DEGRADED while AD-19 routing says to
+        investigate it, else by its overload state (HEALTHY when unknown)."""
         routing_decision = self.get_worker_routing_decision(node_id)
         if routing_decision == RoutingDecision.INVESTIGATE:
             return "DEGRADED"
 
-        overload_state = worker.overload_state
-
-        if overload_state == "healthy":
-            return "HEALTHY"
-        elif overload_state == "busy":
-            return "BUSY"
-        elif overload_state == "stressed":
-            return "DEGRADED"
-        elif overload_state == "overloaded":
-            return "UNHEALTHY"
-
-        return "HEALTHY"
+        return _BUCKET_BY_OVERLOAD_STATE.get(worker.overload_state, "HEALTHY")
 
     def get_worker_health_state_counts(self) -> dict[str, int]:
         counts = {"healthy": 0, "busy": 0, "stressed": 0, "overloaded": 0}
 
         for node_id, worker in self._workers.items():
-            if not self.is_worker_healthy(node_id):
-                continue
-
-            overload_state = worker.overload_state
-            if overload_state in counts:
-                counts[overload_state] += 1
-            else:
-                counts["healthy"] += 1
+            if self.is_worker_healthy(node_id):
+                self._tally_overload_state(counts, worker.overload_state)
 
         return counts
+
+    @staticmethod
+    def _tally_overload_state(counts: dict[str, int], overload_state: str) -> None:
+        """Count a healthy worker under its overload state; an unknown state
+        counts as healthy."""
+        counts[overload_state if overload_state in counts else "healthy"] += 1
 
     def get_workers_by_health_bucket(self) -> dict[str, list[str]]:
         buckets: dict[str, list[str]] = {
@@ -780,73 +861,137 @@ class WorkerPool:
             return False
 
         async with self._cores_condition:
-            if (
-                worker.heartbeat is not None
-                and heartbeat.version < worker.heartbeat.version
-            ):
+            if self._is_stale_heartbeat(worker, heartbeat):
                 return True
 
-            # Allocation selects workers by health bucket, so "may take
-            # work" is the bucket, not bare health: an overloaded worker is
-            # healthy yet never selected.
-            was_selectable = self.get_worker_health_bucket(node_id) != "UNHEALTHY"
-            drain_intended = self.is_worker_drain_intended(node_id)
-            worker.heartbeat = heartbeat
-            worker.last_seen = _DEFAULT_CLOCK.monotonic()
-            if drain_intended:
-                worker.health = WorkerState.DRAINING
-            else:
-                try:
-                    worker.health = WorkerState(heartbeat.state)
-                except ValueError:
-                    worker.health = WorkerState.DEGRADED
-
-            # Against what was free to allocate: the reservations this
-            # heartbeat clears free cores too.
-            old_unreserved_cores = worker.available_cores - worker.reserved_cores
-            worker.total_cores = heartbeat.available_cores + len(
-                heartbeat.active_workflows
-            )
-            reservations = self._dispatch_reservations.get(node_id, {})
-            # A heartbeat older than the free count applied last (reordered
-            # behind a progress report or result) does not overwrite it.
-            if heartbeat.cores_version >= self._applied_cores_versions.get(node_id, 0):
-                worker.available_cores = heartbeat.available_cores
-                self._applied_cores_versions[node_id] = heartbeat.cores_version
-            applied_version = self._applied_cores_versions.get(node_id, 0)
-            # Dispatches the applied count reflects: allocated at or before
-            # its version, or listed by this heartbeat (allocated before it,
-            # so before anything newer too).
-            for dispatch_token in [
-                dispatch_token
-                for dispatch_token, (_job_id, _cores, allocated_at_version) in reservations.items()
-                if dispatch_token in heartbeat.active_workflows
-                or (allocated_at_version is not None and allocated_at_version <= applied_version)
-            ]:
-                del reservations[dispatch_token]
-            worker.reserved_cores = sum(cores for _job_id, cores, _version in reservations.values())
-
-            worker.overload_state = getattr(
-                heartbeat, "health_overload_state", "healthy"
-            )
-
-            if worker.available_cores - worker.reserved_cores > old_unreserved_cores:
-                self.capacity_generation += 1
-                self._cores_condition.notify_all()
-
-            health_state = self._worker_health.get(node_id)
-            if health_state:
-                health_state.update_liveness(success=True)
-
-                self._refresh_readiness(
-                    health_state, drain_intended, heartbeat.health_accepting_work, worker.available_cores
-                )
-
-            if not was_selectable and self.get_worker_health_bucket(node_id) != "UNHEALTHY":
-                self.capacity_generation += 1
-                self._cores_condition.notify_all()
+            self._apply_heartbeat(node_id, worker, heartbeat)
 
         return True
+
+    @staticmethod
+    def _is_stale_heartbeat(worker: WorkerStatus, heartbeat: WorkerHeartbeat) -> bool:
+        """Whether the heartbeat is older than the one applied last."""
+        return (
+            worker.heartbeat is not None
+            and heartbeat.version < worker.heartbeat.version
+        )
+
+    def _apply_heartbeat(
+        self,
+        node_id: str,
+        worker: WorkerStatus,
+        heartbeat: WorkerHeartbeat,
+    ) -> None:
+        """Under the allocation lock: take a worker's heartbeat -- its state,
+        free cores and readiness (AD-19) -- and wake dispatch waiters when
+        its capacity grew or allocation may now select it."""
+        # Allocation selects workers by health bucket, so "may take
+        # work" is the bucket, not bare health: an overloaded worker is
+        # healthy yet never selected.
+        was_selectable = self.get_worker_health_bucket(node_id) != "UNHEALTHY"
+        drain_intended = self.is_worker_drain_intended(node_id)
+        worker.heartbeat = heartbeat
+        worker.last_seen = _DEFAULT_CLOCK.monotonic()
+        worker.health = self._heartbeat_health(heartbeat, drain_intended)
+
+        # Against what was free to allocate: the reservations this
+        # heartbeat clears free cores too.
+        old_unreserved_cores = worker.available_cores - worker.reserved_cores
+        worker.total_cores = heartbeat.available_cores + len(
+            heartbeat.active_workflows
+        )
+        self._apply_heartbeat_cores(node_id, worker, heartbeat)
+
+        worker.overload_state = getattr(
+            heartbeat, "health_overload_state", "healthy"
+        )
+
+        if worker.available_cores - worker.reserved_cores > old_unreserved_cores:
+            self.capacity_generation += 1
+            self._cores_condition.notify_all()
+
+        self._refresh_heartbeat_health(node_id, worker, heartbeat, drain_intended)
+
+        if self._became_selectable(node_id, was_selectable):
+            self.capacity_generation += 1
+            self._cores_condition.notify_all()
+
+    @staticmethod
+    def _heartbeat_health(heartbeat: WorkerHeartbeat, drain_intended: bool) -> WorkerState:
+        """The lifecycle state a heartbeat sets: DRAINING while a drain is
+        intended, else the state it reports (DEGRADED when unknown)."""
+        if drain_intended:
+            return WorkerState.DRAINING
+
+        try:
+            return WorkerState(heartbeat.state)
+        except ValueError:
+            return WorkerState.DEGRADED
+
+    def _apply_heartbeat_cores(
+        self,
+        node_id: str,
+        worker: WorkerStatus,
+        heartbeat: WorkerHeartbeat,
+    ) -> None:
+        """Under the allocation lock: take the heartbeat's free cores unless
+        a newer count was applied, and clear the reservations it reflects."""
+        reservations = self._dispatch_reservations.get(node_id, {})
+        # A heartbeat older than the free count applied last (reordered
+        # behind a progress report or result) does not overwrite it.
+        if heartbeat.cores_version >= self._applied_cores_versions.get(node_id, 0):
+            worker.available_cores = heartbeat.available_cores
+            self._applied_cores_versions[node_id] = heartbeat.cores_version
+        applied_version = self._applied_cores_versions.get(node_id, 0)
+        # Dispatches the applied count reflects: allocated at or before
+        # its version, or listed by this heartbeat (allocated before it,
+        # so before anything newer too).
+        for dispatch_token in self._heartbeat_reflected_tokens(reservations, heartbeat, applied_version):
+            del reservations[dispatch_token]
+        worker.reserved_cores = self._reserved_cores(reservations)
+
+    @staticmethod
+    def _heartbeat_reflected_tokens(
+        reservations: dict[str, tuple[str, int, int | None]],
+        heartbeat: WorkerHeartbeat,
+        applied_version: int,
+    ) -> list[str]:
+        """The reservations a heartbeat reflects: listed by it, or taken at
+        or before the applied free count's version."""
+        return [
+            dispatch_token
+            for dispatch_token, (_job_id, _cores, allocated_at_version) in reservations.items()
+            if WorkerPool._heartbeat_reflects(dispatch_token, allocated_at_version, heartbeat, applied_version)
+        ]
+
+    @staticmethod
+    def _heartbeat_reflects(
+        dispatch_token: str,
+        allocated_at_version: int | None,
+        heartbeat: WorkerHeartbeat,
+        applied_version: int,
+    ) -> bool:
+        """Whether a heartbeat reflects one reservation's dispatch."""
+        return dispatch_token in heartbeat.active_workflows or WorkerPool._is_reflected(
+            allocated_at_version, applied_version
+        )
+
+    def _refresh_heartbeat_health(
+        self,
+        node_id: str,
+        worker: WorkerStatus,
+        heartbeat: WorkerHeartbeat,
+        drain_intended: bool,
+    ) -> None:
+        """AD-19: a heartbeat is liveness, and sets readiness from its free
+        cores and its say on taking work."""
+        health_state = self._worker_health.get(node_id)
+        if health_state:
+            health_state.update_liveness(success=True)
+
+            self._refresh_readiness(
+                health_state, drain_intended, heartbeat.health_accepting_work, worker.available_cores
+            )
 
     # =========================================================================
     # Core Allocation
@@ -910,23 +1055,38 @@ class WorkerPool:
             verified_allocations: list[tuple[str, int]] = []
 
             for node_id, cores in allocations:
-                worker = self._workers.get(node_id)
-                if worker is None:
-                    continue
-
-                actual_available = worker.available_cores - worker.reserved_cores
-                if actual_available <= 0:
-                    continue
-
-                actual_cores = min(cores, actual_available)
-                worker.reserved_cores += actual_cores
-                reservations = self._dispatch_reservations.setdefault(node_id, {})
-                dispatch_token = dispatch_token_for(node_id)
-                _reserved_job_id, already_reserved, _version = reservations.get(dispatch_token, (job_id, 0, None))
-                reservations[dispatch_token] = (job_id, already_reserved + actual_cores, None)
-                verified_allocations.append((node_id, actual_cores))
+                self._reserve_allocation(
+                    node_id, cores, job_id, dispatch_token_for, verified_allocations
+                )
 
             return verified_allocations or None
+
+    def _reserve_allocation(
+        self,
+        node_id: str,
+        cores: int,
+        job_id: str,
+        dispatch_token_for: Callable[[str], str],
+        verified_allocations: list[tuple[str, int]],
+    ) -> None:
+        """Under the allocation lock: reserve a selected worker's share,
+        capped at its unreserved cores, under the dispatch it will be sent
+        as; a worker gone or with none free is skipped."""
+        worker = self._workers.get(node_id)
+        if worker is None:
+            return
+
+        actual_available = worker.available_cores - worker.reserved_cores
+        if actual_available <= 0:
+            return
+
+        actual_cores = min(cores, actual_available)
+        worker.reserved_cores += actual_cores
+        reservations = self._dispatch_reservations.setdefault(node_id, {})
+        dispatch_token = dispatch_token_for(node_id)
+        _reserved_job_id, already_reserved, _version = reservations.get(dispatch_token, (job_id, 0, None))
+        reservations[dispatch_token] = (job_id, already_reserved + actual_cores, None)
+        verified_allocations.append((node_id, actual_cores))
 
     def _select_workers_for_allocation(
         self,
@@ -935,45 +1095,97 @@ class WorkerPool:
     ) -> list[tuple[str, int]]:
         allocations: list[tuple[str, int]] = []
         remaining = cores_needed
-        excluded = excluded_worker_ids or set()
 
         bucket_priority = ["HEALTHY", "BUSY", "DEGRADED"]
 
-        workers_by_bucket: dict[str, list[tuple[str, WorkerStatus]]] = {
-            bucket: [] for bucket in bucket_priority
-        }
-
-        for node_id, worker in self._workers.items():
-            if node_id in excluded:
-                continue
-
-            bucket = self.get_worker_health_bucket(node_id)
-            if bucket in workers_by_bucket:
-                workers_by_bucket[bucket].append((node_id, worker))
+        workers_by_bucket = self._workers_by_selectable_bucket(bucket_priority, excluded_worker_ids)
 
         for bucket in bucket_priority:
             if remaining <= 0:
                 break
 
-            bucket_workers = workers_by_bucket[bucket]
-            bucket_workers.sort(
-                key=lambda x: x[1].available_cores - x[1].reserved_cores,
-                reverse=True,
-            )
-
-            for node_id, worker in bucket_workers:
-                if remaining <= 0:
-                    break
-
-                available = worker.available_cores - worker.reserved_cores
-                if available <= 0:
-                    continue
-
-                to_allocate = min(available, remaining)
-                allocations.append((node_id, to_allocate))
-                remaining -= to_allocate
+            remaining = self._allocate_from_bucket(workers_by_bucket[bucket], remaining, allocations)
 
         return allocations
+
+    def _workers_by_selectable_bucket(
+        self,
+        bucket_priority: list[str],
+        excluded_worker_ids: set[str] | None,
+    ) -> dict[str, list[tuple[str, WorkerStatus]]]:
+        """The workers not excluded, by the health bucket allocation selects
+        them from."""
+        excluded = excluded_worker_ids or set()
+
+        workers_by_bucket: dict[str, list[tuple[str, WorkerStatus]]] = {
+            bucket: [] for bucket in bucket_priority
+        }
+
+        self._file_workers_by_bucket(excluded, workers_by_bucket)
+        return workers_by_bucket
+
+    def _file_workers_by_bucket(
+        self,
+        excluded: set[str],
+        workers_by_bucket: dict[str, list[tuple[str, WorkerStatus]]],
+    ) -> None:
+        """File each worker not excluded under its selectable health bucket."""
+        for node_id, worker in self._workers.items():
+            self._file_worker_by_bucket(node_id, worker, excluded, workers_by_bucket)
+
+    def _file_worker_by_bucket(
+        self,
+        node_id: str,
+        worker: WorkerStatus,
+        excluded: set[str],
+        workers_by_bucket: dict[str, list[tuple[str, WorkerStatus]]],
+    ) -> None:
+        """File a worker not excluded under its health bucket, when
+        allocation selects from that bucket."""
+        if node_id in excluded:
+            return
+
+        bucket = self.get_worker_health_bucket(node_id)
+        if bucket in workers_by_bucket:
+            workers_by_bucket[bucket].append((node_id, worker))
+
+    def _allocate_from_bucket(
+        self,
+        bucket_workers: list[tuple[str, WorkerStatus]],
+        remaining: int,
+        allocations: list[tuple[str, int]],
+    ) -> int:
+        """Take cores from a bucket's workers, most unreserved cores first,
+        until ``remaining`` is met; returns what is still needed."""
+        bucket_workers.sort(
+            key=lambda x: x[1].available_cores - x[1].reserved_cores,
+            reverse=True,
+        )
+
+        for node_id, worker in bucket_workers:
+            if remaining <= 0:
+                break
+
+            remaining -= self._take_worker_cores(node_id, worker, remaining, allocations)
+
+        return remaining
+
+    @staticmethod
+    def _take_worker_cores(
+        node_id: str,
+        worker: WorkerStatus,
+        remaining: int,
+        allocations: list[tuple[str, int]],
+    ) -> int:
+        """Take up to ``remaining`` of a worker's unreserved cores; returns
+        how many were taken."""
+        available = worker.available_cores - worker.reserved_cores
+        if available <= 0:
+            return 0
+
+        to_allocate = min(available, remaining)
+        allocations.append((node_id, to_allocate))
+        return to_allocate
 
     async def release_cores(
         self,
@@ -1032,26 +1244,46 @@ class WorkerPool:
             old_unreserved_cores = worker.available_cores - worker.reserved_cores
             self._apply_reported_cores(node_id, worker, worker_available_cores, dispatch_token, cores_version)
 
-            # AD-19 readiness follows the free count, as a heartbeat sets it:
-            # a worker busy at its last heartbeat read not ready -- never
-            # selected -- after a result freed its cores, its cores idle
-            # until its next heartbeat reached this manager.
-            health_state = self._worker_health.get(node_id)
-            if health_state is not None and worker.heartbeat is not None:
-                self._refresh_readiness(
-                    health_state,
-                    self.is_worker_drain_intended(node_id),
-                    worker.heartbeat.health_accepting_work,
-                    worker.available_cores,
-                )
+            self._refresh_reported_readiness(node_id, worker)
 
-            if worker.available_cores - worker.reserved_cores > old_unreserved_cores or (
-                not was_selectable and self.get_worker_health_bucket(node_id) != "UNHEALTHY"
-            ):
+            if self._capacity_grew(node_id, worker, old_unreserved_cores, was_selectable):
                 self.capacity_generation += 1
                 self._cores_condition.notify_all()
 
             return True
+
+    def _refresh_reported_readiness(self, node_id: str, worker: WorkerStatus) -> None:
+        """Under the allocation lock: AD-19 readiness from a progress
+        report's free count, for a worker that has heartbeated."""
+        # AD-19 readiness follows the free count, as a heartbeat sets it:
+        # a worker busy at its last heartbeat read not ready -- never
+        # selected -- after a result freed its cores, its cores idle
+        # until its next heartbeat reached this manager.
+        health_state = self._worker_health.get(node_id)
+        if health_state is not None and worker.heartbeat is not None:
+            self._refresh_readiness(
+                health_state,
+                self.is_worker_drain_intended(node_id),
+                worker.heartbeat.health_accepting_work,
+                worker.available_cores,
+            )
+
+    def _capacity_grew(
+        self,
+        node_id: str,
+        worker: WorkerStatus,
+        old_unreserved_cores: int,
+        was_selectable: bool,
+    ) -> bool:
+        """Whether the worker has more unreserved cores than before, or
+        allocation may select it now and could not before."""
+        return worker.available_cores - worker.reserved_cores > old_unreserved_cores or self._became_selectable(
+            node_id, was_selectable
+        )
+
+    def _became_selectable(self, node_id: str, was_selectable: bool) -> bool:
+        """Whether allocation may select the worker now and could not before."""
+        return not was_selectable and self.get_worker_health_bucket(node_id) != "UNHEALTHY"
 
     def _apply_reported_cores(
         self,
@@ -1128,12 +1360,17 @@ class WorkerPool:
             reserved_job_id, cores, _version = reservation
             if allocated_at_version <= self._applied_cores_versions.get(node_id, 0):
                 del reservations[dispatch_token]
-                if (worker := self._workers.get(node_id)) is not None:
-                    worker.reserved_cores = max(0, worker.reserved_cores - cores)
-                    self.capacity_generation += 1
-                    self._cores_condition.notify_all()
+                self._return_reflected_reservation_cores(node_id, cores)
                 return
             reservations[dispatch_token] = (reserved_job_id, cores, allocated_at_version)
+
+    def _return_reflected_reservation_cores(self, node_id: str, cores: int) -> None:
+        """Under the allocation lock: a reservation the applied free count
+        already reflects stops holding the worker's cores."""
+        if (worker := self._workers.get(node_id)) is not None:
+            worker.reserved_cores = max(0, worker.reserved_cores - cores)
+            self.capacity_generation += 1
+            self._cores_condition.notify_all()
 
     async def release_job_reservations(self, job_id: str) -> int:
         """Release every reservation still held for ``job_id``'s dispatches
@@ -1143,20 +1380,47 @@ class WorkerPool:
         released = 0
         async with self._cores_condition:
             for node_id, reservations in self._dispatch_reservations.items():
-                job_tokens = [
-                    token for token, (reserved_job_id, _cores, _version) in reservations.items() if reserved_job_id == job_id
-                ]
-                if not job_tokens:
-                    continue
-                for dispatch_token in job_tokens:
-                    del reservations[dispatch_token]
-                released += len(job_tokens)
-                if (worker := self._workers.get(node_id)) is not None:
-                    worker.reserved_cores = sum(cores for _job_id, cores, _version in reservations.values())
+                released += self._release_worker_job_reservations(node_id, reservations, job_id)
             if released:
                 self.capacity_generation += 1
                 self._cores_condition.notify_all()
         return released
+
+    def _release_worker_job_reservations(
+        self,
+        node_id: str,
+        reservations: dict[str, tuple[str, int, int | None]],
+        job_id: str,
+    ) -> int:
+        """Under the allocation lock: drop one worker's reservations for the
+        job; returns how many it held."""
+        job_tokens = self._job_reservation_tokens(reservations, job_id)
+        if job_tokens:
+            self._drop_reservations(node_id, reservations, job_tokens)
+        return len(job_tokens)
+
+    def _drop_reservations(
+        self,
+        node_id: str,
+        reservations: dict[str, tuple[str, int, int | None]],
+        dispatch_tokens: list[str],
+    ) -> None:
+        """Under the allocation lock: drop the given reservations of a worker
+        and recount the cores it has reserved."""
+        for dispatch_token in dispatch_tokens:
+            del reservations[dispatch_token]
+        if (worker := self._workers.get(node_id)) is not None:
+            worker.reserved_cores = self._reserved_cores(reservations)
+
+    @staticmethod
+    def _job_reservation_tokens(
+        reservations: dict[str, tuple[str, int, int | None]],
+        job_id: str,
+    ) -> list[str]:
+        """The dispatch tokens of a worker's reservations held for the job."""
+        return [
+            token for token, (reserved_job_id, _cores, _version) in reservations.items() if reserved_job_id == job_id
+        ]
 
     # =========================================================================
     # Wait Helpers
@@ -1184,19 +1448,7 @@ class WorkerPool:
             if self.capacity_generation != observed_generation:
                 return
 
-            wait_timeout = timeout
-            routing_ready_delay = self._next_dispatch_routing_ready_delay()
-            if routing_ready_delay is not None:
-                wait_timeout = min(wait_timeout, routing_ready_delay)
-
-            # Progress floor. A routing cooldown's remaining time can be a
-            # positive sub-quantum float artifact of deadline arithmetic on
-            # a quantized clock (observed: 1.6e-11s): waiting on it re-arms
-            # a timer at the SAME virtual instant -- a livelock under SIM, a
-            # 100%-CPU micro-spin on a real host. Flooring the wait
-            # guarantees the clock moves; genuine cooldown waits (>= 0.25s
-            # base) are unaffected.
-            wait_timeout = max(wait_timeout, 0.001)
+            wait_timeout = self._capacity_wait_timeout(timeout)
 
             try:
                 await _DEFAULT_CLOCK.wait_for(
@@ -1207,6 +1459,23 @@ class WorkerPool:
                 # The wait is bounded by design: on expiry the caller
                 # re-reads the pool, as on a change.
                 return
+
+    def _capacity_wait_timeout(self, timeout: float) -> float:
+        """The capacity wait's bound: ``timeout``, or sooner when a dispatch
+        routing cooldown ends first, never under 1ms."""
+        wait_timeout = timeout
+        routing_ready_delay = self._next_dispatch_routing_ready_delay()
+        if routing_ready_delay is not None:
+            wait_timeout = min(wait_timeout, routing_ready_delay)
+
+        # Progress floor. A routing cooldown's remaining time can be a
+        # positive sub-quantum float artifact of deadline arithmetic on
+        # a quantized clock (observed: 1.6e-11s): waiting on it re-arms
+        # a timer at the SAME virtual instant -- a livelock under SIM, a
+        # 100%-CPU micro-spin on a real host. Flooring the wait
+        # guarantees the clock moves; genuine cooldown waits (>= 0.25s
+        # base) are unaffected.
+        return max(wait_timeout, 0.001)
 
     async def notify_cores_available(self) -> None:
         async with self._cores_condition:
@@ -1272,55 +1541,63 @@ class WorkerPool:
                 return False
 
             if worker_id in self._remote_workers:
-                existing = self._remote_workers[worker_id]
-                existing.total_cores = update.total_cores
-                existing.available_cores = update.available_cores
-                existing.health = (
-                    WorkerState.DRAINING
-                    if update.state == "draining"
-                    else WorkerState.HEALTHY
-                )
-                existing.last_seen = _DEFAULT_CLOCK.monotonic()
+                self._refresh_remote_worker(self._remote_workers[worker_id], update)
                 return True
 
-
-            node_info = NodeInfo(
-                node_id=worker_id,
-                role="worker",
-                host=update.host,
-                port=update.tcp_port,
-                datacenter=update.datacenter,
-                udp_port=update.udp_port,
-            )
-
-            registration = WorkerRegistration(
-                node=node_info,
-                total_cores=update.total_cores,
-                available_cores=update.available_cores,
-                memory_mb=0,
-            )
-
-            worker = WorkerStatus(
-                worker_id=worker_id,
-                state=(
-                    WorkerState.DRAINING.value
-                    if update.state == "draining"
-                    else WorkerState.HEALTHY.value
-                ),
-                registration=registration,
-                last_seen=_DEFAULT_CLOCK.monotonic(),
-                total_cores=update.total_cores,
-                available_cores=update.available_cores,
-                is_remote=True,
-                owner_manager_id=update.owner_manager_id,
-            )
-
-            self._remote_workers[worker_id] = worker
-
-            addr = (update.host, update.tcp_port)
-            self._remote_addr_to_worker[addr] = worker_id
+            self._add_remote_worker(worker_id, update)
 
             return True
+
+    @staticmethod
+    def _remote_worker_health(update: WorkerStateUpdate) -> WorkerState:
+        """A remote worker's lifecycle state from its owner's update (AD-48)."""
+        return (
+            WorkerState.DRAINING
+            if update.state == "draining"
+            else WorkerState.HEALTHY
+        )
+
+    def _refresh_remote_worker(self, existing: WorkerStatus, update: WorkerStateUpdate) -> None:
+        """Take a known remote worker's cores and state from its owner's
+        update (AD-48)."""
+        existing.total_cores = update.total_cores
+        existing.available_cores = update.available_cores
+        existing.health = self._remote_worker_health(update)
+        existing.last_seen = _DEFAULT_CLOCK.monotonic()
+
+    def _add_remote_worker(self, worker_id: str, update: WorkerStateUpdate) -> None:
+        """Track a remote worker another manager owns (AD-48)."""
+        node_info = NodeInfo(
+            node_id=worker_id,
+            role="worker",
+            host=update.host,
+            port=update.tcp_port,
+            datacenter=update.datacenter,
+            udp_port=update.udp_port,
+        )
+
+        registration = WorkerRegistration(
+            node=node_info,
+            total_cores=update.total_cores,
+            available_cores=update.available_cores,
+            memory_mb=0,
+        )
+
+        worker = WorkerStatus(
+            worker_id=worker_id,
+            state=self._remote_worker_health(update).value,
+            registration=registration,
+            last_seen=_DEFAULT_CLOCK.monotonic(),
+            total_cores=update.total_cores,
+            available_cores=update.available_cores,
+            is_remote=True,
+            owner_manager_id=update.owner_manager_id,
+        )
+
+        self._remote_workers[worker_id] = worker
+
+        addr = (update.host, update.tcp_port)
+        self._remote_addr_to_worker[addr] = worker_id
 
     async def deregister_remote_worker(self, worker_id: str) -> bool:
         async with self._registration_lock:
@@ -1360,19 +1637,27 @@ class WorkerPool:
 
     async def cleanup_remote_workers_for_manager(self, manager_id: str) -> int:
         async with self._registration_lock:
-            to_remove = [
-                worker_id
-                for worker_id, worker in self._remote_workers.items()
-                if getattr(worker, "owner_manager_id", None) == manager_id
-            ]
+            to_remove = self._remote_worker_ids_owned_by(manager_id)
 
             for worker_id in to_remove:
-                worker = self._remote_workers.pop(worker_id, None)
-                if worker and worker.registration:
-                    addr = (
-                        worker.registration.node.host,
-                        worker.registration.node.port,
-                    )
-                    self._remote_addr_to_worker.pop(addr, None)
+                self._forget_remote_worker(worker_id)
 
             return len(to_remove)
+
+    def _remote_worker_ids_owned_by(self, manager_id: str) -> list[str]:
+        """The remote workers the given manager owns (AD-48)."""
+        return [
+            worker_id
+            for worker_id, worker in self._remote_workers.items()
+            if getattr(worker, "owner_manager_id", None) == manager_id
+        ]
+
+    def _forget_remote_worker(self, worker_id: str) -> None:
+        """Drop a remote worker and its address lookup (AD-48)."""
+        worker = self._remote_workers.pop(worker_id, None)
+        if worker and worker.registration:
+            addr = (
+                worker.registration.node.host,
+                worker.registration.node.port,
+            )
+            self._remote_addr_to_worker.pop(addr, None)

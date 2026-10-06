@@ -34,6 +34,8 @@ from hyperscale.distributed.env import Env
 from hyperscale.distributed.models import DatacenterInfo, ManagerPingResponse
 from hyperscale.distributed.nodes.client import HyperscaleClient
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
+    command_environment,
     BOOT_TIMEOUT_SECONDS,
     HYPERSCALE,
     LOCALHOST,
@@ -49,7 +51,7 @@ from tests.integration.cli.node_processes import (
     worker_block,
 )
 
-ENV = Env()
+ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
 WORKER_CORES = 1
 CLIENT_BLOCK = 2  # tcp, udp
 DATACENTER = "default"
@@ -132,7 +134,7 @@ async def _start_cli_run(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
-        env={**os.environ, RUN_MARKER_ENVAR: marker},
+        env=command_environment(**{RUN_MARKER_ENVAR: marker}),
     )
 
 
@@ -186,7 +188,7 @@ async def test_cli_runs_a_test_on_one_datacenters_managers(run_marker: str) -> N
         "--managers", manager.address,
     )
     nodes = [manager, worker]
-    observer = HyperscaleClient(host=LOCALHOST, port=observer_start, env=Env())
+    observer = HyperscaleClient(host=LOCALHOST, port=observer_start, env=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET))
     with tempfile.TemporaryDirectory(prefix="hyperscale-cli-run-") as directory:
         module_path, config_path = _write_test_files(
             directory, SHORT_TEST_DURATION_SECONDS, client_start
@@ -240,7 +242,7 @@ async def test_cli_runs_a_test_through_a_gate(run_marker: str) -> None:
     )
     gate = node_at("gate", gate_start, run_marker)
     nodes = [manager, worker, gate]
-    observer = HyperscaleClient(host=LOCALHOST, port=observer_start, env=Env())
+    observer = HyperscaleClient(host=LOCALHOST, port=observer_start, env=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET))
     with tempfile.TemporaryDirectory(prefix="hyperscale-cli-run-") as directory:
         module_path, config_path = _write_test_files(
             directory, SHORT_TEST_DURATION_SECONDS, client_start
@@ -286,7 +288,7 @@ async def test_operator_stop_cancels_the_job_on_the_cluster(run_marker: str) -> 
         "--managers", manager.address,
     )
     nodes = [manager, worker]
-    observer = HyperscaleClient(host=LOCALHOST, port=observer_start, env=Env())
+    observer = HyperscaleClient(host=LOCALHOST, port=observer_start, env=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET))
     with tempfile.TemporaryDirectory(prefix="hyperscale-cli-run-") as directory:
         module_path, config_path = _write_test_files(
             directory, STOPPED_TEST_DURATION_SECONDS, client_start

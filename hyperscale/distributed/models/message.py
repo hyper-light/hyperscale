@@ -1,3 +1,4 @@
+import dataclasses
 import io
 import os
 import secrets
@@ -55,7 +56,7 @@ def _get_message_id_generator() -> SnowflakeGenerator:
 MESSAGE_INCARNATION = secrets.token_bytes(8)
 
 
-def _generate_message_id() -> int:
+def generate_message_id() -> int:
     """Generate a unique message ID using Snowflake algorithm.
 
     ``generate_sync`` is total and monotone (backwards realtime steps
@@ -98,7 +99,7 @@ class Message:
         a timestamp and is used for replay attack detection.
         """
         if self._message_id is None:
-            self._message_id = _generate_message_id()
+            self._message_id = generate_message_id()
         return self._message_id
 
     @message_id.setter
@@ -143,6 +144,54 @@ class Message:
         """
         return RestrictedUnpickler(io.BytesIO(data)).load()
 
+    def __getattr__(self, name: str) -> object:
+        """A field this message's sender did not have reads as the field's
+        default (AD-25 rolling upgrades).
+
+        A sender running an older version pickles only the fields it knows,
+        so a field added since is unset on this side, and reading it raised
+        AttributeError. Python calls this only after normal lookup fails, so
+        reading a set field costs nothing extra. The default is stored, so
+        later reads are ordinary. Every other missing attribute raises as
+        usual. A sender running a newer version is already read safely: its
+        unknown fields land in the instance ``__dict__`` and are never read.
+        """
+        if (message_field := getattr(type(self), "__dataclass_fields__", {}).get(name)) is None:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+        default = _field_default(message_field, type(self).__name__)
+        object.__setattr__(self, name, default)
+        return default
+
     def dump(self) -> bytes:
-        """Serialize the message using cloudpickle."""
+        """Serialize the message using cloudpickle, stamped with a fresh
+        message id and this process's incarnation.
+
+        Both are stamped on every serialization, so each frame carries the
+        id the receiver's replay guard checks. Generated lazily on first
+        read instead, they were never pickled unless something happened to
+        read them first; the receiver then minted a fresh id of its own for
+        every copy of a frame, so a captured frame replayed as new every
+        time. A resend serializes again under a new id: replay protection
+        refuses captured frames, while idempotency keys deduplicate retries.
+        """
+        self._message_id = generate_message_id()
+        self._sender_incarnation = MESSAGE_INCARNATION
         return cloudpickle.dumps(self)
+
+
+def _field_default(message_field: dataclasses.Field, message_type_name: str) -> object:
+    """The value a field takes when its sender did not send it: the
+    field's default, or a fresh value from its default factory.
+
+    Raises:
+        AttributeError: the field has no default, so a message without it
+            cannot be read (adding a field with no default is a breaking
+            wire change).
+    """
+    if message_field.default_factory is not dataclasses.MISSING:
+        return message_field.default_factory()
+    if message_field.default is dataclasses.MISSING:
+        raise AttributeError(
+            f"{message_type_name!r} message lacks field {message_field.name!r}, which has no default"
+        )
+    return message_field.default

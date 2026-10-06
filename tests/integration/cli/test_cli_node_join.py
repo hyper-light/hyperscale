@@ -34,6 +34,7 @@ from hyperscale.commands.join import default_join_timeout_seconds
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.manager.config import create_manager_config_from_env
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
     HYPERSCALE,
     LOCALHOST,
     NODE_BLOCK,
@@ -46,7 +47,7 @@ from tests.integration.cli.node_processes import (
     worker_block,
 )
 
-ENV = Env()
+ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
 JOIN_REPLY_BOUND_SECONDS = default_join_timeout_seconds(ENV)
 _MANAGER_CONFIG = create_manager_config_from_env(LOCALHOST, 1, 2, ENV)
 # The gate heartbeat loop sleeps one interval then sends with the short

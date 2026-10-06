@@ -168,14 +168,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         "leave": "leaves_propagated",
     }
 
-    # Membership status each piggybacked gossip update type applies.
-    _GOSSIP_UPDATE_STATUSES: dict[str, bytes] = {
-        "alive": b"OK",
-        "join": b"OK",
-        "suspect": b"SUSPECT",
-        "dead": b"DEAD",
-        "leave": b"DEAD",
-    }
+    # Outcome of a direct-probe attempt whose ACK wait timed out inside the
+    # deadline: ``_probe_with_timeout`` loops for another attempt on it.
+    _DIRECT_PROBE_RETRY: str = "retry-direct-probe"
 
     # Lifeguard §4.3 self-health events that raise LHM, by LocalHealthMultiplier handler name.
     _LHM_INCREASE_EVENT_HANDLERS: dict[str, str] = {
@@ -191,13 +186,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         "successful_probe": "on_successful_probe",
         "successful_nack": "on_successful_nack",
         "event_loop_recovered": "on_event_loop_recovered",
-    }
-
-    # Freshness rejections ``is_message_fresh`` reports as errors, by error-builder method name.
-    _FRESHNESS_REJECTION_ERROR_BUILDERS: dict[MessageFreshness, str] = {
-        MessageFreshness.STALE: "_stale_message_error",
-        MessageFreshness.INVALID: "_invalid_incarnation_error",
-        MessageFreshness.SUSPICIOUS: "_suspicious_incarnation_error",
     }
 
     # SwimError categories that ``handle_error`` counts, by metric name.
@@ -2061,12 +2049,41 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             msg_end = membership_idx
 
         addr_sep_idx = message.find(b">", 0, msg_end)
-        # A message without an address separator carries no embedded state.
-        state_sep_idx = (
-            message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
-            if addr_sep_idx >= 0
-            else -1
-        )
+        if addr_sep_idx < 0:
+            if process_piggybacks:
+                if vivaldi_piggyback:
+                    await self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
+                if extension_outcome_piggyback:
+                    self._task_runner.run(
+                        self._process_extension_outcome_piggyback,
+                        extension_outcome_piggyback,
+                        source_addr,
+                    )
+                if extension_decision_piggyback:
+                    self._task_runner.run(
+                        self._process_extension_decision_piggyback,
+                        extension_decision_piggyback,
+                        source_addr,
+                    )
+                if worker_state_piggyback:
+                    self._task_runner.run(
+                        self._process_worker_state_piggyback,
+                        worker_state_piggyback,
+                        source_addr,
+                    )
+                if health_piggyback:
+                    self._health_gossip_buffer.decode_and_process_piggyback(
+                        health_piggyback
+                    )
+                if membership_piggyback:
+                    self._task_runner.run(
+                        self.process_piggyback_data,
+                        membership_piggyback,
+                        source_addr,
+                    )
+            return message[:msg_end] if msg_end < len(message) else message
+
+        state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
 
         if process_piggybacks:
             if vivaldi_piggyback:
@@ -3240,9 +3257,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             role = self._node_role
             node_id = self._node_id.full
         else:
-            role = (
-                self._peer_roles.get(node, None) if hasattr(self, "_peer_roles") else None
-            )
+            role = self._recorded_peer_role(node)
             node_id = self._get_registered_node_id_for_addr(node)
         self._gossip_buffer.add_update(
             update_type,
@@ -3252,6 +3267,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             role,
             node_id,
         )
+
+    def _recorded_peer_role(self, node: tuple[str, int]) -> NodeRole | None:
+        """The role recorded for peer ``node`` from gossip (AD-35 Task 12.4.3), if any."""
+        return self._peer_roles.get(node, None) if hasattr(self, "_peer_roles") else None
 
     def queue_leave_dissemination(
         self,
@@ -3648,7 +3667,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         )
                     )
 
-            status = self._GOSSIP_UPDATE_STATUSES.get(update.update_type)
+            status_map = {
+                "alive": b"OK",
+                "join": b"OK",
+                "suspect": b"SUSPECT",
+                "dead": b"DEAD",
+                "leave": b"DEAD",
+            }
+            status = status_map.get(update.update_type)
             if status is None:
                 self._metrics.increment("gossip_unknown_updates_suppressed")
                 continue
@@ -4829,75 +4855,123 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         budget = self._compute_direct_probe_budget(target, timeout)
         deadline = self._clock.monotonic() + budget
 
-        while True:
-            if not self._running:
-                return False
+        while (
+            probe_outcome := await self._direct_probe_cycle(target, timeout, deadline)
+        ) is self._DIRECT_PROBE_RETRY:
+            pass
+        return probe_outcome
 
-            remaining = deadline - self._clock.monotonic()
-            # Epsilon expiry (protocol.time_quantum): a positive
-            # SUB-QUANTUM remainder is the deadline, not a wait — a
-            # wait_for armed on it fires via call_soon at the SAME
-            # quantized instant (the clock never advances), and this
-            # retry loop then spins forever at one frozen instant
-            # (measured: the chaos suite's seed-5 L3 run flooded the
-            # queue with Timeout._on_timeout at virtual 39.38).
-            if remaining <= TIME_REMAINDER_EPSILON_SECONDS:
-                break
+    async def _direct_probe_cycle(
+        self,
+        target: tuple[str, int],
+        timeout: float,
+        deadline: float,
+    ) -> bool | str:
+        """One direct-probe loop iteration: False once stopped, else one attempt inside the deadline."""
+        if not self._running:
+            return False
+        return await self._direct_probe_window(target, timeout, deadline)
 
-            try:
-                # SHARE any live pending future for this target instead
-                # of cancelling it. Concurrent probes to one target are
-                # legal (the AD-53 burst-confirmation batch races the
-                # main probe cycle on exactly the targets that are
-                # failing), and an ACK from the target proves liveness
-                # for every concurrent waiter identically. The previous
-                # pop-and-cancel here injected CancelledError into the
-                # OTHER waiter's ``wait_for`` — and the main probe
-                # cycle's shutdown handling read that stray cancel as
-                # "the server is stopping" and exited PERMANENTLY: the
-                # node silently lost its whole failure detector (and,
-                # on managers, the worker-heartbeat carrier), starving
-                # dispatch forever after (measured live: every long
-                # soak horizon lost SWIM at the first burst window).
-                ack_future, message = self._register_direct_probe_attempt(target)
+    async def _direct_probe_window(
+        self,
+        target: tuple[str, int],
+        timeout: float,
+        deadline: float,
+    ) -> bool | str:
+        """Run one attempt while the deadline leaves time; on expiry, report the probe timed out."""
+        remaining = deadline - self._clock.monotonic()
+        # Epsilon expiry (protocol.time_quantum): a positive
+        # SUB-QUANTUM remainder is the deadline, not a wait — a
+        # wait_for armed on it fires via call_soon at the SAME
+        # quantized instant (the clock never advances), and this
+        # retry loop then spins forever at one frozen instant
+        # (measured: the chaos suite's seed-5 L3 run flooded the
+        # queue with Timeout._on_timeout at virtual 39.38).
+        if remaining <= TIME_REMAINDER_EPSILON_SECONDS:
+            return await self._time_out_direct_probe(target, timeout)
 
-                await self.send(target, message, timeout=timeout)
+        attempt_outcome = await self._direct_probe_attempt(target, timeout, deadline)
+        if attempt_outcome is None:
+            return await self._time_out_direct_probe(target, timeout)
+        return attempt_outcome
 
-                attempt_window = min(timeout, deadline - self._clock.monotonic())
-                # Same epsilon contract as the loop head: never arm a
-                # wait the clock cannot honor.
-                if attempt_window <= TIME_REMAINDER_EPSILON_SECONDS:
-                    break
+    async def _direct_probe_attempt(
+        self,
+        target: tuple[str, int],
+        timeout: float,
+        deadline: float,
+    ) -> bool | str | None:
+        """Send one direct probe and wait for its ACK.
 
-                try:
-                    # SHIELDED: ``wait_for`` cancels its inner awaitable
-                    # on timeout (and on waiter-task cancellation) — on
-                    # a SHARED ack future that cancellation would erupt
-                    # as CancelledError inside every OTHER concurrent
-                    # waiter's wait, aborting their probe rounds before
-                    # the failure path (indirect probe -> suspicion)
-                    # could run: death detection silently stopped
-                    # converging whenever the burst batch raced the
-                    # main cycle. The shield lets each waiter time out
-                    # independently while the future survives for the
-                    # rest.
-                    await self._clock.wait_for(
-                        asyncio.shield(ack_future), timeout=attempt_window
-                    )
-                    self._metrics.increment("probes_received")
-                    return True
-                except asyncio.TimeoutError:
-                    pass
-                finally:
-                    self._release_settled_probe_ack(target, ack_future)
+        Returns True on ACK, False on failure, ``_DIRECT_PROBE_RETRY`` when
+        the wait timed out, and None when no wait fits before the deadline.
+        """
+        try:
+            # SHARE any live pending future for this target instead
+            # of cancelling it. Concurrent probes to one target are
+            # legal (the AD-53 burst-confirmation batch races the
+            # main probe cycle on exactly the targets that are
+            # failing), and an ACK from the target proves liveness
+            # for every concurrent waiter identically. The previous
+            # pop-and-cancel here injected CancelledError into the
+            # OTHER waiter's ``wait_for`` — and the main probe
+            # cycle's shutdown handling read that stray cancel as
+            # "the server is stopping" and exited PERMANENTLY: the
+            # node silently lost its whole failure detector (and,
+            # on managers, the worker-heartbeat carrier), starving
+            # dispatch forever after (measured live: every long
+            # soak horizon lost SWIM at the first burst window).
+            ack_future, message = self._register_direct_probe_attempt(target)
 
-            except asyncio.CancelledError:
-                self._forget_pending_probe(target)
-                raise
-            except Exception as e:
-                # OSError (a network failure) included.
-                return await self._fail_direct_probe(target, e)
+            await self.send(target, message, timeout=timeout)
 
+            return await self._await_direct_probe_ack(target, ack_future, timeout, deadline)
+
+        except asyncio.CancelledError:
+            self._forget_pending_probe(target)
+            raise
+        except Exception as e:
+            # OSError (a network failure) included.
+            return await self._fail_direct_probe(target, e)
+
+    async def _await_direct_probe_ack(
+        self,
+        target: tuple[str, int],
+        ack_future: asyncio.Future[bool],
+        timeout: float,
+        deadline: float,
+    ) -> bool | str | None:
+        """Wait out one attempt's window for the shared ACK future; None when no window remains."""
+        attempt_window = min(timeout, deadline - self._clock.monotonic())
+        # Same epsilon contract as the loop head: never arm a
+        # wait the clock cannot honor.
+        if attempt_window <= TIME_REMAINDER_EPSILON_SECONDS:
+            return None
+
+        try:
+            # SHIELDED: ``wait_for`` cancels its inner awaitable
+            # on timeout (and on waiter-task cancellation) — on
+            # a SHARED ack future that cancellation would erupt
+            # as CancelledError inside every OTHER concurrent
+            # waiter's wait, aborting their probe rounds before
+            # the failure path (indirect probe -> suspicion)
+            # could run: death detection silently stopped
+            # converging whenever the burst batch raced the
+            # main cycle. The shield lets each waiter time out
+            # independently while the future survives for the
+            # rest.
+            await self._clock.wait_for(
+                asyncio.shield(ack_future), timeout=attempt_window
+            )
+            self._metrics.increment("probes_received")
+            return True
+        except asyncio.TimeoutError:
+            return self._DIRECT_PROBE_RETRY
+        finally:
+            self._release_settled_probe_ack(target, ack_future)
+
+    async def _time_out_direct_probe(self, target: tuple[str, int], timeout: float) -> bool:
+        """Count and report a direct probe whose deadline expired without an ACK; always False."""
         self._metrics.increment("probes_timeout")
         await self.handle_error(ProbeTimeoutError(target, timeout))
         return False
@@ -5789,63 +5863,38 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     node_id=self._node_id.short,
                 ),
             )
-        else:
-            self._report_freshness_rejection(freshness, node, incarnation, current_incarnation)
-
-        return False
-
-    def _report_freshness_rejection(
-        self,
-        freshness: MessageFreshness,
-        node: tuple[str, int],
-        incarnation: int,
-        current_incarnation: int,
-    ) -> None:
-        """Hand a STALE, INVALID or SUSPICIOUS message's error to handle_error through the task runner."""
-        if (error_builder_name := self._FRESHNESS_REJECTION_ERROR_BUILDERS.get(freshness)) is not None:
+        elif freshness == MessageFreshness.STALE:
+            # Stale messages may indicate delayed network or state drift
             self._task_runner.run(
                 self.handle_error,
-                getattr(self, error_builder_name)(node, incarnation, current_incarnation),
+                StaleMessageError(node, incarnation, current_incarnation),
+            )
+        elif freshness == MessageFreshness.INVALID:
+            # Invalid incarnation - log as protocol error
+            self._task_runner.run(
+                self.handle_error,
+                ProtocolError(
+                    f"Invalid incarnation {incarnation} from {node[0]}:{node[1]}",
+                    severity=ErrorSeverity.DEGRADED,
+                    node=node,
+                    incarnation=incarnation,
+                ),
+            )
+        elif freshness == MessageFreshness.SUSPICIOUS:
+            # Suspicious jump - possible attack or serious bug
+            self._task_runner.run(
+                self.handle_error,
+                ProtocolError(
+                    f"Suspicious incarnation jump to {incarnation} from {node[0]}:{node[1]} "
+                    f"(current: {current_incarnation})",
+                    severity=ErrorSeverity.DEGRADED,
+                    node=node,
+                    incarnation=incarnation,
+                    current_incarnation=current_incarnation,
+                ),
             )
 
-    @staticmethod
-    def _stale_message_error(
-        node: tuple[str, int],
-        incarnation: int,
-        current_incarnation: int,
-    ) -> StaleMessageError:
-        """Stale messages may indicate delayed network or state drift."""
-        return StaleMessageError(node, incarnation, current_incarnation)
-
-    @staticmethod
-    def _invalid_incarnation_error(
-        node: tuple[str, int],
-        incarnation: int,
-        current_incarnation: int,
-    ) -> ProtocolError:
-        """Invalid incarnation - log as protocol error."""
-        return ProtocolError(
-            f"Invalid incarnation {incarnation} from {node[0]}:{node[1]}",
-            severity=ErrorSeverity.DEGRADED,
-            node=node,
-            incarnation=incarnation,
-        )
-
-    @staticmethod
-    def _suspicious_incarnation_error(
-        node: tuple[str, int],
-        incarnation: int,
-        current_incarnation: int,
-    ) -> ProtocolError:
-        """Suspicious jump - possible attack or serious bug."""
-        return ProtocolError(
-            f"Suspicious incarnation jump to {incarnation} from {node[0]}:{node[1]} "
-            f"(current: {current_incarnation})",
-            severity=ErrorSeverity.DEGRADED,
-            node=node,
-            incarnation=incarnation,
-            current_incarnation=current_incarnation,
-        )
+        return False
 
     def _make_network_error(
         self,
@@ -6113,14 +6162,36 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         )
 
         if updated:
-            if status == b"DEAD":
-                await self._log_node_dead_transition(node, incarnation, previous_state)
-            # If node was DEAD and is now being set to OK/ALIVE, invoke join callbacks
-            # This handles recovery detection for nodes that come back after being marked dead
-            elif was_dead and status in (b"OK", b"ALIVE"):
-                self._on_dead_node_recovered(node, incarnation)
+            await self._apply_node_state_transition(node, status, incarnation, previous_state, was_dead)
 
         return updated
+
+    async def _apply_node_state_transition(
+        self,
+        node: tuple[str, int],
+        status: Status,
+        incarnation: int,
+        previous_state: NodeState | None,
+        was_dead: bool | None,
+    ) -> None:
+        """Log an applied DEAD transition, or run recovery for a DEAD node set back to OK/ALIVE."""
+        if status == b"DEAD":
+            await self._log_node_dead_transition(node, incarnation, previous_state)
+            return
+        self._recover_returned_dead_node(node, status, incarnation, was_dead)
+
+    def _recover_returned_dead_node(
+        self,
+        node: tuple[str, int],
+        status: Status,
+        incarnation: int,
+        was_dead: bool | None,
+    ) -> None:
+        """Run recovery for a node that was DEAD and is now set back to OK/ALIVE."""
+        # If node was DEAD and is now being set to OK/ALIVE, invoke join callbacks
+        # This handles recovery detection for nodes that come back after being marked dead
+        if was_dead and status in (b"OK", b"ALIVE"):
+            self._on_dead_node_recovered(node, incarnation)
 
     async def _log_node_dead_transition(
         self,
@@ -6134,9 +6205,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 message=(
                     f"[NODE-DEAD] node={node} incarnation={incarnation} "
                     f"prev_status={previous_state.status if previous_state else None} "
-                    # [-9:-2]: skip this helper's frame and update_node_state's,
-                    # naming the same seven callers update_node_state did inline.
-                    f"stack={'/'.join(f.name for f in _tb.extract_stack()[-9:-2])}"
+                    # [-10:-3]: skip this helper's frame, _apply_node_state_transition's
+                    # and update_node_state's, naming the same seven callers
+                    # update_node_state did inline.
+                    f"stack={'/'.join(f.name for f in _tb.extract_stack()[-10:-3])}"
                 ),
                 node_host=self._host,
                 node_port=self._udp_port,
@@ -6393,13 +6465,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         1. They may be slow to respond, causing indirect probe timeouts
         2. We want to reduce load on already-stressed nodes
         """
-        self_addr = self._get_self_udp_addr()
-
-        all_candidates = [
-            node
-            for node in self._incarnation_tracker.node_states.keys()
-            if self._is_usable_indirect_probe_proxy(node, target, self_addr)
-        ]
+        all_candidates = self._indirect_probe_proxy_candidates(target)
 
         if not all_candidates:
             return []
@@ -6413,6 +6479,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return []
 
         return self._sample_proxies_preferring_healthy(healthy_candidates, stressed_candidates, k)
+
+    def _indirect_probe_proxy_candidates(self, target: tuple[str, int]) -> list[tuple[str, int]]:
+        """Every known node other than ``target`` and this node that can serve as an indirect-probe proxy."""
+        self_addr = self._get_self_udp_addr()
+
+        return [
+            node
+            for node in self._incarnation_tracker.node_states.keys()
+            if self._is_usable_indirect_probe_proxy(node, target, self_addr)
+        ]
 
     def _is_usable_indirect_probe_proxy(
         self,
@@ -7455,3 +7531,4 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except Exception as error:
             await self.handle_exception(error, "receive")
             return b"nack"
+

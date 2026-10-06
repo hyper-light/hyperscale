@@ -20,6 +20,10 @@ from hyperscale.distributed.nodes.worker import WorkerServer
 from hyperscale.distributed.env.env import Env
 from hyperscale.logging.config.logging_config import LoggingConfig
 
+# Every node and client of this example shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 # Initialize logging directory (required for server pool)
 _logging_config = LoggingConfig()
 _logging_config.update(log_directory=os.getcwd())
@@ -54,7 +58,7 @@ async def run_test():
             host='127.0.0.1',
             tcp_port=WORKER_TCP_PORT,
             udp_port=WORKER_UDP_PORT,
-            env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
+            env=Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
             dc_id=DC_ID,
             total_cores=WORKER_CORES,
             seed_managers=SEED_MANAGERS,

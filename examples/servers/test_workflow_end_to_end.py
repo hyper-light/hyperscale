@@ -33,6 +33,10 @@ from hyperscale.distributed.nodes.worker import WorkerServer
 from hyperscale.distributed.nodes.client import HyperscaleClient
 from hyperscale.graph import Workflow, step
 
+# Every node and client of this example shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 
 # =============================================================================
 # Test Workflows
@@ -63,7 +67,7 @@ async def run_test():
     # Setup logging
     LoggingConfig().update(log_directory=os.getcwd(), log_level="info")
     
-    env = Env()
+    env = Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET)
     
     # Server addresses
     manager_tcp = 9100

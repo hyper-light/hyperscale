@@ -35,6 +35,10 @@ from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.models import ManagerHeartbeat, ManagerRegistrationResponse
 from hyperscale.logging.config.logging_config import LoggingConfig
 
+# Every node and client of this test shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 # Disable logging to avoid pipe transport errors
 _logging_config = LoggingConfig()
 _logging_config.disable()
@@ -164,6 +168,7 @@ async def scenario_manager_gate_discovery_single_dc(
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),
@@ -184,6 +189,7 @@ async def scenario_manager_gate_discovery_single_dc(
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),
@@ -330,6 +336,7 @@ async def scenario_manager_gate_discovery_multi_dc(
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),
@@ -352,6 +359,7 @@ async def scenario_manager_gate_discovery_multi_dc(
                     tcp_port=config["tcp"],
                     udp_port=config["udp"],
                     env=Env(
+                        MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                         MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                         MERCURY_SYNC_LOG_LEVEL="error",
                     ),
@@ -473,6 +481,7 @@ async def scenario_manager_gate_discovery_failure_recovery(
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),
@@ -490,6 +499,7 @@ async def scenario_manager_gate_discovery_failure_recovery(
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),
@@ -553,6 +563,7 @@ async def scenario_manager_gate_discovery_failure_recovery(
             tcp_port=manager_configs[failed_idx]["tcp"],
             udp_port=manager_configs[failed_idx]["udp"],
             env=Env(
+                MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                 MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                 MERCURY_SYNC_LOG_LEVEL="error",
             ),
@@ -650,6 +661,7 @@ async def scenario_manager_gate_message_validation(gate_count: int, manager_coun
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),
@@ -667,6 +679,7 @@ async def scenario_manager_gate_message_validation(gate_count: int, manager_coun
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=Env(
+                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
                 ),

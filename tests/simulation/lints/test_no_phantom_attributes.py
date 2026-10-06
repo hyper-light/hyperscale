@@ -68,6 +68,14 @@ so private-attribute analysis stays valid for it and for every node
 class beneath it. Without this exemption the entire server hierarchy
 — gate, manager, worker, ``HealthAwareServer`` — is unprovable, which
 is exactly where the bugs were.
+
+``DECLARED_FIELD_BINDERS`` is the second exemption, also receipted.
+``Message.__getattr__`` binds, through ``object.__setattr__``, only a
+name found in the instance's class ``__dataclass_fields__``: a field an
+older sender did not send, filled with its default. Those fields are
+the dataclass annotations this lint already reads as class-level names,
+so the bind adds nothing unenumerated. Without the exemption every wire
+message class is unprovable.
 """
 
 from __future__ import annotations
@@ -95,6 +103,10 @@ INERT_BASES: frozenset[str] = frozenset(
 PUBLIC_ONLY_DYNAMIC_BINDERS: frozenset[str] = frozenset(
     {"MercurySyncBaseServer"}
 )
+
+# Classes whose dynamic binds name only their own declared dataclass
+# fields. See the module docstring for the receipt behind each entry.
+DECLARED_FIELD_BINDERS: frozenset[str] = frozenset({"Message"})
 
 # The lint's blind spot: classes with a base outside `hyperscale/` or
 # an unenumerable dynamic bind. Asserted so it cannot grow unnoticed.
@@ -225,7 +237,7 @@ def _analyze_class(class_node: ast.ClassDef, path: Path) -> ClassFacts:
     )
     _class_level_names(class_node, facts)
 
-    exempt = class_node.name in PUBLIC_ONLY_DYNAMIC_BINDERS
+    exempt = class_node.name in PUBLIC_ONLY_DYNAMIC_BINDERS or class_node.name in DECLARED_FIELD_BINDERS
     for node in _own_nodes(class_node):
         if _binds_unenumerably(node, facts) and not exempt:
             facts.dynamic = True

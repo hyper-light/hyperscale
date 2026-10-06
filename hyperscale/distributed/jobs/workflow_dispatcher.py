@@ -15,9 +15,10 @@ Key responsibilities:
 
 import asyncio
 import inspect
+import operator
 import traceback
 from types import MappingProxyType
-from typing import Awaitable, Callable, Mapping
+from typing import Awaitable, Callable, Coroutine, Mapping
 
 import cloudpickle
 import networkx
@@ -56,7 +57,7 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.taskex import TaskRunner
-from hyperscale.distributed.workflow import WorkflowState
+from hyperscale.distributed.workflow import WorkflowLifecycleStateMachine, WorkflowState
 from hyperscale.logging import Logger
 
 from hyperscale.distributed.runtime import Clock, RealClock
@@ -217,17 +218,31 @@ class WorkflowDispatcher:
         priorities: dict[str, StagePriority] = {}
         is_test: dict[str, bool] = {}
 
+        return (
+            await self._index_workflows(submission, workflows, graph, workflow_by_id, priorities, is_test)
+            and await self._link_workflow_dependencies(job_id, workflows, graph, workflow_by_id)
+            and await self._register_and_queue_workflows(job_id, graph, workflow_by_id, priorities, is_test)
+        )
+
+    async def _index_workflows(
+        self,
+        submission: JobSubmission,
+        workflows: list[tuple[str, list[str], Workflow]],
+        graph: networkx.DiGraph,
+        workflow_by_id: dict[str, tuple[str, Workflow, int]],
+        priorities: dict[str, StagePriority],
+        is_test: dict[str, bool],
+    ) -> bool:
+        """Record each submitted workflow's name, VUs, priority and kind, and
+        add it to the dependency graph; False if one could not be read."""
+        job_id = submission.job_id
         for wf_data in workflows:
             # Unpack with client-generated workflow_id
             workflow_id, dependencies, instance = wf_data
             try:
                 # Use the client-provided workflow_id (globally unique across DCs)
                 name = workflow_name(instance)
-                vus = (
-                    instance.vus
-                    if instance.vus and instance.vus > 0
-                    else submission.vus
-                )
+                vus = self._workflow_vus(instance, submission.vus)
 
                 # Store for graph building
                 workflow_by_id[workflow_id] = (name, instance, vus)
@@ -245,26 +260,78 @@ class WorkflowDispatcher:
                 )
                 return False
 
+        return True
+
+    @staticmethod
+    def _workflow_vus(instance: Workflow, submission_vus: int) -> int:
+        """A workflow's own positive VU count, else the submission's."""
+        return (
+            instance.vus
+            if instance.vus and instance.vus > 0
+            else submission_vus
+        )
+
+    async def _link_workflow_dependencies(
+        self,
+        job_id: str,
+        workflows: list[tuple[str, list[str], Workflow]],
+        graph: networkx.DiGraph,
+        workflow_by_id: dict[str, tuple[str, Workflow, int]],
+    ) -> bool:
+        """Add an edge from each dependency to its dependent; False when a
+        dependency names no workflow of the job."""
         # Dependencies link once every workflow is registered, so the
         # order the client listed them in does not matter. The manager
         # validated the job's dependencies before creating it; a name
         # that still does not resolve is refused, never dropped.
-        workflow_id_by_name = {
+        workflow_id_by_name = self._workflow_ids_by_name(workflow_by_id)
+        for workflow_id, dependencies, _ in workflows:
+            if not await self._link_workflow(job_id, workflow_id, dependencies, workflow_id_by_name, graph):
+                return False
+
+        return True
+
+    @staticmethod
+    def _workflow_ids_by_name(workflow_by_id: dict[str, tuple[str, Workflow, int]]) -> dict[str, str]:
+        """Map each registered workflow's name to its id."""
+        return {
             name: workflow_id for workflow_id, (name, _, _) in workflow_by_id.items()
         }
-        for workflow_id, dependencies, _ in workflows:
-            for dependency_name in dependencies:
-                if (dependency_id := workflow_id_by_name.get(dependency_name)) is None:
-                    await self._log_error(
-                        f"Workflow {workflow_id} of job {job_id} depends on "
-                        f"{dependency_name!r}, which the job does not contain",
-                        job_id=job_id,
-                        workflow_id=workflow_id,
-                    )
-                    return False
 
-                graph.add_edge(dependency_id, workflow_id)
+    async def _link_workflow(
+        self,
+        job_id: str,
+        workflow_id: str,
+        dependencies: list[str],
+        workflow_id_by_name: dict[str, str],
+        graph: networkx.DiGraph,
+    ) -> bool:
+        """Link one workflow to the workflows it depends on; False (logged)
+        when a dependency does not resolve."""
+        for dependency_name in dependencies:
+            if (dependency_id := workflow_id_by_name.get(dependency_name)) is None:
+                await self._log_error(
+                    f"Workflow {workflow_id} of job {job_id} depends on "
+                    f"{dependency_name!r}, which the job does not contain",
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                )
+                return False
 
+            graph.add_edge(dependency_id, workflow_id)
+
+        return True
+
+    async def _register_and_queue_workflows(
+        self,
+        job_id: str,
+        graph: networkx.DiGraph,
+        workflow_by_id: dict[str, tuple[str, Workflow, int]],
+        priorities: dict[str, StagePriority],
+        is_test: dict[str, bool],
+    ) -> bool:
+        """Register each linked workflow with the JobManager, then queue it
+        for dispatch; False if the JobManager refused one."""
         # Register with JobManager once the graph is linked, each workflow
         # with the dependencies it waits on: the job's own record of the
         # graph, which a failure cascades along.
@@ -289,28 +356,40 @@ class WorkflowDispatcher:
 
         # Register pending workflows
         async with self._pending_lock:
-            for workflow_id, (name, workflow, vus) in workflow_by_id.items():
-                # Get dependencies from graph
-                dependencies = set(graph.predecessors(workflow_id))
-
-                key = f"{job_id}:{workflow_id}"
-                pending = PendingWorkflow(
-                    job_id=job_id,
-                    workflow_id=workflow_id,
-                    workflow_name=name,
-                    workflow=workflow,
-                    vus=vus,
-                    priority=priorities[workflow_id],
-                    is_test=is_test[workflow_id],
-                    dependencies=dependencies,
-                    next_retry_delay=self.INITIAL_RETRY_DELAY,
-                )
-                self._pending[key] = pending
-
-                # Signal workflows with no dependencies as ready immediately
-                pending.check_and_signal_ready()
+            self._queue_pending_workflows(job_id, graph, workflow_by_id, priorities, is_test)
 
         return True
+
+    def _queue_pending_workflows(
+        self,
+        job_id: str,
+        graph: networkx.DiGraph,
+        workflow_by_id: dict[str, tuple[str, Workflow, int]],
+        priorities: dict[str, StagePriority],
+        is_test: dict[str, bool],
+    ) -> None:
+        """Under the pending lock: queue each registered workflow, signalling
+        the ones with no dependencies ready at once."""
+        for workflow_id, (name, workflow, vus) in workflow_by_id.items():
+            # Get dependencies from graph
+            dependencies = set(graph.predecessors(workflow_id))
+
+            key = f"{job_id}:{workflow_id}"
+            pending = PendingWorkflow(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                workflow_name=name,
+                workflow=workflow,
+                vus=vus,
+                priority=priorities[workflow_id],
+                is_test=is_test[workflow_id],
+                dependencies=dependencies,
+                next_retry_delay=self.INITIAL_RETRY_DELAY,
+            )
+            self._pending[key] = pending
+
+            # Signal workflows with no dependencies as ready immediately
+            pending.check_and_signal_ready()
 
     def _get_workflow_priority(self, workflow: Workflow) -> StagePriority:
         """Determine dispatch priority for a workflow."""
@@ -353,13 +432,16 @@ class WorkflowDispatcher:
         """
         async with self._pending_lock:
             # Update all pending workflows that depend on this one
-            for key, pending in self._pending.items():
-                if pending.job_id != job_id:
-                    continue
-                if workflow_id in pending.dependencies:
+            for pending in self._pending.values():
+                if self._depends_on(pending, job_id, workflow_id):
                     pending.completed_dependencies.add(workflow_id)
                     # Check if this workflow is now ready and signal if so
                     pending.check_and_signal_ready()
+
+    @staticmethod
+    def _depends_on(pending: PendingWorkflow, job_id: str, workflow_id: str) -> bool:
+        """Whether a queued workflow of the job waits on the given workflow."""
+        return pending.job_id == job_id and workflow_id in pending.dependencies
 
     async def remove_pending_workflows(
         self,
@@ -409,32 +491,48 @@ class WorkflowDispatcher:
         if total_cores <= 0:
             return 0
 
-        dispatched = 0
+        return await self._dispatch_ready_workflows(ready, submission, total_cores)
 
+    async def _dispatch_ready_workflows(
+        self,
+        ready: list[PendingWorkflow],
+        submission: JobSubmission,
+        total_cores: int,
+    ) -> int:
+        """Dispatch the first ready EXCLUSIVE workflow alone, or else split
+        the cores among every ready workflow; returns how many workers took."""
         # Handle EXCLUSIVE workflows first
-        exclusive = [p for p in ready if p.priority == StagePriority.EXCLUSIVE]
-        if exclusive:
-            pending = exclusive[0]
-            success = await self._dispatch_workflow(
-                pending, submission, total_cores
-            )
-            if success:
-                dispatched += 1
+        if (exclusive := self._first_exclusive_workflow(ready)) is not None:
             # Don't dispatch others while EXCLUSIVE is pending
-            return dispatched
+            return int(await self._dispatch_workflow(exclusive, submission, total_cores))
 
-        # Dispatch non-exclusive workflows
-        non_exclusive = [p for p in ready if p.priority != StagePriority.EXCLUSIVE]
-        if not non_exclusive:
-            return dispatched
+        # Dispatch non-exclusive workflows: with no EXCLUSIVE one ready,
+        # that is every ready workflow.
+        return await self._dispatch_allocated_workflows(ready, submission, total_cores)
 
+    @staticmethod
+    def _first_exclusive_workflow(ready: list[PendingWorkflow]) -> PendingWorkflow | None:
+        """The first ready EXCLUSIVE workflow, if any."""
+        return next(
+            (pending for pending in ready if pending.priority == StagePriority.EXCLUSIVE),
+            None,
+        )
+
+    async def _dispatch_allocated_workflows(
+        self,
+        non_exclusive: list[PendingWorkflow],
+        submission: JobSubmission,
+        total_cores: int,
+    ) -> int:
+        """Split the cores among non-exclusive ready workflows and dispatch
+        each; returns how many workers took."""
         # Calculate core allocation
         allocations = self._calculate_allocations(non_exclusive, total_cores)
 
         # Dispatch each workflow
+        dispatched = 0
         for pending, cores in allocations:
-            success = await self._dispatch_workflow(pending, submission, cores)
-            if success:
+            if await self._dispatch_workflow(pending, submission, cores):
                 dispatched += 1
 
         return dispatched
@@ -444,23 +542,29 @@ class WorkflowDispatcher:
         backoff elapsed."""
         now = _DEFAULT_CLOCK.monotonic()
         lifecycle = self._job_manager.workflow_lifecycle
-        ready = []
-        for key, pending in self._pending.items():
-            if pending.job_id != job_id:
-                continue
-            if lifecycle.get_state(job_id, pending.workflow_id) != WorkflowState.PENDING:
-                continue
+        return [
+            pending
+            for pending in self._pending.values()
+            if self._is_ready_for_dispatch(pending, job_id, lifecycle, now)
+        ]
 
-            # Retry backoff via the ONE deadline contract (sub-epsilon
-            # remainders count as expired — see PendingWorkflow's
-            # backoff helpers and protocol.time_quantum).
-            if not pending.is_retry_backoff_expired(now):
-                continue  # Still in backoff period
-
-            # Check if all dependencies are satisfied
-            if pending.dependencies <= pending.completed_dependencies:
-                ready.append(pending)
-        return ready
+    def _is_ready_for_dispatch(
+        self,
+        pending: PendingWorkflow,
+        job_id: str,
+        lifecycle: WorkflowLifecycleStateMachine,
+        now: float,
+    ) -> bool:
+        """Whether a queued workflow of the job is PENDING, past its retry
+        backoff and has every dependency completed."""
+        # Retry backoff via the ONE deadline contract (sub-epsilon
+        # remainders count as expired — see PendingWorkflow's
+        # backoff helpers and protocol.time_quantum).
+        return (
+            self._is_job_workflow_pending(pending, job_id, lifecycle)
+            and pending.is_retry_backoff_expired(now)
+            and pending.dependencies <= pending.completed_dependencies
+        )
 
     def _calculate_allocations(
         self,
@@ -477,83 +581,157 @@ class WorkflowDispatcher:
 
         Returns only workflows that can actually be allocated within available cores.
         Workflows that don't fit remain pending and will be dispatched when cores free up.
+        (No workflows: both steps below allocate nothing, so the result is empty.)
         """
-        if not workflows:
-            return []
-
         # Separate explicit priority from AUTO workflows
-        explicit = [p for p in workflows if p.priority != StagePriority.AUTO]
-        auto = [p for p in workflows if p.priority == StagePriority.AUTO]
-
-        allocations = []
-        remaining_cores = total_cores
+        explicit, auto = self._partition_by_auto_priority(workflows)
 
         # Step 1: Allocate explicit priority workflows first (by priority then VUs)
-        if explicit:
-            # Sort by priority (higher value = higher priority) then by VUs (higher first)
-            # StagePriority: EXCLUSIVE=4, HIGH=3, NORMAL=2, LOW=1
-            explicit = sorted(
-                explicit,
-                key=lambda p: (-p.priority.value, -p.vus),
-            )
-
-            # Proportional allocation by VUs for explicit workflows
-            total_vus = sum(p.vus for p in explicit)
-            if total_vus == 0:
-                total_vus = len(explicit)
-
-            for i, pending in enumerate(explicit):
-                if remaining_cores <= 0:
-                    # No more cores - remaining explicit workflows stay pending
-                    break
-
-                if i == len(explicit) - 1 and not auto:
-                    # Last explicit workflow gets remaining if no AUTO workflows
-                    cores = remaining_cores
-                else:
-                    # Proportional allocation
-                    share = (
-                        pending.vus / total_vus if total_vus > 0 else 1 / len(explicit)
-                    )
-                    cores = max(1, int(total_cores * share))
-                    cores = min(cores, remaining_cores)
-
-                allocations.append((pending, cores))
-                remaining_cores -= cores
+        allocations, remaining_cores = self._allocate_explicit_workflows(
+            explicit, bool(auto), total_cores
+        )
 
         # Step 2: AUTO uses up to one core per VU. A 1-VU workflow should
         # not fan out across every worker in a large cluster; that turns a
         # tiny workload into a cluster-wide dispatch handshake barrier and
         # adds no useful parallelism.
         if auto and remaining_cores > 0:
-            auto = sorted(auto, key=lambda pending: pending.vus, reverse=True)
-            auto_to_allocate = auto[:remaining_cores]
-            auto_core_caps = [max(1, pending.vus) for pending in auto_to_allocate]
-            total_auto_core_cap = sum(auto_core_caps)
-            available_auto_cores = remaining_cores
-
-            for index, pending in enumerate(auto_to_allocate):
-                if remaining_cores <= 0:
-                    break
-                useful_cores = auto_core_caps[index]
-                remaining_workflows = len(auto_to_allocate) - index
-                reserved_for_rest = remaining_workflows - 1
-
-                if index == len(auto_to_allocate) - 1:
-                    cores = min(useful_cores, remaining_cores)
-                else:
-                    share = useful_cores / total_auto_core_cap
-                    proportional_cores = max(1, int(available_auto_cores * share))
-                    cores = min(
-                        useful_cores,
-                        proportional_cores,
-                        remaining_cores - reserved_for_rest,
-                    )
-
-                allocations.append((pending, cores))
-                remaining_cores -= cores
+            allocations.extend(self._allocate_auto_workflows(auto, remaining_cores))
 
         return allocations
+
+    @staticmethod
+    def _partition_by_auto_priority(
+        workflows: list[PendingWorkflow],
+    ) -> tuple[list[PendingWorkflow], list[PendingWorkflow]]:
+        """Split workflows, each keeping its order, into the explicit
+        priority (non-AUTO) ones and the AUTO ones."""
+        explicit: list[PendingWorkflow] = []
+        auto: list[PendingWorkflow] = []
+        for pending in workflows:
+            (auto if pending.priority == StagePriority.AUTO else explicit).append(pending)
+        return explicit, auto
+
+    def _allocate_explicit_workflows(
+        self,
+        explicit: list[PendingWorkflow],
+        has_auto_workflows: bool,
+        total_cores: int,
+    ) -> tuple[list[tuple[PendingWorkflow, int]], int]:
+        """Allocate explicit priority workflows proportionally by VUs, highest
+        priority first; returns the allocations and the cores left over."""
+        # Sort by priority (higher value = higher priority) then by VUs (higher first)
+        # StagePriority: EXCLUSIVE=4, HIGH=3, NORMAL=2, LOW=1
+        explicit = sorted(
+            explicit,
+            key=lambda p: (-p.priority.value, -p.vus),
+        )
+
+        # Proportional allocation by VUs for explicit workflows
+        total_vus = self._explicit_total_vus(explicit)
+
+        allocations: list[tuple[PendingWorkflow, int]] = []
+        remaining_cores = total_cores
+        for index, pending in enumerate(explicit):
+            if remaining_cores <= 0:
+                # No more cores - remaining explicit workflows stay pending
+                break
+
+            cores = self._explicit_workflow_cores(
+                index, pending, len(explicit), has_auto_workflows, total_vus, total_cores, remaining_cores
+            )
+            allocations.append((pending, cores))
+            remaining_cores -= cores
+
+        return allocations, remaining_cores
+
+    @staticmethod
+    def _explicit_total_vus(explicit: list[PendingWorkflow]) -> int:
+        """The explicit workflows' VUs summed, or their count when that sum
+        is zero, as the denominator of each one's proportional share."""
+        return sum(p.vus for p in explicit) or len(explicit)
+
+    def _explicit_workflow_cores(
+        self,
+        index: int,
+        pending: PendingWorkflow,
+        explicit_count: int,
+        has_auto_workflows: bool,
+        total_vus: int,
+        total_cores: int,
+        remaining_cores: int,
+    ) -> int:
+        """Cores for one explicit priority workflow: the last one takes what
+        remains when no AUTO workflow follows; the rest a proportional share."""
+        if index == explicit_count - 1 and not has_auto_workflows:
+            # Last explicit workflow gets remaining if no AUTO workflows
+            return remaining_cores
+
+        # Proportional allocation
+        share = self._explicit_share(pending, total_vus, explicit_count)
+        cores = max(1, int(total_cores * share))
+        return min(cores, remaining_cores)
+
+    @staticmethod
+    def _explicit_share(pending: PendingWorkflow, total_vus: int, explicit_count: int) -> float:
+        """An explicit workflow's share of the cores: its fraction of the VUs."""
+        return pending.vus / total_vus if total_vus > 0 else 1 / explicit_count
+
+    def _allocate_auto_workflows(
+        self,
+        auto: list[PendingWorkflow],
+        remaining_cores: int,
+    ) -> list[tuple[PendingWorkflow, int]]:
+        """Allocate AUTO workflows, most VUs first, at most one core per VU.
+
+        Called with ``remaining_cores > 0``: at most ``remaining_cores``
+        workflows are allocated, and each but the last leaves at least one
+        core for every workflow after it, so cores never run out mid-loop."""
+        auto = sorted(auto, key=lambda pending: pending.vus, reverse=True)
+        auto_to_allocate = auto[:remaining_cores]
+        auto_core_caps = [max(1, pending.vus) for pending in auto_to_allocate]
+        total_auto_core_cap = sum(auto_core_caps)
+        available_auto_cores = remaining_cores
+
+        allocations: list[tuple[PendingWorkflow, int]] = []
+        for index, pending in enumerate(auto_to_allocate):
+            cores = self._auto_workflow_cores(
+                index,
+                len(auto_to_allocate),
+                auto_core_caps[index],
+                total_auto_core_cap,
+                available_auto_cores,
+                remaining_cores,
+            )
+            allocations.append((pending, cores))
+            remaining_cores -= cores
+
+        return allocations
+
+    @staticmethod
+    def _auto_workflow_cores(
+        index: int,
+        workflow_count: int,
+        useful_cores: int,
+        total_auto_core_cap: int,
+        available_auto_cores: int,
+        remaining_cores: int,
+    ) -> int:
+        """Cores for one AUTO workflow: its proportional share of the cap,
+        no more than it can keep busy, leaving one core for each after it."""
+        remaining_workflows = workflow_count - index
+        reserved_for_rest = remaining_workflows - 1
+
+        if index == workflow_count - 1:
+            return min(useful_cores, remaining_cores)
+
+        share = useful_cores / total_auto_core_cap
+        proportional_cores = max(1, int(available_auto_cores * share))
+        return min(
+            useful_cores,
+            proportional_cores,
+            remaining_cores - reserved_for_rest,
+        )
 
     # =========================================================================
     # Single Workflow Dispatch
@@ -621,234 +799,9 @@ class WorkflowDispatcher:
             return False
 
         try:
-            if not await self._job_manager.claim_workflow_for_dispatch(
-                pending.job_id, pending.workflow_id
-            ):
-                for worker_id, _worker_cores in allocations:
-                    await self._worker_pool.release_cores(
-                        worker_id, str(workflow_token.to_sub_workflow_token(worker_id))
-                    )
-                return False
-
-            taken_plans: list[tuple[str, str]] = []
-            delivery_failures: list[str] = []
-            dispatch_plans: list[
-                tuple[str, int, TrackingToken, WorkflowDispatch]
-            ] = []
-            released_worker_ids: set[str] = set()
-            try:
-                total_allocated = sum(cores for _, cores in allocations)
-
-                workflow_bytes = cloudpickle.dumps(pending.workflow)
-
-                stored_context = await self._job_manager.get_stored_dispatched_context(
-                    pending.job_id,
-                    pending.workflow_id,
-                )
-                if stored_context is not None:
-                    context_bytes, layer_version = stored_context
-                else:
-                    context_bytes = _serialize_context(
-                        await self._job_manager.get_job_context(pending.job_id)
-                    )
-                    layer_version = await self._job_manager.get_layer_version(
-                        pending.job_id
-                    )
-
-                for worker_id, worker_cores in allocations:
-                    # Calculate VUs for this worker
-                    worker_vus = max(1, int(pending.vus * (worker_cores / total_allocated)))
-
-                    # Create sub-workflow token
-                    sub_token = workflow_token.to_sub_workflow_token(worker_id)
-
-                    # Get fence token for at-most-once dispatch (AD-10: incorporate leader term)
-                    leader_term = self._get_leader_term() if self._get_leader_term else 0
-                    fence_token = await self._job_manager.get_next_fence_token(
-                        pending.job_id, leader_term
-                    )
-
-                    # Phase H2: derive the worker-observed deadline via
-                    # the canonical override hierarchy (explicit submission
-                    # > class-level timeout override > default = duration ×
-                    # multiplier). All dispatch paths share this resolver
-                    # so deadlines stay consistent across gate, manager,
-                    # and timeout-strategy layers.
-                    resolved_timeout_seconds = resolve_worker_deadline_seconds(
-                        workflow=pending.workflow,
-                        submission_timeout_seconds=submission.timeout_seconds,
-                        submission_timeout_explicit=submission.timeout_seconds_explicit,
-                        default_multiplier=self._env.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
-                    )
-
-                    dispatch = WorkflowDispatch(
-                        job_id=pending.job_id,
-                        workflow_id=str(sub_token),
-                        workflow=workflow_bytes,
-                        context=context_bytes,
-                        vus=worker_vus,
-                        cores=worker_cores,
-                        timeout_seconds=resolved_timeout_seconds,
-                        fence_token=fence_token,
-                        context_version=layer_version,
-                    )
-
-                    sub_workflow = await self._job_manager.register_sub_workflow(
-                        job_id=pending.job_id,
-                        workflow_id=pending.workflow_id,
-                        worker_id=worker_id,
-                        cores_allocated=worker_cores,
-                        fence_token=fence_token,
-                    )
-                    if sub_workflow is None:
-                        released_worker_ids.add(worker_id)
-                        await self._worker_pool.release_cores(worker_id, str(sub_token))
-                        continue
-
-                    dispatch_plans.append((worker_id, worker_cores, sub_token, dispatch))
-                    await self._job_manager.set_sub_workflow_dispatched_context(
-                        sub_workflow_token=str(sub_token),
-                        context_bytes=context_bytes,
-                        layer_version=layer_version,
-                    )
-
-            except Exception as preparation_error:
-                # Preparing the dispatch raised -- the workflow or its context
-                # would not serialize, say. Nothing was sent: everything the
-                # attempt holds is given back, and it failed with the error
-                # as its cause (it surfaces with the workflow's failure).
-                for worker_id, _worker_cores in allocations:
-                    if worker_id not in released_worker_ids:
-                        await self._worker_pool.release_cores(
-                            worker_id, str(workflow_token.to_sub_workflow_token(worker_id))
-                        )
-                for _worker_id, _worker_cores, sub_token, _dispatch in dispatch_plans:
-                    await self._job_manager.remove_unstarted_sub_workflow(str(sub_token))
-                await self._log_error(
-                    f"Preparing the dispatch of workflow {pending.workflow_id} raised "
-                    f"{type(preparation_error).__name__}: {preparation_error}",
-                    job_id=pending.job_id,
-                    workflow_id=pending.workflow_id,
-                )
-                delivery_failures.append(
-                    f"preparing its dispatch raised {type(preparation_error).__name__}: {preparation_error}"
-                )
-
-            else:
-                if (
-                    dispatch_plans
-                    and self._on_dispatch_state_registered is not None
-                    and not await self._on_dispatch_state_registered(pending.job_id)
-                ):
-                    # Nothing is sent: the manager tier could not replicate the
-                    # dispatch, which is no fault of the workflow's -- it backs
-                    # off without spending retry budget.
-                    for worker_id, _worker_cores, sub_token, _dispatch in dispatch_plans:
-                        await self._worker_pool.release_cores(worker_id, str(sub_token))
-                        await self._job_manager.remove_unstarted_sub_workflow(str(sub_token))
-                    self._apply_backoff(pending, attempt_started_at)
-                    # Back in the queue, it needs the job's dispatch loop, which
-                    # may have exited seeing it claimed. A job already dropped
-                    # (teardown removes it from the JobManager first) is not
-                    # requeued, so a finished job's loop is never restarted.
-                    if await self._job_manager.return_workflow_to_pending(
-                        pending.job_id,
-                        pending.workflow_id,
-                        "its dispatch state did not replicate to a quorum of managers",
-                    ) and (
-                        (loop_task := self._job_dispatch_tasks.get(pending.job_id)) is None
-                        or loop_task.done()
-                    ):
-                        await self.start_job_dispatch(pending.job_id, submission)
-                    return False
-
-                for worker_id, worker_cores, sub_token, outcome, detail in await self._send_dispatch_plans(
-                    pending,
-                    dispatch_plans,
-                ):
-                    if (
-                        outcome == DispatchOutcome.ACCEPTED
-                        or not await self._job_manager.remove_unstarted_sub_workflow(str(sub_token))
-                    ):
-                        # Taken: its cores stay reserved until the worker's
-                        # next report shows the dispatch.
-                        taken_plans.append((str(sub_token), worker_id))
-                        continue
-
-                    await self._worker_pool.release_cores(worker_id, str(sub_token))
-                    if outcome in BUDGETED_DISPATCH_OUTCOMES:
-                        delivery_failures.append(f"worker {worker_id} {outcome.value}: {detail}")
-
-            if taken_plans:
-                if self._job_manager.workflow_lifecycle.get_state(
-                    pending.job_id, pending.workflow_id
-                ) not in (WorkflowState.DISPATCHED, WorkflowState.RUNNING):
-                    # It was cancelled (or failed for good) while it was being
-                    # sent: what the workers took is stopped -- otherwise it
-                    # would run on, unseen by the cancellation.
-                    self._task_runner.run(
-                        self._stop_dispatched_plans, pending.job_id, taken_plans
-                    )
-                elif len(taken_plans) < len(allocations):
-                    # PARTIAL success: the workflow runs with reduced
-                    # parallelism on the workers that took it.
-                    await self._log_warning(
-                        f"Partial dispatch for workflow {pending.workflow_id}: "
-                        f"{len(taken_plans)}/{len(allocations)} workers took it",
-                        job_id=pending.job_id,
-                        workflow_id=pending.workflow_id,
-                    )
-                return True
-
-            if not delivery_failures:
-                # Every worker offered refused for capacity (or was gone, or
-                # never sent to): the workflow waits for capacity.
-                if await self._job_manager.return_workflow_to_pending(
-                    pending.job_id,
-                    pending.workflow_id,
-                    "no worker offered had capacity for it",
-                ) and (
-                    (loop_task := self._job_dispatch_tasks.get(pending.job_id)) is None
-                    or loop_task.done()
-                ):
-                    await self.start_job_dispatch(pending.job_id, submission)
-                return False
-
-            failure_cause = "; ".join(delivery_failures)
-            retry_allowed, budget_state = await self._retry_budget_manager.check_and_consume(
-                pending.job_id, pending.workflow_id
+            return await self._claim_and_dispatch_workflow(
+                pending, submission, allocations, workflow_token, attempt_started_at
             )
-            if retry_allowed:
-                self._apply_backoff(pending, attempt_started_at)
-                if await self._job_manager.return_workflow_to_pending(
-                    pending.job_id, pending.workflow_id, failure_cause
-                ) and (
-                    (loop_task := self._job_dispatch_tasks.get(pending.job_id)) is None
-                    or loop_task.done()
-                ):
-                    await self.start_job_dispatch(pending.job_id, submission)
-                return False
-
-            # The retry budget is spent: the workflow fails for good, with the
-            # cause of its last attempt. It leaves the queue now; failing it
-            # announces its terminal, whose handling can complete the job and
-            # stop this very dispatch loop, so it runs outside this pass.
-            async with self._pending_lock:
-                self._pending.pop(f"{pending.job_id}:{pending.workflow_id}", None)
-            pending.ready_event.set()
-            await self._log_warning(
-                f"Dispatch of workflow {pending.workflow_id} failed for good, "
-                f"retry budget spent ({budget_state}): {failure_cause}",
-                job_id=pending.job_id,
-                workflow_id=pending.workflow_id,
-            )
-            self._task_runner.run(
-                self._on_dispatch_exhausted,
-                pending.job_id,
-                pending.workflow_id,
-                f"dispatch failed and its retry budget is spent ({budget_state}): {failure_cause}",
-            )
-            return False
 
         finally:
             # Cores were allocated, so the attempt changed something (took
@@ -857,6 +810,434 @@ class WorkflowDispatcher:
             # nothing, the next pass would start at once and allocate nothing
             # again -- a spin.
             self.signal_dispatch()
+
+    async def _claim_and_dispatch_workflow(
+        self,
+        pending: PendingWorkflow,
+        submission: JobSubmission,
+        allocations: list[tuple[str, int]],
+        workflow_token: TrackingToken,
+        attempt_started_at: float,
+    ) -> bool:
+        """Claim the workflow (PENDING -> DISPATCHED) for the cores just
+        allocated and dispatch it; a claim lost to a racing pass gives every
+        allocated core back (AD-54)."""
+        if not await self._job_manager.claim_workflow_for_dispatch(
+            pending.job_id, pending.workflow_id
+        ):
+            await self._release_unprepared_allocations(allocations, workflow_token, set())
+            return False
+
+        return await self._dispatch_claimed_workflow(
+            pending, submission, allocations, workflow_token, attempt_started_at
+        )
+
+    async def _dispatch_claimed_workflow(
+        self,
+        pending: PendingWorkflow,
+        submission: JobSubmission,
+        allocations: list[tuple[str, int]],
+        workflow_token: TrackingToken,
+        attempt_started_at: float,
+    ) -> bool:
+        """Prepare, replicate and send a claimed workflow's dispatch plans,
+        then settle the attempt from the workers' answers (AD-54, AD-44)."""
+        taken_plans: list[tuple[str, str]] = []
+        delivery_failures: list[str] = []
+        dispatch_plans: list[
+            tuple[str, int, TrackingToken, WorkflowDispatch]
+        ] = []
+        released_worker_ids: set[str] = set()
+        try:
+            await self._prepare_dispatch_plans(
+                pending, submission, allocations, workflow_token, dispatch_plans, released_worker_ids
+            )
+
+        except Exception as preparation_error:
+            # Preparing the dispatch raised -- the workflow or its context
+            # would not serialize, say. Nothing was sent: everything the
+            # attempt holds is given back, and it failed with the error
+            # as its cause (it surfaces with the workflow's failure).
+            await self._abandon_failed_preparation(
+                pending, allocations, workflow_token, dispatch_plans, released_worker_ids, preparation_error
+            )
+            delivery_failures.append(
+                f"preparing its dispatch raised {type(preparation_error).__name__}: {preparation_error}"
+            )
+
+        else:
+            if await self._abandon_unreplicated_dispatch(
+                pending, submission, dispatch_plans, attempt_started_at
+            ):
+                return False
+
+            await self._collect_dispatch_answers(pending, dispatch_plans, taken_plans, delivery_failures)
+
+        return await self._settle_dispatch_attempt(
+            pending, submission, allocations, taken_plans, delivery_failures, attempt_started_at
+        )
+
+    async def _release_unprepared_allocations(
+        self,
+        allocations: list[tuple[str, int]],
+        workflow_token: TrackingToken,
+        released_worker_ids: set[str],
+    ) -> None:
+        """Give back each allocated worker's cores, reserved under its
+        sub-workflow token, unless they were released already."""
+        for worker_id, _worker_cores in allocations:
+            if worker_id not in released_worker_ids:
+                await self._worker_pool.release_cores(
+                    worker_id, str(workflow_token.to_sub_workflow_token(worker_id))
+                )
+
+    async def _prepare_dispatch_plans(
+        self,
+        pending: PendingWorkflow,
+        submission: JobSubmission,
+        allocations: list[tuple[str, int]],
+        workflow_token: TrackingToken,
+        dispatch_plans: list[tuple[str, int, TrackingToken, WorkflowDispatch]],
+        released_worker_ids: set[str],
+    ) -> None:
+        """Build one dispatch plan per allocated worker, appending each to
+        ``dispatch_plans`` as it registers -- a failure part-way leaves what
+        was built for the caller to give back."""
+        total_allocated = sum(cores for _, cores in allocations)
+
+        workflow_bytes = cloudpickle.dumps(pending.workflow)
+
+        context_bytes, layer_version = await self._dispatched_context_for(pending)
+
+        for worker_id, worker_cores in allocations:
+            await self._prepare_worker_dispatch_plan(
+                pending,
+                submission,
+                worker_id=worker_id,
+                worker_cores=worker_cores,
+                total_allocated=total_allocated,
+                workflow_token=workflow_token,
+                workflow_bytes=workflow_bytes,
+                context_bytes=context_bytes,
+                layer_version=layer_version,
+                dispatch_plans=dispatch_plans,
+                released_worker_ids=released_worker_ids,
+            )
+
+    async def _dispatched_context_for(self, pending: PendingWorkflow) -> tuple[bytes, int]:
+        """The context a workflow dispatches with: the one stored for it, or
+        else the job's current context at its current layer version."""
+        stored_context = await self._job_manager.get_stored_dispatched_context(
+            pending.job_id,
+            pending.workflow_id,
+        )
+        if stored_context is not None:
+            return stored_context
+
+        context_bytes = _serialize_context(
+            await self._job_manager.get_job_context(pending.job_id)
+        )
+        layer_version = await self._job_manager.get_layer_version(
+            pending.job_id
+        )
+        return context_bytes, layer_version
+
+    async def _prepare_worker_dispatch_plan(
+        self,
+        pending: PendingWorkflow,
+        submission: JobSubmission,
+        *,
+        worker_id: str,
+        worker_cores: int,
+        total_allocated: int,
+        workflow_token: TrackingToken,
+        workflow_bytes: bytes,
+        context_bytes: bytes,
+        layer_version: int,
+        dispatch_plans: list[tuple[str, int, TrackingToken, WorkflowDispatch]],
+        released_worker_ids: set[str],
+    ) -> None:
+        """Build and register one worker's dispatch plan; a sub-workflow the
+        JobManager will not register gives the worker's cores back."""
+        # Calculate VUs for this worker
+        worker_vus = max(1, int(pending.vus * (worker_cores / total_allocated)))
+
+        # Create sub-workflow token
+        sub_token = workflow_token.to_sub_workflow_token(worker_id)
+
+        # Get fence token for at-most-once dispatch (AD-10: incorporate leader term)
+        leader_term = self._get_leader_term() if self._get_leader_term else 0
+        fence_token = await self._job_manager.get_next_fence_token(
+            pending.job_id, leader_term
+        )
+
+        # Phase H2: derive the worker-observed deadline via
+        # the canonical override hierarchy (explicit submission
+        # > class-level timeout override > default = duration ×
+        # multiplier). All dispatch paths share this resolver
+        # so deadlines stay consistent across gate, manager,
+        # and timeout-strategy layers.
+        resolved_timeout_seconds = resolve_worker_deadline_seconds(
+            workflow=pending.workflow,
+            submission_timeout_seconds=submission.timeout_seconds,
+            submission_timeout_explicit=submission.timeout_seconds_explicit,
+            default_multiplier=self._env.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+        )
+
+        dispatch = WorkflowDispatch(
+            job_id=pending.job_id,
+            workflow_id=str(sub_token),
+            workflow=workflow_bytes,
+            context=context_bytes,
+            vus=worker_vus,
+            cores=worker_cores,
+            timeout_seconds=resolved_timeout_seconds,
+            fence_token=fence_token,
+            context_version=layer_version,
+        )
+
+        sub_workflow = await self._job_manager.register_sub_workflow(
+            job_id=pending.job_id,
+            workflow_id=pending.workflow_id,
+            worker_id=worker_id,
+            cores_allocated=worker_cores,
+            fence_token=fence_token,
+        )
+        if sub_workflow is None:
+            released_worker_ids.add(worker_id)
+            await self._worker_pool.release_cores(worker_id, str(sub_token))
+            return
+
+        dispatch_plans.append((worker_id, worker_cores, sub_token, dispatch))
+        await self._job_manager.set_sub_workflow_dispatched_context(
+            sub_workflow_token=str(sub_token),
+            context_bytes=context_bytes,
+            layer_version=layer_version,
+        )
+
+    async def _abandon_failed_preparation(
+        self,
+        pending: PendingWorkflow,
+        allocations: list[tuple[str, int]],
+        workflow_token: TrackingToken,
+        dispatch_plans: list[tuple[str, int, TrackingToken, WorkflowDispatch]],
+        released_worker_ids: set[str],
+        preparation_error: Exception,
+    ) -> None:
+        """Give back everything a dispatch whose preparation raised holds --
+        its cores and its registered sub-workflows -- and log the error."""
+        await self._release_unprepared_allocations(allocations, workflow_token, released_worker_ids)
+        for _worker_id, _worker_cores, sub_token, _dispatch in dispatch_plans:
+            await self._job_manager.remove_unstarted_sub_workflow(str(sub_token))
+        await self._log_error(
+            f"Preparing the dispatch of workflow {pending.workflow_id} raised "
+            f"{type(preparation_error).__name__}: {preparation_error}",
+            job_id=pending.job_id,
+            workflow_id=pending.workflow_id,
+        )
+
+    async def _dispatch_state_unreplicated(
+        self,
+        job_id: str,
+        dispatch_plans: list[tuple[str, int, TrackingToken, WorkflowDispatch]],
+    ) -> bool:
+        """Whether there are plans to send but the manager tier could not
+        replicate the job's dispatch state to a quorum."""
+        return (
+            bool(dispatch_plans)
+            and self._on_dispatch_state_registered is not None
+            and not await self._on_dispatch_state_registered(job_id)
+        )
+
+    async def _abandon_unreplicated_dispatch(
+        self,
+        pending: PendingWorkflow,
+        submission: JobSubmission,
+        dispatch_plans: list[tuple[str, int, TrackingToken, WorkflowDispatch]],
+        attempt_started_at: float,
+    ) -> bool:
+        """When the dispatch state did not replicate, give back the prepared
+        plans and requeue the workflow with backoff; True when it did so."""
+        if not await self._dispatch_state_unreplicated(pending.job_id, dispatch_plans):
+            return False
+
+        # Nothing is sent: the manager tier could not replicate the
+        # dispatch, which is no fault of the workflow's -- it backs
+        # off without spending retry budget.
+        for worker_id, _worker_cores, sub_token, _dispatch in dispatch_plans:
+            await self._worker_pool.release_cores(worker_id, str(sub_token))
+            await self._job_manager.remove_unstarted_sub_workflow(str(sub_token))
+        self._apply_backoff(pending, attempt_started_at)
+        # Back in the queue, it needs the job's dispatch loop, which
+        # may have exited seeing it claimed. A job already dropped
+        # (teardown removes it from the JobManager first) is not
+        # requeued, so a finished job's loop is never restarted.
+        await self._return_to_pending_and_resume(
+            pending,
+            submission,
+            "its dispatch state did not replicate to a quorum of managers",
+        )
+        return True
+
+    async def _return_to_pending_and_resume(
+        self,
+        pending: PendingWorkflow,
+        submission: JobSubmission,
+        reason: str,
+    ) -> None:
+        """Send the workflow back to PENDING and, when that took and the
+        job's dispatch loop has exited, start it again to pick it up."""
+        if await self._job_manager.return_workflow_to_pending(
+            pending.job_id,
+            pending.workflow_id,
+            reason,
+        ) and self._job_dispatch_loop_stopped(pending.job_id):
+            await self.start_job_dispatch(pending.job_id, submission)
+
+    def _job_dispatch_loop_stopped(self, job_id: str) -> bool:
+        """Whether the job has no dispatch loop running."""
+        return (loop_task := self._job_dispatch_tasks.get(job_id)) is None or loop_task.done()
+
+    async def _collect_dispatch_answers(
+        self,
+        pending: PendingWorkflow,
+        dispatch_plans: list[tuple[str, int, TrackingToken, WorkflowDispatch]],
+        taken_plans: list[tuple[str, str]],
+        delivery_failures: list[str],
+    ) -> None:
+        """Send the plans and sort the workers' answers into the plans taken
+        and the delivery failures that spend retry budget."""
+        for worker_id, _worker_cores, sub_token, outcome, detail in await self._send_dispatch_plans(
+            pending,
+            dispatch_plans,
+        ):
+            await self._record_dispatch_answer(
+                worker_id, sub_token, outcome, detail, taken_plans, delivery_failures
+            )
+
+    async def _record_dispatch_answer(
+        self,
+        worker_id: str,
+        sub_token: TrackingToken,
+        outcome: DispatchOutcome,
+        detail: str,
+        taken_plans: list[tuple[str, str]],
+        delivery_failures: list[str],
+    ) -> None:
+        """Record one worker's answer: taken plans keep their cores; a plan
+        not taken gives them back, and a budgeted refusal is a failure."""
+        if await self._dispatch_plan_taken(outcome, sub_token):
+            # Taken: its cores stay reserved until the worker's
+            # next report shows the dispatch.
+            taken_plans.append((str(sub_token), worker_id))
+            return
+
+        await self._worker_pool.release_cores(worker_id, str(sub_token))
+        if outcome in BUDGETED_DISPATCH_OUTCOMES:
+            delivery_failures.append(f"worker {worker_id} {outcome.value}: {detail}")
+
+    async def _dispatch_plan_taken(self, outcome: DispatchOutcome, sub_token: TrackingToken) -> bool:
+        """Whether the worker took the plan: it accepted, or -- its answer
+        lost -- its sub-workflow can no longer be removed as unstarted
+        because the worker already reported it. A plan not accepted has
+        its unstarted sub-workflow removed here."""
+        return (
+            outcome == DispatchOutcome.ACCEPTED
+            or not await self._job_manager.remove_unstarted_sub_workflow(str(sub_token))
+        )
+
+    async def _settle_dispatch_attempt(
+        self,
+        pending: PendingWorkflow,
+        submission: JobSubmission,
+        allocations: list[tuple[str, int]],
+        taken_plans: list[tuple[str, str]],
+        delivery_failures: list[str],
+        attempt_started_at: float,
+    ) -> bool:
+        """Settle a sent attempt: taken, waiting for capacity, retried with
+        backoff, or failed for good once the retry budget is spent (AD-44)."""
+        if taken_plans:
+            await self._settle_taken_dispatch(pending, allocations, taken_plans)
+            return True
+
+        if not delivery_failures:
+            # Every worker offered refused for capacity (or was gone, or
+            # never sent to): the workflow waits for capacity.
+            await self._return_to_pending_and_resume(
+                pending,
+                submission,
+                "no worker offered had capacity for it",
+            )
+            return False
+
+        await self._settle_failed_dispatch(pending, submission, delivery_failures, attempt_started_at)
+        return False
+
+    async def _settle_taken_dispatch(
+        self,
+        pending: PendingWorkflow,
+        allocations: list[tuple[str, int]],
+        taken_plans: list[tuple[str, str]],
+    ) -> None:
+        """Stop what workers took for a workflow that left the dispatch while
+        it was sent; warn of a partial dispatch otherwise."""
+        if self._job_manager.workflow_lifecycle.get_state(
+            pending.job_id, pending.workflow_id
+        ) not in (WorkflowState.DISPATCHED, WorkflowState.RUNNING):
+            # It was cancelled (or failed for good) while it was being
+            # sent: what the workers took is stopped -- otherwise it
+            # would run on, unseen by the cancellation.
+            self._task_runner.run(
+                self._stop_dispatched_plans, pending.job_id, taken_plans
+            )
+        elif len(taken_plans) < len(allocations):
+            # PARTIAL success: the workflow runs with reduced
+            # parallelism on the workers that took it.
+            await self._log_warning(
+                f"Partial dispatch for workflow {pending.workflow_id}: "
+                f"{len(taken_plans)}/{len(allocations)} workers took it",
+                job_id=pending.job_id,
+                workflow_id=pending.workflow_id,
+            )
+
+    async def _settle_failed_dispatch(
+        self,
+        pending: PendingWorkflow,
+        submission: JobSubmission,
+        delivery_failures: list[str],
+        attempt_started_at: float,
+    ) -> None:
+        """An attempt no worker took failed: it spends retry budget and backs
+        off, or -- the budget spent -- fails for good (AD-44)."""
+        failure_cause = "; ".join(delivery_failures)
+        retry_allowed, budget_state = await self._retry_budget_manager.check_and_consume(
+            pending.job_id, pending.workflow_id
+        )
+        if retry_allowed:
+            self._apply_backoff(pending, attempt_started_at)
+            await self._return_to_pending_and_resume(pending, submission, failure_cause)
+            return
+
+        # The retry budget is spent: the workflow fails for good, with the
+        # cause of its last attempt. It leaves the queue now; failing it
+        # announces its terminal, whose handling can complete the job and
+        # stop this very dispatch loop, so it runs outside this pass.
+        async with self._pending_lock:
+            self._pending.pop(f"{pending.job_id}:{pending.workflow_id}", None)
+        pending.ready_event.set()
+        await self._log_warning(
+            f"Dispatch of workflow {pending.workflow_id} failed for good, "
+            f"retry budget spent ({budget_state}): {failure_cause}",
+            job_id=pending.job_id,
+            workflow_id=pending.workflow_id,
+        )
+        self._task_runner.run(
+            self._on_dispatch_exhausted,
+            pending.job_id,
+            pending.workflow_id,
+            f"dispatch failed and its retry budget is spent ({budget_state}): {failure_cause}",
+        )
 
     def _apply_backoff(self, pending: PendingWorkflow, attempt_started_at: float) -> None:
         """Back off after an attempt that failed for a cause other than
@@ -894,9 +1275,7 @@ class WorkflowDispatcher:
             async with semaphore:
                 # Nothing more is sent for a workflow that left the dispatch
                 # (cancelled, failed for good) while its plans were queued.
-                if self._shutting_down or lifecycle.get_state(
-                    pending.job_id, pending.workflow_id
-                ) not in (WorkflowState.DISPATCHED, WorkflowState.RUNNING):
+                if self._workflow_left_dispatch(pending, lifecycle):
                     return (
                         worker_id,
                         worker_cores,
@@ -905,45 +1284,87 @@ class WorkflowDispatcher:
                         "withheld: the dispatcher is shutting down or the workflow left the dispatch",
                     )
 
-                try:
-                    outcome, detail = await self._send_dispatch(worker_id, dispatch)
-                    return worker_id, worker_cores, sub_token, outcome, detail
-                except asyncio.CancelledError as dispatch_error:
-                    if self._shutting_down or lifecycle.get_state(
-                        pending.job_id, pending.workflow_id
-                    ) not in (WorkflowState.DISPATCHED, WorkflowState.RUNNING):
-                        raise
-
-                    await self._log_warning(
-                        "Dispatch was cancelled by worker-side transport failure "
-                        f"for worker {worker_id}: {dispatch_error}",
-                        job_id=pending.job_id,
-                        workflow_id=pending.workflow_id,
-                    )
-                    return (
-                        worker_id,
-                        worker_cores,
-                        sub_token,
-                        DispatchOutcome.UNREACHABLE,
-                        f"cancelled by a transport failure: {dispatch_error}",
-                    )
-                except Exception as dispatch_error:
-                    await self._log_warning(
-                        f"Exception dispatching to worker {worker_id} for "
-                        f"workflow {pending.workflow_id}: {dispatch_error}",
-                        job_id=pending.job_id,
-                        workflow_id=pending.workflow_id,
-                    )
-                    return (
-                        worker_id,
-                        worker_cores,
-                        sub_token,
-                        DispatchOutcome.UNREACHABLE,
-                        f"{type(dispatch_error).__name__}: {dispatch_error}",
-                    )
+                return await self._send_dispatch_plan(
+                    pending, lifecycle, worker_id, worker_cores, sub_token, dispatch
+                )
 
         return await asyncio.gather(
             *(send_one(*dispatch_plan) for dispatch_plan in dispatch_plans)
+        )
+
+    def _workflow_left_dispatch(
+        self,
+        pending: PendingWorkflow,
+        lifecycle: WorkflowLifecycleStateMachine,
+    ) -> bool:
+        """Whether the dispatcher is shutting down or the workflow left the
+        dispatch (cancelled, failed for good) -- it is neither DISPATCHED
+        nor RUNNING."""
+        return self._shutting_down or lifecycle.get_state(
+            pending.job_id, pending.workflow_id
+        ) not in (WorkflowState.DISPATCHED, WorkflowState.RUNNING)
+
+    async def _send_dispatch_plan(
+        self,
+        pending: PendingWorkflow,
+        lifecycle: WorkflowLifecycleStateMachine,
+        worker_id: str,
+        worker_cores: int,
+        sub_token: TrackingToken,
+        dispatch: WorkflowDispatch,
+    ) -> tuple[str, int, TrackingToken, DispatchOutcome, str]:
+        """Send one dispatch plan to its worker; a send that raised answers
+        UNREACHABLE, with the error as the detail."""
+        try:
+            outcome, detail = await self._send_dispatch(worker_id, dispatch)
+            return worker_id, worker_cores, sub_token, outcome, detail
+        except asyncio.CancelledError as dispatch_error:
+            return await self._answer_cancelled_dispatch(
+                pending, lifecycle, worker_id, worker_cores, sub_token, dispatch_error
+            )
+        except Exception as dispatch_error:
+            await self._log_warning(
+                f"Exception dispatching to worker {worker_id} for "
+                f"workflow {pending.workflow_id}: {dispatch_error}",
+                job_id=pending.job_id,
+                workflow_id=pending.workflow_id,
+            )
+            return (
+                worker_id,
+                worker_cores,
+                sub_token,
+                DispatchOutcome.UNREACHABLE,
+                f"{type(dispatch_error).__name__}: {dispatch_error}",
+            )
+
+    async def _answer_cancelled_dispatch(
+        self,
+        pending: PendingWorkflow,
+        lifecycle: WorkflowLifecycleStateMachine,
+        worker_id: str,
+        worker_cores: int,
+        sub_token: TrackingToken,
+        dispatch_error: asyncio.CancelledError,
+    ) -> tuple[str, int, TrackingToken, DispatchOutcome, str]:
+        """A send cancelled while the workflow is still being dispatched was
+        cancelled by a worker-side transport failure: it answers UNREACHABLE.
+        Any other cancellation (shutdown, the workflow left the dispatch)
+        propagates."""
+        if self._workflow_left_dispatch(pending, lifecycle):
+            raise dispatch_error
+
+        await self._log_warning(
+            "Dispatch was cancelled by worker-side transport failure "
+            f"for worker {worker_id}: {dispatch_error}",
+            job_id=pending.job_id,
+            workflow_id=pending.workflow_id,
+        )
+        return (
+            worker_id,
+            worker_cores,
+            sub_token,
+            DispatchOutcome.UNREACHABLE,
+            f"cancelled by a transport failure: {dispatch_error}",
         )
 
     # =========================================================================
@@ -1007,127 +1428,9 @@ class WorkflowDispatcher:
         """
         lifecycle = self._job_manager.workflow_lifecycle
         try:
-            while not self._shutting_down:
-                # Read before the pass: a capacity change landing during or
-                # after it ends the capacity wait below, so none is lost.
-                capacity_generation = self._worker_pool.capacity_generation
-                await self.try_dispatch(job_id, submission)
-
-                async with self._pending_lock:
-                    job_pending = [
-                        p
-                        for p in self._pending.values()
-                        if p.job_id == job_id
-                        and lifecycle.get_state(job_id, p.workflow_id) == WorkflowState.PENDING
-                    ]
-
-                if not job_pending:
-                    # Nothing this job holds waits for dispatch.
-                    break
-
-                # Backoff expiry and remaining-time both route through
-                # the ``PendingWorkflow`` helpers — ONE deadline
-                # contract (sub-epsilon remainders are expiry, see
-                # ``protocol.time_quantum``), so the eligibility filter
-                # here, ``_get_ready_workflows``' scan, and the wait
-                # computed below can never disagree about a boundary
-                # instant (the disagreement was the frozen-instant
-                # livelock).
-                now = _DEFAULT_CLOCK.monotonic()
-                allocatable_pending = [
-                    p
-                    for p in job_pending
-                    if (
-                        p.dependencies <= p.completed_dependencies
-                        and p.is_retry_backoff_expired(now)
-                    )
-                ]
-                backoff_delays = [
-                    p.remaining_retry_backoff_seconds(now)
-                    for p in job_pending
-                    if (
-                        p.failed_dispatch_attempts > 0
-                        and p.dependencies <= p.completed_dependencies
-                        and not p.is_retry_backoff_expired(now)
-                    )
-                ]
-
-                # Build list of events to wait on. Capacity is relevant only
-                # when at least one workflow can allocate immediately, and is
-                # waited for as a CHANGE since the pass above, never as cores
-                # existing: cores that pass could not use (an excluded or
-                # unselectable worker's) would otherwise end every wait at
-                # once -- a frozen-instant livelock under SIM, a 100%-CPU
-                # spin on a real host.
-                ready_events = [self._consume_ready_signal(p) for p in job_pending]
-                wait_coroutines = [*ready_events, self._wait_dispatch_trigger()]
-                if allocatable_pending:
-                    wait_coroutines.append(
-                        self._worker_pool.wait_for_capacity_change(
-                            capacity_generation,
-                            timeout=5.0,
-                        )
-                    )
-
-                wait_timeout = 5.0
-                positive_backoff_delays = [
-                    delay for delay in backoff_delays if delay > 0.0
-                ]
-                if positive_backoff_delays:
-                    wait_timeout = min(wait_timeout, min(positive_backoff_delays))
-                # Progress floor — defense in depth for the whole
-                # sub-quantum-wait class. The PRIMARY fix is the
-                # epsilon-expiry contract in the ``PendingWorkflow``
-                # backoff helpers (a remainder the clock cannot honor
-                # now counts as expiry, so it never reaches this wait);
-                # the floor keeps any OTHER collapsed timeout source —
-                # present or future — from arming a same-instant timer
-                # in a loop (a dispatcher livelock under SIM's
-                # quantized clock, a 100%-CPU micro-spin on a real
-                # host). Real backoff waits (>= 1s initial delay) are
-                # unaffected.
-                wait_timeout = max(wait_timeout, 0.001)
-
-                # Wait for any event with a timeout for periodic checks.
-                # Phase 6b: explicit ``loop.create_task`` so each wait
-                # task binds to the loop the dispatcher is running on
-                # rather than implicitly going through
-                # ``get_running_loop`` at task-creation time.
-                _loop = asyncio.get_running_loop()
-                tasks = [
-                    _loop.create_task(coro)
-                    for coro in wait_coroutines
-                ]
-                try:
-                    done, pending = await asyncio.wait(
-                        tasks,
-                        timeout=wait_timeout,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-
-                    # Cancel pending tasks and suppress CancelledError
-                    for task in pending:
-                        task.cancel()
-                    # Await cancelled tasks to ensure cleanup completes
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
-
-                    # A finished wait is a wakeup; one that raised is a fault,
-                    # and is reported rather than taken for a wakeup.
-                    for task in done:
-                        if not task.cancelled() and (wait_error := task.exception()) is not None:
-                            await self._log_error(
-                                f"Dispatch loop wait for job {job_id} raised "
-                                f"{type(wait_error).__name__}: {wait_error}",
-                                job_id=job_id,
-                            )
-
-                except asyncio.CancelledError:
-                    # On cancellation, clean up all tasks
-                    for task in tasks:
-                        task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    raise
+            keep_dispatching = True
+            while keep_dispatching:
+                keep_dispatching = await self._run_job_dispatch_pass(job_id, submission, lifecycle)
 
         except Exception as e:
             await self._log_error(
@@ -1137,6 +1440,203 @@ class WorkflowDispatcher:
         finally:
             # Clean up
             self._job_dispatch_tasks.pop(job_id, None)
+
+    async def _run_job_dispatch_pass(
+        self,
+        job_id: str,
+        submission: JobSubmission,
+        lifecycle: WorkflowLifecycleStateMachine,
+    ) -> bool:
+        """One pass of a job's dispatch loop: dispatch what it can, then wait
+        for a wakeup. False once the loop should exit (shutdown, or nothing
+        of the job waits for dispatch)."""
+        if self._shutting_down:
+            return False
+
+        # Read before the pass: a capacity change landing during or
+        # after it ends the capacity wait below, so none is lost.
+        capacity_generation = self._worker_pool.capacity_generation
+        await self.try_dispatch(job_id, submission)
+
+        async with self._pending_lock:
+            job_pending = self._job_pending_workflows(job_id, lifecycle)
+
+        if not job_pending:
+            # Nothing this job holds waits for dispatch.
+            return False
+
+        await self._wait_for_dispatch_wakeup(job_id, job_pending, capacity_generation)
+        return True
+
+    def _job_pending_workflows(
+        self,
+        job_id: str,
+        lifecycle: WorkflowLifecycleStateMachine,
+    ) -> list[PendingWorkflow]:
+        """Under the pending lock: the job's queued workflows still PENDING."""
+        return [
+            pending
+            for pending in self._pending.values()
+            if self._is_job_workflow_pending(pending, job_id, lifecycle)
+        ]
+
+    @staticmethod
+    def _is_job_workflow_pending(
+        pending: PendingWorkflow,
+        job_id: str,
+        lifecycle: WorkflowLifecycleStateMachine,
+    ) -> bool:
+        """Whether a queued workflow belongs to the job and is PENDING."""
+        return pending.job_id == job_id and lifecycle.get_state(job_id, pending.workflow_id) == WorkflowState.PENDING
+
+    async def _wait_for_dispatch_wakeup(
+        self,
+        job_id: str,
+        job_pending: list[PendingWorkflow],
+        capacity_generation: int,
+    ) -> None:
+        """Wait, bounded, for the first event that may let a job's next
+        dispatch pass do something; reports a wait that raised."""
+        # Backoff expiry and remaining-time both route through
+        # the ``PendingWorkflow`` helpers — ONE deadline
+        # contract (sub-epsilon remainders are expiry, see
+        # ``protocol.time_quantum``), so the eligibility filter
+        # here, ``_get_ready_workflows``' scan, and the wait
+        # computed below can never disagree about a boundary
+        # instant (the disagreement was the frozen-instant
+        # livelock).
+        now = _DEFAULT_CLOCK.monotonic()
+        wait_coroutines = self._dispatch_wait_coroutines(job_pending, capacity_generation, now)
+        wait_timeout = self._dispatch_wait_timeout(job_pending, now)
+
+        # Wait for any event with a timeout for periodic checks.
+        # Phase 6b: explicit ``loop.create_task`` so each wait
+        # task binds to the loop the dispatcher is running on
+        # rather than implicitly going through
+        # ``get_running_loop`` at task-creation time.
+        _loop = asyncio.get_running_loop()
+        tasks = [
+            _loop.create_task(coro)
+            for coro in wait_coroutines
+        ]
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=wait_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Cancel pending tasks and suppress CancelledError
+            # Await cancelled tasks to ensure cleanup completes
+            await self._cancel_and_reap_wait_tasks(pending)
+
+            # A finished wait is a wakeup; one that raised is a fault,
+            # and is reported rather than taken for a wakeup.
+            await self._report_failed_waits(job_id, done)
+
+        except asyncio.CancelledError:
+            # On cancellation, clean up all tasks
+            await self._cancel_and_reap_wait_tasks(tasks)
+            raise
+
+    def _dispatch_wait_coroutines(
+        self,
+        job_pending: list[PendingWorkflow],
+        capacity_generation: int,
+        now: float,
+    ) -> list[Coroutine[None, None, None]]:
+        """The waits a job's dispatch loop races between passes."""
+        # Build list of events to wait on. Capacity is relevant only
+        # when at least one workflow can allocate immediately, and is
+        # waited for as a CHANGE since the pass above, never as cores
+        # existing: cores that pass could not use (an excluded or
+        # unselectable worker's) would otherwise end every wait at
+        # once -- a frozen-instant livelock under SIM, a 100%-CPU
+        # spin on a real host.
+        ready_events = [self._consume_ready_signal(pending) for pending in job_pending]
+        wait_coroutines = [*ready_events, self._wait_dispatch_trigger()]
+        if self._has_allocatable_workflow(job_pending, now):
+            wait_coroutines.append(
+                self._worker_pool.wait_for_capacity_change(
+                    capacity_generation,
+                    timeout=5.0,
+                )
+            )
+        return wait_coroutines
+
+    @staticmethod
+    def _has_allocatable_workflow(job_pending: list[PendingWorkflow], now: float) -> bool:
+        """Whether any of the job's PENDING workflows could allocate at
+        ``now``: its dependencies are met and its retry backoff elapsed."""
+        return any(
+            pending.dependencies <= pending.completed_dependencies and pending.is_retry_backoff_expired(now)
+            for pending in job_pending
+        )
+
+    def _dispatch_wait_timeout(self, job_pending: list[PendingWorkflow], now: float) -> float:
+        """How long a job's dispatch loop waits between passes: at most 5s,
+        less when a workflow's retry backoff ends sooner, never under 1ms."""
+        positive_backoff_delays = [
+            delay for delay in self._retry_backoff_delays(job_pending, now) if delay > 0.0
+        ]
+        wait_timeout = min(5.0, min(positive_backoff_delays, default=5.0))
+        # Progress floor — defense in depth for the whole
+        # sub-quantum-wait class. The PRIMARY fix is the
+        # epsilon-expiry contract in the ``PendingWorkflow``
+        # backoff helpers (a remainder the clock cannot honor
+        # now counts as expiry, so it never reaches this wait);
+        # the floor keeps any OTHER collapsed timeout source —
+        # present or future — from arming a same-instant timer
+        # in a loop (a dispatcher livelock under SIM's
+        # quantized clock, a 100%-CPU micro-spin on a real
+        # host). Real backoff waits (>= 1s initial delay) are
+        # unaffected.
+        return max(wait_timeout, 0.001)
+
+    def _retry_backoff_delays(self, job_pending: list[PendingWorkflow], now: float) -> list[float]:
+        """The remaining retry backoff of each of the job's workflows still
+        backing off after a failed dispatch attempt."""
+        return [
+            pending.remaining_retry_backoff_seconds(now)
+            for pending in job_pending
+            if self._is_backing_off(pending, now)
+        ]
+
+    @staticmethod
+    def _is_backing_off(pending: PendingWorkflow, now: float) -> bool:
+        """Whether a workflow with its dependencies met still waits out the
+        retry backoff of a failed dispatch attempt at ``now``."""
+        return (
+            pending.failed_dispatch_attempts > 0
+            and pending.dependencies <= pending.completed_dependencies
+            and not pending.is_retry_backoff_expired(now)
+        )
+
+    @staticmethod
+    async def _cancel_and_reap_wait_tasks(tasks: set[asyncio.Task] | list[asyncio.Task]) -> None:
+        """Cancel a dispatch loop's wait tasks and await them, so each one's
+        cancellation completes before the loop moves on."""
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _report_failed_waits(self, job_id: str, done: set[asyncio.Task]) -> None:
+        """Log each finished dispatch-loop wait that raised: a fault, not a
+        wakeup."""
+        for task in done:
+            if (wait_error := self._wait_task_error(task)) is not None:
+                await self._log_error(
+                    f"Dispatch loop wait for job {job_id} raised "
+                    f"{type(wait_error).__name__}: {wait_error}",
+                    job_id=job_id,
+                )
+
+    @staticmethod
+    def _wait_task_error(task: asyncio.Task) -> BaseException | None:
+        """The exception a finished wait task raised; None when it was
+        cancelled or returned."""
+        return None if task.cancelled() else task.exception()
 
     async def _wait_dispatch_trigger(self) -> None:
         """Wait for the dispatch trigger event."""
@@ -1228,7 +1728,7 @@ class WorkflowDispatcher:
         """Get count of pending workflows (optionally filtered by job_id)."""
         if job_id is None:
             return len(self._pending)
-        return sum(1 for p in self._pending.values() if p.job_id == job_id)
+        return operator.countOf((pending.job_id for pending in self._pending.values()), job_id)
 
     def get_pending_workflows(self) -> Mapping[str, PendingWorkflow]:
         """Read-only view of every tracked workflow (AD-43 capacity input)."""
@@ -1253,13 +1753,7 @@ class WorkflowDispatcher:
         await self._retry_budget_manager.cleanup(job_id)
 
         async with self._pending_lock:
-            keys_to_remove = [
-                key for key in self._pending if key.startswith(f"{job_id}:")
-            ]
-            for key in keys_to_remove:
-                pending = self._pending.pop(key, None)
-                if pending:
-                    pending.ready_event.set()
+            self._pop_pending_workflows(self._job_pending_keys(job_id))
 
     async def cancel_pending_workflows(self, job_id: str) -> list[str]:
         """
@@ -1276,24 +1770,12 @@ class WorkflowDispatcher:
         Returns:
             List of workflow IDs that were cancelled from the pending queue
         """
-        cancelled_workflow_ids: list[str] = []
-
         async with self._pending_lock:
             # Find all pending workflows for this job
-            keys_to_remove = [
-                key for key in self._pending if key.startswith(f"{job_id}:")
-            ]
+            keys_to_remove = self._job_pending_keys(job_id)
 
             # Remove each pending workflow
-            for key in keys_to_remove:
-                pending = self._pending.pop(key, None)
-                if pending:
-                    # Extract workflow_id from key (format: "job_id:workflow_id")
-                    workflow_id = key.split(":", 1)[1]
-                    cancelled_workflow_ids.append(workflow_id)
-
-                    # Set ready event to unblock any waiters
-                    pending.ready_event.set()
+            cancelled_workflow_ids = self._pop_pending_workflows(keys_to_remove)
 
             if cancelled_workflow_ids:
                 await self._log_info(
@@ -1302,6 +1784,26 @@ class WorkflowDispatcher:
                 )
 
         return cancelled_workflow_ids
+
+    def _job_pending_keys(self, job_id: str) -> list[str]:
+        """The pending-queue keys (``job_id:workflow_id``) of a job's workflows."""
+        return [key for key in self._pending if key.startswith(f"{job_id}:")]
+
+    def _pop_pending_workflows(self, keys_to_remove: list[str]) -> list[str]:
+        """Under the pending lock: drop each keyed workflow from the queue,
+        setting its ready event to unblock any waiters; returns the ids of
+        the workflows removed."""
+        removed_workflow_ids: list[str] = []
+        for key in keys_to_remove:
+            pending = self._pending.pop(key, None)
+            if pending:
+                # Extract workflow_id from key (format: "job_id:workflow_id")
+                workflow_id = key.split(":", 1)[1]
+                removed_workflow_ids.append(workflow_id)
+
+                # Set ready event to unblock any waiters
+                pending.ready_event.set()
+        return removed_workflow_ids
 
     async def requeue_workflow(
         self,
@@ -1316,28 +1818,22 @@ class WorkflowDispatcher:
         if token.workflow_id is None:
             return False
 
+        return await self._requeue_parsed_workflow(token, excluded_worker_id)
+
+    async def _requeue_parsed_workflow(
+        self,
+        token: TrackingToken,
+        excluded_worker_id: str | None,
+    ) -> bool:
+        """Requeue the workflow a parsed sub-workflow token names, then make
+        sure its job's dispatch loop runs to pick it up."""
         job_id = token.job_id
         workflow_id = token.workflow_id
         key = f"{job_id}:{workflow_id}"
 
         async with self._pending_lock:
-            pending = self._pending.get(key)
-            # Only a workflow the lifecycle sent back to PENDING (the retry
-            # chain) is dispatched again; anything else -- finished, or
-            # still running elsewhere -- must never be.
-            if (
-                pending is None
-                or self._job_manager.workflow_lifecycle.get_state(job_id, workflow_id)
-                != WorkflowState.PENDING
-            ):
+            if not self._reset_pending_for_requeue(key, job_id, workflow_id, token, excluded_worker_id):
                 return False
-            worker_id_to_exclude = excluded_worker_id or token.worker_id
-            if worker_id_to_exclude:
-                pending.excluded_worker_ids.add(worker_id_to_exclude)
-            pending.failed_dispatch_attempts = 0
-            pending.next_retry_delay = self.INITIAL_RETRY_DELAY
-            pending.check_and_signal_ready()
-            self.signal_dispatch()
 
         # The job's dispatch loop exits once every workflow has been
         # dispatched once — there's no consumer for the trigger we
@@ -1348,12 +1844,54 @@ class WorkflowDispatcher:
         # keeps this safe under racing requeues. Done outside the
         # pending lock because ``start_job_dispatch`` creates a task
         # that takes the same lock.
-        submission = self._job_submissions.get(job_id)
-        if submission is not None:
-            existing_task = self._job_dispatch_tasks.get(job_id)
-            if existing_task is None or existing_task.done():
-                await self.start_job_dispatch(job_id, submission)
+        await self._resume_stopped_job_dispatch(job_id)
         return True
+
+    async def _resume_stopped_job_dispatch(self, job_id: str) -> None:
+        """Start the dispatch loop again for a job still submitted whose loop
+        has exited."""
+        submission = self._job_submissions.get(job_id)
+        if submission is not None and self._job_dispatch_loop_stopped(job_id):
+            await self.start_job_dispatch(job_id, submission)
+
+    def _reset_pending_for_requeue(
+        self,
+        key: str,
+        job_id: str,
+        workflow_id: str,
+        token: TrackingToken,
+        excluded_worker_id: str | None,
+    ) -> bool:
+        """Under the pending lock: reset a PENDING workflow's retry state so
+        it dispatches again, away from the worker it is requeued from."""
+        pending = self._pending.get(key)
+        # Only a workflow the lifecycle sent back to PENDING (the retry
+        # chain) is dispatched again; anything else -- finished, or
+        # still running elsewhere -- must never be.
+        if (
+            pending is None
+            or self._job_manager.workflow_lifecycle.get_state(job_id, workflow_id)
+            != WorkflowState.PENDING
+        ):
+            return False
+        self._exclude_requeued_worker(pending, excluded_worker_id, token)
+        pending.failed_dispatch_attempts = 0
+        pending.next_retry_delay = self.INITIAL_RETRY_DELAY
+        pending.check_and_signal_ready()
+        self.signal_dispatch()
+        return True
+
+    @staticmethod
+    def _exclude_requeued_worker(
+        pending: PendingWorkflow,
+        excluded_worker_id: str | None,
+        token: TrackingToken,
+    ) -> None:
+        """Exclude the worker a requeued workflow left -- the one named, or
+        else the one its sub-workflow token carries -- from its next dispatch."""
+        worker_id_to_exclude = excluded_worker_id or token.worker_id
+        if worker_id_to_exclude:
+            pending.excluded_worker_ids.add(worker_id_to_exclude)
 
     # =========================================================================
     # Logging Helpers

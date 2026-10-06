@@ -234,17 +234,22 @@ class GateOrphanJobCoordinator:
         self._running = False
 
         if self._check_loop_task and not self._check_loop_task.done():
-            self._check_loop_task.cancel()
-            cancels_requested_before_wait = asyncio.current_task().cancelling()
-            try:
-                await self._check_loop_task
-            except asyncio.CancelledError:
-                # The task we cancelled ended; a cancel aimed at this task
-                # while it waited goes on.
-                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
-                    raise
+            await self._cancel_check_loop()
 
         self._check_loop_task = None
+
+    async def _cancel_check_loop(self) -> None:
+        """Cancel the check loop and wait for it to end, passing on a cancel
+        aimed at this task while it waited."""
+        self._check_loop_task.cancel()
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
+        try:
+            await self._check_loop_task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
 
     def mark_jobs_orphaned_by_gate(
         self,
@@ -287,8 +292,7 @@ class GateOrphanJobCoordinator:
         fallback for non-leaders and leadership changes.
         """
         orphaned_job_ids = self.mark_jobs_orphaned_by_gate(failed_gate_addr)
-        for job_id in orphaned_job_ids:
-            self._confirmed_orphaned_jobs.add(job_id)
+        self._confirmed_orphaned_jobs.update(orphaned_job_ids)
 
         if orphaned_job_ids and self._is_current_cluster_leader():
             self._task_runner.run(
@@ -307,17 +311,24 @@ class GateOrphanJobCoordinator:
             return
 
         orphaned_jobs = self._state.get_orphaned_jobs()
-        candidate_job_ids = (
+        for job_id in self._confirmed_orphan_candidates(job_ids):
+            await self._evaluate_confirmed_orphan(job_id, orphaned_jobs)
+
+    def _confirmed_orphan_candidates(self, job_ids: list[str] | None) -> list[str]:
+        """The jobs to evaluate: those given, else every confirmed orphan."""
+        return (
             list(job_ids)
             if job_ids is not None
             else list(self._confirmed_orphaned_jobs)
         )
-        for job_id in candidate_job_ids:
-            orphaned_at = orphaned_jobs.get(job_id)
-            if orphaned_at is None:
-                self._confirmed_orphaned_jobs.discard(job_id)
-                continue
-            await self._evaluate_orphan_takeover(job_id, orphaned_at)
+
+    async def _evaluate_confirmed_orphan(self, job_id: str, orphaned_jobs: dict[str, float]) -> None:
+        """Evaluate a confirmed orphan still orphaned; forget one that is not."""
+        orphaned_at = orphaned_jobs.get(job_id)
+        if orphaned_at is None:
+            self._confirmed_orphaned_jobs.discard(job_id)
+            return
+        await self._evaluate_orphan_takeover(job_id, orphaned_at)
 
     def clear_orphaned_job(self, job_id: str) -> None:
         """A peer resolved an orphan's leadership: a rescue, which the
@@ -351,11 +362,10 @@ class GateOrphanJobCoordinator:
 
         now = self._clock.monotonic()
         if not self._state.is_job_orphaned(job_id):
-            owner_gate = self._state.get_known_gate(owner_node)
             self._state.mark_job_orphaned(
                 job_id,
                 now,
-                (owner_gate.tcp_host, owner_gate.tcp_port) if owner_gate is not None else None,
+                self._known_gate_addr(owner_node),
             )
 
             await self._logger.log(
@@ -367,6 +377,11 @@ class GateOrphanJobCoordinator:
                 ),
             )
 
+    def _known_gate_addr(self, node_id: str) -> tuple[str, int] | None:
+        """The TCP address of a gate this gate knows, else None."""
+        owner_gate = self._state.get_known_gate(node_id)
+        return (owner_gate.tcp_host, owner_gate.tcp_port) if owner_gate is not None else None
+
     async def _send_job_status_push_with_retry(
         self,
         job_id: str,
@@ -374,37 +389,15 @@ class GateOrphanJobCoordinator:
         push_data: bytes,
         allow_peer_forwarding: bool = True,
     ) -> None:
-        last_error: Exception | None = None
+        delivered, last_error = await self._push_to_callback(callback, push_data)
+        if delivered:
+            return
 
-        for attempt in range(self.CALLBACK_PUSH_MAX_RETRIES):
-            try:
-                response, _ = await self._send_tcp(
-                    callback,
-                    "job_status_push",
-                    push_data,
-                    5.0,
-                )
-                # send_tcp returns transport errors rather than raising.
-                if isinstance(response, Exception):
-                    raise response
-                return
-            except Exception as send_error:
-                last_error = send_error
-                if attempt < self.CALLBACK_PUSH_MAX_RETRIES - 1:
-                    delay = min(
-                        self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
-                        self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
-                    )
-                    await self._clock.sleep(delay)
-
-        if allow_peer_forwarding and self._forward_status_push_to_peers:
-            try:
-                forwarded = await self._forward_status_push_to_peers(job_id, push_data)
-            except Exception as forward_error:
-                last_error = forward_error
-            else:
-                if forwarded:
-                    return
+        delivered, last_error = await self._forward_push_to_peers(
+            job_id, push_data, allow_peer_forwarding, last_error
+        )
+        if delivered:
+            return
 
         await self._logger.log(
             ServerWarning(
@@ -418,6 +411,85 @@ class GateOrphanJobCoordinator:
             )
         )
 
+    async def _push_to_callback(
+        self,
+        callback: tuple[str, int],
+        push_data: bytes,
+    ) -> tuple[bool, Exception | None]:
+        """Push to the client's callback, retrying with capped exponential
+        backoff; whether it was delivered, and the last error."""
+        last_error: Exception | None = None
+
+        for attempt in range(self.CALLBACK_PUSH_MAX_RETRIES):
+            if (send_error := await self._push_once(callback, push_data, attempt)) is None:
+                return True, last_error
+            last_error = send_error
+
+        return False, last_error
+
+    async def _push_once(
+        self,
+        callback: tuple[str, int],
+        push_data: bytes,
+        attempt: int,
+    ) -> Exception | None:
+        """One push attempt; the error it failed with (after backing off
+        when attempts remain), or None once delivered."""
+        try:
+            response, _ = await self._send_tcp(
+                callback,
+                "job_status_push",
+                push_data,
+                5.0,
+            )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
+            return None
+        except Exception as send_error:
+            await self._back_off_push(attempt)
+            return send_error
+
+    async def _back_off_push(self, attempt: int) -> None:
+        """Sleep before the next push attempt, when one remains."""
+        if attempt < self.CALLBACK_PUSH_MAX_RETRIES - 1:
+            delay = min(
+                self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
+                self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
+            )
+            await self._clock.sleep(delay)
+
+    async def _forward_push_to_peers(
+        self,
+        job_id: str,
+        push_data: bytes,
+        allow_peer_forwarding: bool,
+        last_error: Exception | None,
+    ) -> tuple[bool, Exception | None]:
+        """Forward the push to peer gates, when allowed and possible;
+        whether a peer delivered it, and the last error."""
+        if not self._may_forward_push(allow_peer_forwarding):
+            return False, last_error
+        return await self._forward_push(job_id, push_data, last_error)
+
+    def _may_forward_push(self, allow_peer_forwarding: bool) -> bool:
+        """Whether the push may go through peer gates."""
+        return allow_peer_forwarding and bool(self._forward_status_push_to_peers)
+
+    async def _forward_push(
+        self,
+        job_id: str,
+        push_data: bytes,
+        last_error: Exception | None,
+    ) -> tuple[bool, Exception | None]:
+        """Ask peer gates to deliver the push; whether one did, and the last
+        error."""
+        try:
+            forwarded = await self._forward_status_push_to_peers(job_id, push_data)
+        except Exception as forward_error:
+            return False, forward_error
+        return bool(forwarded), last_error
+
     async def _orphan_check_loop(self) -> None:
         """
         Periodically check for orphaned jobs and attempt takeover.
@@ -429,95 +501,137 @@ class GateOrphanJobCoordinator:
         4. Executes takeover for jobs we should own
         """
         while self._running:
-            try:
-                await self._clock.sleep(self._orphan_check_interval_seconds)
-
-                if not self._running:
-                    break
-
-                orphaned_jobs = self._state.get_orphaned_jobs()
-                if not orphaned_jobs:
-                    continue
-
-                # Tracking of jobs no longer orphaned goes with them.
-                for settled_job_id in [
-                    job_id
-                    for job_id in self._orphan_extensions.keys() | self._orphan_due_at.keys()
-                    if job_id not in orphaned_jobs
-                ]:
-                    self._orphan_extensions.pop(settled_job_id, None)
-                    self._orphan_due_at.pop(settled_job_id, None)
-                    self._orphan_due_heartbeats.pop(settled_job_id, None)
-                    self._takeover_extensions.pop(settled_job_id, None)
-
-                # The grace: the gate tier's verdict on a lapsed leader
-                # (derived), or the longest rescue seen here if longer.
-                grace = max(self._orphan_grace_period_seconds, self._state.longest_orphan_rescue_seconds)
-                now = self._clock.monotonic()
-                jobs_to_evaluate: list[tuple[str, float]] = []
-
-                for job_id, orphaned_at in orphaned_jobs.items():
-                    if job_id in self._confirmed_orphaned_jobs:
-                        jobs_to_evaluate.append((job_id, orphaned_at))
-                        continue
-                    tracker = self._orphan_extensions.get(job_id)
-                    extended = tracker.total_extended if tracker is not None else 0.0
-                    if now - orphaned_at < grace + extended:
-                        continue
-                    # AD-26: a leader still heard from since the last grant
-                    # (or the orphaning) may yet renew its lease -- extend,
-                    # decaying. A silent one has nothing to wait for.
-                    if (leader_heartbeats := self._state.orphan_leader_heartbeats(job_id)) is not None:
-                        heartbeats, baseline = leader_heartbeats
-                        if tracker is not None and tracker.last_completed_items is not None:
-                            baseline = tracker.last_completed_items
-                        if heartbeats > baseline:
-                            if tracker is None:
-                                tracker = ExtensionTracker(
-                                    worker_id=job_id,
-                                    base_deadline=grace,
-                                    min_grant=self._orphan_extension_min_grant_seconds,
-                                    max_extensions=self._orphan_extension_max_extensions,
-                                )
-                                self._orphan_extensions[job_id] = tracker
-                            granted, _grant, _denial, _warning = tracker.request_extension(
-                                "orphaned: its leader gate is still heard from",
-                                current_progress=float(heartbeats),
-                                completed_items=heartbeats,
-                            )
-                            if granted:
-                                continue
-                    jobs_to_evaluate.append((job_id, orphaned_at))
-
-                if not jobs_to_evaluate:
-                    continue
-
-                await self._logger.log(
-                    ServerDebug(
-                        message=f"Evaluating {len(jobs_to_evaluate)} orphaned jobs for takeover",
-                        node_host=self._get_node_addr()[0],
-                        node_port=self._get_node_addr()[1],
-                        node_id=self._get_node_id().short,
-                    )
-                )
-
-                for job_id, orphaned_at in jobs_to_evaluate:
-                    await self._evaluate_orphan_takeover(
-                        job_id,
-                        orphaned_at,
-                    )
-
-            except asyncio.CancelledError:
+            if not await self._run_orphan_check_reporting_errors():
                 break
-            except Exception as error:
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"Orphan check loop error: {error}",
-                        node_host=self._get_node_addr()[0],
-                        node_port=self._get_node_addr()[1],
-                        node_id=self._get_node_id().short,
-                    ),
-                )
+
+    async def _run_orphan_check_reporting_errors(self) -> bool:
+        """One check; an error it raised is logged and the loop goes on.
+        False when the check was cancelled: the loop ends."""
+        try:
+            await self._run_orphan_check()
+
+        except asyncio.CancelledError:
+            return False
+        except Exception as error:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Orphan check loop error: {error}",
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
+                    node_id=self._get_node_id().short,
+                ),
+            )
+        return True
+
+    async def _run_orphan_check(self) -> None:
+        """One check, an interval after the last: evaluate each orphan past
+        its grace (and AD-26 extensions) for takeover. Stopped meanwhile,
+        it does nothing and the loop ends."""
+        await self._clock.sleep(self._orphan_check_interval_seconds)
+
+        if not self._running:
+            return
+
+        orphaned_jobs = self._state.get_orphaned_jobs()
+        if not orphaned_jobs:
+            return
+
+        # Tracking of jobs no longer orphaned goes with them.
+        self._forget_settled_orphans(orphaned_jobs)
+
+        # The grace: the gate tier's verdict on a lapsed leader
+        # (derived), or the longest rescue seen here if longer.
+        grace = max(self._orphan_grace_period_seconds, self._state.longest_orphan_rescue_seconds)
+        now = self._clock.monotonic()
+        jobs_to_evaluate = self._orphans_due_for_evaluation(orphaned_jobs, grace, now)
+
+        await self._evaluate_due_orphans(jobs_to_evaluate)
+
+    def _forget_settled_orphans(self, orphaned_jobs: dict[str, float]) -> None:
+        """Drop the tracking of jobs no longer orphaned."""
+        for settled_job_id in self._settled_orphan_job_ids(orphaned_jobs):
+            self._orphan_extensions.pop(settled_job_id, None)
+            self._orphan_due_at.pop(settled_job_id, None)
+            self._orphan_due_heartbeats.pop(settled_job_id, None)
+            self._takeover_extensions.pop(settled_job_id, None)
+
+    def _settled_orphan_job_ids(self, orphaned_jobs: dict[str, float]) -> list[str]:
+        """The tracked jobs that are no longer orphaned."""
+        return [
+            job_id
+            for job_id in self._orphan_extensions.keys() | self._orphan_due_at.keys()
+            if job_id not in orphaned_jobs
+        ]
+
+    def _orphans_due_for_evaluation(
+        self,
+        orphaned_jobs: dict[str, float],
+        grace: float,
+        now: float,
+    ) -> list[tuple[str, float]]:
+        """The orphans to evaluate for takeover now, with when each was
+        orphaned."""
+        jobs_to_evaluate: list[tuple[str, float]] = []
+        for job_id, orphaned_at in orphaned_jobs.items():
+            if self._is_orphan_due(job_id, orphaned_at, grace, now):
+                jobs_to_evaluate.append((job_id, orphaned_at))
+        return jobs_to_evaluate
+
+    def _is_orphan_due(self, job_id: str, orphaned_at: float, grace: float, now: float) -> bool:
+        """Whether an orphan is due for evaluation: SWIM confirmed its
+        leader dead, or its grace and extensions ran out unextended."""
+        if job_id in self._confirmed_orphaned_jobs:
+            return True
+        tracker = self._orphan_extensions.get(job_id)
+        if now - orphaned_at < grace + self._extended_seconds(tracker):
+            return False
+        return not self._extend_orphan_grace(job_id, tracker, grace)
+
+    def _extend_orphan_grace(
+        self,
+        job_id: str,
+        tracker: ExtensionTracker | None,
+        grace: float,
+    ) -> bool:
+        """Whether the orphan's grace was extended again: its leader is
+        still heard from since the last grant (AD-26)."""
+        # AD-26: a leader still heard from since the last grant
+        # (or the orphaning) may yet renew its lease -- extend,
+        # decaying. A silent one has nothing to wait for.
+        if (leader_heartbeats := self._state.orphan_leader_heartbeats(job_id)) is None:
+            return False
+        heartbeats, baseline = leader_heartbeats
+        baseline = self._extension_baseline(tracker, baseline)
+        if not heartbeats > baseline:
+            return False
+        return self._grant_extension(
+            job_id,
+            tracker,
+            grace,
+            heartbeats,
+            self._orphan_extensions,
+            "orphaned: its leader gate is still heard from",
+        )
+
+    async def _evaluate_due_orphans(self, jobs_to_evaluate: list[tuple[str, float]]) -> None:
+        """Evaluate each due orphan for takeover."""
+        if not jobs_to_evaluate:
+            return
+
+        await self._logger.log(
+            ServerDebug(
+                message=f"Evaluating {len(jobs_to_evaluate)} orphaned jobs for takeover",
+                node_host=self._get_node_addr()[0],
+                node_port=self._get_node_addr()[1],
+                node_id=self._get_node_id().short,
+            )
+        )
+
+        for job_id, orphaned_at in jobs_to_evaluate:
+            await self._evaluate_orphan_takeover(
+                job_id,
+                orphaned_at,
+            )
 
     async def _evaluate_orphan_takeover(
         self,
@@ -544,49 +658,118 @@ class GateOrphanJobCoordinator:
         tier_heartbeats = self._state.gate_peer_heartbeats_total
         due_heartbeats = self._orphan_due_heartbeats.setdefault(job_id, tier_heartbeats)
         takeover_window = max(self._orphan_grace_period_seconds, self._state.longest_orphan_takeover_wait_seconds)
-        tracker = self._takeover_extensions.get(job_id)
-        takeover_window_spent = now - due_at >= takeover_window + (
-            tracker.total_extended if tracker is not None else 0.0
+        takeover_window_spent = self._is_takeover_window_spent(
+            job_id, now, due_at, takeover_window, tier_heartbeats, due_heartbeats
         )
-        if takeover_window_spent:
-            last_heartbeats = (
-                tracker.last_completed_items
-                if tracker is not None and tracker.last_completed_items is not None
-                else due_heartbeats
-            )
-            if tier_heartbeats > last_heartbeats:
-                if tracker is None:
-                    tracker = ExtensionTracker(
-                        worker_id=job_id,
-                        base_deadline=takeover_window,
-                        min_grant=self._orphan_extension_min_grant_seconds,
-                        max_extensions=self._orphan_extension_max_extensions,
-                    )
-                    self._takeover_extensions[job_id] = tracker
-                granted, _grant, _denial, _warning = tracker.request_extension(
-                    "orphan due: its tier is still heard from",
-                    current_progress=float(tier_heartbeats),
-                    completed_items=tier_heartbeats,
-                )
-                takeover_window_spent = not granted
 
+        job = await self._local_or_repaired_job(job_id)
+        if not job:
+            self._forget_unrecoverable_orphan(job_id, takeover_window_spent)
+            return
+
+        await self._decide_orphan(job_id, job, now - orphaned_at, takeover_window_spent)
+
+    def _is_takeover_window_spent(
+        self,
+        job_id: str,
+        now: float,
+        due_at: float,
+        takeover_window: float,
+        tier_heartbeats: int,
+        due_heartbeats: int,
+    ) -> bool:
+        """Whether the orphan's takeover window, with its AD-26 extensions,
+        is spent -- extended once more while the tier is still heard from."""
+        tracker = self._takeover_extensions.get(job_id)
+        if not now - due_at >= takeover_window + self._extended_seconds(tracker):
+            return False
+
+        last_heartbeats = self._extension_baseline(tracker, due_heartbeats)
+        if not tier_heartbeats > last_heartbeats:
+            return True
+
+        return not self._grant_extension(
+            job_id,
+            tracker,
+            takeover_window,
+            tier_heartbeats,
+            self._takeover_extensions,
+            "orphan due: its tier is still heard from",
+        )
+
+    @staticmethod
+    def _extended_seconds(tracker: ExtensionTracker | None) -> float:
+        """The seconds an AD-26 extension tracker granted so far."""
+        return tracker.total_extended if tracker is not None else 0.0
+
+    @staticmethod
+    def _extension_baseline(tracker: ExtensionTracker | None, baseline: int) -> int:
+        """The heartbeat count of the last grant, else the given baseline."""
+        return (
+            tracker.last_completed_items
+            if tracker is not None and tracker.last_completed_items is not None
+            else baseline
+        )
+
+    def _grant_extension(
+        self,
+        job_id: str,
+        tracker: ExtensionTracker | None,
+        base_deadline: float,
+        heartbeats: int,
+        trackers: dict[str, ExtensionTracker],
+        reason: str,
+    ) -> bool:
+        """Request an AD-26 extension, decaying, for a job still heard from,
+        tracking it from its first; whether it was granted."""
+        if tracker is None:
+            tracker = ExtensionTracker(
+                worker_id=job_id,
+                base_deadline=base_deadline,
+                min_grant=self._orphan_extension_min_grant_seconds,
+                max_extensions=self._orphan_extension_max_extensions,
+            )
+            trackers[job_id] = tracker
+        granted, _grant, _denial, _warning = tracker.request_extension(
+            reason,
+            current_progress=float(heartbeats),
+            completed_items=heartbeats,
+        )
+        return granted
+
+    async def _local_or_repaired_job(self, job_id: str) -> GlobalJobStatus | None:
+        """The job held here, else repaired from peer gates' replicas."""
         job = self._job_manager.get_job(job_id)
         if not job:
             job = await self._get_or_repair_job(job_id)
+        return job
 
-            if not job:
-                if takeover_window_spent:
-                    self._clear_orphaned_job(job_id)
-                return
+    def _forget_unrecoverable_orphan(self, job_id: str, takeover_window_spent: bool) -> None:
+        """An orphan held nowhere is forgotten once its takeover window is spent."""
+        if takeover_window_spent:
+            self._clear_orphaned_job(job_id)
 
+    async def _decide_orphan(
+        self,
+        job_id: str,
+        job: GlobalJobStatus,
+        time_orphaned: float,
+        takeover_window_spent: bool,
+    ) -> None:
+        """Clear a terminal orphan, fail one whose takeover window is spent,
+        else take it over when this gate leads the cluster."""
         if job.status in self._terminal_statuses:
             self._clear_orphaned_job(job_id)
             return
 
         if takeover_window_spent:
-            await self._fail_orphaned_job(job_id, job, now - orphaned_at)
+            await self._fail_orphaned_job(job_id, job, time_orphaned)
             return
 
+        await self._take_over_if_cluster_leader(job_id)
+
+    async def _take_over_if_cluster_leader(self, job_id: str) -> None:
+        """Take the orphan over when this gate is the SWIM cluster leader."""
         if not self._is_current_cluster_leader():
             await self._logger.log(
                 ServerDebug(
@@ -676,6 +859,11 @@ class GateOrphanJobCoordinator:
         if self._state_repair_callback is None:
             return None
 
+        return await self._repair_job(job_id)
+
+    async def _repair_job(self, job_id: str) -> GlobalJobStatus | None:
+        """Fetch the job's committed replica state from peer gates; None
+        (a failure logged) when none could be applied."""
         try:
             repaired = await self._state_repair_callback(job_id)
         except Exception as repair_error:
@@ -692,10 +880,7 @@ class GateOrphanJobCoordinator:
             )
             return None
 
-        if repaired:
-            return self._job_manager.get_job(job_id)
-
-        return None
+        return self._job_manager.get_job(job_id) if repaired else None
 
     async def _execute_takeover(self, job_id: str) -> None:
         """
@@ -711,51 +896,13 @@ class GateOrphanJobCoordinator:
             job_id: The job ID to take over
         """
         async with self._lock:
-            if not self._state.is_job_orphaned(job_id):
-                return
+            target_dc_count = await self._takeover_target_dc_count_locked(job_id)
 
-            job = await self._get_or_repair_job(job_id)
-            if job is None:
-                return
-
-            if job.status in self._terminal_statuses:
-                self._clear_orphaned_job(job_id)
-                return
-
-            if not self._is_current_cluster_leader():
-                return
-
-            target_dc_count = len(self._job_manager.get_target_dcs(job_id))
-
-        if self._commit_takeover_callback is None:
-            await self._logger.log(
-                ServerWarning(
-                    message=f"No commit callback available for orphaned job {job_id[:8]}... takeover",
-                    node_host=self._get_node_addr()[0],
-                    node_port=self._get_node_addr()[1],
-                    node_id=self._get_node_id().short,
-                )
-            )
+        if target_dc_count is None:
             return
 
-        new_token = await self._commit_takeover_callback(job_id)
-        if new_token is None:
-            await self._logger.log(
-                ServerWarning(
-                    message=f"Quorum commit failed for orphaned job {job_id[:8]}... takeover",
-                    node_host=self._get_node_addr()[0],
-                    node_port=self._get_node_addr()[1],
-                    node_id=self._get_node_id().short,
-                )
-            )
+        if (new_token := await self._commit_and_settle_takeover(job_id)) is None:
             return
-
-        async with self._lock:
-            if not self._state.is_job_orphaned(job_id):
-                return
-            if (due_at := self._orphan_due_at.get(job_id)) is not None:
-                self._state.record_orphan_takeover_wait(self._clock.monotonic() - due_at)
-            self._clear_orphaned_job(job_id)
 
         await self._logger.log(
             ServerInfo(
@@ -770,6 +917,81 @@ class GateOrphanJobCoordinator:
         )
 
         await self._broadcast_leadership_takeover(job_id, new_token, target_dc_count)
+
+    async def _takeover_target_dc_count_locked(self, job_id: str) -> int | None:
+        """Under the lock: the job's target datacenter count when this gate,
+        the SWIM cluster leader, may take the still-orphaned job over; None
+        when it may not."""
+        if not self._state.is_job_orphaned(job_id):
+            return None
+
+        job = await self._get_or_repair_job(job_id)
+        if job is None:
+            return None
+
+        return self._leader_target_dc_count(job_id, job)
+
+    def _leader_target_dc_count(self, job_id: str, job: GlobalJobStatus) -> int | None:
+        """The job's target datacenter count while it runs and this gate is
+        the SWIM cluster leader; a terminal job's orphan evidence is cleared."""
+        if job.status in self._terminal_statuses:
+            self._clear_orphaned_job(job_id)
+            return None
+
+        if not self._is_current_cluster_leader():
+            return None
+
+        return len(self._job_manager.get_target_dcs(job_id))
+
+    async def _commit_and_settle_takeover(self, job_id: str) -> int | None:
+        """Quorum-commit the takeover, then clear the job's orphan state;
+        the new fence token, or None when the takeover did not commit or
+        the job stopped being orphaned meanwhile."""
+        new_token = await self._commit_takeover(job_id)
+        if new_token is None:
+            return None
+
+        async with self._lock:
+            if not self._settle_takeover_locked(job_id):
+                return None
+
+        return new_token
+
+    async def _commit_takeover(self, job_id: str) -> int | None:
+        """Quorum-commit this gate's leadership of the job with a raised
+        fence token; None (logged) when it could not."""
+        if self._commit_takeover_callback is None:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"No commit callback available for orphaned job {job_id[:8]}... takeover",
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
+                    node_id=self._get_node_id().short,
+                )
+            )
+            return None
+
+        new_token = await self._commit_takeover_callback(job_id)
+        if new_token is None:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Quorum commit failed for orphaned job {job_id[:8]}... takeover",
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
+                    node_id=self._get_node_id().short,
+                )
+            )
+        return new_token
+
+    def _settle_takeover_locked(self, job_id: str) -> bool:
+        """Under the lock: record the takeover's wait and clear the job's
+        orphan evidence; False when it is no longer orphaned."""
+        if not self._state.is_job_orphaned(job_id):
+            return False
+        if (due_at := self._orphan_due_at.get(job_id)) is not None:
+            self._state.record_orphan_takeover_wait(self._clock.monotonic() - due_at)
+        self._clear_orphaned_job(job_id)
+        return True
 
     async def _broadcast_leadership_takeover(
         self,

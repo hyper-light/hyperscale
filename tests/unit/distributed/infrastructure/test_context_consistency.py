@@ -34,6 +34,10 @@ from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.models import JobStatus
 from hyperscale.logging.config.logging_config import LoggingConfig
 
+# Every node and client of this test shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 # Initialize logging directory (required for server pool)
 _logging_config = LoggingConfig()
 _logging_config.update(log_directory=os.getcwd())
@@ -175,7 +179,7 @@ async def run_test():
                 host='127.0.0.1',
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
-                env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
+                env=Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
                 dc_id=DC_ID,
                 manager_peers=get_manager_peer_tcp_addrs(config["tcp"]),
                 manager_udp_peers=get_manager_peer_udp_addrs(config["udp"]),
@@ -236,7 +240,7 @@ async def run_test():
                 host='127.0.0.1',
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
-                env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
+                env=Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
                 dc_id=DC_ID,
                 total_cores=config["cores"],
                 seed_managers=seed_managers,
@@ -286,7 +290,7 @@ async def run_test():
         client = HyperscaleClient(
             host='127.0.0.1',
             port=CLIENT_CONFIG['tcp'],
-            env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='5s'),
+            env=Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT='5s'),
         )
         
         await client.start()

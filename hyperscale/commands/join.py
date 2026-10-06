@@ -60,7 +60,7 @@ async def join(
     @param host The local address this command listens on for the reply
     @param port The local TCP port this command listens on for the reply
     @param timeout How long to wait for the join (defaults to the slowest join path's configured budget)
-    @param acm_secret The shared cluster secret (defaults to MERCURY_SYNC_AUTH_SECRET)
+    @param acm_secret The shared cluster secret (defaults to MERCURY_SYNC_AUTH_SECRET, else the per-user cluster cookie)
     @param log_level The log level to use
     """
     try:
@@ -72,7 +72,7 @@ async def join(
 
     LoggingConfig().update(log_level=log_level.data, log_output="stderr")
     env = HyperscaleEnv(
-        MERCURY_SYNC_AUTH_SECRET=resolve_auth_secret(acm_secret),
+        MERCURY_SYNC_AUTH_SECRET=await resolve_auth_secret(acm_secret),
         MERCURY_SYNC_LOG_LEVEL=log_level.data,
     )
     join_timeout = (

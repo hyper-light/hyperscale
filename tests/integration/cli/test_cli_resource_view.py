@@ -29,6 +29,7 @@ from hyperscale.distributed.models import DatacenterInfo
 from hyperscale.distributed.nodes.client import HyperscaleClient
 from hyperscale.distributed.nodes.manager.config import create_manager_config_from_env
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
     BOOT_TIMEOUT_SECONDS,
     LOCALHOST,
     NODE_BLOCK,
@@ -45,7 +46,7 @@ from tests.integration.cli.test_cli_resource_guard import (
     SimBurnWorkflow,
 )
 
-ENV = Env()
+ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
 WORKER_CORES = 1
 CLIENT_BLOCK = 2
 DATACENTER = "default"
@@ -83,7 +84,7 @@ async def test_gate_reports_datacenter_resource_pressure(run_marker: str) -> Non
     client = HyperscaleClient(
         host=LOCALHOST,
         port=client_start,
-        env=Env(),
+        env=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET),
         gates=[(LOCALHOST, gate.tcp_port)],
     )
     try:

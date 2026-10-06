@@ -45,7 +45,7 @@ async def cluster(
     @param host The local address this command listens on for the reply
     @param port The local TCP port this command listens on for the reply
     @param timeout How long to wait (defaults to the cluster's standard TCP timeout plus a formation interval)
-    @param acm_secret The shared cluster secret (defaults to MERCURY_SYNC_AUTH_SECRET)
+    @param acm_secret The shared cluster secret (defaults to MERCURY_SYNC_AUTH_SECRET, else the per-user cluster cookie)
     @param log_level The log level to use
     """
     try:
@@ -56,7 +56,7 @@ async def cluster(
 
     LoggingConfig().update(log_level=log_level.data, log_output="stderr")
     env = HyperscaleEnv(
-        MERCURY_SYNC_AUTH_SECRET=resolve_auth_secret(acm_secret),
+        MERCURY_SYNC_AUTH_SECRET=await resolve_auth_secret(acm_secret),
         MERCURY_SYNC_LOG_LEVEL=log_level.data,
     )
     # A member passes the request to its leader (one standard request),

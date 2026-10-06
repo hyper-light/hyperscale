@@ -59,7 +59,7 @@ async def workflow(
     @param gates The TCP host:port of the cluster's gates to run the test through
     @param managers The TCP host:port of one datacenter's managers to run the test on directly
     @param host The address the cluster pushes the run's progress to (cluster runs; it listens on the config's server port)
-    @param acm_secret The shared cluster secret (cluster runs; defaults to MERCURY_SYNC_AUTH_SECRET)
+    @param acm_secret The shared cluster secret (cluster runs; defaults to MERCURY_SYNC_AUTH_SECRET, else the per-user cluster cookie)
     """
 
     workflows = [(workflow._dependencies, workflow()) for workflow in path.data.values()]
@@ -84,7 +84,7 @@ async def workflow(
                 host,
                 config.data.server_port,
                 node_env(
-                    MERCURY_SYNC_AUTH_SECRET=resolve_auth_secret(acm_secret),
+                    MERCURY_SYNC_AUTH_SECRET=await resolve_auth_secret(acm_secret),
                     MERCURY_SYNC_LOG_LEVEL=log_level.data,
                 ),
                 gates=[parse_node_address(gate) for gate in gates],

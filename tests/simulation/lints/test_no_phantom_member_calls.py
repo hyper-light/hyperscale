@@ -17,7 +17,9 @@ Every binding of ``self._x`` in the class says the same class: each
 any class-level ``_x: SomeClass``. A binding the lint cannot type (a
 parameter, a call to a function, a conditional expression) makes ``_x``
 unknown, and unknown is skipped, never guessed. ``SomeClass`` must then be
-inside ``hyperscale/`` all the way up, with no ``__getattr__``.
+inside ``hyperscale/`` all the way up, with no ``__getattr__`` -- except
+one in a ``DECLARED_FIELD_BINDERS`` class (``Message``), which resolves
+only the class's declared dataclass fields, names this lint already sees.
 
 Unlike the sibling lint, a ``setattr(self, <name>, ...)`` does not blind the
 class here: what is called is a method or a callable the class names, and
@@ -36,6 +38,7 @@ from tests.simulation.lints.expected_phantom_member_call_violations import (
     EXPECTED_PHANTOM_MEMBER_CALL_VIOLATIONS,
 )
 from tests.simulation.lints.test_no_phantom_attributes import (
+    DECLARED_FIELD_BINDERS,
     INERT_BASES,
     PRODUCTION_ROOT,
     REPO_ROOT,
@@ -79,8 +82,11 @@ def _annotated_class_name(annotation: ast.expr | None) -> str:
 
 def _members(class_name: str, classes: dict[str, list[ClassFacts]]) -> set[str] | None:
     """Every name ``class_name``'s chain binds, or None when a base lies
-    outside ``hyperscale/`` or the chain resolves names on demand."""
+    outside ``hyperscale/`` or the chain resolves names on demand (a
+    ``DECLARED_FIELD_BINDERS`` class's ``__getattr__`` resolves only its
+    declared fields, so it does not count)."""
     members: set[str] = set()
+    resolves_on_demand = False
     pending = [class_name]
     seen: set[str] = set()
     while pending:
@@ -92,8 +98,12 @@ def _members(class_name: str, classes: dict[str, list[ClassFacts]]) -> set[str] 
             return None
         for facts in entries:
             members |= facts.assigned | facts.defined
+            resolves_on_demand = resolves_on_demand or (
+                name not in DECLARED_FIELD_BINDERS
+                and bool({"__getattr__", "__getattribute__"} & facts.defined)
+            )
             pending.extend(facts.bases)
-    return None if {"__getattr__", "__getattribute__"} & members else members
+    return None if resolves_on_demand else members
 
 
 def _attribute_types_and_member_reads(

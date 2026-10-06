@@ -36,6 +36,7 @@ from tests.simulation.harness.diagnostics import DiagnosticDumper
 from tests.simulation.harness.env_overrides import EnvOverrides
 from tests.simulation.harness.execution_mode import ExecutionMode
 from tests.simulation.harness.fault_matrix import FaultMatrix
+from tests.simulation.harness.harness_auth_secret import HARNESS_AUTH_SECRET
 from tests.simulation.harness import fault_transport
 from tests.simulation.harness.invariants import (
     InvariantChecker,
@@ -662,7 +663,7 @@ class ClusterHarness:
     ) -> Env:
         """Compose Env from cluster + DC + per-node overrides + worker cores."""
         layered = self._layered_overrides(dc_spec=dc_spec, node_id=node_id)
-        kwargs: dict[str, object] = {}
+        kwargs: dict[str, object] = {"MERCURY_SYNC_AUTH_SECRET": HARNESS_AUTH_SECRET}
         if layered.request_timeout is not None:
             kwargs["MERCURY_SYNC_REQUEST_TIMEOUT"] = layered.request_timeout
         if layered.log_level is not None:

@@ -40,6 +40,7 @@ import pytest
 
 from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE, MAX_MESSAGE_SIZE
 from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.models.message import generate_message_id
 from hyperscale.distributed.server import tcp, udp
 from hyperscale.distributed.server.protocol.drop_counter import DropCounter
 from hyperscale.distributed.server.protocol.mercury_sync_tcp_protocol import MercurySyncTCPProtocol
@@ -200,6 +201,7 @@ def feed(protocol: MercurySyncTCPProtocol, transport: RecordingStreamTransport, 
 def request_plaintext(node: EchoNode, handler: bytes, request_id: int, data: bytes, address: bytes) -> bytes:
     return (
         address + b"<" + handler + b"<" + (0).to_bytes(64) + request_id.to_bytes(8, "big")
+        + generate_message_id().to_bytes(8, "big")
         + len(data).to_bytes(4, "big") + data
     )
 
@@ -247,8 +249,8 @@ def decoded_replies(node: EchoNode, written: list[bytes]) -> list[tuple[bytes, i
         offset += LENGTH_PREFIX_SIZE + frame_length
         plaintext = node._decompressor.decompress(node._encryptor.decrypt(body))
         _, handler, rest = plaintext.split(b"<", maxsplit=2)
-        data_length = int.from_bytes(rest[72:76], "big")
-        replies.append((handler, int.from_bytes(rest[64:72], "big"), rest[76 : 76 + data_length]))
+        data_length = int.from_bytes(rest[80:84], "big")
+        replies.append((handler, int.from_bytes(rest[64:72], "big"), rest[84 : 84 + data_length]))
     return replies
 
 
@@ -435,6 +437,7 @@ async def test_malformed_datagrams_are_dropped_and_valid_ones_answered(seed: int
                 datagram = sealed(
                     node,
                     b"c<" + peer_slug + b"<echo_udp<" + (0).to_bytes(64) + (request_index + 1).to_bytes(8, "big")
+                    + generate_message_id().to_bytes(8, "big")
                     + len(data).to_bytes(4, "big") + data,
                 )
             else:
@@ -447,10 +450,11 @@ async def test_malformed_datagrams_are_dropped_and_valid_ones_answered(seed: int
                         datagram = sealed(
                             node,
                             b"c<" + b"no-port\x00here" + b"<echo_udp<" + (0).to_bytes(64) + (0).to_bytes(8)
+                            + generate_message_id().to_bytes(8, "big")
                             + (2**32 - 1).to_bytes(4, "big") + b"short",
                         )
                     case "unknown_type":
-                        datagram = sealed(node, b"x<" + peer_slug + b"<echo_udp<" + (0).to_bytes(76))
+                        datagram = sealed(node, b"x<" + peer_slug + b"<echo_udp<" + (0).to_bytes(84))
                     case _:
                         datagram = malformed_frame_body(node, seeded_random, kind, request_index)
             node.read_udp(datagram, transport, None)
@@ -463,7 +467,7 @@ async def test_malformed_datagrams_are_dropped_and_valid_ones_answered(seed: int
             plaintext = node._decompressor.decompress(node._encryptor.decrypt(datagram))
             request_type, _, handler, rest = plaintext.split(b"<", maxsplit=3)
             assert (request_type, handler) == (b"s", b"echo_udp")
-            echo = rest[76 : 76 + int.from_bytes(rest[72:76], "big")]
+            echo = rest[84 : 84 + int.from_bytes(rest[80:84], "big")]
             echoes.append(echo)
             if echo != b"Request processing failed":
                 answered_request_ids.append(int.from_bytes(rest[64:72], "big"))
@@ -541,7 +545,9 @@ async def test_unsolicited_udp_replies_do_not_grow_the_node(seed: int) -> None:
                 sealed(
                     node,
                     b"s<" + forged_address + b"<" + forged_handler + b"<" + (0).to_bytes(64)
-                    + seeded_random.getrandbits(64).to_bytes(8, "big") + (4).to_bytes(4, "big") + b"data",
+                    + seeded_random.getrandbits(64).to_bytes(8, "big")
+                    + generate_message_id().to_bytes(8, "big")
+                    + (4).to_bytes(4, "big") + b"data",
                 ),
                 transport,
                 None,
@@ -587,6 +593,7 @@ async def test_a_reply_after_its_request_gave_up_never_answers_the_next_request(
             sealed(
                 node,
                 b"s<" + responder_slug + b"<echo_udp<" + (0).to_bytes(64) + timed_out_request_id.to_bytes(8, "big")
+                + generate_message_id().to_bytes(8, "big")
                 + len(b"echo:first").to_bytes(4, "big") + b"echo:first",
             ),
             live_transport,

@@ -32,6 +32,7 @@ from hyperscale.distributed.nodes.client import HyperscaleClient
 from hyperscale.distributed.nodes.manager.config import create_manager_config_from_env
 from hyperscale.graph import Workflow, step
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
     BOOT_TIMEOUT_SECONDS,
     LOCALHOST,
     NODE_BLOCK,
@@ -43,7 +44,7 @@ from tests.integration.cli.node_processes import (
     worker_block,
 )
 
-ENV = Env()
+ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
 DATACENTER = "dc-cohort"
 COHORT_SIZE = 3
 WORKER_CORES = 1

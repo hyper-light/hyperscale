@@ -26,6 +26,7 @@ import pytest
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client import HyperscaleClient
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
     BOOT_TIMEOUT_SECONDS,
     LOCALHOST,
     NODE_BLOCK,
@@ -39,7 +40,7 @@ from tests.integration.cli.node_processes import (
 )
 from tests.integration.cli.test_cli_resource_guard import _submit_until_accepted
 
-ENV = Env()
+ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
 DATACENTER = "dc-gated-status"
 WORKER_CORES = 1
 CLIENT_BLOCK = 2  # client tcp + its udp (port + 1)

@@ -33,6 +33,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes import ManagerServer
 
+# Every node and client of this example shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 
 async def run_manager_1():
     """Run Manager server 1 on ports 9000/9001"""
@@ -76,6 +80,7 @@ async def run_manager_1():
         tcp_port=9000,
         udp_port=9001,
         env=Env(
+            MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
             MERCURY_SYNC_REQUEST_TIMEOUT='2s',
         ),
         dc_id='DC-EAST',

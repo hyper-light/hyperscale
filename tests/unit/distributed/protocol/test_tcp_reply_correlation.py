@@ -35,6 +35,8 @@ import socket
 
 import pytest
 
+from hyperscale.distributed.models.message import generate_message_id
+
 from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.server import tcp, udp
 from hyperscale.distributed.server.server.mercury_sync_base_server import (
@@ -186,13 +188,13 @@ class ClosedTransport:
 
 def reply_frame(node: DelayedEchoNode, request_id: int, data: bytes) -> bytes:
     """A reply to request ``request_id``, framed, compressed and encrypted
-    as a peer sends it: address<handler<clock(64)request_id(8)data_len(4)data."""
+    as a peer sends it: address<handler<clock(64)request_id(8)frame_id(8)data_len(4)data."""
     return node._encryptor.encrypt(
         node._compressor.compress(
             node._tcp_addr_slug
             + b"<delayed_echo<"
             + (0).to_bytes(64)
-            + request_id.to_bytes(8, "big")
+            + request_id.to_bytes(8, "big") + generate_message_id().to_bytes(8, "big")
             + len(data).to_bytes(4, "big")
             + data
         )

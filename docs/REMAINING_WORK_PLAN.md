@@ -181,7 +181,7 @@ These are snapshot ratchets in `tests/simulation/lints/`, sharing `ratchet.py`. 
 - `test_complexity_ceiling`: McCabe at most 3, counted the way radon counts but in stdlib `ast` (no tool install), D7. 2,697 functions over the ceiling.
 - `test_one_class_per_file` (D8): 208 files.
 - `test_dataclass_conventions`: `slots=True` and inside `models/`. 290 dataclasses.
-- `test_no_swallowed_exceptions`: an `except` that only passes. 231 functions; Phase 7 classifies each.
+- `test_no_swallowed_exceptions`: an `except` that only passes; it only stops new ones. Existing sites are not worked unless Raft-related (your decision, 2026-10-06).
 - `test_no_inline_imports`: 101 functions.
 - `test_no_task_runner_logging`: 122 functions.
 - Already in place: phantom attributes and member calls, raw asyncio tasks, sent actions with no receiver.
@@ -216,7 +216,7 @@ Each target was re-verified against the current tree before deletion (no product
   - The ones whose callers reach them from async code are async now: the federated probe-error hook, the lease-expiry hook, gate datacenter selection, the gate result-producer validators, the manager's peer worker snapshots and `register_worker`, and the health-alert loggers.
   - Those with no caller were dead code and are deleted: `ManagerLeadershipCoordinator`'s hooks and `detect_split_brain`, `get_progress_state`, the version-skew worker/peer side, and a duplicate `WorkflowProgressHandler`.
   - Left on the ratchet, deliberately: sites invoked synchronously by their contract. These are asyncio done-callbacks and `datagram_received` (protocol callbacks cannot await); Raft and SWIM leader-state transitions, which are synchronous under their locks; the federated monitor's ack and timeout handlers; and `is_message_fresh`, a per-gossip hot path. Making those async would add a coroutine to a hot path or turn a lock-held transition into a yield point, just to emit a log line. Engines are not changed beyond what you authorize, and `core/jobs` is left to its peer owner.
-- Classify each `except …: pass`: guards stay, the rest log or raise. ✅ The teardown guards stay as they are (your decision, 2026-10-05).
+- Existing `except …: pass` sites: out of scope unless Raft-related; abort/shutdown sites stay as they are (your decision, 2026-10-05/06).
 - ✅ Hoisted the inline imports in `distributed`: 27 files, each checked by importing it and all four node entrypoints in a fresh interpreter, then the full suite. The ones left are cycle-breakers: `Env`'s config getters import modules that import `Env`, plus `rate_limiting`'s import of `models`. The reporting backends' imports stay too (optional third-party dependencies, imported lazily).
 - `Any` → Protocols and generics. ✅ Started (2026-10-05):
   - Canonical seams: `runtime.SendTcp` (a bound `send_tcp`) and `runtime.RunTask` (a bound `TaskRunner.run`).
@@ -270,6 +270,24 @@ Each target was re-verified against the current tree before deletion (no product
   - five unused worker models;
   - `JobForwardingTracker`, a dead parallel forwarder that counted failed sends as successes;
   - the manager's dead cancellation completion-event, initiated-at and per-workflow-lock state, including a pop on the wrong key.
+
+### ✅ Replay protection for every frame (2026-10-06)
+
+Distributed nodes had none. The transport checked only `msgspec`-model payloads; every distributed message is a dataclass its handler decodes, and its id was never pickled. A captured frame replayed byte for byte ran its handler again.
+
+Now:
+- Every frame carries a per-send Snowflake (`frame_id`) inside its AES-GCM-authenticated body: `…clock(64) request_id(8) frame_id(8) data_len(4) data`.
+- `ReplayGuard.validate_frame` checks every frame: TCP and UDP, requests and replies.
+- Duplicates are keyed on the encryption nonce. Snowflakes of different senders collide; 96 random bits don't.
+- A watermark (the newest timestamp evicted from the bounded set) refuses anything that could have been forgotten. It starts at the guard's start minus its max age, so frames captured before a restart cannot be replayed into it.
+- A resend is a new encryption and is accepted.
+- No wall clocks are compared across hosts after start.
+- Cost: about 0.2 µs per frame each side.
+- `Message.dump()` stamps `message_id` and `sender_incarnation`.
+
+Tests:
+- `test_frame_replay_protection.py`: a 40-seed guard VOPR against a watermark model, Snowflake collisions included, plus real-socket TCP and UDP capture-and-replay and resend tests.
+- Mutants: dropping the check, the watermark or nonce keying each fail it.
 
 ### Phase 8 — REFACTOR.md program (L)
 
@@ -337,6 +355,12 @@ Rules for every move: behavior-preserving; public messages and actions unchanged
 - **The distributed server's `@task` hook** (`hyperscale.distributed.server.task`, exported) has never worked. `_get_task_hooks` never matches, `_tasks` is never filled, and it double-wraps kwargs. Nothing uses it: nodes call the task runner directly. Delete it, or wire it?
 
 - **Threading in executors and vendored SSH** (G-70): CLAUDE.md forbids threading; the engines use it. Do you want a carve-out, or a conversion? It's your call because of the engine-authorization rule. ✅ Everywhere outside the engines it is gone (2026-10-05). The log record's `thread_id` and the hook and arg snowflake seeds now take the process id: on a one-thread asyncio process that is the writer's identity, and on Linux the main thread's id *is* the pid. An unused import and an unread attribute were deleted. Lint `test_no_threading` holds it at zero, engines excepted until you decide.
-- **Security defaults** (P8): the weak-secret escape hatch and the engine TLS-verify knob change behavior for users.
+- **✅ Security defaults (P8): decided and implemented 2026-10-06.** Weak secrets refused everywhere; the per-user cluster cookie (`hyperscale/commands/run/cluster_cookie.py`) backs `--acm-secret` / `MERCURY_SYNC_AUTH_SECRET`; `LocalRunner`/`ServerRunner` generate a per-run secret (`core/jobs/runner/run_secret.py`). Engine TLS verification is still to implement.
+  - **Cluster secret.** Today `Env.MERCURY_SYNC_AUTH_SECRET` defaults to `"hyperscale-secret"`, a published value on the weak list, which only warns outside `HYPERSCALE_ENV=production`. Every unconfigured cluster therefore authenticates with a public key, and by-value workflows mean that key admits code execution.
+    - Decision: refuse weak secrets everywhere (the production-only escape hatch goes) and remove the published default.
+    - A node with no secret configured uses a per-user cluster cookie, the Erlang `~/.erlang.cookie` model: 32 random bytes from `secrets`, created once with mode 0600 under the user's config directory. Nodes of one user on one host share it with zero configuration, and multi-host clusters distribute it or set `MERCURY_SYNC_AUTH_SECRET`.
+    - When the cookie cannot be created, the command fails with that instruction rather than running unauthenticated (no substrate assumptions).
+    - Tests pass explicit test secrets.
+  - **Engine TLS verification.** Every engine client sets `check_hostname = False` and `CERT_NONE`. Decision: verify by default (RFC 9110 §4.3.4; k6, the comparator, verifies by default and has `insecureSkipTLSVerify`), with an explicit per-workflow opt-out for self-signed staging targets. The handshake cost is the same one k6 pays.
 - **`RETRY_BUDGET_DEFAULT`** 10 vs 20, and the late-result policy (P-AD44-1). I'll propose both with measurements in Phase 3; you confirm.
 - **E2E tests to run:** `tests/integration/cli/test_cli_leader_leases.py` and `tests/integration/cli/test_cli_gate_follows_manager_resize.py`.

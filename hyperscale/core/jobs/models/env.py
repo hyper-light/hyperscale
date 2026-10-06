@@ -17,7 +17,11 @@ class Env(BaseModel):
     MERCURY_SYNC_CONNECT_SECONDS: StrictStr = "30s"
     MERCURY_SYNC_CLEANUP_INTERVAL: StrictStr = "1m"
     MERCURY_SYNC_MAX_CONCURRENCY: StrictInt = 2048
-    MERCURY_SYNC_AUTH_SECRET: StrictStr = "hyperscale-secret"
+    # No default: a published default would let anyone who read it run code
+    # on an unconfigured cluster. Every node must be given one strong, random
+    # secret (MERCURY_SYNC_AUTH_SECRET or --acm-secret); the encryptor refuses
+    # None, short and known-weak values.
+    MERCURY_SYNC_AUTH_SECRET: StrictStr | None = None
     MERCURY_SYNC_AUTH_SECRET_PREVIOUS: StrictStr | None = None  # For key rotation
     MERCURY_SYNC_LOGS_DIRECTORY: StrictStr = os.getcwd()
     MERCURY_SYNC_REQUEST_TIMEOUT: StrictStr = "1s"

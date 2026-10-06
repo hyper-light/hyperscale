@@ -15,6 +15,10 @@ from hyperscale.logging.config import LoggingConfig
 from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.nodes.worker import WorkerServer
 
+# Every node and client of this test shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 
 async def validte_worker_startup_phases():
     """Test worker startup in phases to find where it hangs."""
@@ -22,7 +26,7 @@ async def validte_worker_startup_phases():
     # Setup logging
     LoggingConfig().update(log_directory=os.getcwd(), log_level="debug")
     
-    env = Env()
+    env = Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET)
     
     # Set WORKER_MAX_CORES via env
     env.WORKER_MAX_CORES = 2

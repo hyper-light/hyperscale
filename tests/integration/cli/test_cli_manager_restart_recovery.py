@@ -31,6 +31,7 @@ from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client import HyperscaleClient
 from hyperscale.graph import Workflow, step
 from tests.integration.cli.node_processes import (
+    CLI_TEST_AUTH_SECRET,
     BOOT_TIMEOUT_SECONDS,
     LOCALHOST,
     NODE_BLOCK,
@@ -88,7 +89,7 @@ async def test_restarted_manager_resumes_job_from_its_data_directory(run_marker:
     client = HyperscaleClient(
         host=LOCALHOST,
         port=client_start,
-        env=Env(),
+        env=Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET),
         managers=[(LOCALHOST, first_manager.tcp_port)],
     )
     try:

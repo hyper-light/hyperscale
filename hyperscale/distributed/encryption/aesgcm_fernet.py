@@ -1,9 +1,7 @@
 """``AESGCMFernet`` -- pickled under the namespace
 ``hyperscale.distributed.encryption.aes_gcm`` (see that module)."""
 
-import os
 import secrets
-import warnings
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -44,10 +42,37 @@ WEAK_SECRETS = frozenset([
 ])
 
 
-def _is_production() -> bool:
-    """Check if running in production mode."""
-    env_val = os.environ.get('HYPERSCALE_ENV', '').lower()
-    return env_val in ('production', 'prod')
+MISSING_SECRET_MESSAGE = (
+    "MERCURY_SYNC_AUTH_SECRET is not set. Every node of a cluster must share one strong, "
+    "random secret: set the MERCURY_SYNC_AUTH_SECRET environment variable or pass --acm-secret "
+    "(generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\")."
+)
+
+
+def strong_secret_bytes(setting_name: str, secret: str) -> bytes:
+    """The UTF-8 bytes of ``secret``, refused when it is too short or a
+    known weak/default value -- whatever ``HYPERSCALE_ENV`` says, since the
+    secret is the only thing standing between the network and code
+    execution on every node.
+
+    Raises:
+        ValueError: ``secret`` is shorter than ``MIN_SECRET_LENGTH`` bytes
+            or is one of ``WEAK_SECRETS``.
+    """
+    secret_bytes = secret.encode("utf-8")
+    if len(secret_bytes) < MIN_SECRET_LENGTH:
+        raise ValueError(
+            f"{setting_name} must be at least {MIN_SECRET_LENGTH} characters. "
+            "Use a strong, random secret (python -c \"import secrets; print(secrets.token_urlsafe(32))\")."
+        )
+
+    if secret.strip().lower() in WEAK_SECRETS:
+        raise ValueError(
+            f"{setting_name} is set to a known weak/default value and is refused. "
+            "Use a strong, random secret (python -c \"import secrets; print(secrets.token_urlsafe(32))\")."
+        )
+
+    return secret_bytes
 
 
 class AESGCMFernet:
@@ -75,65 +100,18 @@ class AESGCMFernet:
     __slots__ = ('_secret_bytes', '_fallback_secret_bytes')
     
     def __init__(self, env: Env) -> None:
-        is_production = _is_production()
-        
-        # Convert secret to bytes and validate minimum length
         secret = env.MERCURY_SYNC_AUTH_SECRET
-        if isinstance(secret, str):
-            self._secret_bytes = secret.encode('utf-8')
-        else:
-            self._secret_bytes = secret
-            
-        # Validate secret has sufficient entropy
-        if len(self._secret_bytes) < MIN_SECRET_LENGTH:
-            raise ValueError(
-                f"MERCURY_SYNC_AUTH_SECRET must be at least {MIN_SECRET_LENGTH} characters. "
-                "Use a strong, random secret for production deployments."
-            )
-        
-        # Check for weak/default secrets
-        secret_lower = secret.lower() if isinstance(secret, str) else secret.decode('utf-8', errors='ignore').lower()
-        if secret_lower in WEAK_SECRETS:
-            if is_production:
-                raise ValueError(
-                    f"MERCURY_SYNC_AUTH_SECRET is set to a known weak/default value. "
-                    "This is not allowed in production. Set a strong, random secret."
-                )
-            else:
-                warnings.warn(
-                    f"MERCURY_SYNC_AUTH_SECRET is set to a weak/default value '{secret_lower}'. "
-                    "This is acceptable for development but must be changed for production.",
-                    UserWarning
-                )
-        
-        # Handle fallback secret for key rotation
-        fallback_secret = env.MERCURY_SYNC_AUTH_SECRET_PREVIOUS
-        if fallback_secret:
-            if isinstance(fallback_secret, str):
-                self._fallback_secret_bytes = fallback_secret.encode('utf-8')
-            else:
-                self._fallback_secret_bytes = fallback_secret
-            
-            if len(self._fallback_secret_bytes) < MIN_SECRET_LENGTH:
-                raise ValueError(
-                    f"MERCURY_SYNC_AUTH_SECRET_PREVIOUS must be at least {MIN_SECRET_LENGTH} characters."
-                )
-            
-            # Check for weak fallback secrets
-            fallback_lower = fallback_secret.lower() if isinstance(fallback_secret, str) else fallback_secret.decode('utf-8', errors='ignore').lower()
-            if fallback_lower in WEAK_SECRETS:
-                if is_production:
-                    raise ValueError(
-                        f"MERCURY_SYNC_AUTH_SECRET_PREVIOUS is set to a known weak/default value. "
-                        "This is not allowed in production."
-                    )
-                else:
-                    warnings.warn(
-                        f"MERCURY_SYNC_AUTH_SECRET_PREVIOUS is set to a weak/default value '{fallback_lower}'.",
-                        UserWarning
-                    )
-        else:
-            self._fallback_secret_bytes = None
+        if secret is None:
+            raise ValueError(MISSING_SECRET_MESSAGE)
+
+        self._secret_bytes = strong_secret_bytes("MERCURY_SYNC_AUTH_SECRET", secret)
+
+        previous_secret = env.MERCURY_SYNC_AUTH_SECRET_PREVIOUS
+        self._fallback_secret_bytes: bytes | None = (
+            strong_secret_bytes("MERCURY_SYNC_AUTH_SECRET_PREVIOUS", previous_secret)
+            if previous_secret
+            else None
+        )
 
     def _derive_key(self, salt: bytes, secret_bytes: bytes) -> bytes:
         """

@@ -650,36 +650,8 @@ class WorkerServer(HealthAwareServer):
         # Start parent server. The base server exposes `start_server`, not
         # `start`; the manager calls it directly on self for the same reason.
 
-        if self._config.event_log_dir is not None:
-            self._event_logger = Logger()
-            self._event_logger.configure(
-                name="worker_events",
-                path=str(self._config.event_log_dir / "events.jsonl"),
-                durability=DurabilityMode.FLUSH,
-                log_format="json",
-                retention_policy={
-                    "max_size": "50MB",
-                    "max_age": "24h",
-                },
-            )
-            await self._event_logger.log(
-                WorkerStarted(
-                    message="Worker started",
-                    node_id=self._node_id.full,
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    manager_host=self._seed_managers[0][0]
-                    if self._seed_managers
-                    else None,
-                    manager_port=self._seed_managers[0][1]
-                    if self._seed_managers
-                    else None,
-                ),
-                name="worker_events",
-            )
+        await self._start_event_logger()
 
-            self._workflow_executor.set_event_logger(self._event_logger)
-        
         await self.start_server(init_context=self.env.get_swim_init_context())
 
         # Restore (or create) this node's persisted incarnation so a
@@ -720,11 +692,7 @@ class WorkerServer(HealthAwareServer):
         # Connect to workers
         await self._lifecycle_manager.connect_to_workers(timeout)
         process_exitcodes = self._lifecycle_manager.get_server_pool_process_exitcodes()
-        self._known_worker_pool_process_ids = {
-            process_id
-            for process_id, exitcode in process_exitcodes.items()
-            if exitcode is None
-        }
+        self._known_worker_pool_process_ids = self._live_pool_process_ids(process_exitcodes)
 
         registration_jitter_max_seconds = (
             self._config.initial_registration_jitter_max_seconds
@@ -768,6 +736,43 @@ class WorkerServer(HealthAwareServer):
             )
         )
 
+    async def _start_event_logger(self) -> None:
+        """Open the worker's JSONL event log, when configured, and record the start."""
+        if self._config.event_log_dir is None:
+            return
+        self._event_logger = Logger()
+        self._event_logger.configure(
+            name="worker_events",
+            path=str(self._config.event_log_dir / "events.jsonl"),
+            durability=DurabilityMode.FLUSH,
+            log_format="json",
+            retention_policy={
+                "max_size": "50MB",
+                "max_age": "24h",
+            },
+        )
+        await self._event_logger.log(
+            self._worker_started_event(),
+            name="worker_events",
+        )
+
+        self._workflow_executor.set_event_logger(self._event_logger)
+
+    def _worker_started_event(self) -> WorkerStarted:
+        """The worker-started event, naming the first seed manager when there is one."""
+        return WorkerStarted(
+            message="Worker started",
+            node_id=self._node_id.full,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            manager_host=self._seed_managers[0][0]
+            if self._seed_managers
+            else None,
+            manager_port=self._seed_managers[0][1]
+            if self._seed_managers
+            else None,
+        )
+
     async def stop(
         self, drain_timeout: float = 5, broadcast_leave: bool = True
     ) -> None:
@@ -793,10 +798,30 @@ class WorkerServer(HealthAwareServer):
 
         self._running = False
 
-        if drain_timeout <= 0:
-            await self.abort_and_wait()
+        if not await self._stop_within_drain_timeout(drain_timeout):
             return
 
+        await super().stop(drain_timeout=0.0, broadcast_leave=False)
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message="Worker stopped",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _stop_within_drain_timeout(self, drain_timeout: float) -> bool:
+        """Stop local resources within ``drain_timeout``; False when it aborted instead."""
+        if drain_timeout <= 0:
+            await self.abort_and_wait()
+            return False
+
+        return await self._drain_after_leave(drain_timeout)
+
+    async def _drain_after_leave(self, drain_timeout: float) -> bool:
+        """Run the post-leave teardown under ``drain_timeout``, aborting on expiry; whether it finished."""
         try:
             await self._clock.wait_for(
                 self._stop_after_leave(),
@@ -815,25 +840,19 @@ class WorkerServer(HealthAwareServer):
                 )
             )
             await self.abort_and_wait()
-            return
+            return False
+        return True
 
-        await super().stop(drain_timeout=0.0, broadcast_leave=False)
-
-        await self._udp_logger.log(
-            ServerInfo(
-                message="Worker stopped",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
-        )
+    def _has_cluster_connection(self) -> bool:
+        """Whether the cluster-connection state machine was built (absent on a partial init)."""
+        return hasattr(self, "_cluster_connection") and self._cluster_connection is not None
 
     async def _stop_after_leave(self) -> None:
         """Stop worker-local resources after membership leave has been sent."""
         # Tear down the cluster-connection state machine first so any
         # in-flight rejoin task is cancelled before the rest of the
         # shutdown begins to dismantle dependent state.
-        if hasattr(self, "_cluster_connection") and self._cluster_connection is not None:
+        if self._has_cluster_connection():
             await self._cluster_connection.stop()
         if hasattr(self, "_manager_membership_watch"):
             self._manager_membership_watch.stop()
@@ -872,11 +891,19 @@ class WorkerServer(HealthAwareServer):
         )
         await self._event_logger.close()
 
+    def _cores_notification_task_live(self) -> bool:
+        """Whether a cores-available notification task exists and has not finished."""
+        return bool(self._cores_notification_task) and not self._cores_notification_task.done()
+
     async def _cancel_cores_notification_task(self) -> None:
-        if not self._cores_notification_task or self._cores_notification_task.done():
+        if not self._cores_notification_task_live():
             return
         self._cores_notification_task.cancel()
         cancels_requested_before_wait = asyncio.current_task().cancelling()
+        await self._await_cancelled_cores_notification_task(cancels_requested_before_wait)
+
+    async def _await_cancelled_cores_notification_task(self, cancels_requested_before_wait: int) -> None:
+        """Wait out the cancelled notification task, re-raising only a cancel aimed at this task."""
         try:
             await self._cores_notification_task
         except asyncio.CancelledError:
@@ -919,7 +946,7 @@ class WorkerServer(HealthAwareServer):
         # Cancel background tasks synchronously
         self._lifecycle_manager.cancel_background_tasks_sync()
 
-        if self._cores_notification_task and not self._cores_notification_task.done():
+        if self._cores_notification_task_live():
             self._cores_notification_task.cancel()
 
         # Mark the cluster-connection lifecycle stopped so any
@@ -927,7 +954,7 @@ class WorkerServer(HealthAwareServer):
         # check. We cannot ``await stop()`` from sync abort, but
         # setting ``_running = False`` is enough — the rejoin loop
         # checks it on every iteration.
-        if hasattr(self, "_cluster_connection") and self._cluster_connection is not None:
+        if self._has_cluster_connection():
             self._cluster_connection._running = False
 
         # Abort modules
@@ -1070,49 +1097,75 @@ class WorkerServer(HealthAwareServer):
         send_tcp: SendTcp,
     ) -> None:
         while self._running:
-            try:
-                # Wake when the soonest pending result is due (a refusal's
-                # retry-after can be sooner than any backoff step); with no
-                # manager reachable, nothing is sent, so the backoff base.
-                wait_seconds = self._config.result_retry_base_delay_seconds
-                if get_healthy_managers():
-                    await self._progress_reporter.retry_pending_results(
-                        send_tcp=send_tcp,
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id_short=self._node_id.short,
-                        task_runner_run=self._task_runner.run,
-                    )
-                    wait_seconds = self._progress_reporter.seconds_until_next_result_retry(
-                        self._clock.monotonic()
-                    )
-                await self._clock.sleep(wait_seconds)
-            except asyncio.CancelledError:
+            if not await self._pending_result_retry_iteration(get_healthy_managers, send_tcp):
                 break
-            except Exception as exc:
-                await self._udp_logger.log(
-                    ServerDebug(
-                        message=f"Pending result retry failed: {type(exc).__name__}: {exc}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
+
+    async def _pending_result_retry_iteration(
+        self,
+        get_healthy_managers: Callable[[], set[str]],
+        send_tcp: SendTcp,
+    ) -> bool:
+        """One pending-result retry pass and its wait; False once cancelled."""
+        try:
+            await self._retry_pending_results_once(get_healthy_managers, send_tcp)
+            return True
+        except asyncio.CancelledError:
+            return False
+        except Exception as exc:
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Pending result retry failed: {type(exc).__name__}: {exc}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
                 )
-                await self._clock.sleep(self._config.result_retry_base_delay_seconds)
+            )
+            await self._clock.sleep(self._config.result_retry_base_delay_seconds)
+            return True
+
+    async def _retry_pending_results_once(
+        self,
+        get_healthy_managers: Callable[[], set[str]],
+        send_tcp: SendTcp,
+    ) -> None:
+        """Retry due pending results while a manager is reachable, then sleep until the next is due."""
+        # Wake when the soonest pending result is due (a refusal's
+        # retry-after can be sooner than any backoff step); with no
+        # manager reachable, nothing is sent, so the backoff base.
+        wait_seconds = self._config.result_retry_base_delay_seconds
+        if get_healthy_managers():
+            await self._progress_reporter.retry_pending_results(
+                send_tcp=send_tcp,
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id_short=self._node_id.short,
+                task_runner_run=self._task_runner.run,
+            )
+            wait_seconds = self._progress_reporter.seconds_until_next_result_retry(
+                self._clock.monotonic()
+            )
+        await self._clock.sleep(wait_seconds)
 
     async def _run_resource_sample_loop(self) -> None:
         while self._running:
-            try:
-                await self._resource_monitor.sample()
-                await self._clock.sleep(1.0)
-            except asyncio.CancelledError:
+            if not await self._resource_sample_iteration():
                 break
-            except Exception as exc:
-                await self._udp_logger.log(
-                    f"Resource sampling failed: {exc}",
-                    level="debug",
-                )
-                await self._clock.sleep(1.0)
+
+    async def _resource_sample_iteration(self) -> bool:
+        """One resource sample and its one-second wait; False once cancelled."""
+        try:
+            await self._resource_monitor.sample()
+            await self._clock.sleep(1.0)
+            return True
+        except asyncio.CancelledError:
+            return False
+        except Exception as exc:
+            await self._udp_logger.log(
+                f"Resource sampling failed: {exc}",
+                level="debug",
+            )
+            await self._clock.sleep(1.0)
+            return True
 
     async def _run_manager_rejoin_watch_loop(self) -> None:
         """Re-register when a manager RESTARTS under us.
@@ -1129,48 +1182,34 @@ class WorkerServer(HealthAwareServer):
         registration overwrites).
         """
         while self._running:
-            try:
-                await self._check_manager_rejoins()
-                await self._clock.sleep(2.0)
-            except asyncio.CancelledError:
+            if not await self._manager_rejoin_watch_iteration():
                 break
-            except Exception as watch_error:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=(
-                            "Manager rejoin watch iteration failed: "
-                            f"{watch_error}"
-                        ),
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
+
+    async def _manager_rejoin_watch_iteration(self) -> bool:
+        """One manager-restart check and its two-second wait; False once cancelled."""
+        try:
+            await self._check_manager_rejoins()
+            await self._clock.sleep(2.0)
+            return True
+        except asyncio.CancelledError:
+            return False
+        except Exception as watch_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        "Manager rejoin watch iteration failed: "
+                        f"{watch_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
                 )
-                await self._clock.sleep(2.0)
+            )
+            await self._clock.sleep(2.0)
+            return True
 
     async def _check_manager_rejoins(self) -> None:
-        rejoin_bump = self._incarnation_tracker.minimum_rejoin_incarnation_bump
-        rejoined_managers: list[tuple[str, int]] = []
-
-        for manager in self._registry.get_known_manager_values():
-            if not manager.udp_host or not manager.udp_port:
-                continue
-            manager_udp_addr = (manager.udp_host, manager.udp_port)
-            current_incarnation = self._incarnation_tracker.get_node_incarnation(
-                manager_udp_addr
-            )
-            previous_incarnation = self._manager_incarnations_seen.get(
-                manager_udp_addr
-            )
-            self._manager_incarnations_seen[manager_udp_addr] = (
-                current_incarnation
-            )
-            if (
-                previous_incarnation is not None
-                and current_incarnation
-                >= previous_incarnation + rejoin_bump
-            ):
-                rejoined_managers.append(manager_udp_addr)
+        rejoined_managers = self._collect_rejoined_managers()
 
         if not rejoined_managers:
             return
@@ -1189,47 +1228,110 @@ class WorkerServer(HealthAwareServer):
         )
         await self.refresh_manager_registrations()
 
+    def _collect_rejoined_managers(self) -> list[tuple[str, int]]:
+        """UDP addresses of known managers whose incarnation jumped by a restart's rejoin bump."""
+        rejoin_bump = self._incarnation_tracker.minimum_rejoin_incarnation_bump
+        rejoined_managers: list[tuple[str, int]] = []
+
+        for manager in self._registry.get_known_manager_values():
+            if self._observe_manager_incarnation(manager, rejoin_bump):
+                rejoined_managers.append((manager.udp_host, manager.udp_port))
+        return rejoined_managers
+
+    def _observe_manager_incarnation(self, manager: ManagerInfo, rejoin_bump: int) -> bool:
+        """Record a manager's current incarnation; whether it jumped by at least ``rejoin_bump``."""
+        if not manager.udp_host or not manager.udp_port:
+            return False
+        manager_udp_addr = (manager.udp_host, manager.udp_port)
+        current_incarnation = self._incarnation_tracker.get_node_incarnation(
+            manager_udp_addr
+        )
+        previous_incarnation = self._manager_incarnations_seen.get(
+            manager_udp_addr
+        )
+        self._manager_incarnations_seen[manager_udp_addr] = (
+            current_incarnation
+        )
+        return self._is_restart_jump(previous_incarnation, current_incarnation, rejoin_bump)
+
+    @staticmethod
+    def _is_restart_jump(previous_incarnation: int | None, current_incarnation: int, rejoin_bump: int) -> bool:
+        """Whether an incarnation moved by a restart's rejoin bump since last seen."""
+        return (
+            previous_incarnation is not None
+            and current_incarnation
+            >= previous_incarnation + rejoin_bump
+        )
+
     async def _run_worker_pool_health_loop(self) -> None:
         """Fail active workflows when a local runner process exits mid-flight."""
         while self._running:
-            try:
-                await self._check_worker_pool_health()
-                await self._clock.sleep(0.25)
-            except asyncio.CancelledError:
+            if not await self._worker_pool_health_iteration():
                 break
-            except Exception as exc:
-                await self._udp_logger.log(
-                    f"Worker pool health check failed: {exc}",
-                    level="debug",
-                )
-                await self._clock.sleep(1.0)
+
+    async def _worker_pool_health_iteration(self) -> bool:
+        """One worker-pool health check and its wait; False once cancelled."""
+        try:
+            await self._check_worker_pool_health()
+            await self._clock.sleep(0.25)
+            return True
+        except asyncio.CancelledError:
+            return False
+        except Exception as exc:
+            await self._udp_logger.log(
+                f"Worker pool health check failed: {exc}",
+                level="debug",
+            )
+            await self._clock.sleep(1.0)
+            return True
 
     async def _check_worker_pool_health(self) -> None:
         process_exitcodes = self._lifecycle_manager.get_server_pool_process_exitcodes()
-        live_process_ids = {
+        live_process_ids = self._live_pool_process_ids(process_exitcodes)
+
+        if not self._active_workflows or not self._known_worker_pool_process_ids:
+            self._known_worker_pool_process_ids = live_process_ids
+            return
+
+        await self._handle_exited_pool_processes(process_exitcodes, live_process_ids)
+
+    @staticmethod
+    def _live_pool_process_ids(process_exitcodes: dict[int | str, int | None]) -> set[int | str]:
+        """The pool processes that have not exited."""
+        return {
             process_id
             for process_id, exitcode in process_exitcodes.items()
             if exitcode is None
         }
 
-        if not self._active_workflows:
-            self._known_worker_pool_process_ids = live_process_ids
-            return
-
-        if not self._known_worker_pool_process_ids:
-            self._known_worker_pool_process_ids = live_process_ids
-            return
-
-        exited_process_ids = {
+    def _vanished_pool_process_ids(self, live_process_ids: set[int | str]) -> set[int | str]:
+        """Known pool processes no longer alive."""
+        return {
             process_id
             for process_id in self._known_worker_pool_process_ids
             if process_id not in live_process_ids
         }
-        exited_process_ids.update(
+
+    @staticmethod
+    def _exited_pool_process_codes(process_exitcodes: dict[int | str, int | None]) -> set[int | str]:
+        """The pool processes reporting an exit code."""
+        return {
             process_id
             for process_id, exitcode in process_exitcodes.items()
-            if process_id in self._known_worker_pool_process_ids
-            and exitcode is not None
+            if exitcode is not None
+        }
+
+    async def _handle_exited_pool_processes(
+        self,
+        process_exitcodes: dict[int | str, int | None],
+        live_process_ids: set[int | str],
+    ) -> None:
+        """Degrade and fail the active workflows when a known pool process exited."""
+        exited_process_ids = self._vanished_pool_process_ids(live_process_ids)
+        exited_process_ids.update(
+            self._known_worker_pool_process_ids.intersection(
+                self._exited_pool_process_codes(process_exitcodes)
+            )
         )
 
         if not exited_process_ids:
@@ -1269,11 +1371,7 @@ class WorkerServer(HealthAwareServer):
     ) -> None:
         fence_token = await self._worker_state.get_workflow_fence_token(workflow_id)
         job_leader_addr = self._worker_state.get_workflow_job_leader(workflow_id)
-        workflow_name = (
-            progress.workflow_name
-            or self._worker_state._workflow_id_to_name.get(workflow_id)
-            or workflow_id
-        )
+        workflow_name = self._workflow_display_name(workflow_id, progress)
 
         progress.status = WorkflowStatus.FAILED.value
         await self._core_allocator.free(workflow_id)
@@ -1307,6 +1405,14 @@ class WorkerServer(HealthAwareServer):
         if workflow_token is not None:
             await self._task_runner.cancel(workflow_token)
 
+    def _workflow_display_name(self, workflow_id: str, progress: WorkflowProgress) -> str:
+        """A workflow's name from its progress, else the dispatch record, else its id."""
+        return (
+            progress.workflow_name
+            or self._worker_state._workflow_id_to_name.get(workflow_id)
+            or workflow_id
+        )
+
     async def _stop_background_loops(self) -> None:
         """Stop all background loops."""
         await self._lifecycle_manager.cancel_background_tasks()
@@ -1321,6 +1427,10 @@ class WorkerServer(HealthAwareServer):
             return WorkerStateEnum.OFFLINE
         if self._stopping:
             return WorkerStateEnum.DRAINING
+        return self._worker_state_for_degradation()
+
+    def _worker_state_for_degradation(self) -> WorkerStateEnum:
+        """A running worker's state by degradation level: DRAINING at 3+, DEGRADED at 2, else HEALTHY."""
         if self._degradation.current_level.value >= 3:
             return WorkerStateEnum.DRAINING
         if self._degradation.current_level.value >= 2:
@@ -1363,23 +1473,30 @@ class WorkerServer(HealthAwareServer):
             )
             if not start_time:
                 continue
-            runtimes.append(
-                WorkflowRuntimeState(
-                    workflow_id=workflow_id,
-                    job_id=progress.job_id,
-                    status=progress.status,
-                    allocated_cores=progress.worker_workflow_assigned_cores or 0,
-                    fence_token=self._worker_state._workflow_fence_tokens.get(
-                        workflow_id, -1
-                    ),
-                    start_time=start_time,
-                    cores_completed=progress.cores_completed,
-                    vus=progress.vus,
-                    step_transitions=0,
-                    actions_completed=progress.completed_count,
-                )
-            )
+            runtimes.append(self._workflow_runtime_state(workflow_id, progress, start_time))
         return runtimes
+
+    def _workflow_runtime_state(
+        self,
+        workflow_id: str,
+        progress: WorkflowProgress,
+        start_time: float,
+    ) -> WorkflowRuntimeState:
+        """One active workflow in the H4 ``WorkflowRuntimeState`` shape."""
+        return WorkflowRuntimeState(
+            workflow_id=workflow_id,
+            job_id=progress.job_id,
+            status=progress.status,
+            allocated_cores=progress.worker_workflow_assigned_cores or 0,
+            fence_token=self._worker_state._workflow_fence_tokens.get(
+                workflow_id, -1
+            ),
+            start_time=start_time,
+            cores_completed=progress.cores_completed,
+            vus=progress.vus,
+            step_transitions=0,
+            actions_completed=progress.completed_count,
+        )
 
     def _get_heartbeat(self) -> WorkerHeartbeat:
         """
@@ -1571,6 +1688,12 @@ class WorkerServer(HealthAwareServer):
             del self._pending_transfers[job_id]
             return
 
+        await self._apply_pending_transfer_if_listed(job_id, workflow_id, pending)
+
+    async def _apply_pending_transfer_if_listed(
+        self, job_id: str, workflow_id: str, pending: PendingTransfer
+    ) -> None:
+        """Apply a pending transfer (Section 8.3) to a workflow it names, then drop it once complete."""
         if workflow_id not in pending.workflow_ids:
             return
 
@@ -1602,13 +1725,21 @@ class WorkerServer(HealthAwareServer):
     def _cleanup_pending_transfer_if_complete(
         self, job_id: str, workflow_id: str, pending: PendingTransfer
     ) -> None:
-        remaining_workflows = [
-            wf_id
-            for wf_id in pending.workflow_ids
-            if wf_id not in self._active_workflows and wf_id != workflow_id
-        ]
+        remaining_workflows = self._remaining_transfer_workflows(workflow_id, pending)
         if not remaining_workflows:
             del self._pending_transfers[job_id]
+
+    def _remaining_transfer_workflows(self, workflow_id: str, pending: PendingTransfer) -> list[str]:
+        """The transfer's workflows, other than ``workflow_id``, not yet active here."""
+        return [
+            wf_id
+            for wf_id in pending.workflow_ids
+            if self._is_transfer_workflow_remaining(wf_id, workflow_id)
+        ]
+
+    def _is_transfer_workflow_remaining(self, transfer_workflow_id: str, workflow_id: str) -> bool:
+        """Whether a transfer's workflow is neither active here nor ``workflow_id``."""
+        return transfer_workflow_id not in self._active_workflows and transfer_workflow_id != workflow_id
 
     # =========================================================================
     # Registration Methods
@@ -1651,12 +1782,13 @@ class WorkerServer(HealthAwareServer):
         """
         has_healthy = bool(self._registry._healthy_manager_ids)
         has_seeds = bool(self._seed_managers)
-        task_running = (
-            self._manager_seed_recovery_task is not None
-            and not self._manager_seed_recovery_task.done()
-        )
+        task_running = self._seed_recovery_task_running()
 
-        if not has_healthy and has_seeds and not task_running and self._running:
+        if has_healthy:
+            self._cancel_running_seed_recovery(task_running)
+            return
+
+        if self._should_start_seed_recovery(has_seeds, task_running):
             self._manager_seed_recovery_task = self._create_background_task(
                 self._run_manager_seed_recovery(),
                 "manager_seed_recovery",
@@ -1664,8 +1796,22 @@ class WorkerServer(HealthAwareServer):
             self._lifecycle_manager.add_background_task(
                 self._manager_seed_recovery_task
             )
-        elif has_healthy and task_running:
+
+    def _seed_recovery_task_running(self) -> bool:
+        """Whether the seed-recovery task exists and has not finished."""
+        return (
+            self._manager_seed_recovery_task is not None
+            and not self._manager_seed_recovery_task.done()
+        )
+
+    def _cancel_running_seed_recovery(self, task_running: bool) -> None:
+        """Cancel the seed-recovery task once a manager is healthy again."""
+        if task_running:
             self._manager_seed_recovery_task.cancel()
+
+    def _should_start_seed_recovery(self, has_seeds: bool, task_running: bool) -> bool:
+        """Whether a running worker with no healthy manager should start retrying its seeds."""
+        return has_seeds and not task_running and self._running
 
     async def _run_manager_seed_recovery(self) -> None:
         """Retry ``refresh_manager_registrations`` until a manager accepts.
@@ -1689,32 +1835,52 @@ class WorkerServer(HealthAwareServer):
         backoff_seconds = 0.0
         max_backoff_seconds = 10.0
         try:
-            while self._running:
-                if backoff_seconds > 0:
-                    await self._clock.sleep(backoff_seconds)
-                try:
-                    succeeded = await self.refresh_manager_registrations()
-                except Exception as refresh_error:
-                    succeeded = False
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=(
-                                f"Seed-recovery refresh raised: "
-                                f"{refresh_error}"
-                            ),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                if succeeded and self._registry._healthy_manager_ids:
-                    return
-                backoff_seconds = min(
-                    max_backoff_seconds,
-                    backoff_seconds * 2 if backoff_seconds > 0 else 1.0,
-                )
+            await self._retry_seed_registrations(backoff_seconds, max_backoff_seconds)
         except asyncio.CancelledError:
             return
+
+    async def _retry_seed_registrations(self, backoff_seconds: float, max_backoff_seconds: float) -> None:
+        """Refresh registrations with capped doubling backoff until a manager accepts or the worker stops."""
+        while self._running:
+            if (
+                backoff_seconds := await self._seed_recovery_round(backoff_seconds, max_backoff_seconds)
+            ) is None:
+                return
+
+    async def _seed_recovery_round(self, backoff_seconds: float, max_backoff_seconds: float) -> float | None:
+        """Wait out the backoff, then refresh; None once a manager accepted, else the next backoff."""
+        if backoff_seconds > 0:
+            await self._clock.sleep(backoff_seconds)
+        if await self._seed_recovery_refresh_succeeded():
+            return None
+        return self._next_seed_recovery_backoff(backoff_seconds, max_backoff_seconds)
+
+    async def _seed_recovery_refresh_succeeded(self) -> bool:
+        """Refresh every manager registration; whether one took and a manager is now healthy."""
+        try:
+            succeeded = await self.refresh_manager_registrations()
+        except Exception as refresh_error:
+            succeeded = False
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Seed-recovery refresh raised: "
+                        f"{refresh_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        return succeeded and bool(self._registry._healthy_manager_ids)
+
+    @staticmethod
+    def _next_seed_recovery_backoff(backoff_seconds: float, max_backoff_seconds: float) -> float:
+        """The next seed-recovery backoff: 1 s, then doubling, capped."""
+        return min(
+            max_backoff_seconds,
+            backoff_seconds * 2 if backoff_seconds > 0 else 1.0,
+        )
 
     def _manager_id_is_seed(self, manager_id: str) -> bool:
         """Return True iff ``manager_id`` is bound to a configured seed addr.
@@ -1798,9 +1964,7 @@ class WorkerServer(HealthAwareServer):
     async def refresh_manager_registrations(self) -> bool:
         """Refresh manager registration after a lifecycle-level connectivity change."""
         manager_addr_candidates = dict.fromkeys(self._seed_managers)
-        for manager in self._registry.get_known_manager_values():
-            if manager.tcp_host and manager.tcp_port:
-                manager_addr_candidates[(manager.tcp_host, manager.tcp_port)] = None
+        manager_addr_candidates.update(dict.fromkeys(self._known_manager_tcp_addrs()))
 
         # Issue register attempts concurrently. Serial iteration here
         # serialises a 5 s TCP timeout per dead candidate — with three
@@ -1826,6 +1990,18 @@ class WorkerServer(HealthAwareServer):
         self._cluster_connection.update()
         return registered_with_manager
 
+    def _known_manager_tcp_addrs(self) -> list[tuple[str, int]]:
+        """TCP addresses of every known manager that has one, in registry order."""
+        return [
+            (manager.tcp_host, manager.tcp_port)
+            for manager in filter(self._has_tcp_endpoint, self._registry.get_known_manager_values())
+        ]
+
+    @staticmethod
+    def _has_tcp_endpoint(manager: ManagerInfo) -> bool:
+        """Whether a manager record carries a TCP host and port."""
+        return manager.tcp_host and manager.tcp_port
+
     async def _send_registration(
         self,
         manager_addr: tuple[str, int],
@@ -1846,26 +2022,35 @@ class WorkerServer(HealthAwareServer):
             # answers) as a returned Exception, not a raised one.
             # Parsing it as a response turned every such failure into
             # "TypeError: a bytes-like object is required".
-            if isinstance(response, Exception):
-                self._record_manager_failure(manager_addr)
-                return response
-
-            accepted, _ = await self._process_manager_registration_response(
-                response
-            )
-            if not accepted:
-                self._record_manager_failure(manager_addr)
-                return RuntimeError(
-                    f"Manager {manager_addr} rejected worker registration"
-                )
-            self._record_manager_round_trip(
-                manager_addr,
-                self._clock.monotonic() - sent_at,
-            )
-            return response
+            return await self._settle_registration_response(manager_addr, response, sent_at)
         except Exception as error:
             self._record_manager_failure(manager_addr)
             return error
+
+    async def _settle_registration_response(
+        self,
+        manager_addr: tuple[str, int],
+        response: bytes | Exception,
+        sent_at: float,
+    ) -> bytes | Exception:
+        """Apply a registration answer: a transport error or refusal counts against the manager (AD-28)."""
+        if isinstance(response, Exception):
+            self._record_manager_failure(manager_addr)
+            return response
+
+        accepted, _ = await self._process_manager_registration_response(
+            response
+        )
+        if not accepted:
+            self._record_manager_failure(manager_addr)
+            return RuntimeError(
+                f"Manager {manager_addr} rejected worker registration"
+            )
+        self._record_manager_round_trip(
+            manager_addr,
+            self._clock.monotonic() - sent_at,
+        )
+        return response
 
     def _record_manager_round_trip(
         self,
@@ -1902,28 +2087,32 @@ class WorkerServer(HealthAwareServer):
         )
 
         if accepted and primary_manager_id:
-            # A successful registration round-trip is the strongest
-            # application-level liveness signal we get from a manager:
-            # the manager not only answered our TCP but accepted us
-            # into its worker registry. Record this as a heartbeat
-            # against every manager we now know is healthy so the
-            # cluster-connection watchdog does not immediately mark
-            # them stale before their first SWIM heartbeat arrives.
-            for manager_id in list(self._registry._healthy_manager_ids):
-                self._cluster_connection.record_heartbeat(manager_id)
-            await self._udp_logger.log(
-                ServerInfo(
-                    message=(
-                        "Registration accepted, primary manager: "
-                        f"{primary_manager_id[:8]}..."
-                    ),
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                ),
-            )
+            await self._on_registration_accepted(primary_manager_id)
 
         return accepted, primary_manager_id
+
+    async def _on_registration_accepted(self, primary_manager_id: str) -> None:
+        """Count an accepted registration as a heartbeat from every healthy manager, and log it."""
+        # A successful registration round-trip is the strongest
+        # application-level liveness signal we get from a manager:
+        # the manager not only answered our TCP but accepted us
+        # into its worker registry. Record this as a heartbeat
+        # against every manager we now know is healthy so the
+        # cluster-connection watchdog does not immediately mark
+        # them stale before their first SWIM heartbeat arrives.
+        for manager_id in list(self._registry._healthy_manager_ids):
+            self._cluster_connection.record_heartbeat(manager_id)
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    "Registration accepted, primary manager: "
+                    f"{primary_manager_id[:8]}..."
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
 
     def _get_memory_mb(self) -> int:
         """Get total memory in MB (via the machine-telemetry seam —
@@ -1992,7 +2181,10 @@ class WorkerServer(HealthAwareServer):
         if not manager_info:
             return
 
-        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+        self._orphan_workflows_led_by((manager_info.tcp_host, manager_info.tcp_port))
+
+    def _orphan_workflows_led_by(self, manager_addr: tuple[str, int]) -> None:
+        """Mark every workflow whose job leader is ``manager_addr`` orphaned."""
         for workflow_id, leader_addr in list(self._workflow_job_leader.items()):
             if leader_addr == manager_addr:
                 self._worker_state.mark_workflow_orphaned(workflow_id)
@@ -2018,28 +2210,8 @@ class WorkerServer(HealthAwareServer):
         await self._registry.mark_manager_healthy(manager_id)
 
         manager_info = self._registry.get_manager(manager_id)
-        if (
-            manager_info is not None
-            and manager_info.tcp_host
-            and manager_info.tcp_port
-        ):
-            manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
-            self._invalidate_tcp_client_transport(manager_addr)
-            self._registry.get_or_create_circuit_by_addr(manager_addr).reset()
-            try:
-                await self._register_with_manager(manager_addr)
-            except Exception as register_error:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=(
-                            f"Re-registration with recovered manager "
-                            f"{manager_id[:8]}... failed: {register_error}"
-                        ),
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
+        if manager_info is not None and self._has_tcp_endpoint(manager_info):
+            await self._reregister_with_recovered_manager(manager_id, manager_info)
 
         await self._udp_logger.log(
             ServerInfo(
@@ -2049,6 +2221,26 @@ class WorkerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+    async def _reregister_with_recovered_manager(self, manager_id: str, manager_info: ManagerInfo) -> None:
+        """Re-register with a recovered manager over a fresh transport and circuit, logging a failure."""
+        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+        self._invalidate_tcp_client_transport(manager_addr)
+        self._registry.get_or_create_circuit_by_addr(manager_addr).reset()
+        try:
+            await self._register_with_manager(manager_addr)
+        except Exception as register_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Re-registration with recovered manager "
+                        f"{manager_id[:8]}... failed: {register_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     def _on_peer_confirmed(self, peer: tuple[str, int]) -> None:
         """
@@ -2184,6 +2376,10 @@ class WorkerServer(HealthAwareServer):
         if not manager_addr:
             return
 
+        await self._send_cores_available_heartbeat(manager_addr)
+
+    async def _send_cores_available_heartbeat(self, manager_addr: tuple[str, int]) -> None:
+        """Send the primary manager a heartbeat announcing freed cores, logging a failure."""
         try:
             heartbeat = self._get_heartbeat()
             response, _ = await self.send_tcp(
@@ -2310,6 +2506,12 @@ class WorkerServer(HealthAwareServer):
         if reason == SERVER_SHUTDOWN_CANCELLATION_REASON:
             return (success, errors)
 
+        self._report_cancellation_complete(workflow_id, success, errors)
+
+        return (success, errors)
+
+    def _report_cancellation_complete(self, workflow_id: str, success: bool, errors: list[str]) -> None:
+        """Push a workflow's cancellation completion to its manager, when its job is known."""
         # Push cancellation complete to manager (fire-and-forget via task runner)
         progress = self._active_workflows.get(workflow_id)
         if progress and progress.job_id:
@@ -2326,8 +2528,6 @@ class WorkerServer(HealthAwareServer):
                 self._tcp_port,
                 self._node_id.short,
             )
-
-        return (success, errors)
 
     async def get_workflows_on_cores(self, core_indices: list[int]) -> set[str]:
         """Get workflows running on specific cores."""
@@ -2528,42 +2728,69 @@ class WorkerServer(HealthAwareServer):
         # job's explicit timeout stands. The latched workflow id names
         # the workflow the request was for; best-effort if it already
         # drained.
-        worker_state = self._worker_state
-        if (
-            response.granted
-            and response.extension_seconds > 0
-            and (
-                worker_state._extension_current_progress > 0.0
-                or (worker_state._extension_completed_items or 0) > 0
-                or worker_state._extension_step_transitions > 0
-                or worker_state._extension_actions_completed > 0
-            )
-        ):
+        self._extend_granted_workflow_deadline(response)
+
+        self.clear_extension_request()
+        await self._log_extension_decision(response)
+        return b"ok"
+
+    def _extend_granted_workflow_deadline(self, response: HealthcheckExtensionResponse) -> None:
+        """Stretch the latched workflow's local deadline by a progress-backed AD-26 grant."""
+        if self._is_progress_backed_grant(response):
             granted_workflow_id = self._worker_state._extension_workflow_id
             if granted_workflow_id:
                 self._worker_state.extend_workflow_timeout(
                     granted_workflow_id, response.extension_seconds
                 )
 
-        self.clear_extension_request()
+    def _is_progress_backed_grant(self, response: HealthcheckExtensionResponse) -> bool:
+        """Whether a positive grant answers a request that reported progress (AD-26, AD-34)."""
+        return (
+            response.granted
+            and response.extension_seconds > 0
+            and self._has_extension_progress()
+        )
+
+    def _has_extension_progress(self) -> bool:
+        """Whether the latched extension request reported any advanced progress dimension."""
+        worker_state = self._worker_state
+        return (
+            self._has_extension_progress_counts()
+            or worker_state._extension_step_transitions > 0
+            or worker_state._extension_actions_completed > 0
+        )
+
+    def _has_extension_progress_counts(self) -> bool:
+        """Whether the latched request reported progress or completed items."""
+        worker_state = self._worker_state
+        return (
+            worker_state._extension_current_progress > 0.0
+            or (worker_state._extension_completed_items or 0) > 0
+        )
+
+    async def _log_extension_decision(self, response: HealthcheckExtensionResponse) -> None:
+        """Record the manager's extension decision in the event log, when one is open."""
         if self._event_logger is not None:
             await self._event_logger.log(
-                WorkerExtensionDecision(
-                    message=(
-                        "Extension "
-                        + ("granted" if response.granted else "denied")
-                        + f" ({response.extension_seconds:.1f}s)"
-                    ),
-                    node_id=self._node_id.full,
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    granted=response.granted,
-                    extension_seconds=response.extension_seconds,
-                    denial_reason=response.denial_reason or "",
-                ),
+                self._extension_decision_event(response),
                 name="worker_events",
             )
-        return b"ok"
+
+    def _extension_decision_event(self, response: HealthcheckExtensionResponse) -> WorkerExtensionDecision:
+        """The event recording a manager's extension decision."""
+        return WorkerExtensionDecision(
+            message=(
+                "Extension "
+                + ("granted" if response.granted else "denied")
+                + f" ({response.extension_seconds:.1f}s)"
+            ),
+            node_id=self._node_id.full,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            granted=response.granted,
+            extension_seconds=response.extension_seconds,
+            denial_reason=response.denial_reason or "",
+        )
 
     @tcp.receive()
     async def eviction_notice(

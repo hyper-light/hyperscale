@@ -95,6 +95,10 @@ from hyperscale.graph import Workflow, depends, step
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.testing import URL, HTTPResponse
 
+# Every node and client of this test shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 # Initialize logging
 _logging_config = LoggingConfig()
 _logging_config.update(log_directory=os.getcwd(), log_level="error")
@@ -293,7 +297,7 @@ async def create_cluster(config: ClusterConfig) -> TestCluster:
     cluster = TestCluster(config=config)
     datacenter_ids = get_datacenter_ids(config.dc_count)
 
-    env = Env(MERCURY_SYNC_REQUEST_TIMEOUT="5s", MERCURY_SYNC_LOG_LEVEL="error")
+    env = Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT="5s", MERCURY_SYNC_LOG_LEVEL="error")
 
     # Calculate port assignments
     gate_tcp_ports = [

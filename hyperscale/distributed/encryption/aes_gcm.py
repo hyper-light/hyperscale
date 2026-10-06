@@ -44,14 +44,12 @@ from .aesgcm_fernet import HEADER_SIZE
 from .aesgcm_fernet import MIN_SECRET_LENGTH
 from .aesgcm_fernet import ENCRYPTION_CONTEXT
 from .aesgcm_fernet import WEAK_SECRETS
-from .aesgcm_fernet import _is_production
 from .aesgcm_fernet import AESGCMFernet
 from .encryption_error import EncryptionError
 
 _REHOMED = (
     EncryptionError,
     AESGCMFernet,
-    _is_production,
 )
 
 for _rehomed in _REHOMED:
