@@ -39,10 +39,13 @@ from hyperscale.distributed.models import ManagerHeartbeat
 from hyperscale.distributed.nodes.gate.models.dc_health_state import (
     DCHealthState,
 )
-from hyperscale.distributed.routing.routing_state import (
-    DatacenterRoutingScore,
+from hyperscale.distributed.routing import (
+    DatacenterCandidate,
+    RoutingScorer,
+    ScoringConfig,
 )
-from hyperscale.distributed.slo import SLOSummary
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.slo import LatencySLO, SLOConfig, SLOSummary
 from hyperscale.distributed.slo.latency_observation import LatencyObservation
 
 
@@ -74,7 +77,12 @@ def test_slo_summary_round_trip() -> None:
         window_start=0.0,
         window_end=300.0,
     )
-    summary = SLOSummary.from_observation(observation=obs)
+    slo_config = SLOConfig.from_env(Env())
+    summary = SLOSummary.from_observation(
+        observation=obs,
+        slo=LatencySLO.from_config(slo_config),
+        config=slo_config,
+    )
     encoded = summary.to_bytes()
     restored = SLOSummary.from_bytes(encoded)
     check(restored is not None, "decode produced a value")
@@ -245,36 +253,28 @@ def test_routing_score_deprioritizes_violators() -> None:
     print("\n[4] Routing score deprioritizes SLO violators")
 
     # Same inputs except slo_routing_factor.
-    compliant = DatacenterRoutingScore.calculate(
-        datacenter_id="dc-compliant",
-        health_bucket="healthy",
-        rtt_ucb_ms=50.0,
-        utilization=0.4,
-        queue_depth=2,
-        circuit_breaker_pressure=0.0,
-        coordinate_quality=1.0,
-        slo_routing_factor=0.8,
-    )
-    neutral = DatacenterRoutingScore.calculate(
-        datacenter_id="dc-neutral",
-        health_bucket="healthy",
-        rtt_ucb_ms=50.0,
-        utilization=0.4,
-        queue_depth=2,
-        circuit_breaker_pressure=0.0,
-        coordinate_quality=1.0,
-        slo_routing_factor=1.0,
-    )
-    violating = DatacenterRoutingScore.calculate(
-        datacenter_id="dc-violating",
-        health_bucket="healthy",
-        rtt_ucb_ms=50.0,
-        utilization=0.4,
-        queue_depth=2,
-        circuit_breaker_pressure=0.0,
-        coordinate_quality=1.0,
-        slo_routing_factor=2.5,
-    )
+    scorer = RoutingScorer(ScoringConfig.from_env(Env()))
+
+    def score(datacenter_id: str, slo_routing_factor: float):
+        return scorer.score_datacenter(
+            DatacenterCandidate(
+                datacenter_id=datacenter_id,
+                health_bucket="HEALTHY",
+                available_cores=6,
+                total_cores=10,
+                queue_depth=2,
+                total_managers=1,
+                healthy_managers=1,
+                circuit_breaker_pressure=0.0,
+                health_severity_weight=1.0,
+                slo_routing_factor=slo_routing_factor,
+            ),
+            latency_ms=50.0,
+        )
+
+    compliant = score("dc-compliant", 0.8)
+    neutral = score("dc-neutral", 1.0)
+    violating = score("dc-violating", 2.5)
 
     check(
         compliant.final_score < neutral.final_score,

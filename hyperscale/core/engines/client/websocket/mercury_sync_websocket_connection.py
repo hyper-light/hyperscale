@@ -10,9 +10,9 @@ from typing import (
     Literal,
     Optional,
     Tuple,
-    Union,
 )
 from urllib.parse import (
+    urljoin,
     ParseResult,
     urlencode,
     urlparse,
@@ -22,9 +22,6 @@ import orjson
 from pydantic import BaseModel
 
 from hyperscale.core.engines.client.shared.models import URL as HTTPUrl
-from hyperscale.core.engines.client.shared.models import (
-    Cookies as HTTPCookies,
-)
 from hyperscale.core.engines.client.shared.models import (
     HTTPCookie,
     HTTPEncodableValue,
@@ -44,12 +41,32 @@ from hyperscale.core.testing.models import (
 from .models.websocket import (
     WebsocketResponse,
     create_sec_websocket_key,
-    get_header_bits,
-    get_message_buffer_size,
     pack_hostname,
+    websocket_accept,
 )
-from .models.websocket.constants import WEBSOCKETS_VERSION
+from .models.websocket.constants import (
+    OPCODE_BINARY,
+    OPCODE_CLOSE,
+    OPCODE_TEXT,
+    WEBSOCKETS_VERSION,
+)
 from .protocols import WebsocketConnection
+
+# Handshake fields the engine writes itself, and handshake options that
+# shape the request without being sent.
+HANDSHAKE_HEADERS = frozenset(
+    (
+        "host",
+        "upgrade",
+        "connection",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-protocol",
+        "origin",
+        "suppress_origin",
+        "subprotocols",
+    )
+)
 
 
 class MercurySyncWebsocketConnection:
@@ -192,30 +209,11 @@ class MercurySyncWebsocketConnection:
 
     async def _optimize_url(self, url: URL):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
-                    url,
-                    upgrade_ssl,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-                connection.reset()
-                self._connections.append(connection)
-
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    url,
+                    optimized_url,
                     _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
@@ -225,7 +223,12 @@ class MercurySyncWebsocketConnection:
                 connection.reset()
                 self._connections.append(connection)
 
-            self._url_cache[url.optimized.hostname] = url
+            # Plain-string requests for the same address reuse this lookup:
+            # the resolved URL, under the key the connect path reads. One
+            # that never resolved is left for the connect path to look up.
+            if optimized_url.ip_addresses:
+                self._url_cache[optimized_url.target] = optimized_url
+
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -280,11 +283,9 @@ class MercurySyncWebsocketConnection:
         if redirect and (
             location := result.headers.get(b'location')
         ):
-            location = location.decode()
-
-            upgrade_ssl = False
-            if "https" in location and "https" not in url:
-                upgrade_ssl = True
+            # Each location resolves against the address it came from (RFC
+            # 3986: absolute, host-relative and path-relative alike).
+            location = urljoin(url.data if isinstance(url, URL) else url, location.decode())
 
             for _ in range(redirects):
                 result, redirect, timings = await self._execute(
@@ -295,7 +296,6 @@ class MercurySyncWebsocketConnection:
                     cookies=cookies,
                     headers=headers,
                     data=data,
-                    upgrade_ssl=upgrade_ssl,
                     redirect_url=location,
                     timings=timings,
                 )
@@ -303,11 +303,10 @@ class MercurySyncWebsocketConnection:
                 if redirect is False:
                     break
 
-                location = result.headers.get(b"location").decode()
+                if (next_location := result.headers.get(b"location")) is None:
+                    break
 
-                upgrade_ssl = False
-                if "https" in location and "https" not in url:
-                    upgrade_ssl = True
+                location = urljoin(location, next_location.decode())
 
         timings["request_end"] = time.monotonic()
         result.timings.update(timings)
@@ -317,13 +316,12 @@ class MercurySyncWebsocketConnection:
     async def _execute(
         self,
         request_url: str | URL,
-        method: str,
+        method: Literal["GET", "POST"],
         auth: Optional[Tuple[str, str] | Auth] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
         headers: Optional[Dict[str, str] | Headers] = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
-        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel | Data] = None,
-        upgrade_ssl: bool = False,
+        data: Optional[str | bytes | Dict[str, Any] | List[Any] | BaseModel | Data] = None,
         redirect_url: Optional[str] = None,
         timings: Dict[
             Literal[
@@ -338,10 +336,7 @@ class MercurySyncWebsocketConnection:
             ],
             float | None,
         ] = None,
-    ) -> Tuple[
-        WebsocketResponse,
-        bool,
-        Dict[
+    ) -> Tuple[WebsocketResponse, bool, Dict[
             Literal[
                 "request_start",
                 "connect_start",
@@ -353,8 +348,12 @@ class MercurySyncWebsocketConnection:
                 "request_end",
             ],
             float | None,
-        ],
-    ]:
+        ]]:
+        """
+        One exchange on a WebSocket: send ``data`` as a message (when given)
+        and read the next message back. A new transport first completes the
+        opening handshake (RFC 6455, 4.1); a reused one is already open.
+        """
         if redirect_url:
             request_url = redirect_url
 
@@ -368,34 +367,14 @@ class MercurySyncWebsocketConnection:
                 error,
                 connection,
                 url,
-                upgrade_ssl,
+                new_transport,
             ) = await asyncio.wait_for(
                 self._connect_to_url_location(
                     connection,
                     request_url,
-                    ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
                 timeout=self.timeouts.request_timeout,
             )
-
-            if upgrade_ssl:
-                ssl_redirect_url = request_url.replace("http://", "https://")
-
-                (
-                    error,
-                    connection,
-                    url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(
-                        connection,
-                        request_url,
-                        ssl_redirect_url=ssl_redirect_url,
-                    ),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-                request_url = ssl_redirect_url
 
             if error or connection is None or connection.reader is None:
                 timings["connect_end"] = time.monotonic()
@@ -419,59 +398,81 @@ class MercurySyncWebsocketConnection:
                     timings,
                 )
 
-            timings["connect_end"] = time.monotonic()
+            response_headers: Dict[bytes, bytes] | None = None
+
+            if new_transport:
+                key = create_sec_websocket_key()
+                connection.write(
+                    self._encode_handshake(
+                        url,
+                        key,
+                        auth=auth,
+                        cookies=cookies,
+                        headers=headers,
+                        params=params,
+                    )
+                )
+
+                status_line = await asyncio.wait_for(
+                    connection.reader.readline(),
+                    timeout=self.timeouts.request_timeout,
+                )
+                status = int(status_line.split()[1])
+
+                response_headers = {}
+                async for header_name, header_value, _ in connection.reader.iter_headers():
+                    response_headers[header_name] = header_value
+
+                timings["connect_end"] = time.monotonic()
+
+                if status != 101 or response_headers.get(b"sec-websocket-accept", b"").strip() != websocket_accept(key):
+                    # Not a WebSocket: a redirect (_request follows it on a
+                    # fresh transport), a refusal, or an answer to another
+                    # key. This transport never opened.
+                    connection.reset()
+                    self._connections.append(connection)
+
+                    return (
+                        WebsocketResponse(
+                            URLMetadata(
+                                host=url.hostname,
+                                path=url.path,
+                            ),
+                            headers=response_headers,
+                            method=method,
+                            status=status if status != 101 else 400,
+                            status_message=None if status != 101 else "Sec-WebSocket-Accept does not match the key sent",
+                            timings=timings,
+                        ),
+                        300 <= status < 400,
+                        timings,
+                    )
+
+            else:
+                timings["connect_end"] = time.monotonic()
 
             if timings["write_start"] is None:
                 timings["write_start"] = time.monotonic()
 
-            encoded_data: Optional[bytes | List[bytes]] = None
-            content_type: Optional[str] = None
-
-            if data:
-                encoded_data, content_type = self._encode_data(data)
-
-            encoded_headers = self._encode_headers(
-                url,
-                method,
-                auth=auth,
-                params=params,
-                headers=headers,
-                cookies=cookies,
-                data=encoded_data,
-                content_type=content_type,
-            )
-
-            connection.write(encoded_headers)
-
-            if isinstance(encoded_data, Iterator):
-                for chunk in encoded_data:
-                    connection.write(chunk)
-
-                connection.write(("0" + NEW_LINE * 2).encode())
-
-            elif data:
-                connection.write(encoded_data)
+            if data is not None:
+                connection.send_message(*self._encode_message(data))
 
             timings["write_end"] = time.monotonic()
 
             if timings["read_start"] is None:
                 timings["read_start"] = time.monotonic()
 
-            response_code = await asyncio.wait_for(
-                connection.reader.readline(),
+            opcode, content, close_code = await asyncio.wait_for(
+                connection.read_message(),
                 timeout=self.timeouts.request_timeout,
             )
 
-            status_string: List[bytes] = response_code.split()
-            status = int(status_string[1])
+            timings["read_end"] = time.monotonic()
 
-            response_headers: dict[bytes, bytes] = {}
-
-            async for key, value, _ in connection.reader.iter_headers():
-                response_headers[key] = value
-
-            if status >= 300 and status < 400:
-                timings["read_end"] = time.monotonic()
+            if opcode == OPCODE_CLOSE:
+                # The server closed this WebSocket, or broke the protocol and
+                # this side closed it: its transport is done either way.
+                connection.reset()
                 self._connections.append(connection)
 
                 return (
@@ -480,49 +481,16 @@ class MercurySyncWebsocketConnection:
                             host=url.hostname,
                             path=url.path,
                         ),
-                        headers=response_headers,
                         method=method,
-                        status=status,
+                        status=400,
+                        status_message=f"WebSocket closed ({close_code}): {content.decode(errors='replace')}",
+                        headers=response_headers,
                         timings=timings,
                     ),
-                    True,
+                    False,
                     timings,
                 )
 
-            cookies: Union[HTTPCookies, None] = None
-            cookies_data: Union[bytes, None] = response_headers.get(b"set-cookie")
-            if cookies_data:
-                cookies = HTTPCookies()
-                cookies.update(cookies_data)
-
-            header_content_length = 0
-            if data:
-                # The reply frame's two header bytes follow the upgrade
-                # response; its length may continue in 2 or 8 more bytes.
-                header_bits = get_header_bits(
-                    await asyncio.wait_for(
-                        connection.readexactly(2),
-                        timeout=self.timeouts.request_timeout,
-                    )
-                )
-                header_content_length = await asyncio.wait_for(
-                    get_message_buffer_size(
-                        header_bits,
-                        connection,
-                    ),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-            body = b''
-            if header_content_length > 0:
-                # All the payload the frame declares: a partial read would
-                # leave the rest on the connection for its next request.
-                body = await asyncio.wait_for(
-                    connection.readexactly(header_content_length),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-            timings["read_end"] = time.monotonic()
             self._connections.append(connection)
 
             return (
@@ -532,9 +500,9 @@ class MercurySyncWebsocketConnection:
                         path=url.path,
                     ),
                     method=method,
-                    status=status,
+                    status=101,
                     headers=response_headers,
-                    content=body,
+                    content=content,
                     timings=timings,
                 ),
                 False,
@@ -559,7 +527,7 @@ class MercurySyncWebsocketConnection:
 
             elif isinstance(request_url, URL):
                 request_url: ParseResult = urlparse(request_url.data)
-                
+
             return (
                 WebsocketResponse(
                     URLMetadata(
@@ -579,71 +547,67 @@ class MercurySyncWebsocketConnection:
         self,
         connection: WebsocketConnection | None,
         request_url: str | URL,
-        ssl_redirect_url: Optional[str] = None,
     ) -> Tuple[
         Optional[Exception],
         WebsocketConnection,
         HTTPUrl,
         bool,
     ]:
-        has_optimized_url = isinstance(request_url, URL)
-        if has_optimized_url:
-            parsed_url = request_url.optimized
-
-        elif ssl_redirect_url:
-            parsed_url = HTTPUrl(ssl_redirect_url)
+        if isinstance(request_url, URL):
+            # Resolved when the workflow prepared it: never looked up here,
+            # and never read from or added to the lookup cache.
+            url = parsed_url = request_url.optimized
 
         else:
             parsed_url = HTTPUrl(request_url)
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+            # A lookup serves only the address it resolved: its target (scheme
+            # and authority), not the hostname every port on a host shares.
+            cache_key = parsed_url.target
+            url = self._url_cache.get(cache_key)
 
-        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
+            if url is None:
+                dns_lock = self._dns_lock[cache_key]
+                dns_waiter = self._dns_waiters[cache_key]
 
-        if do_dns_lookup and dns_lock.locked() is False:
-            try:
-                async with dns_lock:
-                    url = parsed_url
-                    await url.lookup()
+                if dns_lock.locked() is False:
+                    try:
+                        async with dns_lock:
+                            url = parsed_url
+                            await url.lookup()
 
-                    self._url_cache[parsed_url.hostname] = url
+                            self._url_cache[cache_key] = url
 
-            finally:
-                # However the lookup ended, release its waiters; after a
-                # failed or cancelled lookup the next request looks up
-                # again with a fresh waiter.
-                if dns_waiter.done() is False:
-                    dns_waiter.set_result(None)
+                    finally:
+                        # However the lookup ended, release its waiters; after
+                        # a failed or cancelled lookup the next request looks
+                        # up again with a fresh waiter.
+                        if dns_waiter.done() is False:
+                            dns_waiter.set_result(None)
 
-                if parsed_url.hostname not in self._url_cache:
-                    del self._dns_waiters[parsed_url.hostname]
+                        if cache_key not in self._url_cache:
+                            del self._dns_waiters[cache_key]
 
-        elif do_dns_lookup:
-            # Shielded: a waiter's cancellation must not cancel the
-            # lookup future every other waiter shares.
-            await asyncio.shield(dns_waiter)
-            url = self._url_cache.get(parsed_url.hostname)
-
-        elif has_optimized_url:
-            url = request_url.optimized
+                else:
+                    # Shielded: a waiter's cancellation must not cancel the
+                    # lookup future every other waiter shares.
+                    await asyncio.shield(dns_waiter)
+                    url = self._url_cache.get(cache_key)
 
         connection = self._connections.pop()
         connection_error: Optional[Exception] = None
+        new_transport = False
 
         try:
             # Reuses the connection's transport for this host; otherwise
             # races a new one across the host's addresses.
             address, socket_config, new_transport = await connection.connect_to_any(
+                parsed_url.target,
                 url.hostname,
                 url.ip_addresses,
                 url.port,
                 url.address_rotation,
-                ssl=self._client_ssl_context
-                if url.is_ssl or ssl_redirect_url
-                else None,
-                ssl_upgrade=ssl_redirect_url is not None,
+                ssl=self._client_ssl_context if url.is_ssl else None,
             )
 
             if new_transport:
@@ -659,14 +623,6 @@ class MercurySyncWebsocketConnection:
             )
 
         except Exception as err:
-            if "server_hostname is only meaningful with ssl" in str(err):
-                return (
-                    err,
-                    connection,
-                    parsed_url,
-                    True,
-                )
-
             connection_error = err
 
         try:
@@ -674,7 +630,7 @@ class MercurySyncWebsocketConnection:
                 connection_error,
                 connection,
                 parsed_url,
-                False,
+                new_transport,
             )
 
         finally:
@@ -682,206 +638,103 @@ class MercurySyncWebsocketConnection:
             # hold on the error, or the two keep each other alive as garbage.
             connection_error = None
 
-    def _encode_data(
+    def _encode_message(
         self,
-        data: str | bytes | BaseModel | bytes,
-    ):
-        content_type: Optional[str] = None
-        encoded_data: bytes | List[bytes] = None
+        data: str | bytes | Dict[str, Any] | List[Any] | BaseModel | Data | Iterator,
+    ) -> Tuple[int, bytes | List[bytes]]:
+        """
+        A message's opcode and payload: text for strings and JSON, binary for
+        bytes, and for an iterator its chunks, sent as one fragmented message.
+        """
+        if isinstance(data, Data):
+            return (OPCODE_TEXT if data.content_type else OPCODE_BINARY), data.optimized
 
-        if isinstance(data, Iterator):
-            chunks: List[bytes] = []
-            for chunk in data:
-                chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
-                encoded_chunk = chunk_size.encode() + chunk + NEW_LINE.encode()
-                chunks.append(encoded_chunk)
+        if isinstance(data, str):
+            return OPCODE_TEXT, data.encode()
 
-            encoded_data = chunks
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            return OPCODE_BINARY, bytes(data)
 
-        elif isinstance(data, BaseModel):
-            encoded_data = orjson.dumps(data.model_dump())
-            content_type = "application/json"
+        if isinstance(data, BaseModel):
+            return OPCODE_TEXT, orjson.dumps(data.model_dump())
 
-        elif isinstance(data, (dict, list)):
-            encoded_data = orjson.dumps(data)
-            content_type = "application/json"
+        if isinstance(data, (dict, list)):
+            return OPCODE_TEXT, orjson.dumps(data)
 
-        elif isinstance(data, str):
-            encoded_data = data.encode()
+        chunks = list(data)
+        opcode = OPCODE_TEXT if chunks and isinstance(chunks[0], str) else OPCODE_BINARY
+        return opcode, [chunk.encode() if isinstance(chunk, str) else bytes(chunk) for chunk in chunks]
 
-        elif isinstance(data, (memoryview, bytearray)):
-            encoded_data = bytes(data)
-
-        return encoded_data, content_type
-
-    def _encode_headers(
+    def _encode_handshake(
         self,
-        url: HTTPUrl | URL,
-        method: str,
-        auth: tuple[str, str] | Auth | None = None,
-        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
-        headers: Optional[Dict[str, str]] = None,
+        url: HTTPUrl,
+        key: str,
+        auth: Optional[Tuple[str, str] | Auth] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
-        data: Optional[
-            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
-        ] = None,
-        encoded_data: Optional[bytes | List[bytes]] = None,
-        content_type: Optional[str] = None,
-    ):
-        if isinstance(url, URL):
-            url = url.optimized
-
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+    ) -> bytes:
+        """
+        The opening handshake request (RFC 6455, 4.1): a GET carrying the
+        upgrade, ``key`` and version, then the caller's own headers. The
+        options suppress_origin and subprotocols shape it; they are not sent.
+        """
         url_path = url.path
 
         if isinstance(params, Params):
             url_path += params.optimized
 
-        elif params and len(params) > 0:
-            url_params = urlencode(params)
-            url_path += f"?{url_params}"
+        elif params:
+            url_path += f"?{urlencode(params)}"
 
-        if isinstance(headers, Headers):
-            encoded_headers = headers.optimized
+        caller_headers = headers.data if isinstance(headers, Headers) else (headers or {})
+        options = {name.lower(): value for name, value in caller_headers.items()}
 
-        else:
-            encoded_headers = self._encode_dynamic_headers(
-                url,
-                method,
-                headers=headers,
-            )
+        hostport = pack_hostname(url.hostname)
+        if url.port not in (80, 443):
+            hostport = f"{hostport}:{url.port}"
+
+        encoded_headers = [
+            f"GET {url_path} HTTP/1.1",
+            f"Host: {options.get('host', hostport)}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            f"Sec-WebSocket-Version: {WEBSOCKETS_VERSION}",
+        ]
+
+        if not options.get("suppress_origin"):
+            scheme = "https" if url.is_ssl else "http"
+            encoded_headers.append(f"Origin: {options.get('origin') or f'{scheme}://{hostport}'}")
+
+        if subprotocols := options.get("subprotocols"):
+            encoded_headers.append(f"Sec-WebSocket-Protocol: {','.join(subprotocols)}")
 
         if isinstance(auth, Auth):
             encoded_headers.append(auth.optimized)
 
-        elif auth is not None :
-            encoded_headers.append(
-                self._serialize_auth(auth),
-            )
-
-        size: int = 0
-
-        if isinstance(data, Data):
-            size = data.content_length
-
-        elif encoded_data and isinstance(encoded_data, Iterator):
-            size = sum([len(chunk) for chunk in encoded_data])
-
-        elif encoded_data:
-            size = len(encoded_data)
-
-        encoded_headers.append(f"Content-Length: {size}")
-
-        if content_type:
-            encoded_headers.append(f"Content-Type: {content_type}")
+        elif auth is not None:
+            encoded_headers.append(self._serialize_auth(auth))
 
         if isinstance(cookies, Cookies):
             encoded_headers.append(cookies.optimized)
 
         elif cookies:
-            encoded_cookies: List[str] = []
-
-            for cookie_data in cookies:
-                if len(cookie_data) == 1:
-                    encoded_cookies.append(cookie_data[0])
-
-                elif len(cookie_data) == 2:
-                    cookie_name, cookie_value = cookie_data
-                    encoded_cookies.append(f"{cookie_name}={cookie_value}")
-
-            encoded = "; ".join(encoded_cookies)
-            encoded_headers.append(f"cookie: {encoded}")
-
-        encoded_headers.extend(
-            [
-                "",
-                "",
-            ]
-        )
-
-        return f"{NEW_LINE}".join(encoded_headers).encode()
-
-    def _encode_dynamic_headers(
-        self,
-        url: HTTPUrl,
-        method: str,
-        headers: Optional[Dict[str, str]] = None,
-    ):
-        encoded_headers = [
-            f"{method} {url.path} HTTP/1.1",
-            "Upgrade: websocket",
-            "Keep-Alive: timeout=60, max=100000",
-            "User-Agent: hyperscale/client",
-        ]
-
-        if headers is None:
-            headers: Dict[str, HTTPEncodableValue] = {}
-
-        lowered_headers: Dict[str, HTTPEncodableValue] = {}
-
-        for header_name, header_value in headers.items():
-            header_name_lowered = header_name.lower()
-            lowered_headers[header_name_lowered] = header_value
-
-        if url.port == 80 or url.port == 443:
-            hostport = pack_hostname(url.hostname)
-        else:
-            hostport = "%s:%d" % (pack_hostname(url.hostname), url.port)
-
-        host = lowered_headers.get("host")
-        if host:
-            encoded_headers.append(f"Host: {host}")
-        else:
-            encoded_headers.append(f"Host: {hostport}")
-
-        if not lowered_headers.get("suppress_origin"):
-            origin = lowered_headers.get("origin")
-
-            if origin:
-                encoded_headers.append(f"Origin: {origin}")
-
-            elif url.scheme == "wss":
-                encoded_headers.append(f"Origin: https://{hostport}")
-
-            else:
-                encoded_headers.append(f"Origin: http://{hostport}")
-
-        key = create_sec_websocket_key()
-
-        header = lowered_headers.get("header")
-        if not header or "Sec-WebSocket-Key" not in header:
-            encoded_headers.append(f"Sec-WebSocket-Key: {key}")
-        else:
-            key = lowered_headers.get("header", {}).get("Sec-WebSocket-Key")
-
-        if not header or "Sec-WebSocket-Version" not in header:
-            encoded_headers.append(f"Sec-WebSocket-Version: {WEBSOCKETS_VERSION}")
-
-        connection = lowered_headers.get("connection")
-        if not connection:
-            encoded_headers.append("Connection: Upgrade")
-        else:
-            encoded_headers.append(connection)
-
-        subprotocols = lowered_headers.get("subprotocols")
-        if subprotocols:
-            encoded_headers.append(
-                "Sec-WebSocket-Protocol: %s" % ",".join(subprotocols)
+            encoded_cookies = "; ".join(
+                cookie_data[0] if len(cookie_data) == 1 else f"{cookie_data[0]}={cookie_data[1]}"
+                for cookie_data in cookies
             )
-
-        additional_headers: List[str] = []
-
-        if len(headers) > 0:
-            for key, value in headers.items():
-                additional_headers.append(
-                    f"{key}: {value}",
-                )
+            encoded_headers.append(f"cookie: {encoded_cookies}")
 
         encoded_headers.extend(
-            [header for header in additional_headers if header not in encoded_headers]
+            f"{name}: {value}"
+            for name, value in caller_headers.items()
+            if name.lower() not in HANDSHAKE_HEADERS
         )
 
-        return encoded_headers
-    
+        encoded_headers.extend(("", ""))
+
+        return NEW_LINE.join(encoded_headers).encode()
 
     def _serialize_auth(
         self,

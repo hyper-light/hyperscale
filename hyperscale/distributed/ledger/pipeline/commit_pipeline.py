@@ -1,72 +1,34 @@
+"""
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
+"""
+
 from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING, Callable, Awaitable
-
-from hyperscale.distributed.reliability.backpressure import (
-    BackpressureLevel,
-    BackpressureSignal,
-)
-
+from hyperscale.distributed.reliability.backpressure import BackpressureLevel, BackpressureSignal
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .commit_result import CommitResult
+
+if TYPE_CHECKING:
+    from hyperscale.logging import Logger
+    from hyperscale.distributed.ledger.wal.node_wal import NodeWAL
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
 # Bounds on each replication stage (AD-38 latency targets: REGIONAL
 # 2-10ms, GLOBAL 50-300ms, with headroom for a leader election).
 REGIONAL_TIMEOUT_SECONDS = 10.0
+
 GLOBAL_TIMEOUT_SECONDS = 300.0
-
-if TYPE_CHECKING:
-    from hyperscale.logging import Logger
-
-    from hyperscale.distributed.ledger.wal.node_wal import NodeWAL
-
-
-class CommitResult:
-    __slots__ = ("_entry", "_level_achieved", "_error", "_backpressure")
-
-    def __init__(
-        self,
-        entry: WALEntry,
-        level_achieved: DurabilityLevel,
-        error: Exception | None = None,
-        backpressure: BackpressureSignal | None = None,
-    ) -> None:
-        self._entry = entry
-        self._level_achieved = level_achieved
-        self._error = error
-        self._backpressure = backpressure or BackpressureSignal.from_level(
-            BackpressureLevel.NONE
-        )
-
-    @property
-    def entry(self) -> WALEntry:
-        return self._entry
-
-    @property
-    def level_achieved(self) -> DurabilityLevel:
-        return self._level_achieved
-
-    @property
-    def error(self) -> Exception | None:
-        return self._error
-
-    @property
-    def backpressure(self) -> BackpressureSignal:
-        return self._backpressure
-
-    @property
-    def success(self) -> bool:
-        return self._error is None
-
-    @property
-    def lsn(self) -> int:
-        return self._entry.lsn
 
 
 class CommitPipeline:
@@ -262,3 +224,10 @@ class CommitPipeline:
             self._global_replicator(entry),
             timeout=self._global_timeout,
         )
+
+_REHOMED = (
+    CommitResult,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

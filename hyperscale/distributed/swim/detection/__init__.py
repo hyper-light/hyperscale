@@ -22,8 +22,6 @@ from .incarnation_store import (
 
 from .suspicion_state import SuspicionState
 
-from .suspicion_manager import SuspicionManager
-
 from .pending_indirect_probe import PendingIndirectProbe
 
 from .indirect_probe_manager import IndirectProbeManager
@@ -64,7 +62,6 @@ __all__ = [
     "IncarnationStore",
     "IncarnationRecord",
     "SuspicionState",
-    "SuspicionManager",
     "PendingIndirectProbe",
     "IndirectProbeManager",
     "ProbeScheduler",

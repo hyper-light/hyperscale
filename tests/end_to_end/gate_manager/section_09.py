@@ -287,7 +287,7 @@ async def validate_9_3_forward_to_reporter() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Forward to reporter expected job reporter tasks"
         )
     finally:

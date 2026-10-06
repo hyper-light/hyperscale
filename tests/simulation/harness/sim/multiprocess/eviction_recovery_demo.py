@@ -88,7 +88,8 @@ def evicting_manager_entry(
             return
         log.append(("evicting", round(context.loop.time(), 6)))
         try:
-            await manager._handle_worker_failure(worker_ids[0])
+            # Our own eviction: not charged to any workflow's retry budget.
+            await manager._handle_worker_failure(worker_ids[0], False)
         except Exception as evict_error:
             log.append(
                 (

@@ -1,5 +1,5 @@
 import asyncio
-from inspect import signature
+from inspect import isawaitable, signature
 from typing import (
     Any,
     Awaitable,
@@ -63,9 +63,9 @@ class ContextHook(Generic[T, K]):
 
         self.result: T | Exception = None
         self.context_args: Dict[str, Any] = {}
-        self._hook_args = [
-            arg.name for arg in signature(call).parameters.values() if arg.KEYWORD_ONLY
-        ]
+        # Every parameter the hook declares can be filled from the context;
+        # the documented hooks take them positional-or-keyword.
+        self._hook_args = [arg.name for arg in signature(call).parameters.values()]
 
     async def call(self, *args, **kwargs):
         try:
@@ -73,10 +73,17 @@ class ContextHook(Generic[T, K]):
                 name: value for name, value in kwargs.items() if name in self._hook_args
             }
 
-            result = await asyncio.wait_for(
-                self._call(*args, **context_args),
-                timeout=self.timeouts.request_timeout,
-            )
+            # A hook is a plain function -- the documented form, ``def``
+            # returning ``Provide[T]``/``Use[T]`` -- or a coroutine function:
+            # only an awaitable result is awaited, under the hook's timeout.
+            # Awaiting a plain function's value raised TypeError, which was
+            # stored as the provided value.
+            result = self._call(*args, **context_args)
+            if isawaitable(result):
+                result = await asyncio.wait_for(
+                    result,
+                    timeout=self.timeouts.request_timeout,
+                )
 
             return (self.name, result)
 

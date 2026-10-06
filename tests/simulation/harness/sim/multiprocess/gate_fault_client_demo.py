@@ -84,13 +84,16 @@ def _build_sustained_load_workflow(
     windows provably intersect live execution instead of an idle tier.
 
     Deliberately NOT a TEST (duration-governed VU) workflow: probing
-    one under SIM dies with ``SimulationConstraintError`` — production
-    ``WorkflowRunner._generate`` busy-waits via ``asyncio.sleep(0)``
-    while virtual ``loop.time()`` is frozen at the duration boundary
+    one under SIM died with ``SimulationConstraintError`` — the old
+    ``WorkflowRunner._generate`` busy-waited via ``asyncio.sleep(0)``
+    while virtual ``loop.time()`` was frozen at the duration boundary
     (wall clocks advance through CPU spins; the virtual clock only
-    advances on timers). Until that liveness gap gets a production fix,
-    parameterized ACTION sleeps are the virtual-time-safe way to pin
-    execution length; the class ``duration`` is set to match so the
+    advances on timers). Its successor ``_run_long_lived_vu`` takes a
+    timed sleep after ``_FROZEN_CLOCK_SPINS`` frozen-clock iterations,
+    and runs under SIM: ``workflow_lifecycle_demo``'s steady workflow is a
+    TEST workflow repeating its step for fifty virtual seconds. These pins
+    were measured with parameterized ACTION sleeps, which fix execution
+    length exactly; the class ``duration`` is set to match so the
     worker-side active-workflow bookkeeping window agrees.
     """
     step_sleep_seconds = workflow_duration_seconds / 2.0

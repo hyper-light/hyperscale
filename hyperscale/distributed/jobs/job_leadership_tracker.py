@@ -21,53 +21,25 @@ Asyncio Safety:
 - All mutating operations acquire the internal asyncio.Lock
 - Read-only operations do NOT acquire the lock (safe due to GIL for simple reads)
 - Callers should use async methods when mutating state
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
+from .dc_manager_leadership import DCManagerLeadership
+from .job_leadership import JobLeadership
 
 # Type variable for the metadata associated with each job's leadership
 # For managers: layer_version (int)
 # For gates: target_dc_count (int)
 T = TypeVar("T")
-
-
-@dataclass(slots=True)
-class JobLeadership:
-    """
-    Leadership information for a single job.
-
-    Attributes:
-        leader_id: Node ID of the current leader
-        leader_addr: TCP address (host, port) of the leader
-        fencing_token: Monotonic token for consistency (higher = newer epoch)
-    """
-
-    leader_id: str
-    leader_addr: tuple[str, int]
-    fencing_token: int
-
-
-@dataclass(slots=True)
-class DCManagerLeadership:
-    """
-    Leadership information for a manager within a datacenter for a specific job.
-
-    Used by gates to track which manager leads each job in each DC.
-    When a manager fails, another manager takes over and the gate must
-    be notified to update routing.
-
-    Attributes:
-        manager_id: Node ID of the manager leading this job in this DC
-        manager_addr: TCP address (host, port) of the manager
-        fencing_token: Monotonic token for consistency (higher = newer epoch)
-    """
-
-    manager_id: str
-    manager_addr: tuple[str, int]
-    fencing_token: int
 
 
 @dataclass(slots=True)
@@ -629,3 +601,11 @@ class JobLeadershipTracker(Generic[T]):
     def __contains__(self, job_id: str) -> bool:
         """Check if a job is being tracked."""
         return job_id in self._leaderships
+
+_REHOMED = (
+    JobLeadership,
+    DCManagerLeadership,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

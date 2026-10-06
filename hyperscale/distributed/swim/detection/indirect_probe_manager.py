@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from hyperscale.distributed.runtime import Clock, RealClock
 from .pending_indirect_probe import PendingIndirectProbe
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -206,7 +207,6 @@ class IndirectProbeManager:
             return False
         
         try:
-            from hyperscale.logging.hyperscale_logging_models import ServerDebug
             await self._logger.log(ServerDebug(
                 message=f"[IndirectProbeManager] Probes rejected due to capacity: {self._rejected_count} "
                         f"(max_pending={self.max_pending}, pending={len(self.pending_probes)})",

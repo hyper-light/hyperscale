@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from typing import Any
-
 import msgspec
 
 from hyperscale.distributed.hlc.hlc_timestamp import HLCTimestamp
 
+from .datacenter_reassignment import DatacenterReassignment
+from .job_state_record import JobStateRecord
+
 # Both timeout spellings are live vocabulary: managers write
 # JobStatus.TIMEOUT.value ("timeout"), the gate timeout tracker records
 # "timed_out" — the gate-side normalizers accept both and so must we.
+# "relinquished" ends a record, not a job: its manager no longer leads it.
 TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"completed", "failed", "cancelled", "timeout", "timed_out"}
+    {"completed", "failed", "cancelled", "timeout", "timed_out", "relinquished"}
 )
 
 
@@ -40,6 +42,12 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
     last_progress_hlc: HLCTimestamp | None = None
     # Datacenters that confirmed cancellation (JobCancellationAcked).
     cancellation_acked_datacenters: frozenset[str] = frozenset()
+    # Datacenters the job lost mid-run and moved off (AD-36
+    # JobDatacenterReassigned), in the order they were lost.
+    datacenter_reassignments: tuple[DatacenterReassignment, ...] = ()
+    # The node that took the job over last (JobLeadershipAcquired); empty
+    # while it is led by the node that created it.
+    leader_id: str = ""
 
     @classmethod
     def create(
@@ -76,6 +84,9 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             accepted_datacenters=self.accepted_datacenters | {datacenter_id},
             last_hlc=hlc,
         )
+
+    def with_leadership_acquired(self, leader_id: str, hlc: HLCTimestamp) -> JobState:
+        return msgspec.structs.replace(self, leader_id=leader_id, last_hlc=hlc)
 
     def with_cancellation_requested(self, hlc: HLCTimestamp) -> JobState:
         return msgspec.structs.replace(
@@ -114,6 +125,28 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             last_progress_hlc=hlc,
         )
 
+    def with_datacenter_reassigned(
+        self,
+        reassignment: DatacenterReassignment,
+        hlc: HLCTimestamp,
+    ) -> JobState:
+        """The job runs in the replacement, not the lost datacenter."""
+        return msgspec.structs.replace(
+            self,
+            assigned_datacenters=tuple(
+                datacenter
+                for datacenter in self.assigned_datacenters
+                if datacenter != reassignment.lost_datacenter
+            )
+            + (
+                (reassignment.replacement_datacenter,)
+                if reassignment.replacement_datacenter
+                else ()
+            ),
+            datacenter_reassignments=(*self.datacenter_reassignments, reassignment),
+            last_hlc=hlc,
+        )
+
     def with_cancellation_acked(self, datacenter_id: str, hlc: HLCTimestamp) -> JobState:
         return msgspec.structs.replace(
             self,
@@ -131,7 +164,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> JobStateRecord:
         return {
             "job_id": self.job_id,
             "status": self.status,
@@ -161,10 +194,15 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             "cancellation_acked_datacenters": list(
                 self.cancellation_acked_datacenters
             ),
+            "datacenter_reassignments": [
+                msgspec.to_builtins(reassignment)
+                for reassignment in self.datacenter_reassignments
+            ],
+            "leader_id": self.leader_id,
         }
 
     @staticmethod
-    def _decode_hlc(raw: Any) -> HLCTimestamp:
+    def _decode_hlc(raw: object) -> HLCTimestamp:
         """An HLC from its three-component form. Anything else is not a
         record this format wrote (older formats are versioned out before
         reaching here), so it is refused rather than read as time zero --
@@ -175,7 +213,7 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
         raise ValueError(f"unrecognized HLC encoding: {raw!r}")
 
     @classmethod
-    def from_dict(cls, job_id: str, data: dict[str, Any]) -> JobState:
+    def from_dict(cls, job_id: str, data: JobStateRecord) -> JobState:
         created_hlc = cls._decode_hlc(data.get("created_hlc", 0))
         last_hlc = cls._decode_hlc(data.get("last_hlc", 0))
 
@@ -200,4 +238,9 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             cancellation_acked_datacenters=frozenset(
                 data.get("cancellation_acked_datacenters", [])
             ),
+            datacenter_reassignments=tuple(
+                msgspec.convert(raw_reassignment, DatacenterReassignment)
+                for raw_reassignment in data.get("datacenter_reassignments", [])
+            ),
+            leader_id=data.get("leader_id", ""),
         )

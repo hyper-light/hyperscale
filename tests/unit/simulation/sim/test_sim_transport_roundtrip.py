@@ -66,7 +66,7 @@ def _make_sim_cluster():
     in_process_transport = InProcessTransport(loop)
     factory = SimTransportFactory(in_process_transport)
     clock = VirtualClock(loop)
-    env = Env()
+    env = Env(MERCURY_SYNC_AUTH_SECRET="sim-transport-roundtrip-secret-0123456")
 
     server_a = _EchoServer(
         "127.0.0.1", 9000, 9001, env,
@@ -77,6 +77,19 @@ def _make_sim_cluster():
         clock=clock, random_source=SeededRandom(2), transport_factory=factory,
     )
     return loop, server_a, server_b, in_process_transport
+
+
+def _close(loop: SimulationLoop, *started_servers: _EchoServer) -> None:
+    """Shut the started servers down, then close the loop. Closing the
+    loop under running servers left their background loops and task
+    runners pending, destroyed only when the test process exited."""
+    try:
+        loop.run_until_complete(
+            asyncio.gather(*(server.shutdown() for server in started_servers))
+        )
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
 
 
 def test_base_server_starts_under_sim_with_fake_transports():
@@ -93,8 +106,7 @@ def test_base_server_starts_under_sim_with_fake_transports():
         assert ("127.0.0.1", 9001) in in_process_transport.registered_addresses()
         assert ("127.0.0.1", 9000) in in_process_transport.registered_addresses()
     finally:
-        loop.close()
-        asyncio.set_event_loop(None)
+        _close(loop, server_a)
 
 
 def test_tcp_roundtrip_under_sim():
@@ -113,8 +125,7 @@ def test_tcp_roundtrip_under_sim():
         response = loop.run_until_complete(scenario())
         assert response == b"tcp-echo:hello"
     finally:
-        loop.close()
-        asyncio.set_event_loop(None)
+        _close(loop, server_a, server_b)
 
 
 def test_udp_roundtrip_under_sim():
@@ -133,8 +144,7 @@ def test_udp_roundtrip_under_sim():
         response = loop.run_until_complete(scenario())
         assert response == b"udp-echo:world"
     finally:
-        loop.close()
-        asyncio.set_event_loop(None)
+        _close(loop, server_a, server_b)
 
 
 def test_roundtrip_uses_zero_wall_time():
@@ -158,5 +168,4 @@ def test_roundtrip_uses_zero_wall_time():
         # is slow, something is doing real I/O or real sleeping.
         assert wall_elapsed < 2.0
     finally:
-        loop.close()
-        asyncio.set_event_loop(None)
+        _close(loop, server_a, server_b)

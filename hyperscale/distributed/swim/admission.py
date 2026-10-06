@@ -87,7 +87,7 @@ def parse_standard_target(payload: bytes) -> tuple[str, int] | None:
 
     target_bytes = strip_payload_extensions(parsed[1])
     try:
-        host, port = target_bytes.decode().split(":", maxsplit=1)
+        host, port = target_bytes.decode().rsplit(":", maxsplit=1)
         return (host, int(port))
     except (UnicodeDecodeError, ValueError):
         return None
@@ -112,7 +112,7 @@ def parse_join_target(payload: bytes) -> tuple[str, int] | None:
         return None
 
     try:
-        host, port = address_bytes.decode().split(":", maxsplit=1)
+        host, port = address_bytes.decode().rsplit(":", maxsplit=1)
         return (host, int(port))
     except (UnicodeDecodeError, ValueError):
         return None

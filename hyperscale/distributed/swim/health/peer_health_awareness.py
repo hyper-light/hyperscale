@@ -16,116 +16,25 @@ This integrates with:
 - LocalHealthMultiplier: Combines local and peer health for timeouts
 - IndirectProbeManager: Avoids overloaded peers as proxies
 - ProbeScheduler: May reorder probing to prefer healthy peers
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable
-
 from hyperscale.distributed.health.tracker import HealthPiggyback
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
-
-_DEFAULT_CLOCK: Clock = RealClock()
-
-
-class PeerLoadLevel(IntEnum):
-    """
-    Peer load level classification for behavior adaptation.
-
-    Higher values indicate more load - more accommodation needed.
-    """
-    UNKNOWN = 0   # No health info yet (treat as healthy)
-    HEALTHY = 1   # Normal operation
-    BUSY = 2      # Slightly elevated load
-    STRESSED = 3  # Significant load - reduce traffic
-    OVERLOADED = 4  # Critically loaded - minimal traffic only
-
-
-# Map overload_state string to PeerLoadLevel
-_OVERLOAD_STATE_TO_LEVEL: dict[str, PeerLoadLevel] = {
-    "healthy": PeerLoadLevel.HEALTHY,
-    "busy": PeerLoadLevel.BUSY,
-    "stressed": PeerLoadLevel.STRESSED,
-    "overloaded": PeerLoadLevel.OVERLOADED,
-}
-
-
-@dataclass(slots=True)
-class PeerHealthInfo:
-    """
-    Cached health information for a single peer.
-
-    Used to make adaptation decisions without requiring
-    full HealthPiggyback lookups.
-    """
-    node_id: str
-    load_level: PeerLoadLevel
-    accepting_work: bool
-    capacity: int
-    throughput: float
-    expected_throughput: float
-    last_update: float
-
-    @property
-    def is_overloaded(self) -> bool:
-        """Check if peer is in overloaded state."""
-        return self.load_level >= PeerLoadLevel.OVERLOADED
-
-    @property
-    def is_stressed(self) -> bool:
-        """Check if peer is stressed or worse."""
-        return self.load_level >= PeerLoadLevel.STRESSED
-
-    @property
-    def is_healthy(self) -> bool:
-        """Check if peer is healthy."""
-        return self.load_level <= PeerLoadLevel.HEALTHY
-
-    def is_stale(self, max_age_seconds: float = 30.0) -> bool:
-        """Check if this info is stale."""
-        return (_DEFAULT_CLOCK.monotonic() - self.last_update) > max_age_seconds
-
-    @classmethod
-    def from_piggyback(cls, piggyback: HealthPiggyback) -> "PeerHealthInfo":
-        """Create PeerHealthInfo from HealthPiggyback."""
-        load_level = _OVERLOAD_STATE_TO_LEVEL.get(
-            piggyback.overload_state,
-            PeerLoadLevel.UNKNOWN,
-        )
-
-        return cls(
-            node_id=piggyback.node_id,
-            load_level=load_level,
-            accepting_work=piggyback.accepting_work,
-            capacity=piggyback.capacity,
-            throughput=piggyback.throughput,
-            expected_throughput=piggyback.expected_throughput,
-            last_update=_DEFAULT_CLOCK.monotonic(),
-        )
-
-
-@dataclass(slots=True)
-class PeerHealthAwarenessConfig:
-    """Configuration for peer health awareness."""
-
-    # Timeout multipliers based on peer load
-    # Applied on top of base probe timeout
-    timeout_multiplier_busy: float = 1.25  # 25% longer for busy peers
-    timeout_multiplier_stressed: float = 1.75  # 75% longer for stressed peers
-    timeout_multiplier_overloaded: float = 2.5  # 150% longer for overloaded peers
-
-    # Staleness threshold for peer health info
-    stale_threshold_seconds: float = 30.0
-
-    # Maximum peers to track (prevent memory growth)
-    max_tracked_peers: int = 1000
-
-    # Enable behavior adaptations
-    enable_timeout_adaptation: bool = True
-    enable_proxy_avoidance: bool = True
-    enable_gossip_reduction: bool = True
+from .peer_health_info import _DEFAULT_CLOCK
+from .peer_load_level import _OVERLOAD_STATE_TO_LEVEL
+from .peer_health_awareness_config import PeerHealthAwarenessConfig
+from .peer_health_info import PeerHealthInfo
+from .peer_load_level import PeerLoadLevel
 
 
 @dataclass(slots=True)
@@ -205,19 +114,14 @@ class PeerHealthAwareness:
         if peer_info.is_stressed:
             self._overloaded_updates += 1
 
-        # Invoke callbacks for state transitions
+        # Invoke callbacks for state transitions. The update is stored: a
+        # failing callback raises to the caller rather than vanishing.
         if peer_info.is_stressed and not previous_overloaded:
             if self._on_peer_overloaded:
-                try:
-                    self._on_peer_overloaded(health.node_id)
-                except Exception:
-                    pass  # Don't let callback errors affect processing
+                self._on_peer_overloaded(health.node_id)
         elif not peer_info.is_stressed and previous_overloaded:
             if self._on_peer_recovered:
-                try:
-                    self._on_peer_recovered(health.node_id)
-                except Exception:
-                    pass
+                self._on_peer_recovered(health.node_id)
 
     def get_peer_info(self, node_id: str) -> PeerHealthInfo | None:
         """
@@ -487,3 +391,12 @@ class PeerHealthAwareness:
             "current_stressed": stressed_count,
             "max_tracked_peers": self.config.max_tracked_peers,
         }
+
+_REHOMED = (
+    PeerLoadLevel,
+    PeerHealthInfo,
+    PeerHealthAwarenessConfig,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

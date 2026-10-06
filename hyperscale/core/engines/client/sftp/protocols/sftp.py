@@ -2099,9 +2099,14 @@ class SFTPGlob:
     async def _scandir(self, path) -> AsyncIterator[SFTPName]:
         """Cache results of calls to scandir"""
 
-        if cached := self._scandir_cache.get(path):
+        # A listing already made is served from the cache alone (an empty
+        # one included): listing the directory again would yield every
+        # entry twice.
+        if (cached := self._scandir_cache.get(path)) is not None:
             for entry in cached:
                 yield entry
+
+            return
 
         entries: List[SFTPName] = []
 

@@ -430,7 +430,7 @@ async def _connect_tunnel_hop(host: str, port: DefTuple[int],
 
     loop = asyncio.get_event_loop()
 
-    hop_options: SSHClientConnectionOptions = await SSHClientConnectionOptions.construct(
+    hop_options: SSHClientConnectionOptions = SSHClientConnectionOptions(
         None, config=config, host=host, port=port, tunnel=tunnel,
         family=(), local_addr=(), username=username, passphrase=passphrase)
 
@@ -4696,21 +4696,6 @@ class SSHClientConnection(SSHConnection):
         return await connect(host, port, tunnel=self, **kwargs) # type: ignore
 
     @async_context_manager
-    async def listen_ssh(self, host: str = '', port: DefTuple[int] = (),
-                         **kwargs: object) -> SSHAcceptor:
-        """Create a tunneled SSH listener
-
-           This method is a coroutine which can be called to open a remote
-           SSH listener on the requested host and port tunneled inside this
-           already established connection. It takes all the same arguments as
-           :func:`listen` but requests that the upstream SSH server open the
-           listener rather than listening directly via TCP/IP.
-
-        """
-
-        return await listen(host, port, tunnel=self, **kwargs) # type: ignore
-
-    @async_context_manager
     async def listen_reverse_ssh(self, host: str = '',
                                  port: DefTuple[int] = (),
                                  **kwargs: object) -> SSHAcceptor:
@@ -6416,7 +6401,7 @@ async def run_client(sock: socket.socket, config: DefTuple[ConfigPaths] = (),
 
     loop = asyncio.get_event_loop()
 
-    new_options: SSHClientConnectionOptions = await SSHClientConnectionOptions.construct(
+    new_options: SSHClientConnectionOptions = SSHClientConnectionOptions(
         options, config=config, **kwargs)
 
     return await asyncio.wait_for(
@@ -6533,7 +6518,7 @@ async def connect(host = '', port: DefTuple[int] = (), *,
 
     loop = asyncio.get_event_loop()
 
-    new_options: SSHClientConnectionOptions = await SSHClientConnectionOptions.construct(
+    new_options: SSHClientConnectionOptions = SSHClientConnectionOptions(
         options, config=config, host=host, port=port, tunnel=tunnel,
         family=family, local_addr=local_addr, **kwargs)
 
@@ -6669,7 +6654,7 @@ async def listen_reverse(host = '', port: DefTuple[int] = (), *,
 
     loop = asyncio.get_event_loop()
 
-    new_options = await SSHClientConnectionOptions.construct(
+    new_options = SSHClientConnectionOptions(
         options, config=config, host=host, port=port, tunnel=tunnel,
         family=family, **kwargs)
 
@@ -6829,7 +6814,7 @@ async def get_server_host_key(
 
     loop = asyncio.get_event_loop()
 
-    new_options = await SSHClientConnectionOptions.construct(
+    new_options = SSHClientConnectionOptions(
         options, config=config, host=host, port=port, tunnel=tunnel,
         proxy_command=proxy_command, family=family, local_addr=local_addr,
         known_hosts=None, server_host_key_algs=server_host_key_algs,
@@ -6972,7 +6957,7 @@ async def get_server_auth_methods(
 
     loop = asyncio.get_event_loop()
 
-    new_options = await SSHClientConnectionOptions.construct(
+    new_options = SSHClientConnectionOptions(
         options, config=config, host=host, port=port, username=username,
         tunnel=tunnel, proxy_command=proxy_command, family=family,
         local_addr=local_addr, known_hosts=None,

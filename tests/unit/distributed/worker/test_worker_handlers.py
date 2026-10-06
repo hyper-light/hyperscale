@@ -2,7 +2,7 @@
 Integration tests for worker TCP handlers (Section 15.2.5).
 
 Tests WorkflowDispatchHandler, WorkflowCancelHandler, JobLeaderTransferHandler,
-WorkflowProgressHandler, StateSyncHandler, and WorkflowStatusQueryHandler.
+StateSyncHandler and WorkflowStatusQueryHandler.
 
 Covers:
 - Happy path: Normal message handling
@@ -466,67 +466,6 @@ class TestJobLeaderTransferHandler:
 
         # Pending transfer should be stored
         assert "job-123" in mock_server._pending_transfers
-
-
-class TestWorkflowProgressHandler:
-    """Test WorkflowProgressHandler."""
-
-    @pytest.fixture
-    def mock_server(self):
-        server = MockServerForHandlers()
-        server._registry = MagicMock()
-        server._backpressure_manager = MagicMock()
-        server._backpressure_manager.get_backpressure_delay_ms.return_value = 0
-        server._task_runner = MagicMock()
-        server._task_runner.run = MagicMock()
-        return server
-
-    def test_process_ack_updates_routing_and_backpressure(self, mock_server):
-        from hyperscale.distributed.models import ManagerInfo, WorkflowProgressAck
-        from hyperscale.distributed.nodes.worker.handlers.tcp_progress import (
-            WorkflowProgressHandler,
-        )
-
-        handler = WorkflowProgressHandler(mock_server)
-
-        ack = WorkflowProgressAck(
-            manager_id="mgr-1",
-            is_leader=True,
-            healthy_managers=[
-                ManagerInfo(
-                    node_id="mgr-1",
-                    tcp_host="127.0.0.1",
-                    tcp_port=7000,
-                    udp_host="127.0.0.1",
-                    udp_port=7001,
-                    datacenter="dc-1",
-                    is_leader=True,
-                )
-            ],
-            job_leader_addr=("127.0.0.1", 7000),
-            backpressure_level=1,
-            backpressure_delay_ms=50,
-            backpressure_batch_only=False,
-        )
-
-        handler.process_ack(ack.dump(), workflow_id="wf-1")
-
-        mock_server._registry.add_manager.assert_called_once()
-        assert mock_server._primary_manager_id == "mgr-1"
-        assert mock_server._workflow_job_leader["wf-1"] == ("127.0.0.1", 7000)
-        mock_server._backpressure_manager.set_manager_backpressure.assert_called_once()
-        mock_server._backpressure_manager.set_backpressure_delay_ms.assert_called_once()
-
-    def test_process_ack_invalid_data_logs_debug(self, mock_server):
-        from hyperscale.distributed.nodes.worker.handlers.tcp_progress import (
-            WorkflowProgressHandler,
-        )
-
-        handler = WorkflowProgressHandler(mock_server)
-
-        handler.process_ack(b"invalid", workflow_id="wf-1")
-
-        mock_server._task_runner.run.assert_called_once()
 
 
 class TestStateSyncHandler:

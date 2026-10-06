@@ -5,7 +5,7 @@ This module provides a fully modular implementation of the GateServer
 following the one-class-per-file pattern.
 
 Structure:
-- config: GateConfig dataclass for immutable configuration
+- config: settings derived from Env
 - state: GateRuntimeState for mutable runtime state
 - server: GateServer composition root
 - models/: Gate-specific dataclasses (slots=True)
@@ -21,7 +21,6 @@ Coordinators:
 - orphan_job_coordinator: Orphaned job detection and takeover
 """
 
-from .config import GateConfig, create_gate_config
 from .state import GateRuntimeState
 from .server import GateServer
 
@@ -46,8 +45,6 @@ from .handlers import (
 __all__ = [
     # Core
     "GateServer",
-    "GateConfig",
-    "create_gate_config",
     "GateRuntimeState",
     # Coordinators
     "GateLeadershipCoordinator",

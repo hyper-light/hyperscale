@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from hyperscale.distributed.nodes.worker import backpressure as backpressure_module
 from hyperscale.distributed.nodes.worker.backpressure import WorkerBackpressureManager
 from hyperscale.distributed.reliability import BackpressureLevel
 
@@ -350,6 +351,19 @@ class TestWorkerBackpressureManagerStateName:
         assert name == "REJECT"
 
 
+class YieldingClock:
+    """A clock whose sleep only yields to the event loop."""
+
+    def monotonic(self) -> float:
+        return 0.0
+
+    def time(self) -> float:
+        return 0.0
+
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(0)
+
+
 class TestWorkerBackpressureManagerPolling:
     """Test overload polling loop."""
 
@@ -394,10 +408,16 @@ class TestWorkerBackpressureManagerPolling:
             pass
 
     @pytest.mark.asyncio
-    async def test_poll_loop_handles_exceptions(self):
-        """Test that poll loop handles exceptions gracefully."""
+    async def test_poll_loop_handles_exceptions(self, monkeypatch: pytest.MonkeyPatch):
+        """The poll loop keeps sampling after a resource getter raises.
+
+        Driven through the module's clock seam, one sample per sleep: counting
+        samples inside a wall-clock window failed whenever load delayed the
+        loop's timers.
+        """
         state = _create_mock_state()
         manager = WorkerBackpressureManager(state, poll_interval=0.01)
+        monkeypatch.setattr(backpressure_module, "_DEFAULT_CLOCK", YieldingClock())
 
         call_count = [0]
 
@@ -405,24 +425,15 @@ class TestWorkerBackpressureManagerPolling:
             call_count[0] += 1
             if call_count[0] < 3:
                 raise RuntimeError("Resource unavailable")
+            manager.stop()
             return 50.0
 
         manager.set_resource_getters(failing_getter, lambda: 30.0)
 
-        task = asyncio.create_task(manager.run_overload_poll_loop())
+        await manager.run_overload_poll_loop()
 
-        await asyncio.sleep(0.05)
-
-        manager.stop()
-        task.cancel()
-
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-        # Should have been called multiple times despite exceptions
-        assert call_count[0] >= 3
+        # Sampled again after each failure, until the first success.
+        assert call_count[0] == 3
 
 
 class TestWorkerBackpressureManagerEdgeCases:

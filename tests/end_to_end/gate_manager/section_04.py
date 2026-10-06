@@ -268,8 +268,8 @@ async def validate_4_2_priority_based_shedding() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         shedder = gate._load_shedder
-        assert callable(getattr(shedder, "classify_request", None)), (
-            "Priority shedding expected classify_request"
+        assert callable(getattr(shedder, "should_shed_handler", None)), (
+            "Priority shedding expected should_shed_handler"
         )
     finally:
         await runtime.stop_cluster()

@@ -179,6 +179,31 @@ class BaseMonitor:
             except asyncio.CancelledError:
                 pass
 
+    def release_run(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        """
+        Drop everything kept for the workflow's run -- its samples, its
+        flags and its lock -- once nothing reads them. The run's
+        sampler is stopped by then (stop_background_monitor); one still
+        running is cancelled.
+        """
+        if (monitor := self._background_monitors.get(run_id, {}).pop(workflow_name, None)) is not None:
+            monitor.cancel()
+
+        for run_states in (
+            self.active,
+            self._running_monitors,
+            self._locked_runs,
+            self._background_monitors,
+        ):
+            if (workflow_states := run_states.get(run_id)) is not None:
+                workflow_states.pop(workflow_name, None)
+                if not workflow_states:
+                    del run_states[run_id]
+
     async def stop_all_background_monitors(self):
         if len(self.active) > 0:
             await asyncio.gather(

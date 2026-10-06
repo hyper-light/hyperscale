@@ -8,26 +8,27 @@ and resume the persisted submission, the client observes exactly one
 terminal result and the durable truth never regresses. Two probed
 placements of the second crash:
 
-* R2 = 57.0 — INSIDE gen-2's recovery span. Gen-2 boots at 54.4,
-  replays the WAL, re-activates the job and queues its dispatch, and
-  dies at 57.0 BEFORE the worker's re-registration (~62.4) — its
-  generation log carries ``manager-started`` and nothing else, the
-  structural proof the crash landed mid-recovery. Gen-3 boots at 82.0,
+* R2 = gen-2 boot + 2.6 (49.75) — INSIDE gen-2's recovery span. Gen-2
+  boots at 47.15, replays the WAL, re-activates the job and queues its
+  dispatch, and dies BEFORE the worker's re-registration (boot + 4.5) —
+  its generation log carries ``manager-started`` and nothing else, the
+  structural proof the crash landed mid-recovery. Gen-3 boots at 74.75,
   replays the SAME still-ACTIVE ledger + submission payload, resumes
-  again, re-admits the worker (85.5 sample), re-dispatches
-  (85.5-86.0) and the client observes exactly one ``completed`` at
-  85.974191 — prompt: boot + 3.97s.
-* R2 = 59.5 — AFTER gen-2's re-dispatch, BEFORE the completion record.
-  Gen-2 re-admitted the worker (59.4) and re-dispatched (59.25); the
-  crash lands mid-execution, so the worker's second run drains into a
-  dead manager (its active entry lingers to 83.25) and gen-3 resumes a
-  THIRD dispatch (86.25-86.75). Execution is at-least-once times
-  three; the client outcome is exactly-once: one ``completed``,
-  delivered at 86.620758 -- the third run's result reaches gen-3 0.08s
-  after the run ends. Re-probed 2026-10-02: gen-2's recovery got
-  3.0s faster (re-dispatch 62.25 -> 59.25, completion record ~62.61 ->
-  ~59.7), so the old 62.5 landed AFTER the completion and the job
-  finished under gen-2; 59.5 keeps the crash inside the same window.
+  again, re-admits the worker (80.25), re-dispatches (80.0-80.5) and the
+  client observes exactly one ``completed`` at 80.428157 — prompt: boot
+  + 5.68s.
+* R2 = gen-2 boot + 4.6 (51.75) — AFTER gen-2's re-dispatch, BEFORE the
+  completion record. Gen-2 re-admitted the worker (51.65) and
+  re-dispatched (51.5); the crash lands mid-execution, so the worker's
+  second run drains into a dead manager (its active entry lingers to
+  75.5) and gen-3 resumes a THIRD dispatch (77.5-78.0). Execution is
+  at-least-once times three; the client outcome is exactly-once: one
+  ``completed``, delivered at 77.922872.
+
+Re-probed 2026-10-04: the first restart moved from 9.4 to 2.15 (0.15
+after the activation sample, as before) once a lone manager led the
+moment its own vote made the majority; the second crashes are expressed
+from gen-2's boot so they keep their places in its recovery.
 
 FIXED GAP (second placement): gen-3's completion used to arrive ~44s
 late (130.9). Every manager generation re-registers under a new node id
@@ -53,15 +54,21 @@ from tests.simulation.oracle import JobStatusOracle
 _SEED = 101
 _WAIT_TIMEOUT_SECONDS = 200.0
 
-_RESTART_ONE_AT = 9.4
+# Mid-run (seed 101: the worker's activation is sampled at 2.0, the
+# completion record lands ~2.37), 0.15 after the activation sample as
+# before (9.25 -> 9.4 while a lone manager waited out a full pre-vote and
+# vote wait for a majority its own vote already made).
+_RESTART_ONE_AT = 2.15
 _DOWN_ONE_SECONDS = 45.0
-_GENERATION_TWO_BOOT = _RESTART_ONE_AT + _DOWN_ONE_SECONDS  # 54.4
+_GENERATION_TWO_BOOT = _RESTART_ONE_AT + _DOWN_ONE_SECONDS  # 47.15
 
-_MID_RECOVERY_RESTART_AT = 57.0
+# Inside gen-2's recovery span: before it re-admits the worker (probed
+# boot + 4.5).
+_MID_RECOVERY_RESTART_AT = _GENERATION_TWO_BOOT + 2.6
 _MID_RECOVERY_DOWN_SECONDS = 25.0
 _GENERATION_THREE_BOOT = (
     _MID_RECOVERY_RESTART_AT + _MID_RECOVERY_DOWN_SECONDS
-)  # 82.0
+)  # 74.75
 _MID_RECOVERY_CEILING = 140.0
 # Gen-3's resume leg (boot -> worker re-registration -> re-dispatch ->
 # completion push) measured 3.97s; gen-2's equivalent leg in the house
@@ -69,11 +76,14 @@ _MID_RECOVERY_CEILING = 140.0
 # plus slack.
 _RESUME_LEG_CEILING_SECONDS = 12.0
 
-_MID_REDISPATCH_RESTART_AT = 59.5
+# After gen-2's re-dispatch, before its completion record: probed, gen-2
+# re-admits the worker and re-dispatches at boot + 4.5 and the client sees
+# completion at boot + 4.91; 0.1 after re-admission, as before.
+_MID_REDISPATCH_RESTART_AT = _GENERATION_TWO_BOOT + 4.6
 _MID_REDISPATCH_DOWN_SECONDS = 25.0
 _GENERATION_THREE_LATE_BOOT = (
     _MID_REDISPATCH_RESTART_AT + _MID_REDISPATCH_DOWN_SECONDS
-)  # 84.5
+)  # 76.75
 _MID_REDISPATCH_CEILING = 160.0
 
 
@@ -226,7 +236,7 @@ def test_second_crash_inside_recovery_is_idempotent_and_completes():
     assert _GENERATION_THREE_BOOT < finished_time <= resume_ceiling, (
         f"triple-generation completion at {finished_time} outside the "
         f"resume-leg design bound ({_GENERATION_THREE_BOOT}, "
-        f"{resume_ceiling}] (measured 85.974191): {client_log}"
+        f"{resume_ceiling}] (measured 80.428157): {client_log}"
     )
 
     # Execution truth: the doomed gen-1 dispatch plus gen-3's resumed
@@ -301,7 +311,7 @@ def test_second_crash_after_redispatch_never_double_delivers():
         f"exactly-once completion at {finished_time} outside "
         f"({_GENERATION_THREE_LATE_BOOT}, {resume_deadline}) -- the resumed "
         f"job's result must reach the live generation promptly "
-        f"(measured 86.620758): {client_log}"
+        f"(measured 77.922872): {client_log}"
     )
 
     _assert_oracle_clean(client_log)

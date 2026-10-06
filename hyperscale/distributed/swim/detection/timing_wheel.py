@@ -35,107 +35,30 @@ the ``HierarchicalFailureDetector`` is unchanged. The wheel-
 specific configuration fields and the ``WheelEntry`` /
 ``TimingWheelBucket`` types are kept as no-op compatibility
 shims for callers that still import them.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass
 from typing import Callable, Generic, TypeVar
-
 from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+from hyperscale.logging.hyperscale_logging_models import ServerError
 
 from .suspicion_state import SuspicionState
-
+from .timing_wheel_shared import NodeAddress
+from .wheel_entry import T
+from .timing_wheel_bucket import TimingWheelBucket
+from .timing_wheel_config import TimingWheelConfig
+from .wheel_entry import WheelEntry
+from ._entry import _Entry
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-# Type for node address
-NodeAddress = tuple[str, int]
-
-# Type variable for wheel entries (kept for backward-compatibility
-# generics in callers that still import WheelEntry[T])
-T = TypeVar("T")
-
-
-@dataclass(slots=True)
-class WheelEntry(Generic[T]):
-    """Backward-compatibility shim.
-
-    The previous two-level-wheel implementation used this dataclass
-    to thread state + expiration time through bucket data structures.
-    The event-driven replacement no longer uses it internally
-    (entries are tracked by ``_Entry`` instead), but the type is
-    retained so existing imports / type hints continue to resolve.
-    """
-
-    node: NodeAddress
-    state: T
-    expiration_time: float
-    epoch: int = 0
-
-
-@dataclass
-class TimingWheelConfig:
-    """Configuration shim for backward compatibility.
-
-    The wheel-resolution fields (``coarse_tick_ms``, ``fine_tick_ms``,
-    wheel sizes, ``fine_wheel_threshold_ms``) parameterised the
-    previous polling-tick wheel. The event-driven registry does not
-    consume them — asyncio's timer queue resolves expirations to its
-    own precision (microseconds in practice). The fields and the
-    historical ``coarse_tick_ms == fine_tick_ms * fine_wheel_size``
-    invariant remain so existing callers that pass them through
-    don't error out.
-    """
-
-    coarse_tick_ms: int = 1000
-    coarse_wheel_size: int = 64
-    fine_tick_ms: int = 100
-    fine_wheel_size: int = 10
-    fine_wheel_threshold_ms: int = 1000
-
-    def __post_init__(self) -> None:
-        expected_coarse = self.fine_tick_ms * self.fine_wheel_size
-        if self.coarse_tick_ms != expected_coarse:
-            raise ValueError(
-                f"TimingWheelConfig: coarse_tick_ms must equal "
-                f"fine_tick_ms * fine_wheel_size "
-                f"({self.fine_tick_ms} * {self.fine_wheel_size} = "
-                f"{expected_coarse}); got coarse_tick_ms={self.coarse_tick_ms}."
-            )
-        if self.fine_wheel_threshold_ms > expected_coarse:
-            raise ValueError(
-                f"TimingWheelConfig: fine_wheel_threshold_ms "
-                f"({self.fine_wheel_threshold_ms}) cannot exceed the fine "
-                f"wheel span ({expected_coarse})."
-            )
-
-
-class TimingWheelBucket:
-    """Backward-compatibility shim.
-
-    No longer used internally — entries live in ``TimingWheel._entries``
-    directly. Retained because the symbol was part of the public
-    detection module exports.
-    """
-
-    __slots__ = ("entries",)
-
-    def __init__(self) -> None:
-        self.entries: dict[NodeAddress, WheelEntry[SuspicionState]] = {}
-
-    def __len__(self) -> int:
-        return len(self.entries)
-
-
-@dataclass(slots=True)
-class _Entry:
-    """Internal entry: suspicion state, expiration deadline, asyncio handle."""
-
-    state: SuspicionState
-    expiration_time: float
-    timer_handle: asyncio.TimerHandle | None = None
 
 
 class TimingWheel:
@@ -184,10 +107,11 @@ class TimingWheel:
         self._entries_removed: int = 0
         self._entries_expired: int = 0
         self._entries_moved: int = 0
+        # Errors the ``on_error`` hook failed to report.
+        self._error_report_failures: int = 0
 
     async def _log_error(self, message: str) -> None:
         if self._logger:
-            from hyperscale.logging.hyperscale_logging_models import ServerError
 
             await self._logger.log(
                 ServerError(
@@ -311,7 +235,9 @@ class TimingWheel:
                         callback_error,
                     )
                 except Exception:
-                    pass
+                    # The error hook itself failed: nowhere left to report
+                    # it but this wheel's stats.
+                    self._error_report_failures += 1
 
     async def clear(self) -> None:
         """Drop all entries (cancelling pending timers)."""
@@ -327,6 +253,7 @@ class TimingWheel:
             "entries_removed": self._entries_removed,
             "entries_expired": self._entries_expired,
             "entries_moved": self._entries_moved,
+            "error_report_failures": self._error_report_failures,
             # ``cascade_count`` / wheel positions are wheel-specific
             # concepts that don't apply to the event-driven model;
             # keep the keys for backwards-compat stat dashboards.
@@ -379,3 +306,13 @@ class TimingWheel:
     def get_state_sync(self, node: NodeAddress) -> SuspicionState | None:
         entry = self._entries.get(node)
         return entry.state if entry else None
+
+_REHOMED = (
+    WheelEntry,
+    TimingWheelConfig,
+    TimingWheelBucket,
+    _Entry,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

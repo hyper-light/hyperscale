@@ -1,3 +1,12 @@
+"""
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,17 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, AsyncIterator, Mapping
-
 from hyperscale.distributed.hlc.hybrid_logical_clock import HybridLogicalClock
 from hyperscale.distributed.reliability.robust_queue import QueuePutResult, QueueState
-from hyperscale.distributed.reliability.backpressure import (
-    BackpressureLevel,
-    BackpressureSignal,
-)
-
+from hyperscale.distributed.reliability.backpressure import BackpressureLevel, BackpressureSignal
 from hyperscale.distributed.ledger.storage_health import StorageHealth
 from hyperscale.distributed.ledger.events.event_type import JobEventType
-from .entry_state import WALEntryState, TransitionResult
 from hyperscale.distributed.ledger.storage_format import (
     StorageFormat,
     UnrecognizedStorageFormatError,
@@ -25,54 +28,25 @@ from hyperscale.distributed.ledger.storage_format import (
     set_aside_unrecognized,
 )
 from hyperscale.logging.hyperscale_logging_models import WALTailDiscarded
+from hyperscale.distributed.runtime import Filesystem, RealFilesystem
+
+from .entry_state import WALEntryState, TransitionResult
 from .wal_entry import HEADER_SIZE, WALEntry
 from .wal_status_snapshot import WALStatusSnapshot
-from hyperscale.distributed.runtime import (
-    Filesystem,
-    RealFilesystem,
-)
+from .wal_writer import WALWriter, WALWriterConfig, WriteRequest, WALBackpressureError
+from .wal_append_result import WALAppendResult
 
-from .wal_writer import (
-    WALWriter,
-    WALWriterConfig,
-    WriteRequest,
-    WALBackpressureError,
-)
+if TYPE_CHECKING:
+    from hyperscale.logging import Logger
 
 # Module-level storage seam (Phase 7): borrowed, never shut down here;
 # swap_defaults rebinds it under SIM.
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
-
 # Every WAL file begins with this header (AD-39 HLC entry layout). Files
 # without it -- earlier layouts, other programs, corruption -- are never
 # read as entries.
 WAL_FORMAT = StorageFormat(b"HSWL", 1)
-
-if TYPE_CHECKING:
-    from hyperscale.logging import Logger
-
-
-@dataclass(slots=True)
-class WALAppendResult:
-    entry: WALEntry
-    queue_result: QueuePutResult
-
-    @property
-    def backpressure(self) -> BackpressureSignal:
-        return self.queue_result.backpressure
-
-    @property
-    def backpressure_level(self) -> BackpressureLevel:
-        return self.queue_result.backpressure.level
-
-    @property
-    def queue_state(self) -> QueueState:
-        return self.queue_result.queue_state
-
-    @property
-    def in_overflow(self) -> bool:
-        return self.queue_result.in_overflow
 
 
 class NodeWAL:
@@ -321,9 +295,11 @@ class NodeWAL:
             raise
 
         async with self._state_lock:
+            # Appenders of one batch resume in any order once it syncs; the
+            # watermark only ever rises.
             self._status_snapshot = WALStatusSnapshot(
                 next_lsn=self._status_snapshot.next_lsn,
-                last_synced_lsn=lsn,
+                last_synced_lsn=max(self._status_snapshot.last_synced_lsn, lsn),
                 pending_count=self._status_snapshot.pending_count,
                 closed=False,
             )
@@ -413,6 +389,43 @@ class NodeWAL:
             )
             return TransitionResult.SUCCESS
 
+    async def mark_applied_through(self, up_to_lsn: int) -> int:
+        """Mark every entry at or below ``up_to_lsn`` APPLIED in one pass --
+        recovery's: the ledger applied each recovered entry (replayed, or
+        held by the checkpoint it resumed from), and an entry never marked
+        applied could never be compacted. Returns how many moved."""
+        async with self._state_lock:
+            applied_count = 0
+            for lsn, entry in self._pending_entries_internal.items():
+                if lsn <= up_to_lsn and entry.state < WALEntryState.APPLIED:
+                    self._pending_entries_internal[lsn] = entry.with_state(WALEntryState.APPLIED)
+                    applied_count += 1
+            if applied_count > 0:
+                self._pending_snapshot = MappingProxyType(dict(self._pending_entries_internal))
+            return applied_count
+
+    async def discard_through(self, lsn: int) -> int:
+        """Drop every frame at or below ``lsn`` from the log file -- they
+        are held by a checkpoint -- keeping its format header and every
+        later frame byte for byte. Frames are in LSN order (appends queue
+        FIFO), so the cut is a prefix. Returns how many bytes the log
+        shrank by."""
+
+        def drop_through(committed: bytes) -> bytes:
+            frames = WAL_FORMAT.decode(committed)
+            header_length = len(committed) - len(frames)
+            offset = 0
+            while offset + HEADER_SIZE <= len(frames):
+                frame_length, frame_lsn = struct.unpack(">IQ", frames[offset + 4 : offset + 16])
+                if frame_lsn > lsn or frame_length < HEADER_SIZE or offset + frame_length > len(frames):
+                    break
+                offset += frame_length
+            if offset == 0:
+                return committed
+            return committed[:header_length] + frames[offset:]
+
+        return await self._writer.rewrite(drop_through)
+
     async def compact(self, up_to_lsn: int) -> int:
         async with self._state_lock:
             compacted_count = 0
@@ -501,6 +514,21 @@ class NodeWAL:
         self._last_regional_lsn = max(self._last_regional_lsn, regional_lsn)
         self._last_global_lsn = max(self._last_global_lsn, global_lsn)
 
+    def restore_checkpointed_lsn(self, checkpoint_local_lsn: int) -> None:
+        """At recovery from a checkpoint: the next entry's LSN follows every
+        LSN the checkpoint holds through. A checkpoint lets the log drop the
+        frames it covers -- possibly all of them -- and a log recovered
+        with none would number its next entries from 0 again, at or below
+        the checkpoint's LSN, where the next recovery (replaying only past
+        that LSN) would skip them: acknowledged writes lost."""
+        if self._status_snapshot.next_lsn <= checkpoint_local_lsn:
+            self._status_snapshot = WALStatusSnapshot(
+                next_lsn=checkpoint_local_lsn + 1,
+                last_synced_lsn=max(self._status_snapshot.last_synced_lsn, checkpoint_local_lsn),
+                pending_count=self._status_snapshot.pending_count,
+                closed=self._status_snapshot.closed,
+            )
+
     @property
     def is_closed(self) -> bool:
         return self._status_snapshot.closed
@@ -527,3 +555,10 @@ class NodeWAL:
                     pending_count=self._status_snapshot.pending_count,
                     closed=True,
                 )
+
+_REHOMED = (
+    WALAppendResult,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

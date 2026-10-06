@@ -2,6 +2,10 @@ import msgspec
 import mimetypes
 import pathlib
 
+# A file's content type by its name: guess_file_type from Python 3.13,
+# guess_type before it.
+_guess_file_type = getattr(mimetypes, "guess_file_type", mimetypes.guess_type)
+
 
 class FileAttributes(msgspec.Struct):
     type: int | None = None
@@ -32,7 +36,7 @@ class FileAttributes(msgspec.Struct):
     ):
         
         result = path.stat()
-        mime_type, encoding = mimetypes.guess_file_type(path)
+        mime_type, encoding = _guess_file_type(path)
 
         path_type = 1
 

@@ -25,6 +25,7 @@ import orjson
 from pydantic import BaseModel
 
 from hyperscale.core.engines.client.shared.models import URL as HTTPUrl
+from hyperscale.core.engines.client.shared.models.url import DEFAULT_PORTS
 from hyperscale.core.engines.client.shared.models import Cookies as HTTPCookies
 from hyperscale.core.engines.client.shared.models import (
     HTTPCookie,
@@ -33,9 +34,9 @@ from hyperscale.core.engines.client.shared.models import (
     URLMetadata,
 )
 from hyperscale.core.engines.client.shared.protocols import (
-    NEW_LINE,
     ProtocolMap,
 )
+from hyperscale.core.engines.client.shared.concurrency_limit import ConcurrencyLimit
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.engines.client.shared.phase_timeout import PhaseTimeout, within_timeout
 from hyperscale.core.testing.models import (
@@ -47,7 +48,7 @@ from hyperscale.core.testing.models import (
     Params,
 )
 
-from .fast_hpack import ConnectionEncoder, Encoder
+from .fast_hpack import ConnectionEncoder
 from .models.http2 import (
     HTTP2Response,
 )
@@ -57,6 +58,13 @@ from .settings import Settings
 
 A = TypeVar("A")
 R = TypeVar("R")
+
+# Each method's :method pseudo-header, built once: every request with the
+# method sends the same tuple.
+_METHOD_HEADERS: Dict[str, Tuple[bytes, bytes]] = {
+    method: (b":method", method.encode())
+    for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+}
 
 
 class MercurySyncHTTP2Connection:
@@ -70,12 +78,18 @@ class MercurySyncHTTP2Connection:
         # Each engine gets its own Timeouts: a default argument would be one
         # instance shared by every engine built without timeouts.
         self.timeouts = timeouts if timeouts is not None else Timeouts()
+        # Connecting and reading the response are each bounded by half of
+        # request_timeout, so a request stuck in either fails while the run
+        # still has time for the VU's next one; computed once.
+        self._connect_timeout = self.timeouts.request_timeout / 2
+        self._read_timeout = self.timeouts.request_timeout / 2
 
         self.closed = False
         self._concurrency = pool_size
         self._reset_connections = reset_connections
 
-        self._semaphore: asyncio.Semaphore = None
+        # At most one request per pooled connection; set up by setup_client.
+        self._semaphore: ConcurrencyLimit = None
 
         self._dns_lock: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: Dict[str, asyncio.Future] = defaultdict(asyncio.Future)
@@ -90,7 +104,6 @@ class MercurySyncHTTP2Connection:
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
-        self._encoder: Encoder = None
         self._settings: Settings = None
 
         self._client_ssl_context: Optional[ssl.SSLContext] = None
@@ -112,41 +125,47 @@ class MercurySyncHTTP2Connection:
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
-        async with self._semaphore:
-            try:
-                return await within_timeout(
-                    self._request(
-                        url,
-                        "HEAD",
-                        auth=auth,
-                        cookies=cookies,
-                        headers=headers,
-                        params=params,
-                        redirects=redirects,
-                    ),
-                    timeout=timeout,
-                )
+        concurrency_limit = self._semaphore
+        if not concurrency_limit.try_acquire():
+            await concurrency_limit.acquire()
 
-            except asyncio.TimeoutError:
-                if isinstance(url, str):
-                    url_data = urlparse(url)
-
-                else:
-                    url_data = url.optimized.parsed
-
-                return HTTP2Response(
-                    url=URLMetadata(
-                        host=url_data.hostname,
-                        path=url_data.path,
-                        params=url_data.params,
-                        query=url_data.query,
-                    ),
+        try:
+            return await within_timeout(
+                self._request(
+                    url,
+                    "HEAD",
+                    auth=auth,
+                    cookies=cookies,
                     headers=headers,
-                    method="HEAD",
-                    status=408,
-                    status_message="Request timed out.",
-                    timings={},
-                )
+                    params=params,
+                    redirects=redirects,
+                ),
+                timeout=timeout,
+            )
+
+        except asyncio.TimeoutError:
+            if isinstance(url, str):
+                url_data = urlparse(url)
+
+            else:
+                url_data = url.optimized.parsed
+
+            return HTTP2Response(
+                url=URLMetadata(
+                    host=url_data.hostname,
+                    path=url_data.path,
+                    params=url_data.params,
+                    query=url_data.query,
+                ),
+                headers=headers,
+                method="HEAD",
+                status=408,
+                status_message="Request timed out.",
+                timings={},
+            )
+
+        finally:
+            concurrency_limit.release()
 
     async def options(
         self,
@@ -158,41 +177,47 @@ class MercurySyncHTTP2Connection:
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
-        async with self._semaphore:
-            try:
-                return await within_timeout(
-                    self._request(
-                        url,
-                        "OPTIONS",
-                        auth=auth,
-                        cookies=cookies,
-                        headers=headers,
-                        params=params,
-                        redirects=redirects,
-                    ),
-                    timeout=timeout,
-                )
+        concurrency_limit = self._semaphore
+        if not concurrency_limit.try_acquire():
+            await concurrency_limit.acquire()
 
-            except asyncio.TimeoutError:
-                if isinstance(url, str):
-                    url_data = urlparse(url)
-
-                else:
-                    url_data = url.optimized.parsed
-
-                return HTTP2Response(
-                    url=URLMetadata(
-                        host=url_data.hostname,
-                        path=url_data.path,
-                        params=url_data.params,
-                        query=url_data.query,
-                    ),
+        try:
+            return await within_timeout(
+                self._request(
+                    url,
+                    "OPTIONS",
+                    auth=auth,
+                    cookies=cookies,
                     headers=headers,
-                    method="OPTIONS",
-                    status=408,
-                    status_message="Request timed out.",
-                    timings={},
-                )
+                    params=params,
+                    redirects=redirects,
+                ),
+                timeout=timeout,
+            )
+
+        except asyncio.TimeoutError:
+            if isinstance(url, str):
+                url_data = urlparse(url)
+
+            else:
+                url_data = url.optimized.parsed
+
+            return HTTP2Response(
+                url=URLMetadata(
+                    host=url_data.hostname,
+                    path=url_data.path,
+                    params=url_data.params,
+                    query=url_data.query,
+                ),
+                headers=headers,
+                method="OPTIONS",
+                status=408,
+                status_message="Request timed out.",
+                timings={},
+            )
+
+        finally:
+            concurrency_limit.release()
 
     async def get(
         self,
@@ -204,41 +229,47 @@ class MercurySyncHTTP2Connection:
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
-        async with self._semaphore:
-            try:
-                return await within_timeout(
-                    self._request(
-                        url,
-                        "GET",
-                        auth=auth,
-                        cookies=cookies,
-                        headers=headers,
-                        params=params,
-                        redirects=redirects,
-                    ),
-                    timeout=timeout,
-                )
+        concurrency_limit = self._semaphore
+        if not concurrency_limit.try_acquire():
+            await concurrency_limit.acquire()
 
-            except asyncio.TimeoutError:
-                if isinstance(url, str):
-                    url_data = urlparse(url)
-
-                else:
-                    url_data = url.optimized.parsed
-
-                return HTTP2Response(
-                    url=URLMetadata(
-                        host=url_data.hostname,
-                        path=url_data.path,
-                        params=url_data.params,
-                        query=url_data.query,
-                    ),
+        try:
+            return await within_timeout(
+                self._request(
+                    url,
+                    "GET",
+                    auth=auth,
+                    cookies=cookies,
                     headers=headers,
-                    method="GET",
-                    status=408,
-                    status_message="Request timed out.",
-                    timings={},
-                )
+                    params=params,
+                    redirects=redirects,
+                ),
+                timeout=timeout,
+            )
+
+        except asyncio.TimeoutError:
+            if isinstance(url, str):
+                url_data = urlparse(url)
+
+            else:
+                url_data = url.optimized.parsed
+
+            return HTTP2Response(
+                url=URLMetadata(
+                    host=url_data.hostname,
+                    path=url_data.path,
+                    params=url_data.params,
+                    query=url_data.query,
+                ),
+                headers=headers,
+                method="GET",
+                status=408,
+                status_message="Request timed out.",
+                timings={},
+            )
+
+        finally:
+            concurrency_limit.release()
 
     async def post(
         self,
@@ -259,42 +290,48 @@ class MercurySyncHTTP2Connection:
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
-        async with self._semaphore:
-            try:
-                return await within_timeout(
-                    self._request(
-                        url,
-                        "POST",
-                        auth=auth,
-                        cookies=cookies,
-                        headers=headers,
-                        params=params,
-                        data=data,
-                        redirects=redirects,
-                    ),
-                    timeout=timeout,
-                )
+        concurrency_limit = self._semaphore
+        if not concurrency_limit.try_acquire():
+            await concurrency_limit.acquire()
 
-            except asyncio.TimeoutError:
-                if isinstance(url, str):
-                    url_data = urlparse(url)
-
-                else:
-                    url_data = url.optimized.parsed
-
-                return HTTP2Response(
-                    url=URLMetadata(
-                        host=url_data.hostname,
-                        path=url_data.path,
-                        params=url_data.params,
-                        query=url_data.query,
-                    ),
+        try:
+            return await within_timeout(
+                self._request(
+                    url,
+                    "POST",
+                    auth=auth,
+                    cookies=cookies,
                     headers=headers,
-                    method="POST",
-                    status=408,
-                    status_message="Request timed out.",
-                    timings={},
-                )
+                    params=params,
+                    data=data,
+                    redirects=redirects,
+                ),
+                timeout=timeout,
+            )
+
+        except asyncio.TimeoutError:
+            if isinstance(url, str):
+                url_data = urlparse(url)
+
+            else:
+                url_data = url.optimized.parsed
+
+            return HTTP2Response(
+                url=URLMetadata(
+                    host=url_data.hostname,
+                    path=url_data.path,
+                    params=url_data.params,
+                    query=url_data.query,
+                ),
+                headers=headers,
+                method="POST",
+                status=408,
+                status_message="Request timed out.",
+                timings={},
+            )
+
+        finally:
+            concurrency_limit.release()
 
     async def put(
         self,
@@ -315,42 +352,48 @@ class MercurySyncHTTP2Connection:
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
-        async with self._semaphore:
-            try:
-                return await within_timeout(
-                    self._request(
-                        url,
-                        "PUT",
-                        auth=auth,
-                        cookies=cookies,
-                        headers=headers,
-                        params=params,
-                        data=data,
-                        redirects=redirects,
-                    ),
-                    timeout=timeout,
-                )
+        concurrency_limit = self._semaphore
+        if not concurrency_limit.try_acquire():
+            await concurrency_limit.acquire()
 
-            except asyncio.TimeoutError:
-                if isinstance(url, str):
-                    url_data = urlparse(url)
-
-                else:
-                    url_data = url.optimized.parsed
-
-                return HTTP2Response(
-                    url=URLMetadata(
-                        host=url_data.hostname,
-                        path=url_data.path,
-                        params=url_data.params,
-                        query=url_data.query,
-                    ),
+        try:
+            return await within_timeout(
+                self._request(
+                    url,
+                    "PUT",
+                    auth=auth,
+                    cookies=cookies,
                     headers=headers,
-                    method="PUT",
-                    status=408,
-                    status_message="Request timed out.",
-                    timings={},
-                )
+                    params=params,
+                    data=data,
+                    redirects=redirects,
+                ),
+                timeout=timeout,
+            )
+
+        except asyncio.TimeoutError:
+            if isinstance(url, str):
+                url_data = urlparse(url)
+
+            else:
+                url_data = url.optimized.parsed
+
+            return HTTP2Response(
+                url=URLMetadata(
+                    host=url_data.hostname,
+                    path=url_data.path,
+                    params=url_data.params,
+                    query=url_data.query,
+                ),
+                headers=headers,
+                method="PUT",
+                status=408,
+                status_message="Request timed out.",
+                timings={},
+            )
+
+        finally:
+            concurrency_limit.release()
 
     async def patch(
         self,
@@ -371,42 +414,48 @@ class MercurySyncHTTP2Connection:
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
-        async with self._semaphore:
-            try:
-                return await within_timeout(
-                    self._request(
-                        url,
-                        "PATCH",
-                        auth=auth,
-                        cookies=cookies,
-                        headers=headers,
-                        params=params,
-                        data=data,
-                        redirects=redirects,
-                    ),
-                    timeout=timeout,
-                )
+        concurrency_limit = self._semaphore
+        if not concurrency_limit.try_acquire():
+            await concurrency_limit.acquire()
 
-            except asyncio.TimeoutError:
-                if isinstance(url, str):
-                    url_data = urlparse(url)
-
-                else:
-                    url_data = url.optimized.parsed
-
-                return HTTP2Response(
-                    url=URLMetadata(
-                        host=url_data.hostname,
-                        path=url_data.path,
-                        params=url_data.params,
-                        query=url_data.query,
-                    ),
+        try:
+            return await within_timeout(
+                self._request(
+                    url,
+                    "PATCH",
+                    auth=auth,
+                    cookies=cookies,
                     headers=headers,
-                    method="PATCH",
-                    status=408,
-                    status_message="Request timed out.",
-                    timings={},
-                )
+                    params=params,
+                    data=data,
+                    redirects=redirects,
+                ),
+                timeout=timeout,
+            )
+
+        except asyncio.TimeoutError:
+            if isinstance(url, str):
+                url_data = urlparse(url)
+
+            else:
+                url_data = url.optimized.parsed
+
+            return HTTP2Response(
+                url=URLMetadata(
+                    host=url_data.hostname,
+                    path=url_data.path,
+                    params=url_data.params,
+                    query=url_data.query,
+                ),
+                headers=headers,
+                method="PATCH",
+                status=408,
+                status_message="Request timed out.",
+                timings={},
+            )
+
+        finally:
+            concurrency_limit.release()
 
     async def delete(
         self,
@@ -418,41 +467,47 @@ class MercurySyncHTTP2Connection:
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
-        async with self._semaphore:
-            try:
-                return await within_timeout(
-                    self._request(
-                        url,
-                        "DELETE",
-                        auth=auth,
-                        cookies=cookies,
-                        headers=headers,
-                        params=params,
-                        redirects=redirects,
-                    ),
-                    timeout=timeout,
-                )
+        concurrency_limit = self._semaphore
+        if not concurrency_limit.try_acquire():
+            await concurrency_limit.acquire()
 
-            except asyncio.TimeoutError:
-                if isinstance(url, str):
-                    url_data = urlparse(url)
-
-                else:
-                    url_data = url.optimized.parsed
-
-                return HTTP2Response(
-                    url=URLMetadata(
-                        host=url_data.hostname,
-                        path=url_data.path,
-                        params=url_data.params,
-                        query=url_data.query,
-                    ),
+        try:
+            return await within_timeout(
+                self._request(
+                    url,
+                    "DELETE",
+                    auth=auth,
+                    cookies=cookies,
                     headers=headers,
-                    method="DELETE",
-                    status=408,
-                    status_message="Request timed out.",
-                    timings={},
-                )
+                    params=params,
+                    redirects=redirects,
+                ),
+                timeout=timeout,
+            )
+
+        except asyncio.TimeoutError:
+            if isinstance(url, str):
+                url_data = urlparse(url)
+
+            else:
+                url_data = url.optimized.parsed
+
+            return HTTP2Response(
+                url=URLMetadata(
+                    host=url_data.hostname,
+                    path=url_data.path,
+                    params=url_data.params,
+                    query=url_data.query,
+                ),
+                headers=headers,
+                method="DELETE",
+                status=408,
+                status_message="Request timed out.",
+                timings={},
+            )
+
+        finally:
+            concurrency_limit.release()
 
     async def _optimize(
         self,
@@ -466,39 +521,26 @@ class MercurySyncHTTP2Connection:
 
     async def _optimize_url(self, url: URL):
         try:
-            upgrade_ssl: bool = False
             (
                 _,
                 connection,
                 pipe,
                 optimized_url,
-                upgrade_ssl,
             ) = await asyncio.wait_for(
                 self._connect_to_url_location(None, url),
                 timeout=self.timeouts.request_timeout,
             )
 
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    pipe,
-                    optimized_url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.request_timeout,
-                )
-
             connection.reset()
             self._connections.append(connection)
             self._pipes.append(pipe)
 
-            self._url_cache[optimized_url.hostname] = optimized_url
+            # Plain-string requests for the same address reuse this lookup:
+            # the resolved URL, under the key the connect path reads. One
+            # that never resolved is left for the connect path to look up.
+            if optimized_url.ip_addresses:
+                self._url_cache[optimized_url.target] = optimized_url
+
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -515,6 +557,10 @@ class MercurySyncHTTP2Connection:
         data: Union[Optional[str], Optional[bytes], Optional[BaseModel]] = None,
         redirects: Optional[int] = 3,
     ):
+        """
+        The request, and each redirect it follows (up to ``redirects``), in
+        this one coroutine: a coroutine level costs on every wake-up.
+        """
         timings: Dict[
             Literal[
                 "request_start",
@@ -528,7 +574,7 @@ class MercurySyncHTTP2Connection:
             ],
             float | None,
         ] = {
-            "request_start": None,
+            "request_start": time.monotonic(),
             "connect_start": None,
             "connect_end": None,
             "write_start": None,
@@ -538,297 +584,230 @@ class MercurySyncHTTP2Connection:
             "request_end": None,
         }
 
-        timings["request_start"] = time.monotonic()
+        request_url = url
 
-        result, redirect, timings = await self._execute(
-            url,
-            method,
-            cookies=cookies,
-            auth=auth,
-            params=params,
-            headers=headers,
-            data=data,
-            timings=timings,
-        )
+        while True:
+            connection: HTTP2Connection = None
+            reading_response = False
 
-        if redirect and (
-            location := result.headers.get('location')
-        ):
+            # Bounds each phase below by request_timeout, as wait_for did, with a
+            # timer reused across requests rather than a new one per phase.
+            phase_timeout = self._phase_timeouts.pop() if self._phase_timeouts else PhaseTimeout()
+            request_timeout = self.timeouts.request_timeout
 
-            if "http" not in location and "https" not in location:
-                parsed_url: ParseResult = urlparse(url)
+            try:
+                if timings["connect_start"] is None:
+                    timings["connect_start"] = time.monotonic()
 
-                if parsed_url.params:
-                    location += parsed_url.params
+                # A prepared URL whose pooled connection already serves it -- every
+                # request after a connection's first: connecting is the stream-id
+                # step reuse_transport takes, exactly as _connect_to_url_location
+                # would take it, with nothing to await or bound.
+                if (
+                    isinstance(request_url, URL)
+                    and (url := request_url.optimized) is not None
+                    and self._connections[-1].reuse_transport(url.target, url.ip_addresses) is not None
+                ):
+                    connection = self._connections.pop()
+                    pipe = self._pipes.pop()
 
-                location = urljoin(
-                    f'{parsed_url.scheme}://{parsed_url.hostname}',
-                    location
-                )
+                else:
+                    with phase_timeout.within(self._connect_timeout):
+                        (error, connection, pipe, url) = await self._connect_to_url_location(
+                            connection,
+                            request_url,
+                        )
 
-            upgrade_ssl = False
-            if "https" in location and "https" not in url:
-                upgrade_ssl = True
+                    if error or connection is None or connection.stream.reader is None:
+                        timings["connect_end"] = time.monotonic()
 
-            for _ in range(redirects):
-                result, redirect, timings = await self._execute(
+                        if connection:
+                            connection.reset()
+                            self._connections.append(connection)
+                            self._pipes.append(HTTP2Pipe(self._concurrency))
+
+                        timings["request_end"] = time.monotonic()
+
+                        return HTTP2Response(
+                            url=URLMetadata(
+                                host=url.hostname,
+                                path=url.path,
+                            ),
+                            method=method,
+                            status=400,
+                            status_message="Connection failed.",
+                            headers={
+                                key.encode(): value.encode()
+                                for key, value in headers.items()
+                            }
+                            if headers
+                            else {},
+                            timings=timings,
+                        )
+
+                # Writing starts the moment connecting ends: one clock reading.
+                connect_end = timings["connect_end"] = time.monotonic()
+
+                if timings["write_start"] is None:
+                    timings["write_start"] = connect_end
+
+                encoded_headers = self._encode_headers(
                     url,
                     method,
-                    cookies=cookies,
+                    pipe._encoder,
                     auth=auth,
                     params=params,
                     headers=headers,
-                    data=data,
-                    timings=timings,
-                    upgrade_ssl=upgrade_ssl,
-                    redirect_url=location,
+                    cookies=cookies,
                 )
 
-                if redirect is False:
-                    break
+                # The body as sent, encoded ahead of the headers: a request with
+                # none -- no data, or data that encodes to nothing -- ends its
+                # stream on HEADERS, and data that is falsy but encodes to bytes
+                # ({} or []) is sent like any other.
+                encoded_data = self._encode_data(data) if data is not None else None
 
-                location = result.headers.get("location")
-
-                upgrade_ssl = False
-                if "https" in location and "https" not in url:
-                    upgrade_ssl = True
-
-        timings["request_end"] = time.monotonic()
-        result.timings.update(timings)
-
-        return result
-
-    async def _execute(
-        self,
-        request_url: str | URL,
-        method: str,
-        cookies: Optional[List[HTTPCookie] | Cookies] = None,
-        auth: Optional[Tuple[str, str] | Auth] = None,
-        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
-        headers: Optional[Dict[str, str]] = {},
-        data: Union[
-            Optional[str],
-            Optional[bytes],
-            Optional[BaseModel],
-        ] = None,
-        upgrade_ssl: bool = False,
-        redirect_url: Optional[str] = None,
-        timings: Dict[
-            Literal[
-                "request_start",
-                "connect_start",
-                "connect_end",
-                "write_start",
-                "write_end",
-                "read_start",
-                "read_end",
-                "request_end",
-            ],
-            float | None,
-        ] = None,
-    ):
-        if redirect_url:
-            request_url = redirect_url
-
-        connection: HTTP2Connection = None
-        reading_response = False
-
-        # Bounds each phase below by request_timeout, as wait_for did, with a
-        # timer reused across requests rather than a new one per phase.
-        phase_timeout = self._phase_timeouts.pop() if self._phase_timeouts else PhaseTimeout()
-
-        try:
-            if timings["connect_start"] is None:
-                timings["connect_start"] = time.monotonic()
-
-            (error, connection, pipe, url, upgrade_ssl) = await phase_timeout.run(
-                self._connect_to_url_location(
+                connection = pipe.send_request_headers(
+                    encoded_headers,
+                    encoded_data or None,
                     connection,
-                    request_url,
-                    ssl_redirect_url=request_url if upgrade_ssl else None,
-                ),
-                timeout=self.timeouts.request_timeout,
-            )
-
-            if upgrade_ssl:
-                ssl_redirect_url = request_url.replace("http://", "https://")
-
-                (error, connection, pipe, url, _) = await phase_timeout.run(
-                    self._connect_to_url_location(
-                        connection,
-                        request_url,
-                        ssl_redirect_url=ssl_redirect_url,
-                    ),
-                    timeout=self.timeouts.request_timeout,
                 )
 
-                request_url = ssl_redirect_url
+                if encoded_data:
+                    with phase_timeout.within(request_timeout):
+                        connection = await pipe.submit_request_body(
+                            encoded_data,
+                            connection,
+                        )
 
-            if error or connection is None or connection.stream.reader is None:
-                timings["connect_end"] = time.monotonic()
+                # Reading starts the moment writing ends: one clock reading.
+                write_end = timings["write_end"] = time.monotonic()
 
-                if connection:
+                if timings["read_start"] is None:
+                    timings["read_start"] = write_end
+
+                reading_response = True
+                with phase_timeout.within(self._read_timeout):
+                    (status, response_headers, body, error, trailers) = await pipe.receive_response(
+                        connection,
+                        head_request=method == "HEAD",
+                    )
+
+                reading_response = False
+                connection.consecutive_read_timeouts = 0
+
+                if error:
+                    # A failed read fails the request and leaves the connection in
+                    # an unknown state: reset, with a new pipe.
                     connection.reset()
                     self._connections.append(connection)
                     self._pipes.append(HTTP2Pipe(self._concurrency))
 
-                return (
-                    HTTP2Response(
+                    timings["read_end"] = timings["request_end"] = time.monotonic()
+
+                    return HTTP2Response(
                         url=URLMetadata(
                             host=url.hostname,
                             path=url.path,
                         ),
                         method=method,
                         status=400,
-                        status_message="Connection failed.",
-                        headers={
-                            key.encode(): value.encode()
-                            for key, value in headers.items()
-                        }
-                        if headers
-                        else {},
+                        status_message=str(error),
                         timings=timings,
-                    ),
-                    False,
-                    timings,
-                )
+                    )
 
-            timings["connect_end"] = time.monotonic()
+                response_cookies: Union[HTTPCookies, None] = None
 
-            if timings["write_start"] is None:
-                timings["write_start"] = time.monotonic()
+                cookies_data: Union[str, None] = response_headers.get("set-cookie")
+                if cookies_data:
+                    response_cookies = HTTPCookies()
+                    response_cookies.update(cookies_data.encode())
 
-            connection = pipe.send_preamble(connection)
+                if status >= 300 and status < 400:
+                    timings["read_end"] = time.monotonic()
 
-            encoded_headers = self._encode_headers(
-                url,
-                method,
-                pipe._encoder,
-                auth=auth,
-                params=params,
-                headers=headers,
-                cookies=cookies,
-            )
+                    self._connections.append(connection)
+                    self._pipes.append(pipe)
 
-            connection = pipe.send_request_headers(
-                encoded_headers,
-                data,
-                connection,
-            )
+                    if redirects and (location := response_headers.get("location")):
+                        # Each location resolves against the address it came
+                        # from (RFC 3986: absolute, host-relative and
+                        # path-relative alike).
+                        redirects -= 1
+                        request_url = urljoin(
+                            request_url.data if isinstance(request_url, URL) else request_url,
+                            location,
+                        )
+                        continue
 
-            if data:
-                encoded_data = self._encode_data(data)
+                    timings["request_end"] = time.monotonic()
 
-                connection = await phase_timeout.run(
-                    pipe.submit_request_body(
-                        encoded_data,
-                        connection,
-                    ),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-            timings["write_end"] = time.monotonic()
-
-            if timings["read_start"] is None:
-                timings["read_start"] = time.monotonic()
-
-            reading_response = True
-            (status, headers, body, error) = await phase_timeout.run(
-                pipe.receive_response(connection),
-                timeout=self.timeouts.request_timeout,
-            )
-            reading_response = False
-            connection.consecutive_read_timeouts = 0
-
-            if error:
-                raise error
-
-            cookies: Union[HTTPCookies, None] = None
-
-            cookies_data: Union[str, None] = headers.get("set-cookie")
-            if cookies_data:
-                cookies = HTTPCookies()
-                cookies.update(cookies_data.encode())
-
-            if status >= 300 and status < 400:
-                timings["read_end"] = time.monotonic()
-
-                self._connections.append(connection)
-                self._pipes.append(pipe)
-
-                return (
-                    HTTP2Response(
+                    return HTTP2Response(
                         url=URLMetadata(
                             host=url.hostname,
                             path=url.path,
                         ),
                         method=method,
                         status=status,
-                        headers=headers,
+                        headers=response_headers,
+                        trailers=trailers,
                         timings=timings,
-                    ),
-                    True,
-                    timings,
-                )
+                    )
 
-            self._connections.append(connection)
-            self._pipes.append(pipe)
+                self._connections.append(connection)
+                self._pipes.append(pipe)
 
-            timings["read_end"] = time.monotonic()
+                timings["read_end"] = timings["request_end"] = time.monotonic()
 
-            return (
-                HTTP2Response(
+                return HTTP2Response(
                     url=URLMetadata(
                         host=url.hostname,
                         path=url.path,
                     ),
-                    cookies=cookies,
+                    cookies=response_cookies,
                     method=method,
                     status=status,
-                    headers=headers,
+                    headers=response_headers,
+                    trailers=trailers,
                     content=body,
                     timings=timings,
-                ),
-                False,
-                timings,
-            )
+                )
 
-        except (
-            BaseException,
-            Exception,
-        ) as request_exception:
-            if connection:
-                if (
-                    reading_response
-                    and isinstance(request_exception, asyncio.TimeoutError)
-                    and connection.consecutive_read_timeouts == 0
-                ):
-                    # A slow response, not a dead connection: cancel only this
-                    # stream and keep the connection. A second timeout in a row
-                    # on it means the connection itself is dead.
-                    pipe.cancel_stream(connection)
-                    connection.consecutive_read_timeouts += 1
-                    self._connections.append(connection)
-                    self._pipes.append(pipe)
+            except (
+                BaseException,
+                Exception,
+            ) as request_exception:
+                if connection:
+                    if (
+                        reading_response
+                        and isinstance(request_exception, asyncio.TimeoutError)
+                        and connection.consecutive_read_timeouts == 0
+                    ):
+                        # A slow response, not a dead connection: cancel only this
+                        # stream and keep the connection. A second timeout in a row
+                        # on it means the connection itself is dead.
+                        pipe.cancel_stream(connection)
+                        connection.consecutive_read_timeouts += 1
+                        self._connections.append(connection)
+                        self._pipes.append(pipe)
 
-                else:
-                    connection.reset()
-                    self._connections.append(connection)
-                    self._pipes.append(HTTP2Pipe(self._concurrency))
+                    else:
+                        connection.reset()
+                        self._connections.append(connection)
+                        self._pipes.append(HTTP2Pipe(self._concurrency))
 
-            if isinstance(request_url, str):
-                request_url: ParseResult = urlparse(request_url)
+                if isinstance(request_url, str):
+                    request_url: ParseResult = urlparse(request_url)
 
-            elif isinstance(request_url, URL) and request_url.optimized:
-                request_url: ParseResult = request_url.optimized.parsed
+                elif isinstance(request_url, URL) and request_url.optimized:
+                    request_url: ParseResult = request_url.optimized.parsed
 
-            elif isinstance(request_url, URL):
-                request_url: ParseResult = urlparse(request_url.data)
+                elif isinstance(request_url, URL):
+                    request_url: ParseResult = urlparse(request_url.data)
 
-            timings["read_end"] = time.monotonic()
+                timings["read_end"] = timings["request_end"] = time.monotonic()
 
-            return (
-                HTTP2Response(
+                return HTTP2Response(
                     url=URLMetadata(
                         host=request_url.hostname,
                         path=request_url.path,
@@ -837,15 +816,17 @@ class MercurySyncHTTP2Connection:
                     ),
                     method=method,
                     status=400,
-                    status_message="Request failed or timed out.",
+                    # The failure's own reason: a TimeoutError's message is empty.
+                    status_message=(
+                        "Request timed out."
+                        if isinstance(request_exception, asyncio.TimeoutError)
+                        else str(request_exception)
+                    ),
                     timings=timings,
-                ),
-                False,
-                timings,
-            )
+                )
 
-        finally:
-            self._phase_timeouts.append(phase_timeout)
+            finally:
+                self._phase_timeouts.append(phase_timeout)
 
     def _encode_data(
         self,
@@ -857,13 +838,9 @@ class MercurySyncHTTP2Connection:
             encoded_data = data.optimized
 
         elif isinstance(data, Iterator) and not isinstance(data, list):
-            chunks = []
-            for chunk in data:
-                chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
-                encoded_chunk = chunk_size.encode() + chunk + NEW_LINE.encode()
-                chunks.append(encoded_chunk)
-
-            encoded_data = chunks
+            # HTTP/2 has no chunked transfer coding: DATA frames carry the body
+            # as it is (RFC 9113 8.2.2).
+            encoded_data = b"".join(data)
 
         elif isinstance(data, BaseModel):
             encoded_data = orjson.dumps(data.model_dump())
@@ -892,105 +869,112 @@ class MercurySyncHTTP2Connection:
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
     ):
-        if isinstance(url, URL):
-            url = url.optimized
+        method_header = _METHOD_HEADERS.get(method) or (b":method", method.encode())
 
-        url_path = url.path
+        # The address's own pseudo-headers, encoded on its first request and
+        # the same tuples on every one after: nothing encoded per request, and
+        # the HPACK encoder recognizes the list by identity.
+        if (pseudo_headers := url.http2_pseudo_headers) is None:
+            # :authority names the target as RFC 9113 8.3.1 does: the host, an
+            # IPv6 address in brackets, and the port unless it is the
+            # scheme's default.
+            hostname = url.hostname
+            scheme = url.scheme
+            authority = f"[{hostname}]" if ":" in hostname else hostname
+            if url.port != DEFAULT_PORTS.get(scheme):
+                authority = f"{authority}:{url.port}"
 
-        if isinstance(params, Params):
-            url_path += params.optimized
-
-        elif params:
-            url_params = urlencode(params)
-            url_path += f"?{url_params}"
-
-
-        encoded_headers: List[Tuple[bytes, bytes]] = [
-            (b":method", method.encode()),
-            (b":authority", url.hostname.encode()),
-            (b":scheme", url.scheme.encode()),
-            (b":path", url_path.encode()),
-        ]
-
-        if isinstance(auth, Auth):
-            encoded_headers.append(auth.optimized)
-
-        elif auth is not None:
-            encoded_headers.append(
-                self._encode_auth_headers(auth),
+            pseudo_headers = url.http2_pseudo_headers = (
+                (b":authority", authority.encode()),
+                (b":scheme", scheme.encode()),
+                (b":path", url.path.encode()),
             )
 
-        if isinstance(headers, Headers):
-            encoded_headers.extend(headers.optimized)
+        # Absent arguments are tested first, so a plain request makes no
+        # isinstance call: the argument models are always truthy.
+        if not params:
+            encoded_headers: List[Tuple[bytes, bytes]] = [method_header, *pseudo_headers]
 
-        elif headers:
-            encoded_headers.extend(
-                [
-                    (k.lower().encode(), v.encode())
-                    for k, v in headers.items()
-                    if k.lower()
-                    not in (
-                        "host",
-                        "transfer-encoding",
-                    )
-                ]
-            )
+        else:
+            # The params follow any query the address has of its own: after
+            # "&" then, else after "?" (RFC 3986 3.4).
+            url_path = url.path
+            query = params.optimized[1:] if isinstance(params, Params) else urlencode(params)
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
-        if isinstance(cookies, Cookies):
-            encoded_headers.append(cookies.optimized)
+            encoded_headers = [
+                method_header,
+                pseudo_headers[0],
+                pseudo_headers[1],
+                (b":path", url_path.encode()),
+            ]
 
-        elif cookies:
-            encoded_cookies: List[str] = []
+        if auth is not None:
+            if isinstance(auth, Auth):
+                encoded_headers.append(auth.optimized)
 
-            for cookie_data in cookies:
-                if len(cookie_data) == 1:
-                    encoded_cookies.append(cookie_data[0])
-
-                elif len(cookie_data) == 2:
-                    cookie_name, cookie_value = cookie_data
-                    encoded_cookies.append(f"{cookie_name}={cookie_value}")
-
-            encoded_headers.append(
-                (
-                    b"cookie",
-                    "; ".join(encoded_cookies).encode(),
+            else:
+                encoded_headers.append(
+                    self._encode_auth_headers(auth),
                 )
-            )
 
-        encoded_headers: bytes = header_encoder.encode(encoded_headers)
-        if len(encoded_headers) <= self._settings.max_frame_size:
-            return encoded_headers
+        if headers:
+            if isinstance(headers, Headers):
+                encoded_headers.extend(headers.optimized)
 
-        encoded_headers: List[bytes] = [
-            encoded_headers[i : i + self._settings.max_frame_size]
-            for i in range(0, len(encoded_headers), self._settings.max_frame_size)
-        ]
+            else:
+                encoded_headers.extend(
+                    [
+                        (k.lower().encode(), v.encode())
+                        for k, v in headers.items()
+                        if k.lower()
+                        not in (
+                            "host",
+                            "transfer-encoding",
+                        )
+                    ]
+                )
 
-        return encoded_headers[0]
+        if cookies:
+            if isinstance(cookies, Cookies):
+                encoded_headers.append(cookies.optimized)
+
+            else:
+                encoded_cookies: List[str] = []
+
+                for cookie_data in cookies:
+                    if len(cookie_data) == 1:
+                        encoded_cookies.append(cookie_data[0])
+
+                    elif len(cookie_data) == 2:
+                        cookie_name, cookie_value = cookie_data
+                        encoded_cookies.append(f"{cookie_name}={cookie_value}")
+
+                encoded_headers.append(
+                    (
+                        b"cookie",
+                        "; ".join(encoded_cookies).encode(),
+                    )
+                )
+
+        # The whole header block: the pipe frames it, in CONTINUATION frames
+        # past the peer's largest frame.
+        return header_encoder.encode(encoded_headers)
 
     async def _connect_to_url_location(
         self,
         connection: HTTP2Connection | None,
         request_url: str | URL,
-        ssl_redirect_url: Optional[str] = None,
     ) -> Tuple[
         Optional[Exception],
         HTTP2Connection,
         HTTP2Pipe,
         HTTPUrl,
-        bool,
     ]:
-        has_optimized_url = isinstance(request_url, URL)
-
-        if has_optimized_url:
-            parsed_url = request_url.optimized
-
-        elif ssl_redirect_url:
-            parsed_url = HTTPUrl(
-                ssl_redirect_url,
-                family=self.address_family,
-                protocol=self.address_protocol,
-            )
+        if isinstance(request_url, URL):
+            # Resolved when the workflow prepared it: never looked up here,
+            # and never read from or added to the lookup cache.
+            url = parsed_url = request_url.optimized
 
         else:
             parsed_url = HTTPUrl(
@@ -999,38 +983,38 @@ class MercurySyncHTTP2Connection:
                 protocol=self.address_protocol,
             )
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+            # A lookup serves only the address it resolved: its target (scheme
+            # and authority), not the hostname every port on a host shares.
+            cache_key = parsed_url.target
+            url = self._url_cache.get(cache_key)
 
-        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
+            if url is None:
+                dns_lock = self._dns_lock[cache_key]
+                dns_waiter = self._dns_waiters[cache_key]
 
-        if do_dns_lookup and dns_lock.locked() is False:
-            try:
-                async with dns_lock:
-                    url = parsed_url
-                    await url.lookup()
+                if dns_lock.locked() is False:
+                    try:
+                        async with dns_lock:
+                            url = parsed_url
+                            await url.lookup()
 
-                    self._url_cache[parsed_url.hostname] = url
+                            self._url_cache[cache_key] = url
 
-            finally:
-                # However the lookup ended, release its waiters; after a
-                # failed or cancelled lookup the next request looks up
-                # again with a fresh waiter.
-                if dns_waiter.done() is False:
-                    dns_waiter.set_result(None)
+                    finally:
+                        # However the lookup ended, release its waiters; after
+                        # a failed or cancelled lookup the next request looks
+                        # up again with a fresh waiter.
+                        if dns_waiter.done() is False:
+                            dns_waiter.set_result(None)
 
-                if parsed_url.hostname not in self._url_cache:
-                    del self._dns_waiters[parsed_url.hostname]
+                        if cache_key not in self._url_cache:
+                            del self._dns_waiters[cache_key]
 
-        elif do_dns_lookup:
-            # Shielded: a waiter's cancellation must not cancel the
-            # lookup future every other waiter shares.
-            await asyncio.shield(dns_waiter)
-            url = self._url_cache.get(parsed_url.hostname)
-
-        elif has_optimized_url:
-            url = request_url.optimized
+                else:
+                    # Shielded: a waiter's cancellation must not cancel the
+                    # lookup future every other waiter shares.
+                    await asyncio.shield(dns_waiter)
+                    url = self._url_cache.get(cache_key)
 
         connection = self._connections.pop()
         pipe = self._pipes.pop()
@@ -1044,24 +1028,31 @@ class MercurySyncHTTP2Connection:
             # host's addresses; otherwise races a new one across them.
             if (
                 reused := connection.reuse_transport(
+                    parsed_url.target,
                     url.ip_addresses,
-                    url.port,
-                    ssl_upgrade=ssl_redirect_url is not None,
                 )
             ) is not None:
                 address, socket_config = reused
                 new_transport = False
 
+            elif url.is_ssl is False:
+                # HTTP/2 here is TLS only, as browsers run it: an http://
+                # address has no HTTP/2 transport to open.
+                return (
+                    ConnectionError(f"HTTP/2 requires an https:// address, not {url.full}"),
+                    connection,
+                    pipe,
+                    parsed_url,
+                )
+
             else:
                 address, socket_config, new_transport = await connection.connect_to_any(
+                    parsed_url.target,
                     url.hostname,
                     url.ip_addresses,
                     url.port,
                     url.address_rotation,
-                    ssl=self._client_ssl_context
-                    if url.is_ssl or ssl_redirect_url
-                    else None,
-                    ssl_upgrade=ssl_redirect_url is not None,
+                    ssl=self._client_ssl_context,
                 )
 
             if new_transport:
@@ -1079,19 +1070,9 @@ class MercurySyncHTTP2Connection:
                 connection,
                 pipe,
                 parsed_url,
-                False,
             )
 
         except Exception as err:
-            if "server_hostname is only meaningful with ssl" in str(err):
-                return (
-                    err,
-                    connection,
-                    pipe,
-                    parsed_url,
-                    True,
-                )
-
             connection_error = err
 
         try:
@@ -1100,7 +1081,6 @@ class MercurySyncHTTP2Connection:
                 connection,
                 pipe,
                 parsed_url,
-                False,
             )
 
         finally:
@@ -1112,11 +1092,13 @@ class MercurySyncHTTP2Connection:
         self,
         auth: tuple[str, str] | tuple[str],
     ):
+        # The Basic scheme ahead of the credentials (RFC 7617 2), as the
+        # HTTP/1 client sends them.
         if len(auth) > 1:
             credentials_string = f"{auth[0]}:{auth[1]}"
             return (
                 b"authorization",
-                base64.b64encode(
+                b"Basic " + base64.b64encode(
                     credentials_string.encode()
                 )
             )
@@ -1124,7 +1106,7 @@ class MercurySyncHTTP2Connection:
         else:
             return (
                 b"authorization",
-                base64.b64encode(
+                b"Basic " + base64.b64encode(
                     auth[0].encode()
                 )
             )

@@ -10,15 +10,24 @@ forever: the leader removed the job without telling peers it was
 terminal, and a follower's hydrated terminal job never got
 ``completed_at`` — which the retention sweep requires.
 
-Pinned: the leader drops the job and its group at completion; followers
+Measured too: the leader's dispatcher kept the job's queue entry for the
+process's lifetime -- completion removed the job from the JobManager, and
+the retention sweep that also cleaned the dispatcher walks only the
+JobManager's jobs.
+
+Pinned: the leader drops the job, its group and its dispatcher state at
+completion; followers
 drop the group as soon as the leader's terminal sync lands and the job at
 their retention sweep; every member ends with nothing held. Bounds come
-from the mechanism: the follower's group goes in the same sync that
-precedes the leader's removal (one watcher sample of slack), the
-follower's job within retention + one cleanup interval + one sample.
+from the mechanism: the leader's removal follows the client's terminal by
+the completion exchanges still running (one watcher sample of slack), the
+follower's group goes in the same sync that precedes the leader's removal
+(one sample), the follower's job within retention + one cleanup interval
++ one sample.
 """
 
 from tests.simulation.harness.sim.multiprocess.peered_manager_demo import (
+    LINK_LATENCY_SECONDS,
     PEERED_MANAGERS,
     WATCH_INTERVAL_SECONDS,
     run_peered_manager_job,
@@ -27,6 +36,11 @@ from tests.simulation.harness.sim.multiprocess.peered_manager_demo import (
 _CEILING = 90.0
 _JOB_RETENTION_SECONDS = 10.0
 _JOB_CLEANUP_INTERVAL_SECONDS = 2.0
+# The client finishes on the job's final result; the leader's completion
+# then still runs the final result's reply leg, the terminal status
+# push's round trip, and the terminal sync's round trip to its peers
+# (measured with a 5ms watcher: client 8.465, leader removal 8.515).
+_COMPLETION_LEGS_AFTER_CLIENT_TERMINAL = 5
 
 
 def _run_peered_job() -> dict:
@@ -64,7 +78,24 @@ def test_every_member_releases_the_job_and_its_raft_group():
     }
     leader_host = min(job_released_at, key=job_released_at.__getitem__)
     leader_removed_at = job_released_at[leader_host]
-    assert leader_removed_at <= finished_time + WATCH_INTERVAL_SECONDS
+    assert leader_removed_at <= (
+        finished_time
+        + _COMPLETION_LEGS_AFTER_CLIENT_TERMINAL * LINK_LATENCY_SECONDS
+        + WATCH_INTERVAL_SECONDS
+    )
+
+    # The dispatcher's per-job state leaves with the job. It was held for
+    # the process's lifetime: the retention sweep that cleaned it walks the
+    # JobManager's jobs, which the job had already left at completion
+    # (measured: the leader's queue entry stayed at 1 to the run's end).
+    for host, log in manager_logs.items():
+        assert _transitions(log, "dispatcher-pending")[-1][0] == 0, (host, log)
+        assert _transitions(log, "dispatch-loops")[-1][0] == 0, (host, log)
+    leader_pending = _transitions(manager_logs[leader_host], "dispatcher-pending")
+    assert max(value for value, _ in leader_pending) >= 1, leader_pending
+    assert [time for value, time in leader_pending if value == 0][-1] <= (
+        leader_removed_at + WATCH_INTERVAL_SECONDS
+    ), leader_pending
 
     for host, log in manager_logs.items():
         if host == leader_host:

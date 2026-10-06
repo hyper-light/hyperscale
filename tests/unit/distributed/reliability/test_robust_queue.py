@@ -288,33 +288,45 @@ class TestOverflowHandling:
         assert queue.primary_qsize() == 5
         assert queue.overflow_qsize() == 1
 
-    def test_overflow_items_drained_first(self):
-        """Overflow items are drained before primary (FIFO across both)."""
+    def test_items_leave_in_arrival_order_across_primary_and_overflow(self):
+        """FIFO across both: overflow items arrived after every primary item
+        (they overflowed because primary was full), so they leave after
+        them. Draining overflow first handed the WAL writer newer writes
+        before older ones."""
         config = RobustQueueConfig(maxsize=3, overflow_size=3)
         queue: RobustMessageQueue[int] = RobustMessageQueue(config)
 
-        # Fill primary with 0, 1, 2
-        for i in range(3):
-            queue.put_nowait(i)
-
-        # Add 3, 4 to overflow
-        queue.put_nowait(3)
-        queue.put_nowait(4)
-
+        # 0, 1, 2 fill primary; 3, 4 overflow.
+        for item in range(5):
+            queue.put_nowait(item)
         assert queue.overflow_qsize() == 2
 
-        # Drain - should get overflow items first
-        item0 = queue.get_nowait()
-        item1 = queue.get_nowait()
+        assert [queue.get_nowait() for _ in range(5)] == [0, 1, 2, 3, 4]
+        assert queue.overflow_qsize() == 0
 
-        # Overflow drained first (3, 4), then primary (0, 1, 2)
-        assert item0 == 3
-        assert item1 == 4
+    def test_an_item_arriving_while_overflow_holds_items_queues_behind_them(self):
+        """A get frees a primary slot; an item put next must not take it
+        ahead of the older items still in overflow."""
+        config = RobustQueueConfig(maxsize=2, overflow_size=4)
+        queue: RobustMessageQueue[int] = RobustMessageQueue(config)
 
-        # Now primary items
+        for item in range(4):  # 0, 1 primary; 2, 3 overflow
+            queue.put_nowait(item)
         assert queue.get_nowait() == 0
+        queue.put_nowait(4)
         assert queue.get_nowait() == 1
-        assert queue.get_nowait() == 2
+        queue.put_nowait(5)
+
+        assert [queue.get_nowait() for _ in range(4)] == [2, 3, 4, 5]
+
+    @pytest.mark.asyncio
+    async def test_blocking_get_keeps_arrival_order(self):
+        config = RobustQueueConfig(maxsize=2, overflow_size=4)
+        queue: RobustMessageQueue[int] = RobustMessageQueue(config)
+        for item in range(5):
+            queue.put_nowait(item)
+
+        assert [await queue.get() for _ in range(5)] == [0, 1, 2, 3, 4]
 
     def test_overflow_metrics_tracked(self):
         """Overflow events are tracked in metrics."""
@@ -625,9 +637,9 @@ class TestEdgeCases:
         assert result2.accepted
         assert result2.in_overflow
 
-        # Drain
-        assert queue.get_nowait() == 2  # Overflow first
-        assert queue.get_nowait() == 1  # Then primary
+        # Drain, in arrival order
+        assert queue.get_nowait() == 1
+        assert queue.get_nowait() == 2
 
     def test_empty_queue_state(self):
         """Empty queue is in HEALTHY state."""

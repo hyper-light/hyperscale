@@ -2,80 +2,25 @@
 Role-based certificate validation for mTLS.
 
 Enforces the node communication matrix based on certificate claims.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass
 from typing import ClassVar
-
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509.oid import NameOID, ExtensionOID
-
 from hyperscale.distributed.models.distributed import NodeRole
 
-
-class RoleValidationError(Exception):
-    """Raised when role validation fails."""
-
-    def __init__(
-        self,
-        source_role: NodeRole,
-        target_role: NodeRole,
-        message: str,
-    ):
-        self.source_role = source_role
-        self.target_role = target_role
-        super().__init__(
-            f"Role validation failed: {source_role.value} -> {target_role.value}: {message}"
-        )
-
-
-class CertificateParseError(Exception):
-    """Raised when certificate parsing fails in strict mode."""
-
-    def __init__(self, message: str, parse_error: Exception | None = None):
-        self.parse_error = parse_error
-        super().__init__(message)
-
-
-@dataclass(slots=True, frozen=True)
-class CertificateClaims:
-    """Claims extracted from an mTLS certificate."""
-
-    cluster_id: str
-    """Cluster identifier from certificate CN or SAN."""
-
-    environment_id: str
-    """Environment identifier (prod, staging, dev)."""
-
-    role: NodeRole
-    """Node role from certificate OU or custom extension."""
-
-    node_id: str
-    """Unique node identifier."""
-
-    datacenter_id: str = ""
-    """Optional datacenter identifier."""
-
-    region_id: str = ""
-    """Optional region identifier."""
-
-
-@dataclass(slots=True)
-class ValidationResult:
-    """Result of role validation."""
-
-    allowed: bool
-    """Whether the connection is allowed."""
-
-    reason: str
-    """Explanation of the decision."""
-
-    source_claims: CertificateClaims | None = None
-    """Claims of the source node."""
-
-    target_claims: CertificateClaims | None = None
-    """Claims of the target node."""
+from .certificate_claims import CertificateClaims
+from .certificate_parse_error import CertificateParseError
+from .role_validation_error import RoleValidationError
+from .validation_result import ValidationResult
 
 
 @dataclass
@@ -490,3 +435,13 @@ class RoleValidator:
             matrix[source.value].append(target.value)
 
         return matrix
+
+_REHOMED = (
+    RoleValidationError,
+    CertificateParseError,
+    CertificateClaims,
+    ValidationResult,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

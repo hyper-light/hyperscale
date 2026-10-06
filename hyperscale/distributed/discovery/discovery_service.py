@@ -37,15 +37,12 @@ Usage:
 """
 
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Generic, TypeVar
+from typing import Callable
 
 from hyperscale.distributed.runtime import Clock, RealClock
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-T = TypeVar("T")  # Connection type for ConnectionPool
 
 from hyperscale.distributed.discovery.dns.resolver import (
     AsyncDNSResolver,
@@ -79,19 +76,10 @@ from hyperscale.distributed.discovery.models.locality_info import (
 from hyperscale.distributed.discovery.metrics.discovery_metrics import (
     DiscoveryMetrics,
 )
-from hyperscale.distributed.discovery.pool.connection_pool import (
-    ConnectionPool,
-    ConnectionPoolConfig,
-    PooledConnection,
-)
-from hyperscale.distributed.discovery.pool.sticky_connection import (
-    StickyConnectionManager,
-    StickyConfig,
-)
 
 
 @dataclass
-class DiscoveryService(Generic[T]):
+class DiscoveryService:
     """
     Unified discovery service for node integration.
 
@@ -102,35 +90,15 @@ class DiscoveryService(Generic[T]):
     - A set of known peers from DNS discovery and static seeds
     - Health/latency tracking for each peer
     - Locality-aware selection preferences
-    - Connection pooling with health-based eviction
-    - Sticky connections for session affinity
     - Metrics for observability
 
     Thread Safety:
         This class is NOT thread-safe. Use appropriate locking if accessed
         from multiple coroutines concurrently.
-
-    Type Parameters:
-        T: The connection type used by the connection pool (e.g., socket, transport)
     """
 
     config: DiscoveryConfig
     """Discovery configuration."""
-
-    connect_fn: Callable[[str], Awaitable[T]] | None = field(default=None)
-    """Function to create a connection to a peer: async fn(peer_id) -> connection."""
-
-    close_fn: Callable[[T], Awaitable[None]] | None = field(default=None)
-    """Function to close a connection: async fn(connection) -> None."""
-
-    health_check_fn: Callable[[T], Awaitable[bool]] | None = field(default=None)
-    """Optional function to check connection health: async fn(connection) -> is_healthy."""
-
-    pool_config: ConnectionPoolConfig | None = field(default=None)
-    """Configuration for the connection pool. Uses defaults if None."""
-
-    sticky_config: StickyConfig | None = field(default=None)
-    """Configuration for sticky connections. Uses defaults if None."""
 
     _resolver: AsyncDNSResolver = field(init=False)
     """DNS resolver with caching."""
@@ -147,14 +115,11 @@ class DiscoveryService(Generic[T]):
     _metrics: DiscoveryMetrics = field(init=False)
     """Discovery metrics."""
 
-    _connection_pool: ConnectionPool[T] = field(init=False)
-    """Connection pool for managing peer connections."""
-
-    _sticky_manager: StickyConnectionManager[T] = field(init=False)
-    """Sticky connection manager for session affinity."""
-
     _peers: dict[str, PeerInfo] = field(default_factory=dict)
     """Known peers by peer_id."""
+
+    _dns_peer_ids: dict[str, set[str]] = field(default_factory=dict)
+    """The peers each configured DNS name answered last, by peer_id."""
 
     _last_discovery: float = field(default=0.0)
     """Timestamp of last successful discovery."""
@@ -189,7 +154,7 @@ class DiscoveryService(Generic[T]):
         self._resolver = AsyncDNSResolver(
             default_ttl_seconds=self.config.dns_cache_ttl,
             resolution_timeout_seconds=self.config.dns_timeout,
-            max_concurrent_resolutions=self.config.max_concurrent_probes,
+            max_concurrent_resolutions=self.config.max_concurrent_dns_resolutions,
             security_validator=security_validator,
             reject_on_security_violation=self.config.dns_reject_on_security_violation,
         )
@@ -227,21 +192,6 @@ class DiscoveryService(Generic[T]):
         # Metrics tracking
         self._metrics = DiscoveryMetrics()
 
-        # Connection pool initialization
-        effective_pool_config = self.pool_config or ConnectionPoolConfig()
-        self._connection_pool = ConnectionPool(
-            config=effective_pool_config,
-            connect_fn=self.connect_fn,
-            close_fn=self.close_fn,
-            health_check_fn=self.health_check_fn,
-        )
-
-        # Sticky connection manager initialization
-        effective_sticky_config = self.sticky_config or StickyConfig()
-        self._sticky_manager = StickyConnectionManager(
-            config=effective_sticky_config,
-        )
-
         # Add static seeds as initial peers
         for seed in self.config.static_seeds:
             self._add_static_seed(seed)
@@ -277,7 +227,9 @@ class DiscoveryService(Generic[T]):
         Discover peers via DNS resolution.
 
         Resolves configured DNS names and adds discovered addresses as peers.
-        Uses caching unless force_refresh is True.
+        A peer no name answers anymore is retired; a failed lookup changes
+        nothing (a DNS outage is not a departure). Uses caching unless
+        force_refresh is True.
 
         Supports both A/AAAA records (hostname -> IPs) and SRV records
         (_service._proto.domain -> priority, weight, port, target).
@@ -308,15 +260,15 @@ class DiscoveryService(Generic[T]):
 
                     # Handle SRV records specially - each target may have a different port
                     if result.srv_records:
-                        discovered.extend(self._add_peers_from_srv_records(result))
+                        answered_peer_ids, added = self._add_peers_from_srv_records(result)
                     else:
                         # Standard A/AAAA record handling
-                        discovered.extend(
-                            self._add_peers_from_addresses(
-                                result.addresses,
-                                result.port or self.config.default_port,
-                            )
+                        answered_peer_ids, added = self._add_peers_from_addresses(
+                            result.addresses,
+                            result.port or self.config.default_port,
                         )
+                    discovered.extend(added)
+                    self._retire_unanswered_dns_peers(dns_name, answered_peer_ids)
 
                 except DNSError:
                     self._metrics.record_dns_failure()
@@ -329,11 +281,33 @@ class DiscoveryService(Generic[T]):
 
         return discovered
 
+    def _retire_unanswered_dns_peers(
+        self,
+        dns_name: str,
+        answered_peer_ids: set[str],
+    ) -> None:
+        """Record what ``dns_name`` answered, and retire the peers it
+        answered before that no configured name answers now."""
+        previously_answered = self._dns_peer_ids.get(dns_name, set())
+        self._dns_peer_ids[dns_name] = answered_peer_ids
+        still_answered = set().union(*self._dns_peer_ids.values())
+        for peer_id in previously_answered - still_answered:
+            self.remove_peer(peer_id)
+
+    def get_dns_peer_addresses(self) -> list[tuple[str, int]]:
+        """The addresses the configured DNS names answer now."""
+        answered_peer_ids = set().union(*self._dns_peer_ids.values())
+        return [
+            (peer.host, peer.port)
+            for peer_id in sorted(answered_peer_ids)
+            if (peer := self._peers.get(peer_id)) is not None
+        ]
+
     def _add_peers_from_addresses(
         self,
         addresses: list[str],
         port: int,
-    ) -> list[PeerInfo]:
+    ) -> tuple[set[str], list[PeerInfo]]:
         """
         Add peers from resolved IP addresses (A/AAAA records).
 
@@ -342,12 +316,14 @@ class DiscoveryService(Generic[T]):
             port: Port to use for all addresses
 
         Returns:
-            List of newly added peers
+            The answered peers' ids, and the newly added peers
         """
+        answered_peer_ids: set[str] = set()
         added: list[PeerInfo] = []
 
         for addr in addresses:
             peer_id = f"dns-{addr}-{port}"
+            answered_peer_ids.add(peer_id)
 
             if peer_id not in self._peers:
                 peer = PeerInfo(
@@ -365,12 +341,12 @@ class DiscoveryService(Generic[T]):
                 if self._on_peer_added is not None:
                     self._on_peer_added(peer)
 
-        return added
+        return answered_peer_ids, added
 
     def _add_peers_from_srv_records(
         self,
         result: DNSResult,
-    ) -> list[PeerInfo]:
+    ) -> tuple[set[str], list[PeerInfo]]:
         """
         Add peers from SRV record resolution.
 
@@ -387,8 +363,9 @@ class DiscoveryService(Generic[T]):
             result: DNS result containing srv_records and resolved addresses
 
         Returns:
-            List of newly added peers
+            The answered peers' ids, and the newly added peers
         """
+        answered_peer_ids: set[str] = set()
         added: list[PeerInfo] = []
 
         # Build a mapping of target hostname to SRV record for port lookup
@@ -411,6 +388,7 @@ class DiscoveryService(Generic[T]):
             # or we can use the already-resolved IPs if available
             # For now, use the target hostname to preserve the SRV semantics
             peer_id = f"srv-{target}-{port}"
+            answered_peer_ids.add(peer_id)
 
             if peer_id not in self._peers:
                 # Calculate weight factor from SRV priority and weight
@@ -435,7 +413,7 @@ class DiscoveryService(Generic[T]):
                 if self._on_peer_added is not None:
                     self._on_peer_added(peer)
 
-        return added
+        return answered_peer_ids, added
 
     def add_peer(
         self,
@@ -511,9 +489,6 @@ class DiscoveryService(Generic[T]):
         """
         Remove a peer from the discovery service.
 
-        Also evicts all sticky bindings for this peer to ensure
-        no stale bindings reference the removed peer.
-
         Args:
             peer_id: The peer to remove
 
@@ -526,9 +501,6 @@ class DiscoveryService(Generic[T]):
         del self._peers[peer_id]
         self._selector.remove_peer(peer_id)
 
-        # Evict all sticky bindings for this peer
-        self._sticky_manager.evict_peer_bindings(peer_id)
-
         # Invalidate locality cache for this peer
         if self._locality_filter is not None:
             self._locality_filter.invalidate_cache(peer_id)
@@ -538,63 +510,22 @@ class DiscoveryService(Generic[T]):
 
         return True
 
-    def select_peer(
-        self,
-        key: str,
-        use_sticky: bool = True,
-    ) -> SelectionResult | None:
+    def select_peer(self, key: str) -> SelectionResult | None:
         """
-        Select the best peer for a key.
-
-        Selection priority:
-        1. Check for existing healthy sticky binding
-        2. Use locality-aware selection if configured
-        3. Fall back to Power of Two Choices with EWMA
-
-        If a peer is selected and use_sticky is True, a sticky binding is
-        created for future requests with the same key.
+        Select the best peer for a key: locality-aware selection if
+        configured, else Power of Two Choices with EWMA.
 
         Args:
             key: The key to select for (e.g., workflow_id)
-            use_sticky: If True, check/create sticky bindings (default: True)
 
         Returns:
             SelectionResult or None if no peers available
         """
-        # Check for existing healthy sticky binding first
-        if use_sticky and self._sticky_manager.is_bound_healthy(key):
-            sticky_peer_id = self._sticky_manager.get_binding(key)
-            if sticky_peer_id is not None and sticky_peer_id in self._peers:
-                # Return sticky peer with no load balancing (it's sticky)
-                peer_tier = self._get_peer_tier(sticky_peer_id)
-                self._metrics.record_selection(
-                    tier=peer_tier,
-                    load_balanced=False,
-                )
-                # Unreachable until the sticky health comparison was fixed
-                # (it reported healthy peers as unhealthy), so this
-                # constructor used SelectionResult fields that never existed.
-                return SelectionResult(
-                    peer_id=sticky_peer_id,
-                    effective_latency_ms=self._selector.get_effective_latency(
-                        sticky_peer_id
-                    ),
-                    was_load_balanced=False,
-                    candidates_considered=1,
-                )
-
-        # Perform standard selection
-        result = self._select_peer_internal(key)
-
-        # Create sticky binding for the selected peer
-        if result is not None and use_sticky:
-            self._sticky_manager.bind(key, result.peer_id)
-
-        return result
+        return self._select_peer_internal(key)
 
     def _select_peer_internal(self, key: str) -> SelectionResult | None:
         """
-        Internal peer selection without sticky binding logic.
+        Internal peer selection.
 
         Uses locality-aware selection if configured, then falls back
         to Power of Two Choices with EWMA.
@@ -675,7 +606,6 @@ class DiscoveryService(Generic[T]):
         self,
         key: str,
         count: int = 3,
-        use_sticky: bool = True,
     ) -> list[SelectionResult]:
         """
         Select multiple peers for a key with primary/backup ordering.
@@ -684,13 +614,11 @@ class DiscoveryService(Generic[T]):
         - First peer is the primary (lowest latency, healthy)
         - Subsequent peers are backups in order of preference
 
-        If a sticky binding exists and is healthy, that peer will be the primary.
         Backups are selected from remaining healthy peers sorted by latency.
 
         Args:
             key: The key to select for (e.g., workflow_id)
             count: Maximum number of peers to return (default: 3)
-            use_sticky: If True, use sticky binding for primary (default: True)
 
         Returns:
             List of SelectionResults, ordered primary-first. May be empty if no peers.
@@ -701,8 +629,7 @@ class DiscoveryService(Generic[T]):
         results: list[SelectionResult] = []
         used_peer_ids: set[str] = set()
 
-        # Get primary peer (may use sticky binding)
-        primary = self.select_peer(key, use_sticky=use_sticky)
+        primary = self.select_peer(key)
         if primary is not None:
             results.append(primary)
             used_peer_ids.add(primary.peer_id)
@@ -744,8 +671,7 @@ class DiscoveryService(Generic[T]):
         """
         Record a successful request to a peer.
 
-        Updates selector EWMA tracking, peer health metrics, and sticky binding
-        health status for proper failover handling.
+        Updates selector EWMA tracking and peer health metrics.
 
         Args:
             peer_id: The peer that handled the request
@@ -758,15 +684,12 @@ class DiscoveryService(Generic[T]):
         peer = self._peers.get(peer_id)
         if peer is not None:
             peer.record_success(latency_ms, ewma_alpha=self.config.ewma_alpha)
-            # Update sticky manager with current peer health
-            self._sticky_manager.update_peer_health(peer_id, peer.health)
 
     def record_failure(self, peer_id: str) -> None:
         """
         Record a failed request to a peer.
 
-        Updates selector penalty tracking, peer health metrics, and sticky binding
-        health status. May evict sticky bindings for unhealthy peers.
+        Updates selector penalty tracking and peer health metrics.
 
         Args:
             peer_id: The peer that failed
@@ -780,101 +703,6 @@ class DiscoveryService(Generic[T]):
             peer.record_failure()
             # Update selector weight based on health
             self._selector.update_weight(peer_id, peer.health_weight)
-            # Update sticky manager with current peer health
-            # This may evict bindings if peer becomes unhealthy
-            self._sticky_manager.update_peer_health(peer_id, peer.health)
-
-    async def acquire_connection(
-        self,
-        peer_id: str,
-        timeout: float | None = None,
-    ) -> PooledConnection[T]:
-        """
-        Acquire a pooled connection to a peer.
-
-        Gets an existing idle connection from the pool or creates a new one.
-        The connection must be released back to the pool after use.
-
-        Requires connect_fn to be configured when creating the DiscoveryService.
-
-        Args:
-            peer_id: The peer to connect to
-            timeout: Optional timeout in seconds (uses pool config default if None)
-
-        Returns:
-            PooledConnection ready for use
-
-        Raises:
-            RuntimeError: If connect_fn is not configured or pool is exhausted
-            TimeoutError: If connection cannot be established in time
-        """
-        return await self._connection_pool.acquire(peer_id, timeout=timeout)
-
-    async def release_connection(self, pooled_connection: PooledConnection[T]) -> None:
-        """
-        Release a connection back to the pool.
-
-        The connection remains open and available for reuse by future requests.
-        Call mark_connection_success or mark_connection_failure before releasing.
-
-        Args:
-            pooled_connection: The pooled connection to release
-        """
-        await self._connection_pool.release(pooled_connection)
-
-    async def mark_connection_success(
-        self, pooled_connection: PooledConnection[T]
-    ) -> None:
-        """
-        Mark a pooled connection as having completed successfully.
-
-        Resets the connection's consecutive failure count.
-        Also updates peer health tracking.
-
-        Args:
-            pooled_connection: The connection that succeeded
-        """
-        await self._connection_pool.mark_success(pooled_connection)
-
-    async def mark_connection_failure(
-        self, pooled_connection: PooledConnection[T]
-    ) -> None:
-        """
-        Mark a pooled connection as having failed.
-
-        Increments the connection's consecutive failure count.
-        May mark connection for eviction if failures exceed threshold.
-
-        Args:
-            pooled_connection: The connection that failed
-        """
-        await self._connection_pool.mark_failure(pooled_connection)
-
-    async def close_connection(self, pooled_connection: PooledConnection[T]) -> None:
-        """
-        Close and remove a specific connection from the pool.
-
-        Use this when a connection is known to be broken and should not
-        be reused.
-
-        Args:
-            pooled_connection: The connection to close
-        """
-        await self._connection_pool.close(pooled_connection)
-
-    async def close_peer_connections(self, peer_id: str) -> int:
-        """
-        Close all pooled connections to a specific peer.
-
-        Useful when a peer is being removed or is known to be unavailable.
-
-        Args:
-            peer_id: The peer to disconnect from
-
-        Returns:
-            Number of connections closed
-        """
-        return await self._connection_pool.close_peer(peer_id)
 
     def get_peer(self, peer_id: str) -> PeerInfo | None:
         """
@@ -994,59 +822,6 @@ class DiscoveryService(Generic[T]):
         """
         return self._resolver.cleanup_expired()
 
-    async def cleanup_connections(self) -> tuple[int, int, int]:
-        """
-        Clean up idle, old, and failed connections from the pool.
-
-        This method should be called periodically to maintain pool health.
-        It removes:
-        - Connections that have been idle too long
-        - Connections that are older than the max age
-        - Connections that have exceeded the failure threshold
-
-        Returns:
-            Tuple of (idle_evicted, aged_evicted, failed_evicted)
-        """
-        return await self._connection_pool.cleanup()
-
-    def cleanup_sticky_bindings(self) -> tuple[int, int]:
-        """
-        Clean up expired and idle sticky bindings.
-
-        This method should be called periodically to remove stale bindings.
-        It removes:
-        - Bindings that have exceeded the TTL
-        - Bindings that haven't been used within the idle timeout
-
-        Returns:
-            Tuple of (expired_count, idle_count)
-        """
-        return self._sticky_manager.cleanup_expired()
-
-    async def cleanup_all(self) -> dict[str, tuple[int, ...]]:
-        """
-        Perform all cleanup operations.
-
-        Cleans up:
-        - DNS cache entries
-        - Idle/old/failed connections
-        - Expired/idle sticky bindings
-
-        This method should be called periodically to maintain overall health.
-
-        Returns:
-            Dict with cleanup results for each subsystem
-        """
-        dns_cleanup = self.cleanup_expired_dns()
-        connection_cleanup = await self.cleanup_connections()
-        sticky_cleanup = self.cleanup_sticky_bindings()
-
-        return {
-            "dns": dns_cleanup,
-            "connections": connection_cleanup,
-            "sticky_bindings": sticky_cleanup,
-        }
-
     def set_callbacks(
         self,
         on_peer_added: Callable[[PeerInfo], None] | None = None,
@@ -1082,8 +857,6 @@ class DiscoveryService(Generic[T]):
             if self._last_discovery > 0
             else -1,
             "selector_peer_count": self._selector.peer_count,
-            "connection_pool_stats": self._connection_pool.get_stats(),
-            "sticky_binding_stats": self._sticky_manager.get_stats(),
         }
 
     @property
@@ -1106,25 +879,10 @@ class DiscoveryService(Generic[T]):
         return peer_id in self._peers
 
     def clear(self) -> None:
-        """Clear all peers, connections, sticky bindings, and reset state."""
+        """Clear all peers and reset state."""
         self._peers.clear()
+        self._dns_peer_ids.clear()
         self._selector.clear()
         if self._locality_filter is not None:
             self._locality_filter.invalidate_cache()
-        self._sticky_manager.clear()
-        self._sticky_manager.clear_peer_health()
         self._last_discovery = 0.0
-
-    async def close(self) -> int:
-        """
-        Close all connections and clean up resources.
-
-        This method should be called when shutting down the service.
-        It closes all pooled connections and clears all state.
-
-        Returns:
-            Number of connections that were closed
-        """
-        connections_closed = await self._connection_pool.close_all()
-        self.clear()
-        return connections_closed

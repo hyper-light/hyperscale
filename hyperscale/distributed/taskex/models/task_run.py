@@ -1,6 +1,7 @@
-from typing import Any, Optional
+from typing import Optional
 from pydantic import (
     BaseModel,
+    Field,
     StrictFloat,
     StrictInt,
     StrictStr,
@@ -21,10 +22,10 @@ class TaskRun(BaseModel):
     status: RunStatus
     error: Optional[StrictStr] = None
     trace: Optional[StrictStr] = None
-    start: StrictInt | StrictFloat = _DEFAULT_CLOCK.monotonic()
+    start: StrictInt | StrictFloat = Field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     end: Optional[StrictInt | StrictFloat] = None
     elapsed: StrictInt | StrictFloat = 0
-    result: Optional[Any] = None
+    result: Optional[object] = None
     task_type: TaskType = TaskType.CALLABLE
 
     def complete(self):

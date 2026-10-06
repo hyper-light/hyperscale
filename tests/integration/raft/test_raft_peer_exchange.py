@@ -22,12 +22,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.manager.raft_integration import ManagerRaftIntegration
 from hyperscale.distributed.raft import RaftPeerOutbox
-from hyperscale.distributed.raft.models import AppendEntries, RaftCommandType, RequestVote
-from hyperscale.distributed.raft.models.commands import RaftCommand
+from hyperscale.distributed.raft.models import AppendEntries, RequestVote
+from hyperscale.distributed.ledger.events.event_type import JobEventType
+from hyperscale.distributed.raft.models.ledger_append_command import LedgerAppendCommand
 from hyperscale.distributed.raft.raft_node import ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
 from hyperscale.distributed.taskex import TaskRunner
 from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
@@ -59,6 +61,7 @@ class InMemoryCluster:
 
     def __init__(self, member_count: int) -> None:
         self.addresses = [("127.0.0.1", 9000 + index) for index in range(member_count)]
+        self.cluster_members = {_member_id(addr): addr for addr in self.addresses}
         # One TaskRunner per member, as in production (each server owns one).
         self.task_runners = {addr: TaskRunner(0, Env()) for addr in self.addresses}
         self.integrations: dict[tuple[str, int], ManagerRaftIntegration] = {}
@@ -76,13 +79,14 @@ class InMemoryCluster:
                 may_lead=lambda: True,
                 ledger_replica=JobLedgerReplica(),
                 node_id=_member_id(addr),
-                job_manager=MagicMock(),
-                leadership_tracker=MagicMock(),
                 logger=self.logger,
                 task_runner=self.task_runners[addr],
                 send_tcp=self._sender(addr),
-                node_addr=addr,
                 configured_cluster_size=member_count,
+                # The in-memory transport answers or refuses at once.
+                request_timeout_seconds=0.0,
+                # Every member of the cluster, formed from the start.
+                cluster_members=lambda: self.cluster_members, storage=VolatileRaftStorage(),
             )
 
     def _sender(self, sender_addr: tuple[str, int]):
@@ -99,13 +103,8 @@ class InMemoryCluster:
 
     async def start(self) -> None:
         for addr, integration in self.integrations.items():
-            peers = [peer for peer in self.addresses if peer != addr]
-            integration.set_initial_membership(
-                {_member_id(peer) for peer in peers},
-                {_member_id(peer): peer for peer in peers},
-            )
-            await integration.consensus.create_job_raft(JOB_ID)
-            integration.start()
+            await integration.consensus.create_job_raft(JOB_ID, frozenset(self.cluster_members))
+            await integration.start()
 
     async def stop(self) -> None:
         self.release_hung.set()
@@ -146,7 +145,7 @@ def _sender_loop_tasks() -> list[asyncio.Task]:
 
 
 async def _propose(cluster: InMemoryCluster, leader: tuple[str, int]) -> tuple[bool, int]:
-    command = RaftCommand(command_type=RaftCommandType.NO_OP, job_id=JOB_ID)
+    command = LedgerAppendCommand(job_id=JOB_ID, ledger_event_type=JobEventType.JOB_CREATED, ledger_payload=b"")
     return await cluster.integrations[leader].consensus.propose_command(JOB_ID, command)
 
 

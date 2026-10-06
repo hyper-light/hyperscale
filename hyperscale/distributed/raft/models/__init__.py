@@ -4,20 +4,21 @@ Raft consensus model exports.
 All dataclasses, enums, and message types used by the Raft module.
 """
 
-from .command_types import RaftCommandType
-from .commands import RaftCommand
-from .gate_command_types import GateRaftCommandType
-from .gate_commands import GateRaftCommand
 from .ledger_placement_query import LedgerPlacementQuery
 from .ledger_placement_result import LedgerPlacementResult
 from .ledger_proposal import LedgerProposal
 from .ledger_proposal_result import LedgerProposalResult
-from .log_entry import RaftLogEntry
+from .ledger_append_command import LEDGER_APPEND_COMMAND, LedgerAppendCommand
+from .log_entry import RAFT_NO_OP_COMMAND, RaftLogEntry
 from .messages import (
     AppendEntries,
     AppendEntriesResponse,
     RequestVote,
     RequestVoteResponse,
+)
+from .raft_configuration import (
+    RAFT_CONFIGURATION_COMMAND,
+    RaftConfiguration,
 )
 from .raft_state import (
     RaftLeaderVolatileState,
@@ -26,14 +27,14 @@ from .raft_state import (
 )
 
 __all__ = [
-    # Command types
-    "RaftCommandType",
-    "GateRaftCommandType",
-    # Commands
-    "RaftCommand",
-    "GateRaftCommand",
+    "LEDGER_APPEND_COMMAND",
+    "LedgerAppendCommand",
     # Log
+    "RAFT_NO_OP_COMMAND",
     "RaftLogEntry",
+    # Membership (AD-52)
+    "RAFT_CONFIGURATION_COMMAND",
+    "RaftConfiguration",
     # Messages
     "AppendEntries",
     "LedgerPlacementQuery",

@@ -53,7 +53,7 @@ survey of every ``self._task_runner.X`` reference under
 access, which two callsites use for a length count and which is
 better left as a concrete-class-specific detail):
 
-* ``run(callable, *args, **kwargs)`` — submit a callable for async
+* ``run(call, *args, **kwargs)`` — submit a callable for async
   execution. Returns a ``Run`` object with a ``.token`` field for
   later ``cancel`` lookup.
 * ``cancel(token)`` — cancel a specific ``Run`` by its token.
@@ -72,7 +72,12 @@ SWIM tree already carries the ``@runtime_checkable`` decorator and
 those callsites depend on it.
 """
 
-from typing import Any, Protocol, runtime_checkable
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    # ``taskex`` imports the runtime seams; a runtime import back would cycle.
+    from hyperscale.distributed.taskex.run import Run
 
 
 @runtime_checkable
@@ -90,22 +95,30 @@ class Runner(Protocol):
 
     def run(
         self,
-        callable_: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        """Submit ``callable_`` for async execution.
+        call: Callable[..., Awaitable[object]],
+        *args: object,
+        alias: str | None = None,
+        run_id: int | None = None,
+        timeout: str | int | float | None = None,
+        schedule: str | None = None,
+        trigger: Literal["MANUAL", "ON_START"] = "MANUAL",
+        repeat: Literal["NEVER", "ALWAYS"] | int = "NEVER",
+        keep: int | None = None,
+        max_age: str | None = None,
+        keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
+        **kwargs: object,
+    ) -> "Run[object] | None":
+        """Submit ``call`` for async execution.
 
-        Concrete signature (from ``TaskRunner.run``) accepts many
-        optional keyword arguments (``alias``, ``run_id``,
-        ``timeout``, ``schedule``, ``trigger``, ``repeat``,
-        ``keep``, ``max_age``, ``keep_policy``). The Protocol
-        collapses them to ``**kwargs`` because no callsite
-        explicitly matches the full concrete signature — they pass
-        the callable and rely on defaults for the rest.
+        The signature is ``TaskRunner.run``'s (and ``RunTask``'s, its
+        bound-method form): ``call`` runs with ``args`` and ``kwargs``
+        under the task named ``alias`` (else ``call``'s name), once or
+        on ``schedule``. A task already registered under that name runs
+        its own call, so the result is typed ``object``.
 
-        Returns a ``Run`` object with a ``.token`` attribute
-        callers use to reference the submission later.
+        Returns the submitted ``Run`` -- whose ``.token`` callers use to
+        reference the submission later -- or ``None`` when the runner
+        skips the task or nothing ran.
         """
         ...
 

@@ -1,5 +1,7 @@
 import asyncio
+import copy
 import inspect
+from types import MethodType
 import time
 
 # Runtime-default monotonic source — the SIM seam rebinding point
@@ -73,6 +75,7 @@ from hyperscale.ui.actions import (
     update_active_workflow_message,
     update_workflow_execution_stats,
     update_workflow_executions_counter,
+    update_workflow_executions_final_rate,
     update_workflow_executions_rates,
     update_workflow_executions_total_rate,
     update_workflow_progress_seconds,
@@ -817,17 +820,17 @@ class RemoteGraphManager:
         self,
         run_id: int,
         workflow: Workflow,
-        workflow_context: Dict[str, Any],
+        workflow_context: Dict[str, Dict[str, Any]],
         vus: int,
         threads: int,
     ):
+        """Run one workflow for a job executing elsewhere (a distributed
+        worker). ``workflow_context`` is the job's context by workflow
+        namespace: the run starts from all of it, as it would sharing one
+        context in a single process -- ``Provide`` hooks write the
+        namespaces they target, ``Use`` hooks read the namespaces they
+        name."""
         await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.QUEUED)
-
-        await self._controller.create_context_from_external_store(
-            workflow.name,
-            run_id,
-            workflow_context,
-        )
 
         default_config = {
             "workflow": workflow.name,
@@ -874,7 +877,10 @@ class RemoteGraphManager:
                 name="info",
             )
 
+            # A fresh run context, then the job's: seeding first and creating
+            # second dropped the received context before the run began.
             self._controller.create_run_contexts(run_id)
+            await self._controller.seed_run_context(run_id, workflow_context)
 
             # Allocate specific node IDs for this workflow
             # Get available nodes and allocate them for this execution
@@ -1159,6 +1165,21 @@ class RemoteGraphManager:
                     )
 
                     raise Exception('No results returned')
+
+                if is_test_workflow:
+                    # The run's final total over the time it was counted in,
+                    # as the stats report it (every action, divided by the
+                    # run's elapsed time, as k6 reports its rate): actions that
+                    # finished after the last streamed update count too.
+                    final_executed = execution_result["stats"]["executed"]
+                    await asyncio.gather(
+                        update_workflow_executions_counter(workflow_slug, final_executed),
+                        update_workflow_executions_final_rate(
+                            workflow_slug,
+                            final_executed,
+                            execution_result["elapsed"],
+                        ),
+                    )
 
                 await ctx.log_prepared(
                     message=f"Updating context for {workflow.name} run {run_id}",
@@ -1461,17 +1482,30 @@ class RemoteGraphManager:
             self._graph_updates[run_id][workflow_name].put_nowait(update)
 
     def _setup_state_actions(self, workflow: Workflow) -> Dict[str, ContextHook]:
-        state_actions: Dict[str, ContextHook] = {
-            name: hook
-            for name, hook in inspect.getmembers(
-                workflow,
-                predicate=lambda member: isinstance(member, ContextHook),
-            )
-        }
+        """This run's state hooks: a copy of each of the class's, bound to
+        ``workflow``.
 
-        for action in state_actions.values():
-            action._call = action._call.__get__(workflow, workflow.__class__)
-            setattr(workflow, action.name, action._call)
+        A hook is a class attribute every instance shares, and a run sets
+        its call and arguments. Binding the shared hook let concurrent runs
+        of one class take each other's instance and arguments, and from
+        Python 3.14 re-binding an already-bound method returns it unchanged,
+        so a later run called the first run's instance. Hooks are read from
+        the class: binding leaves the bound call on the instance, which
+        would hide the hook from a second setup of the same instance.
+        """
+        state_actions: Dict[str, ContextHook] = {}
+        for name, hook in inspect.getmembers(
+            type(workflow),
+            predicate=lambda member: isinstance(member, ContextHook),
+        ):
+            run_hook = copy.copy(hook)
+            run_hook.context_args = {}
+            run_hook._call = MethodType(
+                hook._call.__func__ if isinstance(hook._call, MethodType) else hook._call,
+                workflow,
+            )
+            setattr(workflow, run_hook.name, run_hook._call)
+            state_actions[name] = run_hook
 
         return state_actions
 
@@ -1850,11 +1884,15 @@ class RemoteGraphManager:
                 *[hook.call(**hook.context_args) for hook in provide_actions]
             )
 
+            # A provided value goes to the provider's own namespace -- read by
+            # a consumer naming its source, @state('Provider') -- and to every
+            # namespace it targets -- read by a consumer of its own
+            # namespace, @state().
             await asyncio.gather(
                 *[
-                    context[target].set(hook_name, result)
+                    context[namespace].set(hook_name, result)
                     for hook_name, result in context_results
-                    for target in hook_targets[hook_name]
+                    for namespace in dict.fromkeys((workflow, *hook_targets[hook_name]))
                 ]
             )
 

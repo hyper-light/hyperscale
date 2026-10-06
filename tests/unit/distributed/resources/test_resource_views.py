@@ -122,9 +122,9 @@ def test_stale_estimate_is_dropped_at_the_threshold_not_before() -> None:
 def test_gate_sums_led_workloads_and_takes_capacity_from_newest_report() -> None:
     clock = SteppedClock()
     aggregator = DatacenterResourceAggregator(clock, STALENESS_SECONDS)
-    aggregator.record("dc-1", MANAGER_A, report(cpu=200.0, memory=4 * 1024**3, cpu_variance=9.0, capacity=400.0))
+    aggregator.record("dc-1", MANAGER_A, report(cpu=200.0, memory=4 * 1024**3, cpu_variance=9.0, capacity=400.0), age_seconds=0.0)
     clock.now = 1.0
-    aggregator.record("dc-1", MANAGER_B, report(cpu=200.0, memory=4 * 1024**3, cpu_variance=16.0))
+    aggregator.record("dc-1", MANAGER_B, report(cpu=200.0, memory=4 * 1024**3, cpu_variance=16.0), age_seconds=0.0)
 
     view = aggregator.view("dc-1")
 
@@ -139,7 +139,7 @@ def test_gate_sums_led_workloads_and_takes_capacity_from_newest_report() -> None
 
 def test_pressure_is_capped_at_one() -> None:
     aggregator = DatacenterResourceAggregator(SteppedClock(), STALENESS_SECONDS)
-    aggregator.record("dc-1", MANAGER_A, report(cpu=10 * CPU_CAPACITY, memory=2 * MEMORY_CAPACITY))
+    aggregator.record("dc-1", MANAGER_A, report(cpu=10 * CPU_CAPACITY, memory=2 * MEMORY_CAPACITY), age_seconds=0.0)
 
     view = aggregator.view("dc-1")
 
@@ -149,9 +149,9 @@ def test_pressure_is_capped_at_one() -> None:
 def test_stale_manager_report_stops_counting_and_is_dropped() -> None:
     clock = SteppedClock()
     aggregator = DatacenterResourceAggregator(clock, STALENESS_SECONDS)
-    aggregator.record("dc-1", MANAGER_A, report(cpu=100.0, memory=1.0))
+    aggregator.record("dc-1", MANAGER_A, report(cpu=100.0, memory=1.0), age_seconds=0.0)
     clock.now = 10.0
-    aggregator.record("dc-1", MANAGER_B, report(cpu=300.0, memory=1.0))
+    aggregator.record("dc-1", MANAGER_B, report(cpu=300.0, memory=1.0), age_seconds=0.0)
 
     clock.now = math.nextafter(STALENESS_SECONDS, math.inf)
     assert aggregator.view("dc-1").workload_cpu_percent == 300.0
@@ -161,9 +161,36 @@ def test_stale_manager_report_stops_counting_and_is_dropped() -> None:
     assert aggregator._reports == {}
 
 
+def test_a_forwarded_report_ages_from_when_its_manager_made_it() -> None:
+    clock = SteppedClock()
+    aggregator = DatacenterResourceAggregator(clock, STALENESS_SECONDS)
+    clock.now = 10.0
+    # Gossiped on by a peer: made 4s ago, not now.
+    aggregator.record("dc-1", MANAGER_A, report(cpu=100.0, memory=1.0), age_seconds=4.0)
+
+    ((address, _, age),) = aggregator.fresh_reports("dc-1")
+    assert (address, age) == (MANAGER_A, 4.0)
+
+    clock.now = math.nextafter(10.0 - 4.0 + STALENESS_SECONDS, math.inf)
+    assert aggregator.fresh_reports("dc-1") == []
+
+
+def test_the_freshest_copy_of_a_managers_report_wins() -> None:
+    clock = SteppedClock()
+    aggregator = DatacenterResourceAggregator(clock, STALENESS_SECONDS)
+    clock.now = 10.0
+    aggregator.record("dc-1", MANAGER_A, report(cpu=300.0, memory=1.0), age_seconds=1.0)
+    # An older copy arriving later (a longer gossip path) changes nothing.
+    aggregator.record("dc-1", MANAGER_A, report(cpu=100.0, memory=1.0), age_seconds=5.0)
+    assert aggregator.view("dc-1").workload_cpu_percent == 300.0
+
+    aggregator.record("dc-1", MANAGER_A, report(cpu=200.0, memory=1.0), age_seconds=0.0)
+    assert aggregator.view("dc-1").workload_cpu_percent == 200.0
+
+
 def test_no_view_without_known_capacity() -> None:
     aggregator = DatacenterResourceAggregator(SteppedClock(), STALENESS_SECONDS)
     assert aggregator.view("dc-1") is None
 
-    aggregator.record("dc-1", MANAGER_A, report(cpu=100.0, memory=1.0, capacity=0.0))
+    aggregator.record("dc-1", MANAGER_A, report(cpu=100.0, memory=1.0, capacity=0.0), age_seconds=0.0)
     assert aggregator.view("dc-1") is None

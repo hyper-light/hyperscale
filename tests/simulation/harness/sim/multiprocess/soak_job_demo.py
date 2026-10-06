@@ -42,9 +42,12 @@ _AUTH_SECRET = "sim-multiprocess-secret-00000000"
 class SimSoakWorkflow(Workflow):
     """Deterministic multi-step soak workflow.
 
-    Two chained half-virtual-second steps per VU iteration; ``duration``
-    (and a proportionate ``timeout``) are overridden per INSTANCE by the
-    client entry, so one class serves every probed execution window.
+    Two chained half-virtual-second ACTION steps (they return plain
+    values), so each VU runs the pair once -- about a virtual second --
+    rather than repeating it for the duration, as a TEST workflow's VUs
+    would. ``duration`` (and a proportionate ``timeout``) are overridden
+    per INSTANCE by the client entry; the SIM pins built on this workflow
+    were measured with this one-shot execution.
     """
 
     vus: int = 2

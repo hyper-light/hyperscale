@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.hlc import HLCTimestamp, HybridLogicalClock
 from hyperscale.distributed.raft.logging_models import RaftWarning
@@ -50,7 +51,7 @@ def make_node(node_id: str, physical_ms: int) -> tuple[RaftNode, HybridLogicalCl
     node = RaftNode(
         job_id="job-1",
         node_id=node_id,
-        members=MEMBERS,
+        initial_voters=frozenset(MEMBERS),
         member_addrs=MEMBER_ADDRS,
         send_message=send_message,
         apply_command=AsyncMock(),
@@ -59,7 +60,7 @@ def make_node(node_id: str, physical_ms: int) -> tuple[RaftNode, HybridLogicalCl
         logger=logger,
         configured_cluster_size=len(MEMBERS),
         clock=clock,
-        may_lead=lambda: True,
+        may_lead=lambda: True, storage=VolatileRaftStorage()
     )
     return node, clock, send_message, logger
 

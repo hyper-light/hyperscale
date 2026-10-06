@@ -3,42 +3,25 @@ Leadership flapping detection for SWIM clusters.
 
 Detects rapid leadership changes that indicate cluster instability,
 network issues, or misconfiguration.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Callable, Any
-
-from hyperscale.distributed.protocol.time_quantum import (
-    TIME_REMAINDER_EPSILON_SECONDS,
-)
+from typing import Callable
+from hyperscale.distributed.protocol.time_quantum import TIME_REMAINDER_EPSILON_SECONDS
 from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
-
-
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 
-
-_DEFAULT_CLOCK: Clock = RealClock()
-
-
-@dataclass(slots=True)
-class LeadershipChange:
-    """
-    Record of a leadership change event.
-    
-    Uses __slots__ for memory efficiency since many instances may be created
-    during flapping episodes.
-    """
-    timestamp: float
-    old_leader: tuple[str, int] | None
-    new_leader: tuple[str, int] | None
-    term: int
-    reason: str  # e.g., 'election', 'stepdown', 'timeout', 'conflict'
-    
-    def __post_init__(self):
-        if self.timestamp == 0:
-            self.timestamp = _DEFAULT_CLOCK.monotonic()
+from .flapping_detector_shared import _DEFAULT_CLOCK
+from .flapping_detector_stats import FlappingDetectorStats
+from .leadership_change import LeadershipChange
 
 
 @dataclass(slots=True)
@@ -99,12 +82,14 @@ class FlappingDetector:
     _last_detection_time: float = 0.0
     
     # Callbacks
-    _on_flapping_detected: Callable[[int, float], Any] | None = None
-    _on_flapping_resolved: Callable[[], Any] | None = None
-    _on_warning: Callable[[int], Any] | None = None
+    _on_flapping_detected: Callable[[int, float], None] | None = None
+    _on_flapping_resolved: Callable[[], None] | None = None
+    _on_warning: Callable[[int], None] | None = None
     
     # Stats
     _total_changes: int = 0
+    # Debug log records lost because the logger's write itself failed.
+    _log_write_failures: int = 0
     _flapping_episodes: int = 0
     _total_flapping_duration: float = 0.0
     
@@ -145,13 +130,15 @@ class FlappingDetector:
                     node_id=self._node_id,
                 ))
             except Exception:
-                pass  # Don't let logging errors propagate
+                # The logger itself failed: nowhere left to report it but
+                # this detector's stats.
+                self._log_write_failures += 1
     
     def set_callbacks(
         self,
-        on_flapping_detected: Callable[[int, float], Any] | None = None,
-        on_flapping_resolved: Callable[[], Any] | None = None,
-        on_warning: Callable[[int], Any] | None = None,
+        on_flapping_detected: Callable[[int, float], None] | None = None,
+        on_flapping_resolved: Callable[[], None] | None = None,
+        on_warning: Callable[[int], None] | None = None,
     ) -> None:
         """
         Set callback functions for flapping events.
@@ -367,7 +354,7 @@ class FlappingDetector:
         self._current_cooldown = self.base_cooldown
         self._flapping_start = None
     
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> FlappingDetectorStats:
         """Get detector statistics."""
         return {
             'is_flapping': self._is_flapping,
@@ -376,8 +363,15 @@ class FlappingDetector:
             'change_rate_per_min': self.get_change_rate(),
             'total_changes': self._total_changes,
             'flapping_episodes': self._flapping_episodes,
+            'log_write_failures': self._log_write_failures,
             'total_flapping_duration': self._total_flapping_duration,
             'window_seconds': self.window_seconds,
             'max_changes_per_window': self.max_changes_per_window,
         }
 
+_REHOMED = (
+    LeadershipChange,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

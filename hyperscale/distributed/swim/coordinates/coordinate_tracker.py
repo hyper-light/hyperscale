@@ -26,7 +26,7 @@ class CoordinateTracker:
         *,
         clock: Clock | None = None,
     ) -> None:
-        self._engine = engine or NetworkCoordinateEngine(config=config)
+        self._engine = engine or NetworkCoordinateEngine(config=config or VivaldiConfig())
         self._peers: dict[str, NetworkCoordinate] = {}
         self._peer_last_seen: dict[str, float] = {}
         self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
@@ -57,9 +57,31 @@ class CoordinateTracker:
         if rtt_ms <= 0.0:
             return self.get_coordinate()
 
+        self._require_dimensions(peer_coordinate)
         self._peers[peer_id] = peer_coordinate
         self._peer_last_seen[peer_id] = self._clock.monotonic()
         return self._engine.update_with_rtt(peer_coordinate, rtt_ms / 1000.0)
+
+    def record_peer_coordinate(
+        self,
+        peer_id: str,
+        peer_coordinate: NetworkCoordinate,
+    ) -> None:
+        """Remember where a peer is without a round-trip measurement to
+        adjust our own coordinate by."""
+        self._require_dimensions(peer_coordinate)
+        self._peers[peer_id] = peer_coordinate
+        self._peer_last_seen[peer_id] = self._clock.monotonic()
+
+    def _require_dimensions(self, peer_coordinate: NetworkCoordinate) -> None:
+        """Refuse a coordinate of another dimension: distances and updates
+        pair components positionally, so a shorter or longer vector would
+        silently truncate them."""
+        dimensions = self._engine.get_config().dimensions
+        if len(peer_coordinate.vec) != dimensions:
+            raise ValueError(
+                f"coordinate has {len(peer_coordinate.vec)} dimensions, not {dimensions}"
+            )
 
     def estimate_rtt_ms(self, peer_coordinate: NetworkCoordinate) -> float:
         """Estimate RTT to a peer using Vivaldi distance."""
@@ -67,26 +89,15 @@ class CoordinateTracker:
             self._engine.get_coordinate(), peer_coordinate
         )
 
-    def estimate_rtt_ucb_ms(
-        self,
-        peer_coordinate: NetworkCoordinate | None = None,
-        peer_id: str | None = None,
-    ) -> float:
+    def estimate_rtt_ucb_ms(self, peer_coordinate: NetworkCoordinate) -> float:
         """
-        Estimate RTT with upper confidence bound (AD-35 Task 12.1.4).
-
-        Uses conservative estimates when coordinate quality is low.
-
-        Args:
-            peer_coordinate: Peer's coordinate (if known)
-            peer_id: Peer ID to look up coordinate (if peer_coordinate not provided)
+        Estimate RTT with upper confidence bound (AD-35 Task 12.1.4): the
+        Vivaldi distance to ``peer_coordinate`` plus a margin for both
+        coordinates' error.
 
         Returns:
             RTT UCB in milliseconds
         """
-        if peer_coordinate is None and peer_id is not None:
-            peer_coordinate = self._peers.get(peer_id)
-
         return self._engine.estimate_rtt_ucb_ms(
             self._engine.get_coordinate(),
             peer_coordinate,

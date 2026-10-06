@@ -7,7 +7,6 @@ import pathlib
 import stat
 import struct
 import sys
-import threading
 import zlib
 from typing import (
     Any,
@@ -487,11 +486,35 @@ class LoggerStream:
         if not self._pending_batch or not self._batch_lock:
             return
 
+        # Closing still syncs what is pending before it says so.
         async with self._batch_lock:
-            for _, future in self._pending_batch:
-                if not future.done():
-                    future.set_result(None)
-            self._pending_batch.clear()
+            await self._sync_pending_batch()
+
+    async def _sync_pending_batch(self) -> None:
+        """Fsync every file the pending batch wrote to, then resolve each
+        waiter with its own file's outcome; the batch is cleared either
+        way. Called holding the batch lock."""
+        pending_batch = list(self._pending_batch)
+        self._pending_batch.clear()
+        sync_errors: dict[str, Exception] = {}
+        for logfile_path in dict.fromkeys(path for path, _ in pending_batch):
+            logfile = self._files.get(logfile_path)
+            if logfile is None or logfile.closed:
+                continue
+            try:
+                await self._filesystem.fsync(logfile)
+            except Exception as sync_error:
+                sync_errors[logfile_path] = WALWriteError(
+                    f"Failed to fsync WAL file '{logfile_path}': {sync_error}"
+                )
+                sync_errors[logfile_path].__cause__ = sync_error
+        for logfile_path, future in pending_batch:
+            if future.done():
+                continue
+            if (sync_error := sync_errors.get(logfile_path)) is not None:
+                future.set_exception(sync_error)
+            else:
+                future.set_result(None)
 
     async def _close_all_files(self) -> None:
         await asyncio.gather(
@@ -679,7 +702,7 @@ class LoggerStream:
         if not entries:
             return
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 self.log(
                     entry,
@@ -692,6 +715,8 @@ class LoggerStream:
             ],
             return_exceptions=True,
         )
+        if failures := [result for result in results if isinstance(result, BaseException)]:
+            raise BaseExceptionGroup("batched log writes failed", failures)
 
     async def batch(
         self,
@@ -704,7 +729,7 @@ class LoggerStream:
         if not entries:
             return
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 self.log(
                     entry,
@@ -717,6 +742,8 @@ class LoggerStream:
             ],
             return_exceptions=True,
         )
+        if failures := [result for result in results if isinstance(result, BaseException)]:
+            raise BaseExceptionGroup("batched log writes failed", failures)
 
     async def log_prepared(
         self,
@@ -850,7 +877,7 @@ class LoggerStream:
             "filename": log_file,
             "function_name": function_name,
             "line_number": line_number,
-            "thread_id": threading.get_native_id(),
+            "thread_id": os.getpid(),
             "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         }
 
@@ -879,7 +906,7 @@ class LoggerStream:
             "function_name": function_name,
             "line_number": line_number,
             "error": str(err),
-            "thread_id": threading.get_native_id(),
+            "thread_id": os.getpid(),
             "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         }
 
@@ -989,7 +1016,8 @@ class LoggerStream:
             file_lock.release()
 
         if self._durability == DurabilityMode.FSYNC_BATCH:
-            await self._schedule_batch_fsync(logfile_path)
+            # Durable when the batch holding it has synced, not before.
+            await (await self._schedule_batch_fsync(logfile_path))
 
         await asyncio.sleep(0)
         return lsn
@@ -1112,7 +1140,7 @@ class LoggerStream:
             filename=code.co_filename,
             function_name=code.co_name,
             line_number=frame.f_lineno,
-            thread_id=threading.get_native_id(),
+            thread_id=os.getpid(),
             timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
         )
 
@@ -1298,12 +1326,4 @@ class LoggerStream:
                 self._batch_timer_handle.cancel()
                 self._batch_timer_handle = None
 
-            logfile = self._files.get(logfile_path)
-            if logfile and not logfile.closed:
-                await self._filesystem.fsync(logfile)
-
-            for _, future in self._pending_batch:
-                if not future.done():
-                    future.set_result(None)
-
-            self._pending_batch.clear()
+            await self._sync_pending_batch()

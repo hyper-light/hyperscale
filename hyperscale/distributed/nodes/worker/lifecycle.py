@@ -2,7 +2,7 @@
 Worker lifecycle management.
 
 Handles startup, shutdown, and abort operations for WorkerServer.
-Extracted from worker_impl.py for modularity (AD-33 compliance).
+Extracted from worker_impl.py for modularity (AD-54 compliance).
 """
 
 import asyncio
@@ -24,6 +24,7 @@ from hyperscale.distributed.runtime import (
     RealClock,
     TransportFactory,
 )
+from collections.abc import Callable
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -113,7 +114,7 @@ class WorkerLifecycleManager:
         # hyperscale import are an order of magnitude slower than UDP
         # connect; see WORKER_POOL_STARTUP_TIMEOUT_SECONDS in Env).
         self._pool_startup_timeout: float = float(
-            getattr(env, "WORKER_POOL_STARTUP_TIMEOUT_SECONDS", 60.0)
+            env.WORKER_POOL_STARTUP_TIMEOUT_SECONDS
         )
 
         # Local env for worker processes
@@ -144,7 +145,7 @@ class WorkerLifecycleManager:
 
     async def initialize_remote_manager(
         self,
-        updates_controller: InterfaceUpdatesController,
+        updates_controller: "InterfaceUpdatesController",
         status_update_poll_interval: float,
     ) -> RemoteGraphManager:
         """
@@ -275,7 +276,7 @@ class WorkerLifecycleManager:
                 "spawn errors."
             )
 
-    def set_on_cores_available(self, callback: callable) -> None:
+    def set_on_cores_available(self, callback: Callable[[int], None]) -> None:
         """
         Register callback for core availability notifications.
 
@@ -320,10 +321,14 @@ class WorkerLifecycleManager:
         for task in self._background_tasks:
             if task and not task.done():
                 task.cancel()
+                cancels_requested_before_wait = asyncio.current_task().cancelling()
                 try:
                     await task
                 except asyncio.CancelledError:
-                    pass
+                    # The task we cancelled ended; a cancel aimed at this task
+                    # while it waited goes on.
+                    if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                        raise
 
         self._background_tasks.clear()
 

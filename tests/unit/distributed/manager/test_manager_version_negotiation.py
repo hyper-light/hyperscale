@@ -10,10 +10,13 @@ AD-25 negotiation on the manager, owned by ManagerVersionSkewHandler
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.slo import SLOConfig
 from hyperscale.distributed.nodes.manager.version_skew import ManagerVersionSkewHandler
 from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
@@ -29,11 +32,11 @@ class RecordingTaskRunner:
 
 
 def make_handler() -> tuple[ManagerVersionSkewHandler, ManagerState]:
-    state = ManagerState()
+    state = ManagerState(slo_config=SLOConfig.from_env(Env()))
     handler = ManagerVersionSkewHandler(
         state=state,
         config=SimpleNamespace(host="127.0.0.1", tcp_port=9000),
-        logger=SimpleNamespace(log=None),
+        logger=SimpleNamespace(log=AsyncMock()),
         node_id="manager-a",
         task_runner=RecordingTaskRunner(),
     )
@@ -60,9 +63,9 @@ def test_a_clients_features_are_intersected_with_this_managers() -> None:
 
 
 @pytest.mark.parametrize("remove", ["handler", "state"])
-def test_a_gates_capabilities_live_in_one_store(remove: str) -> None:
+async def test_a_gates_capabilities_live_in_one_store(remove: str) -> None:
     handler, state = make_handler()
-    handler.negotiate_with_gate("gate-1", NodeCapabilities.current())
+    await handler.negotiate_with_gate("gate-1", NodeCapabilities.current())
     assert state.get_gate_negotiated_caps("gate-1") is handler.get_gate_capabilities("gate-1")
 
     if remove == "handler":

@@ -3,7 +3,6 @@ Integration tests for Gate Job Management (AD-27 Phase 5.1).
 
 Tests:
 - GateJobManager per-job locking and state management
-- JobForwardingTracker peer management and forwarding
 - ConsistentHashRing job-to-gate mapping
 """
 
@@ -12,9 +11,6 @@ import pytest
 
 from hyperscale.distributed.jobs.gates import (
     GateJobManager,
-    JobForwardingTracker,
-    GatePeerInfo,
-    ForwardingResult,
     ConsistentHashRing,
     HashRingNode,
 )
@@ -24,6 +20,24 @@ from hyperscale.distributed.models import (
     JobProgress,
     JobStatus,
 )
+from hyperscale.distributed.runtime import (
+    restore_defaults,
+    snapshot_defaults,
+    swap_defaults,
+)
+
+
+class SteppedClock:
+    """A process clock that moves only when the test moves it."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
 
 
 class TestGateJobManager:
@@ -198,196 +212,43 @@ class TestGateJobManager:
         assert job.total_completed == 6
 
     def test_cleanup_old_jobs(self) -> None:
-        """Test cleaning up old completed jobs."""
-        manager = GateJobManager()
+        """A terminal job is retained for the max age after it ended --
+        from when the sweep first finds it terminal, never from its
+        submission: measured from submission, a job that ran longer than
+        the retention went the moment it ended. A running job is never
+        swept."""
+        clock = SteppedClock()
+        defaults = snapshot_defaults()
+        swap_defaults(clock=clock)
+        try:
+            manager = GateJobManager()
+            manager.set_job(
+                "job-old",
+                GlobalJobStatus(
+                    job_id="job-old",
+                    status=JobStatus.COMPLETED.value,
+                    timestamp=0.0,  # Submitted long before the retention.
+                ),
+            )
+            manager.set_job(
+                "job-new",
+                GlobalJobStatus(
+                    job_id="job-new",
+                    status=JobStatus.RUNNING.value,
+                    timestamp=clock.now,
+                ),
+            )
 
-        # Add old completed job
-        manager.set_job(
-            "job-old",
-            GlobalJobStatus(
-                job_id="job-old",
-                status=JobStatus.COMPLETED.value,
-                timestamp=0.0,  # Very old
-            ),
-        )
+            removed_when_found_ended = manager.cleanup_old_jobs(max_age_seconds=1.0)
+            clock.now += 2.0
+            removed_after_retention = manager.cleanup_old_jobs(max_age_seconds=1.0)
+        finally:
+            restore_defaults(defaults)
 
-        # Add recent running job
-        import time
-
-        manager.set_job(
-            "job-new",
-            GlobalJobStatus(
-                job_id="job-new",
-                status=JobStatus.RUNNING.value,
-                timestamp=time.monotonic(),
-            ),
-        )
-
-        # Cleanup with 1 second max age
-        removed = manager.cleanup_old_jobs(max_age_seconds=1.0)
-
-        assert "job-old" in removed
+        assert removed_when_found_ended == []
+        assert removed_after_retention == ["job-old"]
         assert manager.has_job("job-old") is False
         assert manager.has_job("job-new") is True
-
-
-class TestJobForwardingTracker:
-    """Test JobForwardingTracker operations."""
-
-    def test_create_tracker(self) -> None:
-        """Test creating a JobForwardingTracker."""
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-
-        assert tracker.peer_count() == 0
-
-    def test_register_peer(self) -> None:
-        """Test registering a peer gate."""
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-
-        tracker.register_peer("gate-2", "10.0.0.2", 8080)
-
-        assert tracker.peer_count() == 1
-        peer = tracker.get_peer("gate-2")
-        assert peer is not None
-        assert peer.tcp_host == "10.0.0.2"
-        assert peer.tcp_port == 8080
-
-    def test_register_self_ignored(self) -> None:
-        """Test that registering self is ignored."""
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-
-        tracker.register_peer("gate-1", "10.0.0.1", 8080)
-
-        assert tracker.peer_count() == 0
-
-    def test_unregister_peer(self) -> None:
-        """Test unregistering a peer."""
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-
-        tracker.register_peer("gate-2", "10.0.0.2", 8080)
-        tracker.unregister_peer("gate-2")
-
-        assert tracker.peer_count() == 0
-
-    def test_update_peer_from_heartbeat(self) -> None:
-        """Test updating peer info from heartbeat."""
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-
-        tracker.update_peer_from_heartbeat("gate-2", "10.0.0.2", 8080)
-        tracker.update_peer_from_heartbeat("gate-2", "10.0.0.20", 9000)
-
-        peer = tracker.get_peer("gate-2")
-        assert peer is not None
-        assert peer.tcp_host == "10.0.0.20"
-        assert peer.tcp_port == 9000
-
-    @pytest.mark.asyncio
-    async def test_forward_with_no_peers(self) -> None:
-        """Test forwarding with no peers registered."""
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> bytes:
-            return b"ok"
-
-        result = await tracker.forward_result(
-            job_id="job-123",
-            data=b"test_data",
-            send_tcp=mock_send_tcp,
-        )
-
-        assert result.forwarded is False
-        assert "No peer gates" in (result.error or "")
-
-    @pytest.mark.asyncio
-    async def test_forward_success(self) -> None:
-        """Test successful forwarding."""
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-        tracker.register_peer("gate-2", "10.0.0.2", 8080)
-
-        forwarded_to: list[tuple[str, int]] = []
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> bytes:
-            forwarded_to.append(addr)
-            return b"ok"
-
-        result = await tracker.forward_result(
-            job_id="job-123",
-            data=b"test_data",
-            send_tcp=mock_send_tcp,
-        )
-
-        assert result.forwarded is True
-        assert result.target_gate_id == "gate-2"
-        assert ("10.0.0.2", 8080) in forwarded_to
-
-    @pytest.mark.asyncio
-    async def test_forward_with_failure_retry(self) -> None:
-        """Test that forwarding retries on failure."""
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-        tracker.register_peer("gate-2", "10.0.0.2", 8080)
-        tracker.register_peer("gate-3", "10.0.0.3", 8080)
-
-        call_count = 0
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> bytes:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise ConnectionError("First peer failed")
-            return b"ok"
-
-        result = await tracker.forward_result(
-            job_id="job-123",
-            data=b"test_data",
-            send_tcp=mock_send_tcp,
-        )
-
-        assert result.forwarded is True
-        assert call_count == 2
-
-    def test_get_stats(self) -> None:
-        """Test getting forwarding statistics."""
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-        tracker.register_peer("gate-2", "10.0.0.2", 8080)
-
-        stats = tracker.get_stats()
-
-        assert stats["peer_count"] == 1
-        assert stats["total_forwards"] == 0
-        assert "gate-2" in stats["peers"]
-
-    def test_cleanup_stale_peers(self) -> None:
-        """Test cleaning up stale peers."""
-        import time as time_module
-
-        tracker = JobForwardingTracker(local_gate_id="gate-1")
-
-        # Register peer with old last_seen
-        tracker.register_peer("gate-2", "10.0.0.2", 8080)
-        peer = tracker.get_peer("gate-2")
-        assert peer is not None
-        # Set last_seen to a time in the past (must be > 0 for cleanup check)
-        peer.last_seen = time_module.monotonic() - 100.0  # 100 seconds ago
-
-        removed = tracker.cleanup_stale_peers(max_age_seconds=1.0)
-
-        assert "gate-2" in removed
-        assert tracker.peer_count() == 0
 
 
 class TestConsistentHashRing:
@@ -572,78 +433,6 @@ class TestConsistentHashRing:
 
 class TestIntegrationScenarios:
     """Test realistic integration scenarios."""
-
-    @pytest.mark.asyncio
-    async def test_job_lifecycle_with_forwarding(self) -> None:
-        """
-        Test full job lifecycle with forwarding.
-
-        Scenario:
-        1. Gate-1 receives job submission
-        2. Gate-1 stores job in GateJobManager
-        3. Gate-2 receives result for job it doesn't own
-        4. Gate-2 forwards to Gate-1
-        5. Gate-1 aggregates and completes job
-        """
-        # Setup
-        gate1_manager = GateJobManager()
-        gate2_tracker = JobForwardingTracker(local_gate_id="gate-2")
-        hash_ring = ConsistentHashRing()
-
-        # Register gates in hash ring
-        await hash_ring.add_node("gate-1", "10.0.0.1", 8080)
-        await hash_ring.add_node("gate-2", "10.0.0.2", 8080)
-
-        # Setup forwarding
-        gate2_tracker.register_peer("gate-1", "10.0.0.1", 8080)
-
-        # Find a job that maps to gate-1
-        test_job_id = "job-for-gate1"
-        # Ensure the job maps to gate-1 by checking
-        counter = 0
-        while await hash_ring.get_owner_id(test_job_id) != "gate-1":
-            counter += 1
-            test_job_id = f"job-test-{counter}"
-
-        # Gate-1 receives and stores job
-        job = GlobalJobStatus(
-            job_id=test_job_id,
-            status=JobStatus.RUNNING.value,
-        )
-        gate1_manager.set_job(test_job_id, job)
-        gate1_manager.set_target_dcs(test_job_id, {"dc-1"})
-
-        # Gate-2 receives result (simulated as not owning the job)
-        owner = await hash_ring.get_owner_id(test_job_id)
-        assert owner == "gate-1"
-
-        # Track forwarded data
-        forwarded_data: list[bytes] = []
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> bytes:
-            forwarded_data.append(data)
-            return b"ok"
-
-        # Forward result
-        result = JobFinalResult(
-            job_id=test_job_id,
-            datacenter="dc-1",
-            status=JobStatus.COMPLETED.value,
-        )
-
-        forward_result = await gate2_tracker.forward_result(
-            job_id=test_job_id,
-            data=result.dump(),
-            send_tcp=mock_send_tcp,
-        )
-
-        assert forward_result.forwarded is True
-        assert len(forwarded_data) == 1
 
     @pytest.mark.asyncio
     async def test_hash_ring_with_job_manager(self) -> None:

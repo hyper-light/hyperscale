@@ -5,7 +5,9 @@ recovered ACTIVE from its WAL.
 A restarted manager has lost the in-flight state a resumed dispatch
 would need (worker assignments, workflow progress, in-memory
 callbacks), so pretending a recovered job is still running is a silent
-strand. The contract pinned here:
+strand. The contract pinned here, for a job no peer holds (here, a
+single-manager datacenter; a job a peer took over is relinquished, see
+tests/unit/simulation/sim/test_manager_restart_relinquishes_taken_over_job.py):
 
 * every recovered ACTIVE job transitions to FAILED durably (the record
   lands FIRST — a missed notification still leaves queries truthful);
@@ -27,6 +29,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.models.distributed import (
@@ -76,8 +79,15 @@ def _bare_manager(ledger: JobLedger, send_recorder: list) -> ManagerServer:
     manager._job_ledger = ledger
     # No wal_data_dir: the payload-resume path declines and recovery
     # falls through to the durable-FAIL truth-telling these tests pin.
-    manager._config = SimpleNamespace(wal_data_dir=None)
+    manager._config = SimpleNamespace(
+        wal_data_dir=None,
+        tcp_timeout_standard_seconds=Env().MANAGER_TCP_TIMEOUT_STANDARD,
+    )
     manager._job_manager = _NoJobManager()
+    # A single-manager datacenter: no peer to have taken a job over, and
+    # this manager alone a quorum.
+    manager._manager_state = SimpleNamespace(get_active_manager_peers=set)
+    manager._leadership = SimpleNamespace(get_quorum_size=lambda: 1)
     manager._udp_logger = _RecordingLogger()
     manager._node_id = SimpleNamespace(short="mgr-1", datacenter="dc-east")
     manager._host = "127.0.0.1"

@@ -1,14 +1,22 @@
 import asyncio
+import contextlib
 import functools
 import json
 import os
 import pathlib
 import re
+import sys
 import psutil
 
 
 from hyperscale.core.jobs.models import HyperscaleConfig
 from hyperscale.distributed.env import Env, load_env
+from hyperscale.distributed.ledger.storage_health import StorageHealth
+from hyperscale.distributed.raft.store.raft_store import RaftStore
+from hyperscale.distributed.runtime import RealClock, RealFilesystem, RealRandom
+from hyperscale.distributed.swim.core.node_id import NodeId
+from hyperscale.distributed.taskex import TaskRunner
+from hyperscale.logging import Logger
 
 
 async def get_default_workers():
@@ -140,3 +148,58 @@ async def node_data_directory(
             tcp_port,
         ),
     )
+
+
+async def drain_cluster_membership(node, timeout_seconds: float) -> None:
+    """Before an operator stop aborts a manager or gate, have its cluster
+    release the node's membership (AD-52 section 13) so the cluster does
+    not wait out the tombstone retention for it. A drain that fails or
+    overruns ``timeout_seconds`` is reported on stderr and the stop goes on:
+    the leader's silence detection still releases the node later."""
+    try:
+        await asyncio.wait_for(node.leave_cluster(), timeout=timeout_seconds)
+    except Exception as drain_error:
+        print(
+            f"cluster membership drain did not finish: {type(drain_error).__name__}: {drain_error}",
+            file=sys.stderr,
+        )
+
+
+@contextlib.asynccontextmanager
+async def opened_raft_store(
+    node_directory: pathlib.Path,
+    env: Env,
+    datacenter: str,
+    host: str,
+    udp_port: int,
+):
+    """The node's Raft store (D1), open for the node's whole run: it
+    resumes the identity and every Raft group its disk holds when that disk
+    is this node's and intact, sets an untrustworthy one aside, and starts
+    a new identity otherwise. The node is handed the store and runs as the
+    identity it holds. A store that cannot be opened at all fails the
+    command, as an unusable data directory does."""
+    filesystem = RealFilesystem()
+    task_runner = TaskRunner(0, env)
+    store = RaftStore(
+        directory=node_directory / "raft",
+        filesystem=filesystem,
+        random_source=RealRandom(),
+        clock=RealClock(),
+        logger=Logger(),
+        task_runner=task_runner,
+        set_aside_retained=env.RAFT_SET_ASIDE_RETAINED,
+        storage_health=StorageHealth(),
+    )
+    fresh_node_id_full = NodeId.generate(datacenter, host=host, port=udp_port).full
+    try:
+        await store.open(
+            fresh_node_id_full,
+            is_this_node=lambda node_id_full: NodeId.placement_of(node_id_full)
+            == NodeId.placement_of(fresh_node_id_full),
+        )
+        yield store
+    finally:
+        await store.close()
+        await task_runner.shutdown()
+        filesystem.shutdown(wait=True)

@@ -8,7 +8,7 @@ managers using the same O(log n) piggyback strategy as membership gossip.
 import heapq
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Callable
 
 from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
@@ -16,6 +16,8 @@ from hyperscale.distributed.models.worker_state import (
 )
 
 from hyperscale.distributed.runtime import Clock, RealClock
+from .gossip_buffer import MAX_UDP_PAYLOAD
+from .gossip_buffer_stats import GossipBufferStats
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -50,9 +52,9 @@ class WorkerStateGossipBuffer:
     _oversized_updates_count: int = 0
     _overflow_count: int = 0
 
-    _on_overflow: Any = None
+    _on_overflow: Callable[[int, int], None] | None = None
 
-    def set_overflow_callback(self, callback: Any) -> None:
+    def set_overflow_callback(self, callback: Callable[[int, int], None]) -> None:
         self._on_overflow = callback
 
     def add_update(
@@ -171,7 +173,6 @@ class WorkerStateGossipBuffer:
         base_message: bytes,
         max_count: int = 5,
     ) -> bytes:
-        from .gossip_buffer import MAX_UDP_PAYLOAD
 
         remaining = MAX_UDP_PAYLOAD - len(base_message)
         if remaining <= 0:
@@ -229,10 +230,7 @@ class WorkerStateGossipBuffer:
         if evicted > 0:
             self._overflow_count += 1
             if self._on_overflow:
-                try:
-                    self._on_overflow(evicted, self.max_updates)
-                except Exception:
-                    pass
+                self._on_overflow(evicted, self.max_updates)
 
         return evicted
 
@@ -274,7 +272,7 @@ class WorkerStateGossipBuffer:
             "pending_updates": len(self.updates),
         }
 
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> GossipBufferStats:
         return {
             "pending_updates": len(self.updates),
             "total_evicted": self._evicted_count,

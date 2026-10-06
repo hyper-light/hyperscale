@@ -72,7 +72,7 @@ class File(OptimizedArg, Generic[T]):
         path_encoding: str,
     ):
         
-        filepath = self.data("path")
+        filepath = self.data["path"]
         if isinstance(filepath, str):
             filepath = pathlib.Path(filepath)
 
@@ -85,7 +85,7 @@ class File(OptimizedArg, Generic[T]):
 
         if filepath.is_dir():
             attributes.type = FILEXFER_TYPE_DIRECTORY
-            dstpath = str(filepath).encode(encoding=path_encoding)
+            dstpath = str(filepath).encode(encoding=path_encoding or "utf-8")
 
             return (
                 dstpath,
@@ -99,7 +99,7 @@ class File(OptimizedArg, Generic[T]):
         dstpath = str(filepath)
         with open(dstpath, 'rb') as data_file:
             return  (
-                dstpath.encode(encoding=path_encoding),
+                dstpath.encode(encoding=path_encoding or "utf-8"),
                 data_file.read(),
                 attributes,
             )

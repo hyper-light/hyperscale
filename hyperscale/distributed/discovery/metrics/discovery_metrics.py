@@ -2,103 +2,22 @@
 Discovery system metrics collection and reporting.
 
 Provides comprehensive observability for peer discovery operations.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
 from typing import Callable
-
 from hyperscale.distributed.discovery.models.locality_info import LocalityTier
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .metrics_snapshot import MetricsSnapshot
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-@dataclass(slots=True)
-class MetricsSnapshot:
-    """Point-in-time snapshot of discovery metrics."""
-
-    timestamp: float
-    """When this snapshot was taken (monotonic)."""
-
-    # DNS metrics
-    dns_queries_total: int = 0
-    """Total DNS queries performed."""
-
-    dns_cache_hits: int = 0
-    """DNS queries served from cache."""
-
-    dns_cache_misses: int = 0
-    """DNS queries that required resolution."""
-
-    dns_negative_cache_hits: int = 0
-    """Queries blocked by negative cache."""
-
-    dns_failures: int = 0
-    """DNS resolution failures."""
-
-    dns_avg_latency_ms: float = 0.0
-    """Average DNS resolution latency."""
-
-    # Selection metrics
-    selections_total: int = 0
-    """Total peer selections performed."""
-
-    selections_load_balanced: int = 0
-    """Selections where load balancing changed the choice."""
-
-    selections_by_tier: dict[LocalityTier, int] = field(default_factory=dict)
-    """Selection count broken down by locality tier."""
-
-    # Connection pool metrics
-    connections_active: int = 0
-    """Currently active connections."""
-
-    connections_idle: int = 0
-    """Currently idle connections."""
-
-    connections_created: int = 0
-    """Total connections created."""
-
-    connections_closed: int = 0
-    """Total connections closed."""
-
-    connections_failed: int = 0
-    """Connection failures."""
-
-    # Sticky binding metrics
-    sticky_bindings_total: int = 0
-    """Current number of sticky bindings."""
-
-    sticky_bindings_healthy: int = 0
-    """Sticky bindings to healthy peers."""
-
-    sticky_evictions: int = 0
-    """Sticky bindings evicted due to health."""
-
-    # Peer health metrics
-    peers_total: int = 0
-    """Total known peers."""
-
-    peers_healthy: int = 0
-    """Peers in healthy state."""
-
-    peers_degraded: int = 0
-    """Peers in degraded state."""
-
-    peers_unhealthy: int = 0
-    """Peers in unhealthy state."""
-
-    # Latency tracking
-    peer_avg_latency_ms: float = 0.0
-    """Average latency across all peers."""
-
-    peer_p50_latency_ms: float = 0.0
-    """P50 peer latency."""
-
-    peer_p99_latency_ms: float = 0.0
-    """P99 peer latency."""
 
 
 @dataclass
@@ -139,8 +58,6 @@ class DiscoveryMetrics:
     _connections_failed: int = field(default=0, repr=False)
     _connections_active: int = field(default=0, repr=False)
 
-    _sticky_evictions: int = field(default=0, repr=False)
-
     _peer_latencies_ms: list[float] = field(default_factory=list, repr=False)
     _max_latency_samples: int = field(default=1000, repr=False)
 
@@ -150,12 +67,6 @@ class DiscoveryMetrics:
     """Optional callback when snapshot is generated."""
 
     # External state providers (set by DiscoveryService)
-    _get_connection_stats: Callable[[], dict[str, int]] | None = field(
-        default=None, repr=False
-    )
-    _get_sticky_stats: Callable[[], dict[str, int]] | None = field(
-        default=None, repr=False
-    )
     _get_peer_stats: Callable[[], dict[str, int]] | None = field(
         default=None, repr=False
     )
@@ -233,15 +144,6 @@ class DiscoveryMetrics:
 
     # --- Sticky Binding Metrics ---
 
-    def record_sticky_eviction(self, count: int = 1) -> None:
-        """
-        Record sticky binding eviction(s).
-
-        Args:
-            count: Number of bindings evicted
-        """
-        self._sticky_evictions += count
-
     # --- Latency Tracking ---
 
     def record_peer_latency(self, latency_ms: float) -> None:
@@ -285,24 +187,11 @@ class DiscoveryMetrics:
         snapshot.selections_load_balanced = self._selections_load_balanced
         snapshot.selections_by_tier = dict(self._selections_by_tier)
 
-        # Connection metrics (from pool if available)
+        # Connection metrics
         snapshot.connections_created = self._connections_created
         snapshot.connections_closed = self._connections_closed
         snapshot.connections_failed = self._connections_failed
-
-        if self._get_connection_stats is not None:
-            pool_stats = self._get_connection_stats()
-            snapshot.connections_active = pool_stats.get("in_use", 0)
-            snapshot.connections_idle = pool_stats.get("idle", 0)
-        else:
-            snapshot.connections_active = self._connections_active
-
-        # Sticky binding metrics (from manager if available)
-        if self._get_sticky_stats is not None:
-            sticky_stats = self._get_sticky_stats()
-            snapshot.sticky_bindings_total = sticky_stats.get("total_bindings", 0)
-            snapshot.sticky_bindings_healthy = sticky_stats.get("healthy_bindings", 0)
-        snapshot.sticky_evictions = self._sticky_evictions
+        snapshot.connections_active = self._connections_active
 
         # Peer health metrics (from selector if available)
         if self._get_peer_stats is not None:
@@ -346,26 +235,18 @@ class DiscoveryMetrics:
         self._connections_failed = 0
         self._connections_active = 0
 
-        self._sticky_evictions = 0
-
         self._peer_latencies_ms.clear()
 
     def set_state_providers(
         self,
-        connection_stats: Callable[[], dict[str, int]] | None = None,
-        sticky_stats: Callable[[], dict[str, int]] | None = None,
         peer_stats: Callable[[], dict[str, int]] | None = None,
     ) -> None:
         """
         Set external state providers for richer snapshots.
 
         Args:
-            connection_stats: Function returning connection pool stats
-            sticky_stats: Function returning sticky binding stats
             peer_stats: Function returning peer health stats
         """
-        self._get_connection_stats = connection_stats
-        self._get_sticky_stats = sticky_stats
         self._get_peer_stats = peer_stats
 
     def set_snapshot_callback(
@@ -403,3 +284,10 @@ class DiscoveryMetrics:
         if total == 0:
             return 0.0
         return self._connections_failed / total
+
+_REHOMED = (
+    MetricsSnapshot,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

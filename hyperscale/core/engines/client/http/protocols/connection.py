@@ -79,15 +79,17 @@ class HTTPConnection:
 
     async def connect_to_any(
         self,
+        target: Tuple[str, str],
         hostname: str,
         addresses: Sequence[Tuple[str, SocketConfig]],
         port: int,
         address_rotation: Iterator[int],
         ssl: Optional[SSLContext] = None,
-        ssl_upgrade: bool = False,
     ) -> Tuple[Optional[str], Optional[SocketConfig], bool]:
         """
-        Reuse this connection's cached transport for ``hostname``. Otherwise
+        Reuse this connection's cached transport for ``target``, the
+        scheme and address the request names (``hostname`` is the TLS
+        server name). Otherwise
         open a new one, racing the host's ``addresses`` (RFC 8305) from the
         next offset in ``address_rotation`` so a pool's connections spread
         across all of them.
@@ -95,11 +97,17 @@ class HTTPConnection:
         Returns the address and socket config of a new transport (``None``
         for both on reuse), and whether the transport is new.
         """
-        if ssl_upgrade is False and (
-            cached := self._reader_and_writer.get(hostname)
-        ) is not None:
-            self.reader, self.writer = cached
-            return None, None, False
+        if (cached := self._reader_and_writer.get(target)) is not None:
+            cached_reader, cached_writer = cached
+            if not cached_reader._eof and cached_reader._exception is None:
+                self.reader, self.writer = cached
+                return None, None, False
+
+            # The server closed this transport while it sat in the pool --
+            # its reader at the end of the stream, or holding the error:
+            # release it and open a new one.
+            del self._reader_and_writer[target]
+            cached_writer.abort()
 
         if not addresses:
             raise ConnectionError(f"No addresses to connect to for {hostname}")
@@ -118,7 +126,7 @@ class HTTPConnection:
         self.reader = reader
         self.writer = writer
 
-        self._reader_and_writer[hostname] = (reader, writer)
+        self._reader_and_writer[target] = (reader, writer)
 
         self.dns_address = address
         self.port = port
@@ -152,6 +160,11 @@ class HTTPConnection:
         return self.reader.read_headers()
 
     def close(self):
+        # One transport per target this connection served, while the factory
+        # closes only its newest: abort every one, or the rest stay open.
+        for _, writer in self._reader_and_writer.values():
+            writer.abort()
+
         self._reader_and_writer.clear()
 
         if self.reader:
@@ -162,17 +175,22 @@ class HTTPConnection:
 
         self._connection_factory.close()
 
-    def reset(self, hostname: str | None = None):
-        if hostname:
-            self._reader_and_writer[hostname] = None
-        else:
-            self._reader_and_writer.clear()
+    def reset(self):
+        """
+        Discard the transport in use: an error or a cut-off request left it
+        in an unknown state. Transports to this connection's other targets
+        are healthy and stay open for their next requests.
+        """
+        if (writer := self.writer) is not None:
+            writer.clear()
+            writer.abort()
+
+            # Its entry, found by identity: only a failure comes this way.
+            for target, (_, cached_writer) in self._reader_and_writer.items():
+                if cached_writer is writer:
+                    del self._reader_and_writer[target]
+                    break
 
         if self.reader:
             self.reader = None
-
-        if self.writer:
-            self.writer.clear()
-
-        self._connection_factory.reset()
 

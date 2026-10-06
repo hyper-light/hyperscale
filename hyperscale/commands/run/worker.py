@@ -6,7 +6,8 @@ from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.jobs.models import HyperscaleConfig
 from hyperscale.logging import LoggingConfig, LogLevelName
 
-from .node_address import parse_node_address
+from .node_address import parse_node_address, parse_node_host
+from .seed_locators import is_dynamic_locator, resolve_seed_addresses
 from .shared import get_default_workers, get_default_config, node_env, resolve_auth_secret
 from hyperscale.core.jobs.runner.shutdown_signals import ShutdownSignals
 
@@ -37,6 +38,8 @@ async def worker(
     )
 
 
+    host = parse_node_host(host, tcp_port)
+
     env = node_env(
         MERCURY_SYNC_AUTH_SECRET=resolve_auth_secret(acm_secret),
         MERCURY_SYNC_LOG_LEVEL=log_level.data,
@@ -46,15 +49,28 @@ async def worker(
     start_timeout_sec = TimeParser(boot_timeout).time
     shutdown_timeout_sec = TimeParser(shutdown_timeout).time
 
+    # AD-52 section 2: the managers may be given as seed locators, resolved
+    # at launch (retried while they do not yet resolve, within the boot
+    # timeout).
+    seed_managers = (
+        await resolve_seed_addresses(
+            managers,
+            "--managers",
+            start_timeout_sec,
+            env.CLUSTER_FORMATION_INTERVAL_SECONDS,
+            env.MANAGER_TCP_TIMEOUT_STANDARD,
+        )
+        if any(is_dynamic_locator(manager) for manager in managers)
+        else [parse_node_address(manager) for manager in managers]
+    )
+
     worker = WorkerServer(
         host=host,
         tcp_port=tcp_port,
         udp_port=udp_port,
         env=env,
         dc_id=datacenter,
-        seed_managers=[
-             parse_node_address(manager) for manager in managers
-        ],
+        seed_managers=seed_managers,
     )
 
     try:

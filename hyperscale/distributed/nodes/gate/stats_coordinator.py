@@ -6,7 +6,7 @@ stats aggregation following the REFACTOR.md pattern.
 """
 
 import asyncio
-from typing import TYPE_CHECKING, Callable, Coroutine, Any
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
     JobStatus,
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.taskex import TaskRunner
 
 
-ForwardStatusPushFunc = Callable[[str, bytes], Coroutine[Any, Any, bool]]
+ForwardStatusPushFunc = Callable[[str, bytes], Awaitable[bool]]
 
 
 class GateStatsCoordinator:
@@ -249,7 +249,10 @@ class GateStatsCoordinator:
 
         for attempt in range(self.CALLBACK_PUSH_MAX_RETRIES):
             try:
-                await self._send_tcp(callback, message_type, data, timeout=timeout)
+                response, _ = await self._send_tcp(callback, message_type, data, timeout=timeout)
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response, Exception):
+                    raise response
                 return True
             except Exception as send_error:
                 last_error = send_error

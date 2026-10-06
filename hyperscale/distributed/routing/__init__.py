@@ -2,75 +2,41 @@
 Routing module for distributed job assignment (AD-36).
 
 Provides:
-- Vivaldi-based multi-factor routing (AD-36)
-- Consistent hashing for deterministic job-to-node mapping
-- Health bucket selection preserving AD-17 semantics
-- Hysteresis and stickiness for routing stability
+- Vivaldi-based multi-factor datacenter routing (AD-36)
+- Confidence-weighted latency estimation from Vivaldi and observed
+  latency (AD-35, AD-45)
+- Health bucket ordering preserving AD-17 semantics
+- Per-job dispatch-failure cooldowns
 """
 
-from .bootstrap import BootstrapConfig, BootstrapModeManager
-from .bucket_selector import BucketSelectionResult, BucketSelector
-from .candidate_filter import (
-    CandidateFilter,
-    DatacenterCandidate,
-    DemotionReason,
-    ExclusionReason,
-    ManagerCandidate,
-)
-from .fallback_chain import FallbackChain, FallbackChainBuilder
-from .gate_job_router import GateJobRouter, GateJobRouterConfig, RoutingDecision
-from .hysteresis import HysteresisConfig, HysteresisManager, HysteresisResult
-from .routing_state import (
-    DatacenterRoutingScore,
-    JobRoutingState,
-    RoutingDecisionReason,
-    RoutingStateManager,
-)
-from .scoring import RoutingScorer, ScoringConfig
+from .blended_latency_scorer import BlendedLatencyScorer
+from .blended_scoring_config import BlendedScoringConfig
+from .candidate_filter import CandidateFilter
+from .datacenter_candidate import DatacenterCandidate
+from .datacenter_latency_estimator import DatacenterLatencyEstimator
+from .datacenter_routing_score import DatacenterRoutingScore
+from .exclusion_reason import ExclusionReason
+from .gate_job_router import GateJobRouter
+from .job_dispatch_cooldowns import JobDispatchCooldowns
 from .observed_latency_state import ObservedLatencyState
 from .observed_latency_tracker import ObservedLatencyTracker
-from .blended_scoring_config import BlendedScoringConfig
-from .datacenter_routing_score_extended import DatacenterRoutingScoreExtended
-from .dispatch_time_tracker import DispatchTimeTracker
-from .blended_latency_scorer import BlendedLatencyScorer
+from .routing_decision import RoutingDecision
+from .routing_scorer import RoutingScorer
+from .scoring_config import ScoringConfig
 
 __all__ = [
-    # Main router
-    "GateJobRouter",
-    "GateJobRouterConfig",
-    "RoutingDecision",
-    # Candidate models
-    "DatacenterCandidate",
-    "ManagerCandidate",
-    # Filtering
-    "CandidateFilter",
-    "ExclusionReason",
-    "DemotionReason",
-    # Bucket selection
-    "BucketSelector",
-    "BucketSelectionResult",
-    # Scoring
-    "RoutingScorer",
-    "ScoringConfig",
-    "DatacenterRoutingScore",
-    "BlendedScoringConfig",
-    "DatacenterRoutingScoreExtended",
     "BlendedLatencyScorer",
+    "BlendedScoringConfig",
+    "CandidateFilter",
+    "DatacenterCandidate",
+    "DatacenterLatencyEstimator",
+    "DatacenterRoutingScore",
+    "ExclusionReason",
+    "GateJobRouter",
+    "JobDispatchCooldowns",
     "ObservedLatencyState",
     "ObservedLatencyTracker",
-    "DispatchTimeTracker",
-    # Hysteresis
-    "HysteresisManager",
-    "HysteresisConfig",
-    "HysteresisResult",
-    # Bootstrap mode
-    "BootstrapModeManager",
-    "BootstrapConfig",
-    # Fallback chain
-    "FallbackChainBuilder",
-    "FallbackChain",
-    # State management
-    "RoutingStateManager",
-    "JobRoutingState",
-    "RoutingDecisionReason",
+    "RoutingDecision",
+    "RoutingScorer",
+    "ScoringConfig",
 ]

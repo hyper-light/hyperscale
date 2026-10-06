@@ -15,12 +15,14 @@ import pytest
 from dataclasses import dataclass
 
 from hyperscale.distributed.reliability import (
+    CONTROL_HANDLERS,
     HybridOverloadDetector,
     LoadShedder,
     LoadShedderConfig,
     OverloadConfig,
     OverloadState,
     RequestPriority,
+    classify_handler_to_priority,
 )
 
 
@@ -28,7 +30,7 @@ from hyperscale.distributed.reliability import (
 class RequestResult:
     """Result of a simulated request."""
 
-    message_type: str
+    handler_name: str
     priority: RequestPriority
     was_shed: bool
     latency_ms: float
@@ -68,27 +70,27 @@ class SimulatedServer:
 
     async def process_request(
         self,
-        message_type: str,
+        handler_name: str,
         simulated_latency_ms: float = 10.0,
     ) -> RequestResult:
         """
         Process a request with load shedding check.
 
         Args:
-            message_type: Type of message being processed
+            handler_name: Server handler name the request is addressed to
             simulated_latency_ms: Simulated processing latency
 
         Returns:
             RequestResult with outcome details
         """
-        priority = self._shedder.classify_request(message_type)
+        priority = classify_handler_to_priority(handler_name)
         current_state = self._shedder.get_current_state(
             self._current_cpu_percent,
             self._current_memory_percent,
         )
 
-        was_shed = self._shedder.should_shed(
-            message_type,
+        was_shed = self._shedder.should_shed_handler(
+            handler_name,
             self._current_cpu_percent,
             self._current_memory_percent,
         )
@@ -100,7 +102,7 @@ class SimulatedServer:
             self._detector.record_latency(simulated_latency_ms)
 
         result = RequestResult(
-            message_type=message_type,
+            handler_name=handler_name,
             priority=priority,
             was_shed=was_shed,
             latency_ms=simulated_latency_ms if not was_shed else 0.0,
@@ -148,16 +150,16 @@ class TestLoadSheddingServerBasics:
         """Test that healthy server accepts all request types."""
         server = SimulatedServer()
 
-        message_types = [
-            "DebugRequest",  # LOW
-            "StatsUpdate",  # NORMAL
-            "SubmitJob",  # HIGH
-            "Heartbeat",  # CRITICAL
+        handler_names = [
+            "cluster_metrics",  # LOW
+            "workflow_progress",  # NORMAL
+            "job_submission",  # HIGH
+            "raft_append_entries",  # CRITICAL
         ]
 
-        for message_type in message_types:
-            result = await server.process_request(message_type, simulated_latency_ms=10.0)
-            assert result.was_shed is False, f"{message_type} should not be shed when healthy"
+        for handler_name in handler_names:
+            result = await server.process_request(handler_name, simulated_latency_ms=10.0)
+            assert result.was_shed is False, f"{handler_name} should not be shed when healthy"
             assert result.overload_state == OverloadState.HEALTHY
 
     @pytest.mark.asyncio
@@ -171,7 +173,7 @@ class TestLoadSheddingServerBasics:
         # Process requests with known latencies
         latencies = [20.0, 25.0, 30.0, 35.0]
         for latency in latencies:
-            await server.process_request("SubmitJob", simulated_latency_ms=latency)
+            await server.process_request("job_submission", simulated_latency_ms=latency)
 
         diagnostics = server.get_diagnostics()
         assert diagnostics["sample_count"] == len(latencies)
@@ -197,19 +199,19 @@ class TestLoadSheddingStateTransitions:
 
         # Start healthy with low latencies
         for _ in range(5):
-            await server.process_request("SubmitJob", simulated_latency_ms=30.0)
+            await server.process_request("job_submission", simulated_latency_ms=30.0)
 
         assert server.get_current_state() == OverloadState.HEALTHY
 
         # Increase latency to trigger busy state (above 50ms but below 100ms)
         # Fill the window with busy-level latency values
         for _ in range(5):
-            await server.process_request("SubmitJob", simulated_latency_ms=60.0)
+            await server.process_request("job_submission", simulated_latency_ms=60.0)
 
         assert server.get_current_state() == OverloadState.BUSY
 
         # LOW priority should now be shed
-        result = await server.process_request("DebugRequest", simulated_latency_ms=60.0)
+        result = await server.process_request("cluster_metrics", simulated_latency_ms=60.0)
         assert result.was_shed is True
 
     @pytest.mark.asyncio
@@ -226,20 +228,20 @@ class TestLoadSheddingStateTransitions:
 
         # Get to busy state - fill window with busy-level latencies
         for _ in range(5):
-            await server.process_request("SubmitJob", simulated_latency_ms=60.0)
+            await server.process_request("job_submission", simulated_latency_ms=60.0)
 
         assert server.get_current_state() == OverloadState.BUSY
 
         # Increase latency to trigger stressed state (above 100ms but below 200ms)
         # Fill the window with stressed-level latencies
         for _ in range(5):
-            await server.process_request("SubmitJob", simulated_latency_ms=120.0)
+            await server.process_request("job_submission", simulated_latency_ms=120.0)
 
         assert server.get_current_state() == OverloadState.STRESSED
 
         # NORMAL and LOW should now be shed
-        low_result = await server.process_request("DebugRequest", simulated_latency_ms=120.0)
-        normal_result = await server.process_request("StatsUpdate", simulated_latency_ms=120.0)
+        low_result = await server.process_request("cluster_metrics", simulated_latency_ms=120.0)
+        normal_result = await server.process_request("workflow_progress", simulated_latency_ms=120.0)
 
         assert low_result.was_shed is True
         assert normal_result.was_shed is True
@@ -258,22 +260,22 @@ class TestLoadSheddingStateTransitions:
 
         # Get to stressed state - fill window with stressed-level latencies
         for _ in range(5):
-            await server.process_request("SubmitJob", simulated_latency_ms=120.0)
+            await server.process_request("job_submission", simulated_latency_ms=120.0)
 
         assert server.get_current_state() == OverloadState.STRESSED
 
         # Increase latency to trigger overloaded state (above 200ms)
         # Fill the window with overloaded-level latencies
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=250.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=250.0)
 
         assert server.get_current_state() == OverloadState.OVERLOADED
 
         # All except CRITICAL should be shed
-        low_result = await server.process_request("DebugRequest", simulated_latency_ms=250.0)
-        normal_result = await server.process_request("StatsUpdate", simulated_latency_ms=250.0)
-        high_result = await server.process_request("SubmitJob", simulated_latency_ms=250.0)
-        critical_result = await server.process_request("Heartbeat", simulated_latency_ms=250.0)
+        low_result = await server.process_request("cluster_metrics", simulated_latency_ms=250.0)
+        normal_result = await server.process_request("workflow_progress", simulated_latency_ms=250.0)
+        high_result = await server.process_request("job_submission", simulated_latency_ms=250.0)
+        critical_result = await server.process_request("raft_append_entries", simulated_latency_ms=250.0)
 
         assert low_result.was_shed is True
         assert normal_result.was_shed is True
@@ -295,19 +297,19 @@ class TestLoadSheddingStateTransitions:
 
         # Healthy state
         for _ in range(3):
-            await server.process_request("SubmitJob", simulated_latency_ms=30.0)
+            await server.process_request("job_submission", simulated_latency_ms=30.0)
         states_visited.append(server.get_current_state())
 
         # Ramp up to overloaded
         for latency in [60.0, 120.0, 250.0]:
             for _ in range(5):
-                await server.process_request("Heartbeat", simulated_latency_ms=latency)
+                await server.process_request("raft_append_entries", simulated_latency_ms=latency)
             states_visited.append(server.get_current_state())
 
         # Recovery back to healthy (requires many low-latency samples to lower EMA)
         server.reset()  # Reset for clean recovery test
         for _ in range(10):
-            await server.process_request("SubmitJob", simulated_latency_ms=20.0)
+            await server.process_request("job_submission", simulated_latency_ms=20.0)
         states_visited.append(server.get_current_state())
 
         # Verify we saw healthy at start and end
@@ -328,16 +330,16 @@ class TestLoadSheddingResourceSignals:
 
         # Low CPU - all accepted
         server.set_resource_usage(cpu_percent=50.0)
-        result = await server.process_request("StatsUpdate", simulated_latency_ms=10.0)
+        result = await server.process_request("workflow_progress", simulated_latency_ms=10.0)
         assert result.was_shed is False
 
         # High CPU (> 85%) triggers stressed state
         server.set_resource_usage(cpu_percent=90.0)
-        result = await server.process_request("StatsUpdate", simulated_latency_ms=10.0)
+        result = await server.process_request("workflow_progress", simulated_latency_ms=10.0)
         assert result.was_shed is True  # NORMAL shed in stressed
 
         # CRITICAL still accepted
-        result = await server.process_request("Heartbeat", simulated_latency_ms=10.0)
+        result = await server.process_request("raft_append_entries", simulated_latency_ms=10.0)
         assert result.was_shed is False
 
     @pytest.mark.asyncio
@@ -350,16 +352,16 @@ class TestLoadSheddingResourceSignals:
 
         # Normal memory - all accepted
         server.set_resource_usage(memory_percent=60.0)
-        result = await server.process_request("DebugRequest", simulated_latency_ms=10.0)
+        result = await server.process_request("cluster_metrics", simulated_latency_ms=10.0)
         assert result.was_shed is False
 
         # High memory (> 70%) triggers busy state
         server.set_resource_usage(memory_percent=75.0)
-        result = await server.process_request("DebugRequest", simulated_latency_ms=10.0)
+        result = await server.process_request("cluster_metrics", simulated_latency_ms=10.0)
         assert result.was_shed is True  # LOW shed in busy
 
         # HIGH still accepted in busy
-        result = await server.process_request("SubmitJob", simulated_latency_ms=10.0)
+        result = await server.process_request("job_submission", simulated_latency_ms=10.0)
         assert result.was_shed is False
 
     @pytest.mark.asyncio
@@ -379,7 +381,7 @@ class TestLoadSheddingResourceSignals:
         assert state == OverloadState.STRESSED
 
         # NORMAL should be shed
-        result = await server.process_request("StatsUpdate", simulated_latency_ms=10.0)
+        result = await server.process_request("workflow_progress", simulated_latency_ms=10.0)
         assert result.was_shed is True
 
 
@@ -397,17 +399,17 @@ class TestLoadSheddingConcurrency:
 
         # Prime the server with high latencies to trigger stressed state
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=120.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=120.0)
 
         assert server.get_current_state() == OverloadState.STRESSED
 
         # Send concurrent requests of different priorities
-        message_types = ["DebugRequest", "StatsUpdate", "SubmitJob", "Heartbeat"] * 5
+        handler_names = ["cluster_metrics", "workflow_progress", "job_submission", "raft_append_entries"] * 5
 
-        async def process(msg_type: str) -> RequestResult:
-            return await server.process_request(msg_type, simulated_latency_ms=120.0)
+        async def process(handler_name: str) -> RequestResult:
+            return await server.process_request(handler_name, simulated_latency_ms=120.0)
 
-        results = await asyncio.gather(*[process(mt) for mt in message_types])
+        results = await asyncio.gather(*[process(handler_name) for handler_name in handler_names])
 
         # Count shed vs processed by priority
         shed_counts = {p: 0 for p in RequestPriority}
@@ -437,14 +439,14 @@ class TestLoadSheddingConcurrency:
 
         # Start with low load
         for _ in range(3):
-            await server.process_request("SubmitJob", simulated_latency_ms=20.0)
+            await server.process_request("job_submission", simulated_latency_ms=20.0)
 
         assert server.get_current_state() == OverloadState.HEALTHY
 
         # Simulate burst causing latency spike
         burst_results = []
         for _ in range(10):
-            result = await server.process_request("StatsUpdate", simulated_latency_ms=80.0)
+            result = await server.process_request("workflow_progress", simulated_latency_ms=80.0)
             burst_results.append(result)
 
         # Should have transitioned to at least stressed during burst
@@ -470,24 +472,18 @@ class TestLoadSheddingFailurePaths:
 
         # Push to extreme overload
         for _ in range(10):
-            await server.process_request("Heartbeat", simulated_latency_ms=500.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=500.0)
 
         assert server.get_current_state() == OverloadState.OVERLOADED
 
         # All critical types must still be processed
-        critical_types = [
-            "Ping", "Ack", "Nack", "PingReq", "Suspect", "Alive", "Dead",
-            "Join", "JoinAck", "Leave", "JobCancelRequest", "JobCancelResponse",
-            "JobFinalResult", "Heartbeat", "HealthCheck",
-        ]
-
-        for msg_type in critical_types:
-            result = await server.process_request(msg_type, simulated_latency_ms=500.0)
-            assert result.was_shed is False, f"CRITICAL {msg_type} must never be shed"
+        for handler_name in sorted(CONTROL_HANDLERS):
+            result = await server.process_request(handler_name, simulated_latency_ms=500.0)
+            assert result.was_shed is False, f"CRITICAL {handler_name} must never be shed"
 
     @pytest.mark.asyncio
-    async def test_unknown_message_type_defaults_to_normal(self) -> None:
-        """Test that unknown message types default to NORMAL priority."""
+    async def test_unknown_handler_name_defaults_to_normal(self) -> None:
+        """Test that unknown handler names default to NORMAL priority."""
         config = OverloadConfig(
             absolute_bounds=(50.0, 100.0, 200.0),
         )
@@ -495,12 +491,12 @@ class TestLoadSheddingFailurePaths:
 
         # Push to stressed state
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=120.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=120.0)
 
         assert server.get_current_state() == OverloadState.STRESSED
 
-        # Unknown message should be treated as NORMAL and shed in stressed
-        result = await server.process_request("UnknownCustomMessage", simulated_latency_ms=120.0)
+        # Unknown handler should be treated as NORMAL and shed in stressed
+        result = await server.process_request("not_a_real_handler", simulated_latency_ms=120.0)
         assert result.priority == RequestPriority.NORMAL
         assert result.was_shed is True
 
@@ -511,7 +507,7 @@ class TestLoadSheddingFailurePaths:
 
         # Process with very low latencies
         for _ in range(5):
-            result = await server.process_request("SubmitJob", simulated_latency_ms=0.1)
+            result = await server.process_request("job_submission", simulated_latency_ms=0.1)
             assert result.was_shed is False
 
         diagnostics = server.get_diagnostics()
@@ -532,8 +528,8 @@ class TestLoadSheddingFailurePaths:
         assert server.get_current_state() == OverloadState.HEALTHY
 
         # All requests should be accepted
-        for msg_type in ["DebugRequest", "StatsUpdate", "SubmitJob", "Heartbeat"]:
-            result = await server.process_request(msg_type, simulated_latency_ms=10.0)
+        for handler_name in ["cluster_metrics", "workflow_progress", "job_submission", "raft_append_entries"]:
+            result = await server.process_request(handler_name, simulated_latency_ms=10.0)
             assert result.was_shed is False
 
     @pytest.mark.asyncio
@@ -546,7 +542,7 @@ class TestLoadSheddingFailurePaths:
 
         # Push to overloaded
         for _ in range(10):
-            await server.process_request("Heartbeat", simulated_latency_ms=250.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=250.0)
 
         assert server.get_current_state() == OverloadState.OVERLOADED
         metrics_before = server.get_metrics()
@@ -579,7 +575,7 @@ class TestLoadSheddingRecovery:
 
         # Push to overloaded
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=250.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=250.0)
 
         assert server.get_current_state() == OverloadState.OVERLOADED
 
@@ -593,7 +589,7 @@ class TestLoadSheddingRecovery:
         for target_latency, expected_state in latency_phases:
             # Process enough requests to shift the average
             for _ in range(10):
-                await server.process_request("Heartbeat", simulated_latency_ms=target_latency)
+                await server.process_request("raft_append_entries", simulated_latency_ms=target_latency)
 
             current_state = server.get_current_state()
             # State should be at or better than expected due to averaging
@@ -611,20 +607,20 @@ class TestLoadSheddingRecovery:
 
         # Push to stressed and shed NORMAL
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=120.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=120.0)
 
-        result = await server.process_request("StatsUpdate", simulated_latency_ms=120.0)
+        result = await server.process_request("workflow_progress", simulated_latency_ms=120.0)
         assert result.was_shed is True
 
         # Recover to healthy
         server.reset()
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=20.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=20.0)
 
         assert server.get_current_state() == OverloadState.HEALTHY
 
         # NORMAL should now be accepted
-        result = await server.process_request("StatsUpdate", simulated_latency_ms=20.0)
+        result = await server.process_request("workflow_progress", simulated_latency_ms=20.0)
         assert result.was_shed is False
 
 
@@ -641,19 +637,19 @@ class TestLoadSheddingMetricsAccuracy:
 
         # Push to stressed state
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=120.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=120.0)
 
         # Process known mix of requests
         request_mix = [
-            ("DebugRequest", True),  # LOW - shed
-            ("StatsUpdate", True),  # NORMAL - shed
-            ("SubmitJob", False),  # HIGH - not shed
-            ("Heartbeat", False),  # CRITICAL - not shed
+            ("cluster_metrics", True),  # LOW - shed
+            ("workflow_progress", True),  # NORMAL - shed
+            ("job_submission", False),  # HIGH - not shed
+            ("raft_append_entries", False),  # CRITICAL - not shed
         ] * 3  # 12 total requests
 
-        for msg_type, expected_shed in request_mix:
-            result = await server.process_request(msg_type, simulated_latency_ms=120.0)
-            assert result.was_shed == expected_shed, f"{msg_type} shed status mismatch"
+        for handler_name, expected_shed in request_mix:
+            result = await server.process_request(handler_name, simulated_latency_ms=120.0)
+            assert result.was_shed == expected_shed, f"{handler_name} shed status mismatch"
 
         metrics = server.get_metrics()
 
@@ -675,19 +671,19 @@ class TestLoadSheddingMetricsAccuracy:
 
         # Push to overloaded
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=250.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=250.0)
 
         # Process exactly 10 requests with known outcomes
         # In overloaded: LOW, NORMAL, HIGH shed; CRITICAL not shed
         requests = [
-            "DebugRequest",  # shed
-            "StatsUpdate",  # shed
-            "SubmitJob",  # shed
-            "Heartbeat",  # not shed
-        ] * 2 + ["DebugRequest", "Heartbeat"]  # 10 total: 7 shed, 3 not shed
+            "cluster_metrics",  # shed
+            "workflow_progress",  # shed
+            "job_submission",  # shed
+            "raft_append_entries",  # not shed
+        ] * 2 + ["cluster_metrics", "raft_append_entries"]  # 10 total: 7 shed, 3 not shed
 
-        for msg_type in requests:
-            await server.process_request(msg_type, simulated_latency_ms=250.0)
+        for handler_name in requests:
+            await server.process_request(handler_name, simulated_latency_ms=250.0)
 
         metrics = server.get_metrics()
         # 5 initial (not shed as CRITICAL) + 10 new = 15 total
@@ -714,12 +710,12 @@ class TestLoadSheddingTrendDetection:
 
         # Start with stable baseline
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=50.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=50.0)
 
         # Create rapidly rising pattern (causes baseline drift)
         for latency_increase in range(20):
             latency = 50.0 + (latency_increase * 5)  # 50 -> 145ms
-            await server.process_request("Heartbeat", simulated_latency_ms=latency)
+            await server.process_request("raft_append_entries", simulated_latency_ms=latency)
 
         diagnostics = server.get_diagnostics()
         # Baseline drift should be positive (fast baseline > slow baseline)
@@ -739,13 +735,13 @@ class TestLoadSheddingTrendDetection:
         # Server with stable high latency
         server_stable = SimulatedServer(overload_config=config)
         for _ in range(20):
-            await server_stable.process_request("Heartbeat", simulated_latency_ms=80.0)
+            await server_stable.process_request("raft_append_entries", simulated_latency_ms=80.0)
 
         # Server with rising latency
         server_rising = SimulatedServer(overload_config=config)
         for i in range(20):
             latency = 40.0 + (i * 4)  # 40 -> 116ms
-            await server_rising.process_request("Heartbeat", simulated_latency_ms=latency)
+            await server_rising.process_request("raft_append_entries", simulated_latency_ms=latency)
 
         stable_trend = server_stable.get_diagnostics()["trend"]
         rising_trend = server_rising.get_diagnostics()["trend"]
@@ -774,10 +770,10 @@ class TestLoadSheddingCustomConfiguration:
         # Even in healthy state, LOW should be shed
         assert server.get_current_state() == OverloadState.HEALTHY
 
-        result = await server.process_request("DebugRequest", simulated_latency_ms=10.0)
+        result = await server.process_request("cluster_metrics", simulated_latency_ms=10.0)
         assert result.was_shed is True
 
-        result = await server.process_request("StatsUpdate", simulated_latency_ms=10.0)
+        result = await server.process_request("workflow_progress", simulated_latency_ms=10.0)
         assert result.was_shed is False  # NORMAL still accepted
 
     @pytest.mark.asyncio
@@ -803,11 +799,11 @@ class TestLoadSheddingCustomConfiguration:
 
         # Push to stressed
         for _ in range(5):
-            await server.process_request("Heartbeat", simulated_latency_ms=120.0)
+            await server.process_request("raft_append_entries", simulated_latency_ms=120.0)
 
         assert server.get_current_state() == OverloadState.STRESSED
 
         # All priorities should still be accepted in stressed with lenient config
-        for msg_type in ["DebugRequest", "StatsUpdate", "SubmitJob"]:
-            result = await server.process_request(msg_type, simulated_latency_ms=120.0)
+        for handler_name in ["cluster_metrics", "workflow_progress", "job_submission"]:
+            result = await server.process_request(handler_name, simulated_latency_ms=120.0)
             assert result.was_shed is False

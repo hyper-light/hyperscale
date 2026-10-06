@@ -22,9 +22,9 @@ Pinned outcomes:
 
 Timelines (seed 61, probe-measured): both datacenters are first
 classified healthy once their managers heartbeat the gate, so the client
-submits after two heartbeat periods (20.0); submit 20.08, dispatch to
-both 20.17, execution 20.25-21.5, dc-east's final result at the gate
-21.21. dc-west is killed at 20.6, inside its execution.
+submits after two heartbeat periods (10.0 at the 5s heartbeat); submit
+10.08, execution 10.25-11.5, the job complete at the client 11.26.
+dc-west is killed 0.6s after submission (10.6), inside its execution.
 """
 
 from hyperscale.distributed.env import Env
@@ -51,8 +51,11 @@ _JOB_DATACENTERS = 2
 # Both managers have heartbeated the gate (healthy, with capacity) by the
 # end of their second heartbeat period; earlier, dc-east is still
 # INITIALIZING and the job is placed in dc-west alone.
-_SUBMIT_AT = 2 * create_manager_config_from_env("sim-mgr", 9000, 9001, Env()).gate_heartbeat_interval_seconds
-_LOSS_AT = 20.6
+_SUBMIT_AT = 2 * create_manager_config_from_env("sim-mgr", 9000, 9001, Env()).heartbeat_interval_seconds
+# dc-west dies inside its execution, which runs 0.25-1.5s after the client
+# submits (measured below), wherever the heartbeat period puts submission.
+_LOSS_AFTER_SUBMIT_SECONDS = 0.6
+_LOSS_AT = _SUBMIT_AT + _LOSS_AFTER_SUBMIT_SECONDS
 _DEADLINE_SECONDS = 20.0
 _DEADLINE_CHECK_INTERVAL_SECONDS = Env().BEST_EFFORT_DEADLINE_CHECK_INTERVAL
 _CEILING = _SUBMIT_AT + _JOB_TIMEOUT_SECONDS + _TRACKER_TICK_SECONDS + 15.0

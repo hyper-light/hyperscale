@@ -143,6 +143,37 @@ class GateIdempotencyCache(Generic[T]):
 
         self._resolve_waiters(waiters, result)
 
+    async def adopt_committed(self, key: IdempotencyKey, job_id: str, source_gate_id: str) -> None:
+        """Record ``key`` as decided for ``job_id`` by another gate -- its
+        job's replica committed here (AD-40). A decision already held is
+        kept, and so is this gate's own pending submission of the same job
+        (its commit records the full answer); a pending submission of the
+        key for another job is answered with this one -- that job cannot
+        commit: gates refuse to prepare a second job under the key."""
+        waiters: list[asyncio.Future[T]] = []
+        evicted_waiters: list[asyncio.Future[T]] = []
+        async with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None and (entry.is_terminal() or entry.job_id == job_id):
+                return
+            if entry is None:
+                evicted_waiters = self._evict_if_needed()
+            self._cache[key] = IdempotencyEntry(
+                idempotency_key=key,
+                status=IdempotencyStatus.COMMITTED,
+                job_id=job_id,
+                result=None,
+                created_at=entry.created_at if entry is not None else _DEFAULT_CLOCK.time(),
+                committed_at=_DEFAULT_CLOCK.time(),
+                source_gate_id=source_gate_id,
+            )
+            self._cache.move_to_end(key)
+            waiters = self._pending_waiters.pop(key, [])
+
+        if evicted_waiters:
+            self._reject_waiters(evicted_waiters, TimeoutError("Idempotency entry evicted"))
+        self._resolve_waiters(waiters, None)
+
     async def release(self, key: IdempotencyKey) -> None:
         """Forget a PENDING entry whose request ended without an outcome
         worth replaying (a transient refusal): a retry with the key is

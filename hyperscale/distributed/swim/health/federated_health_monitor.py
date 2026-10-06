@@ -9,154 +9,29 @@ distributed. Uses a SWIM-style probe/ack mechanism but with:
 - Aggregate health responses from DC leaders
 
 This is NOT cluster membership - just health monitoring using probe/ack.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Awaitable, Any
-
+from typing import Callable, Awaitable
 from hyperscale.distributed.models import Message
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
-
 from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.logging.hyperscale_logging_models import ServerError
 
-
-_DEFAULT_CLOCK: Clock = RealClock()
-
-
-class DCReachability(Enum):
-    """Network reachability state for a datacenter."""
-
-    UNKNOWN = "unknown"
-    REACHABLE = "reachable"
-    SUSPECTED = "suspected"
-    UNREACHABLE = "unreachable"
-
-
-@dataclass(slots=True)
-class CrossClusterProbe(Message):
-    """
-    Cross-cluster health probe (xprobe).
-
-    Sent from gates to DC leader managers to check health.
-    Minimal format - no gossip, just identity.
-    """
-
-    source_cluster_id: str  # Gate cluster ID
-    source_node_id: str  # Sending gate's node ID
-    source_addr: tuple[str, int]  # For response routing
-
-
-@dataclass(slots=True)
-class CrossClusterAck(Message):
-    """
-    Cross-cluster health acknowledgment (xack).
-
-    Response from DC leader with aggregate datacenter health.
-    """
-
-    # Identity
-    datacenter: str
-    node_id: str
-    incarnation: int  # External incarnation (separate from cluster incarnation)
-
-    # Leadership
-    is_leader: bool
-    leader_term: int
-
-    # Cluster health
-    cluster_size: int  # Total managers in DC
-    healthy_managers: int  # Managers responding to SWIM
-
-    # Worker capacity
-    worker_count: int
-    healthy_workers: int
-    total_cores: int
-    available_cores: int
-
-    # Workload
-    active_jobs: int
-    active_workflows: int
-
-    # Self-reported health
-    dc_health: str  # "HEALTHY", "DEGRADED", "BUSY", "UNHEALTHY"
-
-    # Optional: reason for non-healthy status
-    health_reason: str = ""
-
-
-@dataclass(slots=True)
-class DCLeaderAnnouncement(Message):
-    """
-    Announcement when a manager becomes DC leader.
-
-    Sent via TCP to notify gates of leadership changes.
-    """
-
-    datacenter: str
-    leader_node_id: str
-    leader_tcp_addr: tuple[str, int]
-    leader_udp_addr: tuple[str, int]
-    term: int
-    timestamp: float = field(default_factory=lambda: _DEFAULT_CLOCK.time())
-
-
-@dataclass(slots=True)
-class DCHealthState:
-    """
-    Gate's view of a datacenter's health.
-
-    Combines probe reachability with self-reported health.
-    """
-
-    datacenter: str
-    leader_udp_addr: tuple[str, int] | None = None
-    leader_tcp_addr: tuple[str, int] | None = None
-    leader_node_id: str = ""
-    leader_term: int = 0
-
-    # Probe state
-    reachability: DCReachability = DCReachability.UNKNOWN
-    last_probe_sent: float = 0.0
-    last_ack_received: float = 0.0
-    consecutive_failures: int = 0
-
-    # External incarnation tracking
-    incarnation: int = 0
-
-    # Last known health (from ack)
-    last_ack: CrossClusterAck | None = None
-
-    # Suspicion timing
-    suspected_at: float = 0.0
-
-    @property
-    def effective_health(self) -> str:
-        """Combine reachability and reported health."""
-        if self.reachability == DCReachability.UNKNOWN:
-            return "UNKNOWN"
-        if self.reachability == DCReachability.UNREACHABLE:
-            return "UNREACHABLE"
-        if self.reachability == DCReachability.SUSPECTED:
-            return "SUSPECTED"
-        if self.last_ack:
-            return self.last_ack.dc_health
-        return "UNKNOWN"
-
-    @property
-    def is_healthy_for_jobs(self) -> bool:
-        """Can this DC accept new jobs?"""
-        if self.reachability in (DCReachability.UNKNOWN, DCReachability.UNREACHABLE):
-            return False
-        if not self.last_ack:
-            return False
-        return self.last_ack.dc_health in ("HEALTHY", "DEGRADED", "BUSY")
-
-    @property
-    def has_successful_probe(self) -> bool:
-        """Return whether this DC has ever answered a federated probe."""
-        return self.last_ack is not None and self.last_ack_received > 0.0
+from .federated_health_monitor_shared import _DEFAULT_CLOCK
+from .cross_cluster_ack import CrossClusterAck
+from .cross_cluster_probe import CrossClusterProbe
+from .dc_health_state import DCHealthState
+from .dc_leader_announcement import DCLeaderAnnouncement
+from .dc_reachability import DCReachability
 
 
 @dataclass(slots=True)
@@ -192,7 +67,7 @@ class FederatedHealthMonitor:
     _on_dc_leader_change: (
         Callable[[str, str, tuple[str, int], tuple[str, int], int], None] | None
     ) = None  # (dc, leader_node_id, tcp_addr, udp_addr, term)
-    on_probe_error: Callable[[str, list[str]], None] | None = None
+    on_probe_error: Callable[[str, list[str]], Awaitable[None]] | None = None
 
     # State
     _dc_health: dict[str, DCHealthState] = field(default_factory=dict)
@@ -248,7 +123,6 @@ class FederatedHealthMonitor:
 
     async def _log_error(self, message: str) -> None:
         if self._logger:
-            from hyperscale.logging.hyperscale_logging_models import ServerError
 
             await self._logger.log(
                 ServerError(
@@ -414,10 +288,14 @@ class FederatedHealthMonitor:
         self._running = False
         if self._probe_task:
             self._probe_task.cancel()
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
                 await self._probe_task
             except asyncio.CancelledError:
-                pass
+                # The task we cancelled ended; a cancel aimed at this task
+                # while it waited goes on.
+                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                    raise
             self._probe_task = None
 
     async def _probe_loop(self) -> None:
@@ -441,11 +319,13 @@ class FederatedHealthMonitor:
 
             except asyncio.CancelledError:
                 await self._log_error("Probe loop cancelled")
-                break
+                # Ended as cancelled, never as returned: a stop awaiting
+                # this task must still see a cancel aimed at itself.
+                raise
             except Exception as error:
                 if self.on_probe_error:
                     try:
-                        self.on_probe_error(
+                        await self.on_probe_error(
                             f"Federated health probe loop error: {error}",
                             list(self._dc_health.keys()),
                         )
@@ -491,7 +371,7 @@ class FederatedHealthMonitor:
             self._handle_probe_failure(state)
             if self.on_probe_error:
                 try:
-                    self.on_probe_error(
+                    await self.on_probe_error(
                         f"Probe to {datacenter} failed: {error}",
                         [datacenter],
                     )
@@ -608,3 +488,14 @@ class FederatedHealthMonitor:
             state.reachability != old_reachability or new_health != old_health
         ) and self._on_dc_health_change:
             self._on_dc_health_change(state.datacenter, new_health)
+
+_REHOMED = (
+    DCReachability,
+    CrossClusterProbe,
+    CrossClusterAck,
+    DCLeaderAnnouncement,
+    DCHealthState,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

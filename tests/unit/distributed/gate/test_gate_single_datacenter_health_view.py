@@ -17,6 +17,11 @@ suspects is DEGRADED in every view.
 
 from types import SimpleNamespace
 
+from hyperscale.distributed.slo.latency_slo import LatencySLO
+from hyperscale.distributed.slo.slo_health_classifier import SLOHealthClassifier
+from hyperscale.distributed.capacity import DatacenterCapacityAggregator
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.health.circuit_breaker_manager import CircuitBreakerManager
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.models import DatacenterStatus
 from hyperscale.distributed.nodes.gate.health_coordinator import GateHealthCoordinator
@@ -51,7 +56,7 @@ def make_gate() -> GateServer:
     tcp_health = TcpHealthy()
     coordinator = GateHealthCoordinator(
         clock=RealClock(),
-        state=GateRuntimeState(),
+        state=GateRuntimeState(forward_throughput_interval_start=0.0),
         logger=None,
         task_runner=None,
         dc_health_manager=tcp_health,
@@ -62,7 +67,6 @@ def make_gate() -> GateServer:
         ),
         track_manager=None,
         versioned_clock=None,
-        manager_dispatcher=None,
         manager_health_config=None,
         datacenter_managers={REACHABLE_DC: [], SUSPECTED_DC: []},
         get_node_id=None,
@@ -70,8 +74,15 @@ def make_gate() -> GateServer:
         get_tcp_port=None,
         confirm_manager_for_dc=None,
         record_manager_heartbeat=None,
+        capacity_aggregator=DatacenterCapacityAggregator(
+            clock=RealClock(),
+            staleness_threshold_seconds=Env().CAPACITY_STALENESS_THRESHOLD_SECONDS,
+        ),
+        circuit_breaker_manager=CircuitBreakerManager(Env(), is_peer_suspected=lambda _peer_addr: False),
         resource_aggregator=None,
         resource_predictor=None,
+        latency_slo=LatencySLO.from_env(Env()),
+        slo_health_classifier=SLOHealthClassifier.from_env(Env()),
     )
     gate = object.__new__(GateServer)
     gate._health_coordinator = coordinator

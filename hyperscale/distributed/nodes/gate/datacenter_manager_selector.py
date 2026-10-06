@@ -127,7 +127,6 @@ class DatacenterManagerSelector:
         selections = discovery.select_peers(
             selection_key,
             count=len(managers),
-            use_sticky=False,
         )
         return [
             candidates[selection.peer_id]

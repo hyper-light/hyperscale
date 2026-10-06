@@ -1,24 +1,24 @@
 import asyncio
 import socket
 from asyncio.constants import SSL_HANDSHAKE_TIMEOUT
-from asyncio.sslproto import SSLProtocol
 from ssl import SSLContext
 from typing import Optional, Sequence
 
-from hyperscale.core.engines.client.shared.protocols import (
-    HTTP2_LIMIT,
-    Reader,
-    Writer,
-)
+from hyperscale.core.engines.client.shared.protocols import Writer
 from hyperscale.core.engines.client.shared.protocols.client_ssl_protocol import (
-    ClientSSLProtocol,
+    open_ssl_protocol_transport,
 )
 from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import (
     SocketConfig,
     connect_first_responding,
 )
+from hyperscale.core.engines.client.shared.protocols.tls_transport import (
+    RECEIVE_BUFFER_SIZE,
+    open_tls_transport,
+    supports_readiness_callbacks,
+)
 
-from .tls_protocol import TLSProtocol
+from .http2_protocol import HTTP2Protocol
 
 
 class TCPConnection:
@@ -28,6 +28,9 @@ class TCPConnection:
         self._connection = None
         self.socket: socket.socket = None
         self._writer = None
+        # Every TLS transport this connection opens reads the socket into
+        # this, one read callback at a time.
+        self._receive_buffer = memoryview(bytearray(RECEIVE_BUFFER_SIZE))
 
     async def create_http2(
         self,
@@ -52,9 +55,8 @@ class TCPConnection:
         ssl: Optional[SSLContext] = None,
         ssl_timeout: int = SSL_HANDSHAKE_TIMEOUT,
     ):
-        # this does the same as loop.open_connection(), but TLS upgrade is done
-        # manually after connection be established.
-
+        # What loop.open_connection(ssl=...) does, over the socket that won
+        # the connection race.
         self.loop = asyncio.get_event_loop()
 
         # RFC 8305: the first address to answer gets the connection.
@@ -63,45 +65,32 @@ class TCPConnection:
             socket_configs,
         )
 
-        family = socket_configs[winner_index][0]
+        # The protocol is the connection's reader too.
+        protocol = HTTP2Protocol(loop=self.loop)
 
-        reader = Reader(limit=HTTP2_LIMIT, loop=self.loop)
+        # The handshake's outcome, or its error, is the connect's: a failed
+        # handshake fails the connect rather than a later read.
+        if supports_readiness_callbacks(self.loop, self.socket):
+            self.transport = await open_tls_transport(
+                self.loop,
+                self.socket,
+                ssl,
+                hostname,
+                protocol,
+                self._receive_buffer,
+                handshake_timeout=ssl_timeout,
+            )
 
-        protocol = TLSProtocol(reader, loop=self.loop)
-
-        self.transport, _ = await self.loop.create_connection(
-            lambda: protocol, sock=self.socket, family=family
-        )
-
-        handshake_complete = self.loop.create_future()
-
-        ssl_protocol = ClientSSLProtocol(
-            self.loop,
-            protocol,
-            ssl,
-            handshake_complete,
-            False,
-            hostname,
-            ssl_handshake_timeout=ssl_timeout,
-            call_connection_made=False,
-        )
-
-        # Pause early so that "ssl_protocol.data_received()" doesn't
-        # have a chance to get called before "ssl_protocol.connection_made()".
-        self.transport.pause_reading()
-
-        self.transport.set_protocol(ssl_protocol)
-
-        # Starts the handshake without blocking. It must run on the loop's
-        # thread: it schedules timers and writes to the transport.
-        ssl_protocol.connection_made(self.transport)
-        self.transport.resume_reading()
-
-        # The handshake's outcome, or its error, arrives on this future, so a
-        # failed handshake fails the connect rather than a later read.
-        await handshake_complete
-
-        self.transport = ssl_protocol._app_transport
+        else:
+            self.transport = await open_ssl_protocol_transport(
+                self.loop,
+                self.socket,
+                socket_configs[winner_index][0],
+                ssl,
+                hostname,
+                protocol,
+                ssl_timeout,
+            )
 
         # RFC 9113 3.2: HTTP/2 over TLS only once ALPN has selected "h2".
         negotiated = self.transport.get_extra_info("ssl_object").selected_alpn_protocol()
@@ -110,16 +99,9 @@ class TCPConnection:
                 f"{hostname} negotiated {negotiated!r} over ALPN, not HTTP/2 (h2)"
             )
 
-        reader = Reader(limit=HTTP2_LIMIT, loop=self.loop)
+        self._writer = Writer(self.transport, protocol, protocol, self.loop)
 
-        protocol.upgrade_reader(reader)  # update reader
-        protocol.connection_made(self.transport)  # update transport
-
-        self._writer = Writer(
-            self.transport, ssl_protocol, reader, self.loop
-        )  # update writer
-
-        return reader, self._writer, winner_index
+        return protocol, self._writer, winner_index
 
     def close(self):
         try:

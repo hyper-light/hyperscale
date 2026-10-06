@@ -3,43 +3,25 @@ Security utilities for distributed_rewrite protocols.
 
 Re-exports security components from hyperscale.core.jobs.protocols for
 local use in the distributed_rewrite module.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
-from hyperscale.core.jobs.protocols.replay_guard import (
-    ReplayGuard as ReplayGuard,
-    ReplayError as ReplayError,
-)
+from hyperscale.core.jobs.protocols.replay_guard import ReplayGuard as ReplayGuard, ReplayError as ReplayError
+from hyperscale.distributed.reliability.rate_limiting import ServerRateLimiter as ServerRateLimiter
+from hyperscale.core.jobs.protocols.constants import MAX_MESSAGE_SIZE, MAX_COMPRESSION_RATIO, MAX_DECOMPRESSED_SIZE
+from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded as RateLimitExceeded
 
-# Import directly to avoid circular import through reliability/__init__.py
-from hyperscale.distributed.reliability.rate_limiting import (
-    ServerRateLimiter as ServerRateLimiter,
-)
-from hyperscale.core.jobs.protocols.constants import (
-    MAX_MESSAGE_SIZE,
-    MAX_COMPRESSION_RATIO,
-    MAX_DECOMPRESSED_SIZE,
-)
-from hyperscale.core.jobs.protocols.rate_limiter import (
-    RateLimitExceeded as RateLimitExceeded,
-)
-
-
-# Message size limits
-# Job submissions with workflow classes can be large when pickled
-
-
-class MessageSizeError(Exception):
-    """Raised when message size limits are exceeded."""
-    pass
-
-
-class AddressValidationError(Exception):
-    """Raised when address validation fails."""
-    pass
-
+from .address_validation_error import AddressValidationError
+from .message_size_error import MessageSizeError
 
 # Valid port range
 MIN_PORT = 1
+
 MAX_PORT = 65535
 
 
@@ -138,3 +120,10 @@ def validate_message_size(
                     f"Suspicious compression ratio: {ratio:.1f} > {MAX_COMPRESSION_RATIO}"
                 )
 
+_REHOMED = (
+    MessageSizeError,
+    AddressValidationError,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -17,14 +17,20 @@ class InterfaceUpdatesController:
                 self._active_workflows_update_ready.wait(), timeout=timeout
             )
 
-        except Exception:
-            pass
-
-        except asyncio.CancelledError:
+        except TimeoutError:
+            # No update within the timeout: the caller keeps cycling the
+            # workflows it has. Anything else, cancellation included, is
+            # the caller's to see.
             pass
 
         if self._active_workflows_updates.empty() is False:
             active_workflows_updates = await self._active_workflows_updates.get()
+
+        # Every queued update is taken: the next call waits for a new one
+        # (update_active_workflows sets the event again) or for the timeout,
+        # instead of returning at once from then on.
+        if self._active_workflows_updates.empty():
+            self._active_workflows_update_ready.clear()
 
         return active_workflows_updates
 

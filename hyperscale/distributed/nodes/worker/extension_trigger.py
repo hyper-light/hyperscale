@@ -29,69 +29,27 @@ Design constraints honored:
 * **Memory-bounded per-workflow tracking** — last-snapshot dict is
   keyed by ``workflow_id`` and cleaned up via
   ``forget_workflow`` when the workflow terminates.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
-
 from hyperscale.distributed.runtime import Clock, RealClock
-from hyperscale.distributed.health.workflow_progress_snapshot import (
-    WorkflowProgressSnapshot,
-)
-from hyperscale.distributed.nodes.worker.models.workflow_runtime_state import (
-    WorkflowRuntimeState,
-)
+from hyperscale.distributed.health.workflow_progress_snapshot import WorkflowProgressSnapshot
+from hyperscale.distributed.nodes.worker.models.workflow_runtime_state import WorkflowRuntimeState
 from hyperscale.distributed.taskex.util.time_parser import TimeParser
 
+from .extension_trigger_config import ExtensionTriggerConfig
+from ._per_workflow_trigger_state import _PerWorkflowTriggerState
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-# ============================================================================
-# Configuration
-# ============================================================================
-
-
-@dataclass(slots=True, frozen=True)
-class ExtensionTriggerConfig:
-    """Configuration for the worker autonomous extension trigger."""
-
-    # How often the loop scans active workflows. Defaults align with
-    # the worker heartbeat cadence so any extension request the
-    # trigger sets piggybacks on the very next outbound heartbeat.
-    poll_interval_seconds: float = 5.0
-    # Fraction of the workflow's deadline at which the trigger starts
-    # requesting extensions. 0.75 = "request once 75% of the budget
-    # is consumed." Picked so short workflows complete normally
-    # without ever requesting; only workflows running into the last
-    # quarter of their budget get extensions.
-    lookahead_fraction: float = 0.75
-    # Hard floor on the time before the deadline at which we send
-    # the first request, regardless of lookahead-fraction math.
-    # Ensures very short deadlines (e.g. 4s) still leave a request
-    # window long enough for the heartbeat round-trip + manager
-    # processing.
-    minimum_lookahead_seconds: float = 1.0
-
-    @classmethod
-    def from_env_values(
-        cls,
-        poll_interval_str: str,
-        lookahead_fraction: float,
-    ) -> "ExtensionTriggerConfig":
-        """Build a config from the parsed env-var values."""
-        return cls(
-            poll_interval_seconds=TimeParser(poll_interval_str).time,
-            lookahead_fraction=lookahead_fraction,
-        )
-
-
-# ============================================================================
-# Snapshot construction protocol
-# ============================================================================
-
 
 # Pulled out so unit tests can substitute a deterministic snapshot
 # builder without depending on the full WorkerServer/state graph.
@@ -118,20 +76,6 @@ def default_snapshot_builder(
         actions_completed=runtime.actions_completed,
         snapshot_time=_DEFAULT_CLOCK.monotonic(),
     )
-
-
-# ============================================================================
-# Trigger
-# ============================================================================
-
-
-@dataclass(slots=True)
-class _PerWorkflowTriggerState:
-    """Per-workflow trigger bookkeeping kept on the worker side."""
-
-    last_request_snapshot: WorkflowProgressSnapshot | None = None
-    last_request_time: float = 0.0
-    last_request_count: int = 0
 
 
 class ExtensionTrigger:
@@ -316,3 +260,11 @@ class ExtensionTrigger:
                 # the next tick try again. Production callers wire a
                 # logger/metric counter to surface these.
                 raise
+
+_REHOMED = (
+    ExtensionTriggerConfig,
+    _PerWorkflowTriggerState,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

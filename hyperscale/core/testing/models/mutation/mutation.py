@@ -54,7 +54,9 @@ class Mutation(OptimizedArg, Generic[T]):
 
         self.optimized: Optional[bytes] = None
         self.content_length: Optional[int] = None
-        self.content_type = "application/graphql-response+json"
+        # The body is a JSON request: application/graphql-response+json names
+        # GraphQL over HTTP's response, not its request.
+        self.content_type = "application/json"
 
     async def optimize(
         self,
@@ -65,7 +67,17 @@ class Mutation(OptimizedArg, Generic[T]):
 
         match request_type:
             case RequestType.GRAPHQL | RequestType.GRAPHQL_HTTP2:
-                self.optimized = orjson.dumps(self.data)
+                # GraphQL over HTTP's request body: query, and operationName
+                # and variables when given -- its names, not this model's.
+                body = {"query": self.data["query"]}
+
+                if operation_name := self.data.get("operation_name"):
+                    body["operationName"] = operation_name
+
+                if variables := self.data.get("variables"):
+                    body["variables"] = variables
+
+                self.optimized = orjson.dumps(body)
                 self.content_length = len(self.optimized)
 
             case _:

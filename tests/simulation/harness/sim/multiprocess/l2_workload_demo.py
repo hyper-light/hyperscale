@@ -21,13 +21,14 @@ workload-realism scenarios in the GATELESS topology:
   timeline: B must never start before A's terminal instant.
 
 Workflows are deliberately ACTION chains (chained ``@step``s awaiting
-parameterized virtual sleeps), NOT duration-governed TEST workflows:
-``WorkflowRunner._generate`` busy-waits ``asyncio.sleep(0)`` against a
-frozen virtual clock at the duration boundary, so TEST workflows die
+parameterized virtual sleeps), NOT duration-governed TEST workflows: the
+old ``WorkflowRunner._generate`` busy-waited ``asyncio.sleep(0)`` against
+a frozen virtual clock at the duration boundary, so TEST workflows died
 with ``SimulationConstraintError`` under SIM (see
-``gate_fault_client_demo`` where this constraint was probed). The
-class ``duration`` is set to match the summed sleeps so worker-side
-bookkeeping windows agree.
+``gate_fault_client_demo`` where this constraint was probed). Its
+successor ``_run_long_lived_vu`` anchors frozen clocks with a timed
+sleep -- not yet re-probed under SIM. The class ``duration`` is set to
+match the summed sleeps so worker-side bookkeeping windows agree.
 
 Milestones are ``(tag, value..., virtual_time)`` ONLY — never node
 ids, snowflakes, or error text — so identical-seed runs compare equal:

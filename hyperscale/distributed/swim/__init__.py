@@ -96,7 +96,6 @@ from .health import (
 from .detection import (
     IncarnationTracker as IncarnationTracker,
     SuspicionState as SuspicionState,
-    SuspicionManager as SuspicionManager,
     PendingIndirectProbe as PendingIndirectProbe,
     IndirectProbeManager as IndirectProbeManager,
     ProbeScheduler as ProbeScheduler,

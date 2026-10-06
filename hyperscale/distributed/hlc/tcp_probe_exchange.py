@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 from hyperscale.distributed.hlc.clock_offset_probe_error import ClockOffsetProbeError
+from hyperscale.distributed.runtime.send_tcp import SendTcp
 
 # The TCP action peers serve clock offset probes under.
 CLOCK_OFFSET_PROBE_ACTION = "clock_offset_probe"
@@ -11,7 +12,7 @@ PeerAddress = tuple[str, int]
 
 
 def tcp_probe_exchange(
-    send_tcp: Callable[..., Awaitable[tuple[Any, Any]]],
+    send_tcp: SendTcp,
 ) -> Callable[[PeerAddress, bytes], Awaitable[bytes]]:
     """A probe exchange over a server's ``send_tcp``, which reports
     failures as values: they become ``ClockOffsetProbeError``.

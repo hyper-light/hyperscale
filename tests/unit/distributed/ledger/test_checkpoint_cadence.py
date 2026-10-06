@@ -343,6 +343,38 @@ async def test_recovery_applies_entries_written_after_the_checkpoint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_restarted_ledger_compacts_what_it_recovered() -> None:
+    """Recovery applies every entry it reads back -- replayed, or held by
+    the checkpoint it resumed from -- so the first checkpoint after a
+    restart compacts them, and an idle node then stops checkpointing.
+
+    Recovered entries used to stay pending forever (nothing marked them
+    applied, and compaction drops only applied ones): the node held its
+    whole history in memory, and with it past the floor every tick wrote
+    a checkpoint that compacted nothing.
+    """
+    filesystem = SimFilesystem()
+    ledger = await _open_ledger(filesystem, min_checkpoint_wal_entries=3)
+    for job_index in range(3):
+        await _create_job(ledger, f"job-{job_index}")
+        await _accept_job(ledger, f"job-{job_index}")
+        await _complete_job(ledger, f"job-{job_index}")
+    await ledger.close()
+
+    recovered_ledger = await _open_ledger(filesystem, min_checkpoint_wal_entries=3)
+    assert recovered_ledger.pending_wal_entries == 9
+
+    assert await recovered_ledger.maybe_checkpoint() is not None
+    assert recovered_ledger.pending_wal_entries == 0, "recovered entries were never compacted"
+    checkpoints = await _checkpoint_files(filesystem)
+
+    for _ in range(5):
+        assert await recovered_ledger.maybe_checkpoint() is None, "an idle restarted node kept checkpointing"
+    assert await _checkpoint_files(filesystem) == checkpoints
+    await recovered_ledger.close()
+
+
+@pytest.mark.asyncio
 async def test_retention_keeps_only_the_newest_checkpoints(monkeypatch) -> None:
     """Checkpoints on a cadence means checkpoint FILES on a cadence.
 

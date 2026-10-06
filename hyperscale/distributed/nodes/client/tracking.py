@@ -5,11 +5,13 @@ Handles job lifecycle tracking, status updates, completion events, and callbacks
 """
 
 import asyncio
-from typing import Callable, Coroutine, Any
+from collections.abc import AsyncIterator
+from typing import Awaitable, Callable
 
 from hyperscale.distributed.models import (
     JobStatus,
     ClientJobResult,
+    ClientWorkflowResult,
     JobStatusPush,
     WorkflowResultPush,
     ReporterResultPush,
@@ -27,7 +29,10 @@ from hyperscale.distributed.nodes.client.status_application import (
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
-PollGateForStatusFunc = Callable[[str], Coroutine[Any, Any, GlobalJobStatus | None]]
+PollGateForStatusFunc = Callable[[str], Awaitable[GlobalJobStatus | None]]
+# Has the job's gate send again what it recorded for this client and could
+# not deliver; True once it has.
+RequestReplayFunc = Callable[[str], Awaitable[bool]]
 
 TERMINAL_STATUSES = frozenset(
     {
@@ -53,16 +58,21 @@ class ClientJobTracker:
         self,
         state: ClientState,
         logger: Logger,
+        result_drain_timeout_seconds: float,
         poll_gate_for_status: PollGateForStatusFunc | None = None,
+        request_replay: RequestReplayFunc | None = None,
     ) -> None:
         self._state = state
         self._logger = logger
+        self._result_drain_timeout_seconds = result_drain_timeout_seconds
         self._poll_gate_for_status = poll_gate_for_status
+        self._request_replay = request_replay
         self._status_applier = JobStatusApplier()
 
     def initialize_job_tracking(
         self,
         job_id: str,
+        expected_workflow_ids: frozenset[str],
         on_status_update: Callable[[JobStatusPush], None] | None = None,
         on_progress_update: Callable | None = None,
         on_workflow_result: Callable[[WorkflowResultPush], None] | None = None,
@@ -75,6 +85,7 @@ class ClientJobTracker:
 
         Args:
             job_id: Job identifier
+            expected_workflow_ids: The workflow ids the job is submitted with
             on_status_update: Optional callback for JobStatusPush updates
             on_progress_update: Optional callback for WindowedStatsPush updates
             on_workflow_result: Optional callback for WorkflowResultPush updates
@@ -88,6 +99,8 @@ class ClientJobTracker:
 
         # Create completion event
         self._state._job_events[job_id] = asyncio.Event()
+        self._state._job_expected_workflows[job_id] = expected_workflow_ids
+        self._state._job_results_events[job_id] = asyncio.Event()
 
         # Register callbacks if provided
         if on_status_update:
@@ -143,6 +156,59 @@ class ClientJobTracker:
         if event:
             event.set()
 
+    async def stream_workflow_results(
+        self,
+        job_id: str,
+        timeout: float | None = None,
+    ) -> AsyncIterator[ClientWorkflowResult]:
+        """
+        Each of a job's workflow results as it arrives -- those that already
+        arrived first -- until the job is done: the iteration ends when
+        ``wait_for_job`` would return (terminal, with the results still in
+        flight waited out), and raises what it would raise.
+
+        Args:
+            job_id: Job identifier from submit_job
+            timeout: Maximum time to wait for the job in seconds (None =
+                wait forever)
+
+        Raises:
+            KeyError: If job_id not found
+            asyncio.TimeoutError: If timeout exceeded
+        """
+        if job_id not in self._state._jobs:
+            raise KeyError(f"Unknown job: {job_id}")
+
+        # Snapshot and subscription in one step (no await between): every
+        # result arrives exactly once -- replayed, or put to the stream.
+        stream: asyncio.Queue[ClientWorkflowResult | None] = asyncio.Queue()
+        for result in self._state._jobs[job_id].workflow_results.values():
+            stream.put_nowait(result)
+        self._state.subscribe_workflow_results(job_id, stream)
+        # The job being done ends the stream, behind the results before it.
+        completion = asyncio.get_running_loop().create_task(self.wait_for_job(job_id, timeout=timeout))
+        completion.add_done_callback(lambda _completion: stream.put_nowait(None))
+        try:
+            while (result := await stream.get()) is not None:
+                yield result
+            completion.result()
+        finally:
+            self._state.unsubscribe_workflow_results(job_id, stream)
+            if completion.done() and not completion.cancelled():
+                # A reader that stopped early: the wait's outcome is read
+                # here rather than reported as never retrieved.
+                completion.exception()
+            if not completion.done():
+                completion.cancel()
+                cancels_requested_before_wait = asyncio.current_task().cancelling()
+                try:
+                    await completion
+                except asyncio.CancelledError:
+                    # The wait we cancelled ended; a cancel aimed at this
+                    # task while it waited goes on.
+                    if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                        raise
+
     async def wait_for_job(
         self,
         job_id: str,
@@ -154,7 +220,9 @@ class ClientJobTracker:
 
         Blocks until the job reaches a terminal state (COMPLETED, FAILED, etc.)
         or timeout is exceeded. Periodically polls the gate to recover from
-        missed status pushes.
+        missed status pushes. A completed job then waits out its workflow
+        results still in flight; the workflows left without one are named
+        in ``missing_workflow_results``.
 
         Args:
             job_id: Job identifier from submit_job
@@ -171,6 +239,9 @@ class ClientJobTracker:
         if job_id not in self._state._jobs:
             raise KeyError(f"Unknown job: {job_id}")
 
+        # Held for the whole wait: a release of the job while it is waited
+        # on cannot take its result away from this caller.
+        job = self._state._jobs[job_id]
         event = self._state._job_events[job_id]
         effective_poll_interval = poll_interval or self.DEFAULT_POLL_INTERVAL_SECONDS
 
@@ -199,12 +270,64 @@ class ClientJobTracker:
         finally:
             if poll_task and not poll_task.done():
                 poll_task.cancel()
+                cancels_requested_before_wait = asyncio.current_task().cancelling()
                 try:
                     await poll_task
                 except asyncio.CancelledError:
-                    pass
+                    # The task we cancelled ended; a cancel aimed at this task
+                    # while it waited goes on.
+                    if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                        raise
 
-        return self._state._jobs[job_id]
+        expected_workflow_ids = self._state._job_expected_workflows.get(job_id, frozenset())
+
+        # Workflow results travel apart from the terminal status, with no
+        # order between them, so a job can be reported complete before its
+        # last results land: a completed job waits for those in flight
+        # (every workflow of a completed job has one).
+        results_event = self._state._job_results_events.get(job_id)
+        if (
+            job.status == JobStatus.COMPLETED.value
+            and results_event is not None
+            and not results_event.is_set()
+            and not expected_workflow_ids <= job.workflow_results.keys()
+        ):
+            drained = False
+            try:
+                await _DEFAULT_CLOCK.wait_for(
+                    results_event.wait(),
+                    timeout=self._result_drain_timeout_seconds,
+                )
+                drained = True
+            except asyncio.TimeoutError:
+                # Not in flight, then: the gate recorded them for this
+                # client and could not send them (the client was out of
+                # reach a while). Re-registering this client's callback
+                # has the gate send them again.
+                if self._request_replay is not None and await self._request_replay(job_id):
+                    try:
+                        await _DEFAULT_CLOCK.wait_for(
+                            results_event.wait(),
+                            timeout=self._result_drain_timeout_seconds,
+                        )
+                        drained = True
+                    except asyncio.TimeoutError:
+                        drained = False
+            if not drained:
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Job {job_id[:8]}... completed, but not every workflow "
+                            f"result arrived within {self._result_drain_timeout_seconds}s"
+                        ),
+                        node_host="client",
+                        node_port=0,
+                        node_id="tracker",
+                    )
+                )
+
+        job.missing_workflow_results = sorted(expected_workflow_ids - job.workflow_results.keys())
+        return job
 
     async def _poll_and_update_status(self, job_id: str) -> None:
         if not self._poll_gate_for_status:

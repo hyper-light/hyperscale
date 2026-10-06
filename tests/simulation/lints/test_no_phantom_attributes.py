@@ -84,9 +84,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 PRODUCTION_ROOT = REPO_ROOT / "hyperscale"
 
 # Bases that introduce no instance attributes of their own, so a class
-# inheriting only these is still fully provable.
+# inheriting only these is still fully provable. A ``TypedDict`` body
+# declares dict keys, never attributes, and cannot define methods.
 INERT_BASES: frozenset[str] = frozenset(
-    {"object", "Generic", "Protocol", "ABC", "Struct"}
+    {"object", "Generic", "Protocol", "ABC", "Struct", "TypedDict"}
 )
 
 # Classes whose dynamic ``setattr`` provably binds only PUBLIC names.
@@ -97,7 +98,13 @@ PUBLIC_ONLY_DYNAMIC_BINDERS: frozenset[str] = frozenset(
 
 # The lint's blind spot: classes with a base outside `hyperscale/` or
 # an unenumerable dynamic bind. Asserted so it cannot grow unnoticed.
-MAX_UNPROVABLE_CLASSES = 610
+# Raised from 610 to 616 when qualified external bases stopped resolving
+# by their trailing name: four `asyncio.Transport` subclasses and two
+# others had been "provable" through same-named `hyperscale` classes
+# (the `Transport` protocol among them), which bind nothing of theirs.
+# Raised from 616 to 617 for `DispatchOutcome` (AD-54/AD-44): an `Enum`,
+# whose base is the stdlib's and whose members are class attributes.
+MAX_UNPROVABLE_CLASSES = 617
 
 
 class ClassFacts:
@@ -123,12 +130,18 @@ def _iter_python_files(root: Path) -> Iterator[Path]:
 
 
 def _base_name(node: ast.expr) -> str | None:
-    """The trailing name of a base expression: ``a.b.C`` -> ``C``,
-    ``Generic[T]`` -> ``Generic``."""
+    """The name a base expression resolves by: ``hyperscale.b.C`` -> ``C``,
+    ``Generic[T]`` -> ``Generic``. A base qualified by any other module
+    (``asyncio.Transport``) keeps its qualified name, which no class in
+    ``hyperscale/`` defines -- so it stays external instead of resolving
+    to a ``hyperscale`` class that shares its trailing name."""
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
-        return node.attr
+        qualified_name = ast.unparse(node)
+        if node.attr in INERT_BASES or qualified_name.split(".", maxsplit=1)[0] == "hyperscale":
+            return node.attr
+        return qualified_name
     if isinstance(node, ast.Subscript):
         return _base_name(node.value)
     return None

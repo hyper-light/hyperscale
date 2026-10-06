@@ -52,11 +52,11 @@ DATACENTER = "default"
 BYTES_PER_MEGABYTE = 1024 * 1024
 POLL_INTERVAL_SECONDS = 0.5
 # The manager's gate heartbeat loop sleeps one interval, then sends with
-# a fixed 2.0s timeout (manager/server.py _gate_heartbeat_loop).
-GATE_HEARTBEAT_SEND_TIMEOUT_SECONDS = 2.0
+# the short TCP timeout (manager/server.py _gate_heartbeat_loop).
+_MANAGER_CONFIG = create_manager_config_from_env(LOCALHOST, 1, 2, ENV)
 HEARTBEAT_BOUND_SECONDS = (
-    create_manager_config_from_env(LOCALHOST, 1, 2, ENV).gate_heartbeat_interval_seconds
-    + GATE_HEARTBEAT_SEND_TIMEOUT_SECONDS
+    _MANAGER_CONFIG.heartbeat_interval_seconds
+    + _MANAGER_CONFIG.tcp_timeout_short_seconds
 )
 DRAIN_BOUND_SECONDS = ENV.RESOURCE_VIEW_STALENESS_SECONDS + HEARTBEAT_BOUND_SECONDS
 

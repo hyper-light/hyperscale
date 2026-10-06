@@ -8,9 +8,9 @@ Handles client-facing job operations:
 """
 
 import asyncio
-import cloudpickle
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from hyperscale.distributed.models import JobStatusQuery
 from hyperscale.distributed.models import (
     GateJobLeaderTransfer,
     GateJobReplica,
@@ -22,6 +22,11 @@ from hyperscale.distributed.models import (
     JobProgressAck,
     JobStatus,
     JobSubmission,
+    restricted_loads,
+)
+from hyperscale.distributed.jobs.workflow_dependencies import (
+    resolve_job_deadline_seconds,
+    validate_workflow_dependencies,
 )
 from hyperscale.distributed.leases import JobLeaseManager
 from hyperscale.distributed.protocol.version import (
@@ -95,7 +100,7 @@ class GateJobHandler:
         should_shed_request: Callable[[str], bool],
         has_quorum_available: Callable[[], bool],
         quorum_size: Callable[[], int],
-        select_datacenters_with_fallback: Callable,
+        select_datacenters_with_fallback: Callable[..., Awaitable[tuple[list[str], list[str], str]]],
         get_healthy_gates: Callable[[], list["GateInfo"]],
         broadcast_job_leadership: Callable[
             [str, int, tuple[str, int] | None], Awaitable[None]
@@ -109,6 +114,13 @@ class GateJobHandler:
         clock: Clock,
         replication_coordinator: "GateJobReplicationCoordinator | None" = None,
         get_active_peer_addrs: Callable[[], list[tuple[str, int]]] | None = None,
+        *,
+        default_timeout_multiplier: float,
+        current_raft_members: Callable[[], frozenset[str]],
+        cluster_formed: Callable[[], bool],
+        cluster_read_only: Callable[[], bool],
+        overload_retry_after_seconds: float,
+        replication_retry_after_seconds: float,
     ) -> None:
         """
         Initialize the job handler.
@@ -140,8 +152,29 @@ class GateJobHandler:
             record_request_latency: Callback to record latency
             record_dc_job_stats: Callback to record DC stats
             handle_update_by_tier: Callback for tiered update handling
+            default_timeout_multiplier: A workflow's deadline per unit of
+                its duration, without a timeout of its own (the budget of
+                a job submitted without one)
+            current_raft_members: The gate cluster's live members, this
+                gate among them: an accepted job's Raft group voters
+            cluster_formed: Whether the gate cluster's membership group has
+                formed -- a job's Raft group has no voters before it
+            cluster_read_only: Whether an operator put the gate cluster in
+                read-only mode (AD-52 section 13)
+            overload_retry_after_seconds: When a submission shed for load
+                may retry: the gate's overload sampling interval, the
+                soonest its verdict can change
+            replication_retry_after_seconds: When a submission refused for
+                want of a replication quorum may retry: one peer replication
+                round's budget, the soonest a retry is not the same round
         """
         self._clock: Clock = clock
+        self._default_timeout_multiplier: float = default_timeout_multiplier
+        self._current_raft_members = current_raft_members
+        self._cluster_formed = cluster_formed
+        self._cluster_read_only = cluster_read_only
+        self._overload_retry_after_seconds = overload_retry_after_seconds
+        self._replication_retry_after_seconds = replication_retry_after_seconds
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
         self._task_runner: "TaskRunner" = task_runner
@@ -163,7 +196,7 @@ class GateJobHandler:
         self._should_shed_request: Callable[[str], bool] = should_shed_request
         self._has_quorum_available: Callable[[], bool] = has_quorum_available
         self._quorum_size: Callable[[], int] = quorum_size
-        self._select_datacenters_with_fallback: Callable = (
+        self._select_datacenters_with_fallback: Callable[..., Awaitable[tuple[list[str], list[str], str]]] = (
             select_datacenters_with_fallback
         )
         self._get_healthy_gates: Callable[[], list["GateInfo"]] = get_healthy_gates
@@ -260,7 +293,10 @@ class GateJobHandler:
         await self._job_lease_manager.release(job_id)
 
     async def _renew_job_lease(self, job_id: str, lease_duration: float) -> None:
-        renewal_interval = max(1.0, lease_duration * 0.5)
+        # Renewed while half the lease is left. The one-second floor this
+        # had let a lease under two seconds run thinner between renewals,
+        # and one under a second lapse -- lost while its job still ran.
+        renewal_interval = lease_duration * 0.5
 
         try:
             while True:
@@ -328,12 +364,13 @@ class GateJobHandler:
                     retry_after_seconds=retry_after,
                 ).dump()
 
-            if self._should_shed_request("JobSubmission"):
+            if self._should_shed_request("job_submission"):
                 overload_state = self._load_shedder.get_current_state()
                 return JobAck(
                     job_id="",
                     accepted=False,
                     error=f"System under load ({overload_state.value}), please retry later",
+                    retry_after_seconds=self._overload_retry_after_seconds,
                     protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
@@ -341,8 +378,8 @@ class GateJobHandler:
             submission = JobSubmission.load(data)
 
             client_version = ProtocolVersion(
-                major=getattr(submission, "protocol_version_major", 1),
-                minor=getattr(submission, "protocol_version_minor", 0),
+                major=submission.protocol_version_major,
+                minor=submission.protocol_version_minor,
             )
 
             if client_version.major != CURRENT_PROTOCOL_VERSION.major:
@@ -354,13 +391,63 @@ class GateJobHandler:
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
-            client_caps_str = getattr(submission, "capabilities", "")
+            client_caps_str = submission.capabilities
             client_features = (
                 set(client_caps_str.split(",")) if client_caps_str else set()
             )
             our_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
             negotiated_features = client_features & our_features
             negotiated_caps_str = ",".join(sorted(negotiated_features))
+
+            # A job runs in at least one datacenter, and a job that lists
+            # its datacenters runs in no more than it lists: anything else
+            # cannot be placed as asked (a non-positive count also sliced
+            # the routing order from its end).
+            listed_datacenters = set(submission.datacenters)
+            if submission.datacenter_count < 1 or (
+                listed_datacenters
+                and submission.datacenter_count > len(listed_datacenters)
+            ):
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=(
+                        f"Unplaceable job: datacenter_count={submission.datacenter_count} "
+                        f"with datacenters={sorted(listed_datacenters)} -- a job runs in "
+                        "at least one datacenter and in no more than it lists"
+                    ),
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    capabilities=negotiated_caps_str,
+                ).dump()
+
+            # The workflows, read as a manager reads them -- through the
+            # restricted unpickler, not one that runs whatever a payload
+            # names -- and refused here, with the reason, when no manager
+            # could run them: in dependency order or at all. A job's
+            # workflow ids are how this gate tracks its results.
+            try:
+                workflows = restricted_loads(submission.workflows)
+                validate_workflow_dependencies(workflows)
+            except Exception as workflow_error:
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=f"Invalid workflows: {type(workflow_error).__name__}: {workflow_error}",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    capabilities=negotiated_caps_str,
+                ).dump()
+            workflow_ids = {workflow_id for workflow_id, _, _ in workflows}
+            # A job submitted without a timeout of its own has as long as
+            # its longest chain of dependent workflows may take: the
+            # budget every gate times it by (it travels in the replica),
+            # and the one its managers are given.
+            if submission.timeout_seconds <= 0.0:
+                submission.timeout_seconds = resolve_job_deadline_seconds(
+                    workflows,
+                    self._default_timeout_multiplier,
+                )
 
             if submission.idempotency_key and self._idempotency_cache is not None:
                 idempotency_key = IdempotencyKey.parse(submission.idempotency_key)
@@ -389,15 +476,45 @@ class GateJobHandler:
                         IdempotencyStatus.COMMITTED,
                         IdempotencyStatus.REJECTED,
                     ):
+                        # AD-40: the original decision, for the original
+                        # job, marked as a duplicate's answer.
                         if entry.result is not None:
-                            return entry.result
+                            original_ack = JobAck.load(entry.result)
+                            original_ack.was_duplicate = True
+                            original_ack.original_job_id = original_ack.job_id
+                            return original_ack.dump()
+                        original_job_id = entry.job_id or submission.job_id
                         return JobAck(
-                            job_id=submission.job_id,
+                            job_id=original_job_id,
                             accepted=entry.status == IdempotencyStatus.COMMITTED,
                             error="Duplicate request"
                             if entry.status == IdempotencyStatus.REJECTED
                             else None,
+                            was_duplicate=True,
+                            original_job_id=original_job_id,
                         ).dump()
+
+            # AD-52: a job's Raft group is founded with the gate cluster's
+            # committed members -- there are none until the cluster forms.
+            if not self._cluster_formed():
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="Gate cluster membership not formed yet; retry",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    capabilities=negotiated_caps_str,
+                ).dump()
+
+            if self._cluster_read_only():
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="Gate cluster is read-only: job submissions are refused",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    capabilities=negotiated_caps_str,
+                ).dump()
 
             lease_result = await self._job_lease_manager.acquire(submission.job_id)
             if not lease_result.success:
@@ -449,7 +566,7 @@ class GateJobHandler:
                 )
 
             primary_dcs, fallback_dcs, worst_health = (
-                self._select_datacenters_with_fallback(
+                await self._select_datacenters_with_fallback(
                     submission.datacenter_count,
                     submission.datacenters if submission.datacenters else None,
                     job_id=submission.job_id,
@@ -458,8 +575,7 @@ class GateJobHandler:
 
             if worst_health == "initializing":
                 await self._release_job_lease(submission.job_id)
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerInfo(
                         message=f"Job {submission.job_id}: Datacenters still initializing - client should retry",
                         node_host=self._get_host(),
@@ -483,27 +599,10 @@ class GateJobHandler:
                     error="No available datacenters - all unhealthy",
                 ).dump()
 
-            workflow_ids: set[str] = set()
-            try:
-                workflows: list[tuple[str, list[str], object]] = cloudpickle.loads(
-                    submission.workflows
-                )
-                workflow_ids = {wf_id for wf_id, _, _ in workflows}
-            except Exception as workflow_parse_error:
-                self._task_runner.run(
-                    self._logger.log,
-                    ServerError(
-                        message=f"Failed to parse workflows for job {submission.job_id}: {workflow_parse_error}",
-                        node_host=self._get_host(),
-                        node_port=self._get_tcp_port(),
-                        node_id=self._get_node_id().short,
-                    ),
-                )
-
             # Build the takeover capsule. ``submission_payload`` carries
-            # the raw serialized submission so peer gates that
-            # eventually take over leadership can dispatch the job
-            # without re-fetching from the client.
+            # the serialized submission so peer gates that eventually
+            # take over leadership can dispatch the job without
+            # re-fetching from the client.
             origin_addr = (self._get_host(), self._get_tcp_port())
             replica_callback = (
                 tuple(submission.callback_addr)
@@ -521,9 +620,14 @@ class GateJobHandler:
                 target_dcs=list(target_dcs),
                 target_dc_count=len(target_dcs),
                 status_seed=JobStatus.SUBMITTED.value,
-                submitted_at=self._clock.monotonic(),
+                submitted_wall_time=self._clock.time(),
+                # The job's Raft group voters: the gates live now, the same
+                # on every gate that joins the group (AD-52).
+                raft_voters=sorted(self._current_raft_members()),
                 workflow_ids=list(workflow_ids),
-                submission_payload=data,
+                # The submission as admitted -- its budget filled in.
+                submission_payload=submission.dump(),
+                idempotency_key=submission.idempotency_key or "",
             )
 
             # AD-31 takeover invariant: JobAck(accepted=True) must not
@@ -555,7 +659,7 @@ class GateJobHandler:
                     job_id=submission.job_id,
                     accepted=False,
                     error="gate_replication_quorum_unavailable",
-                    retry_after_seconds=2.0,
+                    retry_after_seconds=self._replication_retry_after_seconds,
                     protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                     capabilities=negotiated_caps_str,
@@ -648,18 +752,20 @@ class GateJobHandler:
         self,
         addr: tuple[str, int],
         data: bytes,
-        gather_job_status: Callable[[str], Awaitable[GlobalJobStatus]],
+        answer_status_query: Callable[[JobStatusQuery], Awaitable[bytes]],
     ) -> bytes:
         """
         Handle job status request from client.
 
         Args:
             addr: Client address
-            data: Job ID as bytes
-            gather_job_status: Callback to gather job status
+            data: A ``JobStatusQuery``, or a bare job id (an EVENTUAL read,
+                as older clients send)
+            answer_status_query: Answers a query at its consistency level
 
         Returns:
-            Serialized GlobalJobStatus or empty bytes
+            Serialized GlobalJobStatus, or empty bytes when this gate has no
+            answer at the level asked (the client asks elsewhere)
         """
         start_time = self._clock.monotonic()
         try:
@@ -671,12 +777,14 @@ class GateJobHandler:
                     retry_after_seconds=retry_after,
                 ).dump()
 
-            if self._should_shed_request("JobStatusRequest"):
+            if self._should_shed_request("job_status"):
                 return b""
 
-            job_id = data.decode()
-            status = await gather_job_status(job_id)
-            return status.dump()
+            # A pickled query begins with the pickle protocol marker; a bare
+            # job id is text.
+            return await answer_status_query(
+                JobStatusQuery.load(data) if data[:1] == b"\x80" else JobStatusQuery(job_id=data.decode())
+            )
 
         except Exception as error:
             await self._logger.log(
@@ -751,6 +859,28 @@ class GateJobHandler:
                         healthy_gates=self._get_healthy_gates(),
                     ).dump()
 
+            target_dcs = self._job_manager.get_target_dcs(progress.job_id)
+            if job is not None and target_dcs and progress.datacenter not in target_dcs:
+                # A datacenter the job moved off -- lost and replaced, or
+                # released at dispatch: its work counts as it stood when it
+                # was lost (AD-36), and it was told to stop.
+                await self._logger.log(
+                    ServerDebug(
+                        message=(
+                            f"Dropped progress of job {progress.job_id} from DC "
+                            f"{progress.datacenter}: the job runs in {sorted(target_dcs)}"
+                        ),
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=self._get_node_id().short,
+                    ),
+                )
+                return JobProgressAck(
+                    gate_id=self._get_node_id().full,
+                    is_leader=self._is_leader(),
+                    healthy_gates=self._get_healthy_gates(),
+                ).dump()
+
             accepted, reason = await self._state.check_and_record_progress(
                 job_id=progress.job_id,
                 datacenter_id=progress.datacenter,
@@ -758,8 +888,7 @@ class GateJobHandler:
                 timestamp=progress.timestamp,
             )
             if not accepted:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerDebug(
                         message=f"Rejecting job progress for {progress.job_id} from {progress.datacenter}: "
                         f"reason={reason}, progress_sequence={progress.progress_sequence}",
@@ -794,7 +923,6 @@ class GateJobHandler:
                 job.total_completed = sum(p.total_completed for p in job.datacenters)
                 job.total_failed = sum(p.total_failed for p in job.datacenters)
                 job.overall_rate = sum(p.overall_rate for p in job.datacenters)
-                job.timestamp = self._clock.monotonic()
 
                 target_dcs = self._job_manager.get_target_dcs(progress.job_id)
                 target_dc_count = (
@@ -840,8 +968,7 @@ class GateJobHandler:
                     and target_dcs
                 ):
                     missing_dcs = target_dcs - reported_dc_ids
-                    self._task_runner.run(
-                        self._logger.log,
+                    await self._logger.log(
                         ServerWarning(
                             message=(
                                 f"Job {progress.job_id[:8]}... has {len(missing_dcs)} "
@@ -940,8 +1067,7 @@ class GateJobHandler:
                 transfer.job_id
             )
             if transfer.fence_token <= current_fence:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerDebug(
                         message=(
                             f"Rejecting stale gate transfer for job {transfer.job_id[:8]}... "
@@ -964,8 +1090,7 @@ class GateJobHandler:
             )
             if not fence_updated:
                 job_fence = self._job_manager.get_fence_token(transfer.job_id)
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerDebug(
                         message=(
                             f"Rejecting gate transfer for job {transfer.job_id[:8]}... "
@@ -999,8 +1124,7 @@ class GateJobHandler:
 
             await self._state.increment_state_version()
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=(
                         f"Job {transfer.job_id[:8]}... leader gate transferred: "
@@ -1026,12 +1150,15 @@ class GateJobHandler:
                     old_gate_addr=transfer.old_gate_addr,
                 )
                 try:
-                    await self._send_tcp(
+                    response, _ = await self._send_tcp(
                         callback_addr,
                         "receive_gate_job_leader_transfer",
                         notification.dump(),
                         timeout=self._client_push_timeout_seconds,
                     )
+                    # send_tcp returns transport errors rather than raising.
+                    if isinstance(response, Exception):
+                        raise response
                 except Exception as error:
                     await self._logger.log(
                         ServerWarning(

@@ -52,7 +52,7 @@ _MUST_STAY_CLEAN = frozenset(
     {
         "hyperscale/distributed/ledger/wal/wal_writer.py",
         "hyperscale/distributed/ledger/wal/node_wal.py",
-        "hyperscale/distributed/raft/raft_wal.py",
+        "hyperscale/distributed/raft/store/raft_store.py",
         "hyperscale/distributed/idempotency/manager_ledger.py",
         "hyperscale/distributed/swim/detection/incarnation_store.py",
         "hyperscale/distributed/ledger/checkpoint/checkpoint.py",

@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
 git config --global --add safe.directory /workspace
-if [[ ! -d /workspace/.venv ]]; then
-    uv venv
-fi
 
-pip uninstall --root-user-action=ignore -y playwright
+# The project environment exactly as uv.lock pins it: every optional
+# client and reporter, plus the dev group (pytest and the lint tools).
+uv sync --all-extras --dev
 
-. /workspace/.venv/bin/activate && \
-uv pip install -r requirements.txt && \
-playwright install --with-deps && \
-uv pip install -e .
+uv run playwright install --with-deps

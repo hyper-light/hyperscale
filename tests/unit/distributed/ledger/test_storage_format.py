@@ -229,7 +229,9 @@ async def test_unrecognized_newest_checkpoint_is_set_aside_for_an_older_valid_on
     manager = CheckpointManager(CHECKPOINT_DIR, filesystem=filesystem)
     await manager.initialize()
     await manager.save(_checkpoint(created_at_ms=1000))
-    foreign_path = CHECKPOINT_DIR / "checkpoint_9999.bin"
+    # Named as the newest: a later creation time and a higher LSN than
+    # the valid checkpoint's (names carry both, recency orders by them).
+    foreign_path = CHECKPOINT_DIR / "checkpoint_9999_2.bin"
     await _plant(filesystem, foreign_path, FOREIGN_BYTES)
     logger = RecordingLogger()
 

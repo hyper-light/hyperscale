@@ -3,21 +3,20 @@ Latency Tracker for peer gate healthcheck measurements.
 
 Tracks round-trip latency samples to detect network degradation
 within the gate cluster.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .latency_config import LatencyConfig
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-@dataclass(slots=True)
-class LatencyConfig:
-    """Configuration for latency tracking."""
-    sample_max_age: float = 60.0  # Max age of samples in seconds
-    sample_max_count: int = 100   # Max samples to keep per peer
 
 
 class LatencyTracker:
@@ -141,3 +140,10 @@ class LatencyTracker:
         """
         samples = self._samples.get(peer_id)
         return len(samples) if samples else 0
+
+_REHOMED = (
+    LatencyConfig,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -185,8 +185,6 @@ class JoinHandler(BaseHandler):
                 source=source_addr,
             )
 
-            await self._server.write_context(target, b"OK")
-
             self._queue_join_propagation(
                 target, role, target_addr_bytes, sent_incarnation
             )
@@ -291,7 +289,7 @@ class JoinHandler(BaseHandler):
         # Parse target address
         parsed_target: tuple[str, int] | None = None
         try:
-            host, port_str = addr_part.decode().split(":", maxsplit=1)
+            host, port_str = addr_part.decode().rsplit(":", maxsplit=1)
             parsed_target = (host, int(port_str))
         except (ValueError, UnicodeDecodeError):
             pass

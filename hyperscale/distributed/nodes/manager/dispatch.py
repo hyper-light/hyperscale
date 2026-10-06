@@ -6,9 +6,11 @@ retry); this coordinator owns the send and what its outcome means for
 the worker's routing state.
 """
 
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Callable
 
+from hyperscale.distributed.jobs.dispatch_outcome import DispatchOutcome
 from hyperscale.distributed.models import WorkflowDispatch, WorkflowDispatchAck
+from hyperscale.distributed.runtime import Clock, SendTcp
 from hyperscale.logging.hyperscale_logging_models import ServerError, ServerWarning
 
 if TYPE_CHECKING:
@@ -16,8 +18,6 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
     from hyperscale.distributed.nodes.manager.stats import ManagerStatsCoordinator
     from hyperscale.logging import Logger
-
-SendTcp = Callable[..., Awaitable[tuple[Any, Any]]]
 
 # Worker rejections meaning "not ready for more work right now": they cool
 # the worker's routing down instead of counting as a delivered dispatch.
@@ -36,7 +36,13 @@ class ManagerDispatchCoordinator:
     """Sends workflow dispatches to workers (the WorkflowDispatcher's
     ``send_dispatch``) and records each outcome on the worker pool without
     touching SWIM health: success, a readiness rejection (routing cools
-    down), or a transport failure."""
+    down), or a transport failure.
+
+    Every dispatch's round trip to its worker's answer is the datacenter's
+    AD-42 latency sample (dispatch -> response). A dispatch the worker
+    never answered counts at the timeout it waited, the least its latency
+    was: dropping it would report a DC whose workers stop answering as
+    fast."""
 
     def __init__(
         self,
@@ -49,6 +55,8 @@ class ManagerDispatchCoordinator:
         node_port: int,
         node_id: str,
         dispatch_timeout_seconds: float,
+        clock: Clock,
+        record_dispatch_latency: Callable[[float, float], None],
     ) -> None:
         self._registry = registry
         self._worker_pool = worker_pool
@@ -59,9 +67,14 @@ class ManagerDispatchCoordinator:
         self._node_port = node_port
         self._node_id = node_id
         self._dispatch_timeout_seconds = dispatch_timeout_seconds
+        self._clock = clock
+        self._record_dispatch_latency = record_dispatch_latency
 
-    async def send_workflow_dispatch(self, worker_id: str, dispatch: WorkflowDispatch) -> bool:
-        """Send ``dispatch`` to ``worker_id``; True when the worker accepted.
+    async def send_workflow_dispatch(
+        self, worker_id: str, dispatch: WorkflowDispatch
+    ) -> tuple[DispatchOutcome, str]:
+        """Send ``dispatch`` to ``worker_id``: how the worker answered, and
+        the answer's detail (the worker's error, or the transport's).
 
         A worker the registry does not know is a stale pool entry (the
         registry is the registration truth): it is purged so the
@@ -70,9 +83,10 @@ class ManagerDispatchCoordinator:
         registration = self._registry.get_worker(worker_id)
         if registration is None:
             await self._purge_stale_worker(worker_id)
-            return False
+            return DispatchOutcome.UNROUTABLE, f"worker {worker_id} is no longer registered"
         if dispatch.job_leader_addr is None:
             dispatch.job_leader_addr = (self._node_host, self._node_port)
+        dispatched_at = self._clock.monotonic()
         try:
             response, _clock = await self._send_tcp(
                 (registration.node.host, registration.node.port),
@@ -90,25 +104,47 @@ class ManagerDispatchCoordinator:
                     node_id=self._node_id,
                 )
             )
-            return False
+            return DispatchOutcome.UNREACHABLE, f"{type(error).__name__}: {error}"
 
-        if not response or isinstance(response, Exception):
+        answered_at = self._clock.monotonic()
+        if isinstance(response, bytes) and response:
+            self._record_dispatch_latency((answered_at - dispatched_at) * 1000.0, answered_at)
+        elif isinstance(response, TimeoutError):
+            self._record_dispatch_latency(self._dispatch_timeout_seconds * 1000.0, answered_at)
+
+        # send_tcp returns transport errors rather than raising: the same
+        # failure, cause and log as one it raised.
+        if isinstance(response, Exception):
+            await self._record_transport_failure(worker_id, str(response))
+            await self._logger.log(
+                ServerError(
+                    message=f"Workflow dispatch error: {response}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                )
+            )
+            return DispatchOutcome.UNREACHABLE, f"{type(response).__name__}: {response}"
+        if not response:
             await self._record_transport_failure(worker_id, "workflow dispatch returned no response")
-            return False
+            return DispatchOutcome.UNREACHABLE, "workflow dispatch returned no response"
         return await self._record_answer(worker_id, WorkflowDispatchAck.load(response))
 
-    async def _record_answer(self, worker_id: str, ack: WorkflowDispatchAck) -> bool:
+    async def _record_answer(
+        self, worker_id: str, ack: WorkflowDispatchAck
+    ) -> tuple[DispatchOutcome, str]:
         if bool(getattr(ack, "accepted", True)):
+            await self._worker_pool.record_dispatch_taken(worker_id, ack.workflow_id, ack.cores_version)
             await self._record_success(worker_id)
             await self._stats.record_dispatch()
-            return True
-        error = getattr(ack, "error", None)
+            return DispatchOutcome.ACCEPTED, ""
+        error = getattr(ack, "error", None) or "workflow dispatch rejected"
         if self.is_readiness_rejection(error):
-            if self._worker_pool.record_dispatch_readiness_rejection(worker_id, error or "workflow dispatch rejected"):
+            if self._worker_pool.record_dispatch_readiness_rejection(worker_id, error):
                 await self._worker_pool.notify_cores_available()
-        else:
-            await self._record_success(worker_id)
-        return False
+            return DispatchOutcome.NOT_READY, error
+        await self._record_success(worker_id)
+        return DispatchOutcome.REJECTED, error
 
     @staticmethod
     def is_readiness_rejection(error: str | None) -> bool:

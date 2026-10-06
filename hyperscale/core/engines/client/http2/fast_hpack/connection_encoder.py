@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Deque, Dict, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 from .huffman import HuffmanEncoder
 from .table import HeaderTable
@@ -54,6 +54,12 @@ class ConnectionEncoder:
 
     A dynamic index only means something to the peer that received the entry,
     so each connection needs its own encoder, discarded with the connection.
+
+    The block for a header list that changed nothing in the table is kept: a
+    block is a function of the headers, the table and any pending size
+    update, so while the table is untouched (``_table_version``, bumped by
+    every change) and no update is pending, the same headers -- each request
+    of a load test -- encode to that block without being encoded again.
     """
 
     __slots__ = (
@@ -65,6 +71,10 @@ class ConnectionEncoder:
         "_insertion_by_header",
         "_insertion_by_name",
         "_smallest_pending_size",
+        "_table_version",
+        "_memo_headers",
+        "_memo_block",
+        "_memo_version",
     )
 
     def __init__(self) -> None:
@@ -82,6 +92,11 @@ class ConnectionEncoder:
         # size change waits to be signaled (RFC 7541 4.2).
         self._smallest_pending_size: Optional[int] = None
 
+        self._table_version = 0
+        self._memo_headers: Optional[List[Tuple[bytes, ...]]] = None
+        self._memo_block = b""
+        self._memo_version = -1
+
     @property
     def header_table_size(self) -> int:
         return self._maximum_size
@@ -91,6 +106,7 @@ class ConnectionEncoder:
         if new_size == self._maximum_size and self._smallest_pending_size is None:
             return
 
+        self._table_version += 1
         self._maximum_size = new_size
         if self._smallest_pending_size is None or new_size < self._smallest_pending_size:
             self._smallest_pending_size = new_size
@@ -103,9 +119,22 @@ class ConnectionEncoder:
         ``(name, value, sensitive)`` -- into a header block, updating the
         dynamic table as the peer's decoder will.
         """
+        table_version = self._table_version
+
+        if self._smallest_pending_size is None:
+            if table_version == self._memo_version and headers == self._memo_headers:
+                return self._memo_block
+
+            remember = True
+
+        else:
+            # A block that signals a size update is not the one the same
+            # headers need next time.
+            remember = False
+
         header_block = bytearray()
 
-        if self._smallest_pending_size is not None:
+        if not remember:
             self._encode_size_updates(header_block)
 
         for header in headers:
@@ -127,7 +156,16 @@ class ConnectionEncoder:
 
             self._encode_literal_with_indexing(header_block, name, value, static_entry)
 
-        return bytes(header_block)
+        block = bytes(header_block)
+
+        if remember and self._table_version == table_version:
+            # Nothing in the table changed, so these headers encode to this
+            # block until something does. A copy: the caller may reuse its list.
+            self._memo_headers = list(headers)
+            self._memo_block = block
+            self._memo_version = table_version
+
+        return block
 
     def _encode_literal_with_indexing(
         self,
@@ -186,6 +224,7 @@ class ConnectionEncoder:
         return STATIC_LENGTH + 1 + self._newest_insertion - insertion
 
     def _add(self, name: bytes, value: bytes) -> None:
+        self._table_version += 1
         size = ENTRY_OVERHEAD + len(name) + len(value)
 
         # RFC 7541 4.4: an entry larger than the table empties it.

@@ -355,10 +355,12 @@ def _build_chaos_workflow(
     the job index baked into the CLASS NAME (``SimChaosJob3Workflow``)
     so worker-side name-keyed execution milestones attribute every
     attempt to its job. ACTION sleeps, not TEST duration governance —
-    the committed SIM constraint (``WorkflowRunner._generate``
-    busy-waits frozen virtual time; ``l2_workload_demo`` documents the
-    probe). The class ``duration`` matches the summed sleeps so
-    worker-side bookkeeping windows agree."""
+    the SIM constraint probed under the old ``WorkflowRunner._generate``
+    (it busy-waited frozen virtual time; ``l2_workload_demo`` documents
+    the probe). Its successor ``_run_long_lived_vu`` anchors frozen
+    clocks with a timed sleep, not yet re-probed under SIM. The class
+    ``duration`` matches the summed sleeps so worker-side bookkeeping
+    windows agree."""
     step_sleep_seconds = workflow_duration_seconds / 2.0
 
     class SimChaosWorkflow(Workflow):

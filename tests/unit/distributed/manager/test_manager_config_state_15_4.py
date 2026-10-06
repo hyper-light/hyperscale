@@ -24,6 +24,8 @@ from hyperscale.distributed.nodes.manager.config import (
     create_manager_config_from_env,
 )
 from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.slo import SLOConfig
 from hyperscale.distributed.models import ManagerState as ManagerStateEnum
 
 
@@ -66,7 +68,6 @@ class TestManagerConfigHappyPath:
         assert config.quorum_timeout_seconds == 5.0
 
         # Workflow
-        assert config.max_workflow_retries == 3
         assert config.workflow_timeout_seconds == 300.0
 
         # Dead node reaping
@@ -89,7 +90,6 @@ class TestManagerConfigHappyPath:
             seed_gates=[("gate-1.example.com", 6000)],
             seed_managers=[("manager-2.example.com", 7000)],
             quorum_timeout_seconds=10.0,
-            max_workflow_retries=5,
             workflow_timeout_seconds=600.0,
             cluster_id="my-cluster",
             environment_id="production",
@@ -100,7 +100,6 @@ class TestManagerConfigHappyPath:
         assert config.seed_gates == [("gate-1.example.com", 6000)]
         assert config.seed_managers == [("manager-2.example.com", 7000)]
         assert config.quorum_timeout_seconds == 10.0
-        assert config.max_workflow_retries == 5
         assert config.workflow_timeout_seconds == 600.0
         assert config.cluster_id == "my-cluster"
         assert config.environment_id == "production"
@@ -156,12 +155,10 @@ class TestManagerConfigEdgeCases:
             host="127.0.0.1",
             tcp_port=8000,
             udp_port=8001,
-            max_workflow_retries=1_000_000,
             workflow_timeout_seconds=86400.0 * 365,  # One year
             stats_hot_max_entries=10_000_000,
         )
 
-        assert config.max_workflow_retries == 1_000_000
         assert config.stats_hot_max_entries == 10_000_000
 
     def test_ipv6_host(self):
@@ -354,7 +351,7 @@ class TestManagerStateHappyPath:
 
     def test_initialization(self):
         """ManagerState initializes with empty containers."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         # Gate tracking
         assert state._known_gates == {}
@@ -384,7 +381,7 @@ class TestManagerStateHappyPath:
 
     def test_initialize_locks(self):
         """initialize_locks creates asyncio locks."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         assert state._core_allocation_lock is None
         assert state._eager_dispatch_lock is None
@@ -401,7 +398,7 @@ class TestManagerStateLockManagement:
     @pytest.mark.asyncio
     async def test_get_peer_state_lock_creates_new(self):
         """get_peer_state_lock creates lock for new peer."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         peer_addr = ("10.0.0.1", 8000)
 
         lock = await state.get_peer_state_lock(peer_addr)
@@ -412,7 +409,7 @@ class TestManagerStateLockManagement:
     @pytest.mark.asyncio
     async def test_get_peer_state_lock_returns_existing(self):
         """get_peer_state_lock returns existing lock."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         peer_addr = ("10.0.0.1", 8000)
 
         lock1 = await state.get_peer_state_lock(peer_addr)
@@ -423,7 +420,7 @@ class TestManagerStateLockManagement:
     @pytest.mark.asyncio
     async def test_get_gate_state_lock_creates_new(self):
         """get_gate_state_lock creates lock for new gate."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         gate_id = "gate-123"
 
         lock = await state.get_gate_state_lock(gate_id)
@@ -431,22 +428,11 @@ class TestManagerStateLockManagement:
         assert isinstance(lock, asyncio.Lock)
         assert gate_id in state._gate_state_locks
 
-    @pytest.mark.asyncio
-    async def test_get_workflow_cancellation_lock(self):
-        """get_workflow_cancellation_lock creates/returns lock."""
-        state = ManagerState()
-        workflow_id = "workflow-123"
-
-        lock1 = await state.get_workflow_cancellation_lock(workflow_id)
-        lock2 = await state.get_workflow_cancellation_lock(workflow_id)
-
-        assert isinstance(lock1, asyncio.Lock)
-        assert lock1 is lock2
 
     @pytest.mark.asyncio
     async def test_get_dispatch_semaphore(self):
         """get_dispatch_semaphore creates/returns semaphore."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         worker_id = "worker-123"
 
         sem1 = await state.get_dispatch_semaphore(worker_id, max_concurrent=5)
@@ -462,7 +448,7 @@ class TestManagerStateVersioning:
     @pytest.mark.asyncio
     async def test_increment_fence_token(self):
         """increment_fence_token increments and returns value."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         assert state._fence_token == 0
 
@@ -477,7 +463,7 @@ class TestManagerStateVersioning:
     @pytest.mark.asyncio
     async def test_increment_state_version(self):
         """increment_state_version increments and returns value."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         assert state._state_version == 0
 
@@ -488,21 +474,11 @@ class TestManagerStateVersioning:
     @pytest.mark.asyncio
     async def test_increment_external_incarnation(self):
         """increment_external_incarnation increments and returns value."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         assert state._external_incarnation == 0
 
         result = await state.increment_external_incarnation()
-        assert result == 1
-
-    @pytest.mark.asyncio
-    async def test_increment_context_lamport_clock(self):
-        """increment_context_lamport_clock increments and returns value."""
-        state = ManagerState()
-
-        assert state._context_lamport_clock == 0
-
-        result = await state.increment_context_lamport_clock()
         assert result == 1
 
 
@@ -511,7 +487,7 @@ class TestManagerStatePeerManagement:
 
     def test_get_active_peer_count(self):
         """get_active_peer_count returns correct count."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         assert state.get_active_peer_count() == 1
 
@@ -523,7 +499,7 @@ class TestManagerStatePeerManagement:
     @pytest.mark.asyncio
     async def test_is_peer_active(self):
         """is_peer_active checks peer status."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         peer_addr = ("10.0.0.1", 8000)
 
         assert await state.is_peer_active(peer_addr) is False
@@ -535,7 +511,7 @@ class TestManagerStatePeerManagement:
     @pytest.mark.asyncio
     async def test_add_active_peer(self):
         """add_active_peer adds to both sets."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         peer_addr = ("10.0.0.1", 8000)
         node_id = "manager-123"
 
@@ -547,7 +523,7 @@ class TestManagerStatePeerManagement:
     @pytest.mark.asyncio
     async def test_remove_active_peer(self):
         """remove_active_peer removes from both sets."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         peer_addr = ("10.0.0.1", 8000)
         node_id = "manager-123"
 
@@ -565,25 +541,21 @@ class TestManagerStateCancellationCleanup:
 
     def test_clear_cancellation_state(self):
         """clear_cancellation_state removes all cancellation tracking."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         job_id = "job-123"
 
         # Set up cancellation state
         state._cancellation_pending_workflows[job_id] = {"wf-1", "wf-2"}
         state._cancellation_errors[job_id] = ["error1"]
-        state._cancellation_completion_events[job_id] = asyncio.Event()
-        state._cancellation_initiated_at[job_id] = time.monotonic()
 
         state.clear_cancellation_state(job_id)
 
         assert job_id not in state._cancellation_pending_workflows
         assert job_id not in state._cancellation_errors
-        assert job_id not in state._cancellation_completion_events
-        assert job_id not in state._cancellation_initiated_at
 
     def test_clear_cancellation_state_nonexistent_job(self):
         """clear_cancellation_state handles nonexistent job gracefully."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         # Should not raise
         state.clear_cancellation_state("nonexistent-job")
@@ -594,14 +566,13 @@ class TestManagerStateJobCleanup:
 
     def test_clear_job_state(self):
         """clear_job_state removes all job-related state."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         job_id = "job-cleanup"
 
         # Set up job state
         state._job_leaders[job_id] = "manager-1"
         state._job_leader_addrs[job_id] = ("10.0.0.1", 8000)
         state._job_fencing_tokens[job_id] = 5
-        state._job_layer_version[job_id] = 3
         state._job_callbacks[job_id] = ("10.0.0.2", 9000)
         state._job_submissions[job_id] = MagicMock()
         state._cancellation_pending_workflows[job_id] = {"wf-1"}
@@ -611,7 +582,6 @@ class TestManagerStateJobCleanup:
         assert job_id not in state._job_leaders
         assert job_id not in state._job_leader_addrs
         assert job_id not in state._job_fencing_tokens
-        assert job_id not in state._job_layer_version
         assert job_id not in state._job_callbacks
         assert job_id not in state._job_submissions
         assert job_id not in state._cancellation_pending_workflows
@@ -622,7 +592,7 @@ class TestManagerStateMetrics:
 
     def test_get_quorum_metrics(self):
         """get_quorum_metrics returns correct metrics."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         state._active_manager_peers.add(("10.0.0.1", 8000))
         state._active_manager_peers.add(("10.0.0.2", 8000))
@@ -630,18 +600,16 @@ class TestManagerStateMetrics:
         state._known_manager_peers["m2"] = MagicMock()
         state._known_manager_peers["m3"] = MagicMock()
         state._dead_managers.add(("10.0.0.3", 8000))
-        state._pending_provisions["wf-1"] = MagicMock()
 
         metrics = state.get_quorum_metrics()
 
         assert metrics["active_peer_count"] == 2
         assert metrics["known_peer_count"] == 3
         assert metrics["dead_manager_count"] == 1
-        assert metrics["pending_provision_count"] == 1
 
     def test_get_worker_metrics(self):
         """get_worker_metrics returns correct metrics."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         state._workers["w1"] = MagicMock()
         state._workers["w2"] = MagicMock()
@@ -657,7 +625,7 @@ class TestManagerStateMetrics:
 
     def test_get_gate_metrics(self):
         """get_gate_metrics returns correct metrics."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         state._known_gates["g1"] = MagicMock()
         state._known_gates["g2"] = MagicMock()
@@ -674,13 +642,13 @@ class TestManagerStateMetrics:
 
     def test_get_job_metrics(self):
         """get_job_metrics returns correct metrics."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         state._job_leaders["j1"] = "m1"
         state._job_leaders["j2"] = "m2"
         state._job_callbacks["j1"] = ("10.0.0.1", 9000)
         state._job_submissions["j1"] = MagicMock()
-        state._cancelled_workflows["wf-1"] = MagicMock()
+        state.set_cancelled_workflow("j1", "wf-1", MagicMock())
         state._cancellation_pending_workflows["j1"] = {"wf-2"}
 
         metrics = state.get_job_metrics()
@@ -698,7 +666,7 @@ class TestManagerStateConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_lock_access(self):
         """Multiple coroutines can safely access different locks."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         results = []
 
@@ -726,7 +694,7 @@ class TestManagerStateConcurrency:
     @pytest.mark.asyncio
     async def test_same_lock_serializes_access(self):
         """Same lock serializes access."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         peer_addr = ("10.0.0.1", 8000)
 
         execution_order = []
@@ -752,7 +720,7 @@ class TestManagerStateConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_increment_operations(self):
         """Increment operations are not atomic but work correctly."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         async def increment_many():
             for _ in range(100):
@@ -773,7 +741,7 @@ class TestManagerStateEdgeCases:
 
     def test_empty_metrics(self):
         """Metrics work with empty state."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         quorum = state.get_quorum_metrics()
         worker = state.get_worker_metrics()
@@ -787,7 +755,7 @@ class TestManagerStateEdgeCases:
 
     def test_multiple_clear_job_state_calls(self):
         """Multiple clear_job_state calls are safe."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
         job_id = "job-multi-clear"
 
         state._job_leaders[job_id] = "m1"
@@ -800,13 +768,13 @@ class TestManagerStateEdgeCases:
 
     def test_versioned_clock_initialized(self):
         """VersionedStateClock is initialized."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         assert state._versioned_clock is not None
 
     def test_throughput_tracking_initialized(self):
         """Throughput tracking fields are initialized."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         assert state._dispatch_throughput_count == 0
         assert state._dispatch_throughput_interval_start == 0.0
@@ -815,7 +783,7 @@ class TestManagerStateEdgeCases:
     @pytest.mark.asyncio
     async def test_latency_tracking_initialized(self):
         """Latency tracking fields are initialized."""
-        state = ManagerState()
+        state = ManagerState(slo_config=SLOConfig.from_env(Env()))
 
         assert len(state._gate_latency_samples) == 0
         assert state._peer_manager_latency_samples == {}

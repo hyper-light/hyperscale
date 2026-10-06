@@ -34,7 +34,6 @@ from hyperscale.distributed.jobs import (
     WorkerInfo as WorkerInfo,
     WorkerHealth as WorkerHealth,
     WorkflowDispatcher as WorkflowDispatcher,
-    WorkflowStateMachine as WorkflowStateMachine,
     CoreAllocator as CoreAllocator,
     AllocationResult as AllocationResult,
 )

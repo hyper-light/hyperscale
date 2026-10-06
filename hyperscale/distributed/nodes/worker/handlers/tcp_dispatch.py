@@ -22,7 +22,7 @@ class WorkflowDispatchHandler:
     Handler for workflow dispatch requests from managers.
 
     Validates fence tokens, allocates cores, and starts workflow execution.
-    Preserves AD-33 (Workflow State Machine) compliance.
+    Preserves AD-54 (Workflow State Machine) compliance.
     """
 
     def __init__(self, server: "WorkerServer") -> None:

@@ -37,8 +37,8 @@ class ManagerConfig:
     # Quorum settings
     quorum_timeout_seconds: float = 5.0
 
-    # Workflow execution settings
-    max_workflow_retries: int = 3
+    # Workflow execution settings (a workflow's retries are bounded by its
+    # job's AD-44 retry budget)
     workflow_timeout_seconds: float = 300.0
 
     # Dead node reaping intervals (from env)
@@ -95,10 +95,6 @@ class ManagerConfig:
     dead_node_check_interval_seconds: float = 10.0
     rate_limit_cleanup_interval_seconds: float = 300.0
 
-    # Rate limiting settings (AD-24, from env)
-    rate_limit_default_max_requests: int = 100
-    rate_limit_default_window_seconds: float = 10.0
-
     # TCP timeout settings (from env)
     tcp_timeout_short_seconds: float = 2.0
     tcp_timeout_standard_seconds: float = 5.0
@@ -138,6 +134,11 @@ class ManagerConfig:
     environment_id: str = "default"
     mtls_strict_mode: bool = False
 
+    # Per-link circuit breaker (from env: CIRCUIT_BREAKER_*)
+    circuit_breaker_max_errors: int = 3
+    circuit_breaker_window_seconds: float = 30.0
+    circuit_breaker_half_open_after_seconds: float = 10.0
+
     # State sync settings (from env)
     state_sync_retries: int = 3
     state_sync_timeout_seconds: float = 10.0
@@ -152,7 +153,6 @@ class ManagerConfig:
 
     # Heartbeat settings (from env)
     heartbeat_interval_seconds: float = 5.0
-    gate_heartbeat_interval_seconds: float = 10.0
     max_workers_per_manager: int | None = None
 
     # Peer sync settings (from env)
@@ -164,7 +164,6 @@ class ManagerConfig:
 
     # Job timeout settings (AD-34)
     job_timeout_check_interval_seconds: float = 30.0
-    job_retention_seconds: float = 3600.0
 
     # Aggregate health alert thresholds
     health_alert_overloaded_ratio: float = 0.5
@@ -185,7 +184,6 @@ def create_manager_config_from_env(
     seed_managers: list[tuple[str, int]] | None = None,
     manager_udp_peers: list[tuple[str, int]] | None = None,
     quorum_timeout: float = 5.0,
-    max_workflow_retries: int = 3,
     workflow_timeout: float = 300.0,
     wal_data_dir: Path | None = None,
 ) -> ManagerConfig:
@@ -203,7 +201,6 @@ def create_manager_config_from_env(
         seed_managers: Initial manager addresses for peer discovery
         manager_udp_peers: Manager UDP addresses for SWIM cluster
         quorum_timeout: Timeout for quorum operations
-        max_workflow_retries: Maximum retry attempts per workflow
         workflow_timeout: Workflow execution timeout
 
     Returns:
@@ -219,7 +216,6 @@ def create_manager_config_from_env(
         seed_managers=seed_managers or [],
         manager_udp_peers=manager_udp_peers or [],
         quorum_timeout_seconds=quorum_timeout,
-        max_workflow_retries=max_workflow_retries,
         workflow_timeout_seconds=workflow_timeout,
         # From env
         dead_worker_reap_interval_seconds=env.MANAGER_DEAD_WORKER_REAP_INTERVAL,
@@ -248,12 +244,6 @@ def create_manager_config_from_env(
         job_cleanup_interval_seconds=env.JOB_CLEANUP_INTERVAL,
         dead_node_check_interval_seconds=env.MANAGER_DEAD_NODE_CHECK_INTERVAL,
         rate_limit_cleanup_interval_seconds=env.MANAGER_RATE_LIMIT_CLEANUP_INTERVAL,
-        rate_limit_default_max_requests=getattr(
-            env, "MANAGER_RATE_LIMIT_DEFAULT_MAX_REQUESTS", 100
-        ),
-        rate_limit_default_window_seconds=getattr(
-            env, "MANAGER_RATE_LIMIT_DEFAULT_WINDOW_SECONDS", 10.0
-        ),
         tcp_timeout_short_seconds=env.MANAGER_TCP_TIMEOUT_SHORT,
         tcp_timeout_standard_seconds=env.MANAGER_TCP_TIMEOUT_STANDARD,
         batch_push_interval_seconds=env.MANAGER_BATCH_PUSH_INTERVAL,
@@ -277,6 +267,9 @@ def create_manager_config_from_env(
         cluster_id=env.CLUSTER_ID,
         environment_id=env.ENVIRONMENT_ID,
         mtls_strict_mode=env.MTLS_STRICT_MODE.lower() == "true",
+        circuit_breaker_max_errors=env.CIRCUIT_BREAKER_MAX_ERRORS,
+        circuit_breaker_window_seconds=env.CIRCUIT_BREAKER_WINDOW_SECONDS,
+        circuit_breaker_half_open_after_seconds=env.CIRCUIT_BREAKER_HALF_OPEN_AFTER,
         state_sync_retries=env.MANAGER_STATE_SYNC_RETRIES,
         state_sync_timeout_seconds=env.MANAGER_STATE_SYNC_TIMEOUT,
         leader_election_jitter_max_seconds=env.LEADER_ELECTION_JITTER_MAX,
@@ -284,21 +277,11 @@ def create_manager_config_from_env(
         cluster_stabilization_timeout_seconds=env.CLUSTER_STABILIZATION_TIMEOUT,
         cluster_stabilization_poll_interval_seconds=env.CLUSTER_STABILIZATION_POLL_INTERVAL,
         heartbeat_interval_seconds=env.MANAGER_HEARTBEAT_INTERVAL,
-        gate_heartbeat_interval_seconds=getattr(
-            env, "MANAGER_GATE_HEARTBEAT_INTERVAL", 10.0
-        ),
         max_workers_per_manager=env.MAX_WORKERS_PER_MANAGER,
         peer_sync_interval_seconds=env.MANAGER_PEER_SYNC_INTERVAL,
-        peer_job_sync_interval_seconds=getattr(
-            env, "MANAGER_PEER_JOB_SYNC_INTERVAL", 15.0
-        ),
-        throughput_interval_seconds=getattr(
-            env, "MANAGER_THROUGHPUT_INTERVAL_SECONDS", 10.0
-        ),
-        job_timeout_check_interval_seconds=getattr(
-            env, "JOB_TIMEOUT_CHECK_INTERVAL", 30.0
-        ),
-        job_retention_seconds=getattr(env, "JOB_RETENTION_SECONDS", 3600.0),
+        peer_job_sync_interval_seconds=env.MANAGER_PEER_JOB_SYNC_INTERVAL,
+        throughput_interval_seconds=env.MANAGER_THROUGHPUT_INTERVAL_SECONDS,
+        job_timeout_check_interval_seconds=env.JOB_TIMEOUT_CHECK_INTERVAL,
         health_alert_overloaded_ratio=env.MANAGER_HEALTH_ALERT_OVERLOADED_RATIO,
         health_alert_non_healthy_ratio=env.MANAGER_HEALTH_ALERT_NON_HEALTHY_RATIO,
         wal_data_dir=wal_data_dir,

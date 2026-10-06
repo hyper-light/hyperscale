@@ -25,10 +25,7 @@ from hyperscale.logging.hyperscale_logging_models import (
 
 from .state import GateRuntimeState
 
-from hyperscale.distributed.runtime import Clock, Random, RealRandom
-
-
-_DEFAULT_RANDOM: Random = RealRandom()
+from hyperscale.distributed.runtime import Clock, Random
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
@@ -36,9 +33,6 @@ if TYPE_CHECKING:
         ConsistentHashRing,
     )
     from hyperscale.distributed.jobs import JobLeadershipTracker
-    from hyperscale.distributed.jobs.gates.job_forwarding_tracker import (
-        JobForwardingTracker,
-    )
     from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
     from hyperscale.distributed.taskex import TaskRunner
 
@@ -58,7 +52,6 @@ class GatePeerCoordinator:
         task_runner: "TaskRunner",
         peer_discovery: DiscoveryService,
         job_hash_ring: "ConsistentHashRing",
-        job_forwarding_tracker: "JobForwardingTracker",
         job_leadership_tracker: "JobLeadershipTracker",
         versioned_clock: "VersionedStateClock",
         recovery_semaphore: asyncio.Semaphore,
@@ -72,6 +65,7 @@ class GatePeerCoordinator:
         handle_job_leader_failure: Callable[[tuple[str, int]], "asyncio.Task"],
         remove_peer_circuit: Callable[[tuple[str, int]], Awaitable[None]],
         clock: Clock,
+        random: Random,
         is_leader: Callable[[], bool] | None = None,
     ) -> None:
         """
@@ -83,7 +77,6 @@ class GatePeerCoordinator:
             task_runner: Background task executor
             peer_discovery: Discovery service for peer selection
             job_hash_ring: Consistent hash ring for job ownership
-            job_forwarding_tracker: Tracks cross-gate job forwarding
             job_leadership_tracker: Tracks per-job leadership
             versioned_clock: Version tracking for stale update rejection
             recovery_semaphore: Limits concurrent recovery operations
@@ -96,14 +89,16 @@ class GatePeerCoordinator:
             confirm_peer: Callback to confirm peer in SWIM layer
             handle_job_leader_failure: Callback to handle job leader failure
             remove_peer_circuit: Callback to clear peer circuit breakers
+            clock: Time source for recovery jitter sleeps
+            random: Source of the recovery jitter (seeded under SIM)
         """
         self._clock: Clock = clock
+        self._random: Random = random
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
         self._task_runner: "TaskRunner" = task_runner
         self._peer_discovery: DiscoveryService = peer_discovery
         self._job_hash_ring: "ConsistentHashRing" = job_hash_ring
-        self._job_forwarding_tracker: "JobForwardingTracker" = job_forwarding_tracker
         self._job_leadership_tracker: "JobLeadershipTracker" = job_leadership_tracker
         self._versioned_clock: "VersionedStateClock" = versioned_clock
         self._recovery_semaphore: asyncio.Semaphore = recovery_semaphore
@@ -138,8 +133,7 @@ class GatePeerCoordinator:
             return
 
         await self._state.add_active_peer(tcp_addr)
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerDebug(
                 message=f"AD-29: Gate peer {tcp_addr[0]}:{tcp_addr[1]} confirmed via SWIM, added to active sets",
                 node_host=self._get_host(),
@@ -173,19 +167,15 @@ class GatePeerCoordinator:
             self._peer_discovery.remove_peer(peer_id)
 
             peer_heartbeat = self._state._gate_peer_info.get(udp_addr)
-            real_peer_id = peer_heartbeat.node_id if peer_heartbeat else peer_id
 
             if peer_heartbeat:
                 await self._job_hash_ring.remove_node(peer_heartbeat.node_id)
             else:
                 await self._job_hash_ring.remove_node(peer_id)
 
-            self._job_forwarding_tracker.unregister_peer(real_peer_id)
-
         await self._remove_peer_circuit(tcp_addr)
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerInfo(
                 message=f"Gate peer at {tcp_addr} (UDP: {udp_addr}) marked as DEAD, removed from hash ring",
                 node_host=self._get_host(),
@@ -197,8 +187,7 @@ class GatePeerCoordinator:
         await self._handle_job_leader_failure(tcp_addr)
 
         active_count = self._state.get_active_peer_count() + 1
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerInfo(
                 message=f"Gate cluster: {active_count} active",
                 node_host=self._get_host(),
@@ -229,7 +218,7 @@ class GatePeerCoordinator:
 
         async with self._recovery_semaphore:
             if self._recovery_jitter_max > 0:
-                jitter = _DEFAULT_RANDOM.uniform(
+                jitter = self._random.uniform(
                     self._recovery_jitter_min, self._recovery_jitter_max
                 )
                 await self._clock.sleep(jitter)
@@ -237,8 +226,7 @@ class GatePeerCoordinator:
             async with peer_lock:
                 current_epoch = await self._state.get_peer_epoch(tcp_addr)
                 if current_epoch != initial_epoch:
-                    self._task_runner.run(
-                        self._logger.log,
+                    await self._logger.log(
                         ServerDebug(
                             message=f"Gate peer recovery for {tcp_addr} aborted: epoch changed "
                             f"({initial_epoch} -> {current_epoch}) during jitter",
@@ -261,8 +249,7 @@ class GatePeerCoordinator:
                     role="gate",
                 )
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerInfo(
                 message=f"Gate peer at {tcp_addr} (UDP: {udp_addr}) has REJOINED the cluster",
                 node_host=self._get_host(),
@@ -274,8 +261,7 @@ class GatePeerCoordinator:
         self._task_runner.run(self._request_state_sync_from_peer, tcp_addr)
 
         active_count = self._state.get_active_peer_count() + 1
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerInfo(
                 message=f"Gate cluster: {active_count} active",
                 node_host=self._get_host(),
@@ -316,12 +302,10 @@ class GatePeerCoordinator:
             self._peer_discovery.remove_peer(gate_id)
 
         await self._job_hash_ring.remove_node(gate_id)
-        self._job_forwarding_tracker.unregister_peer(gate_id)
 
         gate_ids_to_remove = self._state.cleanup_dead_peer(peer_addr)
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerDebug(
                 message=(
                     "Cleaned up tracking for reaped gate peer "
@@ -351,7 +335,7 @@ class GatePeerCoordinator:
             )
         )
 
-        for tcp_addr in list(self._state.get_active_peers()):
+        for tcp_addr in sorted(self._state.get_active_peers()):
             udp_addr: tuple[str, int] | None = None
             for udp, tcp in list(self._state.iter_udp_to_tcp_mappings()):
                 if tcp == tcp_addr:
@@ -420,8 +404,7 @@ class GatePeerCoordinator:
         try:
             peer_jobs = self._job_leadership_tracker.get_jobs_led_by_addr(peer_tcp_addr)
             if peer_jobs:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerDebug(
                         message=f"Peer {peer_tcp_addr} rejoined with {len(peer_jobs)} known jobs",
                         node_host=self._get_host(),
@@ -432,8 +415,7 @@ class GatePeerCoordinator:
 
             self._state.clear_dead_leader(peer_tcp_addr)
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=f"State sync completed for rejoined peer {peer_tcp_addr}",
                     node_host=self._get_host(),
@@ -442,8 +424,7 @@ class GatePeerCoordinator:
                 ),
             )
         except Exception as error:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerWarning(
                     message=f"Failed to sync state from rejoined peer {peer_tcp_addr}: {error}",
                     node_host=self._get_host(),

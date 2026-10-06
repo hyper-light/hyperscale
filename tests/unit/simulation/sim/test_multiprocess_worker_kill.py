@@ -1,7 +1,11 @@
 """
 Fault injection: the worker host dies mid-job.
 
-Same five-process dispatch topology; at virtual 19.0 — job in flight —
+Same five-process dispatch topology; at virtual 5.0 — job in flight,
+0.25 after its dispatch onto the worker (4.75; it drains by 5.5
+unfaulted) as before, when dispatch was 18.75 while the lone manager
+waited out a full pre-vote and vote wait for a majority its own vote
+already made —
 the worker AND both of its executor children are SIGKILLed at the same
 instant (the host-death model: everything on the box goes silent at
 once). No process the manager can reach holds the job anymore.
@@ -28,7 +32,7 @@ from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
 )
 
 _CEILING = 150.0
-_KILL_AT = 19.0
+_KILL_AT = 5.0
 
 
 def _run_with_worker_kill() -> dict:

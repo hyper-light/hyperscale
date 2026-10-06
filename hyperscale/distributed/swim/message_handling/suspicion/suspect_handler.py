@@ -65,9 +65,18 @@ class SuspectHandler(BaseHandler):
         return self._ack()
 
     async def _handle_self_suspicion(self, msg_incarnation: int) -> HandlerResult:
-        """Handle suspicion about self - refute it."""
-        await self._server.increase_failure_detector("refutation")
-        new_incarnation = await self._server.broadcast_refutation()
+        """Handle suspicion about self - refute it.
+
+        An accusation below our current incarnation was already refuted:
+        answer with our current alive, without raising LHM or the
+        incarnation again (memberlist ``suspectNode``: "Ignore old
+        incarnation numbers").
+        """
+        if msg_incarnation < (new_incarnation := self._server.incarnation_tracker.get_self_incarnation()):
+            self._server.increment_metric("superseded_self_accusations_ignored")
+        else:
+            await self._server.increase_failure_detector("refutation")
+            new_incarnation = await self._server.broadcast_refutation()
 
         base = (
             b"alive:"

@@ -88,7 +88,7 @@ class GateLeadershipCoordinator:
 
         # Send to all active peers
         peers = self._get_active_peers()
-        for peer_addr in peers:
+        for peer_addr in sorted(peers):
             self._task_runner.run(
                 self._send_leadership_announcement,
                 peer_addr,
@@ -110,15 +110,17 @@ class GateLeadershipCoordinator:
         announcement: JobLeadershipAnnouncement,
     ) -> None:
         try:
-            await self._send_tcp(
+            response, _ = await self._send_tcp(
                 peer_addr,
                 "job_leadership_announcement",
                 announcement.dump(),
                 timeout=self._peer_rpc_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
         except Exception as error:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=f"Failed to send leadership announcement to {peer_addr}: {error}",
                     node_host=self._get_node_addr()[0],
@@ -133,12 +135,15 @@ class GateLeadershipCoordinator:
         transfer: GateJobLeaderTransfer,
     ) -> None:
         try:
-            await self._send_tcp(
+            response, _ = await self._send_tcp(
                 callback_addr,
                 "receive_gate_job_leader_transfer",
                 transfer.dump(),
                 timeout=self._peer_rpc_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
         except Exception as error:
             await self._logger.log(
                 ServerWarning(

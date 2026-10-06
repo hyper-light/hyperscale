@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1
+#
+# Hyperscale built from this repository's source, for development
+# clusters (KIND) and pre-release testing. Releases build
+# docker/images/Dockerfile from the published package instead.
+#
+#   docker build -f docker/images/Dockerfile.source -t hyperscale:dev .
+#
+# Dependencies are installed exactly as uv.lock pins them; the project
+# itself is installed as a regular (non-editable) package into a
+# self-contained virtual environment that the runtime stage copies.
+
+ARG PYTHON_VERSION=3.14
+ARG OS_BASE=trixie
+ARG UV_VERSION=0.11.2
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+FROM python:${PYTHON_VERSION}-slim-${OS_BASE} AS build
+
+COPY --from=uv /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/hyperscale
+
+WORKDIR /src
+
+# Dependencies first, so source edits reuse this layer.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+COPY README.md LICENSE MANIFEST.in ./
+COPY hyperscale ./hyperscale
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable
+
+FROM python:${PYTHON_VERSION}-slim-${OS_BASE} AS runtime
+
+ARG USERNAME=hyperscale
+ARG USER_UID=1000
+ARG USER_GID=${USER_UID}
+
+RUN groupadd --gid ${USER_GID} ${USERNAME} \
+    && useradd --uid ${USER_UID} --gid ${USER_GID} --create-home ${USERNAME}
+
+COPY --from=build /opt/hyperscale /opt/hyperscale
+# The CLI reads its help metadata from the nearest pyproject.toml above
+# the installed package (hyperscale/commands/cli/help_message/project),
+# and fails to import without one; the virtual environment's root is an
+# ancestor of site-packages.
+COPY --from=build /src/pyproject.toml /opt/hyperscale/pyproject.toml
+
+ENV PATH=/opt/hyperscale/bin:${PATH} \
+    PYTHONUNBUFFERED=1
+
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+
+ENTRYPOINT ["hyperscale"]
+CMD ["--help"]

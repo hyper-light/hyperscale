@@ -105,9 +105,15 @@ class LamportRunner:
         if self._run_task is None:
             return
 
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
         try:
             self._run_task.cancel()
             await self._run_task
 
-        except (asyncio.CancelledError, asyncio.InvalidStateError):
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
+        except asyncio.InvalidStateError:
             pass

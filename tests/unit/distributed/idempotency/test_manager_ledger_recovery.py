@@ -7,9 +7,13 @@ Pins the torn-tail fix and the seam wiring:
   previously RAISED on it — one crash became a PERMANENT boot loop,
   since every subsequent start() re-hit the same debris. Replay now
   recovers every complete entry, drops the tail, and logs the data
-  loss loudly (matching NodeWAL / RaftWAL truncation tolerance).
+  loss loudly (matching NodeWAL / RaftStore truncation tolerance).
 * Persistence flows through the injected Filesystem (append_fsync, one
   durable unit per entry) — where SIM storage faults will land.
+* Every entry is checksummed: a damaged entry is never replayed as a
+  different key or job -- replay stops there, and what follows is
+  preserved beside the WAL, never destroyed. A file without the WAL's
+  format header is set aside, never read as one.
 """
 
 import struct
@@ -25,6 +29,8 @@ from hyperscale.distributed.idempotency.idempotency_status import (
     IdempotencyStatus,
 )
 from hyperscale.distributed.idempotency.manager_ledger import (
+    FRAME_HEADER,
+    IDEMPOTENCY_WAL_FORMAT,
     ManagerIdempotencyLedger,
 )
 
@@ -193,5 +199,58 @@ async def test_persistence_flows_through_injected_filesystem(tmp_path):
     await ledger.commit(_key(7), b"result-7")
     await ledger.close()
 
-    assert len(recording.appends) == 2  # reserve + commit
+    # The format header the new file starts with, then reserve and commit.
+    assert len(recording.appends) == 3
+    assert recording.appends[0] == IDEMPOTENCY_WAL_FORMAT.header
     assert not wal_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_damaged_entry_is_never_replayed_and_what_follows_is_preserved(tmp_path, filesystem):
+    """A bit flipped inside an entry's job id still decodes -- without the
+    checksum it would replay as a different job under the key."""
+    wal_path = tmp_path / "idempotency.wal"
+    ledger = _ledger(wal_path, filesystem)
+    await ledger.start()
+    await ledger.check_or_reserve(_key(1), "job-1")
+    await ledger.check_or_reserve(_key(2), "job-2")
+    await ledger.check_or_reserve(_key(3), "job-3")
+    await ledger.close()
+
+    data = bytearray(wal_path.read_bytes())
+    second_frame = IDEMPOTENCY_WAL_FORMAT.header_size + FRAME_HEADER.size + FRAME_HEADER.unpack_from(
+        data, IDEMPOTENCY_WAL_FORMAT.header_size
+    )[1]
+    damaged_at = data.index(b"job-2", second_frame)
+    data[damaged_at + 4] ^= 0x01  # "job-2" -> "job-3"
+    wal_path.write_bytes(bytes(data))
+
+    recording_logger = _RecordingLogger()
+    restarted = _ledger(wal_path, filesystem, logger=recording_logger)
+    await restarted.start()
+
+    assert restarted.get_by_key(_key(1)).job_id == "job-1"
+    assert restarted.get_by_key(_key(2)) is None and restarted.get_by_key(_key(3)) is None
+    (preserved,) = list(tmp_path.glob("idempotency.wal.discarded-*"))
+    assert preserved.read_bytes() == bytes(data[second_frame:])
+    assert any("preserved at" in message for message in recording_logger.messages)
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_a_file_without_the_wal_header_is_set_aside(tmp_path, filesystem):
+    wal_path = tmp_path / "idempotency.wal"
+    foreign = struct.pack(">I", 4) + b"\x00\x01\x02\x03"
+    wal_path.write_bytes(foreign)
+
+    restarted = _ledger(wal_path, filesystem)
+    await restarted.start()
+    await restarted.check_or_reserve(_key(1), "job-1")
+    await restarted.close()
+
+    (set_aside,) = list(tmp_path.glob("idempotency.wal.unrecognized-*"))
+    assert set_aside.read_bytes() == foreign
+    replayed = _ledger(wal_path, filesystem)
+    await replayed.start()
+    assert replayed.get_by_key(_key(1)).job_id == "job-1"
+    await replayed.close()

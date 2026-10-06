@@ -600,10 +600,11 @@ class TestCallbacks:
         # Only called once for first transition
         assert on_overloaded.call_count == 1
 
-    def test_callback_exception_does_not_break_processing(self) -> None:
-        """Test callback exceptions don't affect processing."""
+    def test_callback_exception_reaches_the_caller(self) -> None:
+        """A failing callback's error reaches the caller, with the update
+        already applied."""
         awareness = PeerHealthAwareness()
-        on_overloaded = MagicMock(side_effect=Exception("Callback error"))
+        on_overloaded = MagicMock(side_effect=RuntimeError("Callback error"))
         awareness.set_overload_callback(on_overloaded=on_overloaded)
 
         health = HealthPiggyback(
@@ -613,8 +614,8 @@ class TestCallbacks:
             timestamp=time.monotonic(),
         )
 
-        # Should not raise
-        awareness.on_health_update(health)
+        with pytest.raises(RuntimeError, match="Callback error"):
+            awareness.on_health_update(health)
 
         # Peer should still be tracked
         assert awareness.get_peer_info("worker-1") is not None

@@ -14,7 +14,10 @@ heartbeat writer:
 
 * a manager silent past the cutoff is found and forgotten everywhere;
 * a manager that is still heartbeating is kept;
-* a forgotten manager that returns is re-learned from its heartbeat.
+* a forgotten manager that returns is re-learned from its heartbeat;
+* a forgotten manager learned at runtime leaves its datacenter's address
+  lists (which count the datacenter's expected managers), while an
+  operator-declared one -- configured or joined -- stays in them.
 """
 
 from types import SimpleNamespace
@@ -27,26 +30,41 @@ from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 
 DATACENTER = "dc-1"
 SILENT_MANAGER = ("10.0.0.7", 9000)
+SILENT_MANAGER_UDP = ("10.0.0.7", 9001)
 LIVE_MANAGER = ("10.0.0.8", 9000)
+LIVE_MANAGER_UDP = ("10.0.0.8", 9001)
 SILENT_SINCE = 100.0
 LIVE_SINCE = 400.0
 STALE_CUTOFF = 300.0
 
 
-def heartbeat(node_id: str):
-    return SimpleNamespace(node_id=node_id, is_leader=False, incarnation=3)
+def heartbeat(node_id: str, udp_address: tuple[str, int]):
+    return SimpleNamespace(
+        node_id=node_id,
+        is_leader=False,
+        incarnation=3,
+        udp_host=udp_address[0],
+        udp_port=udp_address[1],
+    )
 
 
-async def make_gate() -> tuple[GateServer, GateRuntimeState]:
-    state = GateRuntimeState()
-    await state.update_manager_status(DATACENTER, SILENT_MANAGER, heartbeat("silent"), SILENT_SINCE)
-    await state.update_manager_status(DATACENTER, LIVE_MANAGER, heartbeat("live"), LIVE_SINCE)
+async def make_gate(
+    declared_managers: frozenset[tuple[str, int]] = frozenset(),
+) -> tuple[GateServer, GateRuntimeState]:
+    state = GateRuntimeState(forward_throughput_interval_start=0.0)
+    await state.update_manager_status(
+        DATACENTER, SILENT_MANAGER, heartbeat("silent", SILENT_MANAGER_UDP), SILENT_SINCE
+    )
+    await state.update_manager_status(DATACENTER, LIVE_MANAGER, heartbeat("live", LIVE_MANAGER_UDP), LIVE_SINCE)
     state._manager_health[(DATACENTER, SILENT_MANAGER)] = object()
     state._manager_negotiated_caps[SILENT_MANAGER] = object()
     gate = object.__new__(GateServer)
     gate._modular_state = state
     gate._manager_selector = SimpleNamespace(forget_manager=lambda manager_addr: None)
     gate._circuit_breaker_manager = SimpleNamespace(remove_circuit=AsyncMock())
+    gate._datacenter_managers = {DATACENTER: [SILENT_MANAGER, LIVE_MANAGER]}
+    gate._datacenter_manager_udp = {DATACENTER: [SILENT_MANAGER_UDP, LIVE_MANAGER_UDP]}
+    gate._declared_datacenter_managers = {DATACENTER: declared_managers}
     return gate, state
 
 
@@ -71,16 +89,39 @@ async def test_a_forgotten_manager_that_returns_is_relearned() -> None:
     gate, state = await make_gate()
     await GateServer._cleanup_stale_manager(gate, SILENT_MANAGER)
 
-    await state.update_manager_status(DATACENTER, SILENT_MANAGER, heartbeat("silent"), LIVE_SINCE)
+    await state.update_manager_status(DATACENTER, SILENT_MANAGER, heartbeat("silent", SILENT_MANAGER_UDP), LIVE_SINCE)
 
     assert state.get_manager_status(DATACENTER, SILENT_MANAGER) is not None
     assert state.get_stale_manager_addrs(STALE_CUTOFF) == []
 
 
 @pytest.mark.asyncio
+async def test_a_forgotten_learned_manager_leaves_its_datacenter_address_lists() -> None:
+    gate, _ = await make_gate()
+
+    await GateServer._cleanup_stale_manager(gate, SILENT_MANAGER)
+
+    assert gate._datacenter_managers[DATACENTER] == [LIVE_MANAGER]
+    assert gate._datacenter_manager_udp[DATACENTER] == [LIVE_MANAGER_UDP]
+
+
+@pytest.mark.asyncio
+async def test_a_forgotten_declared_manager_stays_in_its_datacenter_address_lists() -> None:
+    gate, state = await make_gate(declared_managers=frozenset({SILENT_MANAGER}))
+
+    await GateServer._cleanup_stale_manager(gate, SILENT_MANAGER)
+
+    assert state.get_manager_status(DATACENTER, SILENT_MANAGER) is None
+    assert gate._datacenter_managers[DATACENTER] == [SILENT_MANAGER, LIVE_MANAGER]
+    assert gate._datacenter_manager_udp[DATACENTER] == [SILENT_MANAGER_UDP, LIVE_MANAGER_UDP]
+
+
+@pytest.mark.asyncio
 async def test_a_datacenter_whose_last_manager_is_forgotten_leaves_no_entry() -> None:
-    state = GateRuntimeState()
-    await state.update_manager_status(DATACENTER, SILENT_MANAGER, heartbeat("silent"), SILENT_SINCE)
+    state = GateRuntimeState(forward_throughput_interval_start=0.0)
+    await state.update_manager_status(
+        DATACENTER, SILENT_MANAGER, heartbeat("silent", SILENT_MANAGER_UDP), SILENT_SINCE
+    )
 
     await state.remove_manager(SILENT_MANAGER)
 

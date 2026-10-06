@@ -8,6 +8,8 @@ All business logic is delegated to specialized modules.
 import asyncio
 
 from hyperscale.distributed.cluster import ClusterJoinError
+from hyperscale.distributed.cluster.cluster_view_cache import ClusterViewCache
+from hyperscale.distributed.cluster.cluster_watch_follower import ClusterWatchFollower
 from hyperscale.distributed.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed.swim.health.graceful_degradation import DegradationLevel
 from hyperscale.distributed.env import Env
@@ -29,8 +31,7 @@ from hyperscale.distributed.models import (
     WorkflowStatus,
     WorkerHeartbeat,
 )
-from hyperscale.distributed.jobs import AllocationResult
-from hyperscale.distributed.jobs import CoreAllocator
+from hyperscale.distributed.jobs import AllocationResult, CoreAllocator
 from hyperscale.distributed.resources import ProcessResourceMonitor
 from hyperscale.distributed.resources.workflow_resource_tracker import WorkflowResourceTracker
 from hyperscale.distributed.protocol.version import (
@@ -51,9 +52,11 @@ from hyperscale.distributed.runtime import (
 # rebinds it under SIM so registration payloads read a constant
 # machine instead of live psutil.
 _DEFAULT_SYSTEM_RESOURCES: SystemResources = RealSystemResources()
-from hyperscale.logging import Logger
+from hyperscale.logging import Logger, LogLevel
 from hyperscale.logging.config import DurabilityMode
 from hyperscale.logging.hyperscale_logging_models import (
+    ClusterWatchConnectivityChanged,
+    ServerDebug,
     ServerInfo,
     ServerWarning,
     WorkerExtensionDecision,
@@ -71,7 +74,6 @@ from .extension_trigger import (
 from .models import WorkflowRuntimeState
 from .state import WorkerState
 from .registry import WorkerRegistry
-from .execution import WorkerExecutor
 from .sync import WorkerStateSync
 from .health import WorkerHealthIntegration
 from .backpressure import WorkerBackpressureManager
@@ -89,10 +91,12 @@ from .handlers import (
     WorkflowThrottleHandler,
     CancelJobWorkflowsHandler,
     JobLeaderTransferHandler,
-    WorkflowProgressHandler,
     StateSyncHandler,
 )
 from .cluster_connection import WorkerClusterConnection
+from hyperscale.ui.interface_updates_controller import (InterfaceUpdatesController)
+from collections.abc import Callable
+from hyperscale.distributed.runtime import SendTcp, RunTask
 
 
 SERVER_SHUTDOWN_CANCELLATION_REASON = "server_shutdown"
@@ -154,7 +158,11 @@ class WorkerServer(HealthAwareServer):
         self._core_allocator: CoreAllocator = CoreAllocator(self._total_cores)
 
         # Centralized runtime state (single source of truth)
-        self._worker_state: WorkerState = WorkerState(self._core_allocator)
+        self._worker_state: WorkerState = WorkerState(
+            self._core_allocator,
+            throughput_interval_seconds=self._config.throughput_interval_seconds,
+            completion_times_max_samples=self._config.completion_times_max_samples,
+        )
         # Manager UDP addr -> last SWIM incarnation observed. A jump of
         # at least the tracker's rejoin bump is the RESTART signature
         # (the manager's persisted incarnation store bumps on every
@@ -171,6 +179,7 @@ class WorkerServer(HealthAwareServer):
             recovery_jitter_min=env.RECOVERY_JITTER_MIN,
             recovery_jitter_max=env.RECOVERY_JITTER_MAX,
             recovery_semaphore_size=env.RECOVERY_SEMAPHORE_SIZE,
+            circuit_breaker_config=env.get_circuit_breaker_config(),
             # Resolved at call time: the discovery manager is built below.
             select_manager=lambda healthy_manager_ids: (
                 self._discovery_manager.select_best_manager(
@@ -189,15 +198,6 @@ class WorkerServer(HealthAwareServer):
                 batch_delay_ms=env.WORKER_BACKPRESSURE_BATCH_DELAY_MS,
                 reject_delay_ms=env.WORKER_BACKPRESSURE_REJECT_DELAY_MS,
             )
-        )
-
-        self._executor: WorkerExecutor = WorkerExecutor(
-            core_allocator=self._core_allocator,
-            logger=None,
-            state=self._worker_state,
-            progress_update_interval=self._config.progress_update_interval,
-            progress_flush_interval=self._config.progress_flush_interval,
-            backpressure_manager=self._backpressure_manager,
         )
 
         self._state_sync: WorkerStateSync = WorkerStateSync()
@@ -347,9 +347,6 @@ class WorkerServer(HealthAwareServer):
         # Event logger for crash forensics (AD-47)
         self._event_logger: Logger | None = None
 
-        from hyperscale.ui.interface_updates_controller import (
-            InterfaceUpdatesController,
-        )
 
         self._updates_controller: InterfaceUpdatesController = (
             InterfaceUpdatesController()
@@ -368,13 +365,14 @@ class WorkerServer(HealthAwareServer):
             get_active_workflows=lambda: {
                 wf_id: wf.status for wf_id, wf in self._active_workflows.items()
             },
+            get_cores_version=lambda: self._core_allocator.availability_version,
             on_manager_heartbeat=self._handle_manager_heartbeat,
             get_tcp_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
             get_health_accepting_work=lambda: self._get_worker_state()
             in (WorkerStateEnum.HEALTHY, WorkerStateEnum.DEGRADED),
-            get_health_throughput=self._executor.get_throughput,
-            get_health_expected_throughput=self._executor.get_expected_throughput,
+            get_health_throughput=self._worker_state.get_throughput,
+            get_health_expected_throughput=self._worker_state.get_expected_throughput,
             get_health_overload_state=self._backpressure_manager.get_overload_state_str,
             get_extension_requested=lambda: self._worker_state._extension_requested,
             get_extension_reason=lambda: self._worker_state._extension_reason,
@@ -425,6 +423,7 @@ class WorkerServer(HealthAwareServer):
         self._progress_reporter: WorkerProgressReporter = WorkerProgressReporter(
             registry=self._registry,
             state=self._worker_state,
+            config=self._config,
             logger=self._udp_logger,
         )
 
@@ -440,6 +439,7 @@ class WorkerServer(HealthAwareServer):
                 total_memory_bytes=self._resource_monitor.total_memory_bytes,
             ),
             task_runner=self._task_runner,
+            execution_update_wait_seconds=self._config.execution_update_wait_seconds,
         )
 
         self._cancellation_handler_impl: WorkerCancellationHandler = (
@@ -447,6 +447,8 @@ class WorkerServer(HealthAwareServer):
                 state=self._worker_state,
                 logger=self._udp_logger,
                 poll_interval=self._config.cancellation_poll_interval_seconds,
+                query_timeout=self._config.tcp_timeout_short_seconds,
+                cancel_timeout=self._config.workflow_cancel_timeout_seconds,
             )
         )
 
@@ -466,6 +468,8 @@ class WorkerServer(HealthAwareServer):
             orphan_check_interval=self._config.orphan_check_interval_seconds,
             discovery_failure_decay_interval=self._config.discovery_failure_decay_interval_seconds,
             progress_flush_interval=self._config.progress_flush_interval_seconds,
+            orphan_extension_min_grant=self._config.orphan_extension_min_grant_seconds,
+            orphan_extension_max_extensions=self._config.orphan_extension_max_extensions,
         )
 
         # Wire logger to modules after parent init
@@ -489,7 +493,7 @@ class WorkerServer(HealthAwareServer):
 
         # Set up heartbeat callbacks
         self._heartbeat_handler.set_callbacks(
-            on_new_manager_discovered=self._on_new_manager_discovered,
+            on_new_manager_discovered=self._register_with_manager,
             on_job_leadership_update=self._on_job_leadership_update,
         )
 
@@ -503,7 +507,6 @@ class WorkerServer(HealthAwareServer):
         self._transfer_handler: JobLeaderTransferHandler = JobLeaderTransferHandler(
             self
         )
-        self._progress_handler: WorkflowProgressHandler = WorkflowProgressHandler(self)
         self._sync_handler: StateSyncHandler = StateSyncHandler(self)
 
         # Cluster-membership invariant owner. Every registry path that
@@ -538,6 +541,36 @@ class WorkerServer(HealthAwareServer):
             rejoin_jitter_min_seconds=self._config.recovery_jitter_min_seconds,
             rejoin_jitter_max_seconds=self._config.recovery_jitter_max_seconds,
         )
+        # The datacenter's manager membership as last observed (AD-52
+        # section 10): its cohort becomes the rejoin seeds.
+        manager_request_timeout_seconds = self._env.WORKER_TCP_TIMEOUT_STANDARD
+        self._manager_membership_view = ClusterViewCache(
+            poll_wait_seconds=self._env.CLUSTER_WATCH_WAIT_SECONDS,
+            request_timeout_seconds=manager_request_timeout_seconds,
+        )
+        self._manager_membership_watch = ClusterWatchFollower(
+            self._manager_membership_view,
+            seeds=lambda: self._cluster_connection.seed_manager_tcp_addrs,
+            send_watch=self._send_manager_membership_watch,
+            clock=self._clock,
+            poll_wait_seconds=self._env.CLUSTER_WATCH_WAIT_SECONDS,
+            request_timeout_seconds=manager_request_timeout_seconds,
+            on_view_changed=lambda view: self._cluster_connection.adopt_cohort(view.cohort) if view.cohort else None,
+            on_disconnected_changed=lambda disconnected: self._udp_logger.log(
+                ClusterWatchConnectivityChanged(
+                    message=(
+                        "Lost the datacenter's manager membership: rejoining from the cohort last observed"
+                        if disconnected
+                        else "Following the datacenter's manager membership"
+                    ),
+                    node_id=self._node_id.short,
+                    watched=self._node_id.datacenter,
+                    disconnected=disconnected,
+                    staleness_seconds=self._manager_membership_view.read(self._clock.monotonic())[1],
+                    level=LogLevel.WARN if disconnected else LogLevel.INFO,
+                )
+            ),
+        )
         # Wire the registry's healthy-set-changed signal so every
         # mark_healthy / mark_unhealthy / remove_manager_state path
         # flows through the connection state machine AND drives the
@@ -551,7 +584,6 @@ class WorkerServer(HealthAwareServer):
     def _wire_logger_to_modules(self) -> None:
         """Wire logger to all modules after parent init."""
         self._registry._logger = self._udp_logger
-        self._executor._logger = self._udp_logger
         self._backpressure_manager._logger = self._udp_logger
         self._health_integration._logger = self._udp_logger
         self._discovery_manager._logger = self._udp_logger
@@ -723,6 +755,9 @@ class WorkerServer(HealthAwareServer):
         # cycle is running. Starting earlier would risk the watchdog
         # marking managers stale before their first heartbeat.
         self._cluster_connection.start()
+        # AD-52 section 10: the datacenter's manager membership, followed
+        # into its soft-state cache; each change becomes the rejoin seeds.
+        self._task_runner.run(self._manager_membership_watch.run, alias="manager-membership-watch")
 
         await self._udp_logger.log(
             ServerInfo(
@@ -800,6 +835,8 @@ class WorkerServer(HealthAwareServer):
         # shutdown begins to dismantle dependent state.
         if hasattr(self, "_cluster_connection") and self._cluster_connection is not None:
             await self._cluster_connection.stop()
+        if hasattr(self, "_manager_membership_watch"):
+            self._manager_membership_watch.stop()
 
         await self._stop_background_loops()
         await self._cancel_cores_notification_task()
@@ -839,14 +876,17 @@ class WorkerServer(HealthAwareServer):
         if not self._cores_notification_task or self._cores_notification_task.done():
             return
         self._cores_notification_task.cancel()
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
         try:
             await self._cores_notification_task
         except asyncio.CancelledError:
-            pass
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
 
     def _stop_modules(self) -> None:
         self._backpressure_manager.stop()
-        self._executor.stop()
         if self._cancellation_handler_impl:
             self._cancellation_handler_impl.stop()
         if self._background_loops:
@@ -969,6 +1009,7 @@ class WorkerServer(HealthAwareServer):
         self._discovery_maintenance_task = self._create_background_task(
             self._background_loops.run_discovery_maintenance_loop(
                 is_running=lambda: self._running,
+                register_with_manager=self._register_with_manager,
             ),
             "discovery_maintenance",
         )
@@ -1025,11 +1066,15 @@ class WorkerServer(HealthAwareServer):
 
     async def _run_pending_result_retry_loop(
         self,
-        get_healthy_managers: callable,
-        send_tcp: callable,
+        get_healthy_managers: Callable[[], set[str]],
+        send_tcp: SendTcp,
     ) -> None:
         while self._running:
             try:
+                # Wake when the soonest pending result is due (a refusal's
+                # retry-after can be sooner than any backoff step); with no
+                # manager reachable, nothing is sent, so the backoff base.
+                wait_seconds = self._config.result_retry_base_delay_seconds
                 if get_healthy_managers():
                     await self._progress_reporter.retry_pending_results(
                         send_tcp=send_tcp,
@@ -1038,15 +1083,22 @@ class WorkerServer(HealthAwareServer):
                         node_id_short=self._node_id.short,
                         task_runner_run=self._task_runner.run,
                     )
-                await self._clock.sleep(5.0)
+                    wait_seconds = self._progress_reporter.seconds_until_next_result_retry(
+                        self._clock.monotonic()
+                    )
+                await self._clock.sleep(wait_seconds)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 await self._udp_logger.log(
-                    f"Pending result retry failed: {exc}",
-                    level="debug",
+                    ServerDebug(
+                        message=f"Pending result retry failed: {type(exc).__name__}: {exc}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
                 )
-                await self._clock.sleep(5.0)
+                await self._clock.sleep(self._config.result_retry_base_delay_seconds)
 
     async def _run_resource_sample_loop(self) -> None:
         while self._running:
@@ -1236,6 +1288,7 @@ class WorkerServer(HealthAwareServer):
             error=reason,
             worker_id=self._node_id.full,
             worker_available_cores=self._core_allocator.available_cores,
+            worker_cores_version=self._core_allocator.availability_version,
             fence_token=fence_token,
             job_leader_addr=job_leader_addr,
         )
@@ -1298,7 +1351,7 @@ class WorkerServer(HealthAwareServer):
         message stored in ``_active_workflows``) carries cores and
         action counts directly; the start time comes from
         ``WorkerState._workflow_start_times`` (set when the workflow
-        was dispatched). Step transitions default to 0 — the AD-33
+        was dispatched). Step transitions default to 0 — the AD-54
         state-machine wiring lands separately and the trigger's
         ``any_advanced`` check works as long as cores or actions
         advance.
@@ -1346,6 +1399,7 @@ class WorkerServer(HealthAwareServer):
             tcp_host=self._host,
             tcp_port=self._tcp_port,
             available_cores=self._core_allocator.available_cores,
+            cores_version=self._core_allocator.availability_version,
             total_cores=self._core_allocator.total_cores,
             queue_depth=len(self._pending_workflows),
             cpu_percent=self._get_cpu_percent(),
@@ -1415,7 +1469,7 @@ class WorkerServer(HealthAwareServer):
             total_items: Total items to complete.
             estimated_completion: Estimated seconds until workflow completion.
             workflow_id: Specific workflow this snapshot belongs to. Phase H3.
-            step_transitions: AD-33 step state-machine transitions since dispatch.
+            step_transitions: AD-54 step state-machine transitions since dispatch.
                 Secondary progress dimension.
             actions_completed: Sum of StepStats.completed_count across active steps.
                 Tertiary progress dimension.
@@ -1536,8 +1590,7 @@ class WorkerServer(HealthAwareServer):
             self._workflow_job_leader[workflow_id] = pending.new_manager_addr
             self._job_fence_tokens[job_id] = pending.fence_token
 
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerInfo(
                     message=f"Applied pending transfer for workflow {workflow_id[:8]}... to job {job_id[:8]}...",
                     node_host=self._host,
@@ -1715,6 +1768,16 @@ class WorkerServer(HealthAwareServer):
 
         await self._join_known_managers_swim()
         self._cluster_connection.update()
+
+    async def _send_manager_membership_watch(
+        self,
+        manager_addr: tuple[str, int],
+        payload: bytes,
+        timeout: float,
+    ) -> bytes | Exception | None:
+        """One poll of the datacenter's manager membership watch."""
+        response, _clock = await self.send_tcp(manager_addr, "cluster_watch", payload, timeout=timeout)
+        return response
 
     async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
         """Register this worker with a manager."""
@@ -2050,29 +2113,31 @@ class WorkerServer(HealthAwareServer):
         # manager only sends to workers in its registry) proves the
         # cluster-membership relationship is intact.
         self._cluster_connection.record_heartbeat(heartbeat.node_id)
-
-    def _on_new_manager_discovered(self, manager_addr: tuple[str, int]) -> None:
-        """Handle discovery of new manager via heartbeat."""
-        self._task_runner.run(self._register_with_manager, manager_addr)
+        self._worker_state.record_manager_heartbeat()
 
     def _on_job_leadership_update(
         self,
-        job_leaderships: list[str],
+        job_leaderships: dict[str, tuple[int, int]],
         manager_addr: tuple[str, int],
         node_host: str,
         node_port: int,
         node_id_short: str,
-        task_runner_run: callable,
+        task_runner_run: RunTask,
     ) -> None:
         """Handle job leadership claims from heartbeat."""
         # Check each active workflow to see if this manager leads its job
         for workflow_id, progress in list(self._active_workflows.items()):
             job_id = progress.job_id
             if job_id in job_leaderships:
+                # A manager claiming the job leads it: the workflow is not
+                # orphaned -- also when the claimant is the leader it had,
+                # rejoining after a false death (that orphan mark was never
+                # cleared, and the workflow was cancelled at the grace
+                # period's end under a live leader).
+                self._worker_state.clear_workflow_orphaned(workflow_id)
                 current_leader = self._workflow_job_leader.get(workflow_id)
                 if current_leader != manager_addr:
                     self._workflow_job_leader[workflow_id] = manager_addr
-                    self._worker_state.clear_workflow_orphaned(workflow_id)
                     task_runner_run(
                         self._udp_logger.log,
                         ServerInfo(
@@ -2121,15 +2186,17 @@ class WorkerServer(HealthAwareServer):
 
         try:
             heartbeat = self._get_heartbeat()
-            await self.send_tcp(
+            response, _ = await self.send_tcp(
                 manager_addr,
                 "worker_heartbeat",
                 heartbeat.dump(),
-                timeout=1.0,
+                timeout=self._config.heartbeat_send_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
         except Exception as error:
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerInfo(
                     message=f"Failed to notify manager of core availability: {error}",
                     node_host=self._host,
@@ -2164,6 +2231,7 @@ class WorkerServer(HealthAwareServer):
             dispatch=dispatch,
             dispatching_addr=addr,
             allocated_cores=allocation_result.allocated_cores,
+            cores_version=allocation_result.availability_version,
             task_runner_run=self._task_runner.run,
             increment_version=self._increment_version,
             node_id_full=self._node_id.full,
@@ -2214,11 +2282,12 @@ class WorkerServer(HealthAwareServer):
 
     def _cleanup_workflow_state(self, workflow_id: str) -> None:
         """Cleanup workflow state on failure."""
-        self._worker_state.remove_active_workflow(workflow_id)
         # Phase H4 — drop the trigger's per-workflow tracker so the
         # bookkeeping dict doesn't grow unbounded across the worker's
         # lifetime.
         self._extension_trigger.forget_workflow(workflow_id)
+        # Last: its termination callbacks' failures raise.
+        self._worker_state.remove_active_workflow(workflow_id)
 
     # =========================================================================
     # Cancellation
@@ -2320,23 +2389,6 @@ class WorkerServer(HealthAwareServer):
             best_update = max(job_updates, key=lambda p: p.completed_count)
             aggregated[best_update.workflow_id] = best_update
         return aggregated
-
-    async def _report_active_workflows_to_managers(self) -> None:
-        """Report all active workflows to all healthy managers."""
-        if not self._registry._healthy_manager_ids:
-            return
-
-        for workflow_id, progress in list(self._active_workflows.items()):
-            try:
-                await self._progress_reporter.send_progress_to_all_managers(
-                    progress=progress,
-                    send_tcp=self.send_tcp,
-                )
-            except Exception as exc:
-                await self._udp_logger.log(
-                    f"Failed to report progress for workflow {workflow_id}: {exc}",
-                    level="debug",
-                )
 
     # =========================================================================
     # State Version Property (for tcp_state_sync.py)
@@ -2465,14 +2517,28 @@ class WorkerServer(HealthAwareServer):
             )
             return b"error"
 
-        # A GRANT must stretch the workflow's LOCAL deadline too: the
-        # stuck-workflow enforcement loop compares elapsed against the
-        # dispatch-time timeout, and without this the worker
-        # hard-cancels the very workflow the manager just granted more
-        # time (the extension only stretched the manager-side AD-34
-        # budget). The latched workflow id names the workflow the
-        # request was for; best-effort if it already drained.
-        if response.granted and response.extension_seconds > 0:
+        # A GRANT earned with progress must stretch the workflow's LOCAL
+        # deadline too: the stuck-workflow enforcement loop compares
+        # elapsed against the dispatch-time timeout, and without this the
+        # worker hard-cancels the very workflow the manager just granted
+        # more time. A grant with no progress behind it -- the
+        # dispatch-time request, protecting this worker's liveness
+        # through startup -- stretches neither this deadline nor the
+        # job's AD-34 budget (the manager applies the same rule): the
+        # job's explicit timeout stands. The latched workflow id names
+        # the workflow the request was for; best-effort if it already
+        # drained.
+        worker_state = self._worker_state
+        if (
+            response.granted
+            and response.extension_seconds > 0
+            and (
+                worker_state._extension_current_progress > 0.0
+                or (worker_state._extension_completed_items or 0) > 0
+                or worker_state._extension_step_transitions > 0
+                or worker_state._extension_actions_completed > 0
+            )
+        ):
             granted_workflow_id = self._worker_state._extension_workflow_id
             if granted_workflow_id:
                 self._worker_state.extend_workflow_timeout(
@@ -2481,8 +2547,7 @@ class WorkerServer(HealthAwareServer):
 
         self.clear_extension_request()
         if self._event_logger is not None:
-            self._task_runner.run(
-                self._event_logger.log,
+            await self._event_logger.log(
                 WorkerExtensionDecision(
                     message=(
                         "Extension "
@@ -2496,7 +2561,7 @@ class WorkerServer(HealthAwareServer):
                     extension_seconds=response.extension_seconds,
                     denial_reason=response.denial_reason or "",
                 ),
-                "worker_events",
+                name="worker_events",
             )
         return b"ok"
 

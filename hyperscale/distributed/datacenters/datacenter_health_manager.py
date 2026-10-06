@@ -16,16 +16,17 @@ Key insight: BUSY ≠ UNHEALTHY
 - UNHEALTHY = severe problem → try fallback datacenter
 
 See AD-16 in docs/architecture.md for full details.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
 from typing import Callable
-
-from hyperscale.distributed.models import (
-    ManagerHeartbeat,
-    DatacenterHealth,
-    DatacenterStatus,
-)
+from hyperscale.distributed.models import ManagerHeartbeat, DatacenterHealth, DatacenterStatus
 from hyperscale.distributed.datacenters.datacenter_overload_config import (
     DatacenterOverloadConfig,
     DatacenterOverloadState,
@@ -34,20 +35,13 @@ from hyperscale.distributed.datacenters.datacenter_overload_classifier import (
     DatacenterOverloadClassifier,
     DatacenterOverloadSignals,
 )
-
+from hyperscale.distributed.health.phi_accrual_config import PhiAccrualConfig
+from hyperscale.distributed.health.phi_accrual_detector import PhiAccrualDetector
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .cached_manager_info import CachedManagerInfo
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-@dataclass(slots=True)
-class CachedManagerInfo:
-    """Cached information about a manager for health tracking."""
-
-    heartbeat: ManagerHeartbeat
-    last_seen: float
-    is_alive: bool = True
 
 
 class DatacenterHealthManager:
@@ -58,7 +52,7 @@ class DatacenterHealthManager:
     DC health using the three-signal health model.
 
     Example usage:
-        manager = DatacenterHealthManager(heartbeat_timeout=30.0)
+        manager = DatacenterHealthManager(PhiAccrualConfig.for_manager_heartbeats(env))
 
         # Update manager heartbeats as they arrive
         manager.update_manager("dc-1", ("10.0.0.1", 8080), heartbeat)
@@ -75,7 +69,7 @@ class DatacenterHealthManager:
 
     def __init__(
         self,
-        heartbeat_timeout: float = 30.0,
+        phi_config: PhiAccrualConfig,
         get_configured_managers: Callable[[str], list[tuple[str, int]]] | None = None,
         overload_config: DatacenterOverloadConfig | None = None,
     ):
@@ -83,12 +77,17 @@ class DatacenterHealthManager:
         Initialize DatacenterHealthManager.
 
         Args:
-            heartbeat_timeout: Seconds before a heartbeat is considered stale.
+            phi_config: How each manager's heartbeats are judged (AD-52
+                section 8): a manager counts while its phi-accrual
+                detector is below the threshold.
             get_configured_managers: Optional callback to get configured managers
                                       for a DC (to know total expected managers).
             overload_config: Configuration for overload-based health classification.
         """
-        self._heartbeat_timeout = heartbeat_timeout
+        self._phi_config = phi_config
+        # One detector per manager edge, alive as long as its manager is
+        # tracked.
+        self._manager_detectors: dict[tuple[str, tuple[str, int]], PhiAccrualDetector] = {}
         self._get_configured_managers = get_configured_managers
         self._overload_classifier = DatacenterOverloadClassifier(overload_config)
 
@@ -120,10 +119,27 @@ class DatacenterHealthManager:
         if dc_id not in self._dc_manager_info:
             self._dc_manager_info[dc_id] = {}
 
+        now = _DEFAULT_CLOCK.monotonic()
         self._dc_manager_info[dc_id][manager_addr] = CachedManagerInfo(
             heartbeat=heartbeat,
-            last_seen=_DEFAULT_CLOCK.monotonic(),
+            last_seen=now,
             is_alive=True,
+        )
+        if (detector := self._manager_detectors.get((dc_id, manager_addr))) is None:
+            detector = PhiAccrualDetector(self._phi_config)
+            self._manager_detectors[(dc_id, manager_addr)] = detector
+        detector.heartbeat(now)
+
+    def is_manager_suspected(self, manager_addr: tuple[str, int]) -> bool:
+        """Whether phi accrual on this gate's heartbeats from the manager at
+        ``manager_addr`` is past its threshold (AD-52 section 8), in any
+        datacenter it reports in. A manager never heard from is unknown,
+        not suspected."""
+        now = _DEFAULT_CLOCK.monotonic()
+        return any(
+            not detector.is_available(now)
+            for (_datacenter_id, detector_addr), detector in self._manager_detectors.items()
+            if detector_addr == manager_addr
         )
 
     def mark_manager_dead(self, dc_id: str, manager_addr: tuple[str, int]) -> None:
@@ -136,6 +152,7 @@ class DatacenterHealthManager:
         """Remove a manager from tracking."""
         dc_managers = self._dc_manager_info.get(dc_id, {})
         dc_managers.pop(manager_addr, None)
+        self._manager_detectors.pop((dc_id, manager_addr), None)
 
     def add_datacenter(self, dc_id: str) -> None:
         """Add a datacenter to tracking (even if no managers yet)."""
@@ -169,7 +186,7 @@ class DatacenterHealthManager:
         Returns:
             DatacenterStatus with health classification.
         """
-        best_heartbeat, alive_count, total_count = self._get_best_manager_heartbeat(
+        best_heartbeat, alive_count, total_count = self.get_best_manager_heartbeat(
             dc_id
         )
 
@@ -216,7 +233,6 @@ class DatacenterHealthManager:
                 dc_id=dc_id,
                 health=DatacenterHealth.BUSY.value,
                 available_capacity=0,
-                queue_depth=getattr(best_heartbeat, "queue_depth", 0),
                 manager_count=alive_count,
                 worker_count=0,
                 last_update=_DEFAULT_CLOCK.monotonic(),
@@ -228,25 +244,18 @@ class DatacenterHealthManager:
         overload_result = self._overload_classifier.classify(signals)
 
         health = self._map_overload_state_to_health(overload_result.state)
-        healthy_workers = getattr(
-            best_heartbeat, "healthy_worker_count", best_heartbeat.worker_count
-        )
-
         self._record_health_transition(dc_id, health.value)
 
         return DatacenterStatus(
             dc_id=dc_id,
             health=health.value,
             available_capacity=best_heartbeat.available_cores,
-            queue_depth=getattr(best_heartbeat, "queue_depth", 0),
             manager_count=alive_count,
-            worker_count=healthy_workers,
+            worker_count=best_heartbeat.healthy_worker_count,
             last_update=_DEFAULT_CLOCK.monotonic(),
-            overloaded_worker_count=getattr(
-                best_heartbeat, "overloaded_worker_count", 0
-            ),
-            stressed_worker_count=getattr(best_heartbeat, "stressed_worker_count", 0),
-            busy_worker_count=getattr(best_heartbeat, "busy_worker_count", 0),
+            overloaded_worker_count=best_heartbeat.overloaded_worker_count,
+            stressed_worker_count=best_heartbeat.stressed_worker_count,
+            busy_worker_count=best_heartbeat.busy_worker_count,
             worker_overload_ratio=overload_result.worker_overload_ratio,
             health_severity_weight=overload_result.health_severity_weight,
             overloaded_manager_count=signals.overloaded_managers,
@@ -266,7 +275,6 @@ class DatacenterHealthManager:
             dc_id=dc_id,
             health=DatacenterHealth.UNHEALTHY.value,
             available_capacity=0,
-            queue_depth=0,
             manager_count=manager_count,
             worker_count=worker_count,
             last_update=_DEFAULT_CLOCK.monotonic(),
@@ -282,7 +290,6 @@ class DatacenterHealthManager:
             dc_id=dc_id,
             health=DatacenterHealth.INITIALIZING.value,
             available_capacity=0,
-            queue_depth=0,
             manager_count=0,
             worker_count=0,
             last_update=_DEFAULT_CLOCK.monotonic(),
@@ -296,16 +303,13 @@ class DatacenterHealthManager:
         dc_id: str,
     ) -> DatacenterOverloadSignals:
         manager_health_counts = self._aggregate_manager_health_states(dc_id)
-        leader_health_state = getattr(heartbeat, "health_overload_state", "healthy")
 
         return DatacenterOverloadSignals(
             total_workers=heartbeat.worker_count,
-            healthy_workers=getattr(
-                heartbeat, "healthy_worker_count", heartbeat.worker_count
-            ),
-            overloaded_workers=getattr(heartbeat, "overloaded_worker_count", 0),
-            stressed_workers=getattr(heartbeat, "stressed_worker_count", 0),
-            busy_workers=getattr(heartbeat, "busy_worker_count", 0),
+            healthy_workers=heartbeat.healthy_worker_count,
+            overloaded_workers=heartbeat.overloaded_worker_count,
+            stressed_workers=heartbeat.stressed_worker_count,
+            busy_workers=heartbeat.busy_worker_count,
             total_managers=total_managers,
             alive_managers=alive_managers,
             total_cores=heartbeat.total_cores,
@@ -313,7 +317,7 @@ class DatacenterHealthManager:
             overloaded_managers=manager_health_counts.get("overloaded", 0),
             stressed_managers=manager_health_counts.get("stressed", 0),
             busy_managers=manager_health_counts.get("busy", 0),
-            leader_health_state=leader_health_state,
+            leader_health_state=heartbeat.health_overload_state,
         )
 
     def _aggregate_manager_health_states(self, dc_id: str) -> dict[str, int]:
@@ -327,11 +331,11 @@ class DatacenterHealthManager:
         }
 
         for manager_addr, info in dc_managers.items():
-            is_fresh = (now - info.last_seen) < self._heartbeat_timeout
+            is_fresh = self._manager_detectors[(dc_id, manager_addr)].is_available(now)
             if not is_fresh or not info.is_alive:
                 continue
 
-            health_state = getattr(info.heartbeat, "health_overload_state", "healthy")
+            health_state = info.heartbeat.health_overload_state
             if health_state in counts:
                 counts[health_state] += 1
             else:
@@ -352,8 +356,7 @@ class DatacenterHealthManager:
         return mapping.get(state, DatacenterHealth.DEGRADED)
 
     def get_health_severity_weight(self, dc_id: str) -> float:
-        status = self.get_datacenter_health(dc_id)
-        return getattr(status, "health_severity_weight", 1.0)
+        return self.get_datacenter_health(dc_id).health_severity_weight
 
     def _record_health_transition(self, dc_id: str, new_health: str) -> None:
         previous_health = self._previous_health_states.get(dc_id)
@@ -400,7 +403,7 @@ class DatacenterHealthManager:
     # Manager Selection
     # =========================================================================
 
-    def _get_best_manager_heartbeat(
+    def get_best_manager_heartbeat(
         self, dc_id: str
     ) -> tuple[ManagerHeartbeat | None, int, int]:
         """
@@ -422,7 +425,7 @@ class DatacenterHealthManager:
         alive_count = 0
 
         for manager_addr, info in dc_managers.items():
-            is_fresh = (now - info.last_seen) < self._heartbeat_timeout
+            is_fresh = self._manager_detectors[(dc_id, manager_addr)].is_available(now)
 
             if is_fresh and info.is_alive:
                 alive_count += 1
@@ -452,7 +455,7 @@ class DatacenterHealthManager:
         now = _DEFAULT_CLOCK.monotonic()
 
         for manager_addr, info in dc_managers.items():
-            is_fresh = (now - info.last_seen) < self._heartbeat_timeout
+            is_fresh = self._manager_detectors[(dc_id, manager_addr)].is_available(now)
             if is_fresh and info.is_alive and info.heartbeat.is_leader:
                 return manager_addr
 
@@ -465,7 +468,7 @@ class DatacenterHealthManager:
 
         result: list[tuple[str, int]] = []
         for manager_addr, info in dc_managers.items():
-            is_fresh = (now - info.last_seen) < self._heartbeat_timeout
+            is_fresh = self._manager_detectors[(dc_id, manager_addr)].is_available(now)
             if is_fresh and info.is_alive:
                 result.append(manager_addr)
 
@@ -502,17 +505,15 @@ class DatacenterHealthManager:
     # Cleanup
     # =========================================================================
 
-    def cleanup_stale_managers(self, max_age_seconds: float | None = None) -> int:
+    def cleanup_stale_managers(self, max_age_seconds: float) -> int:
         """
-        Remove managers with stale heartbeats.
-
-        Args:
-            max_age_seconds: Override timeout (defaults to configured timeout).
+        Remove managers not heard from for ``max_age_seconds``, and their
+        detectors.
 
         Returns:
             Number of managers removed.
         """
-        timeout = max_age_seconds or self._heartbeat_timeout
+        timeout = max_age_seconds
         now = _DEFAULT_CLOCK.monotonic()
         removed = 0
 
@@ -526,6 +527,14 @@ class DatacenterHealthManager:
 
             for addr in to_remove:
                 dc_managers.pop(addr, None)
+                self._manager_detectors.pop((dc_id, addr), None)
                 removed += 1
 
         return removed
+
+_REHOMED = (
+    CachedManagerInfo,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

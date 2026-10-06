@@ -365,11 +365,7 @@ class MockServerInterface:
     async def decrease_failure_detector(self, reason: str) -> None:
         pass
 
-    def get_lhm_adjusted_timeout(
-        self,
-        base_timeout: float,
-        target_node_id: str | None = None,
-    ) -> float:
+    def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
         return base_timeout
 
     # === Suspicion ===
@@ -702,13 +698,6 @@ class MockServerInterface:
 
     async def context_with_value(self, target: tuple[str, int]) -> "MockContextManager":
         return MockContextManager()
-
-    async def write_context(self, key: Any, value: Any) -> None:
-        if key == "nodes":
-            pass
-        elif isinstance(key, tuple):
-            if key not in self._nodes:
-                self._nodes[key] = asyncio.Queue()
 
     # === Leadership Broadcasting ===
 

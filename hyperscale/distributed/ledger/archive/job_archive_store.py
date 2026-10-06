@@ -118,16 +118,20 @@ class JobArchiveStore:
         if not await self._filesystem.exists(archive_path):
             return False
 
-        try:
-            await self._filesystem.remove(archive_path)
-            return True
-        except OSError:
-            return False
+        # False means there was nothing to delete; a failed removal raises.
+        await self._filesystem.remove(archive_path)
+        return True
 
     async def cleanup_older_than(
         self, max_age_ms: int, current_time_ms: int
     ) -> int:
+        """Remove archive shards older than ``max_age_ms``; returns how many
+        archive files were removed. Every shard is attempted; removals that
+        failed then raise together, so a sweep never reports success over
+        files it left behind. Directories not named by a shard timestamp
+        are not ours and are left alone."""
         removed_count = 0
+        removal_errors: list[OSError] = []
 
         if not await self._filesystem.exists(self._archive_dir):
             return removed_count
@@ -152,13 +156,18 @@ class JobArchiveStore:
                     try:
                         await self._filesystem.remove(archive_file)
                         removed_count += 1
-                    except OSError:
-                        pass
+                    except OSError as removal_error:
+                        removal_errors.append(removal_error)
 
                 try:
                     await self._filesystem.remove_directory(shard_dir)
-                except OSError:
-                    pass
+                except OSError as removal_error:
+                    removal_errors.append(removal_error)
 
+        if removal_errors:
+            raise ExceptionGroup(
+                f"archive cleanup removed {removed_count} files but failed {len(removal_errors)} removals",
+                removal_errors,
+            )
         return removed_count
 

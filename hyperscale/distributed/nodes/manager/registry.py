@@ -5,7 +5,7 @@ Provides centralized registration and tracking of workers, gates,
 and peer managers.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
     WorkerRegistration,
@@ -36,18 +36,26 @@ class ManagerRegistry:
         logger: "Logger",
         node_id: str,
         task_runner: "TaskRunner",
+        on_worker_unregistered: Callable[[str], None],
     ) -> None:
+        """
+        Args:
+            on_worker_unregistered: Hears each worker this registry
+                forgets, so state kept beside it (AD-26 extension tracking)
+                is forgotten with it.
+        """
         self._state: "ManagerState" = state
         self._config: "ManagerConfig" = config
         self._logger: "Logger" = logger
         self._node_id: str = node_id
         self._task_runner: "TaskRunner" = task_runner
+        self._on_worker_unregistered = on_worker_unregistered
         self._worker_pool: "WorkerPool | None" = None
 
     def set_worker_pool(self, worker_pool: "WorkerPool") -> None:
         self._worker_pool = worker_pool
 
-    def register_worker(
+    async def register_worker(
         self,
         registration: WorkerRegistration,
     ) -> None:
@@ -86,13 +94,12 @@ class ManagerRegistry:
         # Initialize circuit breaker for this worker
         if worker_id not in self._state._worker_circuits:
             self._state._worker_circuits[worker_id] = ErrorStats(
-                max_errors=5,
-                window_seconds=60.0,
-                half_open_after=30.0,
+                max_errors=self._config.circuit_breaker_max_errors,
+                window_seconds=self._config.circuit_breaker_window_seconds,
+                half_open_after=self._config.circuit_breaker_half_open_after_seconds,
             )
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerInfo(
                 message=f"Worker {worker_id[:8]}... registered with {registration.total_cores} cores",
                 node_host=self._config.host,
@@ -123,10 +130,12 @@ class ManagerRegistry:
         self._state._dispatch_semaphores.pop(worker_id, None)
 
         progress_keys_to_remove = [
-            key for key in self._state._worker_job_last_progress if key[0] == worker_id
+            key for key in self._state._worker_job_last_progress if key[1] == worker_id
         ]
         for key in progress_keys_to_remove:
             self._state._worker_job_last_progress.pop(key, None)
+
+        self._on_worker_unregistered(worker_id)
 
     def get_worker(self, worker_id: str) -> WorkerRegistration | None:
         """Get worker registration by ID."""
@@ -242,7 +251,7 @@ class ManagerRegistry:
 
         return buckets
 
-    def register_gate(self, gate_info: GateInfo) -> None:
+    async def register_gate(self, gate_info: GateInfo) -> None:
         """
         Register a gate with this manager.
 
@@ -266,8 +275,7 @@ class ManagerRegistry:
         self._state._known_gates[gate_info.node_id] = gate_info
         self._state._healthy_gate_ids.add(gate_info.node_id)
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerInfo(
                 message=f"Gate {gate_info.node_id[:8]}... registered",
                 node_host=self._config.host,
@@ -321,7 +329,7 @@ class ManagerRegistry:
             self._state._healthy_gate_ids.add(gate_id)
             self._state._gate_unhealthy_since.pop(gate_id, None)
 
-    def register_manager_peer(self, peer_info: ManagerInfo) -> None:
+    async def register_manager_peer(self, peer_info: ManagerInfo) -> None:
         """
         Register a manager peer.
 
@@ -344,8 +352,7 @@ class ManagerRegistry:
 
         self._state._known_manager_peers[peer_info.node_id] = peer_info
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerDebug(
                 message=f"Manager peer {peer_info.node_id[:8]}... registered",
                 node_host=self._config.host,

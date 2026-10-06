@@ -8,21 +8,16 @@ from .latency_observation import LatencyObservation
 from .latency_slo import LatencySLO
 from .slo_config import SLOConfig
 
-from hyperscale.distributed.runtime import Clock, RealClock
-
-
-_DEFAULT_CLOCK: Clock = RealClock()
-
 
 @dataclass(slots=True)
 class SLOHealthClassifier:
     """Converts SLO compliance to AD-16 health signal."""
 
-    _config: SLOConfig = field(default_factory=SLOConfig.from_env)
+    _config: SLOConfig
     _violation_start: dict[str, float] = field(default_factory=dict, init=False)
 
     @classmethod
-    def from_env(cls, env: Env | None = None) -> "SLOHealthClassifier":
+    def from_env(cls, env: Env) -> "SLOHealthClassifier":
         return cls(_config=SLOConfig.from_env(env))
 
     def _violation_duration(
@@ -37,14 +32,20 @@ class SLOHealthClassifier:
             return 0.0
         return now - start_time
 
+    def forget(self, datacenter_id: str) -> None:
+        """No violation is under way at ``datacenter_id`` any more (it has
+        too few observations to judge)."""
+        self._violation_start.pop(datacenter_id, None)
+
     def compute_health_signal(
         self,
         datacenter_id: str,
         slo: LatencySLO,
         observation: LatencyObservation,
+        now: float,
     ) -> str:
-        """Return HEALTHY, BUSY, DEGRADED, or UNHEALTHY."""
-        now = _DEFAULT_CLOCK.monotonic()
+        """Return HEALTHY, BUSY, DEGRADED, or UNHEALTHY, judging violation
+        durations at ``now`` (the observing node's monotonic time)."""
         p50_ratio = observation.p50_ms / slo.p50_target_ms
         p95_ratio = observation.p95_ms / slo.p95_target_ms
         p99_ratio = observation.p99_ms / slo.p99_target_ms

@@ -260,8 +260,7 @@ class GateManagerHandler:
 
             # Cluster isolation validation (AD-28 Issue 2)
             if heartbeat.cluster_id != self._env.CLUSTER_ID:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Manager {heartbeat.node_id} rejected: cluster_id mismatch "
                         f"(manager={heartbeat.cluster_id}, gate={self._env.CLUSTER_ID})",
@@ -281,8 +280,7 @@ class GateManagerHandler:
                 ).dump()
 
             if heartbeat.environment_id != self._env.ENVIRONMENT_ID:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Manager {heartbeat.node_id} rejected: environment_id mismatch "
                         f"(manager={heartbeat.environment_id}, gate={self._env.ENVIRONMENT_ID})",
@@ -313,8 +311,7 @@ class GateManagerHandler:
                     # environment, so defaulted claims would pass
                     # validate_claims below (and parse to CLIENT, an
                     # allowed edge into gates).
-                    self._task_runner.run(
-                        self._logger.log,
+                    await self._logger.log(
                         ServerWarning(
                             message=(
                                 f"Manager {heartbeat.node_id} rejected: "
@@ -336,8 +333,7 @@ class GateManagerHandler:
 
                 validation_result = self._role_validator.validate_claims(claims)
                 if not validation_result.allowed:
-                    self._task_runner.run(
-                        self._logger.log,
+                    await self._logger.log(
                         ServerWarning(
                             message=f"Manager {heartbeat.node_id} rejected: certificate claims validation failed - {validation_result.reason}",
                             node_host=self._get_host(),
@@ -357,8 +353,7 @@ class GateManagerHandler:
                 if not self._role_validator.is_allowed(
                     claims.role, SecurityNodeRole.GATE
                 ):
-                    self._task_runner.run(
-                        self._logger.log,
+                    await self._logger.log(
                         ServerWarning(
                             message=f"Manager {heartbeat.node_id} rejected: role-based access denied ({claims.role.value}->gate not allowed)",
                             node_host=self._get_host(),
@@ -378,8 +373,7 @@ class GateManagerHandler:
                 if not self._role_validator.is_allowed(
                     SecurityNodeRole.MANAGER, SecurityNodeRole.GATE
                 ):
-                    self._task_runner.run(
-                        self._logger.log,
+                    await self._logger.log(
                         ServerWarning(
                             message=f"Manager {heartbeat.node_id} registration rejected: role-based access denied (manager->gate not allowed)",
                             node_host=self._get_host(),
@@ -417,8 +411,7 @@ class GateManagerHandler:
             )
 
             if not negotiated.compatible:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Manager registration rejected: incompatible protocol version "
                         f"{manager_version} (we are {CURRENT_PROTOCOL_VERSION})",
@@ -449,8 +442,7 @@ class GateManagerHandler:
                     manager_addr, datacenter_id, backpressure_signal
                 )
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=f"Manager registered: {heartbeat.node_id} from DC {datacenter_id} "
                     f"({heartbeat.worker_count} workers, protocol {manager_version}, "
@@ -529,8 +521,7 @@ class GateManagerHandler:
 
             dc_managers = self._datacenter_managers.setdefault(datacenter_id, [])
             if manager_addr not in dc_managers:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerInfo(
                         message=f"Discovered manager {manager_addr} in DC {datacenter_id} via gate {broadcast.source_gate_id}",
                         node_host=self._get_host(),
@@ -590,8 +581,7 @@ class GateManagerHandler:
         try:
             push = ReporterResultPush.load(data)
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=(
                         f"Received reporter result for job {push.job_id[:8]}... "
@@ -612,16 +602,18 @@ class GateManagerHandler:
                 return b"no_callback"
 
             try:
-                await self._send_tcp(
+                response, _ = await self._send_tcp(
                     callback_addr,
                     "reporter_result_push",
                     data,
                     timeout=self._env.GATE_TCP_TIMEOUT_STANDARD,
                 )
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response, Exception):
+                    raise response
                 return b"ok"
             except Exception as forward_error:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=(
                             f"Failed to forward reporter result for job {push.job_id[:8]}... "

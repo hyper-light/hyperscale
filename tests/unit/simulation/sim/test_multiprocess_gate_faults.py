@@ -35,10 +35,12 @@ skip-marked where the probes exposed gaps:
   SAME loud completion as the kill case via peer-gate failover; the
   rebooted generation rejoins without split-brain. The durable-resume
   invariant is skip-marked.
-* gate_partition — heal-bounded peer isolation causes ZERO membership
-  churn (the no-false-death property); TOTAL isolation (peers +
-  manager) elects a majority leader in ~10.5s, the islanded ex-leader
-  steps down at heal, the split-window is harmless — and the
+* gate_partition — heal-bounded peer isolation of the leader causes
+  NO false deaths (the no-false-death property) while the majority
+  re-elects and the cut ex-leader steps down at heal; TOTAL
+  isolation (peers + manager) elects a majority leader in ~10.5s,
+  the islanded ex-leader steps down at heal, the split-window is
+  harmless — and the
   peer-readmission watch restores FULL membership within one check
   tick of the heal (every gate back to 2 active peers by ~108).
 * client connectivity — submission-window cuts converge acceptance
@@ -464,12 +466,14 @@ def test_restart_submission_gate_is_replay_deterministic():
     assert _run_restart_submission_gate() == _run_restart_submission_gate()
 
 
-# Midpoint of the probed window between the gate's accepted dispatch
-# (10.05) and the job's natural completion (11.14), seed 211: gen-1
-# dies after recording the acceptance and before the first completion
-# send. Re-probed 2026-10-01 after the gate's per-job Raft groups
-# shifted its dispatch-retry jitter (accept moved from 8.95 to 10.05).
-_DURABLE_RESTART_AT = 10.6
+# Midpoint of the probed window between the dispatch landing on the
+# worker (8.25) and the job's completion send (~9.2; the client sees it
+# at 9.26), seed 211: gen-1 dies after recording the acceptance (8.08)
+# and before the first completion send. Re-probed 2026-10-04: the gate
+# now accepts at 8.08, as soon as the client submits, once a lone
+# manager leads the moment its own vote is the majority (Raft section
+# 5.2) -- 10.05 while it waited out a full pre-vote and vote wait.
+_DURABLE_RESTART_AT = 8.7
 _DURABLE_DOWN_SECONDS = 8.0
 _DURABLE_GEN2_BOOT = _DURABLE_RESTART_AT + _DURABLE_DOWN_SECONDS
 _DURABLE_WORKFLOW_SECONDS = 20.0
@@ -495,12 +499,13 @@ def _run_durable_gate_restart() -> dict:
     completion the manager's obligation machinery is still resending —
     the two halves of the durable story meeting.
 
-    Probed timeline (seed 211): gate warm ~5.5, submit_at 8.0 accepted
-    8.14 (durable acceptance recorded), dispatch ~8.6, restart at 9.0
-    (down 8 — covers the job's ~9.9 completion instant, so the first
-    completion send dies with gen-1), gen-2 boots ~17 and recovers the
-    job from the WAL, the obligation resend delivers the final result
-    to gen-2, and the client observes ``completed``."""
+    Probed timeline (seed 211, 2026-10-04): gate started 2.04, submit_at
+    8.0 accepted 8.08 (durable acceptance recorded), dispatch on the
+    worker 8.25, restart at 8.7 (down 8 — covers the job's ~9.2
+    completion instant, so the first completion send dies with gen-1),
+    gen-2 boots 16.7 and recovers the job from the WAL, the obligation
+    resend delivers the final result to gen-2, and the client observes
+    ``completed`` at 19.22."""
     coordinator = SimulationCoordinator(
         latency=0.01, max_virtual_time=_DURABLE_CEILING, seed=_DURABLE_SEED
     )
@@ -613,13 +618,13 @@ def test_restarted_gate_resumes_its_own_jobs_from_durable_state():
         f"its ledger: {client_log}"
     )
     assert _DURABLE_GEN2_BOOT < finished[0][2] < submitted[0][1] + 60.0, client_log
-    # 19.941 (was 24.961): the completion push used to send wire
-    # action "global_job_result", which NO endpoint implements, so
-    # every push burned its full 5s send timeout before the chain
-    # could continue. With the duplicate-definition merge the push
-    # uses the client's real receiver and the terminal lands one
-    # timeout window sooner.
-    assert abs(finished[0][2] - 19.941) <= 2.0, client_log
+    # 19.22 (2026-10-04; gen-2 boots at 16.7): 19.941 with the restart
+    # at 10.6, before a lone manager led the moment its own vote was the
+    # majority; 24.961 before that, when the completion push sent wire
+    # action "global_job_result", which NO endpoint implements, so every
+    # push burned its full 5s send timeout before the chain could
+    # continue.
+    assert abs(finished[0][2] - 19.22) <= 2.0, client_log
 
     assert not JobStatusOracle().check_client_log(client_log), client_log
     _assert_no_unswapped_seams(results)
@@ -634,29 +639,53 @@ def test_durable_gate_restart_is_replay_deterministic():
 # =========================================================================
 
 
+_PEER_CUT_AT = 10.0
+_PEER_CUT_HEALS_AT = 45.0
+
+
 def _run_leader_peer_isolation() -> dict:
     """Cut BOTH of the leader's peer links (gate-c <-> a and c <-> b)
     for 35 virtual seconds spanning live execution, leaving the
     leader's MANAGER link intact.
 
-    Probed invariant (the no-false-death property, gate tier): a 35s
-    peer cut is well inside the witness-less death bound (~[25,85]s of
-    SUSTAINED silence measured from suspicion, and leadership liveness
-    still disseminates via the manager plane), so the tier rides it
-    out with ZERO membership churn — no peer-count drop, no election,
-    no second leader — and the job (owned by gate-a, unpartitioned)
-    completes at the baseline instant."""
+    Probed invariants (gate tier): a 35s peer cut is well inside the
+    witness-less death bound (~[25,85]s of SUSTAINED silence measured
+    from suspicion; indirect probes through the manager keep reaching
+    gate-c), so membership rides it out with NO false deaths. Leader
+    heartbeats travel only over the peer links, so the peers' leases
+    on gate-c lapse and the two of them -- a majority of three --
+    elect gate-a in their first round (probed: t=14.5); the cut leader
+    keeps its flag until the heal shows it the higher term and steps
+    down (probed: t=46.5). The job (owned by gate-a, unpartitioned)
+    completes at the baseline instant.
+
+    The cut gate's suspicions of gate-a reach it many times over, re-
+    gossiped through the manager. Each copy below gate-a's refuted
+    incarnation is superseded and costs no local health: before that
+    rule each copy raised gate-a's LHM (probed: 0 -> 6 by t=22.4),
+    driving the elected leader past its eligibility bound into a step-
+    down and a second election mid-cut.
+
+    Pinned before 2026-10-03 as "no election": each gate also recorded
+    ITSELF in its peer roles from gossip about it, so a three-gate tier
+    counted four and needed all three gates to elect."""
     coordinator = _build_cluster(_SEED, 180.0, wait_timeout=120.0)
     coordinator.schedule_partition(
-        _INITIAL_LEADER_GATE, _FOLLOWER_GATE, 10.0, heal_time=45.0
+        _INITIAL_LEADER_GATE,
+        _FOLLOWER_GATE,
+        _PEER_CUT_AT,
+        heal_time=_PEER_CUT_HEALS_AT,
     )
     coordinator.schedule_partition(
-        _INITIAL_LEADER_GATE, _SUBMISSION_GATE, 10.0, heal_time=45.0
+        _INITIAL_LEADER_GATE,
+        _SUBMISSION_GATE,
+        _PEER_CUT_AT,
+        heal_time=_PEER_CUT_HEALS_AT,
     )
     return coordinator.run()
 
 
-def test_leader_peer_isolation_causes_no_false_deaths_or_churn():
+def test_leader_peer_isolation_reelects_without_false_deaths():
     results = _run_leader_peer_isolation()
     _assert_no_unswapped_seams(results)
 
@@ -680,22 +709,48 @@ def test_leader_peer_isolation_causes_no_false_deaths_or_churn():
             peer_counts,
         )
 
-    # Leadership never moved: the isolated leader retains its single
-    # flag (leadership visibility rides the intact manager plane), and
-    # no second leader ever arose anywhere.
+    # The majority elects exactly one leader while the cut holds, and
+    # never before a peer's lease on the cut leader could have lapsed:
+    # the last heartbeat to reach them left at most one heartbeat
+    # interval before the cut.
+    leader_env = Env()
+    earliest_lease_lapse = (
+        _PEER_CUT_AT
+        + leader_env.LEADER_LEASE_DURATION
+        - leader_env.LEADER_HEARTBEAT_INTERVAL
+    )
+    majority_claims = [
+        (gate_pid, entry[2])
+        for gate_pid in (_FOLLOWER_GATE, _SUBMISSION_GATE)
+        for entry in results[gate_pid]
+        if entry[0] == "gate-leader" and entry[1] == 1
+    ]
+    assert len(majority_claims) == 1, majority_claims
+    ((elected_gate, elected_at),) = majority_claims
+    assert earliest_lease_lapse < elected_at < _PEER_CUT_HEALS_AT, (
+        majority_claims
+    )
+
+    # The cut leader steps down once the heal shows it the higher term
+    # (within one lease of the heal) and never claims again; the
+    # majority's leader keeps leadership through the heal.
+    cut_leader_moves = [
+        entry
+        for entry in results[_INITIAL_LEADER_GATE]
+        if entry[0] == "gate-leader" and entry[2] > _PEER_CUT_AT
+    ]
+    assert len(cut_leader_moves) == 1 and cut_leader_moves[0][1] == 0, (
+        cut_leader_moves
+    )
+    assert (
+        cut_leader_moves[0][2]
+        <= _PEER_CUT_HEALS_AT + leader_env.LEADER_LEASE_DURATION
+    ), cut_leader_moves
+
     flags = _final_leader_flags(results, _GATE_PIDS)
     assert flags == {
-        _FOLLOWER_GATE: 0,
-        _SUBMISSION_GATE: 0,
-        _INITIAL_LEADER_GATE: 1,
+        gate_pid: int(gate_pid == elected_gate) for gate_pid in _GATE_PIDS
     }, flags
-    for gate_pid in (_FOLLOWER_GATE, _SUBMISSION_GATE):
-        claims = [
-            entry
-            for entry in results[gate_pid]
-            if entry[0] == "gate-leader" and entry[1] == 1
-        ]
-        assert not claims, (gate_pid, claims)
 
 
 def test_leader_peer_isolation_is_replay_deterministic():
@@ -813,6 +868,61 @@ def test_leader_total_isolation_majority_elects_and_islander_steps_down():
 
 def test_leader_total_isolation_is_replay_deterministic():
     assert _run_leader_total_isolation() == _run_leader_total_isolation()
+
+
+_DATACENTER_CUT_HEALS_AT = 60.0
+
+
+def _run_leader_without_datacenters() -> dict:
+    """Cut the gate that wins the baseline election (gate-c) from the
+    manager from boot until t=60, so it reaches no datacenter.
+
+    AD-19: a gate that cannot do a leader's work leaves leadership to a
+    live peer whose heartbeat says it can. Probed: gate-c never claims
+    (its datacenter stays INITIALIZING -- no manager heartbeat ever
+    arrives -- until the heal); gate-b claims at 3.0, one round after the
+    baseline's 2.0; the healed gate-c rejoins as a follower and leadership
+    stays put. Before the rule, gate-c won at 2.0 and led the tier with no
+    datacenter to dispatch to."""
+    coordinator = _build_cluster(_SEED, 120.0, wait_timeout=90.0)
+    coordinator.schedule_partition(
+        _INITIAL_LEADER_GATE,
+        "manager",
+        0.0,
+        heal_time=_DATACENTER_CUT_HEALS_AT,
+    )
+    return coordinator.run()
+
+
+def test_a_gate_without_datacenters_leaves_leadership_to_a_ready_peer():
+    results = _run_leader_without_datacenters()
+    _assert_no_unswapped_seams(results)
+    _assert_clean_completed_client(results["client"], "leader-without-datacenters")
+
+    cut_gate_claims = [
+        entry
+        for entry in results[_INITIAL_LEADER_GATE]
+        if entry[0] == "gate-leader" and entry[1] == 1
+    ]
+    assert not cut_gate_claims, cut_gate_claims
+
+    ready_gate_claims = [
+        (gate_pid, entry[2])
+        for gate_pid in (_FOLLOWER_GATE, _SUBMISSION_GATE)
+        for entry in results[gate_pid]
+        if entry[0] == "gate-leader" and entry[1] == 1
+    ]
+    assert len(ready_gate_claims) == 1, ready_gate_claims
+    assert ready_gate_claims[0][1] < _DATACENTER_CUT_HEALS_AT, ready_gate_claims
+
+    flags = _final_leader_flags(results, _GATE_PIDS)
+    assert flags == {
+        gate_pid: int(gate_pid == ready_gate_claims[0][0]) for gate_pid in _GATE_PIDS
+    }, flags
+
+
+def test_leader_without_datacenters_is_replay_deterministic():
+    assert _run_leader_without_datacenters() == _run_leader_without_datacenters()
 
 
 def test_gate_peers_readmit_after_total_isolation_heals():
@@ -938,27 +1048,33 @@ def test_submission_blackout_is_replay_deterministic():
     assert _run_submission_blackout() == _run_submission_blackout()
 
 
-# Between the client-observed acceptance (8.382) and the gate's dispatch
+# Between the client-observed acceptance (6.2766) and the gate's dispatch
 # to the manager, so the whole dispatch window lands inside the cut. With
 # dc-1 healthy at submission the dispatch follows acceptance within
-# milliseconds (probed: a cut from 8.385 or 8.39 catches it, one from
-# 8.441 -- the midpoint of acceptance and worker activation at 8.5 --
-# does not), so the baseline acceptance/running midpoint no longer lies
-# inside the window. Re-probed 2026-10-01 on the clock-offset fencing base.
-_DISPATCH_WINDOW_CUT_AT = 8.386
+# milliseconds (probed 2026-10-04: a cut from 6.2786 or 6.2806 catches it,
+# one from 6.29 does not). Acceptance was 8.382 while a lone manager
+# waited out a full pre-vote and vote wait for a majority its own vote
+# already made.
+_DISPATCH_WINDOW_CUT_AT = 6.2786
 _DISPATCH_WINDOW_HEAL_AT = 26.0
+# The gate's dispatch retry (dispatch_coordinator._try_dispatch_to_manager):
+# an attempt sent into the cut ends at its send timeout, and the next waits
+# a full-jitter backoff of at most one leader heartbeat -- for as long as
+# the datacenter's leader failover lasts.
+_DISPATCH_RETRY_BACKOFF_CAP_SECONDS = Env().LEADER_HEARTBEAT_INTERVAL
 
 
 def _run_dispatch_window_manager_partition() -> dict:
     """Cut the ACCEPTING gate (gate-a) from the manager from between the
-    baseline acceptance (8.382) and its dispatch (before 8.441) until
+    baseline acceptance (6.2766) and its dispatch (before 6.29) until
     t=26 — so the ENTIRE dispatch window lands inside the cut.
 
     Probed invariant: an accepted job's dispatch is not a one-shot —
     the gate retries against the cut for its whole span and lands the
-    dispatch immediately after heal ('running' at t=26.88, worker
-    active [26.75, 33.25], completion at t=32.853 = post-heal dispatch +
-    the full 6s duration + push). No failure, no silence, no
+    dispatch on its first retry after heal ('running' at t=30.28 --
+    the attempt in flight at the heal ends at its send timeout, the next
+    waits its jittered backoff; completion at t=36.30 = post-heal
+    dispatch + the full 6s duration + push). No failure, no silence, no
     leadership disturbance. (Contrast, documented in the report: a
     SECOND job's dispatch dies in ~5.4s — the retry robustness exists
     only on this first-job path today.)"""
@@ -991,19 +1107,25 @@ def test_dispatch_window_manager_partition_retries_across_the_cut():
     submitted = [entry for entry in client_log if entry[0] == "job-submitted"]
     assert submitted and submitted[0][1] < _DISPATCH_WINDOW_CUT_AT, client_log
 
-    # Execution began only AFTER the heal (probed 'running' at 26.88):
-    # the dispatch rode the entire 20s cut on retries instead of
-    # failing the accepted job.
+    # Execution began only AFTER the heal (probed 'running' at 30.28),
+    # on the first retry after it: the attempt in flight at the heal ends
+    # at its send timeout, and the next waits at most one capped backoff.
+    # The dispatch rode the entire 20s cut on retries instead of failing
+    # the accepted job.
+    first_retry_after_heal = (
+        _DISPATCH_WINDOW_HEAL_AT + Env().GATE_TCP_TIMEOUT_STANDARD + _DISPATCH_RETRY_BACKOFF_CAP_SECONDS
+    )
     running_seen = [
         entry
         for entry in client_log
         if entry[0] == "status-seen" and entry[1] == "running"
     ]
-    assert running_seen and 26.0 < running_seen[0][2] <= 29.0, client_log
+    assert running_seen and _DISPATCH_WINDOW_HEAL_AT < running_seen[0][2] <= first_retry_after_heal, client_log
 
     # Completion = post-heal dispatch + the full duration + push
-    # (probed 32.853); past 36 would mean extra dispatch cycles.
-    assert 32.0 < finish_time < 36.0, client_log
+    # (probed 36.30, 6.02 after 'running'); a later one would mean extra
+    # dispatch cycles.
+    assert abs((finish_time - running_seen[0][2]) - 6.02) <= 1.0, client_log
 
     # The membership plane never flinched: single stable leader.
     flags = _final_leader_flags(results, _GATE_PIDS)

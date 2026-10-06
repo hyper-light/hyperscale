@@ -5,16 +5,15 @@ AD-38 GLOBAL durability for the gate job ledger: copies in more than one region.
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
-import cloudpickle
 import msgspec
 
 from hyperscale.distributed.raft.logging_models import RaftDebug
 from hyperscale.distributed.raft.models import (
-    GateRaftCommandType,
     LedgerPlacementQuery,
     LedgerPlacementResult,
     RaftLogEntry,
 )
+from hyperscale.distributed.raft.models.ledger_append_command import LEDGER_APPEND_COMMAND, LedgerAppendCommand
 from hyperscale.distributed.raft.raft_node import HEARTBEAT_INTERVAL
 
 if TYPE_CHECKING:
@@ -141,6 +140,6 @@ class LedgerRegionSpan:
 
 
 def _carries_payload(log_entry: RaftLogEntry, payload: bytes) -> bool:
-    if log_entry.command_type != GateRaftCommandType.LEDGER_APPEND.value:
+    if log_entry.command_type != LEDGER_APPEND_COMMAND:
         return False
-    return cloudpickle.loads(log_entry.command).ledger_payload == payload
+    return msgspec.msgpack.decode(log_entry.command, type=LedgerAppendCommand).ledger_payload == payload

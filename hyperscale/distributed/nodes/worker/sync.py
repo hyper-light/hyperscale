@@ -6,7 +6,10 @@ for manager synchronization.
 """
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from .models.worker_state_sync_snapshot import WorkerStateSyncSnapshot
+from .models.worker_workflow_sync_snapshot import WorkerWorkflowSyncSnapshot
 
 if TYPE_CHECKING:
     from hyperscale.distributed.models import WorkflowProgress
@@ -46,7 +49,7 @@ class WorkerStateSync:
         available_cores: int,
         total_cores: int,
         workflow_job_leaders: dict[str, tuple[str, int]],
-    ) -> dict[str, Any]:
+    ) -> WorkerStateSyncSnapshot:
         """
         Generate a state snapshot for manager sync requests.
 
@@ -60,7 +63,7 @@ class WorkerStateSync:
         Returns:
             Dictionary containing worker state snapshot
         """
-        workflow_snapshots = {}
+        workflow_snapshots: dict[str, WorkerWorkflowSyncSnapshot] = {}
         for workflow_id, progress in active_workflows.items():
             workflow_snapshots[workflow_id] = {
                 "job_id": progress.job_id,
@@ -81,7 +84,7 @@ class WorkerStateSync:
             "workflows": workflow_snapshots,
         }
 
-    def apply_snapshot(self, snapshot: dict[str, Any]) -> bool:
+    def apply_snapshot(self, snapshot: WorkerStateSyncSnapshot) -> bool:
         """
         Apply a state snapshot from a peer.
 

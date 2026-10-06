@@ -5,14 +5,26 @@ Handles manager heartbeats from SWIM and peer confirmation logic.
 Extracted from worker_impl.py for modularity.
 """
 
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Awaitable, Callable, TYPE_CHECKING
 
 from hyperscale.distributed.models import ManagerHeartbeat, ManagerInfo
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerInfo
+from hyperscale.distributed.runtime import RunTask
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
     from .registry import WorkerRegistry
+
+# A manager first seen in a heartbeat, by its TCP address.
+# Registers this worker with a manager it just discovered; submitted to the
+# task runner, which awaits it on the event loop.
+NewManagerDiscoveredFunc = Callable[[tuple[str, int]], Awaitable[bool]]
+# A manager's job leadership claims (job id -> claim), its TCP address, this
+# worker's host, port and short node id, and the task runner's ``run``.
+JobLeadershipUpdateFunc = Callable[
+    [dict[str, tuple[int, int]], tuple[str, int], str, int, str, RunTask],
+    None,
+]
 
 
 class WorkerHeartbeatHandler:
@@ -39,13 +51,13 @@ class WorkerHeartbeatHandler:
         self._logger: "Logger | None" = logger
 
         # Callbacks for registration and job leadership updates
-        self._on_new_manager_discovered: "Callable[..., Any] | None" = None
-        self._on_job_leadership_update: "Callable[..., Any] | None" = None
+        self._on_new_manager_discovered: NewManagerDiscoveredFunc | None = None
+        self._on_job_leadership_update: JobLeadershipUpdateFunc | None = None
 
     def set_callbacks(
         self,
-        on_new_manager_discovered: Callable[..., Any] | None = None,
-        on_job_leadership_update: Callable[..., Any] | None = None,
+        on_new_manager_discovered: NewManagerDiscoveredFunc | None = None,
+        on_job_leadership_update: JobLeadershipUpdateFunc | None = None,
     ) -> None:
         """
         Set callbacks for heartbeat events.
@@ -61,11 +73,11 @@ class WorkerHeartbeatHandler:
         self,
         heartbeat: ManagerHeartbeat,
         source_addr: tuple[str, int],
-        confirm_peer: callable,
+        confirm_peer: Callable[[tuple[str, int]], Awaitable[bool]],
         node_host: str,
         node_port: int,
         node_id_short: str,
-        task_runner_run: callable,
+        task_runner_run: RunTask,
     ) -> None:
         """
         Process manager heartbeat from SWIM.
@@ -133,7 +145,7 @@ class WorkerHeartbeatHandler:
         node_host: str,
         node_port: int,
         node_id_short: str,
-        task_runner_run: callable,
+        task_runner_run: RunTask,
     ) -> None:
         """Update existing manager info from heartbeat if leadership changed."""
         # The manager's own heartbeat is direct evidence for its address.
@@ -180,7 +192,7 @@ class WorkerHeartbeatHandler:
         node_host: str,
         node_port: int,
         node_id_short: str,
-        task_runner_run: callable,
+        task_runner_run: RunTask,
     ) -> None:
         """Register a new manager discovered via SWIM heartbeat."""
         tcp_host = heartbeat.tcp_host or source_addr[0]
@@ -226,7 +238,7 @@ class WorkerHeartbeatHandler:
         node_host: str,
         node_port: int,
         node_id_short: str,
-        task_runner_run: callable,
+        task_runner_run: RunTask,
     ) -> None:
         """
         Process job leadership claims from heartbeat.
@@ -266,7 +278,7 @@ class WorkerHeartbeatHandler:
         node_host: str,
         node_port: int,
         node_id_short: str,
-        task_runner_run: callable,
+        task_runner_run: RunTask,
     ) -> None:
         """
         Handle peer confirmation from SWIM (AD-29).

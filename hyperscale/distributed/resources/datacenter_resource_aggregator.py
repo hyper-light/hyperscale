@@ -14,15 +14,24 @@ ManagerAddress = tuple[str, int]
 
 
 class DatacenterResourceAggregator:
-    """AD-41 gate side: combine managers' resource reports per datacenter.
+    """AD-41: combine managers' resource reports per datacenter -- on a
+    gate, from each manager's heartbeat; on a manager, from its own report
+    and its peers' gossip (``ManagerResourceGossip``), so a client running
+    jobs on one datacenter without a gate sees what a gate would.
 
     Every manager reports the workload of the workflows it leads -- a
     partition of the datacenter's running workflows -- so the
     datacenter's workload is the sum over its managers' fresh reports.
     Worker capacity is the same pool on every manager, so it comes from
-    the most recently received report. A report not refreshed within
-    ``staleness_seconds`` (its manager died or stopped heartbeating) is
+    the most recent report. A report not refreshed within
+    ``staleness_seconds`` (its manager died or stopped reporting) is
     dropped: it neither counts nor lingers.
+
+    A report can arrive second-hand (gossip forwards the reports a manager
+    holds), so each is recorded with how long ago its manager made it: the
+    freshest copy of a manager's report wins, and a forwarded copy ages
+    from when its manager made it, not from when it was forwarded -- a dead
+    manager's report cannot be kept alive by being passed around.
     """
 
     __slots__ = ("_clock", "_staleness_seconds", "_reports")
@@ -37,13 +46,29 @@ class DatacenterResourceAggregator:
         datacenter: str,
         manager_address: ManagerAddress,
         report: ManagerResourceReport,
+        age_seconds: float,
     ) -> None:
-        """Keep ``report`` as the manager's latest."""
-        self._reports.setdefault(datacenter, {})[manager_address] = (
-            report,
-            self._clock.monotonic(),
-        )
+        """Keep ``report`` -- made ``age_seconds`` ago by the manager at
+        ``manager_address`` -- unless a fresher one of that manager's is
+        already held."""
+        reported_at = self._clock.monotonic() - age_seconds
+        reports = self._reports.setdefault(datacenter, {})
+        if (held := reports.get(manager_address)) is None or reported_at > held[1]:
+            reports[manager_address] = (report, reported_at)
         self._drop_stale(datacenter)
+
+    def fresh_reports(
+        self,
+        datacenter: str,
+    ) -> list[tuple[ManagerAddress, ManagerResourceReport, float]]:
+        """Every fresh report held for ``datacenter``: its manager's
+        address, the report, and how long ago that manager made it."""
+        self._drop_stale(datacenter)
+        now = self._clock.monotonic()
+        return [
+            (manager_address, report, now - reported_at)
+            for manager_address, (report, reported_at) in self._reports.get(datacenter, {}).items()
+        ]
 
     def forget_datacenter(self, datacenter: str) -> None:
         self._reports.pop(datacenter, None)

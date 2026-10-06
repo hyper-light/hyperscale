@@ -16,11 +16,16 @@ Design principles:
 - All public methods are async and acquire the lock
 - Internal methods assume lock is held
 - No TOCTOU races: check-and-allocate is atomic
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass, field
-
 from hyperscale.distributed.jobs.logging_models import (
     AllocatorTrace,
     AllocatorDebug,
@@ -30,20 +35,11 @@ from hyperscale.distributed.jobs.logging_models import (
     AllocatorCritical,
 )
 from hyperscale.logging import Logger
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .allocation_result import AllocationResult
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-@dataclass(slots=True)
-class AllocationResult:
-    """Result of a core allocation attempt."""
-
-    success: bool
-    allocated_cores: list[int] = field(default_factory=list)
-    error: str | None = None
 
 
 class CoreAllocator:
@@ -95,6 +91,13 @@ class CoreAllocator:
         # Available core count (cached for fast access)
         self._available_cores = total_cores
 
+        # Bumped with every change to which cores are free: a report of
+        # the free count stamped with it is ordered against every other
+        # (and against the allocation a dispatch got), so a manager can
+        # tell a newer report from a stale one and which allocations a
+        # report already reflects.
+        self._availability_version = 0
+
         # Single lock protects ALL core state
         self._lock = asyncio.Lock()
 
@@ -106,6 +109,12 @@ class CoreAllocator:
     def total_cores(self) -> int:
         """Get total core count."""
         return self._total_cores
+
+    @property
+    def availability_version(self) -> int:
+        """The version of ``available_cores``: read the two together, with
+        no await between, for a consistent report."""
+        return self._availability_version
 
     @property
     def available_cores(self) -> int:
@@ -183,6 +192,7 @@ class CoreAllocator:
 
             self._workflow_cores[workflow_id] = allocated
             self._available_cores = self._count_free_cores()
+            self._availability_version += 1
 
             # Update event state
             if self._available_cores == 0:
@@ -191,6 +201,7 @@ class CoreAllocator:
             return AllocationResult(
                 success=True,
                 allocated_cores=allocated,
+                availability_version=self._availability_version,
             )
 
     async def free(self, workflow_id: str) -> list[int]:
@@ -247,6 +258,7 @@ class CoreAllocator:
 
             # Signal that cores are available
             if to_free:
+                self._availability_version += 1
                 self._cores_available.set()
 
             return to_free
@@ -353,6 +365,7 @@ class CoreAllocator:
 
         # Signal that cores are available
         if allocated:
+            self._availability_version += 1
             self._cores_available.set()
 
         return allocated
@@ -398,3 +411,10 @@ class CoreAllocator:
     async def _log_critical(self, message: str, workflow_id: str = "") -> None:
         """Log a critical-level message."""
         await self._logger.log(AllocatorCritical(message=message, **self._get_log_context(workflow_id)))
+
+_REHOMED = (
+    AllocationResult,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

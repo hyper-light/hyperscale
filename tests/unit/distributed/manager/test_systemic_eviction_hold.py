@@ -26,6 +26,8 @@ import pytest
 from hyperscale.distributed.health.systemic_failure import is_systemic_failure
 from hyperscale.distributed.nodes.manager.server import ManagerServer
 from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.slo import SLOConfig
 from hyperscale.logging.hyperscale_logging_models import (
     SystemicEvictionHeld,
     SystemicEvictionReleased,
@@ -58,7 +60,7 @@ class ActiveWork:
 
 def make_manager(worker_ids: list[str]) -> tuple[ManagerServer, ManagerState, ActiveWork, RecordingLogger, dict]:
     manager = object.__new__(ManagerServer)
-    state = ManagerState()
+    state = ManagerState(slo_config=SLOConfig.from_env(Env()))
     for worker_id in worker_ids:
         state.add_worker(worker_id, SimpleNamespace(node_id=worker_id))
     active_work = ActiveWork()

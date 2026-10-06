@@ -32,7 +32,10 @@ class HTTP2Response(CallResult):
     cookies: Optional[Cookies] = None
     status: Optional[int] = None
     status_message: Optional[str] = None
-    headers: Optional[Dict[bytes, bytes]] = None
+    headers: Optional[Dict[str, str]] = None
+    # The trailer section's fields, kept apart from the header section's
+    # (RFC 9110 6.5).
+    trailers: Optional[Dict[str, str]] = None
     content: bytes = b""
     timings: Optional[
         Dict[
@@ -89,51 +92,41 @@ class HTTP2Response(CallResult):
 
     @property
     def content_type(self):
-        content_type: bytes | None = None 
         if self.headers:
-            content_type = self.headers.get(b"content-type", b"application/text")
+            return self.headers.get("content-type", "application/text")
 
-
-        if content_type:
-            return content_type.decode()
-
-        return content_type
+        return None
 
     @property
     def compression(self):
         if self.headers and (
-            compression := self.headers.get(b"content-encoding")
+            compression := self.headers.get("content-encoding")
         ):
-            return compression.decode()
+            return compression
         
     @property
     def version(self) -> Union[str, None]:
         if self.headers and (
-            version := self.headers.get(b"version")
+            version := self.headers.get("version")
         ):
-            return version.decode()
+            return version
 
     @property
     def reason(self) -> Union[str, None]:
         if self.headers and (
-            reason := self.headers.get(b"reason")
+            reason := self.headers.get("reason")
         ):
-            return reason.decode()
+            return reason
 
     @property
     def size(self):
+        # A msgspec Struct holds its fields alone: nothing is stored here.
         if self.headers and (
-            content_length :=  self.headers.get(b"content-length")
-        ):
-            self._size = int(content_length)
+            content_length := self.headers.get("content-length")
+        ) and content_length.isdigit():
+            return int(content_length)
 
-        elif len(self.content) > 0:
-            self._size = len(self.content)
-
-        else:
-            self._size = 0
-
-        return self._size
+        return len(self.content)
 
     def json(self):
         return orjson.loads(self.body)
@@ -148,10 +141,10 @@ class HTTP2Response(CallResult):
     def body(self) -> bytes:
         data = self.content
 
-        if self.compression == b"gzip":
+        if self.compression == "gzip":
             data = gzip.decompress(self.content)
 
-        elif self.compression == b"deflate":
+        elif self.compression == "deflate":
             data = zlib.decompress(self.content)
 
         return data

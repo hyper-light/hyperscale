@@ -9,75 +9,25 @@ Key features:
 - Drift tolerance: Allows for clock skew between workers
 - Memory bounded: Windows cleared after flush
 - Aggregation modes: Aggregated for clients, unaggregated for gates
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass, field
-
-from hyperscale.distributed.models import (
-    WorkflowProgress,
-    StepStats,
-    Message,
-)
-
+from hyperscale.distributed.models import WorkflowProgress, StepStats, Message
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .window_bucket import WindowBucket
+from .windowed_stats_metrics import WindowedStatsMetrics
+from .windowed_stats_push import WindowedStatsPush
+from .worker_window_stats import WorkerWindowStats
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-@dataclass(slots=True)
-class WorkerWindowStats:
-    """Individual worker stats within a time window."""
-
-    worker_id: str
-    completed_count: int = 0
-    failed_count: int = 0
-    rate_per_second: float = 0.0
-    step_stats: list[StepStats] = field(default_factory=list)
-    avg_cpu_percent: float = 0.0
-    avg_memory_mb: float = 0.0
-
-
-@dataclass(slots=True)
-class WindowedStatsPush(Message):
-    job_id: str
-    workflow_id: str
-    workflow_name: str = ""
-    window_start: float = 0.0
-    window_end: float = 0.0
-    completed_count: int = 0
-    failed_count: int = 0
-    rate_per_second: float = 0.0
-    step_stats: list[StepStats] = field(default_factory=list)
-    worker_count: int = 0
-    avg_cpu_percent: float = 0.0
-    avg_memory_mb: float = 0.0
-    per_worker_stats: list[WorkerWindowStats] = field(default_factory=list)
-    is_aggregated: bool = True
-    datacenter: str = ""
-
-
-@dataclass(slots=True)
-class WindowBucket:
-    """Stats collected within a single time window."""
-
-    window_start: float  # Unix timestamp of window start
-    window_end: float  # Unix timestamp of window end
-    job_id: str
-    workflow_id: str
-    workflow_name: str
-    worker_stats: dict[str, WorkflowProgress]  # worker_id -> progress
-    created_at: float  # When this bucket was created (for cleanup)
-
-
-@dataclass(slots=True)
-class WindowedStatsMetrics:
-    windows_flushed: int = 0
-    windows_dropped_late: int = 0
-    stats_recorded: int = 0
-    stats_dropped_late: int = 0
-    duplicates_detected: int = 0
 
 
 class WindowedStatsCollector:
@@ -170,51 +120,6 @@ class WindowedStatsCollector:
         for k in expired_keys:
             del self._seen_updates[k]
 
-    async def flush_closed_windows(
-        self,
-        aggregate: bool = True,
-    ) -> list[WindowedStatsPush]:
-        """
-        Flush all closed windows and return them for pushing.
-
-        A window is considered closed when the current time exceeds
-        the window's end time plus the drift tolerance. This ensures
-        we've waited long enough for late-arriving stats.
-
-        Args:
-            aggregate: If True, aggregate stats within window.
-                      If False, return per-worker stats (for Gate forwarding).
-
-        Returns:
-            List of WindowedStatsPush messages ready for client/gate.
-        """
-        now = _DEFAULT_CLOCK.time()
-        results: list[WindowedStatsPush] = []
-        keys_to_remove: list[tuple[str, str, int]] = []
-
-        async with self._lock:
-            for key, bucket in self._buckets.items():
-                _, _, bucket_num = key
-
-                if self._is_window_closed(bucket_num, now):
-                    if aggregate:
-                        push = self._aggregate_bucket(bucket)
-                    else:
-                        push = self._unaggregated_bucket(bucket)
-                    results.append(push)
-                    keys_to_remove.append(key)
-                    self._metrics.windows_flushed += 1
-
-                elif (now - bucket.created_at) * 1000 > self._max_window_age_ms:
-                    keys_to_remove.append(key)
-                    self._metrics.windows_dropped_late += 1
-                    self._metrics.stats_dropped_late += len(bucket.worker_stats)
-
-            for key in keys_to_remove:
-                del self._buckets[key]
-
-        return results
-
     def _aggregate_bucket(self, bucket: WindowBucket) -> WindowedStatsPush:
         """Aggregate all worker stats in a bucket into single stats."""
         total_completed = 0
@@ -306,7 +211,7 @@ class WindowedStatsCollector:
         Flush ALL pending windows for a job, ignoring drift tolerance.
 
         Called when a job completes to get final stats before cleanup.
-        Unlike flush_closed_windows, this doesn't wait for drift tolerance
+        Unlike flush_closed_job_windows, this doesn't wait for drift tolerance
         since we know no more updates are coming.
 
         Args:
@@ -414,6 +319,30 @@ class WindowedStatsCollector:
         Returns:
             List of WindowedStatsPush for closed windows belonging to this job.
         """
+        return await self.flush_closed_job_windows(job_id, aggregate=True)
+
+    async def flush_closed_job_windows(
+        self,
+        job_id: str,
+        aggregate: bool,
+    ) -> list[WindowedStatsPush]:
+        """
+        Flush one job's closed windows, leaving its open windows and every
+        other job's windows in place.
+
+        A window is closed once the current time passes its end plus the
+        drift tolerance, so late-arriving stats are still counted. A window
+        older than the maximum window age that has still not closed (stats
+        stamped by a clock running ahead) is dropped.
+
+        Args:
+            job_id: The job identifier.
+            aggregate: If True, aggregate stats within window.
+                      If False, return per-worker stats (for Gate forwarding).
+
+        Returns:
+            List of WindowedStatsPush for closed windows belonging to this job.
+        """
         now = _DEFAULT_CLOCK.time()
         results: list[WindowedStatsPush] = []
         keys_to_remove: list[tuple[str, str, int]] = []
@@ -425,9 +354,19 @@ class WindowedStatsCollector:
 
                 _, _, bucket_num = key
                 if self._is_window_closed(bucket_num, now):
-                    push = self._aggregate_bucket(bucket)
+                    push = (
+                        self._aggregate_bucket(bucket)
+                        if aggregate
+                        else self._unaggregated_bucket(bucket)
+                    )
                     results.append(push)
                     keys_to_remove.append(key)
+                    self._metrics.windows_flushed += 1
+
+                elif (now - bucket.created_at) * 1000 > self._max_window_age_ms:
+                    keys_to_remove.append(key)
+                    self._metrics.windows_dropped_late += 1
+                    self._metrics.stats_dropped_late += len(bucket.worker_stats)
 
             for key in keys_to_remove:
                 del self._buckets[key]
@@ -442,3 +381,13 @@ class WindowedStatsCollector:
 
     def reset_metrics(self) -> None:
         self._metrics = WindowedStatsMetrics()
+
+_REHOMED = (
+    WorkerWindowStats,
+    WindowedStatsPush,
+    WindowBucket,
+    WindowedStatsMetrics,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

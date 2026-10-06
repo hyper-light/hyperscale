@@ -19,7 +19,7 @@ class GRPCResponse(HTTP2Response):
     method: Optional[Literal["POST"]] = "POST"
     status: Optional[int] = None
     status_message: Optional[str] = None
-    headers: Optional[Dict[bytes, bytes]] = None
+    headers: Optional[Dict[str, str]] = None
     content: bytes = b""
     timings: Optional[
         Dict[
@@ -42,6 +42,27 @@ class GRPCResponse(HTTP2Response):
     @classmethod
     def response_type(cls):
         return RequestType.GRPC
+
+    @property
+    def grpc_status(self) -> int | None:
+        """
+        The call's gRPC status code, if present and well formed: the
+        grpc-status trailer, or the header of a trailers-only response.
+        """
+        value = self.trailers.get("grpc-status") if self.trailers else None
+        if value is None and self.headers:
+            value = self.headers.get("grpc-status")
+
+        if value is not None and value.isdigit():
+            return int(value)
+
+        return None
+
+    @property
+    def successful(self) -> bool:
+        # The HTTP/2 status is 200 for failed calls too: a gRPC call succeeds
+        # only when its grpc-status is 0 (OK).
+        return self.status == 200 and self.grpc_status == 0
 
     @property
     def data(self):

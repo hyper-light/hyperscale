@@ -239,7 +239,7 @@ async def validate_11_3_latency_recording() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert state._workflow_latency_digest is not None, (
+        assert state._dispatch_latency_digest is not None, (
             "Workflow latency expected latency digest"
         )
     finally:
@@ -259,7 +259,7 @@ async def validate_11_3_latency_digest() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert state._workflow_latency_digest is not None, (
+        assert state._dispatch_latency_digest is not None, (
             "Latency digest expected latency digest"
         )
     finally:

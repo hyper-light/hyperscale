@@ -16,10 +16,21 @@ reaches the client.
 
 ``JobLogSplitter`` (K2) splits a prefixed multi-job client log into
 per-job unprefixed streams, each feedable to ``JobStatusOracle``.
+
+``WorkflowLifecycleOracle`` (AD-54) judges a MANAGER's observed workflow
+lifecycle histories — table edges only, continuity, absorbing terminals,
+FAILED observable only as terminal, status equal to the state's
+projection, and every record released with its job.
 """
 
 from .cluster_trace_oracle import ClusterTraceOracle
 from .job_log_splitter import JobLogSplitter
 from .job_status_oracle import JobStatusOracle
+from .workflow_lifecycle_oracle import WorkflowLifecycleOracle
 
-__all__ = ("ClusterTraceOracle", "JobLogSplitter", "JobStatusOracle")
+__all__ = (
+    "ClusterTraceOracle",
+    "JobLogSplitter",
+    "JobStatusOracle",
+    "WorkflowLifecycleOracle",
+)

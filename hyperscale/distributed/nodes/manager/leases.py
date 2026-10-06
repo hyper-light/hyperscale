@@ -77,7 +77,7 @@ class ManagerLeaseCoordinator:
         """
         return self._state._job_leader_addrs.get(job_id)
 
-    def claim_job_leadership(
+    async def claim_job_leadership(
         self,
         job_id: str,
         tcp_addr: tuple[str, int],
@@ -113,8 +113,7 @@ class ManagerLeaseCoordinator:
             )
 
             action = "Took over" if force_takeover else "Claimed"
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=(
                         f"{action} leadership for job {job_id[:8]}... "
@@ -135,7 +134,6 @@ class ManagerLeaseCoordinator:
         leader_id: str,
         leader_addr: tuple[str, int],
         fencing_token: int,
-        layer_version: int | None = None,
     ) -> bool:
         """
         Apply a leadership claim that already passed its authoritative protocol.
@@ -149,7 +147,6 @@ class ManagerLeaseCoordinator:
             leader_id=leader_id,
             leader_addr=leader_addr,
             fencing_token=fencing_token,
-            layer_version=layer_version,
         )
 
     def get_fence_token(self, job_id: str) -> int:
@@ -204,35 +201,6 @@ class ManagerLeaseCoordinator:
         current = self._state._job_fencing_tokens.get(job_id, 0)
         return token >= current
 
-    def get_layer_version(self, job_id: str) -> int:
-        """
-        Get current layer version for a job.
-
-        Args:
-            job_id: Job ID
-
-        Returns:
-            Current layer version (0 if not set)
-        """
-        return self._state._job_layer_version.get(job_id, 0)
-
-    def increment_layer_version(self, job_id: str) -> int:
-        """
-        Increment and return layer version for a job.
-
-        Used when completing a workflow layer to advance to next.
-
-        Args:
-            job_id: Job ID
-
-        Returns:
-            New layer version value
-        """
-        current = self._state._job_layer_version.get(job_id, 0)
-        new_value = current + 1
-        self._state._job_layer_version[job_id] = new_value
-        return new_value
-
     def get_global_fence_token(self) -> int:
         """
         Get the global (non-job-specific) fence token.
@@ -258,29 +226,6 @@ class ManagerLeaseCoordinator:
             if leader_id == self._node_id
         ]
 
-    def initialize_job_context(self, job_id: str) -> None:
-        """
-        Initialize empty context for a new job.
-
-        Args:
-            job_id: Job ID to initialize context for
-        """
-        from hyperscale.core.state.context import Context
-
-        self._state._job_contexts[job_id] = Context()
-
-    def get_job_context(self, job_id: str):
-        """
-        Get context for a job.
-
-        Args:
-            job_id: Job ID
-
-        Returns:
-            Context object or None if not found
-        """
-        return self._state._job_contexts.get(job_id)
-
     def clear_job_leases(self, job_id: str) -> None:
         """
         Clear all lease-related state for a job.
@@ -291,5 +236,3 @@ class ManagerLeaseCoordinator:
         self._state._job_leaders.pop(job_id, None)
         self._state._job_leader_addrs.pop(job_id, None)
         self._state._job_fencing_tokens.pop(job_id, None)
-        self._state._job_layer_version.pop(job_id, None)
-        self._state._job_contexts.pop(job_id, None)

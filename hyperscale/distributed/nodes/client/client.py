@@ -21,14 +21,31 @@ Usage:
     await client.stop()
 """
 
+from collections.abc import AsyncIterator
 from typing import Callable
 
 from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
+from hyperscale.distributed.cluster.models import (
+    ClusterLeaveReply,
+    ClusterLeaveRequest,
+    ClusterMemberId,
+    ClusterMetricsReply,
+    ClusterModeReply,
+    ClusterModeRequest,
+    ClusterResizeReply,
+    ClusterResizeRequest,
+    ClusterStatusReply,
+    ClusterStatusRequest,
+    ClusterWatchReply,
+    ClusterWatchRequest,
+)
 from hyperscale.distributed.server import tcp
 from hyperscale.distributed.server.server.mercury_sync_base_server import (
     MercurySyncBaseServer,
 )
 from hyperscale.distributed.models import (
+    JobStatusQuery,
+    ReadConsistency,
     JobStatusPush,
     NodeJoinRequest,
     NodeJoinResponse,
@@ -40,9 +57,11 @@ from hyperscale.distributed.models import (
     DatacenterListResponse,
     JobCancelResponse,
     GlobalJobStatus,
+    RegisterCallback,
+    RegisterCallbackResponse,
 )
 from hyperscale.distributed.env.env import Env
-from hyperscale.logging.hyperscale_logging_models import ServerDebug
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 from hyperscale.distributed.resources.resource_budget import ResourceBudget
 from hyperscale.distributed.runtime import (
     Clock,
@@ -96,6 +115,7 @@ from hyperscale.distributed.models import (
     ClientWorkflowResult,
     ClientJobResult,
 )
+from hyperscale.logging import Logger
 
 # Type aliases for backwards compatibility
 ReporterResult = ClientReporterResult
@@ -162,16 +182,15 @@ class HyperscaleClient(MercurySyncBaseServer):
         # Logger used by every client submodule. The base class also creates
         # `_tcp_logger` / `_udp_logger` during `start_server`, but the
         # submodules below take a single Logger reference at construction.
-        from hyperscale.logging import Logger
         self._logger = Logger()
 
         # Initialize config and state
-        self._config = ClientConfig(
+        self._config = ClientConfig.from_env(
+            env,
             host=host,
             tcp_port=port,
             managers=tuple(managers or []),
             gates=tuple(gates or []),
-            env=env,
         )
         self._state = ClientState()
 
@@ -200,14 +219,13 @@ class HyperscaleClient(MercurySyncBaseServer):
             state=self._state,
             logger=self._logger,
         )
-        self._leadership = ClientLeadershipTracker(
-            state=self._state,
-            logger=self._logger,
-        )
+        self._leadership = ClientLeadershipTracker(state=self._state)
         self._tracker = ClientJobTracker(
             state=self._state,
             logger=self._logger,
+            result_drain_timeout_seconds=self._config.result_drain_timeout_seconds,
             poll_gate_for_status=self._poll_gate_for_job_status,
+            request_replay=self._request_job_replay,
         )
         self._submitter = ClientJobSubmitter(
             state=self._state,
@@ -237,6 +255,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             state=self._state,
             config=self._config,
             logger=self._logger,
+            clock=self._clock,
         )
         self._discovery = ClientDiscovery(
             state=self._state,
@@ -266,22 +285,24 @@ class HyperscaleClient(MercurySyncBaseServer):
             state=self._state,
             logger=self._logger,
         )
-        self._job_final_result_handler = JobFinalResultHandler(
-            state=self._state,
-            logger=self._logger,
-        )
-        self._global_job_result_handler = GlobalJobResultHandler(
-            state=self._state,
-            logger=self._logger,
-        )
-        self._reporter_result_push_handler = ReporterResultPushHandler(
-            state=self._state,
-            logger=self._logger,
-        )
         self._workflow_result_push_handler = WorkflowResultPushHandler(
             state=self._state,
             logger=self._logger,
             reporting_manager=self._reporting,
+        )
+        self._job_final_result_handler = JobFinalResultHandler(
+            state=self._state,
+            logger=self._logger,
+            workflow_results=self._workflow_result_push_handler,
+        )
+        self._global_job_result_handler = GlobalJobResultHandler(
+            state=self._state,
+            logger=self._logger,
+            workflow_results=self._workflow_result_push_handler,
+        )
+        self._reporter_result_push_handler = ReporterResultPushHandler(
+            state=self._state,
+            logger=self._logger,
         )
         self._windowed_stats_push_handler = WindowedStatsPushHandler(
             state=self._state,
@@ -371,7 +392,14 @@ class HyperscaleClient(MercurySyncBaseServer):
         completed once ``best_effort_deadline_seconds`` passed, instead
         of waiting for every datacenter; the rest are cancelled. 0 applies
         the gate's configured default for either.
+
+        Jobs finished for longer than the configured retention are
+        forgotten here, so a long-lived client's tracking stays bounded.
         """
+        self._state.release_finished_jobs(
+            now=self._clock.monotonic(),
+            retention_seconds=self._config.job_retention_seconds,
+        )
         return await self._submitter.submit_job(
             workflows=workflows,
             vus=vus,
@@ -427,6 +455,204 @@ class HyperscaleClient(MercurySyncBaseServer):
             f"join reply from {node_addr[0]}:{node_addr[1]}",
         )
 
+    async def remove_cluster_member(
+        self,
+        node_addr: tuple[str, int],
+        member_addr: tuple[str, int],
+        timeout: float,
+    ) -> ClusterLeaveReply:
+        """Ask the cluster that the node at ``node_addr`` belongs to to
+        release the member at ``member_addr`` now (AD-52 section 13
+        force-remove) -- for a manager or gate that is gone for good,
+        instead of waiting out the tombstone retention. The group's leader
+        refuses while the member still answers.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a leave reply. A refusal is returned, not raised.
+        """
+        request = ClusterLeaveRequest(host=member_addr[0], port=member_addr[1]).dump()
+        # A member that is not the group's leader names it: ask it once.
+        asked_addr = node_addr
+        for _ in range(2):
+            response, _ = await self.send_tcp(asked_addr, "cluster_leave", request, timeout=timeout)
+            if isinstance(response, Exception):
+                raise ClusterJoinError(
+                    f"node {asked_addr[0]}:{asked_addr[1]} is unreachable: "
+                    f"{type(response).__name__}: {response}"
+                )
+            reply = decode_join_message(
+                response,
+                ClusterLeaveReply,
+                f"leave reply from {asked_addr[0]}:{asked_addr[1]} "
+                "(only managers and gates hold cluster membership)",
+            )
+            if reply.released or reply.leader_member_id is None or asked_addr != node_addr:
+                return reply
+            asked_addr = ClusterMemberId.parse(reply.leader_member_id).address
+        return reply
+
+    async def set_cluster_mode(
+        self,
+        node_addr: tuple[str, int],
+        mode: str,
+        timeout: float,
+    ) -> ClusterModeReply:
+        """Set the mode of the cluster the node at ``node_addr`` belongs to
+        (AD-52 section 13): ``open``, ``frozen`` (no membership change
+        commits) or ``read-only`` (frozen, and job submissions refused).
+        A member that does not know its leader names none; one that does
+        passes the change on.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a mode reply. A refusal is returned, not raised.
+        """
+        request = ClusterModeRequest(mode=mode).dump()
+        asked_addr = node_addr
+        for _ in range(2):
+            response, _ = await self.send_tcp(asked_addr, "cluster_mode", request, timeout=timeout)
+            if isinstance(response, Exception):
+                raise ClusterJoinError(
+                    f"node {asked_addr[0]}:{asked_addr[1]} is unreachable: "
+                    f"{type(response).__name__}: {response}"
+                )
+            reply = decode_join_message(
+                response,
+                ClusterModeReply,
+                f"mode reply from {asked_addr[0]}:{asked_addr[1]} "
+                "(only managers and gates hold cluster membership)",
+            )
+            if reply.applied or reply.leader_member_id is None or asked_addr != node_addr:
+                return reply
+            asked_addr = ClusterMemberId.parse(reply.leader_member_id).address
+        return reply
+
+    async def resize_cluster(
+        self,
+        node_addr: tuple[str, int],
+        member_addr: tuple[str, int],
+        add: bool,
+        timeout: float,
+    ) -> ClusterResizeReply:
+        """Add ``member_addr`` to the cohort of the cluster the node at
+        ``node_addr`` belongs to, or remove it (AD-52 ``ResizeCluster``).
+        A member that does not know its leader names none; one that does
+        passes the change on.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a resize reply. A refusal is returned, not raised.
+        """
+        request = ClusterResizeRequest(host=member_addr[0], port=member_addr[1], add=add).dump()
+        asked_addr = node_addr
+        for _ in range(2):
+            response, _ = await self.send_tcp(asked_addr, "cluster_resize", request, timeout=timeout)
+            if isinstance(response, Exception):
+                raise ClusterJoinError(
+                    f"node {asked_addr[0]}:{asked_addr[1]} is unreachable: "
+                    f"{type(response).__name__}: {response}"
+                )
+            reply = decode_join_message(
+                response,
+                ClusterResizeReply,
+                f"resize reply from {asked_addr[0]}:{asked_addr[1]} "
+                "(only managers and gates hold cluster membership)",
+            )
+            if reply.applied or reply.leader_member_id is None or asked_addr != node_addr:
+                return reply
+            asked_addr = ClusterMemberId.parse(reply.leader_member_id).address
+        return reply
+
+    async def cluster_status(self, node_addr: tuple[str, int], timeout: float) -> ClusterStatusReply:
+        """The membership of the cluster the node at ``node_addr`` belongs to,
+        as of now (AD-52 section 11): its leader answers after confirming it
+        still leads. A member that does not know its leader names none; one
+        that does passes the request on.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a status reply. A refusal is returned, not raised.
+        """
+        request = ClusterStatusRequest().dump()
+        asked_addr = node_addr
+        for _ in range(2):
+            response, _ = await self.send_tcp(asked_addr, "cluster_status", request, timeout=timeout)
+            if isinstance(response, Exception):
+                raise ClusterJoinError(
+                    f"node {asked_addr[0]}:{asked_addr[1]} is unreachable: "
+                    f"{type(response).__name__}: {response}"
+                )
+            reply = decode_join_message(
+                response,
+                ClusterStatusReply,
+                f"status reply from {asked_addr[0]}:{asked_addr[1]} "
+                "(only managers and gates hold cluster membership)",
+            )
+            if reply.served or reply.leader_member_id is None or asked_addr != node_addr:
+                return reply
+            asked_addr = ClusterMemberId.parse(reply.leader_member_id).address
+        return reply
+
+    async def watch_cluster(
+        self,
+        node_addr: tuple[str, int],
+        cluster_uuid: str | None,
+        after_index: int,
+        wait_seconds: float,
+        timeout: float,
+    ) -> ClusterWatchReply:
+        """One long poll of a membership watch (AD-52 section 9): the
+        changes the node applied after ``after_index`` of ``cluster_uuid``,
+        or a snapshot to resume from -- answered within ``wait_seconds``
+        when nothing changes. Resume the next poll after the reply's
+        ``applied_index``.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a watch reply. A refusal is returned, not raised.
+        """
+        response, _ = await self.send_tcp(
+            node_addr,
+            "cluster_watch",
+            ClusterWatchRequest(
+                cluster_uuid=cluster_uuid, after_index=after_index, wait_seconds=wait_seconds
+            ).dump(),
+            timeout=timeout,
+        )
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"node {node_addr[0]}:{node_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+        return decode_join_message(
+            response,
+            ClusterWatchReply,
+            f"watch reply from {node_addr[0]}:{node_addr[1]} "
+            "(only managers and gates hold cluster membership)",
+        )
+
+    async def cluster_metrics(self, node_addr: tuple[str, int], timeout: float) -> ClusterMetricsReply:
+        """The node's own metrics of its cluster's membership (AD-52 section
+        18).
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a metrics reply.
+        """
+        response, _ = await self.send_tcp(node_addr, "cluster_metrics", b"", timeout=timeout)
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"node {node_addr[0]}:{node_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+        return decode_join_message(
+            response,
+            ClusterMetricsReply,
+            f"metrics reply from {node_addr[0]}:{node_addr[1]} "
+            "(only managers and gates hold cluster membership)",
+        )
+
     async def wait_for_job(
         self,
         job_id: str,
@@ -434,6 +660,25 @@ class HyperscaleClient(MercurySyncBaseServer):
     ) -> ClientJobResult:
         """Wait for job completion (delegates to ClientJobTracker)."""
         return await self._tracker.wait_for_job(job_id, timeout=timeout)
+
+    def stream_workflow_results(
+        self,
+        job_id: str,
+        timeout: float | None = None,
+    ) -> AsyncIterator[ClientWorkflowResult]:
+        """Each workflow result of a job as it arrives, until the job is
+        done (delegates to ClientJobTracker)::
+
+            async for workflow_result in client.stream_workflow_results(job_id):
+                print(workflow_result.workflow_id, workflow_result.status)
+        """
+        return self._tracker.stream_workflow_results(job_id, timeout=timeout)
+
+    def release_job(self, job_id: str) -> None:
+        """Forget a job the caller is done with: its status, results and
+        callbacks. Finished jobs are also forgotten once the configured
+        retention has passed."""
+        self._state.release_job(job_id)
 
     def get_job_status(self, job_id: str) -> ClientJobResult | None:
         """Get current job status (delegates to ClientJobTracker)."""
@@ -560,6 +805,45 @@ class HyperscaleClient(MercurySyncBaseServer):
     # Internal Helper Methods
     # =========================================================================
 
+    async def query_job_status(
+        self,
+        node_addr: tuple[str, int],
+        job_id: str,
+        timeout: float,
+        consistency: ReadConsistency = ReadConsistency.EVENTUAL,
+        max_staleness_seconds: float = 0.0,
+    ) -> GlobalJobStatus | None:
+        """A job's status, asked of the gate or manager at ``node_addr`` at
+        ``consistency`` (AD-38 Part 8): it answers from what it holds (live
+        state, or a manager's durable ledger) or from the job's leader --
+        None when it has no answer at that level. A SESSION read of a job
+        this client tracks is never older than the newest view of it a read
+        here answered; BOUNDED_STALENESS bounds the view's age by
+        ``max_staleness_seconds``.
+
+        Raises:
+            ClusterJoinError: the node was unreachable.
+        """
+        observed_fence_token, observed_view_time = self._state.get_job_read_view(job_id)
+        query = JobStatusQuery(
+            job_id=job_id,
+            consistency=consistency.value,
+            observed_fence_token=observed_fence_token,
+            observed_view_time=observed_view_time,
+            max_staleness_seconds=max_staleness_seconds,
+        )
+        response, _ = await self.send_tcp(node_addr, "job_status", query.dump(), timeout=timeout)
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"node {node_addr[0]}:{node_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+        if not response:
+            return None
+        job_status = GlobalJobStatus.load(response)
+        self._state.record_job_read_view(job_id, job_status.fence_token, job_status.view_time)
+        return job_status
+
     async def _poll_gate_for_job_status(
         self,
         job_id: str,
@@ -581,8 +865,11 @@ class HyperscaleClient(MercurySyncBaseServer):
                 poll_addr,
                 "job_status",
                 job_id.encode(),
-                timeout=5.0,
+                timeout=self._config.status_query_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response_data, Exception):
+                raise response_data
             if response_data and response_data != b"":
                 return GlobalJobStatus.load(response_data)
         except Exception as poll_error:
@@ -599,6 +886,45 @@ class HyperscaleClient(MercurySyncBaseServer):
             )
 
         return None
+
+    async def _request_job_replay(self, job_id: str) -> bool:
+        """Have the job's gate send again what it recorded for this client
+        and could not deliver: re-registering this client's callback for
+        the job makes the gate replay its update history from the last
+        update that reached the client -- answered once the replay is sent.
+        Gateless (L2), a manager keeps no such history: nothing to ask."""
+        gate_address = self._targets.get_gate_for_job(job_id)
+        if not gate_address:
+            return False
+
+        try:
+            response_data, _ = await self.send_tcp(
+                gate_address,
+                "register_callback",
+                RegisterCallback(
+                    job_id=job_id,
+                    callback_addr=(self._host, self._tcp_port),
+                ).dump(),
+                timeout=self._config.status_query_timeout_seconds,
+            )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response_data, Exception):
+                raise response_data
+            if response_data and RegisterCallbackResponse.load(response_data).success:
+                return True
+        except Exception as replay_error:
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        f"Asking gate {gate_address} to replay job {job_id[:8]}... "
+                        f"failed: {replay_error}"
+                    ),
+                    node_host="client",
+                    node_port=0,
+                    node_id="client",
+                )
+            )
+        return False
 
     # =========================================================================
     # TCP Handlers - Delegate to Handler Classes

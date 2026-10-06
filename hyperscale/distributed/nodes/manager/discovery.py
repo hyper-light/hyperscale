@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.discovery import DiscoveryService
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -46,7 +47,6 @@ class ManagerDiscoveryCoordinator:
         worker_discovery: "DiscoveryService | None" = None,
         peer_discovery: "DiscoveryService | None" = None,
     ) -> None:
-        from hyperscale.distributed.discovery import DiscoveryService
 
         self._state: "ManagerState" = state
         self._config: "ManagerConfig" = config
@@ -158,30 +158,6 @@ class ManagerDiscoveryCoordinator:
         """
         self._peer_discovery.remove_peer(peer_id)
 
-    def select_worker(self, exclude: set[str] | None = None) -> str | None:
-        """
-        Select a worker using EWMA-based selection.
-
-        Args:
-            exclude: Set of worker IDs to exclude
-
-        Returns:
-            Selected worker ID or None if none available
-        """
-        return self._worker_discovery.select_peer(exclude=exclude)
-
-    def select_peer_manager(self, exclude: set[str] | None = None) -> str | None:
-        """
-        Select a peer manager using EWMA-based selection.
-
-        Args:
-            exclude: Set of peer IDs to exclude
-
-        Returns:
-            Selected peer ID or None if none available
-        """
-        return self._peer_discovery.select_peer(exclude=exclude)
-
     def record_worker_success(self, worker_id: str, latency_ms: float) -> None:
         """
         Record successful interaction with worker.
@@ -238,10 +214,14 @@ class ManagerDiscoveryCoordinator:
         """Stop the discovery maintenance loop."""
         if self._state._discovery_maintenance_task:
             self._state._discovery_maintenance_task.cancel()
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
                 await self._state._discovery_maintenance_task
             except asyncio.CancelledError:
-                pass
+                # The task we cancelled ended; a cancel aimed at this task
+                # while it waited goes on.
+                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                    raise
             self._state._discovery_maintenance_task = None
 
     async def maintenance_loop(self) -> None:
@@ -260,8 +240,7 @@ class ManagerDiscoveryCoordinator:
                 self._worker_discovery.decay_failures()
                 self._peer_discovery.decay_failures()
 
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerDebug(
                         message="Discovery maintenance completed",
                         node_host=self._config.host,
@@ -273,8 +252,7 @@ class ManagerDiscoveryCoordinator:
             except asyncio.CancelledError:
                 break
             except Exception as maintenance_error:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Discovery maintenance error: {maintenance_error}",
                         node_host=self._config.host,

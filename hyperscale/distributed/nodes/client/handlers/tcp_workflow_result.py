@@ -59,64 +59,7 @@ class WorkflowResultPushHandler:
             b'ok' on success, b'error' on failure
         """
         try:
-            push = WorkflowResultPush.load(data)
-
-            job = self._state._jobs.get(push.job_id)
-            if job:
-                # Extract aggregated stats (should be single item list for client-bound)
-                stats = push.results[0] if push.results else None
-
-                # Convert per-DC results from message format to client format
-                per_dc_results: list[ClientWorkflowDCResult] = []
-                for dc_result in push.per_dc_results:
-                    per_dc_results.append(
-                        ClientWorkflowDCResult(
-                            datacenter=dc_result.datacenter,
-                            status=dc_result.status,
-                            stats=dc_result.stats,
-                            error=dc_result.error,
-                            elapsed_seconds=dc_result.elapsed_seconds,
-                        )
-                    )
-
-                # Use push.completed_at if provided, otherwise use current time
-                completed_at = (
-                    push.completed_at if push.completed_at > 0 else _DEFAULT_CLOCK.time()
-                )
-
-                job.workflow_results[push.workflow_id] = ClientWorkflowResult(
-                    workflow_id=push.workflow_id,
-                    workflow_name=push.workflow_name,
-                    status=push.status,
-                    stats=stats,
-                    error=push.error,
-                    elapsed_seconds=push.elapsed_seconds,
-                    completed_at=completed_at,
-                    per_dc_results=per_dc_results,
-                )
-
-            # Call user callback if registered
-            callback = self._state._workflow_callbacks.get(push.job_id)
-            if callback:
-                try:
-                    callback(push)
-                except Exception as callback_error:
-                    if self._logger:
-                        await self._logger.log(
-                            ServerWarning(
-                                message=f"Workflow result callback error: {callback_error}",
-                                node_host="client",
-                                node_port=0,
-                                node_id="client",
-                            )
-                        )
-
-            # Submit to local file-based reporters (aggregated stats only, not per-DC)
-            if stats and self._reporting_manager:
-                await self._reporting_manager.submit_to_local_reporters(
-                    push.job_id, push.workflow_name, stats
-                )
-
+            await self.apply(WorkflowResultPush.load(data))
             return b"ok"
 
         except Exception as error:
@@ -130,3 +73,80 @@ class WorkflowResultPushHandler:
                     )
                 )
             return b"error"
+
+    async def apply(self, push: WorkflowResultPush) -> None:
+        """Record one workflow's result, tell the caller's callback and the
+        local reporters, and note when the job's results are complete.
+
+        Shared by pushed results and those a job's final result supplies.
+        """
+        job = self._state._jobs.get(push.job_id)
+        if job is None or push.workflow_id in job.workflow_results:
+            # A workflow has one result. Another push of it -- re-sent, or
+            # rebuilt by a manager that took the job over -- re-ran the
+            # caller's callback and reported its stats a second time.
+            return
+
+        # Aggregated stats: one item for a client-bound result
+        stats = push.results[0] if push.results else None
+
+        # Convert per-DC results from message format to client format
+        per_dc_results = [
+            ClientWorkflowDCResult(
+                datacenter=dc_result.datacenter,
+                status=dc_result.status,
+                stats=dc_result.stats,
+                error=dc_result.error,
+                elapsed_seconds=dc_result.elapsed_seconds,
+                rerun_of=dc_result.rerun_of,
+            )
+            for dc_result in push.per_dc_results
+        ]
+
+        # Use push.completed_at if provided, otherwise use current time
+        completed_at = (
+            push.completed_at if push.completed_at > 0 else _DEFAULT_CLOCK.time()
+        )
+
+        job.workflow_results[push.workflow_id] = ClientWorkflowResult(
+            workflow_id=push.workflow_id,
+            workflow_name=push.workflow_name,
+            status=push.status,
+            stats=stats,
+            error=push.error,
+            elapsed_seconds=push.elapsed_seconds,
+            completed_at=completed_at,
+            per_dc_results=per_dc_results,
+        )
+        for stream in self._state.workflow_result_streams(push.job_id):
+            stream.put_nowait(job.workflow_results[push.workflow_id])
+        # The job's results are complete once every workflow it was
+        # submitted with has one.
+        if (
+            results_event := self._state._job_results_events.get(push.job_id)
+        ) is not None and self._state._job_expected_workflows.get(
+            push.job_id, frozenset()
+        ) <= job.workflow_results.keys():
+            results_event.set()
+
+        # Call user callback if registered
+        callback = self._state._workflow_callbacks.get(push.job_id)
+        if callback:
+            try:
+                callback(push)
+            except Exception as callback_error:
+                if self._logger:
+                    await self._logger.log(
+                        ServerWarning(
+                            message=f"Workflow result callback error: {callback_error}",
+                            node_host="client",
+                            node_port=0,
+                            node_id="client",
+                        )
+                    )
+
+        # Submit to local file-based reporters (aggregated stats only, not per-DC)
+        if stats and self._reporting_manager:
+            await self._reporting_manager.submit_to_local_reporters(
+                push.job_id, push.workflow_name, stats
+            )

@@ -5,7 +5,6 @@ Tests:
 - SlidingWindowCounter deterministic counting
 - AdaptiveRateLimiter health-gated behavior
 - ServerRateLimiter with adaptive limiting
-- TokenBucket (legacy) basic operations
 - CooperativeRateLimiter client-side throttling
 - Client cleanup to prevent memory leaks
 """
@@ -26,7 +25,6 @@ from hyperscale.distributed.reliability import (
     RateLimitResult,
     ServerRateLimiter,
     SlidingWindowCounter,
-    TokenBucket,
 )
 from hyperscale.distributed.reliability.load_shedding import RequestPriority
 
@@ -348,103 +346,6 @@ class TestAdaptiveRateLimiter:
 
         # Should have waited for window to rotate
         assert elapsed >= 0.05
-
-
-class TestTokenBucket:
-    """Test TokenBucket basic operations (legacy support)."""
-
-    def test_initial_state(self) -> None:
-        """Test bucket starts full."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=10.0)
-
-        assert bucket.available_tokens == 100.0
-
-    def test_acquire_success(self) -> None:
-        """Test successful token acquisition."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=10.0)
-
-        result = bucket.acquire(10)
-
-        assert result is True
-        assert bucket.available_tokens == pytest.approx(90.0, abs=0.1)
-
-    def test_acquire_failure(self) -> None:
-        """Test failed token acquisition when bucket empty."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)
-
-        # Drain the bucket
-        bucket.acquire(10)
-
-        # Try to acquire more
-        result = bucket.acquire(1)
-
-        assert result is False
-
-    def test_try_acquire_with_wait_time(self) -> None:
-        """Test try_acquire returns wait time."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=10.0)
-
-        # Drain bucket
-        bucket.acquire(10)
-
-        # Check wait time for 5 tokens
-        acquired, wait_time = bucket.try_acquire(5)
-
-        assert acquired is False
-        assert wait_time == pytest.approx(0.5, rel=0.1)
-
-    def test_try_acquire_zero_refill_rate(self) -> None:
-        """Test try_acquire with zero refill rate returns infinity."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=0.0)
-
-        # Drain bucket
-        bucket.acquire(10)
-
-        # Try to acquire - should return infinity wait time
-        acquired, wait_time = bucket.try_acquire(1)
-
-        assert acquired is False
-        assert wait_time == float("inf")
-
-    def test_refill_over_time(self) -> None:
-        """Test that tokens refill over time."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=100.0)
-
-        # Drain bucket
-        bucket.acquire(100)
-        assert bucket.available_tokens == pytest.approx(0.0, abs=0.1)
-
-        # Wait for refill
-        time.sleep(0.1)
-
-        tokens = bucket.available_tokens
-        assert tokens == pytest.approx(10.0, abs=2.0)
-
-    def test_reset(self) -> None:
-        """Test bucket reset."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=10.0)
-
-        bucket.acquire(100)
-        assert bucket.available_tokens == pytest.approx(0.0, abs=0.1)
-
-        bucket.reset()
-        assert bucket.available_tokens == pytest.approx(100.0, abs=0.1)
-
-    @pytest.mark.asyncio
-    async def test_acquire_async(self) -> None:
-        """Test async acquire with wait."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=100.0)
-
-        # Drain bucket
-        bucket.acquire(10)
-
-        # Async acquire should wait for tokens
-        start = time.monotonic()
-        result = await bucket.acquire_async(5, max_wait=1.0)
-        elapsed = time.monotonic() - start
-
-        assert result is True
-        assert elapsed >= 0.04
 
 
 class TestRateLimitConfig:

@@ -1,50 +1,25 @@
+"""
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import count
 import secrets
 
+from .idempotency_key_model import IdempotencyKey
+from .idempotency_key_generator import IdempotencyKeyGenerator
 
-@dataclass(slots=True, frozen=True)
-class IdempotencyKey:
-    """Client-generated idempotency key for job submissions."""
+_REHOMED = (
+    IdempotencyKey,
+    IdempotencyKeyGenerator,
+)
 
-    client_id: str
-    sequence: int
-    nonce: str
-
-    def __str__(self) -> str:
-        return f"{self.client_id}:{self.sequence}:{self.nonce}"
-
-    @classmethod
-    def parse(cls, key_str: str) -> "IdempotencyKey":
-        """Parse an idempotency key from its string representation."""
-        parts = key_str.split(":", 2)
-        if len(parts) != 3:
-            raise ValueError(f"Invalid idempotency key format: {key_str}")
-
-        return cls(
-            client_id=parts[0],
-            sequence=int(parts[1]),
-            nonce=parts[2],
-        )
-
-
-class IdempotencyKeyGenerator:
-    """Generates idempotency keys for a client."""
-
-    def __init__(
-        self, client_id: str, start_sequence: int = 0, nonce: str | None = None
-    ) -> None:
-        self._client_id = client_id
-        self._sequence = count(start_sequence)
-        self._nonce = nonce or secrets.token_hex(8)
-
-    def generate(self) -> IdempotencyKey:
-        """Generate the next idempotency key."""
-        sequence = next(self._sequence)
-        return IdempotencyKey(
-            client_id=self._client_id,
-            sequence=sequence,
-            nonce=self._nonce,
-        )
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

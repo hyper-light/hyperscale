@@ -15,9 +15,11 @@ This server provides:
 
 import asyncio
 import collections
+import json
 import math
 from base64 import b64decode, b64encode
-from typing import Callable, Literal
+from itertools import filterfalse
+from typing import Awaitable, Callable, Literal
 
 from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
 from hyperscale.distributed.env import Env
@@ -29,6 +31,11 @@ from hyperscale.distributed.server.server.mercury_sync_base_server import (
 from hyperscale.distributed.server.protocol import MessagePriority
 from hyperscale.distributed.taskex.run import Run
 from hyperscale.distributed.swim.coordinates import CoordinateTracker
+from hyperscale.distributed.swim.roles.confirmation_strategy import (
+    GATE_STRATEGY,
+    MANAGER_STRATEGY,
+    WORKER_STRATEGY,
+)
 from hyperscale.distributed.models.coordinates import NetworkCoordinate, VivaldiConfig
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
@@ -75,15 +82,18 @@ from .core.retry import (
 from .health.local_health_multiplier import LocalHealthMultiplier
 from .health.health_monitor import EventLoopHealthMonitor
 from .health.graceful_degradation import GracefulDegradation, DegradationLevel
+from .health.degradation_policy import DegradationPolicy
 from .health.peer_health_awareness import PeerHealthAwareness, PeerHealthAwarenessConfig
 
 # Failure detection
+from .core.node_state import NodeState
 from .detection.incarnation_tracker import IncarnationTracker, MessageFreshness
 from .detection.incarnation_store import IncarnationStore
 
-# SuspicionManager replaced by HierarchicalFailureDetector (AD-30)
 from .detection.indirect_probe_manager import IndirectProbeManager
+from .detection.pending_indirect_probe import PendingIndirectProbe
 from .detection.probe_scheduler import ProbeScheduler
+from .detection.probe_budget import SwimProbeBudget
 from .detection.hierarchical_failure_detector import (
     HierarchicalFailureDetector,
     HierarchicalConfig,
@@ -118,6 +128,14 @@ from hyperscale.distributed.protocol.time_quantum import (
     TIME_REMAINDER_EPSILON_SECONDS,
 )
 from hyperscale.distributed.protocol.version import CURRENT_PROTOCOL_VERSION
+from hyperscale.distributed.swim.leadership.leader_eligibility import (LeaderEligibility)
+from hyperscale.distributed.swim.leadership.leader_state import (LeaderState)
+from hyperscale.distributed.models.distributed import NodeRole
+from hyperscale.distributed.swim.roles.confirmation_manager import (RoleAwareConfirmationManager)
+from pathlib import Path
+from hyperscale.logging.hyperscale_logging_models import (ServerInfo as ServerInfoLog)
+import errno
+import traceback as _tb
 
 # SWIM protocol version prefix (included in join messages)
 # Format: "v{major}.{minor}" - allows detection of incompatible nodes
@@ -144,6 +162,51 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     - Term-based resolution and fencing tokens
     """
 
+    # Gossip update types whose propagation ``queue_gossip_update`` counts, by metric name.
+    _GOSSIP_PROPAGATION_METRIC_NAMES: dict[str, str] = {
+        "join": "joins_propagated",
+        "leave": "leaves_propagated",
+    }
+
+    # Membership status each piggybacked gossip update type applies.
+    _GOSSIP_UPDATE_STATUSES: dict[str, bytes] = {
+        "alive": b"OK",
+        "join": b"OK",
+        "suspect": b"SUSPECT",
+        "dead": b"DEAD",
+        "leave": b"DEAD",
+    }
+
+    # Lifeguard §4.3 self-health events that raise LHM, by LocalHealthMultiplier handler name.
+    _LHM_INCREASE_EVENT_HANDLERS: dict[str, str] = {
+        "probe_timeout": "on_probe_timeout",
+        "refutation": "on_refutation_needed",
+        "missed_nack": "on_missed_nack",
+        "event_loop_lag": "on_event_loop_lag",
+        "event_loop_critical": "on_event_loop_critical",
+    }
+
+    # Self-health recovery events that lower LHM, by LocalHealthMultiplier handler name.
+    _LHM_DECREASE_EVENT_HANDLERS: dict[str, str] = {
+        "successful_probe": "on_successful_probe",
+        "successful_nack": "on_successful_nack",
+        "event_loop_recovered": "on_event_loop_recovered",
+    }
+
+    # Freshness rejections ``is_message_fresh`` reports as errors, by error-builder method name.
+    _FRESHNESS_REJECTION_ERROR_BUILDERS: dict[MessageFreshness, str] = {
+        MessageFreshness.STALE: "_stale_message_error",
+        MessageFreshness.INVALID: "_invalid_incarnation_error",
+        MessageFreshness.SUSPICIOUS: "_suspicious_incarnation_error",
+    }
+
+    # SwimError categories that ``handle_error`` counts, by metric name.
+    _ERROR_CATEGORY_METRIC_NAMES: dict[ErrorCategory, str] = {
+        ErrorCategory.NETWORK: "network_errors",
+        ErrorCategory.PROTOCOL: "protocol_errors",
+        ErrorCategory.RESOURCE: "resource_errors",
+    }
+
     def __init__(
         self,
         *args,
@@ -168,6 +231,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Incarnation persistence settings
         incarnation_storage_dir: str
         | None = None,  # Directory for incarnation persistence
+        # D1: the start time of the identity a Raft store resumed; None
+        # stamps a fresh one.
+        node_created_ms: int | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -184,6 +250,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             priority=priority,
             host=self._host,
             port=self._udp_port,
+            created_ms=node_created_ms,
         )
 
         # Store node role for role-aware failure detection (AD-35 Task 12.4.2)
@@ -193,7 +260,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
 
         # Store Vivaldi config for metrics and observability (AD-35 Task 12.7)
-        self._vivaldi_config: VivaldiConfig = vivaldi_config or VivaldiConfig()
+        self._vivaldi_config: VivaldiConfig = self._resolve_vivaldi_config(vivaldi_config)
 
         # State embedder for Serf-style heartbeat embedding
         self._state_embedder: StateEmbedder = state_embedder or NullStateEmbedder()
@@ -216,13 +283,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Role-aware confirmation manager for unconfirmed peers (AD-35 Task 12.5.6)
         # Initialized after CoordinateTracker so it can use Vivaldi-based timeouts
-        from hyperscale.distributed.swim.roles.confirmation_manager import (
-            RoleAwareConfirmationManager,
-        )
-        from hyperscale.distributed.models.distributed import NodeRole
 
         self._confirmation_manager = RoleAwareConfirmationManager(
-            coordinator_tracker=self._coordinate_tracker,
             send_ping=self._send_confirmation_ping,
             get_lhm_multiplier=lambda: self._local_health.get_multiplier(),
             on_peer_confirmed=self._on_confirmation_manager_peer_confirmed,
@@ -232,10 +294,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Peer role tracking for role-aware confirmation (AD-35 Task 12.4.2)
         # Maps peer address to role. Default to WORKER if unknown (gossip pending)
         self._peer_roles: dict[tuple[str, int], NodeRole] = {}
+        # A node SWIM retires from membership takes its per-node state with
+        # it; without this every peer address ever seen stayed for good.
+        self._incarnation_tracker.set_eviction_callback(self._forget_retired_node)
 
         self._gossip_buffer = GossipBuffer()
         self._gossip_buffer.set_overflow_callback(self._on_gossip_overflow)
         self._probe_scheduler = ProbeScheduler()
+        # AD-52 section 8 probe budgeting: built when the probe cycle starts
+        # and the protocol period is known.
+        self._probe_budget: SwimProbeBudget | None = None
 
         # Monotonic per-node counter for probe request tokens. A probe
         # request id needs UNIQUENESS (to correlate an ack with its
@@ -279,25 +347,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # through the normal direct probe -> indirect probe -> SUSPECT
         # pipeline; burst mode changes scheduling pressure, not SWIM's
         # membership state machine. See ``docs/architecture/AD_53.md``.
-        _burst_default_env = Env()
-        _burst_env = kwargs.get("env") or _burst_default_env
         self._burst_failure_threshold: int = (
-            int(
-                getattr(
-                    _burst_env,
-                    "BURST_FAILURE_THRESHOLD",
-                    _burst_default_env.BURST_FAILURE_THRESHOLD,
-                )
-            )
+            int(self.env.BURST_FAILURE_THRESHOLD)
         )
         self._burst_failure_window_seconds: float = (
-            float(
-                getattr(
-                    _burst_env,
-                    "BURST_FAILURE_WINDOW_SECONDS",
-                    _burst_default_env.BURST_FAILURE_WINDOW_SECONDS,
-                )
-            )
+            float(self.env.BURST_FAILURE_WINDOW_SECONDS)
         )
         self._burst_failure_observations: collections.deque[
             tuple[float, tuple[str, int]]
@@ -346,30 +400,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         )
 
         # Initialize leader election with configurable parameters from Env
-        from hyperscale.distributed.swim.leadership.leader_state import (
-            LeaderState,
-        )
-        from hyperscale.distributed.swim.leadership.leader_eligibility import (
-            LeaderEligibility,
-        )
 
-        # Get leader election config from Env if available
-        env = kwargs.get("env")
-        if env and hasattr(env, "get_leader_election_config"):
-            leader_config = env.get_leader_election_config()
-            self._leader_election = LocalLeaderElection(
-                dc_id=dc_id,
-                heartbeat_interval=leader_config["heartbeat_interval"],
-                election_timeout_base=leader_config["election_timeout_base"],
-                election_timeout_jitter=leader_config["election_timeout_jitter"],
-                pre_vote_timeout=leader_config["pre_vote_timeout"],
-                state=LeaderState(lease_duration=leader_config["lease_duration"]),
-                eligibility=LeaderEligibility(
-                    max_leader_lhm=leader_config["max_leader_lhm"]
-                ),
-            )
-        else:
-            self._leader_election = LocalLeaderElection(dc_id=dc_id)
+        # Leader election runs on the node's own Env (the base server
+        # stored it, however it was passed in).
+        leader_config = self.env.get_leader_election_config()
+        self._leader_election = LocalLeaderElection(
+            dc_id=dc_id,
+            heartbeat_interval=leader_config["heartbeat_interval"],
+            election_timeout_base=leader_config["election_timeout_base"],
+            election_timeout_jitter=leader_config["election_timeout_jitter"],
+            pre_vote_timeout=leader_config["pre_vote_timeout"],
+            state=LeaderState(lease_duration=leader_config["lease_duration"]),
+            eligibility=LeaderEligibility(
+                max_leader_lhm=leader_config["max_leader_lhm"]
+            ),
+        )
 
         # Message deduplication - track recently seen messages to prevent duplicates
         self._seen_messages: BoundedDict[int, float] = BoundedDict(
@@ -413,10 +458,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 max(rate_limit_refill, 10.0),
             ),
         }
-        self._swim_rate_limit_stats: dict[str, dict[str, int]] = {
-            admission_class: {"accepted": 0, "rejected": 0}
-            for admission_class in self._swim_rate_limit_profiles
-        }
+        self._swim_rate_limit_stats: dict[str, dict[str, int]] = (
+            self._build_swim_rate_limit_stats(self._swim_rate_limit_profiles)
+        )
         self._rate_limit_stats = {
             "accepted": 0,
             "rejected": 0,
@@ -443,6 +487,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Graceful degradation (load shedding under pressure)
         self._degradation = GracefulDegradation()
+
+        # These components log through the node's logger (the base server
+        # creates it in its constructor and keeps it for its life).
+        self._metrics.set_logger(self._udp_logger, self._host, self._udp_port, self._node_id.short)
+        self._incarnation_tracker.set_logger(self._udp_logger, self._host, self._udp_port, self._node_id.short)
+        self._health_monitor.set_logger(self._udp_logger, self._host, self._udp_port, self._node_id.short)
+        self._degradation.set_logger(self._udp_logger, self._host, self._udp_port, self._node_id.short)
         # Further reasons a role may refuse SWIM leadership (beyond
         # graceful degradation): each is consulted on every eligibility
         # check; roles register theirs in their own constructors.
@@ -525,6 +576,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._message_dispatcher = MessageDispatcher(self._server_adapter)
         register_default_handlers(self._message_dispatcher, self._server_adapter)
 
+    @staticmethod
+    def _resolve_vivaldi_config(vivaldi_config: "VivaldiConfig | None") -> VivaldiConfig:
+        """Return the configured Vivaldi settings, or the defaults when none (or a falsy one) was given."""
+        return vivaldi_config or VivaldiConfig()
+
+    @staticmethod
+    def _build_swim_rate_limit_stats(
+        swim_rate_limit_profiles: dict[str, tuple[int, float]],
+    ) -> dict[str, dict[str, int]]:
+        """Return zeroed accepted/rejected counters for every SWIM admission class profile."""
+        return {
+            admission_class: {"accepted": 0, "rejected": 0}
+            for admission_class in swim_rate_limit_profiles
+        }
+
     def _create_background_task(
         self,
         coro,
@@ -552,6 +618,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         task.add_done_callback(lambda t: self._handle_background_task_error(t, name))
         return task
 
+    @staticmethod
+    def _background_task_failure(task: asyncio.Task) -> BaseException | None:
+        """Return the exception a finished background task raised, or None if it was cancelled or succeeded."""
+        if task.cancelled():
+            return None
+        return task.exception()
+
+    def _short_node_id_or_unknown(self) -> str:
+        """Return this node's short id, or ``"unknown"`` before the id is assigned during construction."""
+        node_id_value = getattr(self, "_node_id", None)
+        return node_id_value.short if node_id_value is not None else "unknown"
+
+    def _background_failure_logging_available(self) -> bool:
+        """Whether both the task runner and the UDP logger exist to report a background task failure."""
+        return self._task_runner is not None and self._udp_logger is not None
+
     def _handle_background_task_error(self, task: asyncio.Task, name: str) -> None:
         """
         Handle errors from background tasks by logging them.
@@ -564,19 +646,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             task: The completed task.
             name: The descriptive name of the task.
         """
-        if task.cancelled():
-            return
-
-        exception = task.exception()
+        exception = self._background_task_failure(task)
         if exception is None:
             return
 
-        node_id_value = getattr(self, "_node_id", None)
-        node_id_short = node_id_value.short if node_id_value is not None else "unknown"
+        node_id_short = self._short_node_id_or_unknown()
 
         host, port = self._get_self_udp_addr()
 
-        if self._task_runner is not None and self._udp_logger is not None:
+        if self._background_failure_logging_available():
             # Pass the bound method + args separately so the TaskRunner is
             # the one to actually invoke and await the coroutine. The
             # earlier ``run(logger.log(msg))`` form built the coroutine
@@ -637,13 +715,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             "local_coordinate": local_coord.to_dict(),
             "coordinate_error": local_coord.error,
             "is_converged": self._coordinate_tracker.is_converged(),
-            "peer_count": len(self._coordinate_tracker._peers),
+            "peer_count": self._coordinate_tracker.get_peer_count(),
             "sample_count": local_coord.sample_count,
             "config": {
                 "dimensions": self._vivaldi_config.dimensions,
                 "ce": self._vivaldi_config.ce,
                 "error_decay": self._vivaldi_config.error_decay,
-                "convergence_threshold": self._vivaldi_config.convergence_error_threshold,
+                "convergence_min_samples": self._vivaldi_config.min_samples_for_routing,
+                "convergence_error_ms": self._vivaldi_config.error_good_ms,
             },
         }
 
@@ -678,20 +757,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             - confirmation_manager_active: Confirmation manager is tracking peers
             - errors: List of any validation errors
         """
-        errors: list[str] = []
         coord = self._coordinate_tracker.get_coordinate()
 
-        # Validate coordinate bounds
-        coord_valid = True
-        if coord.error < 0 or coord.error > 10.0:
-            coord_valid = False
-            errors.append(f"Coordinate error out of bounds: {coord.error}")
-
-        for dimension_value in coord.vec:
-            if abs(dimension_value) > 10000:  # Sanity check: ~10s RTT max
-                coord_valid = False
-                errors.append(f"Coordinate dimension out of bounds: {dimension_value}")
-                break
+        # Validate coordinate bounds: the engine keeps error within
+        # [0, max_error] seconds, and no component of a position in seconds
+        # can exceed the largest RTT an estimate may claim.
+        errors: list[str] = self._coordinate_bound_errors(coord)
+        coord_valid = not errors
 
         # Validate convergence
         coord_converged = self._coordinate_tracker.is_converged()
@@ -711,9 +783,31 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             "coordinate_converged": coord_converged,
             "role_set": role_set,
             "confirmation_manager_active": confirmation_active,
-            "errors": errors if errors else None,
-            "overall_valid": coord_valid and role_set and confirmation_active,
+            "errors": errors or None,
+            "overall_valid": all((coord_valid, role_set, confirmation_active)),
         }
+
+    def _coordinate_bound_errors(self, coord: NetworkCoordinate) -> list[str]:
+        """Return the AD-35 bound violations of ``coord``: its error estimate first, then its first bad dimension."""
+        violations = (
+            self._coordinate_error_bound_violation(coord),
+            self._first_out_of_bounds_dimension_violation(coord),
+        )
+        return [violation for violation in violations if violation is not None]
+
+    def _coordinate_error_bound_violation(self, coord: NetworkCoordinate) -> str | None:
+        """Describe ``coord``'s error estimate when it lies outside ``[0, max_error]`` seconds, else None."""
+        if coord.error < 0 or coord.error > self._vivaldi_config.max_error:
+            return f"Coordinate error out of bounds: {coord.error}"
+        return None
+
+    def _first_out_of_bounds_dimension_violation(self, coord: NetworkCoordinate) -> str | None:
+        """Describe the first component of ``coord`` larger in magnitude than the largest claimable RTT, else None."""
+        max_component_seconds = self._vivaldi_config.rtt_max_ms / 1000.0
+        for dimension_value in coord.vec:
+            if abs(dimension_value) > max_component_seconds:
+                return f"Coordinate dimension out of bounds: {dimension_value}"
+        return None
 
     # =========================================================================
     # Leadership Event Registration (Composition Pattern)
@@ -846,14 +940,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             peer: The UDP address of the peer to track.
             role: Optional role hint (gate/manager/worker). Defaults to worker.
         """
-        if peer == self._get_self_udp_addr():
-            return  # Don't track self
-
-        if peer in self._confirmed_peers:
-            return  # Already confirmed, no action needed
-
-        # Check incarnation tracker - don't demote confirmed nodes
-        if self._incarnation_tracker.is_node_confirmed(peer):
+        # Never track self, an already-confirmed peer, or a node the
+        # incarnation tracker holds confirmed (don't demote confirmed nodes).
+        if self._is_ineligible_for_unconfirmed_tracking(peer):
             return
 
         if peer not in self._unconfirmed_peers:
@@ -863,16 +952,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             await self._incarnation_tracker.add_unconfirmed_node(peer)
 
             # AD-35 Task 12.5.6: Track with RoleAwareConfirmationManager
-            from hyperscale.distributed.models.distributed import NodeRole
 
             # Store peer role (default to WORKER if unknown)
-            if role:
-                try:
-                    self._peer_roles[peer] = NodeRole(role.lower())
-                except ValueError:
-                    self._peer_roles[peer] = NodeRole.WORKER
-            else:
-                self._peer_roles[peer] = NodeRole.WORKER
+            self._peer_roles[peer] = self._peer_role_hint_or_worker(role)
 
             # Generate peer_id from address
             peer_id = f"{peer[0]}:{peer[1]}"
@@ -884,6 +966,24 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 peer,
                 self._peer_roles[peer],
             )
+
+    def _is_ineligible_for_unconfirmed_tracking(self, peer: tuple[str, int]) -> bool:
+        """Whether ``peer`` is this node, already confirmed here, or confirmed in the incarnation tracker."""
+        return (
+            peer == self._get_self_udp_addr()
+            or peer in self._confirmed_peers
+            or self._incarnation_tracker.is_node_confirmed(peer)
+        )
+
+    @staticmethod
+    def _peer_role_hint_or_worker(role: str | None) -> NodeRole:
+        """Parse a configured role hint into a ``NodeRole``; a missing or unknown hint defaults to WORKER."""
+        if not role:
+            return NodeRole.WORKER
+        try:
+            return NodeRole(role.lower())
+        except ValueError:
+            return NodeRole.WORKER
 
     def record_peer_role(self, peer: tuple[str, int], role: str) -> None:
         """Record a peer's self-declared role into ``_peer_roles``.
@@ -899,7 +999,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Unknown / unparseable role strings are dropped; the role map
         keeps the prior value rather than corrupting it.
         """
-        from hyperscale.distributed.models.distributed import NodeRole
 
         if peer == self._get_self_udp_addr():
             return
@@ -923,11 +1022,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns:
             True if peer was newly confirmed, False if already confirmed.
         """
-        if peer == self._get_self_udp_addr():
-            return False  # Don't confirm self
-
-        if peer in self._confirmed_peers:
-            return False  # Already confirmed
+        # Don't confirm self; an already-confirmed peer needs nothing.
+        if self._is_self_or_confirmed_peer(peer):
+            return False
 
         # Transition from unconfirmed to confirmed
         self._unconfirmed_peers.discard(peer)
@@ -950,7 +1047,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         peer_id = f"{peer[0]}:{peer[1]}"
         self._task_runner.run(self._confirmation_manager.confirm_peer, peer_id)
 
-        # Invoke confirmation callbacks
+        self._invoke_peer_confirmation_callbacks(peer)
+
+        return True
+
+    def _is_self_or_confirmed_peer(self, peer: tuple[str, int]) -> bool:
+        """Whether ``peer`` is this node's own UDP address or a peer already confirmed here."""
+        return peer == self._get_self_udp_addr() or peer in self._confirmed_peers
+
+    def _invoke_peer_confirmation_callbacks(self, peer: tuple[str, int]) -> None:
+        """Call every registered peer-confirmation callback in order; a failing one is handed to handle_exception."""
         for callback in self._peer_confirmation_callbacks:
             try:
                 callback(peer)
@@ -958,8 +1064,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 self._task_runner.run(
                     self.handle_exception, e, "on_peer_confirmed_callback"
                 )
-
-        return True
 
     def is_peer_confirmed(self, peer: tuple[str, int]) -> bool:
         """
@@ -1103,6 +1207,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             )
         )
 
+    def _forget_retired_node(self, node: tuple[str, int], state: NodeState) -> None:
+        """Drop the per-node state kept beside SWIM membership for a node
+        the incarnation tracker retired (dead past its retention, or
+        evicted over the membership cap). A node that comes back is
+        re-learned from its join and its role-bearing gossip."""
+        self._peer_roles.pop(node, None)
+        self._confirmed_peers.discard(node)
+        self._unconfirmed_peers.discard(node)
+        self._unconfirmed_peer_added_at.pop(node, None)
+
     async def remove_peer_tracking(self, peer: tuple[str, int]) -> None:
         """
         Remove a peer from all confirmation tracking (AD-29 Task 12.3.6).
@@ -1121,6 +1235,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._confirmed_peers.discard(peer)
         self._unconfirmed_peers.discard(peer)
         self._unconfirmed_peer_added_at.pop(peer, None)
+        self._peer_roles.pop(peer, None)
         # AD-29: Also remove from formal state machine
         await self._incarnation_tracker.remove_node(peer)
 
@@ -1425,22 +1540,26 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         ``AttributeError`` that then masked the real bug).
         """
         if not isinstance(error, SwimError):
-            if self._error_handler:
-                await self._error_handler.handle_exception(
-                    error, operation="handle_error"
-                )
+            await self._handle_unwrapped_error(error)
             return
 
         # Track error by category for SwimError instances.
-        if error.category == ErrorCategory.NETWORK:
-            self._metrics.increment("network_errors")
-        elif error.category == ErrorCategory.PROTOCOL:
-            self._metrics.increment("protocol_errors")
-        elif error.category == ErrorCategory.RESOURCE:
-            self._metrics.increment("resource_errors")
+        self._record_error_category_metric(error)
 
         if self._error_handler:
             await self._error_handler.handle(error)
+
+    async def _handle_unwrapped_error(self, error: BaseException) -> None:
+        """Route a raw (not yet SwimError-wrapped) exception through the error handler, which wraps it."""
+        if self._error_handler:
+            await self._error_handler.handle_exception(
+                error, operation="handle_error"
+            )
+
+    def _record_error_category_metric(self, error: SwimError) -> None:
+        """Count ``error`` under its category's metric when the category is network, protocol or resource."""
+        if (metric_name := self._ERROR_CATEGORY_METRIC_NAMES.get(error.category)) is not None:
+            self._metrics.increment(metric_name)
 
     async def handle_exception(self, exc: BaseException, operation: str) -> None:
         """Handle a raw exception, converting to SwimError."""
@@ -1478,7 +1597,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if self._incarnation_storage_dir is None:
             return 0
 
-        from pathlib import Path
 
         node_address = f"{self._host}:{self._udp_port}"
         self._incarnation_store = IncarnationStore(
@@ -1577,10 +1695,54 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         new_level: DegradationLevel,
     ) -> None:
         """Handle degradation level changes."""
-        direction = "increased" if new_level.value > old_level.value else "decreased"
+        direction = self._degradation_direction(old_level, new_level)
         policy = self._degradation.get_current_policy()
 
         # Log TaskOverloadError for severe/critical degradation
+        self._report_critical_degradation_overload(old_level, new_level)
+
+        # Log the change. ``_on_degradation_level_change`` runs from a
+        # sync health-callback path, so ``await`` is unavailable — route
+        # the coroutine through the TaskRunner with the callable + args
+        # form so it is actually awaited (not constructed and dropped).
+        if hasattr(self, "_udp_logger"):
+            try:
+
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfoLog(
+                        message=f"Degradation {direction}: {old_level.name} -> {new_level.name} ({policy.description})",
+                        node_host=self._host,
+                        node_port=self._udp_port,
+                        node_id=self._short_node_id_or(0),
+                    ),
+                )
+            except Exception as e:
+                # Don't let logging failure prevent degradation handling
+                # But still track the unexpected error
+                self._task_runner.run(
+                    self.handle_error,
+                    UnexpectedError(e, "degradation_logging"),
+                )
+
+        # Check if we need to step down from leadership
+        self._step_down_if_degradation_policy_requires(policy)
+
+    @staticmethod
+    def _degradation_direction(old_level: DegradationLevel, new_level: DegradationLevel) -> str:
+        """Return ``"increased"`` when ``new_level`` is more degraded than ``old_level``, else ``"decreased"``."""
+        return "increased" if new_level.value > old_level.value else "decreased"
+
+    def _short_node_id_or(self, default: str | int) -> str | int:
+        """Return this node's short id, or ``default`` while the node has no ``_node_id`` attribute yet."""
+        return self._node_id.short if hasattr(self, "_node_id") else default
+
+    def _report_critical_degradation_overload(
+        self,
+        old_level: DegradationLevel,
+        new_level: DegradationLevel,
+    ) -> None:
+        """Report a TaskOverloadError when degradation escalates to CRITICAL or beyond."""
         if (
             new_level.value >= DegradationLevel.CRITICAL.value
             and new_level.value > old_level.value
@@ -1593,36 +1755,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 ),
             )
 
-        # Log the change. ``_on_degradation_level_change`` runs from a
-        # sync health-callback path, so ``await`` is unavailable — route
-        # the coroutine through the TaskRunner with the callable + args
-        # form so it is actually awaited (not constructed and dropped).
-        if hasattr(self, "_udp_logger"):
-            try:
-                from hyperscale.logging.hyperscale_logging_models import (
-                    ServerInfo as ServerInfoLog,
-                )
-
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfoLog(
-                        message=f"Degradation {direction}: {old_level.name} -> {new_level.name} ({policy.description})",
-                        node_host=self._host,
-                        node_port=self._udp_port,
-                        node_id=self._node_id.short
-                        if hasattr(self, "_node_id")
-                        else 0,
-                    ),
-                )
-            except Exception as e:
-                # Don't let logging failure prevent degradation handling
-                # But still track the unexpected error
-                self._task_runner.run(
-                    self.handle_error,
-                    UnexpectedError(e, "degradation_logging"),
-                )
-
-        # Check if we need to step down from leadership
+    def _step_down_if_degradation_policy_requires(self, policy: DegradationPolicy) -> None:
+        """Report NotEligibleError and step down when ``policy`` demands it while this node leads."""
         if policy.should_step_down and self._leader_election.state.is_leader():
             # Log NotEligibleError - we're being forced to step down
             self._task_runner.run(
@@ -1927,45 +2061,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             msg_end = membership_idx
 
         addr_sep_idx = message.find(b">", 0, msg_end)
-        if addr_sep_idx < 0:
-            if process_piggybacks:
-                if vivaldi_piggyback:
-                    self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
-                if extension_outcome_piggyback:
-                    self._task_runner.run(
-                        self._process_extension_outcome_piggyback,
-                        extension_outcome_piggyback,
-                        source_addr,
-                    )
-                if extension_decision_piggyback:
-                    self._task_runner.run(
-                        self._process_extension_decision_piggyback,
-                        extension_decision_piggyback,
-                        source_addr,
-                    )
-                if worker_state_piggyback:
-                    self._task_runner.run(
-                        self._process_worker_state_piggyback,
-                        worker_state_piggyback,
-                        source_addr,
-                    )
-                if health_piggyback:
-                    self._health_gossip_buffer.decode_and_process_piggyback(
-                        health_piggyback
-                    )
-                if membership_piggyback:
-                    self._task_runner.run(
-                        self.process_piggyback_data,
-                        membership_piggyback,
-                        source_addr,
-                    )
-            return message[:msg_end] if msg_end < len(message) else message
-
-        state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
+        # A message without an address separator carries no embedded state.
+        state_sep_idx = (
+            message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
+            if addr_sep_idx >= 0
+            else -1
+        )
 
         if process_piggybacks:
             if vivaldi_piggyback:
-                self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
+                await self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
             if extension_outcome_piggyback:
                 self._task_runner.run(
                     self._process_extension_outcome_piggyback,
@@ -2005,17 +2110,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Skip 3 bytes for '#|s' separator
         encoded_state = message[state_sep_idx + 3 : msg_end]
 
+        # The SWIM message itself stands whatever its embedded state does:
+        # undecodable state, or a handler that fails on it, is logged and
+        # the message processed on -- never dropped unseen.
         try:
             state_data = b64decode(encoded_state)
             await self._process_embedded_state(state_data, source_addr)
-        except Exception:
-            # Invalid base64 or processing error - ignore silently
-            pass
+        except Exception as embedded_state_error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=(
+                        f"Embedded state from {source_addr[0]}:{source_addr[1]} failed "
+                        f"({type(embedded_state_error).__name__}): {embedded_state_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                    node_id=self._node_id.full,
+                )
+            )
 
         # Return message up to state separator (excludes state and all piggyback)
         return message[:state_sep_idx]
 
-    def _process_vivaldi_piggyback(
+    async def _process_vivaldi_piggyback(
         self,
         vivaldi_data: bytes,
         source_addr: tuple[str, int],
@@ -2031,37 +2148,40 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             source_addr: Sender's address tuple
         """
         try:
-            import json
-            from hyperscale.distributed.models.coordinates import NetworkCoordinate
-
-            coord_dict = json.loads(vivaldi_data)
-            peer_coord = NetworkCoordinate.from_dict(coord_dict)
-
-            # Check if this is a response to our probe (we have start time)
-            probe_start = self._pending_probe_start.get(source_addr)
-            if probe_start is not None:
-                # Calculate RTT in milliseconds
-                rtt_seconds = self._clock.monotonic() - probe_start
-                rtt_ms = rtt_seconds * 1000.0
-
-                # Update coordinate tracker with RTT measurement (AD-35 Task 12.2.6)
-                peer_id = f"{source_addr[0]}:{source_addr[1]}"
-                self._coordinate_tracker.update_peer_coordinate(
-                    peer_id=peer_id,
-                    peer_coordinate=peer_coord,
-                    rtt_ms=rtt_ms,
+            peer_coord = NetworkCoordinate.from_dict(json.loads(vivaldi_data))
+            if len(peer_coord.vec) != self._vivaldi_config.dimensions:
+                raise ValueError(
+                    f"{len(peer_coord.vec)} dimensions, not {self._vivaldi_config.dimensions}"
                 )
-            else:
-                # No RTT measurement available - just store coordinate
-                peer_id = f"{source_addr[0]}:{source_addr[1]}"
-                # Store coordinate without updating (no RTT measurement)
-                self._coordinate_tracker._peers[peer_id] = peer_coord
-                self._coordinate_tracker._peer_last_seen[peer_id] = self._clock.monotonic()
+        except (ValueError, TypeError, KeyError) as malformed_coordinate:
+            # A peer's coordinate that does not decode is dropped -- the
+            # message it rode on still stands -- and logged, never silent.
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Malformed Vivaldi coordinate from {source_addr[0]}:{source_addr[1]} "
+                        f"({type(malformed_coordinate).__name__}): {malformed_coordinate}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                    node_id=self._node_id.full,
+                ),
+            )
+            return
 
-        except Exception:
-            # Invalid JSON or coordinate data - ignore silently
-            # Don't let coordinate processing errors break message handling
-            pass
+        peer_id = f"{source_addr[0]}:{source_addr[1]}"
+        # An ack to our own probe measures the round trip (AD-35 Task
+        # 12.2.6); any other message only tells us where the peer is.
+        probe_start = self._pending_probe_start.get(source_addr)
+        if probe_start is None:
+            self._coordinate_tracker.record_peer_coordinate(peer_id, peer_coord)
+            return
+
+        self._coordinate_tracker.update_peer_coordinate(
+            peer_id=peer_id,
+            peer_coordinate=peer_coord,
+            rtt_ms=(self._clock.monotonic() - probe_start) * 1000.0,
+        )
 
     # === Message Size Helpers ===
 
@@ -2137,20 +2257,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         )
         message_with_outcome = message_with_extension + extension_outcome_piggyback
 
-        remaining_after_outcome = MAX_UDP_PAYLOAD - len(message_with_outcome)
-        if remaining_after_outcome >= 150:
-            import json
-
-            coord = self._coordinate_tracker.get_coordinate()
-            coord_dict = coord.to_dict()
-            coord_json = json.dumps(coord_dict, separators=(",", ":")).encode()
-            vivaldi_piggyback = b"#|v" + coord_json
-
-            if (
-                len(message_with_outcome) + len(vivaldi_piggyback)
-                <= MAX_UDP_PAYLOAD
-            ):
-                return message_with_outcome + vivaldi_piggyback
+        vivaldi_piggyback = b"#|v" + json.dumps(
+            self._coordinate_tracker.get_coordinate().to_dict(),
+            separators=(",", ":"),
+        ).encode()
+        if len(message_with_outcome) + len(vivaldi_piggyback) <= MAX_UDP_PAYLOAD:
+            return message_with_outcome + vivaldi_piggyback
 
         return message_with_outcome
 
@@ -2176,24 +2288,52 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     async def stop_cleanup(self) -> None:
         """Stop the periodic cleanup task."""
-        if self._cleanup_task and not self._cleanup_task.done():
+        if self._cleanup_task_is_running():
             self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
+            await self._await_cancelled_cleanup_task(cancels_requested_before_wait)
             self._cleanup_task = None
+
+    def _cleanup_task_is_running(self) -> bool:
+        """Whether a periodic cleanup task exists and has not finished."""
+        return self._cleanup_task is not None and not self._cleanup_task.done()
+
+    async def _await_cancelled_cleanup_task(self, cancels_requested_before_wait: int) -> None:
+        """Wait for the just-cancelled cleanup task to end, re-raising only a cancel aimed at the caller's task.
+
+        The cleanup task's own CancelledError is its expected ending; a
+        cancel requested of the awaiting task while it waited (its
+        ``cancelling()`` count rose past ``cancels_requested_before_wait``)
+        goes on.
+        """
+        try:
+            await self._cleanup_task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
 
     async def _run_cleanup_loop(self) -> None:
         """Run periodic cleanup of all SWIM state."""
         while self._running:
-            try:
-                await self._clock.sleep(self._cleanup_interval)
-                await self._run_cleanup()
-            except asyncio.CancelledError:
+            if not await self._run_cleanup_loop_iteration():
                 break
-            except Exception as e:
-                await self.handle_exception(e, "cleanup_loop")
+
+    async def _run_cleanup_loop_iteration(self) -> bool:
+        """Sleep one cleanup interval then run a cleanup cycle; False once cancelled, ending the loop.
+
+        Any other failure is handed to ``handle_exception`` and the loop
+        goes on.
+        """
+        try:
+            await self._clock.sleep(self._cleanup_interval)
+            await self._run_cleanup()
+        except asyncio.CancelledError:
+            return False
+        except Exception as e:
+            await self.handle_exception(e, "cleanup_loop")
+        return True
 
     async def _run_cleanup(self) -> None:
         """Run one cleanup cycle for all SWIM components using ErrorContext."""
@@ -2232,15 +2372,27 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             confirmation_results = (
                 await self._confirmation_manager.check_and_cleanup_unconfirmed_peers()
             )
-            stats["confirmation_manager"] = {
-                "total": len(confirmation_results),
-                "confirmed": sum(1 for r in confirmation_results if r.confirmed),
-                "removed": sum(1 for r in confirmation_results if r.removed),
-            }
+            stats["confirmation_manager"] = self._summarize_confirmation_cleanup(
+                confirmation_results
+            )
 
         # Check for counter overflow and reset if needed
         # (Python handles big ints, but we reset periodically for monitoring clarity)
         self._check_and_reset_stats()
+
+    @classmethod
+    def _summarize_confirmation_cleanup(cls, confirmation_results: list) -> dict[str, int]:
+        """Count a confirmation-manager cleanup pass: results in total, peers confirmed, peers removed."""
+        return {
+            "total": len(confirmation_results),
+            "confirmed": cls._count_results_with_flag(confirmation_results, "confirmed"),
+            "removed": cls._count_results_with_flag(confirmation_results, "removed"),
+        }
+
+    @staticmethod
+    def _count_results_with_flag(results: list, flag_name: str) -> int:
+        """Count the results whose ``flag_name`` attribute is truthy."""
+        return sum(1 for result in results if getattr(result, flag_name))
 
     def get_cleanup_stats(self) -> dict:
         """Get cleanup statistics from all components."""
@@ -2249,6 +2401,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             "suspicion": self._hierarchical_detector.get_stats_sync(),
             "indirect_probe": self._indirect_probe_manager.get_stats(),
             "gossip": self._gossip_buffer.get_stats(),
+            "probe_budget": self._probe_budget.get_stats() if self._probe_budget is not None else {},
+            "error_handler": {
+                "log_write_failures": self._error_handler.log_write_failures
+                if self._error_handler is not None
+                else 0,
+            },
         }
 
     def _check_and_reset_stats(self) -> None:
@@ -2263,30 +2421,41 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         MAX_COUNTER = 10_000_000_000  # 10 billion - reset threshold
 
         # Reset dedup stats if too large
-        if (
-            self._dedup_stats["duplicates"] > MAX_COUNTER
-            or self._dedup_stats["unique"] > MAX_COUNTER
-        ):
+        if self._dedup_stats_exceed(MAX_COUNTER):
             self._dedup_stats = {"duplicates": 0, "unique": 0}
 
         # Reset rate limit stats if too large
-        if (
-            self._rate_limit_stats["accepted"] > MAX_COUNTER
-            or self._rate_limit_stats["rejected"] > MAX_COUNTER
-            or any(
-                class_stats["accepted"] > MAX_COUNTER
-                or class_stats["rejected"] > MAX_COUNTER
-                for class_stats in self._swim_rate_limit_stats.values()
-            )
-        ):
+        if self._rate_limit_stats_exceed(MAX_COUNTER):
             self._rate_limit_stats = {
                 "accepted": 0,
                 "rejected": 0,
             }
-            self._swim_rate_limit_stats = {
-                admission_class: {"accepted": 0, "rejected": 0}
-                for admission_class in self._swim_rate_limit_profiles
-            }
+            self._swim_rate_limit_stats = self._build_swim_rate_limit_stats(
+                self._swim_rate_limit_profiles
+            )
+
+    def _dedup_stats_exceed(self, max_counter: int) -> bool:
+        """Whether either dedup counter has passed ``max_counter``."""
+        return (
+            self._dedup_stats["duplicates"] > max_counter
+            or self._dedup_stats["unique"] > max_counter
+        )
+
+    def _rate_limit_stats_exceed(self, max_counter: int) -> bool:
+        """Whether an overall or any per-admission-class rate-limit counter has passed ``max_counter``."""
+        return (
+            self._rate_limit_stats["accepted"] > max_counter
+            or self._rate_limit_stats["rejected"] > max_counter
+            or self._admission_class_stats_exceed(max_counter)
+        )
+
+    def _admission_class_stats_exceed(self, max_counter: int) -> bool:
+        """Whether any SWIM admission class's accepted or rejected counter has passed ``max_counter``."""
+        return any(
+            class_stats["accepted"] > max_counter
+            or class_stats["rejected"] > max_counter
+            for class_stats in self._swim_rate_limit_stats.values()
+        )
 
     async def _check_stale_unconfirmed_peers(self) -> None:
         """
@@ -2298,30 +2467,45 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Logs a warning for each stale peer to aid debugging cluster formation issues.
         """
-        # Threshold: peers unconfirmed for more than 60 seconds are considered stale
-        STALE_UNCONFIRMED_THRESHOLD = 60.0
+        # Stale: unconfirmed past the point where AD-35 stops waiting
+        # passively for any role -- half the shortest passive timeout, when
+        # its proactive confirmation begins.
+        stale_unconfirmed_threshold = (
+            min(
+                GATE_STRATEGY.passive_timeout_seconds,
+                MANAGER_STRATEGY.passive_timeout_seconds,
+                WORKER_STRATEGY.passive_timeout_seconds,
+            )
+            / 2
+        )
 
-        stale_count = 0
-        now = self._clock.monotonic()
+        stale_peer_ages = self._stale_unconfirmed_peer_ages(stale_unconfirmed_threshold)
 
-        for peer, added_at in list(self._unconfirmed_peer_added_at.items()):
-            age = now - added_at
-            if age > STALE_UNCONFIRMED_THRESHOLD:
-                stale_count += 1
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=f"Unconfirmed peer {peer[0]}:{peer[1]} stale for {age:.1f}s (AD-29)",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short
-                        if hasattr(self, "_node_id")
-                        else "unknown",
-                    )
+        for peer, age in stale_peer_ages:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Unconfirmed peer {peer[0]}:{peer[1]} stale for {age:.1f}s (AD-29)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._short_node_id_or("unknown"),
                 )
+            )
 
         # Update metrics for stale unconfirmed peers
-        if stale_count > 0:
-            self._metrics.record_counter("stale_unconfirmed_peers", stale_count)
+        if stale_peer_ages:
+            self._metrics.increment("stale_unconfirmed_peer_sightings", len(stale_peer_ages))
+
+    def _stale_unconfirmed_peer_ages(
+        self,
+        stale_unconfirmed_threshold: float,
+    ) -> list[tuple[tuple[str, int], float]]:
+        """Return ``(peer, age)`` for each unconfirmed peer older than the threshold, in tracking order, as of now."""
+        now = self._clock.monotonic()
+        stale_peer_ages: list[tuple[tuple[str, int], float]] = []
+        for peer, added_at in list(self._unconfirmed_peer_added_at.items()):
+            if (age := now - added_at) > stale_unconfirmed_threshold:
+                stale_peer_ages.append((peer, age))
+        return stale_peer_ages
 
     def _should_refuse_leadership(self) -> bool:
         return self._degradation.should_refuse_leadership() or any(
@@ -2340,6 +2524,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             task_runner=self._task_runner,
             on_election_started=self._on_election_started,
             on_heartbeat_sent=self._on_heartbeat_sent,
+            is_cohort_voter=self._is_election_cohort_voter,
         )
 
         # Wire the project Logger into the leader-election machinery so
@@ -2381,27 +2566,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         delivery failures bubble through ``_send_leadership_message``
         retries before reaching the LHM penalty path.
         """
-        from hyperscale.distributed.models.distributed import NodeRole
 
         self_addr = self._get_self_udp_addr()
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
         all_nodes = list(self._incarnation_tracker.node_states.keys())
-        try:
-            self_role: NodeRole | None = NodeRole(self._node_role.lower())
-        except (ValueError, AttributeError):
-            self_role = None
-
-        if self_role is not None and self._peer_roles:
-            targets = [
-                node
-                for node in all_nodes
-                if node != self_addr
-                and self._peer_roles.get(node) == self_role
-            ]
-        else:
-            targets = [node for node in all_nodes if node != self_addr]
+        self_role = self._own_node_role_or_none()
+        targets = self._leadership_broadcast_targets(all_nodes, self_addr, self_role)
 
         await self._udp_logger.log(
             ServerDebug(
@@ -2427,6 +2599,41 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 message,
                 timeout,
             )
+
+    def _own_node_role_or_none(self) -> NodeRole | None:
+        """Parse this node's configured role into a ``NodeRole``, or None when it names no known role."""
+        try:
+            return NodeRole(self._node_role.lower())
+        except (ValueError, AttributeError):
+            return None
+
+    def _leadership_broadcast_targets(
+        self,
+        all_nodes: list[tuple[str, int]],
+        self_addr: tuple[str, int],
+        self_role: NodeRole | None,
+    ) -> list[tuple[str, int]]:
+        """Return the tracked nodes other than self, narrowed to ``self_role``'s tier once peer roles are known."""
+        other_nodes = self._nodes_excluding(all_nodes, self_addr)
+        if self_role is not None and self._peer_roles:
+            return self._nodes_with_peer_role(other_nodes, self_role)
+        return other_nodes
+
+    @staticmethod
+    def _nodes_excluding(
+        nodes: list[tuple[str, int]],
+        excluded_node: tuple[str, int],
+    ) -> list[tuple[str, int]]:
+        """Return ``nodes`` in order without ``excluded_node``."""
+        return [node for node in nodes if node != excluded_node]
+
+    def _nodes_with_peer_role(
+        self,
+        nodes: list[tuple[str, int]],
+        role: NodeRole,
+    ) -> list[tuple[str, int]]:
+        """Return the ``nodes``, in order, whose recorded peer role is ``role``."""
+        return [node for node in nodes if self._peer_roles.get(node) == role]
 
     async def _send_leadership_message(
         self,
@@ -2583,6 +2790,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             )
 
         # Invoke registered callbacks (composition pattern)
+        self._invoke_leader_change_callbacks(new_leader)
+
+    def _invoke_leader_change_callbacks(self, new_leader: tuple[str, int] | None) -> None:
+        """Call every registered leader-change callback in order; a failing one is handed to handle_exception."""
         for callback in self._on_leader_change_callbacks:
             try:
                 callback(new_leader)
@@ -2622,10 +2833,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         host, port = node
         peer_id = f"{host}:{port}"
-        try:
-            peer_coord = self._coordinate_tracker.get_peer_coordinate(peer_id)
-        except Exception:
-            return 1.0
+        # An untracked coordinate -- or one the tracker cannot produce -- is neutral.
+        peer_coord = self._tracked_peer_coordinate_or_none(peer_id)
         if peer_coord is None:
             return 1.0
         error = float(getattr(peer_coord, "error", 0.0) or 0.0)
@@ -2634,6 +2843,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # is ~1.15× from confidence_adjustment alone).
         adjustment = 1.0 + error / 10.0
         return max(1.0, min(adjustment, 1.5))
+
+    def _tracked_peer_coordinate_or_none(self, peer_id: str) -> NetworkCoordinate | None:
+        """Return the coordinate tracked for ``peer_id``, or None when it is untracked or cannot be read."""
+        try:
+            return self._coordinate_tracker.get_peer_coordinate(peer_id)
+        except Exception:
+            return None
 
     def _is_target_already_suspect_or_dead(
         self, target: tuple[str, int]
@@ -2688,11 +2904,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         refutation pressure) and the first isolated confirmed miss
         before a burst is established.
         """
-        if self._is_target_already_suspect_or_dead(target):
-            return False
-        if self._burst_failure_active or self._burst_failure_observations:
-            return False
-        return True
+        return not (
+            self._is_target_already_suspect_or_dead(target)
+            or self._burst_failure_active
+            or self._burst_failure_observations
+        )
 
     def _has_indirect_probe_witnesses(self, target: tuple[str, int]) -> bool:
         """Return whether any registered healthy peer can verify ``target``."""
@@ -2711,11 +2927,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if not self.is_peer_registered(target):
             return False
 
-        node_state = self._incarnation_tracker.get_node_state(target)
-        if node_state is not None and node_state.status == b"DEAD":
-            return False
+        return not self._is_tracked_dead(target) and not self._has_indirect_probe_witnesses(target)
 
-        return not self._has_indirect_probe_witnesses(target)
+    def _is_tracked_dead(self, target: tuple[str, int]) -> bool:
+        """Whether the incarnation tracker holds ``target`` as DEAD."""
+        node_state = self._incarnation_tracker.get_node_state(target)
+        return node_state is not None and node_state.status == b"DEAD"
 
     async def _clear_unwitnessed_suspicion_after_confirmation(
         self,
@@ -2752,38 +2969,79 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         suspicion_started_at: float,
     ) -> bool:
         """Return whether a no-witness SUSPECT expiry may become DEAD."""
-        if self._consume_burst_dead_confirmation(node, incarnation):
+        if self._consume_burst_dead_confirmation(
+            node, incarnation
+        ) or not self._requires_unwitnessed_dead_confirmation(node):
             return True
 
-        if not self._requires_unwitnessed_dead_confirmation(node):
-            return True
+        return not await self._confirm_unwitnessed_suspect_alive(
+            node,
+            incarnation,
+            suspicion_started_at,
+        )
 
+    async def _confirm_unwitnessed_suspect_alive(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        suspicion_started_at: float,
+    ) -> bool:
+        """Seek direct liveness evidence for a no-witness suspect, up to ``max(1, k_proxies)`` attempts.
+
+        True once an attempt finds the node alive (its suspicion is then
+        cleared); the loop yields once between attempts.
+        """
         attempt_count = max(1, self._indirect_probe_manager.k_proxies)
         for attempt_number in range(attempt_count):
-            if self._peer_probe_reliability.had_success_since(
+            if await self._attempt_unwitnessed_liveness_confirmation(
                 node,
+                incarnation,
                 suspicion_started_at,
             ):
-                await self._clear_unwitnessed_suspicion_after_confirmation(
-                    node,
-                    incarnation,
-                )
-                return False
+                return True
 
-            confirmed_alive, _witness_consulted = (
-                await self._confirm_peer_reachable_by_swim(node, incarnation)
+            await self._yield_between_confirmation_attempts(attempt_number, attempt_count)
+
+        return False
+
+    async def _attempt_unwitnessed_liveness_confirmation(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        suspicion_started_at: float,
+    ) -> bool:
+        """One liveness check of a no-witness suspect: a probe success since suspicion began, else a SWIM probe.
+
+        On evidence of life the suspicion is cleared and True returned.
+        """
+        if self._peer_probe_reliability.had_success_since(
+            node,
+            suspicion_started_at,
+        ):
+            await self._clear_unwitnessed_suspicion_after_confirmation(
+                node,
+                incarnation,
             )
-            if confirmed_alive:
-                await self._clear_unwitnessed_suspicion_after_confirmation(
-                    node,
-                    incarnation,
-                )
-                return False
+            return True
 
-            if attempt_number + 1 < attempt_count:
-                await self._clock.sleep(0)
+        confirmed_alive, _witness_consulted = (
+            await self._confirm_peer_reachable_by_swim(node, incarnation)
+        )
+        if confirmed_alive:
+            await self._clear_unwitnessed_suspicion_after_confirmation(
+                node,
+                incarnation,
+            )
+        return confirmed_alive
 
-        return True
+    async def _yield_between_confirmation_attempts(
+        self,
+        attempt_number: int,
+        attempt_count: int,
+    ) -> None:
+        """Yield to the loop once after every confirmation attempt but the last."""
+        if attempt_number + 1 < attempt_count:
+            await self._clock.sleep(0)
 
     def _record_burst_dead_confirmation(
         self,
@@ -2811,17 +3069,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
     ) -> bool:
         """Consume a fresh AD-53 confirmation proof for a suspicion expiry."""
-        proof = self._burst_confirmed_dead.get(node)
+        # A proof is single-use: fresh or stale, it is gone once looked at.
+        proof = self._burst_confirmed_dead.pop(node, None)
         if proof is None:
             return False
 
         proof_incarnation, expires_at = proof
         now = self._clock.monotonic()
-        if now > expires_at or proof_incarnation != incarnation:
-            self._burst_confirmed_dead.pop(node, None)
-            return False
+        return not (now > expires_at or proof_incarnation != incarnation)
 
-        self._burst_confirmed_dead.pop(node, None)
+    def _is_election_cohort_voter(self, voter_udp_address: tuple[str, int]) -> bool:
+        """Whether a vote from ``voter_udp_address`` counts toward this
+        node's election majority. Here every member counted by
+        ``_get_election_member_count`` -- the discovered same-tier peers --
+        votes; a role that counts its majority over a configured cohort
+        admits only that cohort's votes."""
         return True
 
     def _get_election_member_count(self) -> int:
@@ -2840,20 +3102,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         populated yet (early in startup, before any role-bearing gossip
         has been processed) so we don't return 0.
         """
-        from hyperscale.distributed.models.distributed import NodeRole
 
-        try:
-            self_role = NodeRole(self._node_role.lower())
-        except (ValueError, AttributeError):
+        self_role = self._own_node_role_or_none()
+        if self_role is None or not self._peer_roles:
             return self._get_member_count()
 
-        if not self._peer_roles:
-            return self._get_member_count()
+        same_tier_peers = self._count_peers_with_role(self_role)
+        return same_tier_peers + 1  # plus self
 
-        same_tier_peers = sum(
+    def _count_peers_with_role(self, self_role: NodeRole) -> int:
+        """Count the peers whose recorded role is ``self_role``."""
+        return sum(
             1 for role in self._peer_roles.values() if role == self_role
         )
-        return same_tier_peers + 1  # plus self
 
     async def _commit_confirmed_global_death(
         self,
@@ -2870,14 +3131,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             now,
         )
         if not applied:
-            self._metrics.increment("suspicions_expired_stale")
-            self._global_suspicion_started_at.pop(node, None)
-            self._burst_confirmed_dead.pop(node, None)
-            if self._hierarchical_detector is not None:
-                await self._hierarchical_detector.clear_global_suspicion(
-                    node,
-                    incarnation,
-                )
+            await self._discard_stale_global_death(node, incarnation)
             return False
 
         self._metrics.increment("suspicions_expired")
@@ -2898,6 +3152,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self.queue_gossip_update("dead", node, incarnation)
         self.notify_node_dead(node, incarnation, source)
         return True
+
+    async def _discard_stale_global_death(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Drop a DEAD transition the tracker refused as stale: count it and clear its suspicion bookkeeping."""
+        self._metrics.increment("suspicions_expired_stale")
+        self._global_suspicion_started_at.pop(node, None)
+        self._burst_confirmed_dead.pop(node, None)
+        if self._hierarchical_detector is not None:
+            await self._hierarchical_detector.clear_global_suspicion(
+                node,
+                incarnation,
+            )
 
     async def _on_suspicion_expired(
         self, node: tuple[str, int], incarnation: int
@@ -2946,9 +3215,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     message=f"Hierarchical failure detector error: {error_message} - {error}",
                     node_host=self._host,
                     node_port=self._udp_port,
-                    node_id=self._node_id.short
-                    if hasattr(self, "_node_id")
-                    else 0,
+                    node_id=self._short_node_id_or(0),
                 ),
             )
 
@@ -2962,22 +3229,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._metrics.increment("gossip_updates_sent")
 
         # Track specific propagation metrics
-        if update_type == "join":
-            self._metrics.increment("joins_propagated")
-        elif update_type == "leave":
-            self._metrics.increment("leaves_propagated")
+        if (propagation_metric := self._GOSSIP_PROPAGATION_METRIC_NAMES.get(update_type)) is not None:
+            self._metrics.increment(propagation_metric)
 
         n_members = self._get_member_count()
-        # AD-35 Task 12.4.3: Include role in gossip updates
-        role = (
-            self._peer_roles.get(node, None) if hasattr(self, "_peer_roles") else None
-        )
-        # If this is our own node, use our role
+        # AD-35 Task 12.4.3: Include role in gossip updates. Our own node
+        # carries our role and full id; a peer, its recorded role and
+        # registered id.
         if node == self._get_self_udp_addr():
             role = self._node_role
-        node_id = self._node_id.full if node == self._get_self_udp_addr() else (
-            self._get_registered_node_id_for_addr(node)
-        )
+            node_id = self._node_id.full
+        else:
+            role = (
+                self._peer_roles.get(node, None) if hasattr(self, "_peer_roles") else None
+            )
+            node_id = self._get_registered_node_id_for_addr(node)
         self._gossip_buffer.add_update(
             update_type,
             node,
@@ -2998,8 +3264,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if target_addr_bytes is None:
             return
 
-        existing = self._leave_dissemination_queue.get(target)
-        if existing is not None and existing[0] > incarnation:
+        if self._has_newer_queued_dissemination(self._leave_dissemination_queue, target, incarnation):
             return
 
         self._leave_dissemination_queue[target] = (
@@ -3008,17 +3273,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             message,
         )
 
-        if self._leave_dissemination_drain_scheduled:
-            return
+        self._schedule_leave_dissemination_drain()
 
-        self._leave_dissemination_drain_scheduled = True
-        self._task_runner.run(
-            self._drain_leave_dissemination_queue,
-            alias="leave_dissemination_drain",
-            keep=20,
-            max_age="5m",
-            keep_policy="COUNT_AND_AGE",
-        )
+    @staticmethod
+    def _has_newer_queued_dissemination(
+        dissemination_queue: dict[tuple[str, int], tuple[int, bytes, bytes]],
+        target: tuple[str, int],
+        incarnation: int,
+    ) -> bool:
+        """Whether ``dissemination_queue`` already holds ``target`` at an incarnation above ``incarnation``."""
+        existing = dissemination_queue.get(target)
+        return existing is not None and existing[0] > incarnation
 
     async def _drain_leave_dissemination_queue(self) -> None:
         """Drain coalesced LEAVE dissemination work through bounded sends."""
@@ -3056,42 +3321,86 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         base_timeout = await self._context.read("current_timeout")
         gather_timeout = self.get_lhm_adjusted_timeout(base_timeout) * 2
-        send_coros = []
         send_semaphore = asyncio.Semaphore(16)
 
-        async def send_one(
-            node: tuple[str, int],
-            propagate_msg: bytes,
-        ) -> None:
-            async with send_semaphore:
-                await self.send_if_ok(node, propagate_msg)
-
-        for target, (_incarnation, target_addr_bytes, message) in pending_items:
-            propagate_msg = message + b">" + target_addr_bytes
-            send_coros.extend(
-                send_one(node, propagate_msg)
-                for node in self.get_other_nodes(target)
-            )
+        send_coros = self._build_leave_dissemination_sends(pending_items, send_semaphore)
 
         # Same orphan-coroutine guard as the join-dissemination path:
         # cancellation arriving at ``await self.gather_with_errors``
         # before the gather wraps the input coros into Tasks leaves
-        # the raw ``send_one`` coros unawaited when the frame unwinds.
+        # the raw send coros unawaited when the frame unwinds.
         # Close them explicitly on any exception so CLAUDE.md's
         # no-orphan rule holds.
-        if send_coros:
-            pending_coros = send_coros
-            try:
-                await self.gather_with_errors(
-                    pending_coros,
-                    operation="leave_dissemination",
-                    timeout=gather_timeout,
-                )
-            except BaseException:
-                for unwrapped in pending_coros:
-                    if asyncio.iscoroutine(unwrapped):
-                        unwrapped.close()
-                raise
+        await self._gather_dissemination_sends(
+            send_coros,
+            "leave_dissemination",
+            gather_timeout,
+        )
+
+    def _build_leave_dissemination_sends(
+        self,
+        pending_items: list[tuple[tuple[str, int], tuple[int, bytes, bytes]]],
+        send_semaphore: asyncio.Semaphore,
+    ) -> list:
+        """Build one bounded send of each LEAVE propagate message (``message>target``) to every other node."""
+        send_coros = []
+        for target, (_incarnation, target_addr_bytes, message) in pending_items:
+            propagate_msg = message + b">" + target_addr_bytes
+            send_coros.extend(
+                self._send_if_ok_bounded(send_semaphore, node, propagate_msg)
+                for node in self.get_other_nodes(target)
+            )
+        return send_coros
+
+    def _build_join_dissemination_sends(
+        self,
+        pending_items: list[tuple[tuple[str, int], tuple[int, bytes, bytes]]],
+        send_semaphore: asyncio.Semaphore,
+    ) -> list:
+        """Build one bounded send of each queued JOIN propagate message to every other node."""
+        send_coros = []
+        for target, (_incarnation, _target_addr_bytes, message) in pending_items:
+            send_coros.extend(
+                self._send_if_ok_bounded(send_semaphore, node, message)
+                for node in self.get_other_nodes(target)
+            )
+        return send_coros
+
+    async def _send_if_ok_bounded(
+        self,
+        send_semaphore: asyncio.Semaphore,
+        node: tuple[str, int],
+        propagate_msg: bytes,
+    ) -> None:
+        """``send_if_ok`` one dissemination message while holding a slot of ``send_semaphore``."""
+        async with send_semaphore:
+            await self.send_if_ok(node, propagate_msg)
+
+    async def _gather_dissemination_sends(
+        self,
+        send_coros: list,
+        operation: str,
+        gather_timeout: float,
+    ) -> None:
+        """Gather a dissemination batch, closing every send coroutine still unawaited if the gather raises."""
+        if not send_coros:
+            return
+        try:
+            await self.gather_with_errors(
+                send_coros,
+                operation=operation,
+                timeout=gather_timeout,
+            )
+        except BaseException:
+            self._close_unawaited_coroutines(send_coros)
+            raise
+
+    @staticmethod
+    def _close_unawaited_coroutines(send_coros: list) -> None:
+        """Close each entry of ``send_coros`` that is still a coroutine object."""
+        for unwrapped in send_coros:
+            if asyncio.iscoroutine(unwrapped):
+                unwrapped.close()
 
     def queue_join_dissemination(
         self,
@@ -3114,8 +3423,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if target_addr_bytes is None:
             return
 
-        existing = self._join_dissemination_queue.get(target)
-        if existing is not None and existing[0] > incarnation:
+        if self._has_newer_queued_dissemination(self._join_dissemination_queue, target, incarnation):
             return
 
         self._join_dissemination_queue[target] = (
@@ -3124,17 +3432,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             message,
         )
 
-        if self._join_dissemination_drain_scheduled:
-            return
-
-        self._join_dissemination_drain_scheduled = True
-        self._task_runner.run(
-            self._drain_join_dissemination_queue,
-            alias="join_dissemination_drain",
-            keep=20,
-            max_age="5m",
-            keep_policy="COUNT_AND_AGE",
-        )
+        self._schedule_join_dissemination_drain()
 
     async def _drain_join_dissemination_queue(self) -> None:
         """Drain coalesced JOIN dissemination work through bounded sends."""
@@ -3177,21 +3475,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         base_timeout = await self._context.read("current_timeout")
         gather_timeout = self.get_lhm_adjusted_timeout(base_timeout) * 2
-        send_coros = []
         send_semaphore = asyncio.Semaphore(16)
 
-        async def send_one(
-            node: tuple[str, int],
-            propagate_msg: bytes,
-        ) -> None:
-            async with send_semaphore:
-                await self.send_if_ok(node, propagate_msg)
-
-        for target, (_incarnation, _target_addr_bytes, message) in pending_items:
-            send_coros.extend(
-                send_one(node, message)
-                for node in self.get_other_nodes(target)
-            )
+        send_coros = self._build_join_dissemination_sends(pending_items, send_semaphore)
 
         # asyncio delivers cancellation at await points. If the
         # enclosing TaskRunner-managed task is cancelled at the
@@ -3203,19 +3489,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # GC'd unawaited, surfacing the ``coroutine 'send_one' was
         # never awaited`` warning per CLAUDE.md's no-orphan rule.
         # Close any coros that the gather did not consume.
-        if send_coros:
-            pending_coros = send_coros
-            try:
-                await self.gather_with_errors(
-                    pending_coros,
-                    operation="join_dissemination",
-                    timeout=gather_timeout,
-                )
-            except BaseException:
-                for unwrapped in pending_coros:
-                    if asyncio.iscoroutine(unwrapped):
-                        unwrapped.close()
-                raise
+        await self._gather_dissemination_sends(
+            send_coros,
+            "join_dissemination",
+            gather_timeout,
+        )
 
     def queue_suspicion_update(
         self,
@@ -3322,11 +3600,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if update.update_type != "dead":
             return False
 
-        previous_state = self._incarnation_tracker.get_node_state(update.node)
-        if previous_state is not None and previous_state.status == b"DEAD":
-            return False
-
-        return self._requires_unwitnessed_dead_confirmation(update.node)
+        return not self._is_tracked_dead(update.node) and self._requires_unwitnessed_dead_confirmation(
+            update.node
+        )
 
     async def _defer_unwitnessed_dead_piggyback(
         self,
@@ -3352,25 +3628,27 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Process piggybacked membership updates received in a message."""
         updates = GossipBuffer.decode_piggyback(data)
         self._metrics.increment("gossip_updates_received", len(updates))
+        self_addr = self._get_self_udp_addr()
         for update in updates:
-            # AD-35 Task 12.4.3: Extract and store peer role from gossip
-            if update.role and hasattr(self, "_peer_roles"):
-                from hyperscale.distributed.models.distributed import NodeRole
+            # AD-35 Task 12.4.3: Extract and store peer role from gossip.
+            # Gossip about this node carries its role too; recorded as a
+            # peer, the node counted itself twice in its election cohort.
+            if update.role and update.node != self_addr and hasattr(self, "_peer_roles"):
 
                 try:
                     self._peer_roles[update.node] = NodeRole(update.role.lower())
-                except ValueError:
-                    # Invalid role, ignore
-                    pass
+                except ValueError as role_error:
+                    self._metrics.increment("gossip_invalid_role")
+                    await self.handle_error(
+                        MalformedMessageError(
+                            data,
+                            f"Invalid role {update.role!r} gossiped for {update.node}",
+                            source_addr,
+                            cause=role_error,
+                        )
+                    )
 
-            status_map = {
-                "alive": b"OK",
-                "join": b"OK",
-                "suspect": b"SUSPECT",
-                "dead": b"DEAD",
-                "leave": b"DEAD",
-            }
-            status = status_map.get(update.update_type)
+            status = self._GOSSIP_UPDATE_STATUSES.get(update.update_type)
             if status is None:
                 self._metrics.increment("gossip_unknown_updates_suppressed")
                 continue
@@ -3380,8 +3658,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 continue
 
             if self.is_message_fresh(update.node, update.incarnation, status):
-                self_addr = self._get_self_udp_addr()
-
                 # Self-as-target gossip handling — Lifeguard §4.2 / §4.4.
                 # A node receiving any negative-status gossip about
                 # *itself* MUST refute, not apply. Processing
@@ -3395,11 +3671,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 # higher-incarnation alive update; receiving peers
                 # then clear the false suspicion via
                 # ``refute_suspicion``.
+                #
+                # An accusation below our current incarnation was
+                # already refuted: the alive we broadcast supersedes
+                # it, so its re-gossiped copies are no new evidence
+                # about our health and must not raise LHM again
+                # (memberlist ``suspectNode``/``deadNode``: "Ignore
+                # old incarnation numbers").
                 if update.node == self_addr and update.update_type in (
                     "suspect",
                     "dead",
                     "leave",
                 ):
+                    if update.incarnation < self._incarnation_tracker.get_self_incarnation():
+                        self._metrics.increment("superseded_self_accusations_ignored")
+                        continue
                     await self.increase_failure_detector("refutation")
                     await self.broadcast_refutation()
                     continue
@@ -3460,11 +3746,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     def get_other_nodes(self, node: tuple[str, int]):
         target_host, target_port = node
-        return [
-            (host, port)
-            for host, port in list(self._incarnation_tracker.node_states.keys())
-            if not (host == target_host and port == target_port)
-        ]
+        return self._nodes_excluding(
+            list(self._incarnation_tracker.node_states.keys()),
+            (target_host, target_port),
+        )
 
     async def _gather_with_errors(
         self,
@@ -3502,74 +3787,126 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # cancellation in the timeout path, then we explicitly cancel
         # and drain the pending set.
         if timeout:
-            # ``asyncio.ensure_future(c)`` can raise during loop
-            # shutdown (e.g. cluster teardown). If it raises mid-
-            # comprehension the already-wrapped tasks are safe but
-            # the remaining raw coroutines are orphaned and surface
-            # as ``coroutine '...' was never awaited`` from the GC.
-            # CLAUDE.md forbids orphan coroutines: explicitly close
-            # any input coro we couldn't wrap into a Task.
-            tasks: list[asyncio.Task] = []
-            # Phase 6b: explicit ``loop.create_task`` so each wrapped
-            # task binds to the loop the gather helper was invoked on
-            # rather than implicitly going through ``get_running_loop``
-            # at task-creation time.
-            _loop = asyncio.get_running_loop()
-            try:
-                for coro in coros:
-                    tasks.append(_loop.create_task(coro))
-            except BaseException:
-                for unwrapped in coros[len(tasks):]:
-                    unwrapped.close()
-                raise
-            done, pending = await asyncio.wait(tasks, timeout=timeout)
-            for task in pending:
-                task.cancel()
-            if pending:
-                # Drain CancelledError from the cancelled tasks so
-                # their exceptions are retrieved.
-                await asyncio.gather(*pending, return_exceptions=True)
-            if pending:
-                await self.handle_error(
-                    NetworkError(
-                        f"Gather timeout in {operation} "
-                        f"({len(pending)}/{len(tasks)} tasks pending at deadline)",
-                        severity=ErrorSeverity.DEGRADED,
-                        operation=operation,
-                    )
+            return await self._gather_with_deadline(coros, operation, timeout)
+
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        return await self._partition_and_report_gather_results(operation, results)
+
+    async def _gather_with_deadline(
+        self,
+        coros: list,
+        operation: str,
+        timeout: float,
+    ) -> tuple[list, list[Exception]]:
+        """Run ``coros`` as tasks for at most ``timeout`` seconds, then cancel and drain the stragglers.
+
+        A task still pending at the deadline counts as a TimeoutError; when
+        no task finished at all, the result is an empty success list plus a
+        single gather-timeout sentinel.
+        """
+        tasks = self._create_gather_tasks(coros)
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        await self._cancel_and_report_pending_gather_tasks(pending, len(tasks), operation)
+        results, timeout_err = self._collect_deadline_results(tasks, done, operation, timeout)
+        if timeout_err and not done:
+            # Pure-timeout case (no task completed) — preserve the
+            # legacy contract of returning an empty success list
+            # plus a single sentinel TimeoutError.
+            return [], [
+                asyncio.TimeoutError(f"Gather timeout in {operation}")
+            ]
+        return await self._partition_and_report_gather_results(operation, results)
+
+    @classmethod
+    def _create_gather_tasks(cls, coros: list) -> list[asyncio.Task]:
+        """Wrap each coroutine in a task on the running loop, closing any left unwrapped if task creation raises.
+
+        ``asyncio.ensure_future(c)`` can raise during loop shutdown (e.g.
+        cluster teardown). If it raises mid-way the already-wrapped tasks
+        are safe but the remaining raw coroutines would be orphaned and
+        surface as ``coroutine '...' was never awaited`` from the GC.
+        CLAUDE.md forbids orphan coroutines: explicitly close any input
+        coro we couldn't wrap into a Task.
+        """
+        tasks: list[asyncio.Task] = []
+        # Phase 6b: explicit ``loop.create_task`` so each wrapped
+        # task binds to the loop the gather helper was invoked on
+        # rather than implicitly going through ``get_running_loop``
+        # at task-creation time.
+        _loop = asyncio.get_running_loop()
+        try:
+            for coro in coros:
+                tasks.append(_loop.create_task(coro))
+        except BaseException:
+            cls._close_coroutines(coros[len(tasks):])
+            raise
+        return tasks
+
+    @staticmethod
+    def _close_coroutines(unwrapped_coros: list) -> None:
+        """Close every coroutine in ``unwrapped_coros``."""
+        for unwrapped in unwrapped_coros:
+            unwrapped.close()
+
+    async def _cancel_and_report_pending_gather_tasks(
+        self,
+        pending: set[asyncio.Task],
+        task_count: int,
+        operation: str,
+    ) -> None:
+        """Cancel the tasks still pending at the gather deadline, drain their cancellation, and report the timeout."""
+        for task in pending:
+            task.cancel()
+        if pending:
+            # Drain CancelledError from the cancelled tasks so
+            # their exceptions are retrieved.
+            await asyncio.gather(*pending, return_exceptions=True)
+            await self.handle_error(
+                NetworkError(
+                    f"Gather timeout in {operation} "
+                    f"({len(pending)}/{task_count} tasks pending at deadline)",
+                    severity=ErrorSeverity.DEGRADED,
+                    operation=operation,
                 )
-            results = []
-            timeout_err: list[Exception] = []
-            for task in tasks:
-                if task in done:
-                    try:
-                        results.append(task.result())
-                    except BaseException as exc:
-                        results.append(exc)
-                else:
-                    err = asyncio.TimeoutError(
-                        f"Task in {operation} did not complete within {timeout}s"
-                    )
-                    results.append(err)
-                    timeout_err.append(err)
-            if timeout_err and not done:
-                # Pure-timeout case (no task completed) — preserve the
-                # legacy contract of returning an empty success list
-                # plus a single sentinel TimeoutError.
-                return [], [
-                    asyncio.TimeoutError(f"Gather timeout in {operation}")
-                ]
-        else:
-            results = await asyncio.gather(*coros, return_exceptions=True)
+            )
 
-        successes = []
-        errors = []
-
-        for result in results:
-            if isinstance(result, Exception):
-                errors.append(result)
+    @classmethod
+    def _collect_deadline_results(
+        cls,
+        tasks: list[asyncio.Task],
+        done: set[asyncio.Task],
+        operation: str,
+        timeout: float,
+    ) -> tuple[list, list[Exception]]:
+        """Return each task's outcome in order -- a TimeoutError for one unfinished at the deadline -- and those timeouts."""
+        results = []
+        timeout_err: list[Exception] = []
+        for task in tasks:
+            if task in done:
+                results.append(cls._finished_task_outcome(task))
             else:
-                successes.append(result)
+                err = asyncio.TimeoutError(
+                    f"Task in {operation} did not complete within {timeout}s"
+                )
+                results.append(err)
+                timeout_err.append(err)
+        return results, timeout_err
+
+    @staticmethod
+    def _finished_task_outcome(task: asyncio.Task) -> object:
+        """Return a finished task's result, or the exception (cancellation included) it ended with."""
+        try:
+            return task.result()
+        except BaseException as exc:
+            return exc
+
+    async def _partition_and_report_gather_results(
+        self,
+        operation: str,
+        results: list,
+    ) -> tuple[list, list[Exception]]:
+        """Split gather results into successes and Exceptions, reporting the failures in aggregate."""
+        successes, errors = self._partition_gather_results(results)
 
         # Log aggregate errors if any
         if errors:
@@ -3582,6 +3919,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     success_count=len(successes),
                 )
             )
+
+        return successes, errors
+
+    @staticmethod
+    def _partition_gather_results(results: list) -> tuple[list, list[Exception]]:
+        """Split ``results`` in order into non-Exception successes and Exception failures."""
+        successes = []
+        errors = []
+
+        for result in results:
+            if isinstance(result, Exception):
+                errors.append(result)
+            else:
+                successes.append(result)
 
         return successes, errors
 
@@ -3600,8 +3951,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-        node_state = self._incarnation_tracker.get_node_state(node)
-        if node_state is None or node_state.status != b"OK":
+        if not self._is_tracked_ok(node):
             return False
 
         # Track the send and log failures
@@ -3618,6 +3968,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
             )
             return False
+
+    def _is_tracked_ok(self, node: tuple[str, int]) -> bool:
+        """Whether the incarnation tracker holds ``node`` with status OK."""
+        node_state = self._incarnation_tracker.get_node_state(node)
+        return node_state is not None and node_state.status == b"OK"
 
     # poll_node method removed - was deprecated, use start_probe_cycle instead
 
@@ -3648,7 +4003,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns:
             True if join succeeded, False if all retries exhausted
         """
-        from hyperscale.distributed.models.distributed import NodeRole
 
         self_addr = self._get_self_udp_addr()
         # Format: join>v{major}.{minor}|{role}|{host}:{port}|i:{incarnation}
@@ -3666,7 +4020,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # for receivers older than this minor that ignore unknown
         # trailing fields.
         # Version prefix lets old peers detect incompatible nodes (AD-25).
-        self_role = (self._node_role or "worker").lower()
+        self_role = self._join_role_name()
         # Bump the local self_incarnation past the receivers' rejoin
         # threshold (``death_incarnation + minimum_rejoin_incarnation_bump``).
         # A node whose peers have marked it DEAD must claim a strictly
@@ -3699,11 +4053,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # seed) sees a correct cohort. The seed will overwrite this if
         # its own gossip later disagrees, but for static-seed peers
         # (manager_udp_peers, gate_udp_addrs) this is authoritative.
+        # A seed role is configuration: an invalid one raises to the caller.
         if seed_role:
-            try:
-                self._peer_roles[seed_node] = NodeRole(seed_role.lower())
-            except ValueError:
-                pass
+            self._peer_roles[seed_node] = NodeRole(seed_role.lower())
 
         async def attempt_join() -> bool:
             await self.send(seed_node, join_msg, timeout=timeout)
@@ -3721,19 +4073,54 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self.record_network_success()
             return True
         else:
-            if result.last_error:
-                await self.handle_error(
-                    NetworkError(
-                        f"Failed to join cluster via {seed_node[0]}:{seed_node[1]} after {result.attempts} attempts",
-                        severity=ErrorSeverity.DEGRADED,
-                        target=seed_node,
-                        attempts=result.attempts,
-                    )
-                )
+            await self._report_cluster_join_failure(seed_node, result)
             return False
+
+    def _join_role_name(self) -> str:
+        """Return this node's role for the join message, lower-cased; an unset role joins as a worker."""
+        return (self._node_role or "worker").lower()
+
+    async def _report_cluster_join_failure(self, seed_node: tuple[str, int], result) -> None:
+        """Report a join whose retries were exhausted after at least one recorded error."""
+        if result.last_error:
+            await self.handle_error(
+                NetworkError(
+                    f"Failed to join cluster via {seed_node[0]}:{seed_node[1]} after {result.attempts} attempts",
+                    severity=ErrorSeverity.DEGRADED,
+                    target=seed_node,
+                    attempts=result.attempts,
+                )
+            )
 
     async def start_probe_cycle(self) -> None:
         """Start the SWIM randomized round-robin probe cycle."""
+        await self._start_probe_cycle_services()
+
+        self._probe_scheduler._running = True
+        self_addr = self._get_self_udp_addr()
+        members = self._nodes_excluding(
+            list(self._incarnation_tracker.node_states.keys()),
+            self_addr,
+        )
+
+        self._probe_scheduler.update_members(members)
+
+        protocol_period = await self._context.read("udp_poll_interval", 1.0)
+        self._probe_scheduler.protocol_period = protocol_period
+        self._probe_budget = SwimProbeBudget(
+            protocol_period_seconds=protocol_period,
+            max_sample_size=self.env.PHI_ACCRUAL_MAX_SAMPLE_SIZE,
+            min_std_deviation_seconds=self.env.PHI_ACCRUAL_MIN_STD_DEVIATION_SECONDS,
+            member_count=len(members),
+        )
+
+        while self._probe_cycle_should_continue():
+            if not await self._run_probe_round_surviving_spurious_cancel():
+                break
+            await self._clock.sleep(protocol_period)
+
+    async def _start_probe_cycle_services(self) -> None:
+        """Bring up what the probe cycle relies on: error handler, AD-30 detector, health monitor, cleanup task."""
         # Ensure error handler is set up first
         if self._error_handler is None:
             self._setup_error_handler()
@@ -3747,150 +4134,261 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Start cleanup task
         await self.start_cleanup()
 
-        self._probe_scheduler._running = True
-        self_addr = self._get_self_udp_addr()
-        members = [
-            node
-            for node in list(self._incarnation_tracker.node_states.keys())
-            if node != self_addr
-        ]
+    def _probe_cycle_should_continue(self) -> bool:
+        """Whether both the server and its probe scheduler are still running."""
+        return self._running and self._probe_scheduler._running
 
-        self._probe_scheduler.update_members(members)
+    async def _run_probe_round_surviving_spurious_cancel(self) -> bool:
+        """Run one probe round; False only when a cancellation means the probe cycle must end.
 
-        protocol_period = await self._context.read("udp_poll_interval", 1.0)
-        self._probe_scheduler.protocol_period = protocol_period
+        Any other failure is handed to ``handle_exception`` and the cycle
+        goes on.
+        """
+        try:
+            await self._run_probe_round()
+        except asyncio.CancelledError:
+            return self._absorb_spurious_probe_cycle_cancel()
+        except Exception as e:
+            await self.handle_exception(e, "probe_cycle")
+        return True
 
-        while self._running and self._probe_scheduler._running:
-            try:
-                await self._run_probe_round()
-            except asyncio.CancelledError:
-                # Exit ONLY on a genuine task cancellation (shutdown) —
-                # discriminated by the task's own cancelling count and
-                # the running flags. A CancelledError can also surface
-                # from a cancelled INNER awaitable (historically: a
-                # concurrent probe clobbering this round's shared ack
-                # future); treating that as shutdown silently killed
-                # the node's entire failure detector for the rest of
-                # its life. The probe cycle is the SWIM heartbeat of
-                # the node — it dies only when the node does.
-                current_task = asyncio.current_task()
-                genuinely_cancelled = (
-                    current_task is not None and current_task.cancelling() > 0
-                )
-                if (
-                    genuinely_cancelled
-                    or not self._running
-                    or not self._probe_scheduler._running
-                ):
-                    break
-                self._metrics.increment("probe_cycle_spurious_cancel")
-            except Exception as e:
-                await self.handle_exception(e, "probe_cycle")
-            await self._clock.sleep(protocol_period)
+    def _absorb_spurious_probe_cycle_cancel(self) -> bool:
+        """Decide a CancelledError out of a probe round: False to end the cycle, True (counted) to carry on.
+
+        Exit ONLY on a genuine task cancellation (shutdown) —
+        discriminated by the task's own cancelling count and
+        the running flags. A CancelledError can also surface
+        from a cancelled INNER awaitable (historically: a
+        concurrent probe clobbering this round's shared ack
+        future); treating that as shutdown silently killed
+        the node's entire failure detector for the rest of
+        its life. The probe cycle is the SWIM heartbeat of
+        the node — it dies only when the node does.
+        """
+        if self._is_current_task_cancelling() or not self._probe_cycle_should_continue():
+            return False
+        self._metrics.increment("probe_cycle_spurious_cancel")
+        return True
+
+    @staticmethod
+    def _is_current_task_cancelling() -> bool:
+        """Whether the running task has a cancellation requested of it."""
+        current_task = asyncio.current_task()
+        return current_task is not None and current_task.cancelling() > 0
 
     async def _run_probe_round(self) -> None:
         """Execute a single probe round in the SWIM protocol."""
-        # Exit early if we're shutting down - don't attempt probes during shutdown
-        if not self._running or not self._probe_scheduler._running:
-            return
-
-        # Check circuit breaker - if too many network errors, back off
-        if self._error_handler and self._error_handler.is_circuit_open(
-            ErrorCategory.NETWORK
-        ):
-            # Network circuit is open - skip this round to let things recover
-            await self._clock.sleep(1.0)  # Brief pause before next attempt
-            return
-
-        target = self._probe_scheduler.get_next_target()
-        if target is None:
-            return
-
-        if self.udp_target_is_self(target):
+        target, extra_probe_budget = await self._next_probe_round_target()
+        if target is None or self.udp_target_is_self(target):
             return
 
         # Use ErrorContext for consistent error handling throughout the probe
         async with ErrorContext(
             self._error_handler, f"probe_round_{target[0]}_{target[1]}"
         ) as ctx:
-            node_state = self._incarnation_tracker.get_node_state(target)
-            incarnation = node_state.incarnation if node_state else 0
+            await self._probe_round_target(target, extra_probe_budget, ctx)
 
-            base_timeout = await self._context.read("current_timeout")
-            timeout = self.get_lhm_adjusted_timeout(base_timeout)
+    async def _next_probe_round_target(
+        self,
+    ) -> tuple[tuple[str, int] | None, SwimProbeBudget | None]:
+        """Pick this round's target, or None while shutting down or backing off an open network circuit.
 
-            response_received = await self._probe_with_timeout(
-                target,
-                timeout,
-            )
+        The second element is the probe budget when the target is an AD-52
+        extra probe, else None.
+        """
+        # Exit early if we're shutting down - don't attempt probes during shutdown
+        if not self._probe_cycle_should_continue() or await self._backed_off_for_open_network_circuit():
+            return None, None
+        return self._select_probe_round_target()
 
-            # Exit early if shutting down
-            if not self._running:
-                return
+    async def _backed_off_for_open_network_circuit(self) -> bool:
+        """Pause briefly and return True when too many network errors opened the circuit breaker."""
+        # Check circuit breaker - if too many network errors, back off
+        if self._error_handler and self._error_handler.is_circuit_open(
+            ErrorCategory.NETWORK
+        ):
+            # Network circuit is open - skip this round to let things recover
+            await self._clock.sleep(1.0)  # Brief pause before next attempt
+            return True
+        return False
 
-            if response_received:
-                await self.decrease_failure_detector("successful_probe")
-                self._peer_probe_reliability.record_probe_outcome(
-                    target, success=True
-                )
-                ctx.record_success(
-                    ErrorCategory.NETWORK
-                )  # Help circuit breaker recover
-                self._reset_burst_failure_state()
-                return
+    def _select_probe_round_target(
+        self,
+    ) -> tuple[tuple[str, int] | None, SwimProbeBudget | None]:
+        """Pick an AD-52 extra-probe target (with its budget) if one is due, else the round-robin's next.
 
-            # Per-peer probe-failure record. Unlike the LHM bump below
-            # — which is gated to avoid feeding-back into our own
-            # self-health signal — the per-peer tracker *must* record
-            # every probe outcome to ``target``. Its purpose is exactly
-            # to capture this peer's reliability over recent probes;
-            # the architectural fix relies on this signal being
-            # specific to ``target`` and isolated from cross-peer
-            # contamination. The bracket bound ensures even an
-            # all-failed window cannot push the suspicion timer past
-            # ``2·base_max − base_min``.
-            self._peer_probe_reliability.record_probe_outcome(
-                target, success=False
-            )
+        AD-52 section 8: a member whose phi reached the learned threshold
+        takes this period's probe instead of the round-robin's next; a
+        round-robin cycle that ends steers that threshold.
+        """
+        if (probe_budget := self._probe_budget) is not None and (
+            target := probe_budget.next_extra_target(self._probe_scheduler.members, self._clock.monotonic())
+        ) is not None:
+            return target, probe_budget
+        return self._next_round_robin_probe_target(probe_budget), None
 
-            indirect_sent = await self.initiate_indirect_probe(target, incarnation)
+    def _next_round_robin_probe_target(
+        self,
+        probe_budget: SwimProbeBudget | None,
+    ) -> tuple[str, int] | None:
+        """Take the round-robin's next target, telling ``probe_budget`` when that completed a cycle."""
+        cycles_before = self._probe_scheduler.cycles_completed
+        target = self._probe_scheduler.get_next_target()
+        if probe_budget is not None and self._probe_scheduler.cycles_completed != cycles_before:
+            probe_budget.complete_cycle()
+        return target
 
-            # Exit early if shutting down
-            if not self._running:
-                return
+    async def _probe_round_target(
+        self,
+        target: tuple[str, int],
+        extra_probe_budget: SwimProbeBudget | None,
+        ctx: ErrorContext,
+    ) -> None:
+        """Probe ``target`` directly, record an extra probe's outcome, then conclude the round unless shutting down."""
+        incarnation = self._tracked_incarnation_or_zero(target)
 
-            if indirect_sent:
-                await self._clock.sleep(timeout)
+        base_timeout = await self._context.read("current_timeout")
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-                # Exit early if shutting down
-                if not self._running:
-                    return
+        response_received = await self._probe_with_timeout(
+            target,
+            timeout,
+        )
+        if extra_probe_budget is not None:
+            extra_probe_budget.record_extra_probe_outcome(response_received)
 
-                probe = self._indirect_probe_manager.get_pending_probe(target)
-                if probe and probe.is_completed():
-                    await self.decrease_failure_detector("successful_probe")
-                    self._peer_probe_reliability.record_probe_outcome(
-                        target, success=True
-                    )
-                    ctx.record_success(ErrorCategory.NETWORK)
-                    self._reset_burst_failure_state()
-                    return
+        # Exit early if shutting down
+        if not self._running:
+            return
 
-            # Don't start suspicions during shutdown
-            if not self._running:
-                return
+        await self._conclude_direct_probe(target, incarnation, timeout, response_received, ctx)
 
-            if self._should_increment_lhm_for_failed_confirmation(target):
-                await self.increase_failure_detector("probe_timeout")
+    def _tracked_incarnation_or_zero(self, target: tuple[str, int]) -> int:
+        """Return the incarnation the tracker holds for ``target``, or 0 when untracked."""
+        node_state = self._incarnation_tracker.get_node_state(target)
+        return node_state.incarnation if node_state else 0
 
-            self_addr = self._get_self_udp_addr()
-            await self.start_suspicion(target, incarnation, self_addr)
-            self.queue_suspicion_update(target, incarnation)
+    async def _conclude_direct_probe(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        timeout: float,
+        response_received: bool,
+        ctx: ErrorContext,
+    ) -> None:
+        """Record a direct probe's success, or escalate its failure to indirect probing and suspicion."""
+        if response_received:
+            await self._record_probe_round_success(target, ctx)
+            return
 
-            # AD-53 burst-failure detection (after start_suspicion for the
-            # confirmed-dead target, so the failure window only counts
-            # *actual* full direct+indirect failures, not partial ones).
-            await self._record_probe_failure_and_check_burst(self_addr, target)
+        await self._probe_round_after_direct_failure(target, incarnation, timeout, ctx)
+
+    async def _record_probe_round_success(
+        self,
+        target: tuple[str, int],
+        ctx: ErrorContext,
+    ) -> None:
+        """Credit a successful probe round: lower LHM, record the peer success, help the circuit, end any burst run."""
+        await self.decrease_failure_detector("successful_probe")
+        self._peer_probe_reliability.record_probe_outcome(
+            target, success=True
+        )
+        ctx.record_success(
+            ErrorCategory.NETWORK
+        )  # Help circuit breaker recover
+        self._reset_burst_failure_state()
+
+    async def _probe_round_after_direct_failure(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        timeout: float,
+        ctx: ErrorContext,
+    ) -> None:
+        """Record the direct failure, try indirect probes, and suspect ``target`` when they do not settle the round."""
+        # Per-peer probe-failure record. Unlike the LHM bump below
+        # — which is gated to avoid feeding-back into our own
+        # self-health signal — the per-peer tracker *must* record
+        # every probe outcome to ``target``. Its purpose is exactly
+        # to capture this peer's reliability over recent probes;
+        # the architectural fix relies on this signal being
+        # specific to ``target`` and isolated from cross-peer
+        # contamination. The bracket bound ensures even an
+        # all-failed window cannot push the suspicion timer past
+        # ``2·base_max − base_min``.
+        self._peer_probe_reliability.record_probe_outcome(
+            target, success=False
+        )
+
+        indirect_sent = await self.initiate_indirect_probe(target, incarnation)
+
+        if await self._indirect_probe_round_settled(indirect_sent, target, timeout, ctx):
+            return
+
+        await self._suspect_probe_round_target(target, incarnation)
+
+    async def _indirect_probe_round_settled(
+        self,
+        indirect_sent: bool,
+        target: tuple[str, int],
+        timeout: float,
+        ctx: ErrorContext,
+    ) -> bool:
+        """Whether the round ends before suspicion: shutting down, or a sent indirect probe came back in time."""
+        # Exit early if shutting down
+        if not self._running:
+            return True
+
+        if not indirect_sent:
+            return False
+
+        return await self._await_indirect_probe_outcome(target, timeout, ctx)
+
+    async def _await_indirect_probe_outcome(
+        self,
+        target: tuple[str, int],
+        timeout: float,
+        ctx: ErrorContext,
+    ) -> bool:
+        """Wait one probe timeout for the indirect probes; True if shutting down or they reached ``target`` (credited)."""
+        await self._clock.sleep(timeout)
+
+        # Exit early if shutting down
+        if not self._running:
+            return True
+
+        if not self._indirect_probe_completed(target):
+            return False
+
+        await self._record_probe_round_success(target, ctx)
+        return True
+
+    def _indirect_probe_completed(self, target: tuple[str, int]) -> bool:
+        """Whether an indirect probe of ``target`` is pending and has completed."""
+        probe = self._indirect_probe_manager.get_pending_probe(target)
+        return probe is not None and probe.is_completed()
+
+    async def _suspect_probe_round_target(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Suspect a target that failed direct and indirect probes, then feed AD-53 burst detection."""
+        # Don't start suspicions during shutdown
+        if not self._running:
+            return
+
+        if self._should_increment_lhm_for_failed_confirmation(target):
+            await self.increase_failure_detector("probe_timeout")
+
+        self_addr = self._get_self_udp_addr()
+        await self.start_suspicion(target, incarnation, self_addr)
+        self.queue_suspicion_update(target, incarnation)
+
+        # AD-53 burst-failure detection (after start_suspicion for the
+        # confirmed-dead target, so the failure window only counts
+        # *actual* full direct+indirect failures, not partial ones).
+        await self._record_probe_failure_and_check_burst(self_addr, target)
 
     def _reset_burst_failure_state(self) -> None:
         """Clear the burst-failure observation window on any probe success.
@@ -3899,8 +4397,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         full-failure run. Accelerated candidate successes do not call
         this for the whole batch; they refute only their own target.
         """
-        if self._burst_failure_observations:
-            self._burst_failure_observations.clear()
+        self._burst_failure_observations.clear()
         if self._burst_failure_run is None or not self._burst_failure_run.task_running:
             self._burst_failure_active = False
 
@@ -3920,6 +4417,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         ordinary probe success clears the observation window; candidate
         successes refute only their own candidate.
         """
+        self._append_burst_failure_observation(failed_target)
+
+        if self._burst_failure_active or not self._burst_failure_threshold_reached():
+            return
+
+        await self._launch_burst_failure_confirmation(self_addr)
+
+    def _append_burst_failure_observation(self, failed_target: tuple[str, int]) -> None:
+        """Record ``(now, failed_target)`` and evict observations older than the burst window."""
         now = self._clock.monotonic()
         observations = self._burst_failure_observations
         observations.append((now, failed_target))
@@ -3927,13 +4433,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         while observations and observations[0][0] < cutoff:
             observations.popleft()
 
-        if self._burst_failure_active:
-            return
+    def _burst_failure_threshold_reached(self) -> bool:
+        """Whether the observation window holds at least the burst threshold of distinct failed targets."""
+        distinct_failed_targets = {target for _, target in self._burst_failure_observations}
+        return len(distinct_failed_targets) >= self._burst_failure_threshold
 
-        distinct_failed_targets = {target for _, target in observations}
-        if len(distinct_failed_targets) < self._burst_failure_threshold:
-            return
-
+    async def _launch_burst_failure_confirmation(self, self_addr: tuple[str, int]) -> None:
+        """Mark a burst active and run its confirmation batch: inline without a task runner, else as a managed run."""
         self._burst_failure_active = True
         if self._task_runner is None:
             await self._run_burst_failure_confirmation(self_addr)
@@ -4014,9 +4520,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         candidate,
                         self_addr,
                     )
-                except asyncio.CancelledError:
-                    raise
                 except Exception as error:
+                    # CancelledError is a BaseException: it propagates.
                     await self.handle_exception(
                         error,
                         f"ad53_burst_confirmation_{candidate[0]}_{candidate[1]}",
@@ -4024,7 +4529,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     return False
 
         confirmation_results = await asyncio.gather(
-            *(confirm_candidate(candidate) for candidate in candidates)
+            *map(confirm_candidate, candidates)
         )
 
         if all(confirmation_results):
@@ -4035,16 +4540,27 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self_addr: tuple[str, int],
     ) -> list[tuple[str, int]]:
         """Return members eligible for AD-53 accelerated confirmation."""
-        candidates: list[tuple[str, int]] = []
-        for member in list(self._probe_scheduler.members):
-            if member == self_addr:
-                continue
-            if not self.is_peer_registered(member) or not self.is_peer_confirmed(member):
-                continue
-            if self._is_target_already_suspect_or_dead(member):
-                continue
-            candidates.append(member)
-        return candidates
+        return [
+            member
+            for member in list(self._probe_scheduler.members)
+            if self._is_burst_confirmation_candidate(member, self_addr)
+        ]
+
+    def _is_burst_confirmation_candidate(
+        self,
+        member: tuple[str, int],
+        self_addr: tuple[str, int],
+    ) -> bool:
+        """Whether ``member`` is another registered, confirmed peer not already SUSPECT/DEAD/UNCONFIRMED."""
+        return (
+            member != self_addr
+            and self._is_registered_confirmed_peer(member)
+            and not self._is_target_already_suspect_or_dead(member)
+        )
+
+    def _is_registered_confirmed_peer(self, member: tuple[str, int]) -> bool:
+        """Whether ``member`` both completed registration and is confirmed."""
+        return self.is_peer_registered(member) and self.is_peer_confirmed(member)
 
     async def _confirm_burst_failure_candidate(
         self,
@@ -4052,11 +4568,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self_addr: tuple[str, int],
     ) -> bool:
         """Run one normal SWIM confirmation for an AD-53 burst candidate."""
-        if not self._running or self._is_target_already_suspect_or_dead(target):
+        if self._burst_candidate_ineligible(target):
             return False
 
-        node_state = self._incarnation_tracker.get_node_state(target)
-        incarnation = node_state.incarnation if node_state else 0
+        incarnation = self._tracked_incarnation_or_zero(target)
         confirmation_started_at = self._clock.monotonic()
 
         confirmed_alive, witness_consulted = (
@@ -4065,17 +4580,38 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 incarnation,
             )
         )
-        if confirmed_alive:
+        if self._burst_candidate_proved_alive(target, confirmed_alive, confirmation_started_at):
             return True
 
-        if self._peer_probe_reliability.had_success_since(
+        await self._suspect_failed_burst_candidate(target, incarnation, self_addr, witness_consulted)
+        return False
+
+    def _burst_candidate_ineligible(self, target: tuple[str, int]) -> bool:
+        """Whether confirmation of ``target`` must not run: shutting down, or it is already SUSPECT/DEAD/UNCONFIRMED."""
+        return not self._running or self._is_target_already_suspect_or_dead(target)
+
+    def _burst_candidate_proved_alive(
+        self,
+        target: tuple[str, int],
+        confirmed_alive: bool,
+        confirmation_started_at: float,
+    ) -> bool:
+        """Whether the confirmation reached ``target``, or any probe of it succeeded since confirmation began."""
+        return confirmed_alive or self._peer_probe_reliability.had_success_since(
             target,
             confirmation_started_at,
-        ):
-            return True
+        )
 
-        if not self._running or self._is_target_already_suspect_or_dead(target):
-            return False
+    async def _suspect_failed_burst_candidate(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        self_addr: tuple[str, int],
+        witness_consulted: bool,
+    ) -> None:
+        """Suspect a burst candidate that failed confirmation, recording a burst-dead proof only if a witness was consulted."""
+        if self._burst_candidate_ineligible(target):
+            return
 
         # The burst-dead proof — which short-circuits the expiry-time
         # re-confirmation gate in _should_apply_unwitnessed_dead_
@@ -4095,7 +4631,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._record_burst_dead_confirmation(target, incarnation)
         await self.start_suspicion(target, incarnation, self_addr)
         self.queue_suspicion_update(target, incarnation)
-        return False
 
     async def _confirm_peer_reachable_by_swim(
         self,
@@ -4132,31 +4667,49 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             timeout,
         )
         if response_received:
-            await self.decrease_failure_detector("successful_probe")
-            self._peer_probe_reliability.record_probe_outcome(
-                target,
-                success=True,
-            )
+            await self._credit_confirmation_probe_success(target)
             return (True, True)
 
         self._peer_probe_reliability.record_probe_outcome(target, success=False)
 
-        indirect_sent = await self.initiate_indirect_probe(target, incarnation)
-        if indirect_sent:
-            await self._clock.sleep(timeout)
-            if not self._running:
-                return (False, indirect_sent)
+        return await self._confirm_peer_reachable_indirectly(target, incarnation, timeout)
 
-            probe = self._indirect_probe_manager.get_pending_probe(target)
-            if probe and probe.is_completed():
-                await self.decrease_failure_detector("successful_probe")
-                self._peer_probe_reliability.record_probe_outcome(
-                    target,
-                    success=True,
-                )
-                return (True, True)
+    async def _credit_confirmation_probe_success(self, target: tuple[str, int]) -> None:
+        """Credit a confirmation probe that reached ``target``: lower LHM and record the peer success."""
+        await self.decrease_failure_detector("successful_probe")
+        self._peer_probe_reliability.record_probe_outcome(
+            target,
+            success=True,
+        )
+
+    async def _confirm_peer_reachable_indirectly(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        timeout: float,
+    ) -> tuple[bool, bool]:
+        """Indirect-probe phase of ``_confirm_peer_reachable_by_swim``: ``(alive, witness_consulted)``."""
+        indirect_sent = await self.initiate_indirect_probe(target, incarnation)
+        if not indirect_sent:
+            return (False, indirect_sent)
+
+        if await self._await_confirmation_indirect_probe(target, timeout):
+            return (True, True)
 
         return (False, indirect_sent)
+
+    async def _await_confirmation_indirect_probe(
+        self,
+        target: tuple[str, int],
+        timeout: float,
+    ) -> bool:
+        """Wait one probe timeout; True (credited) when still running and the indirect probe of ``target`` completed."""
+        await self._clock.sleep(timeout)
+        if not self._running or not self._indirect_probe_completed(target):
+            return False
+
+        await self._credit_confirmation_probe_success(target)
+        return True
 
     def _compute_direct_probe_budget(
         self,
@@ -4306,16 +4859,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 # on managers, the worker-heartbeat carrier), starving
                 # dispatch forever after (measured live: every long
                 # soak horizon lost SWIM at the first burst window).
-                existing_future = self._pending_probe_acks.get(target)
-                if existing_future is not None and not existing_future.done():
-                    ack_future: asyncio.Future[bool] = existing_future
-                else:
-                    ack_future = asyncio.get_event_loop().create_future()
-                    self._pending_probe_acks[target] = ack_future
-                self._pending_probe_start[target] = self._clock.monotonic()
-                request_id = self._build_direct_probe_request_id()
-                self._pending_probe_request_ids[target] = request_id
-                message = self._build_direct_probe_message(target, request_id)
+                ack_future, message = self._register_direct_probe_attempt(target)
 
                 await self.send(target, message, timeout=timeout)
 
@@ -4345,43 +4889,79 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 except asyncio.TimeoutError:
                     pass
                 finally:
-                    # Clean up only OUR OWN registration, and only once
-                    # the future is DONE: a still-pending shared future
-                    # has live waiters whose ACK must stay findable by
-                    # the ack handler (the next attempt reuses it, so
-                    # an orphaned pending entry self-heals).
-                    if (
-                        self._pending_probe_acks.get(target) is ack_future
-                        and ack_future.done()
-                    ):
-                        self._pending_probe_acks.pop(target, None)
-                        self._pending_probe_start.pop(target, None)
-                        self._pending_probe_request_ids.pop(target, None)
+                    self._release_settled_probe_ack(target, ack_future)
 
             except asyncio.CancelledError:
-                self._pending_probe_acks.pop(target, None)
-                self._pending_probe_start.pop(target, None)
-                self._pending_probe_request_ids.pop(target, None)
+                self._forget_pending_probe(target)
                 raise
-            except OSError as e:
-                self._pending_probe_acks.pop(target, None)
-                self._pending_probe_start.pop(target, None)
-                self._pending_probe_request_ids.pop(target, None)
-                self._metrics.increment("probes_failed")
-                await self.handle_error(
-                    self._make_network_error(e, target, "Probe")
-                )
-                return False
             except Exception as e:
-                self._pending_probe_acks.pop(target, None)
-                self._pending_probe_start.pop(target, None)
-                self._pending_probe_request_ids.pop(target, None)
-                self._metrics.increment("probes_failed")
-                await self.handle_exception(e, f"probe_{target[0]}_{target[1]}")
-                return False
+                # OSError (a network failure) included.
+                return await self._fail_direct_probe(target, e)
 
         self._metrics.increment("probes_timeout")
         await self.handle_error(ProbeTimeoutError(target, timeout))
+        return False
+
+    def _register_direct_probe_attempt(
+        self,
+        target: tuple[str, int],
+    ) -> tuple[asyncio.Future[bool], bytes]:
+        """Register one direct-probe attempt on ``target``: its ack future, start time and request id.
+
+        SHARE any live pending future for this target instead of
+        cancelling it (see ``_probe_with_timeout``); a done or missing one
+        is replaced. Returns the ack future and the probe message to send.
+        """
+        existing_future = self._pending_probe_acks.get(target)
+        if existing_future is not None and not existing_future.done():
+            ack_future: asyncio.Future[bool] = existing_future
+        else:
+            ack_future = asyncio.get_event_loop().create_future()
+            self._pending_probe_acks[target] = ack_future
+        self._pending_probe_start[target] = self._clock.monotonic()
+        request_id = self._build_direct_probe_request_id()
+        self._pending_probe_request_ids[target] = request_id
+        message = self._build_direct_probe_message(target, request_id)
+        return ack_future, message
+
+    def _release_settled_probe_ack(
+        self,
+        target: tuple[str, int],
+        ack_future: asyncio.Future[bool],
+    ) -> None:
+        """Drop ``target``'s pending-probe registration only if it is still ``ack_future`` and that future is done.
+
+        Clean up only OUR OWN registration, and only once the future is
+        DONE: a still-pending shared future has live waiters whose ACK must
+        stay findable by the ack handler (the next attempt reuses it, so an
+        orphaned pending entry self-heals).
+        """
+        if (
+            self._pending_probe_acks.get(target) is ack_future
+            and ack_future.done()
+        ):
+            self._forget_pending_probe(target)
+
+    def _forget_pending_probe(self, target: tuple[str, int]) -> None:
+        """Remove ``target``'s pending direct-probe ack future, start time and request id."""
+        self._pending_probe_acks.pop(target, None)
+        self._pending_probe_start.pop(target, None)
+        self._pending_probe_request_ids.pop(target, None)
+
+    async def _fail_direct_probe(self, target: tuple[str, int], error: Exception) -> bool:
+        """Abandon a direct probe that raised: forget it, count the failure, report the error; always False.
+
+        An OSError is reported as a network error; anything else as an
+        unexpected exception.
+        """
+        self._forget_pending_probe(target)
+        self._metrics.increment("probes_failed")
+        if isinstance(error, OSError):
+            await self.handle_error(
+                self._make_network_error(error, target, "Probe")
+            )
+            return False
+        await self.handle_exception(error, f"probe_{target[0]}_{target[1]}")
         return False
 
     def stop_probe_cycle(self) -> None:
@@ -4391,15 +4971,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def update_probe_scheduler_membership(self) -> None:
         """Update the probe scheduler with current membership, excluding DEAD nodes."""
         self_addr = self._get_self_udp_addr()
-        members = []
-        for node, node_state in self._incarnation_tracker.node_states.items():
-            if node == self_addr:
-                continue
-            # Exclude DEAD nodes from probe scheduling
-            if node_state.status == b"DEAD":
-                continue
-            members.append(node)
+        members = [
+            node
+            for node, node_state in self._incarnation_tracker.node_states.items()
+            if self._is_probeable_member(node, node_state, self_addr)
+        ]
         self._probe_scheduler.update_members(members)
+
+    @staticmethod
+    def _is_probeable_member(
+        node: tuple[str, int],
+        node_state: NodeState,
+        self_addr: tuple[str, int],
+    ) -> bool:
+        """Whether ``node`` is another member the probe scheduler should visit (DEAD nodes are excluded)."""
+        return node != self_addr and node_state.status != b"DEAD"
 
     async def start_leader_election(self) -> None:
         """Start the leader election process."""
@@ -4435,75 +5021,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._running = False
         self_addr = self._get_self_udp_addr()
 
-        # Signal to error handler that we're shutting down - suppress non-fatal errors
-        if self._error_handler:
-            self._error_handler.start_shutdown()
-
-        # 1. Step down from leadership if we're the leader
-        if self._leader_election.state.is_leader():
-            try:
-                await self._leader_election._step_down()
-            except Exception as e:
-                if self._error_handler:
-                    await self.handle_exception(e, "shutdown_step_down")
+        # Signal shutdown, then 1. step down from leadership if we're the leader
+        await self._signal_shutdown_and_step_down()
 
         # 2. Broadcast leave message to cluster
         if broadcast_leave:
-            try:
-                await self._broadcast_leave()
-            except Exception as e:
-                if self._error_handler:
-                    await self.handle_exception(e, "shutdown_broadcast_leave")
+            await self._run_shutdown_step(self._broadcast_leave, "shutdown_broadcast_leave")
 
         # 3. Wait for drain period
         if drain_timeout > 0:
             await self._clock.sleep(drain_timeout)
 
         # 4. Stop all background tasks in proper order
-        # Stop probe cycle first (stops probing other nodes)
-        try:
-            self.stop_probe_cycle()
-        except Exception as e:
-            if self._error_handler:
-                await self.handle_exception(e, "shutdown_stop_probe_cycle")
-
-        await self._cancel_burst_failure_run()
-
-        # Cancel all pending probe ACK futures
-        for future in self._pending_probe_acks.values():
-            if not future.done():
-                future.cancel()
-        self._pending_probe_acks.clear()
-        self._pending_probe_start.clear()
-        self._pending_probe_request_ids.clear()
-
-        # Stop leader election (stops sending heartbeats)
-        try:
-            await self.stop_leader_election()
-        except Exception as e:
-            if self._error_handler:
-                await self.handle_exception(e, "shutdown_stop_election")
-
-        # Stop health monitor
-        try:
-            await self.stop_health_monitor()
-        except Exception as e:
-            if self._error_handler:
-                await self.handle_exception(e, "shutdown_stop_health_monitor")
-
-        # Stop cleanup task
-        try:
-            await self.stop_cleanup()
-        except Exception as e:
-            if self._error_handler:
-                await self.handle_exception(e, "shutdown_stop_cleanup")
-
-        # Stop hierarchical failure detector (AD-30)
-        try:
-            await self._hierarchical_detector.stop()
-        except Exception as e:
-            if self._error_handler:
-                await self.handle_exception(e, "shutdown_stop_hierarchical_detector")
+        await self._stop_background_work_for_shutdown()
 
         # 5. Log final audit event
         self._audit_log.record(
@@ -4512,6 +5042,75 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             reason="graceful_shutdown",
         )
 
+    async def _signal_shutdown_and_step_down(self) -> None:
+        """Tell the error handler shutdown began, then step down from leadership if this node leads."""
+        # Signal to error handler that we're shutting down - suppress non-fatal errors
+        if self._error_handler:
+            self._error_handler.start_shutdown()
+
+        # 1. Step down from leadership if we're the leader
+        if self._leader_election.state.is_leader():
+            await self._run_shutdown_step(self._leader_election._step_down, "shutdown_step_down")
+
+    async def _stop_background_work_for_shutdown(self) -> None:
+        """Stop probing, burst confirmation, pending probe acks, election, health monitor, cleanup and AD-30, in order."""
+        # Stop probe cycle first (stops probing other nodes)
+        await self._run_sync_shutdown_step(self.stop_probe_cycle, "shutdown_stop_probe_cycle")
+
+        await self._cancel_burst_failure_run()
+
+        # Cancel all pending probe ACK futures
+        self._cancel_pending_probe_acks()
+
+        # Stop leader election (stops sending heartbeats)
+        await self._run_shutdown_step(self.stop_leader_election, "shutdown_stop_election")
+
+        # Stop health monitor
+        await self._run_shutdown_step(self.stop_health_monitor, "shutdown_stop_health_monitor")
+
+        # Stop cleanup task
+        await self._run_shutdown_step(self.stop_cleanup, "shutdown_stop_cleanup")
+
+        # Stop hierarchical failure detector (AD-30)
+        await self._run_shutdown_step(
+            # Looked up inside the step's try, as a step of its own.
+            lambda: self._hierarchical_detector.stop(),
+            "shutdown_stop_hierarchical_detector",
+        )
+
+    async def _run_shutdown_step(
+        self,
+        shutdown_step: Callable[[], Awaitable[None]],
+        operation: str,
+    ) -> None:
+        """Await one shutdown step; a failure is handed to handle_exception (when an error handler exists) and shutdown goes on."""
+        try:
+            await shutdown_step()
+        except Exception as e:
+            if self._error_handler:
+                await self.handle_exception(e, operation)
+
+    async def _run_sync_shutdown_step(
+        self,
+        shutdown_step: Callable[[], None],
+        operation: str,
+    ) -> None:
+        """Call one synchronous shutdown step; a failure is handed to handle_exception (when an error handler exists)."""
+        try:
+            shutdown_step()
+        except Exception as e:
+            if self._error_handler:
+                await self.handle_exception(e, operation)
+
+    def _cancel_pending_probe_acks(self) -> None:
+        """Cancel every pending direct-probe ack future and forget all pending direct-probe state."""
+        for future in self._pending_probe_acks.values():
+            if not future.done():
+                future.cancel()
+        self._pending_probe_acks.clear()
+        self._pending_probe_start.clear()
+        self._pending_probe_request_ids.clear()
+
     def _get_additional_leave_targets(self) -> list[tuple[str, int]]:
         """Return role-specific UDP targets that must receive graceful leave."""
         return []
@@ -4519,17 +5118,23 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def _get_leave_targets(self) -> list[tuple[str, int]]:
         """Return a deduplicated snapshot of UDP peers to notify on leave."""
         self_addr = self._get_self_udp_addr()
-        targets: dict[tuple[str, int], None] = {}
-
-        for node in self._incarnation_tracker.node_states.keys():
-            if node != self_addr:
-                targets[node] = None
-
-        for node in self._get_additional_leave_targets():
-            if node != self_addr and node[0] and node[1]:
-                targets[node] = None
+        targets: dict[tuple[str, int], None] = dict.fromkeys(
+            self._nodes_excluding(list(self._incarnation_tracker.node_states.keys()), self_addr)
+        )
+        targets.update(
+            dict.fromkeys(
+                node
+                for node in self._get_additional_leave_targets()
+                if self._is_addressable_leave_target(node, self_addr)
+            )
+        )
 
         return list(targets.keys())
+
+    @staticmethod
+    def _is_addressable_leave_target(node: tuple[str, int], self_addr: tuple[str, int]) -> bool:
+        """Whether ``node`` is another peer with both a host and a port to send a leave to."""
+        return node != self_addr and node[0] and node[1]
 
     async def _broadcast_leave(self) -> None:
         """Best-effort broadcast of this node's SWIM leave message."""
@@ -4561,80 +5166,122 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         send_semaphore = asyncio.Semaphore(concurrency)
         max_attempts = 2
 
-        async def send_leave(node: tuple[str, int]) -> bool:
-            async with send_semaphore:
-                last_failure: object = None
-                for _attempt_number in range(1, max_attempts + 1):
-                    try:
-                        send_result = await self.send(
-                            node,
-                            leave_msg,
-                            timeout=timeout,
-                        )
-                    except Exception as error:
-                        last_failure = error
-                        await self._udp_logger.log(
-                            ServerError(
-                                message=(
-                                    f"[BCAST-SEND-EXC] self={self_addr} "
-                                    f"-> node={node} attempt={_attempt_number} "
-                                    f"err={type(error).__name__}:{error}"
-                                ),
-                                node_host=self._host,
-                                node_port=self._udp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-                        continue
-
-                    response = (
-                        send_result[0]
-                        if isinstance(send_result, tuple)
-                        else send_result
-                    )
-                    await self._udp_logger.log(
-                        ServerError(
-                            message=(
-                                f"[BCAST-SEND-RSP] self={self_addr} "
-                                f"-> node={node} attempt={_attempt_number} "
-                                f"response={response!r:.80}"
-                            ),
-                            node_host=self._host,
-                            node_port=self._udp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    if isinstance(response, bytes) and response.startswith(
-                        (b"ack", b"leave")
-                    ):
-                        return True
-                    last_failure = response
-
-                await self._udp_logger.log(
-                    ServerDebug(
-                        message=(
-                            f"Leave broadcast to {node[0]}:{node[1]} failed "
-                            f"after {max_attempts} attempts: "
-                            f"{type(last_failure).__name__}"
-                        ),
-                        node_host=self._host,
-                        node_port=self._udp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                return False
-
         results = await asyncio.gather(
-            *(send_leave(node) for node in node_addresses),
+            *(
+                self._send_leave_with_retries(
+                    node,
+                    leave_msg,
+                    timeout,
+                    send_semaphore,
+                    max_attempts,
+                    self_addr,
+                )
+                for node in node_addresses
+            ),
             return_exceptions=False,
         )
-        send_failures = sum(1 for result in results if not result)
+        # Every result is the bool a leave send returned.
+        await self._log_leave_broadcast_failures(results.count(False), len(node_addresses))
 
+    async def _send_leave_with_retries(
+        self,
+        node: tuple[str, int],
+        leave_msg: bytes,
+        timeout: float,
+        send_semaphore: asyncio.Semaphore,
+        max_attempts: int,
+        self_addr: tuple[str, int],
+    ) -> bool:
+        """Send ``leave_msg`` to ``node`` (one ``send_semaphore`` slot) until acknowledged or out of attempts."""
+        async with send_semaphore:
+            last_failure: object = None
+            for _attempt_number in range(1, max_attempts + 1):
+                acknowledged, last_failure = await self._attempt_leave_send(
+                    node,
+                    leave_msg,
+                    timeout,
+                    self_addr,
+                    _attempt_number,
+                )
+                if acknowledged:
+                    return True
+
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=(
+                        f"Leave broadcast to {node[0]}:{node[1]} failed "
+                        f"after {max_attempts} attempts: "
+                        f"{type(last_failure).__name__}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+
+    async def _attempt_leave_send(
+        self,
+        node: tuple[str, int],
+        leave_msg: bytes,
+        timeout: float,
+        self_addr: tuple[str, int],
+        attempt_number: int,
+    ) -> tuple[bool, object]:
+        """One leave send to ``node``: ``(acknowledged, failure)`` where failure is the send error or the response."""
+        try:
+            send_result = await self.send(
+                node,
+                leave_msg,
+                timeout=timeout,
+            )
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=(
+                        f"[BCAST-SEND-EXC] self={self_addr} "
+                        f"-> node={node} attempt={attempt_number} "
+                        f"err={type(error).__name__}:{error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False, error
+
+        response = self._leave_send_response(send_result)
+        await self._udp_logger.log(
+            ServerError(
+                message=(
+                    f"[BCAST-SEND-RSP] self={self_addr} "
+                    f"-> node={node} attempt={attempt_number} "
+                    f"response={response!r:.80}"
+                ),
+                node_host=self._host,
+                node_port=self._udp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return self._is_leave_acknowledgement(response), response
+
+    @staticmethod
+    def _leave_send_response(send_result: object) -> object:
+        """Return the response element of a ``send`` result that is a tuple, else the result itself."""
+        return send_result[0] if isinstance(send_result, tuple) else send_result
+
+    @staticmethod
+    def _is_leave_acknowledgement(response: object) -> bool:
+        """Whether a leave send's response is bytes starting with ``ack`` or ``leave``."""
+        return isinstance(response, bytes) and response.startswith((b"ack", b"leave"))
+
+    async def _log_leave_broadcast_failures(self, send_failures: int, target_count: int) -> None:
+        """Log how many of the leave broadcast's sends failed, when any did."""
         if send_failures > 0:
             await self._udp_logger.log(
                 ServerDebug(
                     message=(
-                        f"Leave broadcast: {send_failures}/{len(node_addresses)} "
+                        f"Leave broadcast: {send_failures}/{target_count} "
                         "sends failed"
                     ),
                     node_host=self._host,
@@ -4749,38 +5396,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         silently bumping LHM, so future callers cannot regress this
         invariant.
         """
-        if event_type == "probe_timeout":
-            self._local_health.on_probe_timeout()
-        elif event_type == "refutation":
-            self._local_health.on_refutation_needed()
-        elif event_type == "missed_nack":
-            self._local_health.on_missed_nack()
-        elif event_type == "event_loop_lag":
-            self._local_health.on_event_loop_lag()
-        elif event_type == "event_loop_critical":
-            self._local_health.on_event_loop_critical()
-        else:
-            if self._task_runner and self._udp_logger:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=(
-                            f"increase_failure_detector called with unrecognised "
-                            f"event_type={event_type!r} — LHM not bumped. Per "
-                            f"Lifeguard §4.3, LHM tracks self-health events only "
-                            f"(probe_timeout/refutation/missed_nack/event_loop_lag/"
-                            f"event_loop_critical). Operational retry telemetry "
-                            f"belongs in metrics."
-                        ),
-                        node_host=self._host,
-                        node_port=self._udp_port,
-                        node_id=(
-                            self._node_id.short
-                            if hasattr(self, "_node_id")
-                            else 0
-                        ),
-                    ),
-                )
+        if (handler_name := self._LHM_INCREASE_EVENT_HANDLERS.get(event_type)) is not None:
+            getattr(self._local_health, handler_name)()
+            return
+
+        await self._warn_unrecognised_lhm_event(
+            f"increase_failure_detector called with unrecognised "
+            f"event_type={event_type!r} — LHM not bumped. Per "
+            f"Lifeguard §4.3, LHM tracks self-health events only "
+            f"(probe_timeout/refutation/missed_nack/event_loop_lag/"
+            f"event_loop_critical). Operational retry telemetry "
+            f"belongs in metrics."
+        )
 
     async def decrease_failure_detector(self, event_type: str = "successful_probe"):
         """Decrease local health score based on event type.
@@ -4790,133 +5417,55 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         event types surface a warning rather than silently
         decrementing.
         """
-        if event_type == "successful_probe":
-            self._local_health.on_successful_probe()
-        elif event_type == "successful_nack":
-            self._local_health.on_successful_nack()
-        elif event_type == "event_loop_recovered":
-            self._local_health.on_event_loop_recovered()
-        else:
-            if self._task_runner and self._udp_logger:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=(
-                            f"decrease_failure_detector called with unrecognised "
-                            f"event_type={event_type!r} — LHM not decremented. "
-                            f"See ``increase_failure_detector`` docstring."
-                        ),
-                        node_host=self._host,
-                        node_port=self._udp_port,
-                        node_id=(
-                            self._node_id.short
-                            if hasattr(self, "_node_id")
-                            else 0
-                        ),
-                    ),
-                )
+        if (handler_name := self._LHM_DECREASE_EVENT_HANDLERS.get(event_type)) is not None:
+            getattr(self._local_health, handler_name)()
+            return
 
-    def get_lhm_adjusted_timeout(
-        self, base_timeout: float, target_node_id: str | None = None
-    ) -> float:
-        """Adjust ``base_timeout`` via two-stage bounded composition.
+        await self._warn_unrecognised_lhm_event(
+            f"decrease_failure_detector called with unrecognised "
+            f"event_type={event_type!r} — LHM not decremented. "
+            f"See ``increase_failure_detector`` docstring."
+        )
 
-        **Stage 1 — per-peer base RTT scaling (real network distance).**
-        Vivaldi's ``latency_multiplier`` is the geometric estimate of
-        round-trip time relative to a 10 ms same-DC reference. This is
-        a *real* cost — a cross-continent peer's ack physically takes
-        longer to arrive — so it scales the base timeout linearly,
-        outside the uncertainty-padding stage.
-
-        **Stage 2 — bounded uncertainty padding via prob-OR.** Four
-        independent measurement-reliability signals collapse to a
-        single bounded padding factor:
-
-        * ``self_lhm``           — global self-health (LHM)
-        * ``degradation``        — global graceful-degradation level
-        * ``coord_quality``      — per-peer Vivaldi confidence
-        * ``peer_load``          — per-peer reported load class
-
-        Each multiplier ``m_i ≥ 1`` becomes a reliability
-        ``r_i = 1 / m_i ∈ (0, 1]``. Independent reliabilities compose
-        multiplicatively: ``R = ∏ r_i``. Unreliability is
-        ``U = 1 − R ∈ [0, 1)``. Padding scales linearly within the
-        cap derived from LHM saturation:
-
-            timeout = peer_base × (1 + (lhm_max_multiplier − 1) × U)
-
-        With default config (``LHM.max_score=8``,
-        ``MULTIPLIER_WEIGHT=0.25``) the cap is ``3 × peer_base`` —
-        matching the existing LHM-saturated bound — and remains there
-        even if every signal is simultaneously at its individual
-        worst-case. The previous code multiplied every signal
-        ``base × lhm × degradation × latency × confidence × peer_load``
-        which (e.g.) at all-saturated produced ``> 90×`` blow-ups.
-
-        Why drop ``peer_health_awareness.get_probe_timeout`` here?
-        Because that helper just multiplied ``peer_load`` on top of
-        ``base_adjusted`` — which is exactly the multiplicative
-        compounding this rewrite eliminates. ``peer_load_multiplier``
-        is now folded into the prob-OR composition where it belongs,
-        with the rest of the per-peer reliability inputs.
-
-        Args:
-            base_timeout: Base probe timeout in seconds.
-            target_node_id: Optional probe target. When supplied,
-                per-peer Vivaldi (RTT scaling, coord quality) and PHA
-                (peer load) signals participate; otherwise only the
-                two global signals (LHM, degradation) do.
-
-        Returns:
-            Adjusted timeout in seconds, strictly bounded by
-            ``base_timeout × latency_multiplier × lhm_max_multiplier``.
-        """
-        latency_multiplier = 1.0
-        coord_quality_multiplier = 1.0
-        if target_node_id:
-            peer_coord = self._coordinate_tracker.get_peer_coordinate(target_node_id)
-            if peer_coord is not None:
-                estimated_rtt_ms = self._coordinate_tracker.estimate_rtt_ucb_ms(
-                    peer_coordinate=peer_coord
-                )
-                reference_rtt_ms = 10.0  # Same-datacenter baseline (10ms)
-                latency_multiplier = min(
-                    10.0, max(1.0, estimated_rtt_ms / reference_rtt_ms)
-                )
-                # Vivaldi coord quality ∈ [0, 1]; convert to a
-                # multiplier ≥ 1 the same way the previous formula did
-                # (``1 + (1 − quality) × 0.5``) so saturation gives a
-                # 1.5× factor — preserves the existing per-peer
-                # reliability semantic with the new composition.
-                quality = self._coordinate_tracker.coordinate_quality(peer_coord)
-                coord_quality_multiplier = 1.0 + (1.0 - quality) * 0.5
-
-        peer_base = base_timeout * latency_multiplier
-
-        peer_load_multiplier = 1.0
-        if target_node_id:
-            peer_load_multiplier = self._peer_health_awareness.get_load_multiplier(
-                target_node_id
+    async def _warn_unrecognised_lhm_event(self, message: str) -> None:
+        """Log a warning that an LHM adjustment named an unrecognised event type (when runner and logger exist)."""
+        if self._task_runner and self._udp_logger:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=message,
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                    node_id=self._short_node_id_or(0),
+                ),
             )
 
+    def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
+        """Pad ``base_timeout`` for this node's own unreliability.
+
+        Two global signals -- self-health (LHM) and the graceful
+        degradation level -- each become a reliability ``r = 1 / m``
+        (``m >= 1`` their multiplier). Independent reliabilities compose
+        multiplicatively, ``R = r_lhm * r_degradation``, and the padding
+        scales the unreliability ``1 - R`` within the cap LHM saturation
+        derives:
+
+            timeout = base * (1 + (lhm_max_multiplier - 1) * (1 - R))
+
+        Bounded by ``base * lhm_max_multiplier`` whatever the inputs. No
+        per-peer factor: every probe base already exceeds any terrestrial
+        round trip, and per-peer load is weighed where it decides
+        something (the probe retry budget, the hierarchical detector).
+        """
         lhm_multiplier = max(1.0, self._local_health.get_multiplier())
         degradation_multiplier = max(
             1.0, self._degradation.get_timeout_multiplier()
         )
-        coord_quality_multiplier = max(1.0, coord_quality_multiplier)
-        peer_load_multiplier = max(1.0, peer_load_multiplier)
-
-        combined_reliability = (
-            (1.0 / lhm_multiplier)
-            * (1.0 / degradation_multiplier)
-            * (1.0 / coord_quality_multiplier)
-            * (1.0 / peer_load_multiplier)
+        combined_unreliability = 1.0 - (1.0 / lhm_multiplier) * (
+            1.0 / degradation_multiplier
         )
-        combined_unreliability = 1.0 - combined_reliability
-
         max_padding_factor = self._local_health.get_max_multiplier() - 1.0
 
-        return peer_base * (1.0 + max_padding_factor * combined_unreliability)
+        return base_timeout * (1.0 + max_padding_factor * combined_unreliability)
 
     def get_self_incarnation(self) -> int:
         """Get this node's current incarnation number."""
@@ -4952,7 +5501,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         target = None
         if len(parts) > 1:
             target_str = parts[1].decode()
-            host, port = target_str.split(":", maxsplit=1)
+            host, port = target_str.rsplit(":", maxsplit=1)
             target = (host, int(port))
 
         msg_parts = msg_part.split(b":", maxsplit=2)
@@ -5154,22 +5703,28 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         lhm = 0
 
         if len(msg_parts) >= 2:
-            try:
-                term = int(msg_parts[1].decode())
-            except ValueError as e:
-                await self.handle_error(
-                    MalformedMessageError(message, f"Invalid term: {e}", source)
-                )
+            term = await self._parse_leadership_int_field(message, msg_parts[1], "term", source)
 
         if len(msg_parts) >= 3:
-            try:
-                lhm = int(msg_parts[2].decode())
-            except ValueError as e:
-                await self.handle_error(
-                    MalformedMessageError(message, f"Invalid LHM: {e}", source)
-                )
+            lhm = await self._parse_leadership_int_field(message, msg_parts[2], "LHM", source)
 
         return term, lhm
+
+    async def _parse_leadership_int_field(
+        self,
+        message: bytes,
+        field: bytes,
+        field_label: str,
+        source: tuple[str, int],
+    ) -> int:
+        """Parse one integer field of a leadership message; a malformed one is reported and read as 0."""
+        try:
+            return int(field.decode())
+        except ValueError as e:
+            await self.handle_error(
+                MalformedMessageError(message, f"Invalid {field_label}: {e}", source)
+            )
+            return 0
 
     async def _parse_pre_vote_response(
         self,
@@ -5186,12 +5741,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         granted = False
 
         if len(msg_parts) >= 2:
-            try:
-                term = int(msg_parts[1].decode())
-            except ValueError as e:
-                await self.handle_error(
-                    MalformedMessageError(message, f"Invalid term: {e}", source)
-                )
+            term = await self._parse_leadership_int_field(message, msg_parts[1], "term", source)
 
         if len(msg_parts) >= 3:
             granted = msg_parts[2].decode() == "1"
@@ -5239,38 +5789,63 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     node_id=self._node_id.short,
                 ),
             )
-        elif freshness == MessageFreshness.STALE:
-            # Stale messages may indicate delayed network or state drift
-            self._task_runner.run(
-                self.handle_error,
-                StaleMessageError(node, incarnation, current_incarnation),
-            )
-        elif freshness == MessageFreshness.INVALID:
-            # Invalid incarnation - log as protocol error
-            self._task_runner.run(
-                self.handle_error,
-                ProtocolError(
-                    f"Invalid incarnation {incarnation} from {node[0]}:{node[1]}",
-                    severity=ErrorSeverity.DEGRADED,
-                    node=node,
-                    incarnation=incarnation,
-                ),
-            )
-        elif freshness == MessageFreshness.SUSPICIOUS:
-            # Suspicious jump - possible attack or serious bug
-            self._task_runner.run(
-                self.handle_error,
-                ProtocolError(
-                    f"Suspicious incarnation jump to {incarnation} from {node[0]}:{node[1]} "
-                    f"(current: {current_incarnation})",
-                    severity=ErrorSeverity.DEGRADED,
-                    node=node,
-                    incarnation=incarnation,
-                    current_incarnation=current_incarnation,
-                ),
-            )
+        else:
+            self._report_freshness_rejection(freshness, node, incarnation, current_incarnation)
 
         return False
+
+    def _report_freshness_rejection(
+        self,
+        freshness: MessageFreshness,
+        node: tuple[str, int],
+        incarnation: int,
+        current_incarnation: int,
+    ) -> None:
+        """Hand a STALE, INVALID or SUSPICIOUS message's error to handle_error through the task runner."""
+        if (error_builder_name := self._FRESHNESS_REJECTION_ERROR_BUILDERS.get(freshness)) is not None:
+            self._task_runner.run(
+                self.handle_error,
+                getattr(self, error_builder_name)(node, incarnation, current_incarnation),
+            )
+
+    @staticmethod
+    def _stale_message_error(
+        node: tuple[str, int],
+        incarnation: int,
+        current_incarnation: int,
+    ) -> StaleMessageError:
+        """Stale messages may indicate delayed network or state drift."""
+        return StaleMessageError(node, incarnation, current_incarnation)
+
+    @staticmethod
+    def _invalid_incarnation_error(
+        node: tuple[str, int],
+        incarnation: int,
+        current_incarnation: int,
+    ) -> ProtocolError:
+        """Invalid incarnation - log as protocol error."""
+        return ProtocolError(
+            f"Invalid incarnation {incarnation} from {node[0]}:{node[1]}",
+            severity=ErrorSeverity.DEGRADED,
+            node=node,
+            incarnation=incarnation,
+        )
+
+    @staticmethod
+    def _suspicious_incarnation_error(
+        node: tuple[str, int],
+        incarnation: int,
+        current_incarnation: int,
+    ) -> ProtocolError:
+        """Suspicious jump - possible attack or serious bug."""
+        return ProtocolError(
+            f"Suspicious incarnation jump to {incarnation} from {node[0]}:{node[1]} "
+            f"(current: {current_incarnation})",
+            severity=ErrorSeverity.DEGRADED,
+            node=node,
+            incarnation=incarnation,
+            current_incarnation=current_incarnation,
+        )
 
     def _make_network_error(
         self,
@@ -5283,7 +5858,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Returns ConnectionRefusedError for ECONNREFUSED, otherwise NetworkError.
         """
-        import errno
 
         if e.errno == errno.ECONNREFUSED:
             return SwimConnectionRefusedError(target)
@@ -5538,44 +6112,58 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             node, status, incarnation, timestamp
         )
 
-        if updated and status == b"DEAD":
-            import traceback as _tb
-            await self._udp_logger.log(
-                ServerError(
-                    message=(
-                        f"[NODE-DEAD] node={node} incarnation={incarnation} "
-                        f"prev_status={previous_state.status if previous_state else None} "
-                        f"stack={'/'.join(f.name for f in _tb.extract_stack()[-8:-1])}"
-                    ),
-                    node_host=self._host,
-                    node_port=self._udp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-
-        # If node was DEAD and is now being set to OK/ALIVE, invoke join callbacks
-        # This handles recovery detection for nodes that come back after being marked dead
-        if updated and was_dead and status in (b"OK", b"ALIVE"):
-            self._metrics.increment("node_recoveries_detected")
-            self._audit_log.record(
-                AuditEventType.NODE_RECOVERED,
-                node=node,
-                incarnation=incarnation,
-            )
-
-            # Add back to probe scheduler
-            self._probe_scheduler.add_member(node)
-
-            # Invoke registered callbacks (composition pattern)
-            for callback in self._on_node_join_callbacks:
-                try:
-                    callback(node)
-                except Exception as e:
-                    self._task_runner.run(
-                        self.handle_exception, e, "on_node_join_callback (recovery)"
-                    )
+        if updated:
+            if status == b"DEAD":
+                await self._log_node_dead_transition(node, incarnation, previous_state)
+            # If node was DEAD and is now being set to OK/ALIVE, invoke join callbacks
+            # This handles recovery detection for nodes that come back after being marked dead
+            elif was_dead and status in (b"OK", b"ALIVE"):
+                self._on_dead_node_recovered(node, incarnation)
 
         return updated
+
+    async def _log_node_dead_transition(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        previous_state: NodeState | None,
+    ) -> None:
+        """Log an applied DEAD transition with the prior status and the seven frames that led to update_node_state."""
+        await self._udp_logger.log(
+            ServerError(
+                message=(
+                    f"[NODE-DEAD] node={node} incarnation={incarnation} "
+                    f"prev_status={previous_state.status if previous_state else None} "
+                    # [-9:-2]: skip this helper's frame and update_node_state's,
+                    # naming the same seven callers update_node_state did inline.
+                    f"stack={'/'.join(f.name for f in _tb.extract_stack()[-9:-2])}"
+                ),
+                node_host=self._host,
+                node_port=self._udp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    def _on_dead_node_recovered(self, node: tuple[str, int], incarnation: int) -> None:
+        """Record a DEAD node's recovery, return it to probing, and invoke the node-join callbacks."""
+        self._metrics.increment("node_recoveries_detected")
+        self._audit_log.record(
+            AuditEventType.NODE_RECOVERED,
+            node=node,
+            incarnation=incarnation,
+        )
+
+        # Add back to probe scheduler
+        self._probe_scheduler.add_member(node)
+
+        # Invoke registered callbacks (composition pattern)
+        for callback in self._on_node_join_callbacks:
+            try:
+                callback(node)
+            except Exception as e:
+                self._task_runner.run(
+                    self.handle_exception, e, "on_node_join_callback (recovery)"
+                )
 
     async def start_suspicion(
         self,
@@ -5593,30 +6181,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         AD-29 Task 12.3.4: UNCONFIRMED → SUSPECT transitions are explicitly
         prevented by the formal state machine.
         """
-        # Registration gate: a peer must have completed an explicit
-        # registration handshake (TCP register endpoint or SWIM JOIN)
-        # before this node may suspect them. Passive observation —
-        # for instance an inbound probe from a peer we've never been
-        # introduced to — does not promote them into a suspectable
-        # state. This eliminates the "boot-time false positive": a
-        # peer that's still completing its startup handshake cannot
-        # be SUSPECTed by transient probe-timeouts.
-        if not self.is_peer_registered(node):
-            self._metrics.increment("suspicions_skipped_unregistered")
+        # Registration gate (registered peers only) and AD-29's
+        # UNCONFIRMED -> SUSPECT guard; see ``_suspicion_gate_rejects``.
+        if self._suspicion_gate_rejects(node):
             return None
 
-        # AD-29: Guard against suspecting unconfirmed peers
-        # Use formal state machine check which prevents UNCONFIRMED → SUSPECT
-        if not self._incarnation_tracker.can_suspect_node(node):
-            self._metrics.increment("suspicions_skipped_unconfirmed")
-            return None
-
-        previous_state = self._incarnation_tracker.get_node_state(node)
-        already_suspect = (
-            previous_state is not None
-            and previous_state.status == b"SUSPECT"
-            and previous_state.incarnation >= incarnation
-        )
+        already_suspect = self._is_already_suspect_at(node, incarnation)
         now = self._clock.monotonic()
         result = await self._hierarchical_detector.suspect_global(
             node, incarnation, from_node
@@ -5624,6 +6194,84 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if not result:
             return result
 
+        return await self._commit_started_suspicion(
+            node,
+            incarnation,
+            from_node,
+            now,
+            already_suspect,
+            result,
+        )
+
+    def _suspicion_gate_rejects(self, node: tuple[str, int]) -> bool:
+        """Whether ``node`` may not be suspected: it never registered, or it is still UNCONFIRMED (counted).
+
+        Registration gate: a peer must have completed an explicit
+        registration handshake (TCP register endpoint or SWIM JOIN)
+        before this node may suspect them. Passive observation —
+        for instance an inbound probe from a peer we've never been
+        introduced to — does not promote them into a suspectable
+        state. This eliminates the "boot-time false positive": a
+        peer that's still completing its startup handshake cannot
+        be SUSPECTed by transient probe-timeouts.
+        """
+        if not self.is_peer_registered(node):
+            self._metrics.increment("suspicions_skipped_unregistered")
+            return True
+
+        # AD-29: Guard against suspecting unconfirmed peers
+        # Use formal state machine check which prevents UNCONFIRMED → SUSPECT
+        if not self._incarnation_tracker.can_suspect_node(node):
+            self._metrics.increment("suspicions_skipped_unconfirmed")
+            return True
+
+        return False
+
+    def _is_already_suspect_at(self, node: tuple[str, int], incarnation: int) -> bool:
+        """Whether the tracker already holds ``node`` SUSPECT at ``incarnation`` or later."""
+        previous_state = self._incarnation_tracker.get_node_state(node)
+        return (
+            previous_state is not None
+            and previous_state.status == b"SUSPECT"
+            and previous_state.incarnation >= incarnation
+        )
+
+    async def _commit_started_suspicion(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        from_node: tuple[str, int],
+        now: float,
+        already_suspect: bool,
+        result: bool,
+    ) -> bool | None:
+        """Mirror a started global suspicion into the tracker, then count, audit and log it.
+
+        None when the tracker refused the SUSPECT as stale (and the node was
+        not already suspect): the global suspicion is withdrawn.
+        """
+        if not await self._apply_suspect_to_tracker(node, incarnation, now, already_suspect):
+            return None
+
+        self._metrics.increment("suspicions_started")
+        self._audit_log.record(
+            AuditEventType.NODE_SUSPECTED,
+            node=node,
+            from_node=from_node,
+            incarnation=incarnation,
+        )
+        self._global_suspicion_started_at.setdefault(node, now)
+        await self._log_suspicion_start(node, incarnation)
+        return result
+
+    async def _apply_suspect_to_tracker(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        now: float,
+        already_suspect: bool,
+    ) -> bool:
+        """Write SUSPECT to the tracker; on a stale refusal of a not-yet-suspect node, withdraw the suspicion (False)."""
         applied = await self._incarnation_tracker.update_node(
             node,
             b"SUSPECT",
@@ -5636,55 +6284,56 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 incarnation,
             )
             self._metrics.increment("suspicions_skipped_stale_tracker")
-            return None
+            return False
+        return True
 
-        self._metrics.increment("suspicions_started")
-        self._audit_log.record(
-            AuditEventType.NODE_SUSPECTED,
-            node=node,
-            from_node=from_node,
-            incarnation=incarnation,
+    async def _log_suspicion_start(self, node: tuple[str, int], incarnation: int) -> None:
+        """Log a started suspicion with its witnesses, rejections, LHM, degradation and timeout bracket."""
+        witness_count, rejection_reasons = self._proxy_eligibility_breakdown(
+            node
         )
-        if result:
-            self._global_suspicion_started_at.setdefault(node, now)
-            witness_count, rejection_reasons = self._proxy_eligibility_breakdown(
-                node
+        min_timeout, max_timeout = await self._suspicion_timeout_bracket(node)
+        mapped_worker_id = self._get_registered_node_id_for_addr(node)
+        degradation_level = self._degradation_level_name_or_none()
+        await self._udp_logger.log(
+            ServerError(
+                message=(
+                    f"[SUSPICION-START] target={node} "
+                    f"worker_id={mapped_worker_id} incarnation={incarnation} "
+                    f"witnesses={witness_count} "
+                    f"rejected={rejection_reasons} "
+                    f"lhm_score={self._local_health.score} "
+                    f"lhm_multiplier={self._local_health.get_multiplier():.2f} "
+                    f"degradation={degradation_level} "
+                    f"min_timeout={min_timeout} max_timeout={max_timeout}"
+                ),
+                node_host=self._host,
+                node_port=self._udp_port,
+                node_id=self._node_id.short,
             )
-            suspicion_state = (
-                await self._hierarchical_detector._global_wheel.get_state(node)
-                if self._hierarchical_detector is not None
-                else None
-            )
-            min_timeout = (
-                suspicion_state.min_timeout if suspicion_state is not None else None
-            )
-            max_timeout = (
-                suspicion_state.max_timeout if suspicion_state is not None else None
-            )
-            mapped_worker_id = self._get_registered_node_id_for_addr(node)
-            degradation_level = (
-                self._degradation.current_level.name
-                if self._degradation is not None
-                else None
-            )
-            await self._udp_logger.log(
-                ServerError(
-                    message=(
-                        f"[SUSPICION-START] target={node} "
-                        f"worker_id={mapped_worker_id} incarnation={incarnation} "
-                        f"witnesses={witness_count} "
-                        f"rejected={rejection_reasons} "
-                        f"lhm_score={self._local_health.score} "
-                        f"lhm_multiplier={self._local_health.get_multiplier():.2f} "
-                        f"degradation={degradation_level} "
-                        f"min_timeout={min_timeout} max_timeout={max_timeout}"
-                    ),
-                    node_host=self._host,
-                    node_port=self._udp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-        return result
+        )
+
+    async def _suspicion_timeout_bracket(
+        self,
+        node: tuple[str, int],
+    ) -> tuple[float | None, float | None]:
+        """Return the global suspicion's ``(min_timeout, max_timeout)`` for ``node``, or ``(None, None)``."""
+        suspicion_state = (
+            await self._hierarchical_detector._global_wheel.get_state(node)
+            if self._hierarchical_detector is not None
+            else None
+        )
+        if suspicion_state is None:
+            return None, None
+        return suspicion_state.min_timeout, suspicion_state.max_timeout
+
+    def _degradation_level_name_or_none(self) -> str | None:
+        """Return the current graceful-degradation level's name, or None without a degradation tracker."""
+        return (
+            self._degradation.current_level.name
+            if self._degradation is not None
+            else None
+        )
 
     async def confirm_suspicion(
         self,
@@ -5749,19 +6398,44 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         all_candidates = [
             node
             for node in self._incarnation_tracker.node_states.keys()
-            if (
-                node != target
-                and node != self_addr
-                and self._is_valid_indirect_probe_proxy(node)
-            )
+            if self._is_usable_indirect_probe_proxy(node, target, self_addr)
         ]
 
         if not all_candidates:
             return []
 
         # Phase 6.2: Filter to prefer healthy proxies
-        # We need node_id (string) but have (host, port) tuples
-        # For filtering, use addr-based lookup since health gossip uses node_id
+        healthy_candidates, stressed_candidates = self._partition_proxies_by_health(all_candidates)
+
+        # Prefer healthy nodes, but fall back to stressed if necessary
+        k = min(k, len(all_candidates))
+        if k <= 0:
+            return []
+
+        return self._sample_proxies_preferring_healthy(healthy_candidates, stressed_candidates, k)
+
+    def _is_usable_indirect_probe_proxy(
+        self,
+        node: tuple[str, int],
+        target: tuple[str, int],
+        self_addr: tuple[str, int],
+    ) -> bool:
+        """Whether ``node`` -- neither the target nor this node -- can serve as an indirect-probe proxy."""
+        return (
+            node != target
+            and node != self_addr
+            and self._is_valid_indirect_probe_proxy(node)
+        )
+
+    def _partition_proxies_by_health(
+        self,
+        all_candidates: list[tuple[str, int]],
+    ) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+        """Split proxy candidates, in order, into healthy (usable as proxy per Phase 6.2) and stressed.
+
+        We need node_id (string) but have (host, port) tuples; for
+        filtering, use addr-based lookup since health gossip uses node_id.
+        """
         healthy_candidates: list[tuple[str, int]] = []
         stressed_candidates: list[tuple[str, int]] = []
 
@@ -5773,30 +6447,43 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             else:
                 stressed_candidates.append(node)
 
-        # Prefer healthy nodes, but fall back to stressed if necessary
-        k = min(k, len(all_candidates))
-        if k <= 0:
-            return []
+        return healthy_candidates, stressed_candidates
 
+    def _sample_proxies_preferring_healthy(
+        self,
+        healthy_candidates: list[tuple[str, int]],
+        stressed_candidates: list[tuple[str, int]],
+        k: int,
+    ) -> list[tuple[str, int]]:
+        """Sample ``k`` proxies from the healthy ones; short of healthy ones, fill from (or fall back to) stressed."""
         if len(healthy_candidates) >= k:
             return self._random.sample(healthy_candidates, k)
         elif healthy_candidates:
             # Use all healthy + some stressed to fill
-            result = healthy_candidates.copy()
-            remaining = k - len(result)
-            if remaining > 0 and stressed_candidates:
-                additional = self._random.sample(
-                    stressed_candidates, min(remaining, len(stressed_candidates))
-                )
-                result.extend(additional)
-            return result
+            return self._healthy_proxies_topped_up_from_stressed(healthy_candidates, stressed_candidates, k)
         else:
             # No healthy candidates, use stressed
             return self._random.sample(stressed_candidates, min(k, len(stressed_candidates)))
 
+    def _healthy_proxies_topped_up_from_stressed(
+        self,
+        healthy_candidates: list[tuple[str, int]],
+        stressed_candidates: list[tuple[str, int]],
+        k: int,
+    ) -> list[tuple[str, int]]:
+        """Return every healthy proxy plus a random sample of stressed ones filling the rest of ``k``."""
+        result = healthy_candidates.copy()
+        remaining = k - len(result)
+        if remaining > 0 and stressed_candidates:
+            additional = self._random.sample(
+                stressed_candidates, min(remaining, len(stressed_candidates))
+            )
+            result.extend(additional)
+        return result
+
     def _is_valid_indirect_probe_proxy(self, node: tuple[str, int]) -> bool:
         """Return True when ``node`` can add useful indirect-probe evidence."""
-        if not self.is_peer_registered(node) or not self.is_peer_confirmed(node):
+        if not self._is_registered_confirmed_peer(node):
             return False
 
         node_state = self._incarnation_tracker.get_node_state(node)
@@ -5855,28 +6542,44 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         or because they were transiently disqualified.
         """
         self_addr = self._get_self_udp_addr()
+        candidate_nodes = [
+            node
+            for node in self._incarnation_tracker.node_states.keys()
+            if node not in (target, self_addr)
+        ]
+        return self._tally_proxy_eligibility(candidate_nodes)
+
+    def _tally_proxy_eligibility(
+        self,
+        candidate_nodes: list[tuple[str, int]],
+    ) -> tuple[int, dict[str, int]]:
+        """Count the eligible proxies among ``candidate_nodes`` and each rejection reason among the rest."""
         eligible: list[tuple[str, int]] = []
         reasons: dict[str, int] = {}
-        for node in self._incarnation_tracker.node_states.keys():
-            if node == target or node == self_addr:
-                continue
-            if not self.is_peer_registered(node):
-                reasons["unregistered"] = reasons.get("unregistered", 0) + 1
-                continue
-            if not self.is_peer_confirmed(node):
-                reasons["unconfirmed"] = reasons.get("unconfirmed", 0) + 1
-                continue
-            node_state = self._incarnation_tracker.get_node_state(node)
-            if node_state is None:
-                reasons["no_state"] = reasons.get("no_state", 0) + 1
-                continue
-            status = node_state.status
-            if status not in (b"OK", b"JOIN"):
-                key = f"status={status.decode(errors='replace')}"
-                reasons[key] = reasons.get(key, 0) + 1
+        for node in candidate_nodes:
+            if (reason := self._proxy_rejection_reason(node)) is not None:
+                reasons[reason] = reasons.get(reason, 0) + 1
                 continue
             eligible.append(node)
         return len(eligible), reasons
+
+    def _proxy_rejection_reason(self, node: tuple[str, int]) -> str | None:
+        """Why ``node`` cannot be an indirect-probe proxy -- unregistered, unconfirmed, no state, a bad status -- or None."""
+        if not self.is_peer_registered(node):
+            return "unregistered"
+        if not self.is_peer_confirmed(node):
+            return "unconfirmed"
+        return self._proxy_state_rejection_reason(self._incarnation_tracker.get_node_state(node))
+
+    @staticmethod
+    def _proxy_state_rejection_reason(node_state: NodeState | None) -> str | None:
+        """Why a tracked state disqualifies a proxy -- no state, or a status other than OK/JOIN -- or None."""
+        if node_state is None:
+            return "no_state"
+        status = node_state.status
+        if status not in (b"OK", b"JOIN"):
+            return f"status={status.decode(errors='replace')}"
+        return None
 
     def _get_self_udp_addr(self) -> tuple[str, int]:
         """Get this server's UDP address as a tuple."""
@@ -5914,8 +6617,38 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return False
         self._metrics.increment("indirect_probes_sent")
 
+        msg = self._build_ping_req_message(target, incarnation, request_id)
+
+        successful_sends, failed_proxies = await self._send_ping_req_to_proxies(
+            probe,
+            proxies,
+            msg,
+            timeout,
+        )
+
+        # If some proxies failed, try to get replacement proxies
+        successful_sends = await self._replace_failed_indirect_probe_proxies(
+            probe,
+            target,
+            proxies,
+            failed_proxies,
+            successful_sends,
+            k,
+            msg,
+            timeout,
+        )
+
+        return await self._indirect_probe_reached_any_proxy(successful_sends, target, proxies, timeout)
+
+    @staticmethod
+    def _build_ping_req_message(
+        target: tuple[str, int],
+        incarnation: int,
+        request_id: str,
+    ) -> bytes:
+        """Build ``ping-req:{incarnation}:{request_id}>{host}:{port}`` asking a proxy to probe ``target``."""
         target_addr = f"{target[0]}:{target[1]}".encode()
-        msg = (
+        return (
             b"ping-req:"
             + str(incarnation).encode()
             + b":"
@@ -5924,6 +6657,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             + target_addr
         )
 
+    async def _send_ping_req_to_proxies(
+        self,
+        probe: PendingIndirectProbe,
+        proxies: list[tuple[str, int]],
+        msg: bytes,
+        timeout: float,
+    ) -> tuple[int, list[tuple[str, int]]]:
+        """Enrol each proxy on ``probe`` and send it the ping-req: ``(successful sends, failed proxies)``."""
         successful_sends = 0
         failed_proxies: list[tuple[str, int]] = []
 
@@ -5935,21 +6676,60 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             else:
                 failed_proxies.append(proxy)
 
-        # If some proxies failed, try to get replacement proxies
-        if failed_proxies and successful_sends < k:
-            # Get additional proxies excluding those we already tried
-            all_tried = set(proxies)
-            additional = self.get_random_proxy_nodes(target, k - successful_sends)
+        return successful_sends, failed_proxies
 
-            for proxy in additional:
-                if proxy not in all_tried:
-                    success = await self._send_indirect_probe_to_proxy(
-                        proxy, msg, timeout
-                    )
-                    if success:
-                        probe.add_proxy(proxy)
-                        successful_sends += 1
+    async def _replace_failed_indirect_probe_proxies(
+        self,
+        probe: PendingIndirectProbe,
+        target: tuple[str, int],
+        proxies: list[tuple[str, int]],
+        failed_proxies: list[tuple[str, int]],
+        successful_sends: int,
+        k: int,
+        msg: bytes,
+        timeout: float,
+    ) -> int:
+        """When proxies failed and fewer than ``k`` sends landed, try fresh proxies; returns the new success count."""
+        if not failed_proxies or successful_sends >= k:
+            return successful_sends
 
+        # Get additional proxies excluding those we already tried
+        additional = self.get_random_proxy_nodes(target, k - successful_sends)
+        untried_proxies = list(filterfalse(set(proxies).__contains__, additional))
+
+        return successful_sends + await self._send_ping_req_to_replacement_proxies(
+            probe,
+            untried_proxies,
+            msg,
+            timeout,
+        )
+
+    async def _send_ping_req_to_replacement_proxies(
+        self,
+        probe: PendingIndirectProbe,
+        untried_proxies: list[tuple[str, int]],
+        msg: bytes,
+        timeout: float,
+    ) -> int:
+        """Send the ping-req to each replacement proxy, enrolling on ``probe`` those reached; returns how many."""
+        successful_sends = 0
+        for proxy in untried_proxies:
+            success = await self._send_indirect_probe_to_proxy(
+                proxy, msg, timeout
+            )
+            if success:
+                probe.add_proxy(proxy)
+                successful_sends += 1
+        return successful_sends
+
+    async def _indirect_probe_reached_any_proxy(
+        self,
+        successful_sends: int,
+        target: tuple[str, int],
+        proxies: list[tuple[str, int]],
+        timeout: float,
+    ) -> bool:
+        """Whether any ping-req send landed; when none did, report an IndirectProbeTimeoutError."""
         if successful_sends == 0:
             await self.handle_error(IndirectProbeTimeoutError(target, proxies, timeout))
             return False
@@ -5972,16 +6752,30 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return True
         except asyncio.TimeoutError:
             return False
-        except OSError as e:
-            await self.handle_error(
-                self._make_network_error(e, proxy, "Indirect probe")
-            )
-            return False
         except Exception as e:
-            await self.handle_exception(
-                e, f"indirect_probe_proxy_{proxy[0]}_{proxy[1]}"
+            # OSError (a network failure) included.
+            await self._report_send_error(
+                e,
+                proxy,
+                "Indirect probe",
+                f"indirect_probe_proxy_{proxy[0]}_{proxy[1]}",
             )
             return False
+
+    async def _report_send_error(
+        self,
+        error: Exception,
+        target: tuple[str, int],
+        network_operation: str,
+        exception_operation: str,
+    ) -> None:
+        """Report a failed send: an OSError as the matching network error, anything else as an exception."""
+        if isinstance(error, OSError):
+            await self.handle_error(
+                self._make_network_error(error, target, network_operation)
+            )
+            return
+        await self.handle_exception(error, exception_operation)
 
     async def handle_indirect_probe_response(
         self,
@@ -6044,10 +6838,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         with a captured transport; without this check they refute their
         own death and the manager treats the killed node as still alive.
         """
-        if not self._running:
+        # Rate limiting: a burst of refutations past the window's tokens
+        # returns the current incarnation without incrementing.
+        if not self._running or self._refutation_rate_limited():
             return self._incarnation_tracker.get_self_incarnation()
 
-        # Rate limiting check
+        new_incarnation = await self.increment_incarnation()
+
+        await self._broadcast_alive(new_incarnation)
+
+        return new_incarnation
+
+    def _refutation_rate_limited(self) -> bool:
+        """Count a refutation in the current window (opening a new one when it lapsed); True past the token budget."""
         now = self._clock.monotonic()
         window_elapsed = now - self._last_refutation_time
 
@@ -6055,22 +6858,23 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # Reset window
             self._last_refutation_time = now
             self._refutation_count_in_window = 1
-        else:
-            self._refutation_count_in_window += 1
-            if self._refutation_count_in_window > self._refutation_rate_limit_tokens:
-                # Rate limited - return current incarnation without incrementing
-                return self._incarnation_tracker.get_self_incarnation()
+            return False
 
-        new_incarnation = await self.increment_incarnation()
+        self._refutation_count_in_window += 1
+        return self._refutation_count_in_window > self._refutation_rate_limit_tokens
 
-        # Post-await terminal barrier: ``abort()`` may have flipped
-        # ``_running`` while we were inside ``increment_incarnation``.
-        # Without this check, an in-flight self-suspicion handler
-        # continues into the per-peer send loop after the instance is
-        # supposed to be dark, re-emerging on the wire with a fresh
-        # incarnation that the manager treats as authoritative liveness.
+    async def _broadcast_alive(self, new_incarnation: int) -> None:
+        """Send ``alive:{incarnation}:{node_id}>{self}`` to every other member, reporting send failures.
+
+        Post-await terminal barrier: ``abort()`` may have flipped
+        ``_running`` while the caller was inside ``increment_incarnation``.
+        Without this check, an in-flight self-suspicion handler continues
+        into the per-peer send loop after the instance is supposed to be
+        dark, re-emerging on the wire with a fresh incarnation that the
+        manager treats as authoritative liveness.
+        """
         if not self._running:
-            return new_incarnation
+            return
 
         self_addr = self._get_self_udp_addr()
 
@@ -6087,34 +6891,44 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-        successful = 0
-        failed = 0
-
-        node_addresses = list(self._incarnation_tracker.node_states.keys())
-        for node in node_addresses:
-            if not self._running:
-                break
-            if node != self_addr:
-                success = await self._send_with_retry(node, msg, timeout)
-                if success:
-                    successful += 1
-                else:
-                    failed += 1
+        send_results = await self._send_alive_to_members(msg, timeout, self_addr)
+        successful = send_results.count(True)
+        failed = len(send_results) - successful
 
         # Log if we had failures but don't fail the operation
+        await self._report_refutation_send_failures(successful, failed)
+
+    async def _send_alive_to_members(
+        self,
+        msg: bytes,
+        timeout: float,
+        self_addr: tuple[str, int],
+    ) -> list[bool]:
+        """Send the refutation to each other member in turn, stopping once shutdown begins; one result per send."""
+        send_results: list[bool] = []
+        node_addresses = list(self._incarnation_tracker.node_states.keys())
+        for node in self._nodes_excluding(node_addresses, self_addr):
+            if not self._running:
+                break
+            send_results.append(await self._send_with_retry(node, msg, timeout))
+        return send_results
+
+    async def _report_refutation_send_failures(self, successful: int, failed: int) -> None:
+        """Report a refutation broadcast that had failed sends (when an error handler exists)."""
         if failed > 0 and self._error_handler:
             await self.handle_error(
                 NetworkError(
                     f"Refutation broadcast: {failed}/{successful + failed} sends failed",
-                    severity=ErrorSeverity.TRANSIENT
-                    if successful > 0
-                    else ErrorSeverity.DEGRADED,
+                    severity=self._refutation_failure_severity(successful),
                     successful=successful,
                     failed=failed,
                 )
             )
 
-        return new_incarnation
+    @staticmethod
+    def _refutation_failure_severity(successful: int) -> ErrorSeverity:
+        """TRANSIENT when some refutation sends landed, DEGRADED when none did."""
+        return ErrorSeverity.TRANSIENT if successful > 0 else ErrorSeverity.DEGRADED
 
     async def _send_with_retry(
         self,
@@ -6193,9 +7007,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-        successful = 0
-        failed = 0
-
         # Send to *all* peers, including the target. Lifeguard §4.2's
         # refutation flow requires the suspected node to receive the
         # SUSPECT — it's the only node that can refute by incrementing
@@ -6213,11 +7024,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # serial form blocked the probe loop for ~100 s per round,
         # starving the burst-failure observation window of the failures
         # needed to trip its threshold.
-        node_addresses = [
-            node
-            for node in list(self._incarnation_tracker.node_states.keys())
-            if node != self_addr
-        ]
+        node_addresses = self._nodes_excluding(
+            list(self._incarnation_tracker.node_states.keys()),
+            self_addr,
+        )
+        results: list[bool] = []
         if node_addresses:
             results = await asyncio.gather(
                 *(
@@ -6226,12 +7037,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 ),
                 return_exceptions=False,
             )
-            for success in results:
-                if success:
-                    successful += 1
-                else:
-                    failed += 1
+        # Every result is the bool a broadcast send returned.
+        successful = results.count(True)
+        failed = len(results) - successful
 
+        await self._report_suspicion_broadcast_failures(target, successful, failed)
+
+    async def _report_suspicion_broadcast_failures(
+        self,
+        target: tuple[str, int],
+        successful: int,
+        failed: int,
+    ) -> None:
+        """Report a suspicion broadcast that had failed sends (when an error handler exists)."""
         if failed > 0 and self._error_handler:
             await self.handle_error(
                 NetworkError(
@@ -6261,14 +7079,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except asyncio.TimeoutError:
             # Timeouts are expected for unreachable nodes
             return False
-        except OSError as e:
-            # Network errors - log but don't fail broadcast
-            if self._error_handler:
-                await self.handle_error(self._make_network_error(e, node, "Broadcast"))
-            return False
         except Exception as e:
-            await self.handle_exception(e, f"broadcast_to_{node[0]}_{node[1]}")
+            await self._report_broadcast_send_error(e, node)
             return False
+
+    async def _report_broadcast_send_error(self, error: Exception, node: tuple[str, int]) -> None:
+        """Report a failed broadcast send: an OSError as a network error (when an error handler exists), else an exception."""
+        if not isinstance(error, OSError):
+            await self.handle_exception(error, f"broadcast_to_{node[0]}_{node[1]}")
+            return
+        # Network errors - log but don't fail broadcast
+        if self._error_handler:
+            await self.handle_error(self._make_network_error(error, node, "Broadcast"))
 
     async def _send_to_addr(
         self,
@@ -6281,9 +7103,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Returns True on success, False on failure.
         """
-        if timeout is None:
-            base_timeout = await self._context.read("current_timeout")
-            timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        timeout = await self._resolve_send_timeout(timeout)
 
         try:
             await self.send(target, message, timeout=timeout)
@@ -6291,12 +7111,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except asyncio.TimeoutError:
             await self.handle_error(ProbeTimeoutError(target, timeout))
             return False
-        except OSError as e:
-            await self.handle_error(self._make_network_error(e, target, "Send"))
-            return False
         except Exception as e:
-            await self.handle_exception(e, f"send_to_{target[0]}_{target[1]}")
+            # OSError (a network failure) included.
+            await self._report_send_error(e, target, "Send", f"send_to_{target[0]}_{target[1]}")
             return False
+
+    async def _resolve_send_timeout(self, timeout: float | None) -> float:
+        """Return ``timeout``, or the LHM-adjusted current timeout when none was given."""
+        if timeout is None:
+            base_timeout = await self._context.read("current_timeout")
+            timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        return timeout
 
     async def _send_probe_and_wait(self, target: tuple[str, int]) -> bool:
         """
@@ -6312,16 +7137,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
         try:
-            existing_future = self._pending_probe_acks.pop(target, None)
-            if existing_future and not existing_future.done():
-                existing_future.cancel()
-
-            ack_future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
-            self._pending_probe_acks[target] = ack_future
-            self._pending_probe_start[target] = self._clock.monotonic()
-            request_id = self._build_direct_probe_request_id()
-            self._pending_probe_request_ids[target] = request_id
-            msg = self._build_direct_probe_message(target, request_id)
+            ack_future, msg = self._register_exclusive_probe(target)
 
             await self.send(target, msg, timeout=timeout)
             await self._clock.wait_for(ack_future, timeout=timeout)
@@ -6330,16 +7146,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except asyncio.TimeoutError:
             await self.handle_error(ProbeTimeoutError(target, timeout))
             return False
-        except OSError as e:
-            await self.handle_error(self._make_network_error(e, target, "Probe"))
-            return False
         except Exception as e:
-            await self.handle_exception(e, f"probe_and_wait_{target[0]}_{target[1]}")
+            # OSError (a network failure) included.
+            await self._report_send_error(e, target, "Probe", f"probe_and_wait_{target[0]}_{target[1]}")
             return False
         finally:
-            self._pending_probe_acks.pop(target, None)
-            self._pending_probe_start.pop(target, None)
-            self._pending_probe_request_ids.pop(target, None)
+            self._forget_pending_probe(target)
+
+    def _register_exclusive_probe(
+        self,
+        target: tuple[str, int],
+    ) -> tuple[asyncio.Future[bool], bytes]:
+        """Replace any pending probe of ``target`` (cancelling it) with a fresh ack future; returns it and the message."""
+        existing_future = self._pending_probe_acks.pop(target, None)
+        if existing_future and not existing_future.done():
+            existing_future.cancel()
+
+        ack_future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        self._pending_probe_acks[target] = ack_future
+        self._pending_probe_start[target] = self._clock.monotonic()
+        request_id = self._build_direct_probe_request_id()
+        self._pending_probe_request_ids[target] = request_id
+        msg = self._build_direct_probe_message(target, request_id)
+        return ack_future, msg
 
     @udp.send("receive")
     async def send(
@@ -6399,10 +7228,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         addr_tuple: tuple[str, int] | None = None
         if isinstance(addr, bytes):
             try:
-                host, port_str = addr.decode().split(":", 1)
+                host, port_str = addr.decode().rsplit(":", 1)
                 addr_tuple = (host, int(port_str))
-            except (ValueError, UnicodeDecodeError):
-                pass
+            except (ValueError, UnicodeDecodeError) as address_error:
+                # The reply cannot be matched to its probe, which then
+                # times out: record why rather than blame the peer.
+                self._metrics.increment("malformed_source_address")
+                await self.handle_error(
+                    MalformedMessageError(
+                        data,
+                        f"Unparseable source address {addr!r}",
+                        cause=address_error,
+                    )
+                )
         elif isinstance(addr, tuple):
             addr_tuple = addr
 
@@ -6477,6 +7315,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     )
                 )
                 return b"nack>" + self._udp_addr_slug
+
+            # A message from a probed member is a heartbeat on its edge
+            # (AD-52 section 8 probe budgeting).
+            if (probe_budget := self._probe_budget) is not None:
+                probe_budget.record_message(addr, _t_entry)
 
             if data.startswith(b"leave"):
                 await self._udp_logger.log(

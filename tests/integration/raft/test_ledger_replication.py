@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.ledger.events.event_type import JobEventType
 from hyperscale.distributed.ledger.events.job_event import JobCreated
@@ -23,7 +24,6 @@ from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.ledger.wal.entry_state import WALEntryState
 from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
 from hyperscale.distributed.raft import LedgerReplicator
-from hyperscale.distributed.raft.models.commands import ledger_append_command
 from hyperscale.distributed.nodes.manager.raft_integration import ManagerRaftIntegration
 from hyperscale.distributed.raft.models import LedgerProposal
 from hyperscale.distributed.raft.raft_node import ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
@@ -46,6 +46,7 @@ class LedgerCluster:
 
     def __init__(self) -> None:
         self.addresses = [("127.0.0.1", 9000 + index) for index in range(3)]
+        self.cluster_members = {_member_id(addr): addr for addr in self.addresses}
         # One TaskRunner per member, as in production (each server owns one).
         self.task_runners = {addr: TaskRunner(0, Env()) for addr in self.addresses}
         self.unreachable: set[tuple[str, int]] = set()
@@ -61,17 +62,17 @@ class LedgerCluster:
                 may_lead=lambda: True,
                 ledger_replica=self.replicas[addr],
                 node_id=_member_id(addr),
-                job_manager=MagicMock(),
-                leadership_tracker=MagicMock(),
                 logger=logger,
                 task_runner=self.task_runners[addr],
                 send_tcp=self._send_tcp,
-                node_addr=addr,
                 configured_cluster_size=len(self.addresses),
+                # The in-memory transport answers or refuses at once.
+                request_timeout_seconds=0.0,
+                # Every member of the cluster, formed from the start.
+                cluster_members=lambda: self.cluster_members, storage=VolatileRaftStorage(),
             )
             self.replicators[addr] = LedgerReplicator(
                 consensus=self.integrations[addr].consensus,
-                build_command=ledger_append_command,
                 node_id=_member_id(addr),
                 send_tcp=self._send_tcp,
                 forward_method="raft_ledger_proposal",
@@ -97,14 +98,9 @@ class LedgerCluster:
 
     async def start(self) -> None:
         for addr, integration in self.integrations.items():
-            peers = [peer for peer in self.addresses if peer != addr]
-            integration.set_initial_membership(
-                {_member_id(peer) for peer in peers},
-                {_member_id(peer): peer for peer in peers},
-            )
             # As the job leadership announcement does on every member.
-            await integration.consensus.create_job_raft(JOB_ID)
-            integration.start()
+            await integration.consensus.create_job_raft(JOB_ID, frozenset(self.cluster_members))
+            await integration.start()
 
     async def stop(self) -> None:
         for integration in self.integrations.values():

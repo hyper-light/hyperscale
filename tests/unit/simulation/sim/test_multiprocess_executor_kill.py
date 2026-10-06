@@ -4,12 +4,15 @@ mid-workflow and watch the production recovery chain fire on virtual
 time.
 
 Same five-process topology as the dispatch scenario, plus one scheduled
-fault: executor ``executor-sim-wkr-9009`` dies at virtual 19.0 — after
-the workflow dispatch lands on the worker (18.75) and before it drains.
+fault: executor ``executor-sim-wkr-9009`` dies at virtual 5.0 — after
+the workflow dispatch lands on the worker (4.75) and before it drains
+(5.5). Re-probed 2026-10-04: dispatch was 18.75 while the lone manager
+waited out a full pre-vote and vote wait for a majority its own vote
+already made (Raft section 5.2: a candidate leads once it holds one).
 The kill is a real SIGKILL to a real OS process; the coordinator
 removes the victim from the route map (silence semantics) and surfaces
 ``(kill_time, process_id, exitcode)`` to the worker's exit-code
-snapshot at exactly 19.0.
+snapshot at exactly 5.0.
 
 From there every hop is unchanged production code: the worker's
 pool-health loop (0.25s cadence) observes the non-``None`` exitcode ->
@@ -31,6 +34,8 @@ from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
 )
 
 _CEILING = 60.0
+# Between the workflow's dispatch onto the worker and its drain.
+_KILL_AT = 5.0
 
 
 def _run_with_executor_kill() -> dict:
@@ -53,7 +58,7 @@ def _run_with_executor_kill() -> dict:
     coordinator.add_process(
         "client", dispatch_client_entry, "sim-cli", 9500, ("sim-mgr", 9000)
     )
-    coordinator.schedule_kill("executor-sim-wkr-9009", at_time=19.0)
+    coordinator.schedule_kill("executor-sim-wkr-9009", at_time=_KILL_AT)
     return coordinator.run()
 
 

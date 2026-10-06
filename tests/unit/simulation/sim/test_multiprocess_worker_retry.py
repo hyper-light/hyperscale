@@ -5,13 +5,15 @@ COMPLETES.
 
 Topology forces the story deterministically: worker-a is the only
 worker alive at submission, so the job provably dispatches to it
-(active on worker-a from ~11.75); at virtual 12.0 worker-a and both of
-its executor children are SIGKILLed (host death). Worker-b only begins
-its startup at 25.0 — fifteen virtual seconds of ZERO cluster capacity,
+(active on worker-a from ~7.5, re-probed 2026-10-04: ~11.75 while a lone
+manager waited out a full pre-vote and vote wait for a majority its own
+vote already made); at virtual 7.75 worker-a and both of its executor
+children are SIGKILLed (host death). Worker-b only begins its startup
+13s later — virtual seconds of ZERO cluster capacity,
 exactly the regime where the dispatcher used to busy-spin (13/N).
 Production machinery then recovers unaided: the workflow times out /
 its worker is declared dead, the retry requeues it, worker-b registers
-(~27) and signals capacity, the dispatcher wakes from its consumed-event
+(~2s after its start) and signals capacity, the dispatcher wakes from its consumed-event
 wait, re-dispatches, worker-b's executor pool runs the workflow, and
 the client's ``wait_for_job`` resolves ``completed``. Replay-identical.
 """
@@ -26,8 +28,8 @@ from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
 )
 
 _CEILING = 90.0
-_KILL_AT = 12.0
-_WORKER_B_START = 25.0
+_KILL_AT = 7.75
+_WORKER_B_START = _KILL_AT + 13.0
 
 
 def _run_with_retry() -> dict:

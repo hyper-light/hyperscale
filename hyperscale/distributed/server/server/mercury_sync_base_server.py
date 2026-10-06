@@ -1,12 +1,18 @@
 import asyncio
 import inspect
+import itertools
 import secrets
 import socket
 import ssl
 import traceback
+
+try:
+    import resource
+except ImportError:
+    # Windows reports no per-process descriptor limit: no cap.
+    resource = None
 from collections import defaultdict, deque
 from typing import (
-    Any,
     Coroutine,
     Deque,
     Dict,
@@ -15,7 +21,6 @@ from typing import (
     Union,
     Callable,
     Awaitable,
-    TypeVar,
     get_type_hints,
     Literal,
     get_args,
@@ -27,6 +32,8 @@ import zstandard
 
 from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
 from hyperscale.distributed.server.context import Context, T
+from hyperscale.distributed.discovery.dns.negative_cache import NegativeCache
+from hyperscale.distributed.discovery.dns.resolver import AsyncDNSResolver, DNSError
 from hyperscale.distributed.env import Env, TimeParser
 from hyperscale.distributed.encryption import AESGCMFernet
 from hyperscale.distributed.models import (
@@ -42,6 +49,9 @@ from hyperscale.distributed.runtime import (
     TransportFactory,
 )
 
+from hyperscale.distributed.server.server.host_address_resolver import (
+    HostAddressResolver,
+)
 from hyperscale.distributed.server.protocol import (
     MercurySyncTCPProtocol,
     MercurySyncUDPProtocol,
@@ -58,6 +68,7 @@ from hyperscale.distributed.server.protocol import (
     _classify_handler_to_priority,
 )
 from hyperscale.distributed.server.protocol.security import MessageSizeError
+from hyperscale.distributed.server.protocol.server_state import ServerState
 from hyperscale.distributed.reliability import ServerRateLimiter
 from hyperscale.distributed.reliability.load_shedding import (
     classify_handler_to_priority,
@@ -82,21 +93,18 @@ from hyperscale.logging.hyperscale_logging_models import (
     SilentDropStats,
 )
 from hyperscale.core.jobs.tasks.cancel import cancel
+import traceback as _traceback
 
 
 do_patch()
 
-D = TypeVar("D", bound=msgspec.Struct)
-R = TypeVar("R", bound=msgspec.Struct)
 
+# A TCP/UDP hook as the server invokes it: the sender's address, the
+# request payload and the request's logical clock in; the reply (a
+# ``Message`` is serialized before it is framed) out.
 Handler = Callable[
-    [
-        tuple[str, int],
-        bytes | msgspec.Struct,
-        int,
-        asyncio.Transport,  # AD-28: Transport for certificate extraction
-    ],
-    Awaitable[tuple[bytes, msgspec.Struct | bytes],],
+    [tuple[str, int], bytes | Message, int],
+    Awaitable[bytes | Message],
 ]
 
 
@@ -131,6 +139,27 @@ class MercurySyncBaseServer(Generic[T]):
         # routes those sites through the in-process transport registry
         # with no real sockets. See ``runtime/transport_factory.py``.
         self._transport_factory: TransportFactory | None = transport_factory
+        # An OS datagram socket sends to an IP, so in REAL mode a peer
+        # addressed by DNS name (a Kubernetes pod's stable name) is
+        # resolved first; SIM's transport routes by the address itself.
+        self._host_address_resolver: HostAddressResolver | None = (
+            None
+            if transport_factory is not None
+            else HostAddressResolver(
+                AsyncDNSResolver(
+                    default_ttl_seconds=env.MERCURY_SYNC_HOST_RESOLUTION_TTL,
+                    resolution_timeout_seconds=env.MERCURY_SYNC_HOST_RESOLUTION_TIMEOUT,
+                    # A name that does not resolve yet (a peer pod still
+                    # starting, or restarting) is retried after the same
+                    # TTL DNS gives its NXDOMAIN answer, never backed off:
+                    # the peer is reachable the moment its record exists.
+                    negative_cache=NegativeCache(
+                        base_ttl_seconds=env.MERCURY_SYNC_HOST_RESOLUTION_TTL,
+                        max_ttl_seconds=env.MERCURY_SYNC_HOST_RESOLUTION_TTL,
+                    ),
+                )
+            )
+        )
         self._tcp_clock = LamportClock()
         self._udp_clock = LamportClock()
 
@@ -171,13 +200,6 @@ class MercurySyncBaseServer(Generic[T]):
         self._tcp_events: Dict[str, Coroutine] = {}
         self._udp_events: Dict[str, Coroutine] = {}
 
-        self._tcp_queue: Dict[str, Deque[Tuple[str, int, float, Any]]] = defaultdict(
-            deque
-        )
-        self._udp_queue: Dict[str, Deque[Tuple[str, int, float, Any]]] = defaultdict(
-            deque
-        )
-
         self._tcp_connected = False
         self._udp_connected = False
 
@@ -193,23 +215,48 @@ class MercurySyncBaseServer(Generic[T]):
         # Message queue size limits for backpressure
         self._message_queue_max_size = env.MESSAGE_QUEUE_MAX_SIZE
 
-        # Use bounded queues to prevent memory exhaustion under load
-        # When queue is full, put_nowait() will raise QueueFull and message will be dropped
-        self._tcp_client_data: dict[bytes, dict[bytes, asyncio.Queue[bytes]]] = (
-            defaultdict(
-                lambda: defaultdict(
-                    lambda: asyncio.Queue(maxsize=self._message_queue_max_size)
-                )
+        # In-flight TCP requests by request id. A reply echoes its
+        # request's id and resolves exactly that request -- whatever address
+        # the request was dialed at (a Service, a forwarded port), and never
+        # a later request after this one gave up.
+        self._tcp_request_waiters: dict[
+            int, asyncio.Future[tuple[bytes | Exception, int]]
+        ] = {}
+        self._tcp_request_ids = itertools.count(1)
+        # Requests waiting on each client transport, and the transports
+        # retired from new requests (an invalidated address, a failed
+        # request) that close once no request waits on them: a retired
+        # transport still carries the replies to the requests sent on it.
+        self._tcp_transport_requests: dict[asyncio.Transport, set[int]] = {}
+        self._retired_tcp_client_transports: set[asyncio.Transport] = set()
+        # Every connection this node's TCP server accepted, and their cap:
+        # abort and shutdown close them -- a listener's close leaves them
+        # open, still answering for this node (asyncio's own
+        # ``Server.abort_clients`` exists from Python 3.13 only).
+        maximum_accepted_connections = env.MERCURY_SYNC_MAX_ACCEPTED_TCP_CONNECTIONS
+        if maximum_accepted_connections <= 0 and resource is not None:
+            descriptor_soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if descriptor_soft_limit != resource.RLIM_INFINITY:
+                maximum_accepted_connections = descriptor_soft_limit // 2
+        self._tcp_server_state = ServerState[MercurySyncTCPProtocol](
+            max_connections=(
+                maximum_accepted_connections if maximum_accepted_connections > 0 else None
             )
         )
 
-        self._udp_client_data: dict[
-            bytes, dict[bytes, asyncio.Queue[bytes | Message | Exception]]
-        ] = defaultdict(
-            lambda: defaultdict(
-                lambda: asyncio.Queue(maxsize=self._message_queue_max_size)
-            )
-        )
+        # In-flight UDP requests by request id, as for TCP: a reply echoes
+        # its request's id and resolves exactly that request. A reply that
+        # arrives after its request gave up finds no waiter and is dropped
+        # -- it is never handed to the next request to the same peer -- and
+        # nothing is kept per peer once its requests settle.
+        self._udp_request_waiters: dict[
+            int, asyncio.Future[tuple[bytes | Message | Exception, int]]
+        ] = {}
+        self._udp_request_ids = itertools.count(1)
+        self._udp_datagram_processors = {
+            b"c": self.process_udp_server_request,
+            b"s": self.process_udp_client_response,
+        }
 
         self._pending_tcp_server_responses: Deque[asyncio.Task] = deque()
         self._pending_udp_server_responses: Deque[asyncio.Task] = deque()
@@ -226,7 +273,6 @@ class MercurySyncBaseServer(Generic[T]):
         self._client_tcp_ssl_context: Union[ssl.SSLContext, None] = None
         self._server_tcp_ssl_context: Union[ssl.SSLContext, None] = None
 
-        self._udp_ssl_context: Union[ssl.SSLContext, None] = None
 
         self._encryptor = AESGCMFernet(env)
 
@@ -258,6 +304,15 @@ class MercurySyncBaseServer(Generic[T]):
 
         self._tcp_semaphore: asyncio.Semaphore | None = None
         self._udp_semaphore: asyncio.Semaphore | None = None
+        # AD-32: per destination, the TCP requests it may hold at once, and
+        # how many requests are using its bound -- dropped when the last
+        # one settles, so only destinations with requests outstanding are
+        # tracked. A destination that stops answering fills its own bound,
+        # never the node's: requests queued behind it hold no node-wide
+        # slot.
+        self._tcp_destination_slots: dict[tuple[str, int], asyncio.Semaphore] = {}
+        self._tcp_destination_requests: dict[tuple[str, int], int] = {}
+        self._max_requests_per_destination = env.OUTGOING_QUEUE_SIZE
 
         self._compressor: zstandard.ZstdCompressor | None = None
         self._decompressor: zstandard.ZstdDecompressor | None = None
@@ -401,7 +456,9 @@ class MercurySyncBaseServer(Generic[T]):
                     )
                 )
             except Exception:
-                pass  # Best effort logging - don't fail on logging errors
+                # The logger itself failed: count the lost record where the
+                # next drop report shows it.
+                (self._udp_drop_counter if protocol == "udp" else self._tcp_drop_counter).log_write_failed += 1
 
     async def start_server(
         self,
@@ -559,8 +616,7 @@ class MercurySyncBaseServer(Generic[T]):
                 socket.SOL_SOCKET, socket.SO_RCVBUF
             )
             self._udp_actual_rcvbuf = actual_rcvbuf
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerError(
                     message=(
                         f"[UDP-RCVBUF] requested="
@@ -599,17 +655,11 @@ class MercurySyncBaseServer(Generic[T]):
 
             self._udp_connected = True
 
-        if (
-            self._udp_connected is False
-            and self._server_cert_path
-            and self._server_key_path
-        ):
-            self._udp_ssl_context = self._create_udp_ssl_context()
-
-            self._udp_server_socket = self._udp_ssl_context.wrap_socket(
-                self._udp_server_socket
-            )
-
+        # No TLS on the datagram socket: Python's ssl has no DTLS, and
+        # wrap_socket refuses anything but a stream socket -- the attempt,
+        # made whenever certificates were configured, raised
+        # NotImplementedError and the UDP server never started. Datagrams
+        # are authenticated at the message layer instead.
         if self._udp_connected is False:
             server = self._loop.create_datagram_endpoint(
                 lambda: MercurySyncUDPProtocol(self),
@@ -635,7 +685,9 @@ class MercurySyncBaseServer(Generic[T]):
             # transport via ``connection_made`` when a peer dials in.
             self._transport_factory.register_stream_server(
                 (self._host, self._tcp_port),
-                lambda: MercurySyncTCPProtocol(self, mode="server"),
+                lambda: MercurySyncTCPProtocol(
+                    self, mode="server", server_state=self._tcp_server_state
+                ),
             )
             self._tcp_connected = True
             return
@@ -682,7 +734,9 @@ class MercurySyncBaseServer(Generic[T]):
 
         if self._tcp_connected is False:
             server = await self._loop.create_server(
-                lambda: MercurySyncTCPProtocol(self, mode="server"),
+                lambda: MercurySyncTCPProtocol(
+                    self, mode="server", server_state=self._tcp_server_state
+                ),
                 sock=self._tcp_server_socket,
                 ssl=self._server_tcp_ssl_context,
                 backlog=self.env.MERCURY_SYNC_TCP_SERVER_BACKLOG,
@@ -691,9 +745,12 @@ class MercurySyncBaseServer(Generic[T]):
             self._tcp_server = server
             self._tcp_connected = True
             if self._tcp_server.sockets:
-                host, port = self._tcp_server.sockets[0].getsockname()[:2]
-                self._host = host
-                self._tcp_port = port
+                # The host stays the one this node was started with: it
+                # is the identity every frame, SWIM entry and NodeId
+                # carries, and peers address this node by it. A DNS name
+                # bound here would otherwise be replaced by its IP while
+                # the frames still declare the name.
+                self._tcp_port = self._tcp_server.sockets[0].getsockname()[1]
 
     def _close_startup_transports(self) -> None:
         """Close partially-started listeners after startup failure."""
@@ -718,38 +775,9 @@ class MercurySyncBaseServer(Generic[T]):
                 pass
             self._tcp_server_socket = None
 
-    def _create_udp_ssl_context(self) -> ssl.SSLContext:
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS)
-        ssl_ctx.options |= ssl.OP_NO_TLSv1
-        ssl_ctx.options |= ssl.OP_NO_TLSv1_1
-        ssl_ctx.options |= ssl.OP_SINGLE_DH_USE
-        ssl_ctx.options |= ssl.OP_SINGLE_ECDH_USE
-        ssl_ctx.load_cert_chain(self._server_cert_path, keyfile=self._server_key_path)
-        ssl_ctx.load_verify_locations(cafile=self._server_cert_path)
-        # Hostname verification: disabled by default for local testing,
-        # set MERCURY_SYNC_TLS_VERIFY_HOSTNAME=true in production
-        ssl_ctx.check_hostname = (
-            self.env.MERCURY_SYNC_TLS_VERIFY_HOSTNAME.lower() == "true"
-        )
-
-        match self._verify_cert:
-            case "REQUIRED":
-                ssl_ctx.verify_mode = ssl.VerifyMode.CERT_REQUIRED
-
-            case "OPTIONAL":
-                ssl_ctx.verify_mode = ssl.VerifyMode.CERT_OPTIONAL
-
-            case _:
-                ssl_ctx.verify_mode = ssl.VerifyMode.CERT_NONE
-
-        ssl_ctx.set_ciphers("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")
-
-        return ssl_ctx
-
     def _create_tcp_server_ssl_context(self) -> ssl.SSLContext:
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.options |= ssl.OP_NO_TLSv1
-        ssl_ctx.options |= ssl.OP_NO_TLSv1_1
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_ctx.options |= ssl.OP_SINGLE_DH_USE
         ssl_ctx.options |= ssl.OP_SINGLE_ECDH_USE
         ssl_ctx.load_cert_chain(self._server_cert_path, keyfile=self._server_key_path)
@@ -957,8 +985,7 @@ class MercurySyncBaseServer(Generic[T]):
 
     def _create_tcp_client_ssl_context(self) -> ssl.SSLContext:
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ssl_ctx.options |= ssl.OP_NO_TLSv1
-        ssl_ctx.options |= ssl.OP_NO_TLSv1_1
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_ctx.load_cert_chain(self._client_cert_path, keyfile=self._client_key_path)
         ssl_ctx.load_verify_locations(cafile=self._client_cert_path)
         # Hostname verification: disabled by default for local testing,
@@ -993,23 +1020,58 @@ class MercurySyncBaseServer(Generic[T]):
         answered, and the next send waits out its full timeout on it.
         Callers that learn the process at an address was replaced drop
         the transport here so the next send dials whoever listens now.
+        Requests already sent on it keep waiting for their replies -- the
+        process may never have been replaced -- and it closes once they
+        settle.
         """
-        if (cached := self._tcp_client_transports.pop(address, None)) is not None:
+        if (cached := self._tcp_client_transports.pop(address, None)) is None:
+            return
+
+        # Replies are matched by request id, so the requests already sent
+        # on it still get theirs from a live peer; closing it under them
+        # only lost those replies.
+        if self._tcp_transport_requests.get(cached):
+            self._retired_tcp_client_transports.add(cached)
+        else:
             cached.abort()
 
     async def send_tcp(
         self,
         address: tuple[str, int],
         action: str,
-        data: D,
+        data: bytes | Message,
         timeout: int | float | None = None,
-    ) -> tuple[R | Error, int]:
+    ) -> tuple[bytes | Exception, int]:
+        transport: asyncio.Transport | None = None
+        if timeout is None:
+            timeout = self._request_timeout
+        # One deadline for the whole request: its waits for slots, its dial
+        # and its reply (the dial and the reply each used to get all of it).
+        deadline = self._clock.monotonic() + timeout
+        if (destination_slots := self._tcp_destination_slots.get(address)) is None:
+            destination_slots = self._tcp_destination_slots[address] = asyncio.Semaphore(
+                self._max_requests_per_destination
+            )
+        self._tcp_destination_requests[address] = self._tcp_destination_requests.get(address, 0) + 1
+        holds_destination_slot = False
         try:
-            if timeout is None:
-                timeout = self._request_timeout
-
-            async with self._tcp_semaphore:
-                transport: asyncio.Transport = self._tcp_client_transports.get(address)
+            # The destination's own bound first: a request waiting on a
+            # destination that stopped answering holds no node-wide slot.
+            # A free slot is taken at once; only a request that must queue
+            # waits -- within its deadline.
+            if destination_slots.locked():
+                await self._clock.wait_for(destination_slots.acquire(), timeout=timeout)
+            else:
+                await destination_slots.acquire()
+            holds_destination_slot = True
+            if self._tcp_semaphore.locked():
+                await self._clock.wait_for(
+                    self._tcp_semaphore.acquire(), timeout=max(0.0, deadline - self._clock.monotonic())
+                )
+            else:
+                await self._tcp_semaphore.acquire()
+            try:
+                transport = self._tcp_client_transports.get(address)
                 if transport is None or transport.is_closing():
                     # The dial must sit INSIDE the request timeout: a
                     # down/unroutable peer otherwise hangs the connect
@@ -1019,7 +1081,7 @@ class MercurySyncBaseServer(Generic[T]):
                     # in REAL mode it waits on the OS connect timeout.)
                     transport = await self._clock.wait_for(
                         self._connect_tcp_client(address),
-                        timeout=timeout,
+                        timeout=max(0.0, deadline - self._clock.monotonic()),
                     )
                     self._tcp_client_transports[address] = transport
 
@@ -1030,107 +1092,86 @@ class MercurySyncBaseServer(Generic[T]):
                 if isinstance(data, Message):
                     data = data.dump()
 
-                # Build the message payload with length-prefixed data to avoid delimiter issues
-                # Format: address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+                # An id unique among this node's requests (wrapping at 8
+                # bytes); the reply echoes it, and it is all the reply is
+                # matched on.
+                request_id = next(self._tcp_request_ids) & 0xFFFFFFFFFFFFFFFF
+
+                # Message payload with length-prefixed data to avoid delimiter issues
+                # Format: address<handler<clock(64 bytes)request_id(8 bytes)data_len(4 bytes)data(N bytes)
                 # Clock comes before data so all fixed-size fields are parsed first
-                data_len = len(data).to_bytes(4, "big")
                 payload = (
                     self._tcp_addr_slug
                     + b"<"
                     + encoded_action
                     + b"<"
                     + clock.to_bytes(64)
-                    + data_len
+                    + request_id.to_bytes(8, "big")
+                    + len(data).to_bytes(4, "big")
                     + data
                 )
 
                 # Compress and encrypt
                 encrypted = self._encryptor.encrypt(self._compressor.compress(payload))
 
-                # Frame with length prefix for proper TCP stream handling
-                transport.write(frame_message(encrypted))
+                reply = asyncio.get_running_loop().create_future()
+                self._tcp_request_waiters[request_id] = reply
+                if (pending_requests := self._tcp_transport_requests.get(transport)) is None:
+                    pending_requests = self._tcp_transport_requests[transport] = set()
+                pending_requests.add(request_id)
+                try:
+                    # Frame with length prefix for proper TCP stream handling
+                    transport.write(frame_message(encrypted))
+                    return await self._clock.wait_for(
+                        reply, timeout=max(0.0, deadline - self._clock.monotonic())
+                    )
 
-                host, port = address
-
-                target = f"{host}:{port}".encode()
-
-                return await self._clock.wait_for(
-                    self._tcp_client_data[target][encoded_action].get(),
-                    timeout=timeout,
-                )
+                finally:
+                    self._tcp_request_waiters.pop(request_id, None)
+                    # This request has settled (answered, timed out, or
+                    # cancelled); a retired transport closes with its last.
+                    pending_requests.discard(request_id)
+                    if not pending_requests:
+                        self._tcp_transport_requests.pop(transport, None)
+                        if transport in self._retired_tcp_client_transports:
+                            self._retired_tcp_client_transports.discard(transport)
+                            transport.abort()
+            finally:
+                self._tcp_semaphore.release()
 
         except Exception as error:
-            transport = self._tcp_client_transports.get(address)
-            if transport and not transport.is_closing():
-                transport.close()
+            # New requests stop using the connection this one failed on,
+            # while the requests still waiting on it keep their replies: it
+            # closes once they settle. A newer connection to the address
+            # is not this request's to close.
+            if transport is not None and self._tcp_client_transports.get(address) is transport:
+                del self._tcp_client_transports[address]
+                if self._tcp_transport_requests.get(transport):
+                    self._retired_tcp_client_transports.add(transport)
+                else:
+                    transport.abort()
 
             return (
                 error,
                 self._tcp_clock.time,
             )
 
-    async def broadcast_tcp(
-        self,
-        data: D,
-        max_nodes: int | None = None,
-        selection_method: Literal["all", "random", "subset"] = "subset",
-        timeout: int | float | None = None,
-    ):
-        nodes = list(self._tcp_client_transports.keys())
-        node_max = len(nodes)
-
-        if max_nodes is None:
-            max_nodes = max(1, node_max / 2)
-
-        match selection_method:
-            case "random":
-                selection = [nodes[self._random.randrange(0, node_max)]]
-
-            case "subset":
-                selection = self._random.choices(nodes, k=max_nodes)
-
-            case "all":
-                selection = nodes
-
-        # INPUT-ORDER partition (determinism): ``as_completed`` yields
-        # via an id()-hashed done-callback set, so two sends completing
-        # on one loop iteration tie-break by Task address — permuting
-        # the results/errors lists across otherwise identical runs.
-        # ``gather`` preserves input order and loses nothing: callers
-        # consume the aggregate, not arrival order.
-        errors: list[Exception] = []
-        results: list[R] = []
-
-        outcomes = await asyncio.gather(
-            *[
-                self.send_tcp(
-                    addr,
-                    data,
-                    timeout=timeout,
-                )
-                for addr in selection
-            ],
-            return_exceptions=True,
-        )
-        for result in outcomes:
-            if isinstance(result, (Error, Exception)):
-                errors.append(result)
-
+        finally:
+            if holds_destination_slot:
+                destination_slots.release()
+            if (remaining_requests := self._tcp_destination_requests[address] - 1) == 0:
+                del self._tcp_destination_requests[address]
+                del self._tcp_destination_slots[address]
             else:
-                results.append(result)
-
-        return (
-            results,
-            errors,
-        )
+                self._tcp_destination_requests[address] = remaining_requests
 
     async def send_udp(
         self,
         address: tuple[str, int],
         action: str,
-        data: D,
+        data: bytes | Message,
         timeout: int | float | None = None,
-    ) -> tuple[R | Exception, int]:
+    ) -> tuple[bytes | Exception, int]:
         try:
             if timeout is None:
                 timeout = self._request_timeout
@@ -1144,8 +1185,9 @@ class MercurySyncBaseServer(Generic[T]):
                     data = data.dump()
 
                 # UDP message with length-prefixed data to avoid delimiter issues
-                # Format: type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+                # Format: type<address<handler<clock(64 bytes)request_id(8 bytes)data_len(4 bytes)data(N bytes)
                 data_len = len(data).to_bytes(4, "big")
+                request_id = next(self._udp_request_ids) & 0xFFFFFFFFFFFFFFFF
                 if not isinstance(address, tuple):
                     # asyncio's ``sendto`` raises a TypeError that's
                     # swallowed by the transport's internal
@@ -1163,7 +1205,6 @@ class MercurySyncBaseServer(Generic[T]):
                     # strings instead of writing to stderr, so we can
                     # include the trace inside the log payload without
                     # touching stderr from the event loop.
-                    import traceback as _traceback
                     stack_str = "".join(_traceback.format_stack())
                     await self._udp_logger.log(
                         ServerError(
@@ -1183,91 +1224,41 @@ class MercurySyncBaseServer(Generic[T]):
                         f"send_udp address must be tuple[str, int], "
                         f"got {type(address).__name__}: {address!r}"
                     )
-                self._udp_transport.sendto(
-                    self._encryptor.encrypt(
-                        self._compressor.compress(
-                            b"c<"
-                            + self._udp_addr_slug
-                            + b"<"
-                            + encoded_action
-                            + b"<"
-                            + clock.to_bytes(64)
-                            + data_len
-                            + data,
-                        )
-                    ),
-                    address,
+                destination = (
+                    address
+                    if self._host_address_resolver is None
+                    else await self._host_address_resolver.resolve(address)
                 )
-
-                host, port = address
-
-                target = f"{host}:{port}".encode()
-
-                return await self._clock.wait_for(
-                    self._udp_client_data[target][encoded_action].get(),
-                    timeout=timeout,
-                )
+                reply = asyncio.get_running_loop().create_future()
+                self._udp_request_waiters[request_id] = reply
+                try:
+                    self._udp_transport.sendto(
+                        self._encryptor.encrypt(
+                            self._compressor.compress(
+                                b"c<"
+                                + self._udp_addr_slug
+                                + b"<"
+                                + encoded_action
+                                + b"<"
+                                + clock.to_bytes(64)
+                                + request_id.to_bytes(8, "big")
+                                + data_len
+                                + data,
+                            )
+                        ),
+                        destination,
+                    )
+                    return await self._clock.wait_for(reply, timeout=timeout)
+                finally:
+                    # Answered, timed out or cancelled: a later reply to it
+                    # is dropped.
+                    self._udp_request_waiters.pop(request_id, None)
 
         except Exception as error:
             return (
                 error,
                 self._udp_clock.time,
             )
-
-    async def broadcast_udp(
-        self,
-        data: D,
-        max_nodes: int | None = None,
-        selection_method: Literal["all", "random", "subset"] = "subset",
-        timeout: int | float | None = None,
-    ):
-        nodes = list(self._tcp_client_transports.keys())
-        node_max = len(nodes)
-
-        if max_nodes is None:
-            max_nodes = max(1, node_max / 2)
-
-        match selection_method:
-            case "random":
-                selection = [nodes[self._random.randrange(0, node_max)]]
-
-            case "subset":
-                selection = self._random.choices(nodes, k=max_nodes)
-
-            case "all":
-                selection = nodes
-
-        # INPUT-ORDER partition (determinism): ``as_completed`` yields
-        # via an id()-hashed done-callback set, so two sends completing
-        # on one loop iteration tie-break by Task address — permuting
-        # the results/errors lists across otherwise identical runs.
-        # ``gather`` preserves input order and loses nothing: callers
-        # consume the aggregate, not arrival order.
-        errors: list[Exception] = []
-        results: list[R] = []
-
-        outcomes = await asyncio.gather(
-            *[
-                self.send_udp(
-                    addr,
-                    data,
-                    timeout=timeout,
-                )
-                for addr in selection
-            ],
-            return_exceptions=True,
-        )
-        for result in outcomes:
-            if isinstance(result, (Error, Exception)):
-                errors.append(result)
-
-            else:
-                results.append(result)
-
-        return (
-            results,
-            errors,
-        )
 
     async def connect_tcp_client(
         self,
@@ -1333,13 +1324,18 @@ class MercurySyncBaseServer(Generic[T]):
         priority: MessagePriority,
     ) -> None:
         """Done callback for TCP response tasks - release slot and cleanup."""
-        # Retrieve exception to prevent memory leak
-        try:
-            task.exception()
-        except (asyncio.CancelledError, asyncio.InvalidStateError):
-            pass
-        except Exception:
-            pass  # Logged elsewhere
+        # A handler's own errors become error replies inside it; one that
+        # escaped it is a bug, reported here rather than dropped.
+        if not task.cancelled() and (escaped_error := task.exception()) is not None:
+            self._task_runner.run(
+                self._tcp_logger.log,
+                ServerError(
+                    message=f"TCP response task raised: {escaped_error!r}",
+                    node_id=str(self._tcp_port),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                ),
+            )
 
         # Release the priority slot
         self._tcp_in_flight_tracker.release(priority)
@@ -1480,19 +1476,38 @@ class MercurySyncBaseServer(Generic[T]):
         admission_group: str | None = None,
     ) -> None:
         """Done callback for UDP response tasks - release slot and cleanup."""
-        # Retrieve exception to prevent memory leak
-        try:
-            task.exception()
-        except (asyncio.CancelledError, asyncio.InvalidStateError):
-            pass
-        except Exception:
-            pass  # Logged elsewhere
+        # A handler's own errors become error replies inside it; one that
+        # escaped it is a bug, reported here rather than dropped.
+        if not task.cancelled() and (escaped_error := task.exception()) is not None:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"UDP response task raised: {escaped_error!r}",
+                    node_id=str(self._udp_port),
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                ),
+            )
 
         # Release the priority slot
         self._udp_in_flight_tracker.release(
             priority,
             admission_group=admission_group,
         )
+
+    def lose_client_tcp(self, transport: asyncio.Transport) -> None:
+        """A connection this node dialed closed: the requests waiting on
+        it can get no reply, so each fails now rather than at its timeout
+        (a peer that crashed mid-request held its caller the whole
+        timeout)."""
+        for request_id in self._tcp_transport_requests.get(transport, ()):
+            if (waiter := self._tcp_request_waiters.get(request_id)) is not None and not waiter.done():
+                waiter.set_exception(
+                    ConnectionResetError(
+                        f"connection to {transport.get_extra_info('peername')} "
+                        "closed before the reply"
+                    )
+                )
 
     def read_client_tcp(
         self,
@@ -1627,14 +1642,12 @@ class MercurySyncBaseServer(Generic[T]):
                 return
 
             # Parse length-prefixed UDP message format:
-            # type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+            # type<address<handler<clock(64 bytes)request_id(8 bytes)data_len(4 bytes)data(N bytes)
             request_type, addr, handler_name, rest = decrypted.split(b"<", maxsplit=3)
-            # Extract clock (first 64 bytes)
             clock_time = int.from_bytes(rest[:64])
-            # Extract data length (next 4 bytes)
-            data_len = int.from_bytes(rest[64:68], "big")
-            # Extract payload (remaining bytes)
-            payload = rest[68 : 68 + data_len]
+            request_id = int.from_bytes(rest[64:72], "big")
+            data_len = int.from_bytes(rest[72:76], "big")
+            payload = rest[76 : 76 + data_len]
 
             # Classify priority from explicit hook metadata first, then
             # fall back to AD-37 handler-name classification. SWIM uses
@@ -1652,32 +1665,21 @@ class MercurySyncBaseServer(Generic[T]):
                 except UnicodeDecodeError:
                     handler_priority = MessagePriority.NORMAL
 
-            match request_type:
-                case b"c":
-                    self._spawn_udp_response(
-                        self.process_udp_server_request(
-                            handler_name,
-                            addr,
-                            payload,
-                            clock_time,
-                            transport,
-                        ),
-                        priority=handler_priority,
-                        admission_group=admission_group,
-                    )
-
-                case b"s":
-                    self._spawn_udp_response(
-                        self.process_udp_client_response(
-                            handler_name,
-                            addr,
-                            payload,
-                            clock_time,
-                            transport,
-                        ),
-                        priority=handler_priority,
-                        admission_group=admission_group,
-                    )
+            # A request (``c``) or a reply (``s``); anything else, though
+            # authenticated, is counted malformed (the except below).
+            process_datagram = self._udp_datagram_processors[request_type]
+            self._spawn_udp_response(
+                process_datagram(
+                    handler_name,
+                    addr,
+                    payload,
+                    clock_time,
+                    request_id,
+                    transport,
+                ),
+                priority=handler_priority,
+                admission_group=admission_group,
+            )
 
         except Exception as err:
             self._udp_drop_counter.increment_malformed_message()
@@ -1718,15 +1720,27 @@ class MercurySyncBaseServer(Generic[T]):
             return
 
         # Parse length-prefixed message format:
-        # address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
-        address_bytes, handler_name, rest = decrypted.split(b"<", maxsplit=2)
+        # address<handler<clock(64 bytes)request_id(8 bytes)data_len(4 bytes)data(N bytes)
+        # A reply missing its separators names no request: it is dropped
+        # here rather than escaping this task as a ValueError.
+        try:
+            address_bytes, handler_name, rest = decrypted.split(b"<", maxsplit=2)
+        except ValueError:
+            self._tcp_drop_counter.increment_malformed_message()
+            await self._log_security_warning(
+                "TCP client response malformed: missing address or handler separator",
+                protocol="tcp",
+            )
+            return
 
         # Extract clock (first 64 bytes)
         clock_time = int.from_bytes(rest[:64])
+        # Extract the id of the request this replies to (next 8 bytes)
+        request_id = int.from_bytes(rest[64:72], "big")
         # Extract data length (next 4 bytes)
-        data_len = int.from_bytes(rest[64:68], "big")
+        data_len = int.from_bytes(rest[72:76], "big")
         # Extract payload (remaining bytes)
-        payload = rest[68 : 68 + data_len]
+        payload = rest[76 : 76 + data_len]
 
         await self._udp_clock.ack(clock_time)
 
@@ -1739,22 +1753,13 @@ class MercurySyncBaseServer(Generic[T]):
             )
             return
 
+        # The reply goes to the request waiting on its id. A reply whose
+        # request already gave up (timed out or was cancelled) has no
+        # waiter and is dropped: it is never handed to a later request.
         try:
 
             self._tcp_client_response_transports[addr] = transport
-            if request_model := self.tcp_server_request_models.get(handler_name):
-                payload = request_model.load(payload)
-
-                # Validate response for replay attacks if it's a Message instance
-                if isinstance(payload, Message):
-                    try:
-                        self._replay_guard.validate_with_incarnation(
-                            payload.message_id,
-                            payload.sender_incarnation,
-                        )
-                    except ReplayError:
-                        self._tcp_drop_counter.increment_replay_detected()
-                        return
+            payload = self._load_tcp_reply_payload(handler_name, payload)
 
             handler = self.tcp_client_handler.get(handler_name)
             if handler:
@@ -1764,21 +1769,29 @@ class MercurySyncBaseServer(Generic[T]):
                     clock_time,
                 )
 
-            self._tcp_client_data[address_bytes][handler_name].put_nowait(
-                (payload, clock_time)
-            )
+            waiter = self._tcp_request_waiters.pop(request_id, None)
+            if waiter is not None and not waiter.done():
+                waiter.set_result((payload, clock_time))
 
-        except asyncio.QueueFull:
-            self._tcp_drop_counter.increment_load_shed()
+        except ReplayError:
+            self._tcp_drop_counter.increment_replay_detected()
 
         except Exception as err:
-            try:
-                self._tcp_client_data[address_bytes][handler_name].put_nowait(
-                    (err, clock_time)
-                )
+            waiter = self._tcp_request_waiters.pop(request_id, None)
+            if waiter is not None and not waiter.done():
+                waiter.set_result((err, clock_time))
 
-            except asyncio.QueueFull:
-                self._tcp_drop_counter.increment_load_shed()
+    def _load_tcp_reply_payload(self, handler_name: bytes, payload: bytes) -> bytes | Message:
+        """A TCP reply's payload as its handler's model, when it has one; a
+        ``Message`` is checked against replay first (``ReplayError``)."""
+        if request_model := self.tcp_server_request_models.get(handler_name):
+            payload = request_model.load(payload)
+            if isinstance(payload, Message):
+                self._replay_guard.validate_with_incarnation(
+                    payload.message_id,
+                    payload.sender_incarnation,
+                )
+        return payload
 
     async def _admit_tcp_request(
         self,
@@ -1807,11 +1820,12 @@ class MercurySyncBaseServer(Generic[T]):
         transport: asyncio.Transport,
         handler_name: bytes,
         clock_time: int,
+        request_id: int,
         response: bytes,
     ) -> None:
-        """Frame and write a response correlated to ``handler_name``.
+        """Frame and write the response to request ``request_id``.
 
-        Format: address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes),
+        Format: address<handler<clock(64 bytes)request_id(8 bytes)data_len(4 bytes)data(N bytes),
         compressed, encrypted, and length-prefixed for the TCP stream.
         """
         response_payload = self._encryptor.encrypt(
@@ -1821,6 +1835,7 @@ class MercurySyncBaseServer(Generic[T]):
                 + handler_name
                 + b"<"
                 + clock_time.to_bytes(64)
+                + request_id.to_bytes(8, "big")
                 + len(response).to_bytes(4, "big")
                 + response,
             )
@@ -1835,6 +1850,9 @@ class MercurySyncBaseServer(Generic[T]):
         # Get client address for rate limiting
         peername = transport.get_extra_info("peername")
         handler_name = b""
+        # No request matches id 0: an error reply sent before the request
+        # could be parsed reaches no waiter.
+        request_id = 0
 
         try:
             # Message size validation
@@ -1861,15 +1879,17 @@ class MercurySyncBaseServer(Generic[T]):
                 return
 
             # Parse length-prefixed message format:
-            # address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+            # address<handler<clock(64 bytes)request_id(8 bytes)data_len(4 bytes)data(N bytes)
             address_bytes, handler_name, rest = decrypted.split(b"<", maxsplit=2)
 
             # Extract clock (first 64 bytes)
             clock_time = int.from_bytes(rest[:64])
+            # Extract the request's id, which its reply echoes (next 8 bytes)
+            request_id = int.from_bytes(rest[64:72], "big")
             # Extract data length (next 4 bytes)
-            data_len = int.from_bytes(rest[64:68], "big")
+            data_len = int.from_bytes(rest[72:76], "big")
             # Extract payload (remaining bytes)
-            payload = rest[68 : 68 + data_len]
+            payload = rest[76 : 76 + data_len]
 
             next_time = await self._tcp_clock.update(clock_time)
 
@@ -1879,7 +1899,13 @@ class MercurySyncBaseServer(Generic[T]):
                 # Answer instead of dropping: a silent drop left the sender
                 # to time out, and its timeout closes the connection it
                 # shares with every other in-flight request to this node.
-                self._write_tcp_response(transport, handler_name, next_time, rate_limited.dump())
+                self._write_tcp_response(
+                    transport,
+                    handler_name,
+                    next_time,
+                    request_id,
+                    rate_limited.dump(),
+                )
                 return
 
             try:
@@ -1934,7 +1960,7 @@ class MercurySyncBaseServer(Generic[T]):
             if handler_name == b"":
                 handler_name = b"error"
 
-            self._write_tcp_response(transport, handler_name, next_time, response)
+            self._write_tcp_response(transport, handler_name, next_time, request_id, response)
 
         except Exception as e:
             self._tcp_drop_counter.increment_malformed_message()
@@ -1955,14 +1981,20 @@ class MercurySyncBaseServer(Generic[T]):
                         + handler_name
                         + b"<"
                         + error_time.to_bytes(64)
+                        + request_id.to_bytes(8, "big")
                         + error_len
                         + error_msg,
                     )
                 )
                 # Frame with length prefix for proper TCP stream handling
                 transport.write(frame_message(error_response))
-            except Exception:
-                pass  # Best effort error response
+            except Exception as reply_error:
+                # The sender waits out its timeout: say why it got no answer.
+                await self._log_security_warning(
+                    f"TCP error reply for {handler_name!r} failed: "
+                    f"{type(reply_error).__name__}: {reply_error}",
+                    protocol="tcp",
+                )
 
     async def process_udp_server_request(
         self,
@@ -1970,6 +2002,7 @@ class MercurySyncBaseServer(Generic[T]):
         addr: bytes,
         payload: bytes,
         clock_time: int,
+        request_id: int,
         transport: asyncio.DatagramTransport,
     ):
         if handler_name == b"receive":
@@ -2062,8 +2095,8 @@ class MercurySyncBaseServer(Generic[T]):
             if not self._running:
                 return
 
-            # UDP response with clock before length-prefixed data
-            # Format: type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+            # UDP response with clock and the request's id before length-prefixed data
+            # Format: type<address<handler<clock(64 bytes)request_id(8 bytes)data_len(4 bytes)data(N bytes)
             response_len = len(response).to_bytes(4, "big")
             response_payload = self._encryptor.encrypt(
                 self._compressor.compress(
@@ -2073,12 +2106,20 @@ class MercurySyncBaseServer(Generic[T]):
                     + handler_name
                     + b"<"
                     + next_time.to_bytes(64)
+                    + request_id.to_bytes(8, "big")
                     + response_len
                     + response,
                 )
             )
 
-            transport.sendto(response_payload, parsed_addr)
+            # Reply to the address the requester declared, a DNS name
+            # resolved to its IP in REAL mode.
+            transport.sendto(
+                response_payload,
+                parsed_addr
+                if self._host_address_resolver is None
+                else await self._host_address_resolver.resolve(parsed_addr),
+            )
 
         except Exception as e:
             # Log security event - don't leak internal details
@@ -2101,12 +2142,25 @@ class MercurySyncBaseServer(Generic[T]):
                     + handler_name
                     + b"<"
                     + next_time.to_bytes(64)
+                    + request_id.to_bytes(8, "big")
                     + error_len
                     + error_msg,
                 )
             )
 
-            transport.sendto(response_payload, parsed_addr)
+            try:
+                transport.sendto(
+                    response_payload,
+                    parsed_addr
+                    if self._host_address_resolver is None
+                    else await self._host_address_resolver.resolve(parsed_addr),
+                )
+
+            except DNSError as resolution_error:
+                await self._log_security_warning(
+                    f"UDP error reply dropped: {resolution_error}",
+                    protocol="udp",
+                )
 
     async def process_udp_client_response(
         self,
@@ -2114,6 +2168,7 @@ class MercurySyncBaseServer(Generic[T]):
         addr: bytes,
         payload: bytes,
         clock_time: int,
+        request_id: int,
         _: asyncio.DatagramTransport,
     ):
         if not self._running:
@@ -2143,17 +2198,13 @@ class MercurySyncBaseServer(Generic[T]):
                     clock_time,
                 )
 
-            self._udp_client_data[addr][handler_name].put_nowait((payload, clock_time))
-
-        except asyncio.QueueFull:
-            self._udp_drop_counter.increment_load_shed()
-
         except Exception as err:
-            try:
-                self._udp_client_data[addr][handler_name].put_nowait((err, clock_time))
+            payload = err
 
-            except asyncio.QueueFull:
-                self._udp_drop_counter.increment_load_shed()
+        # Only the request this reply names takes it: one that gave up,
+        # or never was, finds no waiter.
+        if (waiter := self._udp_request_waiters.pop(request_id, None)) is not None and not waiter.done():
+            waiter.set_result((payload, clock_time))
 
     async def _cleanup_tcp_server_tasks(self):
         loop = asyncio.get_running_loop()
@@ -2170,14 +2221,13 @@ class MercurySyncBaseServer(Generic[T]):
                 # Normal cycle — sleep elapsed, fall through to cleanup.
                 pass
 
-            for pending in list(self._pending_tcp_server_responses):
-                if pending.done() or pending.cancelled():
-                    try:
-                        await pending
-
-                    except (Exception, socket.error):
-                        pass
-                    self._pending_tcp_server_responses.pop()
+            # A finished task's outcome was taken by its done callback;
+            # only unfinished tasks stay tracked for the shutdown drain.
+            self._pending_tcp_server_responses = deque(
+                pending
+                for pending in self._pending_tcp_server_responses
+                if not pending.done()
+            )
 
     async def _cleanup_udp_server_tasks(self):
         loop = asyncio.get_running_loop()
@@ -2195,14 +2245,13 @@ class MercurySyncBaseServer(Generic[T]):
                 # for the UDP variant.
                 pass
 
-            for pending in list(self._pending_udp_server_responses):
-                if pending.done() or pending.cancelled():
-                    try:
-                        await pending
-
-                    except (Exception, socket.error):
-                        pass
-                    self._pending_udp_server_responses.pop()
+            # A finished task's outcome was taken by its done callback;
+            # only unfinished tasks stay tracked for the shutdown drain.
+            self._pending_udp_server_responses = deque(
+                pending
+                for pending in self._pending_udp_server_responses
+                if not pending.done()
+            )
 
     async def _log_drop_stats_periodically(self) -> None:
         """Periodically log silent drop statistics for security monitoring."""
@@ -2228,13 +2277,25 @@ class MercurySyncBaseServer(Generic[T]):
                             decompression_too_large_count=tcp_snapshot.decompression_too_large,
                             decryption_failed_count=tcp_snapshot.decryption_failed,
                             malformed_message_count=tcp_snapshot.malformed_message,
+                            replay_detected_count=tcp_snapshot.replay_detected,
                             load_shed_count=tcp_snapshot.load_shed,
+                            log_write_failed_count=tcp_snapshot.log_write_failed,
                             total_dropped=tcp_snapshot.total,
                             interval_seconds=tcp_snapshot.interval_seconds,
                         )
                     )
                 except Exception:
-                    pass  # Best effort logging
+                    # The report did not reach the log: its drops go back to
+                    # the counter for the next report, with the failed write
+                    # (itself a lost record) counted beside them.
+                    self._tcp_drop_counter.rate_limited += tcp_snapshot.rate_limited
+                    self._tcp_drop_counter.message_too_large += tcp_snapshot.message_too_large
+                    self._tcp_drop_counter.decompression_too_large += tcp_snapshot.decompression_too_large
+                    self._tcp_drop_counter.decryption_failed += tcp_snapshot.decryption_failed
+                    self._tcp_drop_counter.malformed_message += tcp_snapshot.malformed_message
+                    self._tcp_drop_counter.replay_detected += tcp_snapshot.replay_detected
+                    self._tcp_drop_counter.load_shed += tcp_snapshot.load_shed
+                    self._tcp_drop_counter.log_write_failed += tcp_snapshot.log_write_failed + 1
 
             # Get and reset UDP drop stats
             udp_snapshot = self._udp_drop_counter.reset()
@@ -2252,13 +2313,23 @@ class MercurySyncBaseServer(Generic[T]):
                             decompression_too_large_count=udp_snapshot.decompression_too_large,
                             decryption_failed_count=udp_snapshot.decryption_failed,
                             malformed_message_count=udp_snapshot.malformed_message,
+                            replay_detected_count=udp_snapshot.replay_detected,
                             load_shed_count=udp_snapshot.load_shed,
+                            log_write_failed_count=udp_snapshot.log_write_failed,
                             total_dropped=udp_snapshot.total,
                             interval_seconds=udp_snapshot.interval_seconds,
                         )
                     )
                 except Exception:
-                    pass  # Best effort logging
+                    # As for TCP: the drops go back for the next report.
+                    self._udp_drop_counter.rate_limited += udp_snapshot.rate_limited
+                    self._udp_drop_counter.message_too_large += udp_snapshot.message_too_large
+                    self._udp_drop_counter.decompression_too_large += udp_snapshot.decompression_too_large
+                    self._udp_drop_counter.decryption_failed += udp_snapshot.decryption_failed
+                    self._udp_drop_counter.malformed_message += udp_snapshot.malformed_message
+                    self._udp_drop_counter.replay_detected += udp_snapshot.replay_detected
+                    self._udp_drop_counter.load_shed += udp_snapshot.load_shed
+                    self._udp_drop_counter.log_write_failed += udp_snapshot.log_write_failed + 1
 
     def _wake_cleanup_loops(self) -> None:
         """Wake cleanup loops so they observe ``_running == False`` and exit."""
@@ -2291,6 +2362,11 @@ class MercurySyncBaseServer(Generic[T]):
                     transport.close()
             transport_map.clear()
 
+        for transport in self._retired_tcp_client_transports:
+            if not transport.is_closing():
+                transport.close()
+        self._retired_tcp_client_transports.clear()
+
         if self._tcp_transport is not None and not self._tcp_transport.is_closing():
             self._tcp_transport.close()
         self._tcp_transport = None
@@ -2311,9 +2387,13 @@ class MercurySyncBaseServer(Generic[T]):
             self._udp_server_socket = None
 
     async def _close_tcp_server(self) -> None:
-        """Close the TCP listener and underlying socket."""
+        """Close the TCP listener, every connection it accepted, and the
+        underlying socket."""
+        if self._transport_factory is not None:
+            self._transport_factory.close_stream_server((self._host, self._tcp_port))
+        for accepted_connection in list(self._tcp_server_state.connections):
+            accepted_connection.transport.abort()
         if self._tcp_server is not None:
-            self._tcp_server.abort_clients()
             self._tcp_server.close()
             try:
                 await self._tcp_server.wait_closed()
@@ -2397,6 +2477,7 @@ class MercurySyncBaseServer(Generic[T]):
         """Return count of transports still not closing after teardown."""
         transports: list[asyncio.Transport] = []
         transports.extend(self._tcp_client_transports.values())
+        transports.extend(self._retired_tcp_client_transports)
         transports.extend(self._tcp_client_response_transports.values())
         transports.extend(self._tcp_server_request_transports.values())
         if self._tcp_transport is not None:
@@ -2500,6 +2581,13 @@ class MercurySyncBaseServer(Generic[T]):
                 pass
             self._udp_server_socket = None
 
+        # The connections this node accepted die with it: a listener's
+        # close leaves them open, answering for a node that is gone.
+        if self._transport_factory is not None:
+            self._transport_factory.close_stream_server((self._host, self._tcp_port))
+        for accepted_connection in list(self._tcp_server_state.connections):
+            accepted_connection.transport.abort()
+
         # Close TCP server (and its underlying socket — see UDP
         # comment above for the same kill→restart race rationale).
         # ``socket.shutdown(SHUT_RDWR)`` BEFORE ``close()`` is
@@ -2531,13 +2619,14 @@ class MercurySyncBaseServer(Generic[T]):
                 pass
             self._tcp_server_socket = None
 
-        # Close all TCP client transports
-        for client in self._tcp_client_transports.values():
+        # Close all TCP client transports, retired ones included
+        for client in [*self._tcp_client_transports.values(), *self._retired_tcp_client_transports]:
             try:
                 client.abort()
             except Exception:
                 pass
         self._tcp_client_transports.clear()
+        self._retired_tcp_client_transports.clear()
 
         cancel_and_release_task(self._drop_stats_task)
         cancel_and_release_task(self._tcp_server_sleep_task)
@@ -2566,13 +2655,26 @@ class MercurySyncBaseServer(Generic[T]):
     ):
         if timeout:
             try:
-                await asyncio.wait_for(
+                await self._clock.wait_for(
                     self._abort_and_wait(),
                     timeout=timeout,
                 )
 
             except asyncio.TimeoutError:
-                pass
+                # The abort itself ran (transports closed, loops
+                # cancelled); only waiting out the cancelled handlers
+                # overran the deadline.
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Abort did not finish within {timeout}s: some "
+                            "cancelled handlers were still unwinding"
+                        ),
+                        node_host=self._host,
+                        node_port=self._udp_port,
+                        node_id=0,
+                    )
+                )
 
             return
 

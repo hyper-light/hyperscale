@@ -11,8 +11,6 @@ import ssl
 import time
 from collections import defaultdict, deque
 from typing import (
-    Any,
-    AsyncIterable,
     Awaitable,
     Callable,
     Coroutine,
@@ -82,7 +80,6 @@ class TCPProtocol(Generic[T, K]):
 
         self._events: Dict[str, Coroutine] = {}
 
-        self.queue: Dict[str, Deque[Tuple[str, int, float, Any]]] = defaultdict(deque)
         self.tasks: Optional[TaskRunner] = None
         self.connected = False
         self._running = False
@@ -93,14 +90,17 @@ class TCPProtocol(Generic[T, K]):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._waiters: Dict[str, Deque[asyncio.Future]] = defaultdict(deque)
         self._pending_responses: Deque[asyncio.Task] = deque()
-        self._last_call: Deque[str] = deque()
+        # One waiter per request in flight, by the id its reply echoes.
+        self._request_waiters: Dict[int, asyncio.Future] = {}
 
         self._sent_values = deque()
         self.server_socket = None
-        self._stream = False
 
         self._client_key_path: Optional[str] = None
         self._client_cert_path: Optional[str] = None
+        # The log file connect_client() was given, for the connects send()
+        # makes on its own.
+        self._client_logfile: Optional[str] = None
 
         self._server_key_path: Optional[str] = None
         self._server_cert_path: Optional[str] = None
@@ -358,8 +358,7 @@ class TCPProtocol(Generic[T, K]):
             self._server_key_path = key_path
 
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.options |= ssl.OP_NO_TLSv1
-        ssl_ctx.options |= ssl.OP_NO_TLSv1_1
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_ctx.options |= ssl.OP_SINGLE_DH_USE
         ssl_ctx.options |= ssl.OP_SINGLE_ECDH_USE
         ssl_ctx.load_cert_chain(cert_path, keyfile=key_path)
@@ -382,6 +381,8 @@ class TCPProtocol(Generic[T, K]):
     ) -> int | None:
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
+
+        self._client_logfile = logfile
 
         if not self._abort_handle_created:
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
@@ -486,13 +487,20 @@ class TCPProtocol(Generic[T, K]):
                     timeout=attempt_timeout,
                 )
 
-                shard_id, _ = result
+                shard_id, response = result
 
                 snowflake = Snowflake.parse(shard_id)
 
                 instance_id = snowflake.instance
 
-                self._node_host_map[instance_id] = address
+                # The responder's own address, not the one dialed: every
+                # concurrent connect waits on one reply queue, so this reply
+                # can answer another call's request, and recording it against
+                # the address dialed here would swap two nodes' addresses.
+                self._node_host_map[instance_id] = (
+                    response.service_host,
+                    response.service_port,
+                )
                 self._nodes.put_no_wait(instance_id)
 
                 # Successfully connected
@@ -551,8 +559,7 @@ class TCPProtocol(Generic[T, K]):
             self._client_key_path = key_path
 
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ssl_ctx.options |= ssl.OP_NO_TLSv1
-        ssl_ctx.options |= ssl.OP_NO_TLSv1_1
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_ctx.load_cert_chain(cert_path, keyfile=key_path)
         ssl_ctx.load_verify_locations(cafile=cert_path)
         # Hostname verification: disabled by default for local testing,
@@ -615,15 +622,20 @@ class TCPProtocol(Generic[T, K]):
         for the peer's answer. Unlike send(), this never reconnects:
         when it raises, connect_client() retries the whole connection.
         """
-        self._last_call.append(None)
+        # The connect's own name, which the peer echoes in its reply (every
+        # node version does): it routes that reply, and only that reply, to
+        # this waiter. A late reply to an earlier attempt, or another node's,
+        # carries another name.
+        request_shard_id = self.id_generator.generate()
+        connect_name = f"connect:{request_shard_id}"
 
         item = cloudpickle.dumps(
             (
                 "connect",
-                self.id_generator.generate(),
+                request_shard_id,
                 Message(
                     self.node_id,
-                    None,
+                    connect_name,
                     data=None,
                     service_host=self.host,
                     service_port=self.port,
@@ -635,10 +647,13 @@ class TCPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
-        client_transport.write(compressed)
+        # Every message on the wire is length-prefixed (4 bytes, big-endian), as
+        # the distributed server frames them: TCP keeps no message boundaries,
+        # and the receiving protocol splits the stream back into messages.
+        client_transport.write(len(compressed).to_bytes(4, "big") + compressed)
 
         waiter = self._loop.create_future()
-        self._waiters[None].append(waiter)
+        self._waiters[connect_name].append(waiter)
 
         try:
             (_, shard_id, response) = await asyncio.wait_for(
@@ -647,10 +662,8 @@ class TCPProtocol(Generic[T, K]):
             )
 
         finally:
-            # Only an answer removes a waiter, so one that timed out
-            # would otherwise stay queued for good.
-            if waiter in self._waiters[None]:
-                self._waiters[None].remove(waiter)
+            # The name served this one connect: its waiters go with it.
+            self._waiters.pop(connect_name, None)
 
         return (shard_id, response)
 
@@ -664,8 +677,6 @@ class TCPProtocol(Generic[T, K]):
     ) -> Tuple[int, K]:
         async with self._semaphore:
             try:
-                self._last_call.append(target)
-
                 if node_id is None:
                     node_id = await self._nodes.get()
 
@@ -680,6 +691,7 @@ class TCPProtocol(Generic[T, K]):
                 client_transport = self._client_transports.get(address)
                 if client_transport is None or client_transport.is_closing():
                     await self.connect_client(
+                        self._client_logfile,
                         address,
                         cert_path=self._client_cert_path,
                         key_path=self._client_key_path,
@@ -687,31 +699,39 @@ class TCPProtocol(Generic[T, K]):
 
                     client_transport = self._client_transports.get(address)
 
-                item = cloudpickle.dumps(
-                    (
-                        request_type,
-                        self.id_generator.generate(),
-                        Message(
-                            self.node_id,
-                            target,
-                            data=data,
-                            service_host=self.host,
-                            service_port=self.port,
-                        ),
-                    ),
-                    protocol=pickle.HIGHEST_PROTOCOL,
+                # The request's id, which the server echoes in its reply: that
+                # reply, and no other request's, completes this one -- however
+                # many requests to the same target are in flight.
+                request_id = self.id_generator.generate()
+                message = Message(
+                    self.node_id,
+                    target,
+                    data=data,
+                    service_host=self.host,
+                    service_port=self.port,
+                    request_id=request_id,
                 )
 
-                encrypted_message = self._encryptor.encrypt(item)
-                compressed = self._compressor.compress(encrypted_message)
+                for attempt in range(self._retries + 1):
+                    # A new shard id each attempt, or the server's replay
+                    # guard drops the retry.
+                    item = cloudpickle.dumps(
+                        (
+                            request_type,
+                            self.id_generator.generate(),
+                            message,
+                        ),
+                        protocol=pickle.HIGHEST_PROTOCOL,
+                    )
 
-                client_transport.write(compressed)
+                    encrypted_message = self._encryptor.encrypt(item)
+                    compressed = self._compressor.compress(encrypted_message)
 
-                while True:
+                    waiter = self._loop.create_future()
+                    self._request_waiters[request_id] = waiter
+                    client_transport.write(len(compressed).to_bytes(4, "big") + compressed)
+
                     try:
-                        waiter = self._loop.create_future()
-                        self._waiters[target].append(waiter)
-
                         result: Tuple[str, int, Message[K]] = await asyncio.wait_for(
                             waiter,
                             timeout=self._request_timeout,
@@ -728,9 +748,15 @@ class TCPProtocol(Generic[T, K]):
                         return (shard_id, response.data)
 
                     except (Exception, socket.error):
+                        if attempt == self._retries:
+                            raise
+
+                        # The connection may be dead: a new one, then the
+                        # same request on it.
                         client_transport.close()
 
                         await self.connect_client(
+                            self._client_logfile,
                             address,
                             cert_path=self._client_cert_path,
                             key_path=self._client_key_path,
@@ -739,6 +765,10 @@ class TCPProtocol(Generic[T, K]):
                         client_transport = self._client_transports.get(address)
 
                         await asyncio.sleep(self._retry_interval)
+
+                    finally:
+                        # Answered, failed or cancelled: the waiter goes.
+                        self._request_waiters.pop(request_id, None)
 
             except (Exception, socket.error) as err:
                 return (
@@ -749,131 +779,6 @@ class TCPProtocol(Generic[T, K]):
                         error=str(err),
                     ),
                 )
-
-    async def stream(
-        self,
-        target: str,
-        data: T,
-        target_address: Optional[Tuple[str, int]] = None,
-        request_type: Optional[Literal["request", "connect"]] = None,
-    ) -> AsyncIterable[Tuple[int, Message[K]]]:
-        async with self._semaphore:
-            try:
-                self._last_call.append(target)
-
-                node_id = await self._nodes.get()
-
-                address = self._node_host_map.get(node_id)
-
-                if address is None and target_address:
-                    address = target_address
-
-                if request_type is None:
-                    request_type = "request"
-
-                client_transport = self._client_transports.get(address)
-
-                if self._stream is False:
-                    item = cloudpickle.dumps(
-                        (
-                            "stream_connect",
-                            self.id_generator.generate(),
-                            Message(
-                                self.node_id,
-                                target,
-                                data=data,
-                                service_host=self.host,
-                                service_port=self.port,
-                            ),
-                        ),
-                        protocol=pickle.HIGHEST_PROTOCOL,
-                    )
-
-                else:
-                    item = cloudpickle.dumps(
-                        (
-                            "stream",
-                            self.id_generator.generate(),
-                            Message(
-                                self.node_id,
-                                target,
-                                data=data,
-                                service_host=self.host,
-                                service_port=self.port,
-                            ),
-                        ),
-                        protocol=pickle.HIGHEST_PROTOCOL,
-                    )
-
-                encrypted_message = self._encryptor.encrypt(item)
-                compressed = self._compressor.compress(encrypted_message)
-
-                if client_transport.is_closing():
-                    yield (
-                        self.id_generator.generate(),
-                        Message(
-                            self.node_id,
-                            target,
-                            error="Transport closed.",
-                        ),
-                    )
-
-                client_transport.write(compressed)
-
-                waiter = self._loop.create_future()
-                self._waiters[target].append(waiter)
-
-                await asyncio.wait_for(
-                    waiter,
-                    timeout=self._request_timeout,
-                )
-
-                if self._stream is False:
-                    self.queue[target].pop()
-
-                    self._stream = True
-
-                    item = cloudpickle.dumps(
-                        (
-                            "stream",
-                            self.id_generator.generate(),
-                            Message(
-                                self.node_id,
-                                target,
-                                data=data,
-                                service_host=self.host,
-                                service_port=self.port,
-                            ),
-                        ),
-                        pickle.HIGHEST_PROTOCOL,
-                    )
-
-                    encrypted_message = self._encryptor.encrypt(item)
-                    compressed = self._compressor.compress(encrypted_message)
-
-                    client_transport.write(compressed)
-
-                    waiter = self._loop.create_future()
-                    self._waiters[target].append(waiter)
-
-                    await waiter
-
-                while bool(self.queue[target]) and self._stream:
-                    (_, shard_id, response) = self.queue[target].pop()
-
-                    yield (shard_id, response)
-
-            except (Exception, socket.error):
-                yield (
-                    self.id_generator.generate(),
-                    Message(
-                        self.node_id,
-                        target,
-                        error="Request timed out.",
-                    ),
-                )
-
-        self.queue.clear()
 
     def read(
         self,
@@ -905,8 +810,8 @@ class TCPProtocol(Generic[T, K]):
             # Sanitized error - don't leak internal details
             error = Message(
                 node_id=self.node_id,
-                host=self.host,
-                port=self.port,
+                service_host=self.host,
+                service_port=self.port,
                 name="protocol_error",
                 error="Message processing failed",
             )
@@ -923,7 +828,7 @@ class TCPProtocol(Generic[T, K]):
             encrypted_message = self._encryptor.encrypt(item)
             compressed = self._compressor.compress(encrypted_message)
 
-            transport.write(compressed)
+            transport.write(len(compressed).to_bytes(4, "big") + compressed)
             return
 
         # Validate decompressed size (compression bomb detection)
@@ -938,8 +843,8 @@ class TCPProtocol(Generic[T, K]):
             # Sanitized error - don't leak encryption details
             error = Message(
                 node_id=self.node_id,
-                host=self.host,
-                port=self.port,
+                service_host=self.host,
+                service_port=self.port,
                 name="protocol_error",
                 error="Message processing failed",
             )
@@ -956,7 +861,7 @@ class TCPProtocol(Generic[T, K]):
             encrypted_message = self._encryptor.encrypt(item)
             compressed = self._compressor.compress(encrypted_message)
 
-            transport.write(compressed)
+            transport.write(len(compressed).to_bytes(4, "big") + compressed)
             return
 
         result: Tuple[str, int, Message] = None
@@ -969,8 +874,8 @@ class TCPProtocol(Generic[T, K]):
             # Sanitized error - don't leak details about what was blocked
             error = Message(
                 node_id=self.node_id,
-                host=self.host,
-                port=self.port,
+                service_host=self.host,
+                service_port=self.port,
                 name="protocol_error",
                 error="Message processing failed",
             )
@@ -987,7 +892,7 @@ class TCPProtocol(Generic[T, K]):
             encrypted_message = self._encryptor.encrypt(item)
             compressed = self._compressor.compress(encrypted_message)
 
-            transport.write(compressed)
+            transport.write(len(compressed).to_bytes(4, "big") + compressed)
 
             return
 
@@ -1039,7 +944,7 @@ class TCPProtocol(Generic[T, K]):
             encrypted_message = self._encryptor.encrypt(item)
             compressed = self._compressor.compress(encrypted_message)
 
-            transport.write(compressed)
+            transport.write(len(compressed).to_bytes(4, "big") + compressed)
 
         elif message_type == "request":
             response_call = self._events[message.name](
@@ -1059,6 +964,7 @@ class TCPProtocol(Generic[T, K]):
                         data=response_data,
                         service_host=self.host,
                         service_port=self.port,
+                        request_id=message.request_id,
                     ),
                 ),
                 protocol=pickle.HIGHEST_PROTOCOL,
@@ -1067,105 +973,29 @@ class TCPProtocol(Generic[T, K]):
             encrypted_message = self._encryptor.encrypt(item)
             compressed = self._compressor.compress(encrypted_message)
 
-            transport.write(compressed)
-
-        elif message_type == "stream_connect":
-            self.queue[message.name].append(
-                (
-                    message_type,
-                    shard_id,
-                    message,
-                )
-            )
-
-            item = cloudpickle.dumps(
-                (
-                    "response",
-                    self.id_generator.generate(),
-                    Message(
-                        node_id=self.node_id,
-                        name=message.name,
-                        data="Connection successful.",
-                        service_host=self.host,
-                        service_port=self.port,
-                    ),
-                ),
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
-
-            encrypted_message = self._encryptor.encrypt(item)
-            compressed = self._compressor.compress(encrypted_message)
-
-            transport.write(compressed)
-
-            event_waiter = self._waiters[message.name]
-
-            if bool(event_waiter):
-                waiter = event_waiter.pop()
-
-                try:
-                    waiter.set_result(None)
-
-                except asyncio.InvalidStateError:
-                    pass
-
-        elif message_type == "stream" or message_type == "stream_connect":
-            self.queue[message.name].append(
-                (
-                    message_type,
-                    shard_id,
-                    message_type,
-                )
-            )
-
-            response_iterator = self._events[message.name](
-                shard_id,
-                message.data,
-            )
-
-            async for response in response_iterator:
-                try:
-                    item = cloudpickle.dumps(
-                        (
-                            "response",
-                            self.id_generator.generate(),
-                            Message(
-                                self.node_id,
-                                message.name,
-                                response,
-                                service_host=self.host,
-                                service_port=self.port,
-                            ),
-                        ),
-                        protocol=pickle.HIGHEST_PROTOCOL,
-                    )
-
-                    encrypted_message = self._encryptor.encrypt(item)
-                    compressed = self._compressor.compress(encrypted_message)
-
-                    transport.write(compressed)
-
-                except (Exception, socket.error):
-                    pass
-
-            event_waiter = self._waiters[message.name]
-
-            if bool(event_waiter):
-                waiter = event_waiter.pop()
-
-                try:
-                    waiter.set_result(None)
-
-                except asyncio.InvalidStateError:
-                    pass
+            transport.write(len(compressed).to_bytes(4, "big") + compressed)
 
         else:
-            if message.name is None and bool(self._last_call):
-                message.name = self._last_call.pop()
+            if (request_id := message.request_id) is not None:
+                # A request's reply: it completes that request's waiter, if
+                # the request still waits, and nothing else.
+                if (request_waiter := self._request_waiters.pop(request_id, None)) is not None and not request_waiter.done():
+                    request_waiter.set_result(
+                        (
+                            message_type,
+                            shard_id,
+                            message,
+                        )
+                    )
 
-            event_waiter = self._waiters[message.name]
+                return
 
-            if bool(event_waiter):
+            # A connect's reply, by the connect's own name. One nothing waits
+            # for any more -- a late one to a finished connect -- finds no
+            # waiters, and adds no entry for its name.
+            event_waiter = self._waiters.get(message.name)
+
+            if event_waiter:
                 waiter = event_waiter.pop()
 
                 try:
@@ -1181,7 +1011,6 @@ class TCPProtocol(Generic[T, K]):
                     pass
 
     async def close(self) -> None:
-        self._stream = False
         self._running = False
 
         # Wait for shutdown task only if it exists and with a short timeout

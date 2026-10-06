@@ -8,10 +8,11 @@ Wires Raft consensus into the gate server by providing:
 - Message routing helpers for TCP handlers
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
-from hyperscale.distributed.raft import GateRaftConsensus, GateRaftJobManager, RaftPeerOutbox
+from hyperscale.distributed.raft.store.raft_storage import RaftStorage
+from hyperscale.distributed.raft import GateRaftConsensus, RaftPeerOutbox
 from hyperscale.distributed.raft.logging_models import RaftDebug
 from hyperscale.distributed.raft.models import (
     AppendEntries,
@@ -22,9 +23,6 @@ from hyperscale.distributed.raft.models import (
 
 if TYPE_CHECKING:
     from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
-    from hyperscale.distributed.jobs.gates.gate_job_manager import GateJobManager
-    from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
-    from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
     from hyperscale.distributed.hlc.hybrid_logical_clock import HybridLogicalClock
@@ -38,24 +36,22 @@ class GateRaftIntegration:
     tracking. The server only needs to:
     1. Call initialize() during startup
     2. Wire TCP handlers to the route_* methods
-    3. Call on_node_join/on_node_leave from SWIM callbacks
+    Membership comes from the gate cluster's membership group
+    (``cluster_members``), never from SWIM events.
     """
 
     __slots__ = (
         "_consensus",
-        "_raft_job_manager",
         "_send_tcp",
         "_node_id",
         "_logger",
         "_outbox",
+        "_request_timeout_seconds",
     )
 
     def __init__(
         self,
         node_id: str,
-        job_manager: "GateJobManager",
-        leadership_tracker: "JobLeadershipTracker",
-        gate_state: "GateRuntimeState",
         logger: "Logger",
         task_runner: "TaskRunner",
         send_tcp: Callable[..., Awaitable[bytes | Exception | None]],
@@ -67,10 +63,20 @@ class GateRaftIntegration:
         ledger_replica: "JobLedgerReplica",
         cluster_size: Callable[[], int],
         proposal_timeout_seconds: float,
+        request_timeout_seconds: float,
+        cluster_members: Callable[[], Mapping[str, tuple[str, int]]],
+        storage: RaftStorage,
     ) -> None:
+        """
+        ``request_timeout_seconds`` bounds each Raft exchange over
+        ``send_tcp``; the job groups' CheckQuorum window covers it.
+        ``cluster_members`` is the cluster's committed membership (AD-52
+        slice C): the members every job group moves toward.
+        """
         self._node_id = node_id
         self._logger = logger
         self._send_tcp = send_tcp
+        self._request_timeout_seconds = request_timeout_seconds
         self._outbox = RaftPeerOutbox(
             exchange=self._exchange,
             task_runner=task_runner,
@@ -80,9 +86,6 @@ class GateRaftIntegration:
 
         self._consensus = GateRaftConsensus(
             node_id=node_id,
-            job_manager=job_manager,
-            leadership_tracker=leadership_tracker,
-            gate_state=gate_state,
             logger=logger,
             task_runner=task_runner,
             send_message=self._send_raft_message,
@@ -93,12 +96,9 @@ class GateRaftIntegration:
             ledger_replica=ledger_replica,
             cluster_size=cluster_size,
             proposal_timeout_seconds=proposal_timeout_seconds,
-        )
-
-        self._raft_job_manager = GateRaftJobManager(
-            consensus=self._consensus,
-            logger=logger,
-            node_id=node_id,
+            request_timeout_seconds=request_timeout_seconds,
+            cluster_members=cluster_members,
+            storage=storage,
         )
 
     @property
@@ -106,14 +106,15 @@ class GateRaftIntegration:
         """Access the underlying GateRaftConsensus coordinator."""
         return self._consensus
 
-    @property
-    def raft_job_manager(self) -> GateRaftJobManager:
-        """Access the Raft-backed gate job manager wrapper."""
-        return self._raft_job_manager
-
-    def start(self) -> None:
-        """Start the Raft tick loop."""
+    async def start(self) -> None:
+        """Resume the job groups this node's disk held, then start the
+        Raft tick loop."""
+        await self._consensus.recover_groups()
         self._consensus.start_tick_loop()
+
+    def set_cohort_size(self, cohort_size: int) -> None:
+        """The cluster's cohort was resized (AD-52 ``ResizeCluster``)."""
+        self._consensus.set_cohort_size(cohort_size)
 
     async def stop(self) -> None:
         """Stop all Raft instances and the tick loop."""
@@ -156,7 +157,7 @@ class GateRaftIntegration:
             case AppendEntries():
                 method = "gate_raft_append_entries"
 
-        reply, _ = await self._send_tcp(addr, method, request.dump())
+        reply, _ = await self._send_tcp(addr, method, request.dump(), self._request_timeout_seconds)
         if isinstance(reply, Exception) or not reply:
             await self._logger.log(
                 RaftDebug(
@@ -210,25 +211,3 @@ class GateRaftIntegration:
         """Handle incoming AppendEntriesResponse RPC."""
         response = AppendEntriesResponse.load(data)
         await self._consensus.route_append_entries_response(response)
-
-    # =========================================================================
-    # SWIM Membership Routing
-    # =========================================================================
-
-    def on_node_join(self, node_id: str, addr: tuple[str, int]) -> None:
-        """Route SWIM node join to Raft consensus."""
-        self._consensus.on_node_join(node_id, addr)
-
-    def on_node_leave(self, node_id: str) -> None:
-        """Route SWIM node dead to Raft consensus."""
-        if (addr := self._consensus.member_address(node_id)) is not None:
-            self._outbox.forget_peer(addr)
-        self._consensus.on_node_leave(node_id)
-
-    def set_initial_membership(
-        self,
-        members: set[str],
-        addrs: dict[str, tuple[str, int]],
-    ) -> None:
-        """Set initial cluster membership from SWIM state."""
-        self._consensus.set_initial_membership(members, addrs)

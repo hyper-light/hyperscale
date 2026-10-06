@@ -2,7 +2,7 @@
 Integration tests for client models (Section 15.1.1).
 
 Tests JobTrackingState, CancellationState, GateLeaderTracking,
-ManagerLeaderTracking, OrphanedJob, and RequestRouting dataclasses.
+ManagerLeaderTracking, and RequestRouting dataclasses.
 
 Covers:
 - Happy path: Normal instantiation and field access
@@ -22,7 +22,6 @@ from hyperscale.distributed.nodes.client.models import (
     CancellationState,
     GateLeaderTracking,
     ManagerLeaderTracking,
-    OrphanedJob,
     RequestRouting,
 )
 
@@ -308,53 +307,6 @@ class TestManagerLeaderTracking:
         assert tracking.leader_info is None
 
 
-class TestOrphanedJob:
-    """Test OrphanedJob dataclass."""
-
-    def test_happy_path_instantiation(self):
-        """Test normal orphaned job tracking."""
-        now = time.time()
-        orphan_info = {"reason": "Leader disappeared", "attempts": 3}
-
-        orphaned = OrphanedJob(
-            job_id="job-orphan-123",
-            orphan_info=orphan_info,
-            orphaned_at=now,
-        )
-
-        assert orphaned.job_id == "job-orphan-123"
-        assert orphaned.orphan_info == orphan_info
-        assert orphaned.orphaned_at == now
-
-    def test_edge_case_none_info(self):
-        """Test with None orphan info."""
-        orphaned = OrphanedJob(
-            job_id="job-orphan-456",
-            orphan_info=None,
-            orphaned_at=time.time(),
-        )
-
-        assert orphaned.orphan_info is None
-
-    def test_edge_case_complex_orphan_info(self):
-        """Test with complex orphan information."""
-        complex_info = {
-            "reason": "Manager cluster failure",
-            "last_known_leader": ("manager-5", 7000),
-            "retry_count": 10,
-            "error_messages": ["timeout", "connection refused"],
-        }
-
-        orphaned = OrphanedJob(
-            job_id="job-complex-orphan",
-            orphan_info=complex_info,
-            orphaned_at=time.time(),
-        )
-
-        assert orphaned.orphan_info["retry_count"] == 10
-        assert len(orphaned.orphan_info["error_messages"]) == 2
-
-
 class TestRequestRouting:
     """Test RequestRouting dataclass."""
 
@@ -454,7 +406,6 @@ class TestModelsEdgeCases:
         cancellation = CancellationState("cancel", event, False, [])
         gate_leader = GateLeaderTracking("gate-job", None, 0.0)
         manager_leader = ManagerLeaderTracking("mgr-job", "dc", None, 0.0)
-        orphaned = OrphanedJob("orphan", None, 0.0)
         routing = RequestRouting("route", lock, None)
 
         # All should raise AttributeError when trying to set new attributes
@@ -463,7 +414,6 @@ class TestModelsEdgeCases:
             cancellation,
             gate_leader,
             manager_leader,
-            orphaned,
             routing,
         ]
 

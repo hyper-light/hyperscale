@@ -3,8 +3,8 @@ Checklist B8 — storage faults DURING recovery, pinned over the gateless
 L2 restart-resume scenario (client -> manager -> worker, seed 101).
 
 Both scenarios reuse the house restart schedule
-(``test_multiprocess_manager_restart``: power-lose the manager at 9.4
-mid-workflow, reboot from the surviving disk at 54.4) and arm a
+(power-lose the manager at 2.15 mid-workflow, reboot from the surviving
+disk at 47.15) and arm a
 ``SimFilesystem`` fault via the BOOT-AWARE schedule applier
 (``recovery_faults_demo.apply_boot_aware_storage_fault_schedule``):
 a rebooted generation re-runs the same entry args, and a fault window
@@ -14,22 +14,23 @@ recovery (incarnation store, WAL replay, submission resume) runs
 against the faulted disk from its very first I/O. The stock
 ``call_at``-only applier provably misses that window: the boot task's
 first step runs the whole synchronous recovery prefix before any
-past-due timer callback fires (probe: gen-2 ``manager-started`` lands
-at exactly 54.4 under a 20ms slow disk armed the ``call_at`` way, and
-at 54.52 armed boot-aware).
+past-due timer callback fires (probe, before the 2026-10-04 re-pin:
+gen-2 ``manager-started`` landed at exactly its boot instant under a
+20ms slow disk armed the ``call_at`` way, and 0.12 later armed
+boot-aware).
 
-Probed timeline (seed 101, this exact topology — the client entry
-polls past the down window, which shifts the schedule slightly off the
-house test's):
+Probed timeline (seed 101, re-probed 2026-10-04: the restart moved
+from 9.4 to 2.15 once a lone manager led the moment its own vote made
+the majority; every later pin is expressed from it or from gen-2's
+boot):
 
-* baseline (no storage fault): submit 9.213062, dispatch 9.25, restart
-  9.4 mid-run, gen-2 up exactly 54.4 (virtually instantaneous boot),
-  worker re-registered by the 62.4 sample, resumed re-dispatch runs
-  62.25-62.75, completion observed 62.618552.
-* slow disk 20ms over [9.3, 75): gen-2 up 54.52 — the boot recovery
-  charged exactly 6 storage operations — worker re-registered by the
-  62.52 sample, completion 62.658552 (+0.040 = the 2 completion-path
-  writes: JobCompleted WAL append + archive write). The client-visible
+* baseline (no storage fault): submit 1.795823, worker active from the
+  2.0 sample, restart 2.15 mid-run, gen-2 up 47.15, resumed re-dispatch,
+  completion observed 51.914493.
+* slow disk 20ms over [2.05, 67.75): completion 51.974493 (+0.060 over
+  baseline: the charged boot-recovery and completion-path operations).
+  (Before the re-pin: +0.040, the boot recovery charging exactly 6
+  storage operations.) The client-visible
   slack stays small because the worker's own re-registration cadence,
   not the manager's charged boot, dominates the resume leg.
 * disk_full budget sweep (armed at gen-2 boot): budgets >= 2048 fit
@@ -45,7 +46,7 @@ house test's):
   the tier-1 client push; the client's own 5s-cadence gateless poll
   fallback recovers the terminal from the manager's live state at the
   next tick — completion observed 64.253062 (= the 64.21 poll,
-  +1.6345 over baseline). A third restart at 70 proves the terminal
+  +1.6345 over baseline). A third restart (gen-2 boot + 15.6) proves the terminal
   record's durability behaviorally (gen-3 recovers the job TERMINAL:
   no resume, no re-execution). ``start()`` never wedges at any swept
   budget; the client is never silent.
@@ -63,20 +64,25 @@ from tests.simulation.oracle import JobStatusOracle
 
 _SEED = 101
 _CEILING = 120.0
-_RESTART_AT = 9.4
+# Mid-run, 0.15 after the worker's activation sample (2.0), as the
+# repeated-crash scenario's (seed 101; 9.4 while a lone manager waited out
+# a full pre-vote and vote wait for a majority its own vote already made).
+_RESTART_AT = 2.15
 _DOWN_SECONDS = 45.0
-_GENERATION_TWO_BOOT = _RESTART_AT + _DOWN_SECONDS  # 54.4
+_GENERATION_TWO_BOOT = _RESTART_AT + _DOWN_SECONDS  # 47.15
 # Never expires under the ceiling, so ``job-finished`` is always logged.
 _WAIT_TIMEOUT_SECONDS = 200.0
 
 _SLOW_DISK_DELAY_SECONDS = 0.02
-# Armed after the pre-restart dispatch (9.25) and before the restart
-# (9.4) so the window genuinely STRADDLES the power loss; open until
-# well past the resumed completion (~62.7).
-_SLOW_DISK_SCHEDULE = (("slow_disk", 9.3, _SLOW_DISK_DELAY_SECONDS, 75.0),)
+# Armed after the pre-restart dispatch and before the restart so the
+# window genuinely STRADDLES the power loss; open until well past the
+# resumed completion (gen-2 boot + ~5).
+_SLOW_DISK_SCHEDULE = (
+    ("slow_disk", _RESTART_AT - 0.1, _SLOW_DISK_DELAY_SECONDS, _GENERATION_TWO_BOOT + 20.6),
+)
 # Probe-measured completion of the no-fault restart baseline (see the
 # module docstring) — the slow-disk bound is derived from it.
-_BASELINE_COMPLETION = 62.618552
+_BASELINE_COMPLETION = 51.914493
 # Design bound on charged storage operations along the client-visible
 # path (boot recovery measured 6 ops, completion path 2; the ceiling
 # leaves headroom for schedule drift without ever hiding a stall).
@@ -179,7 +185,7 @@ def test_recovery_completes_through_slow_disk():
 
     The straddle is asserted structurally: gen-2's ``manager-started``
     must land STRICTLY after the boot instant (the no-fault boot is
-    virtually instantaneous at exactly 54.4, so any shift is charged
+    virtually instantaneous at exactly its boot instant, so any shift is charged
     recovery I/O — measured +0.12 = 6 operations) yet within the
     boot-op ceiling.
     """
@@ -251,19 +257,19 @@ def test_slow_disk_recovery_is_replay_deterministic():
 # Scenario 2: disk FULL armed inside gen-2's recovery window
 # ---------------------------------------------------------------------------
 
-# Armed at a virtual instant INSIDE the down window: gen-1 dies at 9.4
-# before the timer fires (its budget is never armed), gen-2's boot-aware
-# replay arms the FRESH budget synchronously at 54.4 — before the first
+# Armed at a virtual instant INSIDE the down window: gen-1 dies before
+# the timer fires (its budget is never armed), gen-2's boot-aware replay
+# arms the FRESH budget synchronously at its boot — before the first
 # recovery I/O.
-_DISK_FULL_ARM_AT = 30.0
+_DISK_FULL_ARM_AT = _RESTART_AT + 20.6
 # Probe-swept budgets 96/512/2048/8192: at >= 2048 every gen-2 write
 # fits (completion at the exact no-fault baseline); at <= 512 the
 # budget pinches gen-2's completion-record leg. 512 keeps the ~110-byte
 # incarnation record inside the budget so recovery itself is clean.
 _DISK_FULL_BUDGET_BYTES = 512
 _DISK_FULL_SCHEDULE = (("disk_full", _DISK_FULL_ARM_AT, _DISK_FULL_BUDGET_BYTES),)
-# Probe-measured completion: 62.618552 — byte-identical to the
-# no-fault restart baseline. Traced: the durable JobCompleted append
+# Probe-measured completion: 51.914493 (2026-10-04) — byte-identical to
+# the no-fault restart baseline. Traced: the durable JobCompleted append
 # fits the budget; the 236-byte archive copy ENOSPCs and is ISOLATED
 # (parked for healing, logged loudly — JobLedger._archive_job_isolated)
 # so the tier-1 client push runs and delivers at the baseline instant:
@@ -272,13 +278,13 @@ _DISK_FULL_SCHEDULE = (("disk_full", _DISK_FULL_ARM_AT, _DISK_FULL_BUDGET_BYTES)
 # gateless poll fallback rescued the terminal at 64.253062 — the fix
 # reclaimed that 1.63s and, in gate topologies where no manager poll
 # exists, the outcome itself.) Ceiling = baseline + push/apply slack.
-_DISK_FULL_COMPLETION = 62.618552
-_DISK_FULL_COMPLETION_CEILING = 63.7
+_DISK_FULL_COMPLETION = 51.914493
+_DISK_FULL_COMPLETION_CEILING = _DISK_FULL_COMPLETION + 1.081448
 
 # Scenario 3: a THIRD restart after the degraded completion — if the
 # terminal record had not genuinely landed durably, gen-3 would replay
 # the job ACTIVE and re-run it.
-_TRUTH_RESTART_AT = 70.0
+_TRUTH_RESTART_AT = _GENERATION_TWO_BOOT + 15.6
 _TRUTH_DOWN_SECONDS = 20.0
 _TRUTH_CEILING = 130.0
 
@@ -310,9 +316,9 @@ def test_disk_full_during_recovery_never_wedges_and_stays_truthful():
     86-byte durable JobCompleted append fits, the 236-byte archive
     copy raises and is ISOLATED (parked + logged, never aborting the
     handler), so the tier-1 push delivers the exactly-once
-    ``completed`` at 62.618552 — the no-fault baseline instant; the
+    ``completed`` at 51.914493 — the no-fault baseline instant; the
     archive failure is invisible to the client. Gen-2 boots at exactly
-    54.4 (disk_full charges bytes, not time) with no
+    its boot instant, 47.15 (disk_full charges bytes, not time), with no
     ``manager-start-failed``.
     """
     results = _run_disk_full_during_recovery()
@@ -402,11 +408,13 @@ def test_degraded_completion_record_survives_a_further_restart():
     TERMINAL — no resume, no re-execution — and the client's delivered
     result stands.
 
-    Probed: gen-3 boots 90.0, re-admits the worker (91.0 sample), and
-    the worker never runs the workflow again (its last activation is
-    gen-2's resumed run at 62.25). If the JobCompleted record had been
-    lost to the exhausted budget, gen-3 would resume the job and the
-    worker would show an activation after 90 — the assertion that
+    Probed (before the 2026-10-04 re-pin; every instant has since moved
+    with the first restart, 9.4 -> 2.15): gen-3 booted 90.0, re-admitted
+    the worker, and the worker never ran the workflow again (its last
+    activation was gen-2's resumed run). If the JobCompleted record had
+    been lost to the exhausted budget, gen-3 would resume the job and
+    the worker would show an activation after gen-3's boot — the
+    assertion that
     catches any silent ledger/client divergence here.
     """
     results = _run_disk_full_completion_truth()

@@ -4,6 +4,7 @@ Message parser for SWIM protocol.
 Extracts piggyback data, parses message format, and builds MessageContext.
 """
 
+import binascii
 from base64 import b64decode
 from typing import Callable
 
@@ -146,11 +147,14 @@ class MessageParser:
         if self._process_embedded_state is None:
             return
 
+        # The message itself still parses: undecodable state from a peer
+        # is counted; a failing callback raises to the dispatcher.
         try:
-            state_data = b64decode(state_part)
-            self._process_embedded_state(state_data, source_addr)
-        except Exception:
-            pass  # Invalid state, ignore
+            state_data = b64decode(state_part, validate=True)
+        except binascii.Error:
+            self._server.increment_metric("malformed_embedded_state")
+            return
+        self._process_embedded_state(state_data, source_addr)
 
     def _parse_target_address(
         self, target_addr_bytes: bytes
@@ -166,7 +170,7 @@ class MessageParser:
         """
         try:
             addr_str = target_addr_bytes.decode()
-            host, port_str = addr_str.split(":", maxsplit=1)
+            host, port_str = addr_str.rsplit(":", maxsplit=1)
             return (host, int(port_str))
         except (ValueError, UnicodeDecodeError):
             return None

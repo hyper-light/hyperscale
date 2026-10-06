@@ -17,7 +17,11 @@ to ``MercurySyncBaseServer`` and the Phase 4 harness already proved
 ``send_tcp`` / ``send_udp`` is the right intercept point.
 """
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    # ``models`` imports the runtime seams; a runtime import back would cycle.
+    from hyperscale.distributed.models.message import Message
 
 
 class Transport(Protocol):
@@ -26,18 +30,19 @@ class Transport(Protocol):
     Return type matches the existing
     ``MercurySyncBaseServer.send_tcp`` / ``send_udp`` signature: a
     ``(response, clock_time)`` pair where ``response`` is the framed
-    reply bytes, an ``Exception`` on transport-layer failure, or
-    ``None`` on no-response paths. The clock_time is the receiver's
-    logical clock at the moment the reply was produced.
+    reply bytes or the ``Exception`` that ended the request (returned,
+    never raised). A ``Message`` is serialized before it is framed. The
+    clock_time is the receiver's logical clock at the moment the reply
+    was produced.
     """
 
     async def send_tcp(
         self,
         address: tuple[str, int],
         action: str,
-        data: Any,
-        timeout: float | None = None,
-    ) -> tuple[Any, int]:
+        data: "bytes | Message",
+        timeout: int | float | None = None,
+    ) -> tuple[bytes | Exception, int]:
         """Send a TCP request and await the framed response."""
         ...
 
@@ -45,8 +50,8 @@ class Transport(Protocol):
         self,
         address: tuple[str, int],
         action: str,
-        data: Any,
-        timeout: float | None = None,
-    ) -> tuple[Any, int]:
+        data: "bytes | Message",
+        timeout: int | float | None = None,
+    ) -> tuple[bytes | Exception, int]:
         """Send a UDP request and await the framed response."""
         ...

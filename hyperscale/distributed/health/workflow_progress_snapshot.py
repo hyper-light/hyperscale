@@ -71,7 +71,7 @@ class WorkflowProgressSnapshot:
             sub-workflow. Static for the lifetime of one
             ``WorkflowDispatch`` (re-dispatch produces a new
             ``workflow_id`` and resets the counter origin).
-        step_transitions: SECONDARY counter. Number of AD-33 step
+        step_transitions: SECONDARY counter. Number of AD-54 step
             state-machine transitions observed since dispatch
             (e.g. PENDING→RUNNING, RUNNING→COMPLETED). Catches
             in-flight cores that are doing meaningful work even

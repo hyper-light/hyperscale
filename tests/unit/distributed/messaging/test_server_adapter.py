@@ -90,11 +90,7 @@ class MockHealthAwareServer:
     async def decrease_failure_detector(self, reason: str) -> None:
         pass
 
-    def get_lhm_adjusted_timeout(
-        self,
-        base_timeout: float,
-        target_node_id: str | None = None,
-    ) -> float:
+    def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
         return base_timeout
 
     async def start_suspicion(
@@ -452,9 +448,7 @@ class TestServerAdapterCommunication:
         result = await adapter.send(("192.168.1.1", 8000), b"test_data")
 
         assert result == b"ack"
-        assert ("192.168.1.1", 8000), (
-            b"test_data" in mock_health_aware_server._sent_messages
-        )
+        assert (("192.168.1.1", 8000), b"test_data") in mock_health_aware_server._sent_messages
 
     @pytest.mark.asyncio
     async def test_send_if_ok(
@@ -731,11 +725,3 @@ class TestServerAdapterContextManagement:
         ctx = await adapter.context_with_value(("192.168.1.1", 8000))
 
         assert ctx is not None
-
-    @pytest.mark.asyncio
-    async def test_write_context(
-        self, mock_health_aware_server: MockHealthAwareServer
-    ) -> None:
-        adapter = ServerAdapter(mock_health_aware_server)
-
-        await adapter.write_context("key", "value")

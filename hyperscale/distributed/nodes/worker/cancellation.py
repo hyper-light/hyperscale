@@ -15,7 +15,8 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerInfo
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock, RealClock, SendTcp, RunTask
+from collections.abc import Awaitable, Callable
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -40,6 +41,9 @@ class WorkerCancellationHandler:
         state: "WorkerState",
         logger: "Logger | None" = None,
         poll_interval: float = 5.0,
+        *,
+        query_timeout: float,
+        cancel_timeout: float,
     ) -> None:
         """
         Initialize cancellation handler.
@@ -48,10 +52,14 @@ class WorkerCancellationHandler:
             state: WorkerState for workflow tracking
             logger: Logger instance for logging
             poll_interval: Interval for polling cancellation requests
+            query_timeout: Seconds a cancellation query to a manager may take
+            cancel_timeout: Seconds to wait for a cancelled workflow to stop
         """
         self._state: "WorkerState" = state
         self._logger: "Logger | None" = logger
         self._poll_interval: float = poll_interval
+        self._query_timeout: float = query_timeout
+        self._cancel_timeout: float = cancel_timeout
         self._running: bool = False
 
         # Remote graph manager (set later)
@@ -102,8 +110,8 @@ class WorkerCancellationHandler:
         self,
         workflow_id: str,
         reason: str,
-        task_runner_cancel: callable,
-        increment_version: callable,
+        task_runner_cancel: Callable[[str], Awaitable[None]],
+        increment_version: Callable[[], Awaitable[int]],
     ) -> tuple[bool, list[str]]:
         """
         Cancel a workflow and clean up resources.
@@ -180,7 +188,7 @@ class WorkerCancellationHandler:
                 ) = await self._remote_manager.await_workflow_cancellation(
                     run_id,
                     workflow_name,
-                    timeout=5.0,
+                    timeout=self._cancel_timeout,
                 )
                 if not success:
                     errors.append(
@@ -197,14 +205,14 @@ class WorkerCancellationHandler:
 
     async def run_cancellation_poll_loop(
         self,
-        get_manager_addr: callable,
-        is_circuit_open: callable,
-        send_tcp: callable,
+        get_manager_addr: Callable[[], tuple[str, int] | None],
+        is_circuit_open: Callable[[], bool],
+        send_tcp: SendTcp,
         node_host: str,
         node_port: int,
         node_id_short: str,
-        task_runner_run: callable,
-        is_running: callable,
+        task_runner_run: RunTask,
+        is_running: Callable[[], bool],
     ) -> None:
         """
         Background loop for polling managers for cancellation status.
@@ -251,12 +259,15 @@ class WorkerCancellationHandler:
                     )
 
                     try:
-                        response_data = await send_tcp(
+                        response_data, _ = await send_tcp(
                             manager_addr,
                             "workflow_cancellation_query",
                             query.dump(),
-                            timeout=2.0,
+                            timeout=self._query_timeout,
                         )
+                        # send_tcp returns transport errors rather than raising.
+                        if isinstance(response_data, Exception):
+                            raise response_data
 
                         if response_data:
                             response = WorkflowCancellationResponse.load(response_data)

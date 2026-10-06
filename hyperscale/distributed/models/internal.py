@@ -1,38 +1,29 @@
-import msgspec
-from typing import Literal
+"""
 
+This module is the wire namespace of the models below. Each lives in a
+file of its own and is re-homed here -- its ``__module__`` set to this
+module -- so its pickled form names this module, exactly as before the
+split: mixed-version clusters keep talking and data written earlier
+keeps loading.
+"""
 
-class Ack(msgspec.Struct):
-    node: tuple[str, int]
-    message: Literal['ACK'] = 'ACK'
+from .ack import Ack
+from .confirm import Confirm
+from .eject import Eject
+from .join import Join
+from .leave import Leave
+from .nack import Nack
+from .probe import Probe
 
-class Confirm(msgspec.Struct):
-    target: tuple[str, int]
-    refuted: int
-    required: int
-    message: Literal['PROBE'] = 'PROBE'
-    
-class Eject(msgspec.Struct):
-    target: tuple[str, int]
-    confirmed: int
-    message: Literal['EJECT'] = 'EJECT'
+_WIRE_MODELS = (
+    Ack,
+    Confirm,
+    Eject,
+    Join,
+    Leave,
+    Nack,
+    Probe,
+)
 
-class Join(msgspec.Struct):
-    udp_addr: tuple[str, int]
-    tcp_addr: tuple[str, int]
-    confirmed: int
-    message: Literal['JOIN'] = 'JOIN'
-
-class Leave(msgspec.Struct):
-    node: tuple[str, int]
-    message: Literal['LEAVE'] = 'LEAVE'
-
-class Nack(msgspec.Struct):
-    node: tuple[str, int]
-    message: Literal['NACK'] = 'NACK'
-
-class Probe(msgspec.Struct):
-    target: tuple[str, int]
-    comfirmed: int
-    required: int
-    message: Literal['PROBE'] = 'PROBE'
+for _wire_model in _WIRE_MODELS:
+    _wire_model.__module__ = __name__

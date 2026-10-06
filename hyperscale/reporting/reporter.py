@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import os
-import threading
 import uuid
 from typing import Generic, List, TypeVar
 
@@ -191,7 +190,6 @@ class Reporter(Generic[T]):
         self.reporter_id = str(uuid.uuid4())
 
         self.metadata_string: str = None
-        self.thread_id = threading.current_thread().ident
         self.process_id = os.getpid()
 
         self.reporter_config: T = reporter_config

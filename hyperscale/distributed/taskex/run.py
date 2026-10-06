@@ -6,7 +6,7 @@ import pathlib
 import traceback
 from asyncio.subprocess import Process
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Awaitable, Callable, Dict, Generic, Optional, TypeVar
 
 from .models import (
     CommandType,
@@ -21,8 +21,10 @@ from hyperscale.distributed.runtime import Clock, RealClock
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
+T = TypeVar("T")
 
-class Run:
+
+class Run(Generic[T]):
     __slots__ = (
         "run_id",
         "status",
@@ -56,7 +58,7 @@ class Run:
         self,
         run_id: int,
         task_name: str,
-        call: Callable[..., Awaitable[Any]] | str,
+        call: Callable[..., Awaitable[T]] | str,
         task_type: TaskType,
         executor: ProcessPoolExecutor | ThreadPoolExecutor | None,
         semaphore: asyncio.Semaphore,
@@ -66,8 +68,8 @@ class Run:
         self.task_name = task_name
         self.status = RunStatus.CREATED
 
-        self._args: tuple[Any, ...] | None = None
-        self._env: dict[str, Any] | None = None
+        self._args: tuple[str, ...] | None = None
+        self._env: dict[str, str] | None = None
         self._working_directory: str | None = None
 
         self.error: Optional[str] = None
@@ -79,48 +81,19 @@ class Run:
 
         self.call = call
         self.task_type = task_type
-        self.result: Any | None = None
-        self._args: tuple[Any, ...] | None = None
-        self._env: dict[str, Any] | None = None
+        self.result: T | None = None
+        self._args: tuple[str, ...] | None = None
+        self._env: dict[str, str] | None = None
         self._working_directory: str | None = None
         self._read_lock = asyncio.Lock()
 
-        if not isinstance(
-            self.call,
-            str,
-        ) and not isinstance(
-            call,
-            functools.partial,
-        ) and hasattr(
-            call,
-            "__self__",
-        ):
-            bound_instance = call.__self__
-            self.call = self.call.__get__(bound_instance, self.call.__class__)
-            # Caching the bound method on the instance is an optimization; it
-            # is impossible (and unnecessary) on classes using __slots__ that
-            # do not list this attribute. Skip the cache when that's the case.
-            try:
-                setattr(bound_instance, self.call.__name__, self.call)
-            except AttributeError:
-                pass
-
-        elif not isinstance(
-            self.call,
-            str,
-        ) and isinstance(
-            call,
-            functools.partial,
-        ) and hasattr(
-            call.func,
-            "__self__",
-        ):
-            bound_instance = call.func.__self__
-            self.call = self.call.__get__(bound_instance, self.call.__class__)
-            try:
-                setattr(bound_instance, call.func.__name__, self.call)
-            except AttributeError:
-                pass
+        # ``call`` runs as given: a bound method is already bound to its
+        # instance and a partial already carries its bound method. Re-binding
+        # them (and caching the result on the instance) did nothing for a
+        # method, while a partial broke -- ``partial`` has no ``__get__``
+        # before Python 3.14 (AttributeError), and from 3.14 binding one
+        # prepends the instance as an extra argument and the cache replaced
+        # the instance's method with that partial.
 
         self._task: Optional[asyncio.Task] = None
         self._process: Process | None = None
@@ -302,10 +275,14 @@ class Run:
             try:
                 self._task.cancel()
                 # Give the task a chance to handle cancellation
+                cancels_requested_before_wait = asyncio.current_task().cancelling()
                 try:
                     await self._task
                 except asyncio.CancelledError:
-                    pass
+                    # The task we cancelled ended; a cancel aimed at this task
+                    # while it waited goes on.
+                    if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                        raise
             except Exception:
                 pass
         else:
@@ -344,7 +321,7 @@ class Run:
 
     def execute_shell(
         self,
-        *args: tuple[Any, ...],
+        *args: str,
         poll_interval: int | float = 0.5,
         env: Dict[str, str] | None = None,
         cwd: str | pathlib.Path | None = None,
@@ -370,7 +347,7 @@ class Run:
 
     async def _execute_shell(
         self,
-        *args: tuple[Any, ...],
+        *args: str,
         poll_interval: int | float = 0.5,
         env: Dict[str, str] | None = None,
         cwd: str | pathlib.Path | None = None,
@@ -407,8 +384,26 @@ class Run:
                     cwd=working_directory if cwd else None,
                 )
 
-        except Exception:
-            pass
+        except Exception as spawn_error:
+            # No process exists: the run fails with the spawn's own error.
+            self.error = f"Err. - Task Run - {self.run_id} - could not start: {spawn_error!r}."
+            self.trace = traceback.format_exc()
+            self.status = RunStatus.FAILED
+
+            return ShellProcess(
+                run_id=self.run_id,
+                task_name=self.task_name,
+                process_id=None,
+                command=self.call,
+                args=self._args,
+                status=self.status,
+                env=self._env,
+                working_directory=self._working_directory,
+                command_type=self._command_type,
+                error=self.error,
+                trace=self.trace,
+                elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
+            )
 
         self.status = RunStatus.RUNNING
 
@@ -450,7 +445,7 @@ class Run:
                 command_type=self._command_type,
                 error=error,
                 trace=self.trace,
-                elapsed=self.start - _DEFAULT_CLOCK.monotonic(),
+                elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
             )
 
         except Exception as err:
@@ -470,7 +465,7 @@ class Run:
                 command_type=self._command_type,
                 error=error,
                 trace=self.trace,
-                elapsed=self.start - _DEFAULT_CLOCK.monotonic(),
+                elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
             )
 
         self.result = stdout
@@ -498,7 +493,7 @@ class Run:
             error=self.error,
             result=self.result,
             trace=self.trace,
-            elapsed=self.start - _DEFAULT_CLOCK.monotonic(),
+            elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
         )
 
     async def _execute(self, *args, **kwargs):

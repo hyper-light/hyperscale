@@ -16,6 +16,7 @@ manager lists cannot displace the confirmed id. Driven through the real
 WorkerRegistry.
 """
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.models import ManagerInfo
 from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
 from hyperscale.distributed.swim.core import CircuitState
@@ -51,7 +52,7 @@ def open_breakers(registry: WorkerRegistry, manager_id: str) -> None:
 
 
 def make_registry_with_dead_first_incarnation() -> WorkerRegistry:
-    registry = WorkerRegistry(None, select_manager=select_lowest_id)
+    registry = WorkerRegistry(None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=select_lowest_id)
     registry.confirm_manager(FIRST_INCARNATION, manager_info(FIRST_INCARNATION))
     registry.set_primary_manager(FIRST_INCARNATION)
     open_breakers(registry, FIRST_INCARNATION)
@@ -81,7 +82,7 @@ def test_hearsay_cannot_resurrect_a_superseded_incarnation() -> None:
 
 
 def test_reaping_the_confirmed_manager_releases_its_address() -> None:
-    registry = WorkerRegistry(None, select_manager=select_lowest_id)
+    registry = WorkerRegistry(None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=select_lowest_id)
     registry.confirm_manager(SECOND_INCARNATION, manager_info(SECOND_INCARNATION))
 
     registry.remove_manager_state(SECOND_INCARNATION, MANAGER_ADDR)

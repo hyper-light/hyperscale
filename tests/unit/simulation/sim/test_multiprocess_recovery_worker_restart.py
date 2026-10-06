@@ -14,31 +14,34 @@ probe.
 
 Probed timelines (seed 101):
 
+Re-probed 2026-10-04, once a lone manager led the moment its own vote
+made the majority (the job would otherwise be accepted at 1.8, before
+either restart):
+
 * FRESH-JOB scenario (restart at 2.0, down 10): gen-1 worker registers
-  at the 1.0 sample and dies idle; gen-2 boots at 12.0, respawns the
-  pool, re-registers; the client's retrying submission is accepted at
-  14.193062 — strictly AFTER the reboot — dispatch 14.25, drain 15.0,
-  completion 14.773062. (Gen-2's ``worker-started`` milestone lands at
-  15.623419, AFTER the dispatch it already served: ``start()`` returns
+  at the 1.0 sample and dies idle; the client submits inside the down
+  window (accepted 9.24); gen-2 boots at 12.0, respawns the pool,
+  re-registers; the dispatch retry ladder carries the job across the
+  reboot onto gen-2 (active 15.75-16.5), completion 16.263419. (Gen-2's
+  ``worker-started`` milestone lands at 15.663419: ``start()`` returns
   only once the pool is fully settled, while registration + dispatch
   service begin mid-``start()``.)
-* IN-FLIGHT scenario (restart at 9.5, down 20): dispatch 9.25, the
+* IN-FLIGHT scenario (restart at 2.1, down 20): dispatch ~1.84, the
   gen-1 worker dies with the workflow ACTIVE (its generation log ends
   ``workflows-active 1`` — restarts, unlike kills, preserve the
-  victim's milestones). Gen-2 re-registers at 33.13 under a NEW node
-  id (a node id embeds its process start time) at the SAME address,
-  inside the ~38s SWIM detection bound -- SWIM never declares gen-1
-  dead, because gen-2 answers its probes. The manager recognizes the
-  different id at the address as gen-1's successor: it recovers gen-1
-  as a dead worker (pool entry dropped, unfinished workflow
-  reassigned) and drops the cached transport to the address, so the
-  reassigned workflow dispatches to gen-2 at once (33.16) and the
-  client observes ``completed`` at 33.743419 -- inside the job's
+  victim's milestones). Gen-2 re-registers under a NEW node id (a node
+  id embeds its process start time) at the SAME address, inside the
+  ~38s SWIM detection bound -- SWIM never declares gen-1 dead, because
+  gen-2 answers its probes. The manager recognizes the different id at
+  the address as gen-1's successor: it recovers gen-1 as a dead worker
+  (pool entry dropped, unfinished workflow reassigned) and drops the
+  cached transport to the address, so the reassigned workflow
+  dispatches to gen-2 at once (active 25.85) and the client observes
+  ``completed`` at 26.363419 -- reboot + 4.26, inside the job's
   budget. (Before the in-flight reassignment landed, the stale id kept
-  the workflow forever and the job timed out at 60.03; with the
-  reassignment but without the transport drop, the first re-dispatch
-  rode gen-1's dead socket for a full send timeout and completion
-  slipped to 43.74.)
+  the workflow forever and the job timed out; with the reassignment
+  but without the transport drop, the first re-dispatch rode gen-1's
+  dead socket for a full send timeout.)
 
 FIXED BUG (scenario 3 below pins the fix): submitting a job ~8s AFTER
 the rebooted worker re-registered used to drive the MANAGER's
@@ -76,11 +79,20 @@ _FRESH_RESTART_AT = 2.0
 _FRESH_DOWN_SECONDS = 10.0
 _FRESH_REBOOT = _FRESH_RESTART_AT + _FRESH_DOWN_SECONDS  # 12.0
 _FRESH_CEILING = 90.0
+# Inside the worker's down window, 7.2s into it: where acceptance landed
+# while a lone manager waited out a full pre-vote and vote wait for a
+# majority its own vote already made. The manager now leads at once and
+# would take the job at 1.8 -- while gen-1 is still up -- so the client
+# submits at the instant this scenario is about.
+_FRESH_SUBMIT_AT = 9.2
 
-_INFLIGHT_RESTART_AT = 9.5
+# 0.25 after the dispatch (~1.84; the worker's activation is sampled at
+# 2.0) and before the completion record (~2.37), as before (dispatch
+# 9.25 -> restart 9.5 while a lone manager waited out its election).
+_INFLIGHT_RESTART_AT = 2.1
 _INFLIGHT_DOWN_SECONDS = 20.0
 _INFLIGHT_CEILING = 90.0
-# The job's budget (submit ~9.213 + 30s): the in-flight recovery must
+# The job's budget (submit ~1.796 + 30s): the in-flight recovery must
 # complete the job inside it rather than surface as a timeout.
 _JOB_TIMEOUT_SECONDS = 30.0
 
@@ -178,7 +190,10 @@ def _activation_times(worker_log: list) -> list[float]:
 
 def _run_fresh_job_after_worker_restart() -> dict:
     return _run_worker_restart(
-        _FRESH_RESTART_AT, _FRESH_DOWN_SECONDS, _FRESH_CEILING
+        _FRESH_RESTART_AT,
+        _FRESH_DOWN_SECONDS,
+        _FRESH_CEILING,
+        client_submit_at=_FRESH_SUBMIT_AT,
     )
 
 
@@ -203,18 +218,19 @@ def test_job_submitted_after_worker_reboot_completes_on_new_pool():
     results = _run_fresh_job_after_worker_restart()
     client_log = results["client"]
 
-    # Accepted once the manager is leader (~9.2) — never before, and
-    # never past the reboot + re-registration + one retry rung.
+    # Accepted at the submission inside the down window -- the manager
+    # accepts for a worker it still holds -- and never past the reboot +
+    # re-registration + one retry rung.
     submitted_time = _submitted_at(client_log)
-    assert 9.0 < submitted_time < _FRESH_REBOOT + 5.0, client_log
+    assert _FRESH_SUBMIT_AT <= submitted_time < _FRESH_REBOOT + 5.0, client_log
 
     (_tag, final_status, finished_time) = _finished(client_log)
     assert final_status == "completed", client_log
-    # Completion promptly after gen-2 re-registration (~13.6): the
-    # retry ladder's next attempt + dispatch + 2s workflow + push
-    # (probed 14.67).
+    # Completion promptly after gen-2 re-registration: the retry
+    # ladder's next attempt + dispatch + workflow + push (probed
+    # 16.263419).
     assert _FRESH_REBOOT < finished_time < _FRESH_REBOOT + 6.0, (
-        "post-reboot completion must be prompt (probed 14.67): "
+        "post-reboot completion must be prompt (probed 16.263419): "
         f"{client_log}"
     )
 
@@ -297,7 +313,7 @@ def test_inflight_job_completes_on_the_rebooted_worker():
     deadline = submitted_time + _JOB_TIMEOUT_SECONDS
     assert reboot_time < finished_time < deadline, (
         f"in-flight completion at {finished_time} outside "
-        f"({reboot_time}, {deadline}) (measured 33.743419): {client_log}"
+        f"({reboot_time}, {deadline}) (measured 26.363419): {client_log}"
     )
 
     _assert_oracle_clean(client_log)

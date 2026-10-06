@@ -35,6 +35,55 @@ def parse_node_address(address: str) -> tuple[str, int]:
     return (parsed_locator.hostname, _parse_port(parsed_locator, address))
 
 
+def parse_node_host(host: str, port: int) -> str:
+    """The host a node is started with, validated and written the way
+    ``parse_node_address`` writes hosts (DNS names lowercased, IPv6
+    unbracketed). A node is identified by this exact string -- every
+    frame it sends carries it -- so it must match how peers write it.
+
+    Raises:
+        ValueError: ``host`` is not an IP address or DNS name.
+    """
+    bracketed_host = f"[{host}]" if ":" in host else host
+    return parse_node_address(f"{bracketed_host}:{port}")[0]
+
+
+def parse_peer_addresses(
+    tcp_addresses: list[str],
+    udp_addresses: list[str],
+    tcp_flag: str,
+    udp_flag: str,
+    own_tcp_address: tuple[str, int],
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Each peer's TCP and UDP address, paired by position, without this
+    node's own entry -- every member of a cohort can be given the same
+    full list.
+
+    Raises:
+        ValueError: an address is malformed, or the two lists differ in
+            length.
+    """
+    if len(tcp_addresses) != len(udp_addresses):
+        raise ValueError(
+            f"{udp_flag} needs one address per {tcp_flag} address "
+            f"(got {len(udp_addresses)} for {len(tcp_addresses)})"
+        )
+
+    peers = [
+        (parse_node_address(tcp_address), parse_node_address(udp_address))
+        for tcp_address, udp_address in zip(tcp_addresses, udp_addresses)
+    ]
+    other_peers = [
+        (tcp_address, udp_address)
+        for tcp_address, udp_address in peers
+        if tcp_address != own_tcp_address
+    ]
+    return (
+        [tcp_address for tcp_address, _ in other_peers],
+        [udp_address for _, udp_address in other_peers],
+    )
+
+
 def _require_printable_address(address: str) -> None:
     # urlsplit silently DELETES tab/CR/LF (its CVE-2022-0391 hardening),
     # which would turn "127.0.0.1:8\t231" into port 8231 — reject every

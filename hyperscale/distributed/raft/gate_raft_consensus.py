@@ -6,27 +6,26 @@ Drives the Raft tick loop via TaskRunner for background execution.
 Bounded by max concurrent Raft instances with backpressure.
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
-import cloudpickle
+import msgspec
 
-from .gate_state_machine import GateStateMachine
+from .ledger_state_machine import LedgerStateMachine
 from .logging_models import RaftDebug, RaftInfo, RaftWarning
-from .models import GateRaftCommandType
-from .models.gate_commands import GateRaftCommand
+from .models.ledger_append_command import LEDGER_APPEND_COMMAND, LedgerAppendCommand
 from .raft_node import HEARTBEAT_INTERVAL, RaftNode
+from .store.models import GroupReleasedRecord
+from .store.raft_storage import RaftStorage
 
 from hyperscale.distributed.runtime import Clock, RealClock
+import asyncio
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
-    from hyperscale.distributed.jobs.gates.gate_job_manager import GateJobManager
-    from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
     from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
-    from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
     from hyperscale.distributed.hlc.hybrid_logical_clock import HybridLogicalClock
@@ -42,30 +41,28 @@ class GateRaftConsensus:
 
     __slots__ = (
         "_node_id",
-        "_job_manager",
         "_state_machine",
         "_logger",
         "_task_runner",
         "_send_message",
         "_clock",
         "_may_lead",
-        "_members",
-        "_member_addrs",
+        "_cluster_members",
+        "_addressed_members",
         "_nodes",
         "_max_instances",
         "_cluster_size",
         "_proposal_timeout_seconds",
+        "_request_timeout_seconds",
         "_tick_running",
         "_on_become_leader",
         "_on_lose_leadership",
+        "_storage",
     )
 
     def __init__(
         self,
         node_id: str,
-        job_manager: "GateJobManager",
-        leadership_tracker: "JobLeadershipTracker",
-        gate_state: "GateRuntimeState",
         logger: "Logger",
         task_runner: "TaskRunner",
         send_message: Callable[..., Awaitable[None]],
@@ -78,21 +75,28 @@ class GateRaftConsensus:
         ledger_replica: "JobLedgerReplica",
         cluster_size: Callable[[], int],
         proposal_timeout_seconds: float,
+        request_timeout_seconds: float,
+        cluster_members: Callable[[], Mapping[str, tuple[str, int]]],
+        storage: RaftStorage,
     ) -> None:
+        """
+        ``request_timeout_seconds`` bounds one exchange on ``send_message``'s
+        transport; each job group's CheckQuorum window covers it
+        (``RaftNode``).
+        """
         self._node_id = node_id
-        self._job_manager = job_manager
-        self._state_machine = GateStateMachine(
-            job_manager, leadership_tracker, gate_state, logger, node_id,
-            ledger_replica=ledger_replica,
-        )
+        self._state_machine = LedgerStateMachine(ledger_replica, logger, node_id)
         self._logger = logger
         self._task_runner = task_runner
         self._send_message = send_message
         self._clock = clock
         self._may_lead = may_lead
 
-        self._members: set[str] = set()
-        self._member_addrs: dict[str, tuple[str, int]] = {}
+        # The cluster's members by node id, with their TCP addresses
+        # (``ClusterMembership.node_addresses``), and the mapping last given
+        # to the groups' address books.
+        self._cluster_members = cluster_members
+        self._addressed_members: Mapping[str, tuple[str, int]] | None = None
         self._nodes: dict[str, RaftNode] = {}
         self._max_instances = max_instances
         # The gate tier's static cohort at group creation. Fixing each
@@ -101,10 +105,13 @@ class GateRaftConsensus:
         # majority -- two disjoint majorities, two leaders.
         self._cluster_size = cluster_size
         self._proposal_timeout_seconds = proposal_timeout_seconds
+        self._request_timeout_seconds = request_timeout_seconds
         self._tick_running = False
 
         self._on_become_leader = on_become_leader
         self._on_lose_leadership = on_lose_leadership
+        # Where every job group keeps its persistent state (D1).
+        self._storage = storage
 
     # =========================================================================
     # Lifecycle
@@ -129,15 +136,25 @@ class GateRaftConsensus:
         Background tick loop. Drives election timeouts, heartbeats,
         replication, and entry application for all active Raft nodes.
         """
-        import asyncio
 
         while self._tick_running:
             tick_start = _DEFAULT_CLOCK.monotonic()
+            # The cluster's committed members (AD-52 slice C): each group
+            # this node leads moves its configuration toward them through
+            # its log -- none until the cluster has formed.
+            members = self._cluster_members()
+            if members is not self._addressed_members:
+                self._addressed_members = members
+                for node in self._nodes.values():
+                    node.update_member_addresses(members)
+            live_members = frozenset(members) | {self._node_id}
 
             for job_id, node in list(self._nodes.items()):
                 await node.tick()
                 if node.is_leader():
                     await node.replicate_to_followers()
+                    if members:
+                        await node.reconcile_membership(live_members)
                 applied = await node.apply_committed_entries()
                 if applied > 0:
                     await self._logger.log(RaftDebug(
@@ -157,12 +174,22 @@ class GateRaftConsensus:
     # Job Raft Management
     # =========================================================================
 
-    async def create_job_raft(self, job_id: str) -> bool:
+    async def create_job_raft(self, job_id: str, initial_voters: frozenset[str]) -> bool:
         """
-        Create a Raft instance for a job.
+        Create the job's Raft instance on this node, with the voters the
+        job's group was created with -- the same on every member, decided
+        once by whoever created the job (``current_members`` there) and
+        handed to every member that joins the group. Members that differed
+        in them could each count a quorum the others would not.
 
-        Returns False if at capacity (backpressure) or already exists.
+        Returns False if at capacity (backpressure); True when created or
+        already present.
+
+        Raises:
+            ValueError: no voters -- a group without them never elects.
         """
+        if not initial_voters:
+            raise ValueError(f"the Raft group of job {job_id} needs at least one voter")
         if job_id in self._nodes:
             return True
 
@@ -177,8 +204,10 @@ class GateRaftConsensus:
         node = RaftNode(
             job_id=job_id,
             node_id=self._node_id,
-            members=self._members,
-            member_addrs=self._member_addrs,
+            # The group's agreed voters; the members it gains or loses
+            # later change through its log (``reconcile_membership``).
+            initial_voters=initial_voters,
+            member_addrs=dict(self._cluster_members()),
             send_message=self._send_message,
             apply_command=self._state_machine.apply,
             on_become_leader=self._make_leader_callback(job_id),
@@ -188,6 +217,8 @@ class GateRaftConsensus:
             may_lead=self._may_lead,
             configured_cluster_size=self._cluster_size(),
             proposal_timeout_seconds=self._proposal_timeout_seconds,
+            request_timeout_seconds=self._request_timeout_seconds,
+            storage=self._storage,
         )
         self._nodes[job_id] = node
 
@@ -198,12 +229,20 @@ class GateRaftConsensus:
         ))
         return True
 
+    def set_cohort_size(self, cohort_size: int) -> None:
+        """The cluster's cohort was resized (AD-52 ``ResizeCluster``): every
+        group held now counts its majority as its quorum floor (groups
+        founded later read the size when founded)."""
+        for node in self._nodes.values():
+            node.set_cohort_size(cohort_size)
+
     async def destroy_job_raft(self, job_id: str) -> None:
-        """Destroy the Raft instance for a job. Releases all memory."""
+        """The job is done with its Raft instance: it is dropped from
+        memory and from this node's disk (D1)."""
         node = self._nodes.pop(job_id, None)
         if node is None:
             return
-        node.destroy()
+        await node.release()
         self._state_machine.release_job(job_id)
 
         await self._logger.log(RaftInfo(
@@ -228,7 +267,7 @@ class GateRaftConsensus:
     async def propose_command(
         self,
         job_id: str,
-        command: GateRaftCommand,
+        command: LedgerAppendCommand,
     ) -> tuple[bool, int]:
         """
         Propose a command through Raft for a specific job.
@@ -240,8 +279,7 @@ class GateRaftConsensus:
         if node is None:
             return False, 0
 
-        serialized = cloudpickle.dumps(command)
-        return await node.propose(serialized, command.command_type.value)
+        return await node.propose(msgspec.msgpack.encode(command), LEDGER_APPEND_COMMAND)
 
     # =========================================================================
     # Message Routing
@@ -275,52 +313,57 @@ class GateRaftConsensus:
     # Membership
     # =========================================================================
 
-    def on_node_join(self, node_id: str, addr: tuple[str, int]) -> None:
-        """Handle a new node joining the cluster."""
-        self._members.add(node_id)
-        self._member_addrs[node_id] = addr
-
-        for node in self._nodes.values():
-            node.update_membership(self._members, self._member_addrs)
+    def current_members(self) -> frozenset[str]:
+        """The cluster's committed members, this node among them: the
+        voters a job's group is created with by the node creating the job.
+        Only this node until the cluster has formed -- a job is not
+        admitted before then."""
+        return frozenset(self._cluster_members()) | {self._node_id}
 
     def member_address(self, node_id: str) -> tuple[str, int] | None:
         """TCP address of a current member, or None if unknown."""
-        return self._member_addrs.get(node_id)
+        return self._cluster_members().get(node_id)
 
     def member_addresses(self) -> dict[str, tuple[str, int]]:
-        """Each current member's TCP address, by node id."""
+        """Each other current member's TCP address, by node id."""
         return {
             member: address
-            for member in self._members
-            if (address := self._member_addrs.get(member)) is not None
+            for member, address in self._cluster_members().items()
+            if member != self._node_id
         }
-
-    def on_node_leave(self, node_id: str) -> None:
-        """Handle a node leaving the cluster."""
-        self._members.discard(node_id)
-        self._member_addrs.pop(node_id, None)
-
-        for node in self._nodes.values():
-            node.update_membership(self._members, self._member_addrs)
-
-    def set_initial_membership(
-        self,
-        members: set[str],
-        addrs: dict[str, tuple[str, int]],
-    ) -> None:
-        """Set the initial cluster membership."""
-        self._members = set(members)
-        self._member_addrs = dict(addrs)
 
     # =========================================================================
     # Cleanup
     # =========================================================================
 
     async def destroy_all(self) -> None:
-        """Destroy all Raft instances. Called on node shutdown."""
+        """Drop every Raft instance from memory on node shutdown -- not
+        from disk: a restart resumes them (D1)."""
         self._tick_running = False
-        for job_id in list(self._nodes.keys()):
-            await self.destroy_job_raft(job_id)
+        for job_id, node in list(self._nodes.items()):
+            node.destroy()
+            self._state_machine.release_job(job_id)
+        self._nodes.clear()
+
+    async def recover_groups(self) -> None:
+        """Resume every job group this node's disk held (D1) before the
+        tick loop and before any Raft message: each as it was created,
+        state and all. A group of a member this node no longer is, is
+        released.
+
+        Raises:
+            RuntimeError: more groups than this node may hold at once.
+        """
+        recovered_groups = self._storage.take_recovered_groups(
+            lambda group_id: not group_id.startswith("cluster:")
+        )
+        for job_id, recovered in sorted(recovered_groups.items()):
+            if recovered.member_id != self._node_id:
+                await self._storage.write([GroupReleasedRecord(group_id=job_id)])
+                continue
+            if not await self.create_job_raft(job_id, frozenset(recovered.initial_voters)):
+                raise RuntimeError(f"cannot resume the Raft group of job {job_id}: at the instance limit")
+            await self._nodes[job_id].recover(recovered)
 
     # =========================================================================
     # Helpers

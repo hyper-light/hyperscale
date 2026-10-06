@@ -1,5 +1,6 @@
 import asyncio
 import socket
+from asyncio.constants import SSL_HANDSHAKE_TIMEOUT
 from asyncio.sslproto import SSLProtocol
 from typing import Sequence
 
@@ -9,11 +10,17 @@ from hyperscale.core.engines.client.shared.protocols import (
     Writer,
 )
 from hyperscale.core.engines.client.shared.protocols.client_ssl_protocol import (
-    ClientSSLProtocol,
+    open_ssl_protocol_transport,
 )
 from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import (
     SocketConfig,
     connect_first_responding,
+)
+from hyperscale.core.engines.client.shared.protocols.tls_transport import (
+    RECEIVE_BUFFER_SIZE,
+    TLSTransport,
+    open_tls_transport,
+    supports_readiness_callbacks,
 )
 
 from .protocol import TCPProtocol
@@ -26,6 +33,9 @@ class TCPConnection:
         self._connection = None
         self.socket: socket.socket = None
         self._writer = None
+        # Every TLS transport this connection opens reads the socket into
+        # this, one read callback at a time; allocated on the first one.
+        self._receive_buffer: memoryview | None = None
 
     async def create(
         self, hostname=None, socket_config=None, *, limit=_DEFAULT_LIMIT, ssl=None
@@ -76,42 +86,43 @@ class TCPConnection:
 
     async def _connect_tls(self, app_protocol, family, hostname, ssl):
         """
-        What ``loop.create_connection(ssl=...)`` does, with ClientSSLProtocol
-        in place of asyncio's SSLProtocol: TLS over the connected socket,
-        returning the TLS transport once the handshake completes.
+        What ``loop.create_connection(ssl=...)`` does: TLS over the connected
+        socket, returning the TLS transport once the handshake completes --
+        a TLSTransport where the loop can watch the socket for readiness,
+        asyncio's TLS path with ClientSSLProtocol where it cannot.
         """
         if hostname is None:
             raise ValueError("You must set server_hostname when using ssl without a host")
 
-        handshake_complete = self.loop.create_future()
-        ssl_protocol = ClientSSLProtocol(
+        if supports_readiness_callbacks(self.loop, self.socket):
+            if self._receive_buffer is None:
+                self._receive_buffer = memoryview(bytearray(RECEIVE_BUFFER_SIZE))
+
+            return await open_tls_transport(
+                self.loop,
+                self.socket,
+                ssl,
+                hostname,
+                app_protocol,
+                self._receive_buffer,
+                handshake_timeout=SSL_HANDSHAKE_TIMEOUT,
+            )
+
+        return await open_ssl_protocol_transport(
             self.loop,
-            app_protocol,
+            self.socket,
+            family,
             ssl,
-            handshake_complete,
-            False,
             hostname,
+            app_protocol,
+            SSL_HANDSHAKE_TIMEOUT,
         )
-
-        await self.loop.create_connection(
-            lambda: ssl_protocol,
-            sock=self.socket,
-            family=family,
-        )
-
-        try:
-            await handshake_complete
-
-        except BaseException:
-            ssl_protocol._app_transport.close()
-            raise
-
-        return ssl_protocol._app_transport
 
     def close(self):
         try:
-            if hasattr(self.transport, "_ssl_protocol") and isinstance(
-                self.transport._ssl_protocol, SSLProtocol
+            if isinstance(self.transport, TLSTransport) or (
+                hasattr(self.transport, "_ssl_protocol")
+                and isinstance(self.transport._ssl_protocol, SSLProtocol)
             ):
                 # close() starts a TLS shutdown that cannot finish once the
                 # socket below is closed, leaving the raw transport registered

@@ -1,4 +1,5 @@
 from typing import Generic, Optional, TypeVar
+from urllib.parse import urlencode
 
 from hyperscale.core.engines.client.shared.models import RequestType
 from hyperscale.core.testing.models.base import OptimizedArg
@@ -31,13 +32,9 @@ class Query(OptimizedArg, Generic[T]):
         
         match request_type:
             case RequestType.GRAPHQL | RequestType.GRAPHQL_HTTP2:
-                query_string = "".join(
-                    self.data.replace(
-                        "query",
-                        "",
-                    ).split()
-                )
-                self.optimized = f"?query={{{query_string}}}"
+                # The query document unaltered and URL-encoded, as GraphQL
+                # over HTTP carries it in a GET.
+                self.optimized = f"?{urlencode({'query': self.data})}"
 
             case _:
                 pass

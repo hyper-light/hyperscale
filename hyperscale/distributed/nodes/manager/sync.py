@@ -20,6 +20,8 @@ from hyperscale.distributed.models import (
     WorkerState,
     WorkerStateSnapshot,
 )
+from hyperscale.distributed.nodes.manager.models import StateSyncNotReadyError
+from hyperscale.distributed.reliability import JitterStrategy, RetryConfig, RetryExecutor
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
 
 if TYPE_CHECKING:
@@ -77,6 +79,23 @@ class ManagerStateSync:
         self._apply_job_state_sync_message = apply_job_state_sync_message
         self._get_job_callback_addr = get_job_callback_addr
         self._validate_mtls_claims = validate_mtls_claims
+        # AD-11: a request refused or reset in transport (a target
+        # restarting), or answered not-ready (a target still starting), is
+        # retried with exponential backoff (full jitter),
+        # the backoffs together spanning one sync timeout -- base *
+        # (2^retries - 1) = timeout: a target back within one request's
+        # budget is caught, and past it SWIM's verdict governs. A timeout
+        # is not retried: it already spent a whole budget on a target
+        # shown unresponsive, and the takeover path syncs peers in turn.
+        sync_retries = config.state_sync_retries
+        self._sync_retry_config = RetryConfig(
+            max_attempts=sync_retries + 1,
+            base_delay=config.state_sync_timeout_seconds / (2**sync_retries - 1) if sync_retries > 0 else 0.0,
+            max_delay=config.state_sync_timeout_seconds,
+            jitter=JitterStrategy.FULL,
+            is_retryable=lambda sync_error: isinstance(sync_error, StateSyncNotReadyError)
+            or (isinstance(sync_error, OSError) and not isinstance(sync_error, TimeoutError)),
+        )
 
     async def sync_state_from_workers(self) -> None:
         """Sync state from all workers."""
@@ -91,16 +110,29 @@ class ManagerStateSync:
                 )
 
                 worker_addr = (worker.node.host, worker.node.port)
-                response, _clock = await self._send_tcp(
-                    worker_addr,
-                    "state_sync_request",
-                    request.dump(),
-                    timeout=self._config.state_sync_timeout_seconds,
+
+                async def request_worker_state() -> StateSyncResponse | None:
+                    response, _clock = await self._send_tcp(
+                        worker_addr,
+                        "state_sync_request",
+                        request.dump(),
+                        timeout=self._config.state_sync_timeout_seconds,
+                    )
+                    # send_tcp returns transport errors rather than raising.
+                    if isinstance(response, Exception):
+                        raise response
+                    if not response:
+                        return None
+                    if not (sync_response := StateSyncResponse.load(response)).responder_ready:
+                        raise StateSyncNotReadyError(f"worker {worker_id[:8]}... not ready")
+                    return sync_response
+
+                sync_response = await RetryExecutor(self._sync_retry_config).execute(
+                    request_worker_state, operation_name=f"state_sync_from_worker_{worker_id}"
                 )
 
-                if response and not isinstance(response, Exception):
-                    sync_response = StateSyncResponse.load(response)
-                    if sync_response.worker_state and sync_response.responder_ready:
+                if sync_response is not None:
+                    if sync_response.worker_state:
                         worker_snapshot = sync_response.worker_state
                         if self._state.has_worker(worker_id):
                             worker_reg = self._state.get_worker(worker_id)
@@ -141,8 +173,11 @@ class ManagerStateSync:
                 callback_addr=self._get_job_callback_addr(progress.job_id),
             )
 
-    async def sync_state_from_manager_peers(self, *, force_full: bool = False) -> None:
-        """Sync state from peer managers."""
+    async def sync_state_from_manager_peers(self, *, force_full: bool = False) -> int:
+        """Sync state from peer managers; returns how many peers answered
+        with their state -- what a caller concluding from the cluster's
+        view needs to know it heard a quorum."""
+        peers_answered = 0
         # Snapshot the live set before iterating. Each loop iteration
         # awaits ``send_tcp`` and now also routes through
         # ``_apply_peer_worker_snapshots``, both of which yield to the
@@ -153,7 +188,7 @@ class ManagerStateSync:
         # catches that on the takeover path and the client surfaces
         # it as ``Job cancellation failed: Set changed size during
         # iteration`` — a permanent failure that aborts the request.
-        for peer_addr in list(self._state.get_active_manager_peers()):
+        for peer_addr in sorted(self._state.get_active_manager_peers()):
             try:
                 since_version = -1 if force_full else self._state.state_version
                 request = StateSyncRequest(
@@ -164,18 +199,30 @@ class ManagerStateSync:
                     since_version=since_version,
                 )
 
-                response, _clock = await self._send_tcp(
-                    peer_addr,
-                    "state_sync_request",
-                    request.dump(),
-                    timeout=self._config.state_sync_timeout_seconds,
+                async def request_peer_state() -> StateSyncResponse | None:
+                    response, _clock = await self._send_tcp(
+                        peer_addr,
+                        "state_sync_request",
+                        request.dump(),
+                        timeout=self._config.state_sync_timeout_seconds,
+                    )
+                    # send_tcp returns transport errors rather than raising.
+                    if isinstance(response, Exception):
+                        raise response
+                    if not response:
+                        return None
+                    if not (sync_response := StateSyncResponse.load(response)).responder_ready:
+                        raise StateSyncNotReadyError(f"peer {peer_addr} not ready")
+                    return sync_response
+
+                sync_response = await RetryExecutor(self._sync_retry_config).execute(
+                    request_peer_state, operation_name=f"state_sync_from_peer_{peer_addr}"
                 )
 
-                if response and not isinstance(response, Exception):
-                    sync_response = StateSyncResponse.load(response)
-                    if sync_response.manager_state and sync_response.responder_ready:
+                if sync_response is not None:
+                    if sync_response.manager_state:
                         peer_snapshot = sync_response.manager_state
-                        self._apply_peer_worker_snapshots(peer_snapshot.workers)
+                        await self._apply_peer_worker_snapshots(peer_snapshot.workers)
                         for job_id, fence_token in peer_snapshot.job_fence_tokens.items():
                             leader_id = peer_snapshot.job_leaders.get(job_id)
                             leader_addr = peer_snapshot.job_leader_addrs.get(job_id)
@@ -186,13 +233,18 @@ class ManagerStateSync:
                                 leader_id=leader_id,
                                 leader_addr=tuple(leader_addr),
                                 fencing_token=fence_token,
-                                layer_version=peer_snapshot.job_layer_versions.get(job_id),
                             )
+                        # A peer's snapshot speaks for the jobs it leads;
+                        # its copies of the rest are evidence, merged forward.
                         for sync_msg in peer_snapshot.job_states.values():
                             await self._apply_job_state_sync_message(
                                 sync_msg,
                                 peer_addr,
+                                sender_leads_job=(
+                                    sync_msg.leader_id == sync_response.responder_id
+                                ),
                             )
+                        peers_answered += 1
 
             except Exception as error:
                 await self._logger.log(
@@ -203,6 +255,8 @@ class ManagerStateSync:
                         node_id=self._node_id.short,
                     )
                 )
+
+        return peers_answered
 
     def build_peer_worker_snapshots(self) -> list[WorkerStateSnapshot]:
         """Serialize this manager's worker registry for a peer sync.
@@ -231,7 +285,7 @@ class ManagerStateSync:
             for worker_id, registration in self._state.iter_workers()
         ]
 
-    def _apply_peer_worker_snapshots(
+    async def _apply_peer_worker_snapshots(
         self,
         worker_snapshots: list[WorkerStateSnapshot],
     ) -> None:
@@ -294,7 +348,7 @@ class ManagerStateSync:
                 cluster_id=self._config.cluster_id,
                 environment_id=self._config.environment_id,
             )
-            self._registry.register_worker(registration)
+            await self._registry.register_worker(registration)
 
     async def sync_full_state_from_manager_peers(self) -> None:
         """Force a full peer-manager state sync after leadership changes."""
@@ -364,14 +418,7 @@ class ManagerStateSync:
                     responder_ready=False,
                 ).dump()
 
-            self._task_runner.run(
-                # ``_udp_logger`` is this class's logger; ``_logger``
-                # has never existed in its MRO, so evaluating this
-                # argument raised AttributeError and took the whole
-                # state_sync_request handler with it — peer state sync
-                # answered an error for every request that got past
-                # mTLS validation.
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=f"State sync request from {request.requester_id[:8]}... role={request.requester_role} since_version={request.since_version}",
                     node_host=self._node_host,
@@ -410,7 +457,6 @@ class ManagerStateSync:
                 job_leaders=dict(self._state._job_leaders),
                 job_leader_addrs=dict(self._state._job_leader_addrs),
                 job_fence_tokens=dict(self._state._job_fencing_tokens),
-                job_layer_versions=dict(self._state._job_layer_version),
                 job_states={
                     job.job_id: self._build_job_state_sync_message(job.job_id, job)
                     for job in self._job_manager.iter_jobs()
@@ -425,8 +471,7 @@ class ManagerStateSync:
             ).dump()
 
         except Exception as error:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerWarning(
                     message=f"State sync request failed: {error}",
                     node_host=self._node_host,

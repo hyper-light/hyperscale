@@ -29,24 +29,33 @@ THE TWO FIXES THESE PINS STAND ON (both traced live):
 
 Measured timelines (seed 79/83/89, A=20s B=2s, job timeout 60):
 
-* CLEAN (seed 79): submit 17.945249, A executes [18.0, 38.0], B
-  dispatches ON the completion edge (worker-started 38.0 sample ->
-  B active by 38.25), B executes ~[38.25, 40.25], client observes
-  ``completed`` at 40.025249 — dependency ordering enforced by the
+* CLEAN (seed 79): submit 1.576255, B dispatches ON A's completion
+  edge, client observes ``completed`` at 23.736255 (re-probed
+  2026-10-04; submit 17.945249 and completion 40.025249 before a lone
+  manager led at once) — dependency ordering enforced by the
   edge, not by core contention (2 cores, vus=1 each: cores were free
   for B the whole time A ran).
 * WORKER KILL mid-A (seed 83, kill worker + both executors at 12.0):
-  SWIM death detection inside the [20, 70] host-death bound, the
-  dead-worker path fails A -> the cascade fails B at the job level ->
-  the whole job reaches a LOUD ``failed`` terminal in one sweep.
-* MANAGER RESTART mid-A (seed 89, power loss at 22.0, down 30): gen-2
-  boots 52.0, resumes the persisted submission and re-dispatches A
+  SWIM death detection inside the [20, 70] host-death bound charges A's
+  loss to its retry budget and returns it to PENDING. A datacenter with
+  no workers left is a capacity wait (user decision 2026-10-04: it used
+  to fail every workflow the moment the last worker died): A and B wait
+  for a worker, none joins, and the job's deadline fails the job LOUDLY
+  on the AD-34 grid -- a ``timeout`` terminal, never silence. Traced
+  2026-10-04: the terminal came a full grant late (120.06, past the
+  client's own wait) because the worker's dispatch-time extension
+  request -- a liveness grant with no progress behind it -- was also
+  added to the job's explicit 60s timeout (90s). A job's AD-34 timeout
+  now stretches only for grants earned with progress.
+* MANAGER RESTART mid-A (seed 89, power loss at 7.5, down 30): gen-2
+  boots 37.5, resumes the persisted submission and re-dispatches A
   (at-least-once: the first A completed into the dead manager,
   undeliverable); A's re-run completes, the edge fires on gen-2, B
   dispatches and completes — exactly-once client outcome ACROSS a
   manager reboot with a live dependency graph.
 """
 
+from hyperscale.distributed.env import Env
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.l2_workload_demo import (
     dag_client_entry,
@@ -62,24 +71,36 @@ _SHORT_B_SECONDS = 2.0
 _JOB_TIMEOUT_SECONDS = 60.0
 
 _CLEAN_SEED = 79
-# Probed: A executes [18.0, 38.0]; B rides the completion edge and the
-# client sees completed at 40.025249 (= A-drain + B duration + push).
-_CLEAN_COMPLETION = 40.025249
-_CLEAN_COMPLETION_CEILING = 42.0
+# Probed 2026-10-04: submit 1.576255, A executes from 1.75; B rides the
+# completion edge and the client sees completed at 23.736255 (= A-drain +
+# B duration + push), 22.16 after submission (22.08 when submission was
+# 17.95, while a lone manager waited out a full pre-vote and vote wait
+# for a majority its own vote already made). The ceiling keeps the
+# original margin over the measured instant.
+_CLEAN_COMPLETION = 23.736255
+_CLEAN_COMPLETION_CEILING = _CLEAN_COMPLETION + 1.974751
+
+# Every simulated message's delivery time.
+_LINK_LATENCY_SECONDS = 0.01
 
 _KILL_SEED = 83
 _KILL_AT = 12.0
 _RESTART_SEED = 89
-_RESTART_AT = 22.0
+# Four seconds into A (A starts at 3.5 on seed 89, probed 2026-10-04 --
+# 18.0 before a lone manager led at once), as before: the first A then
+# finishes into the dead manager and stays in the worker's active set
+# while its undeliverable result is retried (until 47.25), so gen-2's
+# re-dispatch overlaps it.
+_RESTART_AT = 7.5
 _RESTART_DOWN_SECONDS = 30.0
-_GEN2_BOOT = _RESTART_AT + _RESTART_DOWN_SECONDS  # 52.0
+_GEN2_BOOT = _RESTART_AT + _RESTART_DOWN_SECONDS  # 37.5
 
 
 def _build_dag_topology(
     seed: int, ceiling: float, wait_timeout_seconds: float
 ) -> SimulationCoordinator:
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=ceiling, seed=seed
+        latency=_LINK_LATENCY_SECONDS, max_virtual_time=ceiling, seed=seed
     )
     coordinator.add_process(
         "manager", manager_entry, "sim-mgr", 9000, 9001, "sim-dc"
@@ -193,11 +214,11 @@ def test_clean_dag_is_replay_deterministic():
     assert _run_clean_dag() == _run_clean_dag()
 
 
-def test_worker_kill_mid_dependency_cascade_fails_job_loudly():
-    """A fails on worker death inside the detection bound; the cascade
-    must fail B at the JOB level in the same sweep — a LOUD ``failed``
-    terminal, never a strand to AD-34 for work that deterministically
-    cannot run."""
+def test_worker_kill_mid_dependency_waits_for_workers_until_the_deadline():
+    """The only worker dies mid-A: A's loss is detected inside the
+    detection bound and A goes back to PENDING. With no worker left the
+    job waits for one, as for any capacity, and its deadline ends it
+    LOUDLY: a ``timeout`` terminal on the first AD-34 check past it."""
     results = _run_dag_worker_kill()
     client_log = results["client"]
 
@@ -214,13 +235,20 @@ def test_worker_kill_mid_dependency_cascade_fails_job_loudly():
         f"design bound: {manager_log}"
     )
 
+    submitted = [entry for entry in client_log if entry[0] == "job-submitted"]
+    assert len(submitted) == 1, client_log
     finished = [entry for entry in client_log if entry[0] == "job-finished"]
     assert len(finished) == 1, client_log
-    assert finished[0][1] == "failed", client_log
-    # The terminal rides death detection (+ failure sweep), never the
-    # AD-34 job timeout: it must land inside the detection bracket's
-    # tail, well before submit + 60s + a 30s tick could fire.
-    assert _KILL_AT + 20.0 < finished[0][2] <= _KILL_AT + 70.0, client_log
+    assert finished[0][1] == "timeout", client_log
+    # The deadline fails the job on the first AD-34 timeout check past it;
+    # the checks run every JOB_TIMEOUT_CHECK_INTERVAL, so that check lands
+    # within one interval of the deadline.
+    deadline = submitted[0][1] + _JOB_TIMEOUT_SECONDS
+    assert (
+        deadline
+        < finished[0][2]
+        <= deadline + Env().JOB_TIMEOUT_CHECK_INTERVAL + _LINK_LATENCY_SECONDS
+    ), client_log
 
     assert JobStatusOracle().check_client_log(client_log) == [], client_log
     trace_oracle = ClusterTraceOracle(

@@ -42,6 +42,7 @@ from hyperscale.distributed.jobs.logging_models import (
 from hyperscale.logging import Logger
 
 from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.models import NodeInfo
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -104,6 +105,21 @@ class WorkerPool:
         # Worker storage - node_id -> WorkerStatus
         self._workers: dict[str, WorkerStatus] = {}
 
+        # Cores reserved per dispatch, per worker: dispatch (sub-workflow
+        # token) -> (job, cores, the worker's core availability version
+        # once it allocated them, or None until its ack says). Every report
+        # of a worker's free cores -- heartbeat, progress, result -- carries
+        # that version, so a reservation stands exactly until the free
+        # count applied here reflects its dispatch: a report at or past the
+        # version it was allocated at (running or already finished), or
+        # one listing or reporting on the dispatch. Or until the dispatch
+        # fails, the worker re-registers or leaves, or its job ends here.
+        # ``WorkerStatus.reserved_cores`` is their sum.
+        self._dispatch_reservations: dict[str, dict[str, tuple[str, int, int | None]]] = {}
+        # Per worker, the version of the free count applied last: a report
+        # older than it (reordered in flight) never overwrites it.
+        self._applied_cores_versions: dict[str, int] = {}
+
         # Three-signal health state tracking (AD-19)
         self._worker_health: dict[str, WorkerHealthState] = {}
         self._health_config = WorkerHealthConfig()
@@ -126,6 +142,13 @@ class WorkerPool:
 
         # Condition for waiting on cores (uses allocation lock for atomic wait)
         self._cores_condition = asyncio.Condition(self._allocation_lock)
+
+        # Moves, under the condition, with every notify of it. A dispatcher
+        # that reads it before an allocation attempt waits for it to move
+        # (``wait_for_capacity_change``), not for cores to exist: a change
+        # landing between the attempt and the wait is never lost, and cores
+        # the attempt could not use never wake it in a loop.
+        self.capacity_generation: int = 0
 
     # =========================================================================
     # Worker Registration
@@ -158,6 +181,8 @@ class WorkerPool:
             stale_node_id = self._addr_to_worker.get(new_addr)
             if stale_node_id is not None and stale_node_id != node_id:
                 self._workers.pop(stale_node_id, None)
+                self._dispatch_reservations.pop(stale_node_id, None)
+                self._applied_cores_versions.pop(stale_node_id, None)
                 self._worker_health.pop(stale_node_id, None)
                 self._dispatch_routing.pop(stale_node_id, None)
                 self._drain_intents.pop(stale_node_id, None)
@@ -178,7 +203,11 @@ class WorkerPool:
                 worker.last_seen = _DEFAULT_CLOCK.monotonic()
                 worker.total_cores = registration.total_cores or 0
                 worker.available_cores = registration.available_cores or 0
+                # A (re-)registration reports from scratch: nothing it has
+                # not seen is in flight to it any more.
                 worker.reserved_cores = 0
+                self._dispatch_reservations.pop(node_id, None)
+                self._applied_cores_versions.pop(node_id, None)
                 worker.health = (
                     WorkerState.DRAINING if drain_intended else WorkerState.HEALTHY
                 )
@@ -242,6 +271,7 @@ class WorkerPool:
 
         # Signal outside registration lock to avoid nested lock acquisition
         async with self._cores_condition:
+            self.capacity_generation += 1
             self._cores_condition.notify_all()
 
         return worker
@@ -259,6 +289,8 @@ class WorkerPool:
                 return False
 
             # Remove health state tracking
+            self._dispatch_reservations.pop(node_id, None)
+            self._applied_cores_versions.pop(node_id, None)
             self._worker_health.pop(node_id, None)
             self._dispatch_routing.pop(node_id, None)
             self._drain_intents.pop(node_id, None)
@@ -353,6 +385,7 @@ class WorkerPool:
                 marked_worker_ids.add(node_id)
 
             if marked_worker_ids:
+                self.capacity_generation += 1
                 self._cores_condition.notify_all()
 
         return marked_worker_ids
@@ -753,7 +786,10 @@ class WorkerPool:
             ):
                 return True
 
-            was_healthy = self.is_worker_healthy(node_id)
+            # Allocation selects workers by health bucket, so "may take
+            # work" is the bucket, not bare health: an overloaded worker is
+            # healthy yet never selected.
+            was_selectable = self.get_worker_health_bucket(node_id) != "UNHEALTHY"
             drain_intended = self.is_worker_drain_intended(node_id)
             worker.heartbeat = heartbeat
             worker.last_seen = _DEFAULT_CLOCK.monotonic()
@@ -765,35 +801,49 @@ class WorkerPool:
                 except ValueError:
                     worker.health = WorkerState.DEGRADED
 
-            old_available = worker.available_cores
-            worker.available_cores = heartbeat.available_cores
+            # Against what was free to allocate: the reservations this
+            # heartbeat clears free cores too.
+            old_unreserved_cores = worker.available_cores - worker.reserved_cores
             worker.total_cores = heartbeat.available_cores + len(
                 heartbeat.active_workflows
             )
-
-            worker.reserved_cores = 0
+            reservations = self._dispatch_reservations.get(node_id, {})
+            # A heartbeat older than the free count applied last (reordered
+            # behind a progress report or result) does not overwrite it.
+            if heartbeat.cores_version >= self._applied_cores_versions.get(node_id, 0):
+                worker.available_cores = heartbeat.available_cores
+                self._applied_cores_versions[node_id] = heartbeat.cores_version
+            applied_version = self._applied_cores_versions.get(node_id, 0)
+            # Dispatches the applied count reflects: allocated at or before
+            # its version, or listed by this heartbeat (allocated before it,
+            # so before anything newer too).
+            for dispatch_token in [
+                dispatch_token
+                for dispatch_token, (_job_id, _cores, allocated_at_version) in reservations.items()
+                if dispatch_token in heartbeat.active_workflows
+                or (allocated_at_version is not None and allocated_at_version <= applied_version)
+            ]:
+                del reservations[dispatch_token]
+            worker.reserved_cores = sum(cores for _job_id, cores, _version in reservations.values())
 
             worker.overload_state = getattr(
                 heartbeat, "health_overload_state", "healthy"
             )
 
-            if worker.available_cores > old_available:
+            if worker.available_cores - worker.reserved_cores > old_unreserved_cores:
+                self.capacity_generation += 1
                 self._cores_condition.notify_all()
 
             health_state = self._worker_health.get(node_id)
             if health_state:
                 health_state.update_liveness(success=True)
 
-                health_state.update_readiness(
-                    accepting=(
-                        not drain_intended
-                        and heartbeat.health_accepting_work
-                        and worker.available_cores > 0
-                    ),
-                    capacity=0 if drain_intended else worker.available_cores,
+                self._refresh_readiness(
+                    health_state, drain_intended, heartbeat.health_accepting_work, worker.available_cores
                 )
 
-            if not was_healthy and self.is_worker_healthy(node_id):
+            if not was_selectable and self.get_worker_health_bucket(node_id) != "UNHEALTHY":
+                self.capacity_generation += 1
                 self._cores_condition.notify_all()
 
         return True
@@ -803,11 +853,14 @@ class WorkerPool:
     # =========================================================================
 
     def get_total_available_cores(self) -> int:
-        """Get total available cores across all healthy workers."""
+        """Get the free cores allocation can take now: those of every
+        worker in a health bucket it selects from (healthy, busy or
+        degraded). A healthy but overloaded worker's free cores are not
+        counted -- ``allocate_cores`` never selects it."""
         total = sum(
             worker.available_cores - worker.reserved_cores
             for worker in self._workers.values()
-            if self.is_worker_healthy(worker.node_id)
+            if self.get_worker_health_bucket(worker.node_id) != "UNHEALTHY"
         )
 
         return total
@@ -815,97 +868,65 @@ class WorkerPool:
     async def allocate_cores(
         self,
         cores_needed: int,
-        timeout: float = 30.0,
         excluded_worker_ids: set[str] | None = None,
+        *,
+        job_id: str,
+        dispatch_token_for: Callable[[str], str],
     ) -> list[tuple[str, int]] | None:
         """
-        Allocate cores from the worker pool.
+        Allocate cores from the worker pool, now.
 
-        Selects workers to satisfy the core requirement and reserves
-        the cores. Returns list of (worker_node_id, cores_allocated) tuples.
+        Selects workers allocation may use -- by health bucket, never one in
+        ``excluded_worker_ids`` -- and reserves up to ``cores_needed`` of
+        their free cores. Returns list of (worker_node_id, cores_allocated)
+        tuples.
+
+        One attempt, never a wait: a caller that got nothing waits for the
+        pool to change (``wait_for_capacity_change``) outside whatever it
+        holds. Fewer cores than ``cores_needed`` is an allocation, not a
+        failure: the caller's share was sized against every selectable
+        worker's free cores, which a heartbeat can shrink and an exclusion
+        can put out of its reach -- holding out for the share starved it
+        while the cores it could use sat idle.
 
         Thread-safe: uses allocation lock.
 
         Args:
-            cores_needed: Total cores required
-            timeout: Max seconds to wait for cores to become available
+            cores_needed: Most cores to reserve
+            excluded_worker_ids: Workers this allocation must not use
+            job_id: The job the dispatches belong to
+            dispatch_token_for: The dispatch (sub-workflow token) a worker's
+                share will be sent as; each share is reserved under it
 
         Returns:
-            List of (node_id, cores) tuples, or None if timeout
+            List of (node_id, cores) tuples reserving at least one core, or
+            None when no worker it may use has a free core
         """
+        async with self._cores_condition:
+            allocations = self._select_workers_for_allocation(
+                cores_needed,
+                excluded_worker_ids=excluded_worker_ids,
+            )
+            verified_allocations: list[tuple[str, int]] = []
 
-        start_time = _DEFAULT_CLOCK.monotonic()
+            for node_id, cores in allocations:
+                worker = self._workers.get(node_id)
+                if worker is None:
+                    continue
 
-        while True:
-            elapsed = _DEFAULT_CLOCK.monotonic() - start_time
-            if elapsed >= timeout:
-                return None
+                actual_available = worker.available_cores - worker.reserved_cores
+                if actual_available <= 0:
+                    continue
 
-            async with self._cores_condition:
-                allocations = self._select_workers_for_allocation(
-                    cores_needed,
-                    excluded_worker_ids=excluded_worker_ids,
-                )
-                total_allocated = sum(cores for _, cores in allocations)
+                actual_cores = min(cores, actual_available)
+                worker.reserved_cores += actual_cores
+                reservations = self._dispatch_reservations.setdefault(node_id, {})
+                dispatch_token = dispatch_token_for(node_id)
+                _reserved_job_id, already_reserved, _version = reservations.get(dispatch_token, (job_id, 0, None))
+                reservations[dispatch_token] = (job_id, already_reserved + actual_cores, None)
+                verified_allocations.append((node_id, actual_cores))
 
-                if total_allocated >= cores_needed:
-                    verified_allocations: list[tuple[str, int]] = []
-                    verified_total = 0
-
-                    for node_id, cores in allocations:
-                        worker = self._workers.get(node_id)
-                        if worker is None:
-                            continue
-
-                        actual_available = (
-                            worker.available_cores - worker.reserved_cores
-                        )
-                        if actual_available <= 0:
-                            continue
-
-                        actual_cores = min(cores, actual_available)
-                        worker.reserved_cores += actual_cores
-                        verified_allocations.append((node_id, actual_cores))
-                        verified_total += actual_cores
-
-                    if verified_total >= cores_needed:
-                        return verified_allocations
-
-                    for node_id, cores in verified_allocations:
-                        worker = self._workers.get(node_id)
-                        if worker:
-                            worker.reserved_cores = max(
-                                0, worker.reserved_cores - cores
-                            )
-
-                remaining = timeout - elapsed
-                wait_timeout = min(5.0, remaining)
-                routing_ready_delay = self._next_dispatch_routing_ready_delay()
-                if routing_ready_delay is not None:
-                    wait_timeout = min(wait_timeout, routing_ready_delay)
-
-                # Progress floor. A routing cooldown's remaining time can
-                # be a positive sub-quantum float artifact (observed:
-                # 1.6e-11s — ``suspended_until - now`` where the deadline
-                # was composed on a quantized clock): ``is_routable`` is
-                # still False, so selection keeps refusing the worker,
-                # and waiting on the artifact cannot advance a quantized
-                # virtual clock (the re-armed timer lands on the SAME
-                # instant — a hard allocator livelock under SIM, caught
-                # by the run_window spin guard) while on a real host it
-                # degenerates into a 100%-CPU micro-spin until the wall
-                # clock crawls past the boundary. Flooring the wait
-                # guarantees the clock moves every iteration; genuine
-                # cooldown waits (>= 0.25s base) are unaffected.
-                wait_timeout = max(wait_timeout, 0.001)
-
-                try:
-                    await _DEFAULT_CLOCK.wait_for(
-                        self._cores_condition.wait(),
-                        timeout=wait_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+            return verified_allocations or None
 
     def _select_workers_for_allocation(
         self,
@@ -957,12 +978,12 @@ class WorkerPool:
     async def release_cores(
         self,
         node_id: str,
-        cores: int,
+        dispatch_token: str,
     ) -> bool:
         """
-        Release reserved cores back to a worker.
+        Release a dispatch's reserved cores back to its worker: the
+        dispatch was not taken (or never sent).
 
-        Called when a dispatch fails or workflow completes.
         Thread-safe: uses allocation lock.
         """
         async with self._cores_condition:
@@ -970,33 +991,13 @@ class WorkerPool:
             if not worker:
                 return False
 
+            _job_id, cores, _version = self._dispatch_reservations.get(node_id, {}).pop(
+                dispatch_token, ("", 0, None)
+            )
             worker.reserved_cores = max(0, worker.reserved_cores - cores)
 
+            self.capacity_generation += 1
             self._cores_condition.notify_all()
-
-            return True
-
-    async def confirm_allocation(
-        self,
-        node_id: str,
-        cores: int,
-    ) -> bool:
-        """
-        Confirm that an allocation was accepted by the worker.
-
-        This converts reserved cores to actually-in-use cores.
-        The next heartbeat from the worker will provide authoritative counts.
-
-        Thread-safe: uses allocation lock.
-        """
-        async with self._cores_condition:
-            worker = self._workers.get(node_id)
-            if not worker:
-                return False
-
-            # Move from reserved to in-use (reduce available)
-            worker.reserved_cores = max(0, worker.reserved_cores - cores)
-            worker.available_cores = max(0, worker.available_cores - cores)
 
             return True
 
@@ -1004,13 +1005,17 @@ class WorkerPool:
         self,
         node_id: str,
         worker_available_cores: int,
+        dispatch_token: str,
+        cores_version: int,
     ) -> bool:
         """
         Update worker's available cores from workflow progress report.
 
-        Progress reports from workers include their current available_cores,
-        which is more recent than heartbeat data. This method updates the
-        worker's availability and signals if cores became available.
+        Progress reports and results from workers include their current
+        available_cores, which is more recent than heartbeat data. This
+        method updates the worker's availability -- clearing the reservation
+        of the dispatch the report is for -- and signals if cores became
+        available.
 
         Thread-safe: uses allocation lock.
 
@@ -1021,44 +1026,191 @@ class WorkerPool:
             if not worker:
                 return False
 
-            old_available = worker.available_cores
-            worker.available_cores = worker_available_cores
+            was_selectable = self.get_worker_health_bucket(node_id) != "UNHEALTHY"
+            # Against what was free to allocate: the reservation this
+            # report clears frees cores too.
+            old_unreserved_cores = worker.available_cores - worker.reserved_cores
+            self._apply_reported_cores(node_id, worker, worker_available_cores, dispatch_token, cores_version)
 
-            worker.reserved_cores = 0
+            # AD-19 readiness follows the free count, as a heartbeat sets it:
+            # a worker busy at its last heartbeat read not ready -- never
+            # selected -- after a result freed its cores, its cores idle
+            # until its next heartbeat reached this manager.
+            health_state = self._worker_health.get(node_id)
+            if health_state is not None and worker.heartbeat is not None:
+                self._refresh_readiness(
+                    health_state,
+                    self.is_worker_drain_intended(node_id),
+                    worker.heartbeat.health_accepting_work,
+                    worker.available_cores,
+                )
 
-            if worker.available_cores > old_available:
+            if worker.available_cores - worker.reserved_cores > old_unreserved_cores or (
+                not was_selectable and self.get_worker_health_bucket(node_id) != "UNHEALTHY"
+            ):
+                self.capacity_generation += 1
                 self._cores_condition.notify_all()
 
             return True
+
+    def _apply_reported_cores(
+        self,
+        node_id: str,
+        worker: "WorkerStatus",
+        worker_available_cores: int,
+        dispatch_token: str,
+        cores_version: int,
+    ) -> None:
+        """Take a worker's reported free cores and clear the reservations
+        its report reflects (held under the allocation lock)."""
+        # A report older than the free count applied last (reordered in
+        # flight) does not overwrite it.
+        if cores_version >= self._applied_cores_versions.get(node_id, 0):
+            worker.available_cores = worker_available_cores
+            self._applied_cores_versions[node_id] = cores_version
+        reservations = self._dispatch_reservations.get(node_id, {})
+        # The report's own dispatch is reflected (it reports after its
+        # allocation), and so is every dispatch allocated at or before the
+        # applied version; the rest are still in flight.
+        reservations.pop(dispatch_token, None)
+        for reflected_token in self._reflected_reservation_tokens(
+            reservations, self._applied_cores_versions.get(node_id, 0)
+        ):
+            del reservations[reflected_token]
+        worker.reserved_cores = self._reserved_cores(reservations)
+
+    @staticmethod
+    def _reflected_reservation_tokens(
+        reservations: dict[str, tuple[str, int, int | None]],
+        applied_version: int,
+    ) -> list[str]:
+        """The reservations a free count at ``applied_version`` already
+        reflects: those taken at or before it (one not yet taken has no
+        version)."""
+        return [
+            reflected_token
+            for reflected_token, (_job_id, _cores, allocated_at_version) in reservations.items()
+            if WorkerPool._is_reflected(allocated_at_version, applied_version)
+        ]
+
+    @staticmethod
+    def _is_reflected(allocated_at_version: int | None, applied_version: int) -> bool:
+        """Whether a free count at ``applied_version`` reflects a dispatch
+        the worker took at ``allocated_at_version`` (None: not taken yet)."""
+        return allocated_at_version is not None and allocated_at_version <= applied_version
+
+    @staticmethod
+    def _reserved_cores(reservations: dict[str, tuple[str, int, int | None]]) -> int:
+        """The cores a worker's outstanding reservations hold."""
+        return sum(cores for _job_id, cores, _version in reservations.values())
+
+    @staticmethod
+    def _refresh_readiness(
+        health_state: "WorkerHealthState",
+        drain_intended: bool,
+        accepting_work: bool,
+        available_cores: int,
+    ) -> None:
+        """AD-19 readiness from a worker's free cores and its own say on
+        taking work: no capacity, so not accepting, while it drains."""
+        capacity = 0 if drain_intended else available_cores
+        health_state.update_readiness(accepting=accepting_work and capacity > 0, capacity=capacity)
+
+    async def record_dispatch_taken(self, node_id: str, dispatch_token: str, allocated_at_version: int) -> None:
+        """The worker took ``dispatch_token``, allocating its cores at core
+        availability version ``allocated_at_version``: any free count at
+        or past that version reflects them. Its reservation stands until
+        the count applied here does -- at once, if it already does."""
+        async with self._cores_condition:
+            reservations = self._dispatch_reservations.get(node_id, {})
+            if (reservation := reservations.get(dispatch_token)) is None:
+                return
+            reserved_job_id, cores, _version = reservation
+            if allocated_at_version <= self._applied_cores_versions.get(node_id, 0):
+                del reservations[dispatch_token]
+                if (worker := self._workers.get(node_id)) is not None:
+                    worker.reserved_cores = max(0, worker.reserved_cores - cores)
+                    self.capacity_generation += 1
+                    self._cores_condition.notify_all()
+                return
+            reservations[dispatch_token] = (reserved_job_id, cores, allocated_at_version)
+
+    async def release_job_reservations(self, job_id: str) -> int:
+        """Release every reservation still held for ``job_id``'s dispatches
+        once the job has ended here -- one whose dispatch no report from
+        this worker ever showed (its result went to another manager, say).
+        Returns how many were released."""
+        released = 0
+        async with self._cores_condition:
+            for node_id, reservations in self._dispatch_reservations.items():
+                job_tokens = [
+                    token for token, (reserved_job_id, _cores, _version) in reservations.items() if reserved_job_id == job_id
+                ]
+                if not job_tokens:
+                    continue
+                for dispatch_token in job_tokens:
+                    del reservations[dispatch_token]
+                released += len(job_tokens)
+                if (worker := self._workers.get(node_id)) is not None:
+                    worker.reserved_cores = sum(cores for _job_id, cores, _version in reservations.values())
+            if released:
+                self.capacity_generation += 1
+                self._cores_condition.notify_all()
+        return released
 
     # =========================================================================
     # Wait Helpers
     # =========================================================================
 
-    async def wait_for_cores(self, timeout: float = 30.0) -> bool:
+    async def wait_for_capacity_change(
+        self,
+        observed_generation: int,
+        timeout: float,
+    ) -> None:
         """
-        Wait for cores to become available.
+        Wait until the pool's capacity may have changed since
+        ``capacity_generation`` read ``observed_generation``.
 
-        Returns True if cores became available, False on timeout.
+        Returns at once when it has already moved, else on the next change,
+        when the soonest dispatch-routing cooldown ends (a worker becomes
+        routable again with no notify), or after ``timeout`` -- whichever
+        comes first. Read the generation BEFORE the allocation attempt this
+        waits out: a change during or after the attempt then ends the wait,
+        and none is lost. Unlike waiting for free cores, this never returns
+        at once over cores the attempt could not use (excluded or
+        unselectable workers), so a dispatch loop built on it cannot spin.
         """
-        try:
-            async with asyncio.timeout(timeout):
-                async with self._cores_condition:
-                    while True:
-                        total_available = sum(
-                            worker.available_cores - worker.reserved_cores
-                            for worker in self._workers.values()
-                            if self.is_worker_healthy(worker.node_id)
-                        )
-                        if total_available > 0:
-                            return True
+        async with self._cores_condition:
+            if self.capacity_generation != observed_generation:
+                return
 
-                        await self._cores_condition.wait()
-        except asyncio.TimeoutError:
-            return False
+            wait_timeout = timeout
+            routing_ready_delay = self._next_dispatch_routing_ready_delay()
+            if routing_ready_delay is not None:
+                wait_timeout = min(wait_timeout, routing_ready_delay)
+
+            # Progress floor. A routing cooldown's remaining time can be a
+            # positive sub-quantum float artifact of deadline arithmetic on
+            # a quantized clock (observed: 1.6e-11s): waiting on it re-arms
+            # a timer at the SAME virtual instant -- a livelock under SIM, a
+            # 100%-CPU micro-spin on a real host. Flooring the wait
+            # guarantees the clock moves; genuine cooldown waits (>= 0.25s
+            # base) are unaffected.
+            wait_timeout = max(wait_timeout, 0.001)
+
+            try:
+                await _DEFAULT_CLOCK.wait_for(
+                    self._cores_condition.wait(),
+                    timeout=wait_timeout,
+                )
+            except asyncio.TimeoutError:
+                # The wait is bounded by design: on expiry the caller
+                # re-reads the pool, as on a change.
+                return
 
     async def notify_cores_available(self) -> None:
         async with self._cores_condition:
+            self.capacity_generation += 1
             self._cores_condition.notify_all()
 
     # =========================================================================
@@ -1131,7 +1283,6 @@ class WorkerPool:
                 existing.last_seen = _DEFAULT_CLOCK.monotonic()
                 return True
 
-            from hyperscale.distributed.models import NodeInfo
 
             node_info = NodeInfo(
                 node_id=worker_id,

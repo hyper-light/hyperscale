@@ -65,6 +65,8 @@ def _make_receive_server(
         "rejected": 0,
     }
     server._is_duplicate_message = lambda addr, data: False
+    # Built when the probe cycle starts; this server never starts one.
+    server._probe_budget = None
 
     async def check_rate_limit(
         addr: tuple[str, int],

@@ -99,7 +99,6 @@ class TestWALWriterBatching:
     async def test_batch_writes(self, temp_wal_directory: str):
         wal_path = Path(temp_wal_directory) / "test.wal"
         config = WALWriterConfig(
-            batch_timeout_microseconds=10000,
             batch_max_entries=50,
         )
         writer = WALWriter(path=wal_path, config=config)
@@ -132,7 +131,6 @@ class TestWALWriterBatching:
     async def test_batch_max_bytes_triggers_commit(self, temp_wal_directory: str):
         wal_path = Path(temp_wal_directory) / "test.wal"
         config = WALWriterConfig(
-            batch_timeout_microseconds=1000000,
             batch_max_entries=1000,
             batch_max_bytes=1024,
         )
@@ -310,7 +308,6 @@ class TestWALWriterFutureResolution:
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
         config = WALWriterConfig(
-            batch_timeout_microseconds=100000,
             batch_max_entries=10,
         )
         writer = WALWriter(path=wal_path, config=config)
@@ -346,7 +343,7 @@ class TestWALWriterFutureResolution:
         temp_wal_directory: str,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
-        config = WALWriterConfig(batch_timeout_microseconds=100000)
+        config = WALWriterConfig()
         writer = WALWriter(path=wal_path, config=config)
 
         await writer.start()
@@ -467,7 +464,6 @@ class TestWALWriterBackpressure:
         config = WALWriterConfig(
             queue_max_size=100,
             throttle_threshold=0.70,
-            batch_timeout_microseconds=1000000,
         )
         writer = WALWriter(path=wal_path, config=config)
 
@@ -496,7 +492,6 @@ class TestWALWriterBackpressure:
             queue_max_size=100,
             throttle_threshold=0.70,
             batch_threshold=0.85,
-            batch_timeout_microseconds=1000000,
         )
         writer = WALWriter(path=wal_path, config=config)
 
@@ -524,9 +519,7 @@ class TestWALWriterBackpressure:
         config = WALWriterConfig(
             queue_max_size=100,
             overflow_size=10,
-            preserve_newest=False,
             reject_threshold=0.95,
-            batch_timeout_microseconds=10000000,
         )
         writer = WALWriter(path=wal_path, config=config)
 
@@ -559,7 +552,6 @@ class TestWALWriterBackpressure:
         config = WALWriterConfig(
             queue_max_size=50,
             overflow_size=20,
-            batch_timeout_microseconds=10000000,
         )
         writer = WALWriter(path=wal_path, config=config)
 
@@ -600,7 +592,6 @@ class TestWALWriterStateChangeCallback:
         config = WALWriterConfig(
             queue_max_size=50,
             throttle_threshold=0.50,
-            batch_timeout_microseconds=10000000,
         )
         writer = WALWriter(
             path=wal_path,
@@ -695,7 +686,6 @@ class TestWALWriterMetrics:
     async def test_peak_batch_size_tracked(self, temp_wal_directory: str):
         wal_path = Path(temp_wal_directory) / "test.wal"
         config = WALWriterConfig(
-            batch_timeout_microseconds=100000,
             batch_max_entries=50,
         )
         writer = WALWriter(path=wal_path, config=config)
@@ -745,7 +735,7 @@ class TestWALWriterErrorRecovery:
     @pytest.mark.asyncio
     async def test_pending_requests_failed_on_stop(self, temp_wal_directory: str):
         wal_path = Path(temp_wal_directory) / "test.wal"
-        config = WALWriterConfig(batch_timeout_microseconds=10000000)
+        config = WALWriterConfig()
         writer = WALWriter(path=wal_path, config=config)
 
         await writer.start()

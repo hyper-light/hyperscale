@@ -1,6 +1,7 @@
 import asyncio
 import socket
 from asyncio.sslproto import SSLProtocol
+from ssl import SSLContext
 from typing import Callable, Optional
 
 from hyperscale.core.engines.client.http3.protocols.quic.h3.connection import H3_ALPN
@@ -29,6 +30,7 @@ class UDPConnection:
         configuration: Optional[QuicConfiguration] = None,
         stream_handler: Optional[QuicStreamHandler] = None,
         local_port: int = 0,
+        ssl: Optional[SSLContext] = None,
     ) -> QuicProtocol:
         
         _, _, _, _, address = socket_config
@@ -41,7 +43,14 @@ class UDPConnection:
         if not hasattr(socket, "IPPROTO_IPV6"):
             socket.IPPROTO_IPV6 = 41
 
-        configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
+        # The engine's TLS context decides whether the server's certificate
+        # is checked, as it does for every other engine: QUIC takes its
+        # verify mode. Without one, QUIC's default checks it.
+        configuration = QuicConfiguration(
+            is_client=True,
+            alpn_protocols=H3_ALPN,
+            verify_mode=ssl.verify_mode if ssl is not None else None,
+        )
 
         # prepare QUIC connection
         if configuration.server_name is None:

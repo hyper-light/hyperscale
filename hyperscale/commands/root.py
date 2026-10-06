@@ -9,9 +9,14 @@ from .cli import (
     CLI,
     CLIStyle,
 )
+from .cluster import cluster
+from .job import job
 from .join import join
+from .membership import membership
 from .new import new
 from .ping import ping
+from .remove import remove
+from .resize import resize
 from .run import run
 
 
@@ -65,9 +70,14 @@ async def create_header():
     return await terminal.render_once()
 
 @CLI.root(
+    cluster,
+    job,
     join,
+    membership,
     new,
     ping,
+    remove,
+    resize,
     run,
     global_styles=CLIStyle(
         header=create_header,

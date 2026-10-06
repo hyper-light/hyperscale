@@ -14,37 +14,18 @@ _DEFAULT_CLOCK: Clock = RealClock()
 class NetworkCoordinateEngine:
     def __init__(
         self,
-        config: VivaldiConfig | None = None,
-        dimensions: int = 8,
-        ce: float = 0.25,
-        error_decay: float = 0.25,
-        gravity: float = 0.01,
-        height_adjustment: float = 0.25,
-        adjustment_smoothing: float = 0.05,
-        min_error: float = 0.05,
-        max_error: float = 10.0,
+        config: VivaldiConfig,
         *,
         clock: Clock | None = None,
     ) -> None:
         self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
-        # Use config if provided, otherwise use individual parameters
-        self._config = config or VivaldiConfig(
-            dimensions=dimensions,
-            ce=ce,
-            error_decay=error_decay,
-            gravity=gravity,
-            height_adjustment=height_adjustment,
-            adjustment_smoothing=adjustment_smoothing,
-            min_error=min_error,
-            max_error=max_error,
-        )
+        self._config = config
         self._dimensions = self._config.dimensions
         self._ce = self._config.ce
         self._error_decay = self._config.error_decay
         self._gravity = self._config.gravity
         self._height_adjustment = self._config.height_adjustment
         self._adjustment_smoothing = self._config.adjustment_smoothing
-        self._min_error = self._config.min_error
         self._max_error = self._config.max_error
         self._coordinate = NetworkCoordinate(
             vec=[0.0 for _ in range(self._dimensions)],
@@ -95,9 +76,7 @@ class NetworkCoordinateEngine:
         new_error = self._coordinate.error + self._error_decay * (
             abs(diff) - self._coordinate.error
         )
-        self._coordinate.error = self._clamp(
-            new_error, self._min_error, self._max_error
-        )
+        self._coordinate.error = self._clamp(new_error, 0.0, self._max_error)
         self._coordinate.updated_at = self._clock.monotonic()
         self._coordinate.sample_count += 1
 
@@ -144,37 +123,33 @@ class NetworkCoordinateEngine:
 
     def estimate_rtt_ucb_ms(
         self,
-        local: NetworkCoordinate | None,
-        remote: NetworkCoordinate | None,
+        local: NetworkCoordinate,
+        remote: NetworkCoordinate,
     ) -> float:
         """
         Estimate RTT with upper confidence bound (AD-35 Task 12.1.4).
 
         Uses Vivaldi distance plus a safety margin based on coordinate error.
-        Falls back to conservative defaults when coordinates are unavailable.
+        There is no estimate without both coordinates: a caller missing one
+        has no evidence and decides for itself what that means.
 
         Formula: rtt_ucb = clamp(rtt_hat + K_SIGMA * sigma, RTT_MIN, RTT_MAX)
 
         Args:
-            local: Local node coordinate (or None for default)
-            remote: Remote node coordinate (or None for default)
+            local: Local node coordinate
+            remote: Remote node coordinate
 
         Returns:
             RTT upper confidence bound in milliseconds
         """
-        if local is None or remote is None:
-            rtt_hat_ms = self._config.rtt_default_ms
-            sigma_ms = self._config.sigma_default_ms
-        else:
-            # Estimate RTT from coordinate distance (in seconds, convert to ms)
-            rtt_hat_ms = self.estimate_rtt_ms(local, remote)
-            # Sigma is combined error of both coordinates (in seconds → ms)
-            combined_error = (local.error + remote.error) * 1000.0
-            sigma_ms = self._clamp(
-                combined_error,
-                self._config.sigma_min_ms,
-                self._config.sigma_max_ms,
-            )
+        # Estimate RTT from coordinate distance (in seconds, convert to ms)
+        rtt_hat_ms = self.estimate_rtt_ms(local, remote)
+        # Sigma is combined error of both coordinates (in seconds → ms)
+        sigma_ms = self._clamp(
+            (local.error + remote.error) * 1000.0,
+            self._config.sigma_min_ms,
+            self._config.sigma_max_ms,
+        )
 
         # Apply UCB formula: rtt_hat + K_SIGMA * sigma
         rtt_ucb = rtt_hat_ms + self._config.k_sigma * sigma_ms
@@ -235,11 +210,9 @@ class NetworkCoordinateEngine:
 
     def is_converged(self, coord: NetworkCoordinate | None = None) -> bool:
         """
-        Check if coordinate has converged (AD-35 Task 12.1.6).
-
-        A coordinate is converged when:
-        - Error is below the convergence threshold
-        - Sample count is at or above minimum
+        Check if coordinate has converged (AD-35 Task 12.1.6): it has the
+        samples and the error that earn full coordinate quality --
+        ``min_samples_for_routing`` and ``error_good_ms``.
 
         Args:
             coord: Coordinate to check (defaults to local coordinate)
@@ -250,10 +223,10 @@ class NetworkCoordinateEngine:
         if coord is None:
             coord = self._coordinate
 
-        error_converged = coord.error <= self._config.convergence_error_threshold
-        samples_sufficient = coord.sample_count >= self._config.convergence_min_samples
-
-        return error_converged and samples_sufficient
+        return (
+            coord.sample_count >= self._config.min_samples_for_routing
+            and coord.error * 1000.0 <= self._config.error_good_ms
+        )
 
     def get_config(self) -> VivaldiConfig:
         """Get the Vivaldi configuration."""

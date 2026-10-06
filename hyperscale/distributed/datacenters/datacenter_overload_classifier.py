@@ -1,38 +1,21 @@
-from dataclasses import dataclass
+"""
 
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
+"""
+
+from dataclasses import dataclass
 from hyperscale.distributed.datacenters.datacenter_overload_config import (
     DatacenterOverloadConfig,
     DatacenterOverloadState,
     OVERLOAD_STATE_ORDER,
 )
 
-
-@dataclass(slots=True)
-class DatacenterOverloadSignals:
-    total_workers: int
-    healthy_workers: int
-    overloaded_workers: int
-    stressed_workers: int
-    busy_workers: int
-    total_managers: int
-    alive_managers: int
-    total_cores: int
-    available_cores: int
-    overloaded_managers: int = 0
-    stressed_managers: int = 0
-    busy_managers: int = 0
-    leader_health_state: str = "healthy"
-
-
-@dataclass(slots=True)
-class DatacenterOverloadResult:
-    state: DatacenterOverloadState
-    worker_overload_ratio: float
-    manager_unhealthy_ratio: float
-    manager_overload_ratio: float
-    capacity_utilization: float
-    health_severity_weight: float
-    leader_overloaded: bool = False
+from .datacenter_overload_result import DatacenterOverloadResult
+from .datacenter_overload_signals import DatacenterOverloadSignals
 
 
 class DatacenterOverloadClassifier:
@@ -176,3 +159,11 @@ class DatacenterOverloadClassifier:
         overload_adjustment = 1.0 + (worker_overload_ratio * 0.5)
 
         return base_weight * overload_adjustment
+
+_REHOMED = (
+    DatacenterOverloadSignals,
+    DatacenterOverloadResult,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

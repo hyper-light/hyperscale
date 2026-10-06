@@ -121,12 +121,14 @@ class SoakPlan:
     attribute. MEASURED CAVEAT (probes, seeds 901/907): under SIM the
     ACTION-chain ``SimSoakWorkflow`` executes ONE pass per VU (~1.0s
     worker-side active window, ~1.04s client-visible latency)
-    regardless of ``duration`` — duration-GOVERNED workloads are the
-    open K1 runner constraint (``WorkflowRunner._generate`` busy-waits
-    frozen virtual time). The drawn duration still seeds the
-    submission payload/timeout shape and becomes load-bearing the day
-    the runner fix lands; horizon OCCUPANCY today comes from the
-    30-60s submission cadence, not per-job execution length.
+    regardless of ``duration`` — duration-GOVERNED workloads were the
+    K1 runner constraint (the old ``WorkflowRunner._generate`` busy-waited
+    frozen virtual time). Its successor, ``_run_long_lived_vu``, takes a
+    timed sleep after ``_FROZEN_CLOCK_SPINS`` iterations on a frozen
+    clock, which should lift it -- not yet re-probed under SIM. The drawn
+    duration still seeds the submission payload/timeout shape and becomes
+    load-bearing once that probe passes; horizon OCCUPANCY today comes
+    from the 30-60s submission cadence, not per-job execution length.
     """
 
     seed: int

@@ -2,21 +2,18 @@
 Lease state tracking.
 
 Tracks datacenter leases and fence tokens for at-most-once delivery.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
-
 from hyperscale.distributed.models import DatacenterLease
 
-
-@dataclass(slots=True)
-class LeaseTracking:
-    """Tracks a single lease state."""
-
-    job_id: str
-    datacenter_id: str
-    lease: DatacenterLease
-    fence_token: int
+from .lease_tracking import LeaseTracking
 
 
 @dataclass(slots=True)
@@ -65,3 +62,10 @@ class LeaseState:
         """Get and increment the fence token."""
         self.fence_token += 1
         return self.fence_token
+
+_REHOMED = (
+    LeaseTracking,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

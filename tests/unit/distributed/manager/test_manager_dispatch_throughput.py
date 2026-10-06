@@ -18,6 +18,8 @@ from types import SimpleNamespace
 import pytest
 
 from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.slo import SLOConfig
 from hyperscale.distributed.nodes.manager.stats import ManagerStatsCoordinator
 
 INTERVAL_SECONDS = 10.0
@@ -37,7 +39,7 @@ class SteppedClock:
 def make_stats(healthy_workers: list[int]) -> tuple[ManagerStatsCoordinator, SteppedClock]:
     clock = SteppedClock()
     stats = ManagerStatsCoordinator(
-        state=ManagerState(),
+        state=ManagerState(slo_config=SLOConfig.from_env(Env())),
         config=SimpleNamespace(throughput_interval_seconds=INTERVAL_SECONDS),
         logger=None,
         node_id="manager-a",

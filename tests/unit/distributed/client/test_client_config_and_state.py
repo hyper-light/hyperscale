@@ -12,174 +12,138 @@ Covers:
 """
 
 import asyncio
-import os
 import time
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client.config import (
     ClientConfig,
-    create_client_config,
     TRANSIENT_ERRORS,
 )
 from hyperscale.distributed.nodes.client.state import ClientState
+from hyperscale.reporting.common import ReporterTypes
 from hyperscale.distributed.models import (
     ClientJobResult,
     GateLeaderInfo,
     ManagerLeaderInfo,
-    OrphanedJobInfo,
 )
 
 
 class TestClientConfig:
-    """Test ClientConfig dataclass."""
+    """Test ClientConfig, which reads every setting from the client's Env."""
 
-    def test_happy_path_instantiation(self):
-        """Test normal configuration creation."""
-        config = ClientConfig(
+    def make_config(self, env: Env, **addresses) -> ClientConfig:
+        return ClientConfig.from_env(
+            env,
+            host=addresses.get("host", "localhost"),
+            tcp_port=addresses.get("tcp_port", 8000),
+            managers=addresses.get("managers", []),
+            gates=addresses.get("gates", []),
+        )
+
+    def test_happy_path_addresses(self):
+        """The node addresses are taken as given."""
+        config = self.make_config(
+            Env(),
             host="localhost",
             tcp_port=8000,
-            env="test",
             managers=[("manager1", 7000), ("manager2", 7001)],
             gates=[("gate1", 9000)],
         )
 
         assert config.host == "localhost"
         assert config.tcp_port == 8000
-        assert config.env == "test"
-        assert len(config.managers) == 2
-        assert len(config.gates) == 1
+        assert config.managers == [("manager1", 7000), ("manager2", 7001)]
+        assert config.gates == [("gate1", 9000)]
 
-    def test_default_values(self):
-        """Test default configuration values."""
-        config = ClientConfig(
-            host="0.0.0.0",
-            tcp_port=5000,
-            env="dev",
-            managers=[],
-            gates=[],
-        )
-
-        assert config.orphan_grace_period_seconds == float(
-            os.getenv("CLIENT_ORPHAN_GRACE_PERIOD", "120.0")
-        )
-        assert config.orphan_check_interval_seconds == float(
-            os.getenv("CLIENT_ORPHAN_CHECK_INTERVAL", "30.0")
-        )
-        assert config.response_freshness_timeout_seconds == float(
-            os.getenv("CLIENT_RESPONSE_FRESHNESS_TIMEOUT", "5.0")
-        )
-        assert config.leadership_max_retries == 3
-        assert config.leadership_retry_delay_seconds == 0.5
-        assert config.leadership_exponential_backoff is True
-        assert config.leadership_max_delay_seconds == 5.0
-        assert config.submission_max_retries == 5
-        assert config.submission_max_redirects_per_attempt == 3
-        assert config.rate_limit_enabled is True
-        assert config.rate_limit_health_gated is True
-        assert config.negotiate_capabilities is True
-
-    def test_environment_variable_defaults(self):
-        """Test environment variable configuration.
-
-        Note: Environment variables are read at class definition time (module import),
-        not at instantiation time. This test validates that the dataclass defaults
-        correctly use os.getenv() values from when the module was imported.
-        """
-        config = ClientConfig(
-            host="test",
-            tcp_port=8000,
-            env="staging",
-            managers=[],
-            gates=[],
+    def test_every_setting_is_read_from_env(self):
+        """Each timing and retry setting is the Env field of its name."""
+        env = Env(
+            CLIENT_ORPHAN_GRACE_PERIOD=11.0,
+            CLIENT_ORPHAN_CHECK_INTERVAL=3.0,
+            CLIENT_RESPONSE_FRESHNESS_TIMEOUT=7.0,
+            CLIENT_STATUS_QUERY_TIMEOUT=2.5,
+            CLIENT_SUBMISSION_TIMEOUT=12.0,
+            CLIENT_SUBMISSION_MAX_RETRIES=9,
+            CLIENT_SUBMISSION_MAX_REDIRECTS=4,
+            CLIENT_RESULT_DRAIN_TIMEOUT=1.5,
+            CLIENT_JOB_RETENTION_SECONDS=90.0,
         )
 
-        # Validate that defaults match what os.getenv() returns
-        # (these are the values from when the module was imported)
-        assert config.orphan_grace_period_seconds == float(
-            os.getenv("CLIENT_ORPHAN_GRACE_PERIOD", "120.0")
-        )
-        assert config.orphan_check_interval_seconds == float(
-            os.getenv("CLIENT_ORPHAN_CHECK_INTERVAL", "30.0")
-        )
-        assert config.response_freshness_timeout_seconds == float(
-            os.getenv("CLIENT_RESPONSE_FRESHNESS_TIMEOUT", "5.0")
-        )
+        config = self.make_config(env)
 
-    def test_create_client_config_factory(self):
-        """Test create_client_config factory function."""
-        config = create_client_config(
-            host="192.168.1.1",
-            port=9000,
-            env="production",
-            managers=[("m1", 8000), ("m2", 8001)],
-            gates=[("g1", 10000)],
-        )
+        assert config.orphan_grace_period_seconds == 11.0
+        assert config.orphan_check_interval_seconds == 3.0
+        assert config.response_freshness_timeout_seconds == 7.0
+        assert config.status_query_timeout_seconds == 2.5
+        assert config.submission_timeout_seconds == 12.0
+        assert config.submission_max_retries == 9
+        assert config.submission_max_redirects_per_attempt == 4
+        assert config.result_drain_timeout_seconds == 1.5
+        assert config.job_retention_seconds == 90.0
 
-        assert config.host == "192.168.1.1"
-        assert config.tcp_port == 9000
-        assert config.env == "production"
-        assert len(config.managers) == 2
-        assert len(config.gates) == 1
+    def test_default_settings_are_the_env_defaults(self):
+        """With no overrides, the settings are Env's defaults."""
+        env = Env()
 
-    def test_create_client_config_defaults(self):
-        """Test factory with default managers and gates."""
-        config = create_client_config(
-            host="localhost",
-            port=5000,
-        )
+        config = self.make_config(env)
 
-        assert config.managers == []
-        assert config.gates == []
-        assert config.env == "local"
+        assert config.orphan_grace_period_seconds == env.CLIENT_ORPHAN_GRACE_PERIOD
+        assert config.orphan_check_interval_seconds == env.CLIENT_ORPHAN_CHECK_INTERVAL
+        assert config.response_freshness_timeout_seconds == env.CLIENT_RESPONSE_FRESHNESS_TIMEOUT
+        assert config.status_query_timeout_seconds == env.CLIENT_STATUS_QUERY_TIMEOUT
+        assert config.submission_timeout_seconds == env.CLIENT_SUBMISSION_TIMEOUT
+        assert config.submission_max_retries == env.CLIENT_SUBMISSION_MAX_RETRIES
+        assert config.submission_max_redirects_per_attempt == env.CLIENT_SUBMISSION_MAX_REDIRECTS
+        assert config.result_drain_timeout_seconds == env.CLIENT_RESULT_DRAIN_TIMEOUT
+        assert config.job_retention_seconds == env.CLIENT_JOB_RETENTION_SECONDS
+
+    def test_settings_have_no_defaults_of_their_own(self):
+        """A config built without Env is refused rather than given hidden values."""
+        with pytest.raises(TypeError):
+            ClientConfig(host="localhost", tcp_port=8000, managers=[], gates=[])
+
+    def test_local_reporters_are_the_file_reporters(self):
+        """The client itself writes the file-based reporters."""
+        config = self.make_config(Env())
+
+        assert config.local_reporter_types == {
+            ReporterTypes.JSON,
+            ReporterTypes.CSV,
+            ReporterTypes.XML,
+        }
+
+    def test_local_reporter_types_are_not_shared_between_configs(self):
+        """Each config owns its reporter set."""
+        first_config = self.make_config(Env())
+        second_config = self.make_config(Env())
+
+        first_config.local_reporter_types.add(ReporterTypes.Kafka)
+
+        assert ReporterTypes.Kafka not in second_config.local_reporter_types
 
     def test_edge_case_empty_managers_and_gates(self):
         """Test with no managers or gates."""
-        config = ClientConfig(
-            host="test",
-            tcp_port=8000,
-            env="dev",
-            managers=[],
-            gates=[],
-        )
+        config = self.make_config(Env(), managers=[], gates=[])
 
         assert config.managers == []
         assert config.gates == []
 
     def test_edge_case_many_managers(self):
         """Test with many manager endpoints."""
-        managers = [(f"manager{i}", 7000 + i) for i in range(100)]
-        config = ClientConfig(
-            host="test",
-            tcp_port=8000,
-            env="dev",
-            managers=managers,
-            gates=[],
-        )
+        managers = [(f"manager{index}", 7000 + index) for index in range(100)]
+        config = self.make_config(Env(), managers=managers)
 
         assert len(config.managers) == 100
 
     def test_edge_case_port_boundaries(self):
         """Test with edge case port numbers."""
-        # Min valid port
-        config1 = ClientConfig(
-            host="test",
-            tcp_port=1,
-            env="dev",
-            managers=[("m", 1024)],
-            gates=[],
-        )
-        assert config1.tcp_port == 1
+        lowest_port_config = self.make_config(Env(), tcp_port=1, managers=[("m", 1024)])
+        assert lowest_port_config.tcp_port == 1
 
-        # Max valid port
-        config2 = ClientConfig(
-            host="test",
-            tcp_port=65535,
-            env="dev",
-            managers=[("m", 65535)],
-            gates=[],
-        )
-        assert config2.tcp_port == 65535
+        highest_port_config = self.make_config(Env(), tcp_port=65535, managers=[("m", 65535)])
+        assert highest_port_config.tcp_port == 65535
 
     def test_transient_errors_frozenset(self):
         """Test TRANSIENT_ERRORS constant."""
@@ -296,58 +260,6 @@ class TestClientState:
         assert stored.fence_token == 10
         assert stored.datacenter_id == datacenter_id
 
-    def test_mark_job_orphaned(self):
-        """Test marking job as orphaned."""
-        state = ClientState()
-        job_id = "orphan-job"
-        orphan_info = OrphanedJobInfo(
-            job_id=job_id,
-            orphan_timestamp=time.time(),
-            last_known_gate=("gate-1", 9000),
-            last_known_manager=None,
-        )
-
-        state.mark_job_orphaned(job_id, orphan_info)
-
-        assert job_id in state._orphaned_jobs
-        orphaned = state._orphaned_jobs[job_id]
-        assert orphaned.job_id == job_id
-        assert orphaned.orphan_timestamp > 0
-        assert orphaned.last_known_gate == ("gate-1", 9000)
-
-    def test_clear_job_orphaned(self):
-        """Test clearing orphan status."""
-        state = ClientState()
-        job_id = "orphan-clear-job"
-
-        orphan_info = OrphanedJobInfo(
-            job_id=job_id,
-            orphan_timestamp=time.time(),
-            last_known_gate=None,
-            last_known_manager=None,
-        )
-        state.mark_job_orphaned(job_id, orphan_info)
-        assert job_id in state._orphaned_jobs
-
-        state.clear_job_orphaned(job_id)
-        assert job_id not in state._orphaned_jobs
-
-    def test_is_job_orphaned(self):
-        """Test checking orphan status."""
-        state = ClientState()
-        job_id = "orphan-check-job"
-
-        assert state.is_job_orphaned(job_id) is False
-
-        orphan_info = OrphanedJobInfo(
-            job_id=job_id,
-            orphan_timestamp=time.time(),
-            last_known_gate=None,
-            last_known_manager=None,
-        )
-        state.mark_job_orphaned(job_id, orphan_info)
-        assert state.is_job_orphaned(job_id) is True
-
     @pytest.mark.asyncio
     async def test_increment_gate_transfers(self):
         """Test gate transfer counter."""
@@ -413,29 +325,6 @@ class TestClientState:
         assert metrics["manager_transfers_received"] == 1
         assert metrics["requests_rerouted"] == 1
         assert metrics["requests_failed_leadership_change"] == 1
-        assert metrics["orphaned_jobs"] == 0
-
-    def test_get_leadership_metrics_with_orphans(self):
-        """Test leadership metrics with orphaned jobs."""
-        state = ClientState()
-
-        orphan1 = OrphanedJobInfo(
-            job_id="job-1",
-            orphan_timestamp=time.time(),
-            last_known_gate=None,
-            last_known_manager=None,
-        )
-        orphan2 = OrphanedJobInfo(
-            job_id="job-2",
-            orphan_timestamp=time.time(),
-            last_known_gate=None,
-            last_known_manager=None,
-        )
-        state.mark_job_orphaned("job-1", orphan1)
-        state.mark_job_orphaned("job-2", orphan2)
-
-        metrics = state.get_leadership_metrics()
-        assert metrics["orphaned_jobs"] == 2
 
     @pytest.mark.asyncio
     async def test_concurrency_job_tracking(self):
@@ -473,29 +362,6 @@ class TestClientState:
 
         # Final state should have latest update
         assert job_id in state._gate_job_leaders
-
-    @pytest.mark.asyncio
-    async def test_concurrency_orphan_tracking(self):
-        """Test concurrent orphan status updates."""
-        state = ClientState()
-        job_id = "orphan-concurrent"
-
-        async def mark_and_clear():
-            orphan_info = OrphanedJobInfo(
-                job_id=job_id,
-                orphan_timestamp=time.time(),
-                last_known_gate=None,
-                last_known_manager=None,
-            )
-            state.mark_job_orphaned(job_id, orphan_info)
-            await asyncio.sleep(0.001)
-            state.clear_job_orphaned(job_id)
-
-        await asyncio.gather(*[mark_and_clear() for _ in range(5)])
-
-        # Final state depends on race, but should be consistent
-        orphaned = state.is_job_orphaned(job_id)
-        assert isinstance(orphaned, bool)
 
     def test_edge_case_empty_callbacks(self):
         """Test job tracking with no callbacks."""

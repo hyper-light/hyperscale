@@ -114,7 +114,7 @@ def create_mock_handler(
 ) -> GateCancellationHandler:
     """Create a mock handler with configurable behavior."""
     if state is None:
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
     if job_manager is None:
         job_manager = MockGateJobManager()
     if datacenter_managers is None:
@@ -438,7 +438,7 @@ class TestHandleCancelJobFailureModes:
         async def mock_check_rate_limit(client_id, op):
             return (True, 0)
 
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         handler = GateCancellationHandler(
             client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_SHORT,
             manager_request_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
@@ -484,7 +484,7 @@ class TestHandleJobCancellationComplete:
     @pytest.mark.asyncio
     async def test_handles_completion_notification(self):
         """Handles cancellation completion notification."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
         handler = create_mock_handler(state=state)
 
@@ -794,7 +794,7 @@ async def test_a_cancel_reaches_exactly_the_jobs_datacenters() -> None:
     handler = GateCancellationHandler(
         client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_SHORT,
         manager_request_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
-        state=GateRuntimeState(),
+        state=GateRuntimeState(forward_throughput_interval_start=0.0),
         logger=MockLogger(),
         task_runner=MockTaskRunner(),
         job_manager=job_manager,

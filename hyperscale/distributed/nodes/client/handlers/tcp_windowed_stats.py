@@ -1,10 +1,11 @@
-import asyncio
+import inspect
 import cloudpickle
 
 from hyperscale.distributed.reliability.rate_limiting import RequestPriority
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
+from hyperscale.distributed.jobs import WindowedStatsPush
 
 
 class WindowedStatsPushHandler:
@@ -50,18 +51,17 @@ class WindowedStatsPushHandler:
                     return b"rate_limited"
 
             # Import WindowedStatsPush from jobs module (avoid circular import)
-            from hyperscale.distributed.jobs import WindowedStatsPush
 
             push: WindowedStatsPush = cloudpickle.loads(data)
 
             callback = self._state._progress_callbacks.get(push.job_id)
             if callback:
                 try:
-                    if asyncio.iscoroutinefunction(callback):
-                        await callback(push)
-                    else:
-                        loop = asyncio.get_running_loop()
-                        await loop.run_in_executor(None, callback, push)
+                    # Called on the event loop -- never handed to an executor
+                    # thread -- and awaited when it returns an awaitable, so an
+                    # async callback, or a sync one wrapping one, both work.
+                    if inspect.isawaitable(callback_outcome := callback(push)):
+                        await callback_outcome
                 except Exception as callback_error:
                     if self._logger:
                         await self._logger.log(

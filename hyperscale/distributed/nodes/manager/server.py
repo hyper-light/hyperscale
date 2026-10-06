@@ -14,21 +14,29 @@ from typing import TYPE_CHECKING
 
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
+from hyperscale.distributed.cluster.cluster_membership import ClusterMembership
+from hyperscale.distributed.jobs.logical_id_generator import LogicalIdGenerator
+from hyperscale.distributed.cluster.joined_peer import JoinedPeer
+from hyperscale.distributed.cluster.joined_peer_store import JoinedPeerStore
 from hyperscale.distributed.swim import HealthAwareServer, ManagerStateEmbedder
-from hyperscale.distributed.swim.core import ErrorStats, CircuitState
+from hyperscale.distributed.swim.core import CircuitState
 from hyperscale.distributed.swim.detection import HierarchicalConfig
-from hyperscale.distributed.swim.health import CrossClusterAck, FederatedHealthMonitor
+from hyperscale.distributed.swim.health import CrossClusterAck
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.server import tcp
 from hyperscale.distributed.idempotency import (
     IdempotencyKey,
+    IdempotencyLedgerEntry,
     IdempotencyStatus,
     ManagerIdempotencyLedger,
     create_idempotency_config_from_env,
 )
 
 from hyperscale.reporting.common.results_types import WorkflowStats
+from hyperscale.reporting.results import Results
 from hyperscale.distributed.models import (
+    JobStatusQuery,
+    ReadConsistency,
     GlobalJobStatus,
     ManagerRegistrationResponse,
     NodeInfo,
@@ -64,9 +72,6 @@ from hyperscale.distributed.models import (
     WorkerEvictionNotice,
     WorkerEvictionNoticeAck,
     WorkerDiscoveryBroadcast,
-    ContextForward,
-    ContextLayerSync,
-    ContextLayerSyncAck,
     JobLeadershipAnnouncement,
     JobLeadershipAck,
     JobStateSyncMessage,
@@ -77,9 +82,6 @@ from hyperscale.distributed.models import (
     JobLeaderManagerTransferAck,
     JobLeaderWorkerTransfer,
     JobLeaderWorkerTransferAck,
-    ProvisionRequest,
-    ProvisionConfirm,
-    ProvisionCommit,
     JobGlobalTimeout,
     PingRequest,
     ManagerPingResponse,
@@ -95,7 +97,10 @@ from hyperscale.distributed.models import (
     restricted_loads,
     JobInfo,
     WorkflowInfo,
+    CancelledWorkflowInfo,
 )
+from hyperscale.distributed.models.sub_workflow_state_snapshot import SubWorkflowStateSnapshot
+from hyperscale.distributed.models.workflow_state_snapshot import WorkflowStateSnapshot
 from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
     WorkerListResponse,
@@ -103,12 +108,19 @@ from hyperscale.distributed.models.worker_state import (
 )
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
+    RetryBudgetManager,
     ServerRateLimiter,
     StatsBuffer,
     StatsBufferConfig,
+    create_reliability_config_from_env,
 )
 from hyperscale.distributed.resources import ProcessResourceMonitor, ResourceMetrics
-from hyperscale.distributed.health import WorkerHealthManager, WorkerHealthManagerConfig
+from hyperscale.distributed.health import WorkerHealthManager
+from hyperscale.distributed.health.progress_witness import (
+    HierarchicalAlphaConfig,
+    ThroughputWitness,
+    ThroughputWitnessConfig,
+)
 from hyperscale.distributed.health.workflow_progress_snapshot import (
     WorkflowProgressSnapshot,
 )
@@ -130,26 +142,44 @@ from hyperscale.distributed.jobs import (
     WindowedStatsCollector,
     WindowedStatsPush,
 )
+from hyperscale.distributed.jobs.workflow_dependencies import (
+    resolve_job_deadline_seconds,
+    select_rerun_workflows,
+    validate_workflow_dependencies,
+)
 from hyperscale.distributed.jobs.completion_notice_obligation import (
     CompletionNoticeObligation,
 )
-from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
 from hyperscale.distributed.jobs.job_status_order import JobStatusOrder
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.distributed.ledger.job_ledger import JobLedger
+from hyperscale.distributed.ledger.job_event_applier import JOB_RELINQUISHED_STATUS
+from hyperscale.distributed.ledger.job_state import JobState
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.ledger.storage_health import StorageHealth
 from hyperscale.distributed.ledger.pipeline.commit_pipeline import CommitResult
 from hyperscale.distributed.raft import LedgerReplicator
+from hyperscale.distributed.slo import SLOConfig
 from hyperscale.distributed.resources.resource_budget import ResourceBudget
 from hyperscale.distributed.resources.resource_enforcer import ResourceEnforcer
 from hyperscale.distributed.resources.resource_violation_type import ResourceViolationType
 from hyperscale.distributed.resources.led_workflow_resources import LedWorkflowResources
 from hyperscale.distributed.resources.manager_resource_report import ManagerResourceReport
+from hyperscale.distributed.resources.datacenter_resource_aggregator import (
+    DatacenterResourceAggregator,
+)
+from hyperscale.distributed.resources.manager_resource_gossip import ManagerResourceGossip
+from hyperscale.distributed.resources.manager_resource_gossip_message import (
+    ManagerResourceGossipMessage,
+)
 from hyperscale.distributed.raft.models import LedgerProposal
-from hyperscale.distributed.raft.models.commands import ledger_append_command
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.distributed.runtime import Filesystem, RealFilesystem
+from hyperscale.distributed.raft.store.raft_storage import RaftStorage
+from hyperscale.distributed.raft.store.raft_store import RaftStore
+from hyperscale.distributed.swim.core.node_id import NodeId
+from hyperscale.distributed.swim.core.node_state import NodeState
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 
 # Module-level storage seam (Phase 7): borrowed, never shut down
 # here; swap_defaults rebinds it under SIM.
@@ -173,7 +203,9 @@ from hyperscale.distributed.jobs.timeout_strategy import (
     GateCoordinatedTimeout,
 )
 from hyperscale.distributed.workflow import (
-    WorkflowStateMachine as WorkflowLifecycleStateMachine,
+    WORKFLOW_STATUS_BY_WORKFLOW_STATE,
+    StateTransition,
+    WorkflowState,
 )
 from hyperscale.logging.hyperscale_logging_models import (
     SystemicEvictionHeld,
@@ -217,6 +249,7 @@ from hyperscale.distributed.health.extension_outcome import (
     ExtensionOutcomeEvent,
     ExtensionOutcomeKind,
 )
+from .config import ManagerConfig
 
 
 if TYPE_CHECKING:
@@ -235,6 +268,13 @@ _TERMINAL_WORKFLOW_STATUS_VALUES = frozenset(
 _BYTES_PER_MEGABYTE = 1024 * 1024
 
 
+# Ledger-internal job statuses in the client's vocabulary.
+_LEDGER_STATUS_VOCABULARY: dict[str, str] = {
+    "pending": JobStatus.SUBMITTED.value,
+    "cancelling": JobStatus.RUNNING.value,
+}
+
+
 class ManagerServer(HealthAwareServer):
     """
     Manager node composition root.
@@ -245,7 +285,6 @@ class ManagerServer(HealthAwareServer):
     - Aggregating status updates from workers
     - Reporting to gates (if present)
     - Participating in leader election among managers
-    - Handling quorum-based confirmation for workflow provisioning
     """
 
     def __init__(
@@ -261,7 +300,6 @@ class ManagerServer(HealthAwareServer):
         manager_peers: list[tuple[str, int]] | None = None,
         manager_udp_peers: list[tuple[str, int]] | None = None,
         quorum_timeout: float = 5.0,
-        max_workflow_retries: int = 3,
         workflow_timeout: float = 300.0,
         wal_data_dir: Path | None = None,
         incarnation_storage_dir: str | None = None,
@@ -269,6 +307,7 @@ class ManagerServer(HealthAwareServer):
         clock: "Clock | None" = None,
         random_source: "Random | None" = None,
         transport_factory: "TransportFactory | None" = None,
+        raft_store: RaftStore | None = None,
     ) -> None:
         """
         Initialize manager server.
@@ -285,10 +324,8 @@ class ManagerServer(HealthAwareServer):
             manager_peers: Deprecated alias for seed_managers
             manager_udp_peers: Manager UDP addresses for SWIM cluster
             quorum_timeout: Timeout for quorum operations
-            max_workflow_retries: Maximum retry attempts per workflow
             workflow_timeout: Workflow execution timeout in seconds
         """
-        from .config import ManagerConfig
 
         self._config: ManagerConfig = create_manager_config_from_env(
             host=host,
@@ -301,7 +338,6 @@ class ManagerServer(HealthAwareServer):
             seed_managers=seed_managers or manager_peers,
             manager_udp_peers=manager_udp_peers,
             quorum_timeout=quorum_timeout,
-            max_workflow_retries=max_workflow_retries,
             workflow_timeout=workflow_timeout,
             wal_data_dir=wal_data_dir,
         )
@@ -315,6 +351,9 @@ class ManagerServer(HealthAwareServer):
         # Storage seam for submission-payload persistence (borrowed,
         # never shut down here; swap_defaults rebinds it under SIM).
         self._storage_filesystem: Filesystem = _DEFAULT_FILESYSTEM
+        # Gates this manager was joined to at runtime, kept in its data
+        # directory (created at start, once the logger exists).
+        self._joined_peer_store: JoinedPeerStore | None = None
         # worker_id -> next monotonic instant an unknown-worker
         # re-register nudge may be sent (rate limit).
         self._unknown_worker_nudges: dict[str, float] = {}
@@ -324,6 +363,9 @@ class ManagerServer(HealthAwareServer):
         self._completion_notice_obligations: dict[
             str, CompletionNoticeObligation
         ] = {}
+        # Job ids whose submission a request is deciding right now: a job
+        # id's submission is decided by one request at a time.
+        self._job_submissions_in_progress: set[str] = set()
 
         self._env: Env = env
         self._seed_gates: list[tuple[str, int]] = gate_addrs or []
@@ -332,10 +374,11 @@ class ManagerServer(HealthAwareServer):
             seed_managers or manager_peers or []
         )
         self._manager_udp_peers: list[tuple[str, int]] = manager_udp_peers or []
-        self._max_workflow_retries: int = max_workflow_retries
         self._workflow_timeout: float = workflow_timeout
 
-        self._manager_state: ManagerState = ManagerState()
+        self._manager_state: ManagerState = ManagerState(
+            slo_config=SLOConfig.from_env(env),
+        )
         self._idempotency_config = create_idempotency_config_from_env(env)
         self._idempotency_ledger: ManagerIdempotencyLedger[bytes] | None = None
 
@@ -361,7 +404,16 @@ class ManagerServer(HealthAwareServer):
             random_source=random_source,
             transport_factory=transport_factory,
             incarnation_storage_dir=incarnation_storage_dir,
+            # D1: an identity the Raft store resumed keeps its start time,
+            # so this node is the member its groups knew.
+            node_created_ms=(
+                None if raft_store is None else NodeId.created_ms_of(raft_store.identity.node_id_full)
+            ),
         )
+        # Where every Raft group of this node keeps its persistent state
+        # (D1): the opened store the node was given, or none -- each start
+        # then a new member of every group. Borrowed: its opener closes it.
+        self._raft_storage: RaftStorage = raft_store if raft_store is not None else VolatileRaftStorage()
 
         # Wire logger to modules
         self._init_modules()
@@ -381,6 +433,9 @@ class ManagerServer(HealthAwareServer):
             logger=self._udp_logger,
             node_id=self._node_id.short,
             task_runner=self._task_runner,
+            # AD-26 extension tracking (trackers, ledger, throughput
+            # streams) leaves with the worker.
+            on_worker_unregistered=lambda worker_id: self._worker_health_manager.on_worker_removed(worker_id),
         )
 
         # Lease coordinator for fencing tokens and job leadership
@@ -427,6 +482,17 @@ class ManagerServer(HealthAwareServer):
         self._job_manager = JobManager(
             datacenter=self._node_id.datacenter,
             manager_id=self._node_id.full,
+            clock=self._clock,
+            max_budgeted_retries=self.env.RETRY_BUDGET_PER_WORKFLOW_MAX,
+        )
+        # Every job's AD-44 retry budget: a failed dispatch and a lost
+        # worker charge the same per-workflow budget.
+        self._retry_budget_manager = RetryBudgetManager(
+            config=create_reliability_config_from_env(self.env)
+        )
+        # A workflow moving along its lifecycle is its job's progress (AD-34).
+        self._job_manager.workflow_lifecycle.register_observer(
+            self._report_lifecycle_progress
         )
 
         # Worker and peer-manager state sync (state_sync_request delegates)
@@ -467,12 +533,9 @@ class ManagerServer(HealthAwareServer):
             config=self._config,
             logger=self._udp_logger,
             node_id=self._node_id.short,
-            task_runner=self._task_runner,
             is_leader_fn=self.is_leader,
-            get_term_fn=lambda: self._leader_election.state.current_term
-            if hasattr(self, "_leader_election")
-            else 0,
             step_down_fn=self._step_down_from_cluster_leadership,
+            cohort_size_fn=lambda: len(self._cluster_membership.cohort),
         )
 
         # Discovery coordinator
@@ -514,45 +577,71 @@ class ManagerServer(HealthAwareServer):
         # AD-39: fenced while this manager's clock disagrees with a quorum
         # of the cluster (or its HLC ran past its own clock). A fenced
         # manager neither leads (Raft or SWIM) nor accepts jobs.
-        configured_manager_count = len(self._config.manager_udp_peers) + 1
         self._clock_offset_monitor = ClockOffsetMonitor(
             hlc=self._hlc,
-            cluster_size=lambda: configured_manager_count,
+            cluster_size=lambda: len(self._cluster_membership.cohort),
             sample_ttl_seconds=self._env.HLC_OFFSET_SAMPLE_TTL_SECONDS,
             clock=self._clock,
         )
         self._leadership_refusals.append(self._is_clock_fenced)
 
-        # Raft consensus integration
-        self._raft_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
-            node_id=self._node_id.full,
-            node_addr=(self._host, self._tcp_port),
-        )
         # AD-38 REGIONAL: every member's copy of the ledger events its
         # job groups commit; a takeover adopts a job's history from here.
         self._ledger_replica = JobLedgerReplica()
+        # AD-52 slice C: the datacenter's managers keep their membership in
+        # one Raft group -- the configured cohort founds it, and every job
+        # group takes its members from it.
+        self._cluster_membership = ClusterMembership(
+            self._node_id.full,
+            (self._host, self._tcp_port),
+            frozenset(self._seed_managers),
+            send_request=self._send_to_peer,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            hlc=self._hlc,
+            clock=self._clock,
+            may_lead=self._may_lead,
+            cluster_uuids=LogicalIdGenerator(scope=self._node_id.full, clock=self._clock),
+            formation_interval_seconds=self._env.CLUSTER_FORMATION_INTERVAL_SECONDS,
+            tombstone_retention_seconds=self._env.CLUSTER_TOMBSTONE_RETENTION_SECONDS,
+            request_timeout_seconds=self._config.tcp_timeout_standard_seconds,
+            watch_wait_ceiling_seconds=self._env.CLUSTER_WATCH_WAIT_SECONDS,
+            on_cohort_change=self._on_cohort_change,
+            snapshot_entries=self._env.CLUSTER_SNAPSHOT_ENTRIES,
+            snapshot_catch_up_entries=self._env.CLUSTER_SNAPSHOT_CATCH_UP_ENTRIES,
+            leader_lease_drift_bound=(
+                self._env.RAFT_CLOCK_DRIFT_BOUND if self._env.RAFT_LEADER_LEASES_ENABLED else None
+            ),
+            storage=self._raft_storage,
+        )
         self._raft = ManagerRaftIntegration(
             node_id=self._node_id.full,
-            job_manager=self._job_manager,
-            leadership_tracker=self._raft_leadership_tracker,
             logger=self._udp_logger,
             task_runner=self._task_runner,
             send_tcp=self._send_to_peer,
-            node_addr=(self._host, self._tcp_port),
-            configured_cluster_size=configured_manager_count,
+            configured_cluster_size=len(self._cluster_membership.cohort),
             proposal_timeout_seconds=self._config.quorum_timeout_seconds,
             on_job_raft_leader=self._on_job_raft_leader,
             on_job_raft_lose_leader=self._on_job_raft_lose_leader,
-            manager_state=self._manager_state,
             clock=self._hlc,
             may_lead=self._may_lead,
             ledger_replica=self._ledger_replica,
+            request_timeout_seconds=self._config.tcp_timeout_standard_seconds,
+            cluster_members=self._cluster_membership.node_addresses,
+            storage=self._raft_storage,
         )
+        # AD-39 measures the configured cohort, one entry per address, from
+        # the start: before the cluster's membership forms, and never
+        # counting one address twice under two processes' ids.
+        self._clock_probe_peers = {
+            f"{peer_host}:{peer_port}": (peer_host, peer_port)
+            for peer_host, peer_port in self._seed_managers
+        }
         self._clock_offset_prober = ClockOffsetProber(
             node_id=self._node_id.full,
             hlc=self._hlc,
             monitor=self._clock_offset_monitor,
-            peers=self._raft.consensus.member_addresses,
+            peers=lambda: self._clock_probe_peers,
             exchange=tcp_probe_exchange(self.send_tcp),
             clock=self._clock,
             probe_interval_seconds=self._env.HLC_OFFSET_PROBE_INTERVAL_SECONDS,
@@ -563,7 +652,6 @@ class ManagerServer(HealthAwareServer):
         # timeout, plus one short transit for the request and its reply.
         self._ledger_replicator = LedgerReplicator(
             consensus=self._raft.consensus,
-            build_command=ledger_append_command,
             node_id=self._node_id.full,
             send_tcp=self._send_to_peer,
             forward_method="raft_ledger_proposal",
@@ -596,6 +684,16 @@ class ManagerServer(HealthAwareServer):
             staleness_seconds=self._env.RESOURCE_VIEW_STALENESS_SECONDS,
             leads_job=self._is_job_leader,
         )
+        # AD-41 Part 4: the datacenter's resource view on the manager tier,
+        # by gossip among its managers -- what a gate sees, for clients that
+        # run jobs on this datacenter without one.
+        self._resource_gossip = ManagerResourceGossip(
+            datacenter=self._node_id.datacenter,
+            own_address=(self._host, self._tcp_port),
+            aggregator=DatacenterResourceAggregator(
+                self._clock, self._env.RESOURCE_VIEW_STALENESS_SECONDS
+            ),
+        )
 
         self._worker_pool = WorkerPool(
             health_grace_period=30.0,
@@ -619,9 +717,10 @@ class ManagerServer(HealthAwareServer):
         # Health-gated (AD-24): limits tighten with the overload state the
         # node's resource sampler settles on.
         self._rate_limiter = ServerRateLimiter(
-            inactive_cleanup_seconds=300.0,
+            inactive_cleanup_seconds=self._env.RATE_LIMIT_CLIENT_IDLE_TIMEOUT,
             overload_detector=self._overload_detector,
             detector_sampled_externally=True,
+            overload_retry_after_seconds=self._env.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
         )
 
         # AD-20 cancellation protocol (the server's cancel handlers delegate)
@@ -651,6 +750,7 @@ class ManagerServer(HealthAwareServer):
             emit_outcomes_for_terminal_job=self._emit_outcomes_for_terminal_job,
             discard_persisted_submission=self._discard_persisted_submission,
             log_ledger_shortfall=self._log_ledger_shortfall,
+            complete_job_if_done=self._complete_job_if_done,
         )
 
         # Stats buffer (AD-23)
@@ -694,16 +794,22 @@ class ManagerServer(HealthAwareServer):
             node_port=self._tcp_port,
             node_id=self._node_id.short,
             dispatch_timeout_seconds=self._config.tcp_timeout_standard_seconds,
+            clock=self._clock,
+            record_dispatch_latency=self._manager_state.record_dispatch_latency,
         )
 
-        # Worker health manager (AD-26)
+        # Worker health manager (AD-26), its extension policy from Env.
+        # The H6 throughput witness makes the H5 multi-witness decision
+        # live, its false-deny rate held to the configured budget.
         self._worker_health_manager = WorkerHealthManager(
-            WorkerHealthManagerConfig(
-                base_deadline=30.0,
-                min_grant=1.0,
-                max_extensions=5,
-                eviction_threshold=3,
-            )
+            self.env.get_worker_health_manager_config(),
+            throughput_witness=ThroughputWitness(
+                ThroughputWitnessConfig(
+                    alpha=HierarchicalAlphaConfig(alpha_system=self.env.HYPERSCALE_EXTENSION_FPR_BUDGET),
+                ),
+                clock=self._clock,
+            ),
+            clock=self._clock,
         )
 
         # WorkflowDispatcher (initialized in start())
@@ -717,10 +823,8 @@ class ManagerServer(HealthAwareServer):
             get_workflow_dispatcher=lambda: self._workflow_dispatcher,
             get_total_cores=self._get_total_cores,
             node_id=self._node_id.full,
+            clock=self._clock,
         )
-
-        # WorkflowLifecycleStateMachine (initialized in start())
-        self._workflow_lifecycle_states: WorkflowLifecycleStateMachine | None = None
 
         # WorkerDisseminator (AD-48, initialized in start())
         self._worker_disseminator: "WorkerDisseminator | None" = None
@@ -740,31 +844,6 @@ class ManagerServer(HealthAwareServer):
         # the cluster.
         self._extension_outcome_buffer: ExtensionOutcomeGossipBuffer = (
             ExtensionOutcomeGossipBuffer()
-        )
-
-        # Federated health monitor for gate probing
-        fed_config = self._env.get_federated_health_config()
-        self._gate_health_monitor = FederatedHealthMonitor(
-            probe_interval=fed_config["probe_interval"],
-            probe_timeout=fed_config["probe_timeout"],
-            suspicion_timeout=fed_config["suspicion_timeout"],
-            max_consecutive_failures=fed_config["max_consecutive_failures"],
-            on_probe_error=self._on_federated_probe_error,
-        )
-
-        # Gate circuit breaker
-        cb_config = self._env.get_circuit_breaker_config()
-        self._gate_circuit = ErrorStats(
-            max_errors=cb_config["max_errors"],
-            window_seconds=cb_config["window_seconds"],
-            half_open_after=cb_config["half_open_after"],
-        )
-
-        # Quorum circuit breaker
-        self._quorum_circuit = ErrorStats(
-            window_seconds=30.0,
-            max_errors=3,
-            half_open_after=10.0,
         )
 
         # Recovery semaphore
@@ -794,6 +873,7 @@ class ManagerServer(HealthAwareServer):
         self._manager_peer_registration_sync_task: asyncio.Task | None = None
         self._peer_job_state_sync_task: asyncio.Task | None = None
         self._resource_sample_task: asyncio.Task | None = None
+        self._resource_gossip_task: asyncio.Task | None = None
 
     def _init_address_mappings(self) -> None:
         """Initialize UDP to TCP address mappings."""
@@ -837,8 +917,8 @@ class ManagerServer(HealthAwareServer):
                 global_no_witness_timeout=float(
                     self._env.SWIM_NO_WITNESS_SUSPICION_TIMEOUT
                 ),
-                job_min_timeout=2.0,
-                job_max_timeout=15.0,
+                job_min_timeout=float(self._env.MANAGER_SWIM_JOB_MIN_TIMEOUT),
+                job_max_timeout=float(self._env.MANAGER_SWIM_JOB_MAX_TIMEOUT),
             ),
             on_job_death=self._on_worker_dead_for_job,
             get_job_n_members=self._get_job_worker_count,
@@ -923,13 +1003,39 @@ class ManagerServer(HealthAwareServer):
         itself as the entire cluster and grant itself leadership —
         precisely the split-brain scenario AD-3 forbids.
 
-        For the manager tier the configured cohort is the static
-        ``_manager_udp_peers`` seed list plus self. That count is
-        immutable across restarts and yields the correct Raft-style
-        majority threshold regardless of how many peer registrations
-        have landed at any given moment.
+        For the manager tier that is the cohort: the managers this one was
+        configured with plus itself, until a committed resize changes it
+        (AD-52) -- never the managers seen so far, which a restart resets,
+        whatever peer registrations have landed.
         """
-        return len(self._manager_udp_peers) + 1
+        return len(self._cluster_membership.cohort)
+
+    def _is_election_cohort_voter(self, voter_udp_address: tuple[str, int]) -> bool:
+        """Only the cohort the majority is counted over votes (Raft section
+        5.2): a manager outside it -- removed, or never in it -- cannot
+        carry a minority of the cohort to a majority."""
+        return self._manager_state.get_manager_tcp_from_udp(voter_udp_address) in self._cluster_membership.cohort
+
+    def _on_cohort_change(self, cohort: frozenset[tuple[str, int]]) -> None:
+        """A committed resize changed the datacenter's manager cohort (AD-52
+        ``ResizeCluster``): job groups count its majority, and clock offsets
+        are measured to its members. The leadership quorum, election size
+        and clock fence read the cohort as they count."""
+        self._raft.set_cohort_size(len(cohort))
+        self._clock_probe_peers = {
+            f"{peer_host}:{peer_port}": (peer_host, peer_port)
+            for peer_host, peer_port in cohort
+            if (peer_host, peer_port) != (self._host, self._tcp_port)
+        }
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager cohort resized to {sorted(cohort)}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
 
     def _is_clock_fenced(self) -> bool:
         return self._clock_offset_monitor.is_fenced
@@ -984,6 +1090,10 @@ class ManagerServer(HealthAwareServer):
         # restarted manager rejoins above its pre-restart value.
         await self.initialize_incarnation_store()
 
+        # Gates this manager was joined to in earlier runs: reported to
+        # and SWIM-joined exactly like configured ones.
+        await self._restore_joined_gates()
+
         if self._config.wal_data_dir is not None:
             # The full event-sourced job ledger (WAL + checkpoints +
             # archive + recovery), sharing the HLC created in __init__
@@ -1018,21 +1128,17 @@ class ManagerServer(HealthAwareServer):
         )
         await self._idempotency_ledger.start()
 
-        # Initialize workflow lifecycle state machine (AD-33)
-        self._workflow_lifecycle_states = WorkflowLifecycleStateMachine(
-            logger=self._udp_logger,
-            node_host=self._host,
-            node_port=self._tcp_port,
-            node_id=self._node_id.short,
-        )
-
         self._workflow_dispatcher = WorkflowDispatcher(
             job_manager=self._job_manager,
             worker_pool=self._worker_pool,
             manager_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
             send_dispatch=self._dispatch.send_workflow_dispatch,
+            task_runner=self._task_runner,
+            on_dispatch_exhausted=self._fail_workflow_for_good,
+            stop_dispatched_plans=self._cancellation.stop_dispatched_plans,
             on_dispatch_state_registered=self._replicate_job_state_for_dispatch,
+            retry_budget_manager=self._retry_budget_manager,
             env=self.env,
             max_concurrent_dispatches=self._config.dispatch_max_concurrent_workers,
         )
@@ -1106,14 +1212,9 @@ class ManagerServer(HealthAwareServer):
         # the parent's TaskRunner was still None; start_server has populated it
         # by now.
         self._raft._consensus._task_runner = self._task_runner
-        self._raft.start()
+        await self._raft.start()
+        await self._cluster_membership.start()
         self._task_runner.run(self._clock_offset_prober.run, alias="clock_offset_prober")
-        raft_members: set[str] = set()
-        raft_addrs: dict[str, tuple[str, int]] = {}
-        for peer_id, peer_info in self._manager_state.iter_known_manager_peers():
-            raft_members.add(peer_id)
-            raft_addrs[peer_id] = (peer_info.tcp_host, peer_info.tcp_port)
-        self._raft.set_initial_membership(raft_members, raft_addrs)
 
         manager_count = self._manager_state.get_known_manager_peer_count() + 1
         await self._udp_logger.log(
@@ -1135,6 +1236,28 @@ class ManagerServer(HealthAwareServer):
         # still None) and wedged start() via a pre-tick Raft job group.
         await self._fail_recovered_active_jobs()
 
+    async def leave_cluster(self) -> None:
+        """Drain this node's cluster membership (AD-52 section 13): the
+        group releases its address now rather than after the tombstone
+        retention, so the cluster's quorum stops counting a node that is
+        going away. The outcome is logged; a refusal leaves the release to
+        the leader's silence detection."""
+        if not self._cluster_membership.formed:
+            return
+        reply = await self._cluster_membership.leave()
+        await self._udp_logger.log(
+            (ServerInfo if reply.released else ServerWarning)(
+                message=(
+                    f"Left cluster membership as {reply.released_member_id}"
+                    if reply.released
+                    else f"Cluster membership drain refused: {reply.refusal}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
     async def stop(
         self,
         drain_timeout: float = 5,
@@ -1143,12 +1266,19 @@ class ManagerServer(HealthAwareServer):
         """Stop the manager server."""
         if not self._running and not hasattr(self, "_started"):
             return
+        # Drain membership first, while its loops and this transport run.
+        if broadcast_leave and self._running:
+            await self.leave_cluster()
 
         self._running = False
         self._manager_state.set_manager_state_enum(ManagerStateEnum.DRAINING)
 
         # Cancel background tasks
         await self._cancel_background_tasks()
+        # Each job's dispatch loop is a task of the dispatcher's: never
+        # stopped here, every one outlived the manager.
+        if self._workflow_dispatcher is not None:
+            await self._workflow_dispatcher.shutdown()
 
         if self._idempotency_ledger is not None:
             await self._idempotency_ledger.close()
@@ -1159,7 +1289,8 @@ class ManagerServer(HealthAwareServer):
         elif self._node_wal is not None:
             await self._node_wal.close()
 
-        # Stop Raft consensus and clock offset probing
+        # Stop the membership group, Raft consensus and clock offset probing
+        await self._cluster_membership.stop()
         self._clock_offset_prober.stop()
         await self._raft.stop()
 
@@ -1178,6 +1309,8 @@ class ManagerServer(HealthAwareServer):
         for task in self._get_background_tasks():
             if task and not task.done():
                 task.cancel()
+        if self._workflow_dispatcher is not None:
+            self._workflow_dispatcher.abort()
 
         super().abort()
 
@@ -1198,6 +1331,7 @@ class ManagerServer(HealthAwareServer):
             self._manager_peer_registration_sync_task,
             self._peer_job_state_sync_task,
             self._resource_sample_task,
+            self._resource_gossip_task,
         ]
 
     def _start_background_tasks(self) -> None:
@@ -1244,16 +1378,23 @@ class ManagerServer(HealthAwareServer):
         self._resource_sample_task = self._create_background_task(
             self._resource_sample_loop(), "resource_sample"
         )
+        self._resource_gossip_task = self._create_background_task(
+            self._resource_gossip_loop(), "resource_gossip"
+        )
 
     async def _cancel_background_tasks(self) -> None:
         """Cancel all background tasks."""
         for task in self._get_background_tasks():
             if task and not task.done():
                 task.cancel()
+                cancels_requested_before_wait = asyncio.current_task().cancelling()
                 try:
                     await task
                 except asyncio.CancelledError:
-                    pass
+                    # The task we cancelled ended; a cancel aimed at this task
+                    # while it waited goes on.
+                    if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                        raise
 
     # =========================================================================
     # Registration
@@ -1392,7 +1533,7 @@ class ManagerServer(HealthAwareServer):
         )
 
         if should_update_registry:
-            self._registry.register_manager_peer(peer_info)
+            await self._registry.register_manager_peer(peer_info)
         self._manager_state.set_manager_udp_to_tcp_mapping(peer_udp_addr, peer_tcp_addr)
         self._probe_scheduler.add_member(peer_udp_addr)
         self.record_peer_role(peer_udp_addr, NodeRole.MANAGER.value)
@@ -1428,8 +1569,6 @@ class ManagerServer(HealthAwareServer):
             await self._manager_state.add_active_peer(tcp_addr, peer_info.node_id)
             self._manager_state.clear_manager_peer_unhealthy_since(peer_info.node_id)
             self._manager_state.remove_dead_manager(tcp_addr)
-
-        self._raft.on_node_join(peer_info.node_id, tcp_addr)
 
     async def _register_with_peer_managers(self) -> None:
         """Register with seed peer managers."""
@@ -1514,6 +1653,29 @@ class ManagerServer(HealthAwareServer):
                 )
                 await self._clock.sleep(sync_interval)
 
+    async def _restore_joined_gates(self) -> None:
+        """Add the gates saved by earlier runs' joins to this manager's gate
+        addresses (TCP and UDP, paired by position)."""
+        if self._config.wal_data_dir is None:
+            return
+
+        self._joined_peer_store = JoinedPeerStore(
+            self._config.wal_data_dir,
+            self._storage_filesystem,
+            self._udp_logger,
+            self._host,
+            self._tcp_port,
+        )
+        for joined_gate in await self._joined_peer_store.load():
+            if joined_gate.tcp_address in self._seed_gates:
+                continue
+
+            self._seed_gates.append(joined_gate.tcp_address)
+            self._gate_udp_addrs.append(joined_gate.udp_address)
+            self._manager_state.set_gate_udp_to_tcp_mapping(
+                joined_gate.udp_address, joined_gate.tcp_address
+            )
+
     async def _join_node(self, target_addr: tuple[str, int]) -> None:
         """Operator join: register this manager with the gate at ``target_addr``.
 
@@ -1556,6 +1718,18 @@ class ManagerServer(HealthAwareServer):
         if target_addr not in self._seed_gates:
             self._seed_gates.append(target_addr)
 
+        if self._joined_peer_store is not None:
+            await self._joined_peer_store.add(
+                [
+                    JoinedPeer(
+                        datacenter=gate_info.datacenter,
+                        tcp_address=(gate_info.tcp_host, gate_info.tcp_port),
+                        udp_address=(gate_info.udp_host, gate_info.udp_port),
+                    )
+                    for gate_info in registration.healthy_gates
+                ]
+            )
+
     async def _register_with_manager(
         self,
         manager_addr: tuple[str, int],
@@ -1578,8 +1752,11 @@ class ManagerServer(HealthAwareServer):
                 registration.dump(),
                 timeout=self._config.tcp_timeout_standard_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
 
-            if response and not isinstance(response, Exception):
+            if response:
                 parsed = ManagerPeerRegistrationResponse.load(response)
                 if parsed.accepted:
                     responder_info = self._build_manager_info_from_registration_response(
@@ -1657,15 +1834,12 @@ class ManagerServer(HealthAwareServer):
                 "swim_node_dead",
             )
             self._detach_worker_membership(worker_id)
-            self._task_runner.run(self._handle_worker_failure, worker_id)
+            # An unexplained death: charged to the workflows it ran (AD-44).
+            self._task_runner.run(self._handle_worker_failure, worker_id, True)
             return
 
         manager_tcp_addr = self._manager_state.get_manager_tcp_from_udp(node_addr)
         if manager_tcp_addr:
-            for peer_id, peer_info in self._manager_state.iter_known_manager_peers():
-                if (peer_info.udp_host, peer_info.udp_port) == node_addr:
-                    self._raft.on_node_leave(peer_id)
-                    break
             self._task_runner.run(
                 self._handle_manager_peer_failure, node_addr, manager_tcp_addr
             )
@@ -1691,10 +1865,6 @@ class ManagerServer(HealthAwareServer):
         if manager_tcp_addr:
             dead_managers = self._manager_state.get_dead_managers()
             dead_managers.discard(manager_tcp_addr)
-            for peer_id, peer_info in self._manager_state.iter_known_manager_peers():
-                if (peer_info.udp_host, peer_info.udp_port) == node_addr:
-                    self._raft.on_node_join(peer_id, manager_tcp_addr)
-                    break
             self._task_runner.run(
                 self._register_with_manager,
                 manager_tcp_addr,
@@ -1796,47 +1966,35 @@ class ManagerServer(HealthAwareServer):
             worker_id,
         )
 
-    def _on_federated_probe_error(
-        self,
-        error_message: str,
-        affected_datacenters: list[str],
-    ) -> None:
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerWarning(
-                message=f"Federated health probe error: {error_message} "
-                f"(DCs: {affected_datacenters})",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            ),
-        )
-
     async def _handle_worker_dead_for_job_reassignment(
         self,
         job_id: str,
         worker_id: str,
     ) -> None:
-        if not self._workflow_dispatcher or not self._job_manager:
+        # The job's leader decides its workflows' retries.
+        if (
+            not self._workflow_dispatcher
+            or not self._job_manager
+            or not self._leases.is_job_leader(job_id)
+        ):
             return
 
-        job = self._job_manager.get_job_by_id(job_id)
-        if not job:
-            return
-
-        sub_workflows_to_reassign = [
-            (sub.token.workflow_id or "", sub.token_str)
-            for sub in job.sub_workflows.values()
-            if sub.worker_id == worker_id and sub.result is None
-        ]
-
-        for workflow_id, sub_token in sub_workflows_to_reassign:
+        # The same filter as a worker's global death: a superseded sub, or
+        # one whose parent already finished (a multi-core workflow completed
+        # on its surviving sub), is not reassigned -- requeueing it
+        # dispatched a finished workflow again, running its load twice.
+        # The worker stalled on this job (AD-30): charged to its workflows.
+        for _, workflow_id, sub_token in self._job_manager.get_reassignable_sub_workflows_on_worker(
+            worker_id,
+            job_id=job_id,
+        ):
             await self._apply_workflow_reassignment_state(
                 job_id=job_id,
                 workflow_id=workflow_id,
                 sub_workflow_token=sub_token,
                 failed_worker_id=worker_id,
-                reason="worker_dead",
+                reason="job_unresponsive",
+                loss_is_charged=not self._systemic_eviction_hold,
             )
 
     async def _apply_workflow_reassignment_state(
@@ -1846,155 +2004,345 @@ class ManagerServer(HealthAwareServer):
         sub_workflow_token: str,
         failed_worker_id: str,
         reason: str,
+        loss_is_charged: bool,
     ) -> tuple[bool, bool]:
+        """
+        A worker the workflow ran on is lost; this manager leads its job
+        and decides what that means (a follower only mirrors the superseded
+        sub):
+
+        * a sub still runs elsewhere -> the workflow finishes with reduced
+          parallelism, or completes now if the survivors already reported;
+        * every worker it ran on is lost -> it runs again, unless the loss
+          is charged to it (AD-44: an unexplained death, an AD-41
+          over-budget eviction, an AD-30 stall, an orphan -- never our own
+          eviction or a systemic loss) and its retry budget is spent, or
+          this manager holds no dispatch entry to run it with (its job was
+          taken over without the workflow): then it fails for good, loudly,
+          with the cause.
+
+        Returns ``(applied, requeued)``.
+        """
         if not self._workflow_dispatcher or not self._job_manager:
             return False, False
 
-        try:
-            reassignment_token = TrackingToken.parse(sub_workflow_token)
-        except ValueError as error:
+        async with self._workflow_reassignment_lock:
+            applied, lost_every_sub = await self._job_manager.apply_workflow_reassignment(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                sub_workflow_token=sub_workflow_token,
+                failed_worker_id=failed_worker_id,
+            )
+            requeued, failure_reason, ready_result = await self._settle_reassigned_workflow(
+                applied,
+                lost_every_sub,
+                job_id,
+                workflow_id,
+                sub_workflow_token,
+                failed_worker_id,
+                reason,
+                loss_is_charged,
+            )
+
+        await self._finish_workflow_reassignment(
+            job_id,
+            workflow_id,
+            failed_worker_id,
+            reason,
+            applied,
+            failure_reason,
+            ready_result,
+        )
+        return applied, requeued
+
+    async def _settle_reassigned_workflow(
+        self,
+        applied: bool,
+        lost_every_sub: bool,
+        job_id: str,
+        workflow_id: str,
+        sub_workflow_token: str,
+        failed_worker_id: str,
+        reason: str,
+        loss_is_charged: bool,
+    ) -> tuple[bool, str | None, WorkflowFinalResult | None]:
+        """
+        Decide, under the reassignment lock, what an applied worker loss means for its workflow.
+
+        Returns ``(requeued, failure_reason, ready_result)``: whether the
+        workflow was requeued, why it fails for good (None when it does not),
+        and the parent's result when the surviving subs already completed it.
+        A workflow being cancelled lost a worker: nothing runs it there any
+        more, so its tracked sub drains instead.
+        """
+        if not applied:
+            return False, None, None
+        if self._job_manager.workflow_lifecycle.get_state(job_id, workflow_id) == WorkflowState.CANCELLING:
+            await self._drain_cancelling_workflow_after_loss(
+                job_id, workflow_id, sub_workflow_token, lost_every_sub
+            )
+            return False, None, None
+        return await self._settle_running_reassigned_workflow(
+            lost_every_sub,
+            job_id,
+            workflow_id,
+            sub_workflow_token,
+            failed_worker_id,
+            reason,
+            loss_is_charged,
+        )
+
+    async def _drain_cancelling_workflow_after_loss(
+        self,
+        job_id: str,
+        workflow_id: str,
+        sub_workflow_token: str,
+        lost_every_sub: bool,
+    ) -> None:
+        """
+        Drain a cancelling workflow's sub on a lost worker, cancelling the workflow once no sub is left.
+
+        Its tracked sub drains, survivors or not -- the job's cancellation
+        completes only once every sub did; with no sub left anywhere the
+        workflow is cancelled and the job completes if it is done.
+        """
+        await self._cancellation.finalize_workflow_cancellation(
+            job_id=job_id,
+            workflow_id=sub_workflow_token,
+            success=True,
+            errors=[],
+        )
+        if lost_every_sub and await self._job_manager.finish_workflow_cancellation(
+            job_id, workflow_id
+        ):
+            await self._complete_job_if_done(job_id)
+
+    async def _settle_running_reassigned_workflow(
+        self,
+        lost_every_sub: bool,
+        job_id: str,
+        workflow_id: str,
+        sub_workflow_token: str,
+        failed_worker_id: str,
+        reason: str,
+        loss_is_charged: bool,
+    ) -> tuple[bool, str | None, WorkflowFinalResult | None]:
+        """
+        Settle a running workflow that lost a worker: finish on its survivors, or run it again.
+
+        Returns ``(requeued, failure_reason, ready_result)``. A workflow with
+        a sub still running elsewhere yields its ready result, if any; one
+        that lost every sub while dispatched or running is requeued or fails
+        for good; any other workflow needs nothing.
+        """
+        if not lost_every_sub:
+            return False, None, await self._ready_result_after_superseding(
+                job_id, workflow_id, failed_worker_id
+            )
+        if self._job_manager.workflow_lifecycle.get_state(
+            job_id, workflow_id
+        ) not in (WorkflowState.DISPATCHED, WorkflowState.RUNNING):
+            return False, None, None
+        requeued, failure_reason = await self._rerun_lost_workflow(
+            job_id,
+            workflow_id,
+            sub_workflow_token,
+            failed_worker_id,
+            reason,
+            loss_is_charged,
+        )
+        return requeued, failure_reason, None
+
+    async def _ready_result_after_superseding(
+        self,
+        job_id: str,
+        workflow_id: str,
+        failed_worker_id: str,
+    ) -> WorkflowFinalResult | None:
+        """Fetch the parent's ready result once a failed worker's sub is superseded, logging which way it went."""
+        ready_result = await self._job_manager.get_parent_ready_result(
+            job_id,
+            workflow_id,
+        )
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    f"Workflow {workflow_id[:8]}... is ready after "
+                    f"superseding failed worker {failed_worker_id[:8]}..."
+                    if ready_result is not None
+                    else f"Workflow {workflow_id[:8]}... still has active "
+                    f"sub-workflows after worker {failed_worker_id[:8]}... failed"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return ready_result
+
+    async def _rerun_lost_workflow(
+        self,
+        job_id: str,
+        workflow_id: str,
+        sub_workflow_token: str,
+        failed_worker_id: str,
+        reason: str,
+        loss_is_charged: bool,
+    ) -> tuple[bool, str | None]:
+        """Requeue a workflow that lost every worker it ran on and log the outcome; returns (requeued, failure_reason)."""
+        requeued, failure_reason = await self._requeue_lost_workflow(
+            job_id,
+            workflow_id,
+            sub_workflow_token,
+            failed_worker_id,
+            reason,
+            loss_is_charged,
+        )
+        await self._log_lost_workflow_requeue(job_id, workflow_id, failed_worker_id, reason, requeued)
+        return requeued, failure_reason
+
+    async def _requeue_lost_workflow(
+        self,
+        job_id: str,
+        workflow_id: str,
+        sub_workflow_token: str,
+        failed_worker_id: str,
+        reason: str,
+        loss_is_charged: bool,
+    ) -> tuple[bool, str | None]:
+        """
+        Return a lost workflow to pending and requeue it, or name why it fails for good.
+
+        It fails for good when this manager holds no dispatch entry to run it
+        again (its job was taken over without the workflow), or when the loss
+        is charged to it and its retry budget is spent.
+        """
+        if f"{job_id}:{workflow_id}" not in self._workflow_dispatcher.get_pending_workflows():
+            return False, (
+                f"lost with worker {failed_worker_id} ({reason}), and this manager "
+                "holds no dispatch entry to run it again (its job was taken over "
+                "without the workflow)"
+            )
+        retry_allowed, budget_state = await self._charge_lost_workflow_retry(
+            job_id, workflow_id, loss_is_charged
+        )
+        if not retry_allowed:
+            return False, (
+                f"lost with worker {failed_worker_id} ({reason}), and its "
+                f"retry budget is spent ({budget_state})"
+            )
+        return await self._return_lost_workflow_to_pending(
+            job_id, workflow_id, sub_workflow_token, failed_worker_id, reason
+        ), None
+
+    async def _charge_lost_workflow_retry(
+        self,
+        job_id: str,
+        workflow_id: str,
+        loss_is_charged: bool,
+    ) -> tuple[bool, str]:
+        """Consume a retry from the workflow's budget when the loss is charged to it; returns (allowed, budget state)."""
+        if not loss_is_charged:
+            return True, "the loss is not charged to the workflow"
+        return await self._retry_budget_manager.check_and_consume(job_id, workflow_id)
+
+    async def _return_lost_workflow_to_pending(
+        self,
+        job_id: str,
+        workflow_id: str,
+        sub_workflow_token: str,
+        failed_worker_id: str,
+        reason: str,
+    ) -> bool:
+        """Move a lost workflow back to pending and requeue it away from the failed worker; returns whether requeued."""
+        if await self._job_manager.return_workflow_to_pending(
+            job_id,
+            workflow_id,
+            f"worker {failed_worker_id} lost ({reason})",
+        ):
+            return await self._workflow_dispatcher.requeue_workflow(
+                sub_workflow_token,
+                excluded_worker_id=failed_worker_id,
+            )
+        return False
+
+    async def _log_lost_workflow_requeue(
+        self,
+        job_id: str,
+        workflow_id: str,
+        failed_worker_id: str,
+        reason: str,
+        requeued: bool,
+    ) -> None:
+        """Log a lost workflow's requeue, and warn when no healthy worker is left to run it."""
+        if requeued:
             await self._udp_logger.log(
-                ServerWarning(
+                ServerInfo(
                     message=(
-                        "Workflow reassignment parse error: "
-                        f"{sub_workflow_token} ({error})"
+                        f"Requeued workflow {workflow_id[:8]}... from "
+                        f"failed worker {failed_worker_id[:8]}... ({reason})"
                     ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
-            return False, False
 
-        requeued = False
-        applied = False
-        dispatch_state_updated = False
-        ready_result: WorkflowFinalResult | None = None
-
-        async with self._workflow_reassignment_lock:
-            applied = await self._job_manager.apply_workflow_reassignment(
-                job_id=job_id,
-                workflow_id=workflow_id,
-                sub_workflow_token=sub_workflow_token,
-                failed_worker_id=failed_worker_id,
+        if not self._worker_pool.get_healthy_worker_ids():
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"No healthy workers available to reassign workflow "
+                        f"{workflow_id[:8]}... for job {job_id[:8]}..."
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
             )
 
-            if applied:
-                ready_result = await self._job_manager.get_parent_ready_result(
-                    job_id,
-                    workflow_id,
-                )
+    async def _finish_workflow_reassignment(
+        self,
+        job_id: str,
+        workflow_id: str,
+        failed_worker_id: str,
+        reason: str,
+        applied: bool,
+        failure_reason: str | None,
+        ready_result: WorkflowFinalResult | None,
+    ) -> None:
+        """
+        Act on a settled reassignment outside its lock.
 
-            if (
-                reassignment_token.worker_id == failed_worker_id
-                or not reassignment_token.worker_id
-            ):
-                parent_has_active_sub_workflows = (
-                    await self._job_manager.has_active_sub_workflows(
-                        job_id,
-                        workflow_id,
-                    )
-                )
-                if ready_result is not None:
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=(
-                                f"Workflow {workflow_id[:8]}... is ready after "
-                                f"superseding failed worker {failed_worker_id[:8]}..."
-                            ),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                elif parent_has_active_sub_workflows:
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=(
-                                f"Workflow {workflow_id[:8]}... still has active "
-                                f"sub-workflows after worker {failed_worker_id[:8]}... "
-                                "failed"
-                            ),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                else:
-                    requeued = await self._workflow_dispatcher.requeue_workflow(
-                        sub_workflow_token,
-                        excluded_worker_id=failed_worker_id,
-                    )
-                    dispatch_state_updated = requeued
-
-                if requeued:
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=(
-                                f"Requeued workflow {workflow_id[:8]}... from "
-                                f"failed worker {failed_worker_id[:8]}... ({reason})"
-                            ),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                elif ready_result is None and not parent_has_active_sub_workflows:
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=(
-                                f"Failed to requeue workflow {workflow_id[:8]}... from "
-                                f"failed worker {failed_worker_id[:8]}... - not found in pending"
-                            ),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-
-                if not self._worker_pool.get_healthy_worker_ids():
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=(
-                                f"No healthy workers available to reassign workflow "
-                                f"{workflow_id[:8]}... for job {job_id[:8]}..."
-                            ),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-            elif reassignment_token.worker_id:
-                unassigned = await self._workflow_dispatcher.unassign_workflow(
-                    job_id=job_id,
-                    workflow_id=workflow_id,
-                )
-                assigned = await self._workflow_dispatcher.mark_workflow_assigned(
-                    job_id=job_id,
-                    workflow_id=workflow_id,
-                )
-                dispatch_state_updated = unassigned or assigned
-
-        if applied or dispatch_state_updated:
-            new_worker_id = (
-                reassignment_token.worker_id
-                if reassignment_token.worker_id != failed_worker_id
-                else None
-            )
+        Tells the gate about an applied reassignment, fails a workflow that
+        cannot run again for good, and completes a parent workflow its
+        surviving subs made ready.
+        """
+        if applied:
             await self._notify_gate_of_workflow_reassignment(
                 job_id=job_id,
                 workflow_id=workflow_id,
                 failed_worker_id=failed_worker_id,
                 reason=reason,
-                new_worker_id=new_worker_id,
+                new_worker_id=None,
             )
 
-        if ready_result is not None:
-            await self._handle_parent_workflow_completion(ready_result, True, True)
-            if self._is_job_complete(job_id):
-                await self._handle_job_completion(job_id)
+        if failure_reason is not None:
+            await self._fail_workflow_for_good(job_id, workflow_id, failure_reason)
 
-        return applied, requeued
+        await self._complete_ready_parent_workflow(job_id, ready_result)
+
+    async def _complete_ready_parent_workflow(
+        self,
+        job_id: str,
+        ready_result: WorkflowFinalResult | None,
+    ) -> None:
+        """Complete a parent workflow from its ready result, then the job if that finished it; None does nothing."""
+        if ready_result is None:
+            return
+        await self._handle_parent_workflow_completion(ready_result, True, True)
+        if self._is_job_complete(job_id):
+            await self._handle_job_completion(job_id)
 
     def _aggregate_job_progress(
         self,
@@ -2063,7 +2411,7 @@ class ManagerServer(HealthAwareServer):
                 origin_gate_addr,
                 "job_status_push_forward",
                 push.dump(),
-                timeout=2.0,
+                timeout=self._config.tcp_timeout_short_seconds,
             )
             if isinstance(response, Exception):
                 raise response
@@ -2085,7 +2433,13 @@ class ManagerServer(HealthAwareServer):
     # Failure/Recovery Handlers
     # =========================================================================
 
-    async def _handle_worker_failure(self, worker_id: str) -> None:
+    async def _handle_worker_failure(self, worker_id: str, loss_is_charged: bool) -> None:
+        """A worker is gone. ``loss_is_charged`` says whether its loss is
+        charged to the retry budgets of the workflows it ran (AD-44): an
+        unexplained death or an AD-41 over-budget eviction is, our own
+        deadline eviction is not -- and nothing is during a systemic hold.
+        Only a job's leader decides its workflows' retries; a follower
+        mirrors the superseded subs."""
         await self._udp_logger.log(
             ServerError(
                 message=(
@@ -2111,27 +2465,37 @@ class ManagerServer(HealthAwareServer):
                 self._job_manager.get_reassignable_sub_workflows_on_worker(worker_id)
             )
 
+            loss_reason = "worker_dead" if loss_is_charged else "worker_evicted"
             for job_id, workflow_id, sub_token in reassignable_sub_workflows:
+                if not self._leases.is_job_leader(job_id):
+                    await self._job_manager.apply_workflow_reassignment(
+                        job_id=job_id,
+                        workflow_id=workflow_id,
+                        sub_workflow_token=sub_token,
+                        failed_worker_id=worker_id,
+                    )
+                    continue
                 await self._apply_workflow_reassignment_state(
                     job_id=job_id,
                     workflow_id=workflow_id,
                     sub_workflow_token=sub_token,
                     failed_worker_id=worker_id,
-                    reason="worker_dead",
+                    reason=loss_reason,
+                    loss_is_charged=loss_is_charged and not self._systemic_eviction_hold,
                 )
 
             if reassignable_sub_workflows and self._worker_disseminator:
                 await self._worker_disseminator.broadcast_workflow_reassignments(
                     failed_worker_id=worker_id,
-                    reason="worker_dead",
+                    reason=loss_reason,
                     reassignments=reassignable_sub_workflows,
                 )
 
-        if (
-            self._job_manager
-            and self._manager_state.get_worker_count() == 0
-        ):
-            await self._fail_unfinished_workflows_with_no_workers()
+        # Losing the last worker fails nothing more: the workflows it held
+        # went back to PENDING above (or failed for good when their retry
+        # budget was spent), and a datacenter without workers is a capacity
+        # wait like any other -- a worker joining dispatches them, and the
+        # job's deadline (AD-34) fails them loudly if none does.
 
     def _detach_worker_membership(
         self, worker_id: str, reason: str = "worker_failure"
@@ -2203,7 +2567,10 @@ class ManagerServer(HealthAwareServer):
                 notice.dump(),
                 timeout=self._config.tcp_timeout_standard_seconds,
             )
-            if response and not isinstance(response, Exception):
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
+            if response:
                 ack = WorkerEvictionNoticeAck.load(response)
                 if ack.worker_id == worker_id:
                     self._manager_state.clear_eviction_notice(worker_id)
@@ -2414,6 +2781,9 @@ class ManagerServer(HealthAwareServer):
                 ),
                 timeout=self._config.tcp_timeout_short_seconds + 1.0,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
             return response is not None and response != b"error"
         except asyncio.TimeoutError:
             return False
@@ -2507,6 +2877,19 @@ class ManagerServer(HealthAwareServer):
         old_leader_id: str | None,
     ) -> bool:
         """Advance a job's fenced leadership epoch as the SWIM cluster leader."""
+        if not await self._may_take_over_job_leadership(job_id):
+            return False
+
+        peers_answered = await self._state_sync.sync_state_from_manager_peers(
+            force_full=True
+        )
+        verdict, job = await self._job_takeover_verdict(job_id, old_leader_id, peers_answered)
+        if verdict is not None:
+            return verdict
+        return await self._claim_job_leadership_takeover(job_id, job, old_leader_id)
+
+    async def _may_take_over_job_leadership(self, job_id: str) -> bool:
+        """Whether this manager is the cluster leader with manager quorum; a missing quorum is logged."""
         if not self.is_leader():
             return False
         if not self._leadership.has_quorum():
@@ -2521,20 +2904,185 @@ class ManagerServer(HealthAwareServer):
                 )
             )
             return False
+        return True
 
-        await self._state_sync.sync_state_from_manager_peers(force_full=True)
+    async def _job_takeover_verdict(
+        self,
+        job_id: str,
+        old_leader_id: str | None,
+        peers_answered: int,
+    ) -> tuple[bool | None, JobInfo | None]:
+        """
+        Decide whether a job's takeover is settled before any claim is made.
+
+        Returns (verdict, None) when the takeover is already decided -- True
+        when this manager leads the job, False when it may not or need not
+        take it over -- and (None, job) when the job is to be claimed. A job
+        that ended or was never admitted is settled here rather than claimed.
+        """
+        if (verdict := self._job_takeover_claim_verdict(job_id, old_leader_id)) is not None:
+            return verdict, None
+        job = self._job_manager.get_job_by_id(job_id)
+        if not await self._job_still_needs_takeover(job_id, job, peers_answered):
+            return False, None
+        return None, job
+
+    def _job_takeover_claim_verdict(self, job_id: str, old_leader_id: str | None) -> bool | None:
+        """
+        Return True when this manager already leads the job, False when the claim is blocked, else None.
+
+        The claim is blocked while another manager than the dead one leads
+        the job, or while the job's consensus group has not settled.
+        """
         current_leader_id = self._leases.get_job_leader(job_id)
-        if current_leader_id == self._node_id.full and self._leases.is_job_leader(job_id):
+        if self._already_leads_job(current_leader_id, job_id):
             return True
-        if (
+        if self._job_takeover_blocked(job_id, current_leader_id, old_leader_id):
+            return False
+        return None
+
+    def _already_leads_job(self, current_leader_id: str | None, job_id: str) -> bool:
+        """Whether the job's recorded leader is this manager and this manager holds the job's leadership."""
+        return current_leader_id == self._node_id.full and self._leases.is_job_leader(job_id)
+
+    def _job_takeover_blocked(
+        self,
+        job_id: str,
+        current_leader_id: str | None,
+        old_leader_id: str | None,
+    ) -> bool:
+        """Whether another live manager leads the job, or the job's consensus group is not yet settled."""
+        return self._job_led_by_another_manager(
+            current_leader_id, old_leader_id
+        ) or self._job_group_unsettled(job_id, old_leader_id)
+
+    def _job_led_by_another_manager(
+        self,
+        current_leader_id: str | None,
+        old_leader_id: str | None,
+    ) -> bool:
+        """Whether the job's recorded leader is neither this manager nor the leader being taken over from."""
+        return (
             current_leader_id is not None
             and current_leader_id != self._node_id.full
-            and (old_leader_id is None or current_leader_id != old_leader_id)
-        ):
-            return False
+            and self._differs_from_old_leader(current_leader_id, old_leader_id)
+        )
 
+    @staticmethod
+    def _differs_from_old_leader(current_leader_id: str, old_leader_id: str | None) -> bool:
+        """Whether a job's recorded leader is not the old leader -- always so when no old leader is named."""
+        return old_leader_id is None or current_leader_id != old_leader_id
+
+    def _job_group_unsettled(self, job_id: str, old_leader_id: str | None) -> bool:
+        """
+        Whether the job's consensus group has yet to settle on what its dead leader last recorded.
+
+        The group settles once it has a new group leader and every entry held
+        here is applied: an end the leader committed sits unapplied here
+        until then, and the job would read as running. The orphan scan
+        retries.
+        """
+        job_group = self._raft.consensus.get_node(job_id)
+        return job_group is not None and (
+            job_group.current_leader in (None, old_leader_id)
+            or job_group.last_applied_index < job_group.last_log_index
+        )
+
+    async def _job_still_needs_takeover(
+        self,
+        job_id: str,
+        job: JobInfo | None,
+        peers_answered: int,
+    ) -> bool:
+        """
+        Settle a job that ended or was never admitted, and report whether it still needs a takeover.
+
+        An ended job's leader died after finishing it, before every member
+        heard: taken over, it re-ran what its copy still showed unfinished.
+        A never-admitted job's leader announced it and died before
+        replicating it to a quorum, so its submitter was never told it was
+        accepted: taken over, it had nothing to run and "completed".
+        """
+        status_order = JobStatusOrder()
+        replicated_state = self._ledger_replica.job_state(job_id)
+        if self._job_ended(replicated_state, job, status_order):
+            await self._settle_ended_job_copy(job_id, job, replicated_state, status_order)
+            return False
+        if self._is_unadmitted_job_copy(job):
+            await self._settle_unadmitted_job_copy(job_id, peers_answered)
+            return False
+        return True
+
+    @classmethod
+    def _job_ended(
+        cls,
+        replicated_state: JobState | None,
+        job: JobInfo | None,
+        status_order: JobStatusOrder,
+    ):
+        """Whether the replicated ledger or the job held here shows the job terminal."""
+        return cls._replicated_state_is_terminal(replicated_state) or cls._job_is_terminal(
+            job, status_order
+        )
+
+    @staticmethod
+    def _replicated_state_is_terminal(replicated_state: JobState | None):
+        """Whether the replicated ledger holds the job in a terminal state."""
+        return replicated_state is not None and replicated_state.is_terminal
+
+    @staticmethod
+    def _job_is_terminal(job: JobInfo | None, status_order: JobStatusOrder):
+        """Whether the job is held here with a terminal status."""
+        return job is not None and status_order.is_terminal(job.status)
+
+    @staticmethod
+    def _is_unadmitted_job_copy(job: JobInfo | None) -> bool:
+        """Whether the job is unknown here or holds no workflows -- it was never admitted."""
+        return job is None or not job.workflows
+
+    async def _settle_ended_job_copy(
+        self,
+        job_id: str,
+        job: JobInfo | None,
+        replicated_state: JobState | None,
+        status_order: JobStatusOrder,
+    ) -> None:
+        """End a live copy of a job the replicated ledger shows terminal, and destroy the job's group."""
+        if job is None or status_order.is_terminal(job.status):
+            return
+        await self._end_job_copy_at_clock_time(job, replicated_state.status)
+        await self._raft.consensus.destroy_job_raft(job_id)
+
+    async def _end_job_copy_at_clock_time(self, job: JobInfo, status: str) -> None:
+        """Under the job's lock, set its status and stamp its completion with the clock's time when it has none."""
+        async with job.lock:
+            job.status = status
+            if job.completed_at <= 0:
+                job.completed_at = self._clock.time()
+
+    async def _settle_unadmitted_job_copy(self, job_id: str, peers_answered: int) -> None:
+        """
+        Clean up a never-admitted job's state when a quorum answered the state sync.
+
+        Settled on a quorum's word only -- an unheard member may hold the
+        replicated job.
+        """
+        if peers_answered + 1 >= self._leadership.get_quorum_size():
+            await self._cleanup_job_state(job_id)
+
+    async def _claim_job_leadership_takeover(
+        self,
+        job_id: str,
+        job: JobInfo | None,
+        old_leader_id: str | None,
+    ) -> bool:
+        """
+        Claim a job's leadership at the next fencing token through a quorum, then assume it.
+
+        Returns False when the claim did not reach a quorum or the lease
+        coordinator refused it, and True once this manager leads the job.
+        """
         next_fencing_token = max(2, self._leases.get_fence_token(job_id) + 1)
-        job = self._job_manager.get_job_by_id(job_id)
         takeover_claim = self._build_job_state_sync_message(
             job_id,
             job,
@@ -2559,18 +3107,25 @@ class ManagerServer(HealthAwareServer):
         if not accepted:
             return False
 
-        await self._hydrate_job_state_for_takeover(job_id)
-        await self._adopt_replicated_ledger_history(job_id)
+        await self._assume_taken_over_job_leadership(job_id, old_leader_id, next_fencing_token)
+        return True
 
-        job = self._job_manager.get_job_by_id(job_id)
-        workflow_names: list[str] = []
-        if job is not None:
-            job.leader_node_id = self._node_id.full
-            job.leader_addr = (self._host, self._tcp_port)
-            job.fencing_token = next_fencing_token
-            workflow_names = [
-                workflow.name for workflow in job.workflows.values()
-            ]
+    async def _assume_taken_over_job_leadership(
+        self,
+        job_id: str,
+        old_leader_id: str | None,
+        next_fencing_token: int,
+    ) -> None:
+        """
+        Act as a taken-over job's leader: hydrate and adopt its state, announce it, and tell its gate and workers.
+
+        Phase F4: the job inherits AD-26 H7/H8 state from the previous
+        leader's persisted TimeoutTrackingState.
+        """
+        await self._hydrate_job_state_for_takeover(job_id)
+        await self._adopt_replicated_ledger_history(job_id, old_leader_id, next_fencing_token)
+
+        workflow_names = self._stamp_taken_over_job_leadership(job_id, next_fencing_token)
 
         await self._manager_state.increment_state_version()
         await self._broadcast_job_leadership(
@@ -2586,13 +3141,25 @@ class ManagerServer(HealthAwareServer):
             next_fencing_token,
         )
         await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
-        # Phase F4: inherit AD-26 H7/H8 state from the previous
-        # leader's persisted TimeoutTrackingState.
         self._replay_extension_state_for_job(job_id)
-        return True
 
-    async def _adopt_replicated_ledger_history(self, job_id: str) -> None:
-        """AD-38: take over the job's ledger record along with the job.
+    def _stamp_taken_over_job_leadership(self, job_id: str, next_fencing_token: int) -> list[str]:
+        """Record this manager as the job's leader at the new fencing token; returns the job's workflow names."""
+        job = self._job_manager.get_job_by_id(job_id)
+        if job is None:
+            return []
+        job.leader_node_id = self._node_id.full
+        job.leader_addr = (self._host, self._tcp_port)
+        job.fencing_token = next_fencing_token
+        return [
+            workflow.name for workflow in job.workflows.values()
+        ]
+
+    async def _adopt_replicated_ledger_history(
+        self, job_id: str, previous_leader_id: str | None, lease_fence_token: int
+    ) -> None:
+        """AD-38: take over the job's ledger record along with the job, and
+        record the takeover in it (``JobLeadershipAcquired``).
 
         The previous leader's ledger held the job; this member mirrored
         every REGIONAL entry of it through the job's Raft group. Without
@@ -2619,6 +3186,9 @@ class ManagerServer(HealthAwareServer):
 
         adopted = await self._job_ledger.adopt_replicated_history(
             job_id, self._ledger_replica.history(job_id)
+        )
+        await self._job_ledger.record_leadership_acquired(
+            job_id, self._node_id.full, previous_leader_id, lease_fence_token
         )
         await self._udp_logger.log(
             ServerInfo(
@@ -2673,6 +3243,9 @@ class ManagerServer(HealthAwareServer):
                 transfer.dump(),
                 timeout=self._config.tcp_timeout_standard_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
             if not response:
                 return
             ack = JobLeaderManagerTransferAck.load(response)
@@ -2794,12 +3367,15 @@ class ManagerServer(HealthAwareServer):
                 # re-carries the request on its next heartbeat and this
                 # branch re-responds.
                 try:
-                    await self.send_tcp(
+                    push_reply, _ = await self.send_tcp(
                         (worker.node.host, worker.node.port),
                         "extension_response",
                         response.dump(),
                         timeout=self._config.tcp_timeout_standard_seconds,
                     )
+                    # send_tcp returns transport errors rather than raising.
+                    if isinstance(push_reply, Exception):
+                        raise push_reply
                 except Exception as send_error:
                     await self._udp_logger.log(
                         ServerWarning(
@@ -2843,12 +3419,15 @@ class ManagerServer(HealthAwareServer):
             reason="unknown_worker_heartbeat (manager restarted?)",
         )
         try:
-            await self.send_tcp(
+            response, _ = await self.send_tcp(
                 worker_tcp_addr,
                 "eviction_notice",
                 notice.dump(),
                 timeout=self._config.tcp_timeout_standard_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
             await self._udp_logger.log(
                 ServerInfo(
                     message=(
@@ -2909,7 +3488,7 @@ class ManagerServer(HealthAwareServer):
         )
 
         if previous_peer_state and previous_peer_state != peer_health_state:
-            self._log_peer_manager_health_transition(
+            await self._log_peer_manager_health_transition(
                 peer_id, previous_peer_state, peer_health_state
             )
             await self._worker_health_monitor.check_peer_manager_health_alerts()
@@ -2935,7 +3514,7 @@ class ManagerServer(HealthAwareServer):
                 datacenter=heartbeat.datacenter,
                 is_leader=heartbeat.is_leader,
             )
-            self._registry.register_gate(gate_info)
+            await self._registry.register_gate(gate_info)
 
         # Update gate leader tracking
         if heartbeat.is_leader:
@@ -2998,10 +3577,17 @@ class ManagerServer(HealthAwareServer):
         dead_manager_cleanup_threshold = now - (
             self._config.dead_peer_reap_interval_seconds * 2
         )
+        # A dead manager still leading a job held here stays tracked: the
+        # orphan scan finds a dead leader's jobs by it, and untracked, they
+        # were never taken over.
+        leaders_of_held_jobs = {
+            leader_addr for _, leader_addr in self._manager_state.iter_job_leader_addrs()
+        }
         dead_managers_to_cleanup = [
             tcp_addr
             for tcp_addr, dead_since in self._manager_state.iter_dead_manager_timestamps()
             if dead_since < dead_manager_cleanup_threshold
+            and tcp_addr not in leaders_of_held_jobs
         ]
         for tcp_addr in dead_managers_to_cleanup:
             self._manager_state.remove_dead_manager(tcp_addr)
@@ -3019,7 +3605,7 @@ class ManagerServer(HealthAwareServer):
                 self._reap_dead_gates(now)
                 self._cleanup_stale_dead_manager_tracking(now)
                 self._resend_eviction_notices(now)
-                self._resend_completion_notices(now)
+                await self._resend_completion_notices(now)
                 await self._checkpoint_ledger_if_due()
 
             except asyncio.CancelledError:
@@ -3124,6 +3710,12 @@ class ManagerServer(HealthAwareServer):
         orphaned_tokens: set[str],
         worker_id: str,
     ) -> None:
+        """Sub-workflows this manager believes run on ``worker_id``, which
+        no longer has them, are lost there: they go through reassignment --
+        superseded, and the workflow retried (charged: an unexplained loss)
+        or failed for good -- decided by the job's leader. Orphans of jobs
+        another manager leads are broadcast to the peers for their leader."""
+        orphans_led_elsewhere: list[tuple[str, str, str]] = []
         for orphaned_token in orphaned_tokens:
             await self._udp_logger.log(
                 ServerWarning(
@@ -3133,8 +3725,27 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            if self._workflow_dispatcher:
-                await self._workflow_dispatcher.requeue_workflow(orphaned_token)
+            orphan = TrackingToken.parse(orphaned_token)
+            if not orphan.workflow_id:
+                continue
+            if not self._leases.is_job_leader(orphan.job_id):
+                orphans_led_elsewhere.append((orphan.job_id, orphan.workflow_id, orphaned_token))
+                continue
+            await self._apply_workflow_reassignment_state(
+                job_id=orphan.job_id,
+                workflow_id=orphan.workflow_id,
+                sub_workflow_token=orphaned_token,
+                failed_worker_id=worker_id,
+                reason="orphaned",
+                loss_is_charged=not self._systemic_eviction_hold,
+            )
+
+        if orphans_led_elsewhere and self._worker_disseminator:
+            await self._worker_disseminator.broadcast_workflow_reassignments(
+                failed_worker_id=worker_id,
+                reason="orphaned",
+                reassignments=orphans_led_elsewhere,
+            )
 
     async def _scan_worker_for_orphans(
         self, worker_id: str, worker_addr: tuple[str, int]
@@ -3167,6 +3778,9 @@ class ManagerServer(HealthAwareServer):
                 should_scan = self.is_leader() or self._should_backup_orphan_scan()
                 if not should_scan:
                     continue
+
+                if self.is_leader():
+                    await self._scan_for_orphaned_jobs()
 
                 for worker_id, worker in self._manager_state.iter_workers():
                     try:
@@ -3371,23 +3985,26 @@ class ManagerServer(HealthAwareServer):
                 )
 
     async def _flush_windowed_stats(self) -> None:
-        windowed_stats = await self._windowed_stats.flush_closed_windows(
-            aggregate=False
-        )
-        if not windowed_stats:
-            return
+        """Forward the closed windows of gate-routed jobs to their origin
+        gate, per worker (the gate aggregates across datacenters). A job a
+        client submitted directly keeps its windows for the client stats
+        push, which aggregates them: each job has one consumer."""
+        for job_id in self._windowed_stats.get_jobs_with_pending_stats():
+            origin_gate_addr = self._manager_state.get_job_origin_gate(job_id)
+            if origin_gate_addr is None:
+                continue
 
-        for stats_push in windowed_stats:
-            await self._push_windowed_stats_to_gate(stats_push)
+            for stats_push in await self._windowed_stats.flush_closed_job_windows(
+                job_id,
+                aggregate=False,
+            ):
+                await self._push_windowed_stats_to_gate(stats_push, origin_gate_addr)
 
     async def _push_windowed_stats_to_gate(
         self,
         stats_push: WindowedStatsPush,
+        origin_gate_addr: tuple[str, int],
     ) -> None:
-        origin_gate_addr = self._manager_state.get_job_origin_gate(stats_push.job_id)
-        if not origin_gate_addr:
-            return
-
         stats_push.datacenter = self._node_id.datacenter
 
         try:
@@ -3411,6 +4028,37 @@ class ManagerServer(HealthAwareServer):
                 )
             )
 
+    async def _send_gate_heartbeat(
+        self,
+        gate_addr: tuple[str, int],
+        heartbeat_payload: bytes,
+    ) -> bool:
+        """Send one heartbeat to one gate; whether the gate took it. A
+        failure -- raised or returned -- is logged."""
+        try:
+            response, _clock = await self.send_tcp(
+                gate_addr,
+                "manager_status_update",
+                heartbeat_payload,
+                timeout=self._config.tcp_timeout_short_seconds,
+            )
+
+        except Exception as heartbeat_error:
+            response = heartbeat_error
+
+        if isinstance(response, Exception):
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Failed to send heartbeat to gate {gate_addr}: {response}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+
+        return True
+
     async def _gate_heartbeat_loop(self) -> None:
         """
         Periodically send ManagerHeartbeat to gates via TCP.
@@ -3418,7 +4066,7 @@ class ManagerServer(HealthAwareServer):
         This supplements the Serf-style SWIM embedding for reliability.
         Gates use this for datacenter health classification.
         """
-        heartbeat_interval = self._config.gate_heartbeat_interval_seconds
+        heartbeat_interval = self._config.heartbeat_interval_seconds
 
         await self._udp_logger.log(
             ServerInfo(
@@ -3438,26 +4086,16 @@ class ManagerServer(HealthAwareServer):
                 # Send to all healthy gates (use known gates if available, else seed gates)
                 gate_addrs = self._get_healthy_gate_tcp_addrs() or self._seed_gates
 
-                sent_count = 0
-                for gate_addr in gate_addrs:
-                    try:
-                        response, _clock = await self.send_tcp(
-                            gate_addr,
-                            "manager_status_update",
-                            heartbeat.dump(),
-                            timeout=2.0,
-                        )
-                        if not isinstance(response, Exception):
-                            sent_count += 1
-                    except Exception as heartbeat_error:
-                        await self._udp_logger.log(
-                            ServerWarning(
-                                message=f"Failed to send heartbeat to gate: {heartbeat_error}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
+                # Concurrently: an unreachable gate costs the round one send
+                # timeout, not one per gate after it.
+                heartbeat_payload = heartbeat.dump()
+                deliveries = await asyncio.gather(
+                    *(
+                        self._send_gate_heartbeat(gate_addr, heartbeat_payload)
+                        for gate_addr in gate_addrs
+                    )
+                )
+                sent_count = sum(deliveries)
 
                 if sent_count > 0:
                     await self._udp_logger.log(
@@ -3525,10 +4163,13 @@ class ManagerServer(HealthAwareServer):
         Runs at JOB_CLEANUP_INTERVAL (default 60s).
         Jobs are eligible for cleanup when:
         - Status is terminal (completed, failed, cancelled or timed out)
-        - More than JOB_RETENTION_SECONDS have elapsed since completion
+        - More than their status's max age has elapsed since completion:
+          COMPLETED_JOB_MAX_AGE for a completed job, FAILED_JOB_MAX_AGE
+          for a failed, cancelled or timed-out one
         """
         cleanup_interval = self._config.job_cleanup_interval_seconds
-        retention_seconds = self._config.job_retention_seconds
+        completed_job_max_age = self._config.completed_job_max_age_seconds
+        unsuccessful_job_max_age = self._config.failed_job_max_age_seconds
         # TIMEOUT used to be missing from a hand-written terminal set, so
         # every timed-out job (completed_at stamped, status TIMEOUT) was
         # retained forever.
@@ -3537,30 +4178,12 @@ class ManagerServer(HealthAwareServer):
         while self._running:
             try:
                 await self._clock.sleep(cleanup_interval)
-
-                # Wall-clock seconds: matches the semantic of job.completed_at
-                # which is set from Raft entry.timestamp (HLC) or local self._clock.time().
-                current_time = self._clock.time()
-                jobs_cleaned = 0
-
-                for job in list(self._job_manager.iter_jobs()):
-                    is_terminal = status_order.is_terminal(job.status)
-                    if not is_terminal or job.completed_at <= 0:
-                        continue
-                    time_since_completion = current_time - job.completed_at
-                    if time_since_completion > retention_seconds:
-                        self._cleanup_job(job.job_id)
-                        jobs_cleaned += 1
-
-                if jobs_cleaned > 0:
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=f"Cleaned up {jobs_cleaned} completed jobs",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
+                await self._run_job_cleanup_pass(
+                    cleanup_interval,
+                    status_order,
+                    completed_job_max_age,
+                    unsuccessful_job_max_age,
+                )
 
             except asyncio.CancelledError:
                 break
@@ -3573,6 +4196,326 @@ class ManagerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
+
+    async def _run_job_cleanup_pass(
+        self,
+        cleanup_interval: float,
+        status_order: JobStatusOrder,
+        completed_job_max_age: float,
+        unsuccessful_job_max_age: float,
+    ) -> None:
+        """
+        Run one job cleanup sweep: drop terminal jobs past their retention, then reconcile silent copies.
+
+        Wall-clock seconds: the sweep's time matches the semantic of
+        job.completed_at, which is set from Raft entry.timestamp (HLC) or the
+        local clock. The sweep's counts are logged once both steps are done.
+        """
+        current_time = self._clock.time()
+        jobs_cleaned = await self._sweep_expired_terminal_jobs(
+            current_time,
+            status_order,
+            completed_job_max_age,
+            unsuccessful_job_max_age,
+        )
+        copies_reconciled = await self._reconcile_silent_job_copies(
+            self._silent_job_copies(current_time, cleanup_interval, status_order),
+            current_time,
+            status_order,
+        )
+        await self._log_job_cleanup_pass(copies_reconciled, jobs_cleaned)
+
+    async def _sweep_expired_terminal_jobs(
+        self,
+        current_time: float,
+        status_order: JobStatusOrder,
+        completed_job_max_age: float,
+        unsuccessful_job_max_age: float,
+    ) -> int:
+        """Clean up every terminal job held longer than its status's retention age; returns how many were cleaned."""
+        jobs_cleaned = 0
+        for job in list(self._job_manager.iter_jobs()):
+            if self._terminal_job_retention_expired(
+                job,
+                current_time,
+                status_order,
+                completed_job_max_age,
+                unsuccessful_job_max_age,
+            ):
+                await self._cleanup_job_state(job.job_id)
+                jobs_cleaned += 1
+        return jobs_cleaned
+
+    @classmethod
+    def _terminal_job_retention_expired(
+        cls,
+        job: JobInfo,
+        current_time: float,
+        status_order: JobStatusOrder,
+        completed_job_max_age: float,
+        unsuccessful_job_max_age: float,
+    ) -> bool:
+        """Whether a job is terminal, stamped complete, and held longer than its status's retention age."""
+        if not status_order.is_terminal(job.status) or job.completed_at <= 0:
+            return False
+        max_age = cls._retention_age_for_status(
+            job.status, completed_job_max_age, unsuccessful_job_max_age
+        )
+        return current_time - job.completed_at > max_age
+
+    @staticmethod
+    def _retention_age_for_status(
+        status: str,
+        completed_job_max_age: float,
+        unsuccessful_job_max_age: float,
+    ) -> float:
+        """The retention age of a terminal job: the completed age for a completed job, else the unsuccessful one."""
+        return (
+            completed_job_max_age
+            if status == JobStatus.COMPLETED.value
+            else unsuccessful_job_max_age
+        )
+
+    def _silent_job_copies(
+        self,
+        current_time: float,
+        cleanup_interval: float,
+        status_order: JobStatusOrder,
+    ) -> list[tuple[JobInfo, float, tuple[str, int] | None]]:
+        """
+        List the copies of jobs led elsewhere that heard nothing for a whole sweep, with whom to ask about each.
+
+        Each entry is the job, when it was last heard from, and the address
+        to ask: its leader while that leader is an active peer, else the
+        datacenter leader (None when this manager is it). A job's leader
+        re-syncs every job it leads each interval, so the silence means the
+        leader dropped the job -- it ended, or its submission was refused --
+        and the one terminal sync saying so was lost; or the leader died, and
+        the datacenter leader settles its jobs. Kept, the copy was never
+        swept, held its consensus group, and stood as a takeover candidate
+        for a job already over.
+        """
+        active_peers = self._manager_state.get_active_manager_peers()
+        datacenter_leader_addr = self._datacenter_leader_addr_to_ask()
+        return [
+            (
+                job,
+                job.timestamp,
+                self._job_copy_contact(leader_addr, active_peers, datacenter_leader_addr),
+            )
+            for job in self._job_manager.iter_jobs()
+            if (
+                leader_addr := self._silent_job_copy_leader(
+                    job, current_time, cleanup_interval, status_order
+                )
+            )
+            is not None
+        ]
+
+    def _datacenter_leader_addr_to_ask(self) -> tuple[str, int] | None:
+        """The datacenter leader's address to ask about a job copy, or None when this manager is the leader."""
+        return None if self.is_leader() else self._resolve_dc_leader_addr()
+
+    @staticmethod
+    def _job_copy_contact(
+        leader_addr: tuple[str, int],
+        active_peers,
+        datacenter_leader_addr: tuple[str, int] | None,
+    ) -> tuple[str, int] | None:
+        """The job's leader when it is an active peer, else the datacenter leader's address."""
+        return leader_addr if leader_addr in active_peers else datacenter_leader_addr
+
+    def _silent_job_copy_leader(
+        self,
+        job: JobInfo,
+        current_time: float,
+        cleanup_interval: float,
+        status_order: JobStatusOrder,
+    ) -> tuple[str, int] | None:
+        """The leader address of a silent, unled copy of a live job, or None when the job is not one or has none."""
+        if not self._is_silent_unled_job_copy(job, current_time, cleanup_interval, status_order):
+            return None
+        return self._manager_state.get_job_leader_addr(job.job_id)
+
+    def _is_silent_unled_job_copy(
+        self,
+        job: JobInfo,
+        current_time: float,
+        cleanup_interval: float,
+        status_order: JobStatusOrder,
+    ) -> bool:
+        """Whether a job is live, unheard from for longer than a sweep interval, and not led by this manager."""
+        return (
+            not status_order.is_terminal(job.status)
+            and current_time - job.timestamp > cleanup_interval
+            and not self._leases.is_job_leader(job.job_id)
+        )
+
+    async def _reconcile_silent_job_copies(
+        self,
+        silent_copies: list[tuple[JobInfo, float, tuple[str, int] | None]],
+        current_time: float,
+        status_order: JobStatusOrder,
+    ) -> int:
+        """Reconcile each silent job copy with its settled status; returns how many copies were reconciled."""
+        copies_reconciled = 0
+        for job, last_heard_at, asked_addr in silent_copies:
+            if await self._reconcile_silent_job_copy(
+                job, last_heard_at, asked_addr, current_time, status_order
+            ):
+                copies_reconciled += 1
+        return copies_reconciled
+
+    async def _reconcile_silent_job_copy(
+        self,
+        job: JobInfo,
+        last_heard_at: float,
+        asked_addr: tuple[str, int] | None,
+        current_time: float,
+        status_order: JobStatusOrder,
+    ) -> bool:
+        """
+        Retire one silent job copy once its status is settled; returns whether it was reconciled.
+
+        A copy whose status is still unsettled is asked about again next
+        sweep. A sync that landed meanwhile speaks for the copy itself, so a
+        copy heard from since the sweep began is left alone.
+        """
+        known_status, settled = await self._settled_status_of_silent_copy(
+            job, asked_addr, status_order
+        )
+        if not settled:
+            return False
+        if self._job_copy_heard_from_meanwhile(job, last_heard_at):
+            return False
+        await self._retire_silent_job_copy(job, known_status, current_time)
+        return True
+
+    async def _settled_status_of_silent_copy(
+        self,
+        job: JobInfo,
+        asked_addr: tuple[str, int] | None,
+        status_order: JobStatusOrder,
+    ) -> tuple[str | None, bool]:
+        """
+        Settle a silent copy's status from the replicated ledger, else by asking its leader.
+
+        Returns (status, True) when settled -- the status None when the job
+        is unknown where it is led -- and (None, False) when it stays
+        unsettled: there is no one to ask, the ask went unanswered, or the
+        job is live where it is led.
+        """
+        if (known_status := self._replicated_terminal_status(job.job_id)) is not None:
+            return known_status, True
+        if asked_addr is None:
+            return None, False
+        return await self._ask_leader_for_settled_status(job, asked_addr, status_order)
+
+    def _replicated_terminal_status(self, job_id: str) -> str | None:
+        """The job's status in the replicated ledger when that status is terminal, else None."""
+        replicated_state = self._ledger_replica.job_state(job_id)
+        return (
+            replicated_state.status
+            if replicated_state is not None and replicated_state.is_terminal
+            else None
+        )
+
+    async def _ask_leader_for_settled_status(
+        self,
+        job: JobInfo,
+        asked_addr: tuple[str, int],
+        status_order: JobStatusOrder,
+    ) -> tuple[str | None, bool]:
+        """Ask a silent copy's leader for the job's status; an unanswered ask leaves it unsettled until next sweep."""
+        response = await self._send_to_peer(
+            asked_addr,
+            "job_status",
+            job.job_id.encode(),
+            timeout=self._config.tcp_timeout_short_seconds,
+        )
+        if isinstance(response, Exception) or response is None:
+            return None, False
+        return self._settled_status_from_reply(response, status_order)
+
+    @staticmethod
+    def _settled_status_from_reply(
+        response: bytes,
+        status_order: JobStatusOrder,
+    ) -> tuple[str | None, bool]:
+        """
+        Read a leader's job-status reply into (status, settled).
+
+        An empty reply means no such job where it is led: settled with no
+        status. A live status means the job is held live where it is led --
+        the syncs are what fail -- so it stays unsettled.
+        """
+        if not response:
+            return None, True
+        known_status = GlobalJobStatus.load(response).status
+        return known_status, status_order.is_terminal(known_status)
+
+    def _job_copy_heard_from_meanwhile(self, job: JobInfo, last_heard_at: float) -> bool:
+        """Whether a job copy was replaced, synced since the sweep began, or came to be led here."""
+        return (
+            self._job_manager.get_job_by_id(job.job_id) is not job
+            or job.timestamp != last_heard_at
+            or self._leases.is_job_leader(job.job_id)
+        )
+
+    async def _retire_silent_job_copy(
+        self,
+        job: JobInfo,
+        known_status: str | None,
+        current_time: float,
+    ) -> None:
+        """
+        Retire a reconciled job copy: drop it, or end it with its settled status and destroy its group.
+
+        No such job where it is led, or one never admitted (announced, then
+        refused): there is no job to keep, so its state is cleaned up.
+        """
+        if known_status is None or not job.workflows:
+            await self._cleanup_job_state(job.job_id)
+            return
+        await self._apply_settled_job_copy_status(job, known_status, current_time)
+        await self._raft.consensus.destroy_job_raft(job.job_id)
+
+    @staticmethod
+    async def _apply_settled_job_copy_status(
+        job: JobInfo,
+        known_status: str,
+        current_time: float,
+    ) -> None:
+        """Under the job's lock, set its settled status and stamp its completion time when it has none."""
+        async with job.lock:
+            job.status = known_status
+            if job.completed_at <= 0:
+                job.completed_at = current_time
+
+    async def _log_job_cleanup_pass(self, copies_reconciled: int, jobs_cleaned: int) -> None:
+        """Log how many silent job copies a cleanup sweep reconciled and how many jobs it cleaned, when any."""
+        if copies_reconciled > 0:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        f"Reconciled {copies_reconciled} job copies their "
+                        "leaders no longer hold"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        if jobs_cleaned > 0:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Cleaned up {jobs_cleaned} completed jobs",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _unified_timeout_loop(self) -> None:
         """
@@ -3619,6 +4562,34 @@ class ManagerServer(HealthAwareServer):
                                 node_id=self._node_id.short,
                             )
                         )
+
+                # A cancellation its workers never confirmed within the
+                # window they have to confirm one is over anyway (AD-54): the
+                # workers are gone, or stop it when they learn its job's
+                # fate -- the job's cancellation must not wait forever.
+                for job_id, workflow_id, _state, _seconds_cancelling in (
+                    self._job_manager.workflow_lifecycle.get_stuck_workflows(
+                        frozenset({WorkflowState.CANCELLING}),
+                        self.env.CANCELLED_WORKFLOW_TIMEOUT,
+                    )
+                ):
+                    if not self._leases.is_job_leader(job_id):
+                        continue
+                    for pending_sub_workflow in list(
+                        self._manager_state.get_cancellation_pending_workflows(job_id)
+                    ):
+                        if TrackingToken.parse(pending_sub_workflow).workflow_id == workflow_id:
+                            await self._cancellation.finalize_workflow_cancellation(
+                                job_id=job_id,
+                                workflow_id=pending_sub_workflow,
+                                success=False,
+                                errors=[
+                                    "its worker never confirmed stopping it within "
+                                    f"{self.env.CANCELLED_WORKFLOW_TIMEOUT:.0f}s"
+                                ],
+                            )
+                    if await self._job_manager.finish_workflow_cancellation(job_id, workflow_id):
+                        await self._complete_job_if_done(job_id)
 
             except asyncio.CancelledError:
                 break
@@ -3765,57 +4736,23 @@ class ManagerServer(HealthAwareServer):
         fencing_token: int | None = None,
         replace_existing: bool = True,
     ) -> JobStateSyncMessage:
-        elapsed_seconds = (
-            self._clock.monotonic() - job.started_at
-            if job is not None and job.started_at
-            else 0.0
-        )
-        origin_gate_addr = (
-            job.submission.origin_gate_addr
-            if job is not None
-            and job.submission
-            and job.submission.origin_gate_addr
-            else self._manager_state.get_job_origin_gate(job_id)
-        )
+        elapsed_seconds = self._job_elapsed_seconds(job)
+        origin_gate_addr = self._job_origin_gate_addr(job_id, job)
         callback_addr = self._get_job_callback_addr(job_id)
-        effective_leader_id = (
-            leader_id
-            or self._leases.get_job_leader(job_id)
-            or (job.leader_node_id if job is not None else None)
-            or self._node_id.full
-        )
-        effective_leader_addr = (
-            leader_addr
-            or self._manager_state.get_job_leader_addr(job_id)
-            or (job.leader_addr if job is not None else None)
-            or (self._host, self._tcp_port)
-        )
-        effective_fencing_token = (
-            fencing_token
-            if fencing_token is not None
-            else self._leases.get_fence_token(job_id)
-        )
-        workflow_statuses = {}
-        workflow_snapshots = {}
-        sub_workflow_snapshots = {}
-        context_snapshot = {}
-        job_status = JobStatus.RUNNING.value
-        workflows_total = 0
-        workflows_completed = 0
-        workflows_failed = 0
-        layer_version = self._manager_state.get_job_layer_version(job_id)
-        if job is not None:
-            workflow_statuses = {
-                wf_id: wf.status.value for wf_id, wf in job.workflows.items()
-            }
-            workflow_snapshots = self._build_workflow_state_snapshots(job)
-            sub_workflow_snapshots = self._build_sub_workflow_state_snapshots(job)
-            context_snapshot = job.context.dict()
-            job_status = job.status
-            workflows_total = job.workflows_total
-            workflows_completed = job.workflows_completed
-            workflows_failed = job.workflows_failed
-            layer_version = job.layer_version
+        effective_leader_id = self._effective_job_leader_id(job_id, job, leader_id)
+        effective_leader_addr = self._effective_job_leader_addr(job_id, job, leader_addr)
+        effective_fencing_token = self._effective_job_fencing_token(job_id, fencing_token)
+        (
+            job_status,
+            workflows_total,
+            workflows_completed,
+            workflows_failed,
+            workflow_statuses,
+            workflow_snapshots,
+            sub_workflow_snapshots,
+            context_snapshot,
+            layer_version,
+        ) = self._job_sync_progress(job)
 
         return JobStateSyncMessage(
             leader_id=effective_leader_id,
@@ -3836,23 +4773,149 @@ class ManagerServer(HealthAwareServer):
             replace_existing=replace_existing,
             context_snapshot=context_snapshot,
             layer_version=layer_version,
+            raft_voters=self._job_raft_voters(job_id),
+        )
+
+    def _job_elapsed_seconds(self, job: JobInfo | None) -> float:
+        """Seconds since the job started on the monotonic clock, or 0.0 for no job or one not yet started."""
+        return (
+            self._clock.monotonic() - job.started_at
+            if job is not None and job.started_at
+            else 0.0
+        )
+
+    def _job_origin_gate_addr(self, job_id: str, job: JobInfo | None) -> tuple[str, int] | None:
+        """The origin gate the job's submission names, else the one the manager state records for the job."""
+        return self._submitted_origin_gate_addr(job) or self._manager_state.get_job_origin_gate(job_id)
+
+    def _effective_job_leader_id(
+        self,
+        job_id: str,
+        job: JobInfo | None,
+        leader_id: str | None,
+    ) -> str:
+        """The leader a job's state sync names: the one given, else the one recorded, else this manager."""
+        return leader_id or self._recorded_job_leader_id(job_id, job) or self._node_id.full
+
+    def _effective_job_leader_addr(
+        self,
+        job_id: str,
+        job: JobInfo | None,
+        leader_addr: tuple[str, int] | None,
+    ) -> tuple[str, int]:
+        """The leader address a job's state sync names: the one given, else the one recorded, else this manager's."""
+        return leader_addr or self._recorded_job_leader_addr(job_id, job) or (self._host, self._tcp_port)
+
+    def _effective_job_fencing_token(self, job_id: str, fencing_token: int | None) -> int:
+        """The fencing token a job's state sync carries: the one given, else the job's current fence token."""
+        return (
+            fencing_token
+            if fencing_token is not None
+            else self._leases.get_fence_token(job_id)
+        )
+
+    @staticmethod
+    def _submitted_origin_gate_addr(job: JobInfo | None):
+        """The origin gate named by the job's held submission, or a falsy value when there is none."""
+        return job is not None and job.submission and job.submission.origin_gate_addr
+
+    def _recorded_job_leader_id(self, job_id: str, job: JobInfo | None) -> str | None:
+        """The job's leader as the lease coordinator records it, else as the job records it."""
+        return self._leases.get_job_leader(job_id) or self._job_record_leader_id(job)
+
+    @staticmethod
+    def _job_record_leader_id(job: JobInfo | None) -> str | None:
+        """The leader node id the job records, or None for no job."""
+        return job.leader_node_id if job is not None else None
+
+    def _recorded_job_leader_addr(self, job_id: str, job: JobInfo | None) -> tuple[str, int] | None:
+        """The job's leader address as the manager state records it, else as the job records it."""
+        return self._manager_state.get_job_leader_addr(job_id) or self._job_record_leader_addr(job)
+
+    @staticmethod
+    def _job_record_leader_addr(job: JobInfo | None) -> tuple[str, int] | None:
+        """The leader address the job records, or None for no job."""
+        return job.leader_addr if job is not None else None
+
+    def _job_sync_progress(
+        self,
+        job: JobInfo | None,
+    ) -> tuple[
+        str,
+        int,
+        int,
+        int,
+        dict[str, str],
+        dict[str, WorkflowStateSnapshot],
+        dict[str, SubWorkflowStateSnapshot],
+        dict[str, dict[str, object]],
+        int,
+    ]:
+        """
+        The job's progress fields for a state sync, or a running job's empty progress when there is no job.
+
+        Returns, in order: the job's status, its total, completed and failed
+        workflow counts, its workflow statuses, workflow snapshots and
+        sub-workflow snapshots, its context snapshot, and its layer version.
+        """
+        if job is None:
+            return JobStatus.RUNNING.value, 0, 0, 0, {}, {}, {}, {}, 0
+        workflow_statuses = {
+            wf_id: wf.status.value for wf_id, wf in job.workflows.items()
+        }
+        workflow_snapshots = self._build_workflow_state_snapshots(job)
+        sub_workflow_snapshots = self._build_sub_workflow_state_snapshots(job)
+        context_snapshot = job.context.dict()
+        return (
+            job.status,
+            job.workflows_total,
+            job.workflows_completed,
+            job.workflows_failed,
+            workflow_statuses,
+            workflow_snapshots,
+            sub_workflow_snapshots,
+            context_snapshot,
+            job.layer_version,
+        )
+
+    def _job_raft_voters(self, job_id: str) -> list[str]:
+        """The sorted initial voters of the job's consensus group, or an empty list when this manager holds none."""
+        return (
+            sorted(job_group.initial_voters)
+            if (job_group := self._raft.consensus.get_node(job_id)) is not None
+            else []
         )
 
     def _build_workflow_state_snapshots(
         self,
         job: JobInfo,
-    ) -> dict[str, dict[str, object]]:
-        snapshots: dict[str, dict[str, object]] = {}
+    ) -> dict[str, WorkflowStateSnapshot]:
+        snapshots: dict[str, WorkflowStateSnapshot] = {}
+        lifecycle = self._job_manager.workflow_lifecycle
         for workflow_token, workflow in job.workflows.items():
             if isinstance(workflow.status, WorkflowStatus):
                 status = workflow.status.value
             else:
                 status = str(workflow.status)
 
+            # The lifecycle travels with the status (AD-54): a manager that
+            # takes the job over knows where each workflow is, how many times
+            # it was retried, and what it waits on.
+            lifecycle_record = lifecycle.get_record(
+                job.job_id, workflow.token.workflow_id or ""
+            )
             snapshots[workflow_token] = {
                 "token": str(workflow.token),
                 "name": workflow.name,
                 "status": status,
+                "lifecycle_state": (
+                    None if lifecycle_record is None else lifecycle_record.state.value
+                ),
+                "retry_generation": (
+                    0 if lifecycle_record is None else lifecycle_record.retry_generation
+                ),
+                "dependency_workflow_ids": sorted(workflow.dependency_workflow_ids),
+                "is_test": workflow.is_test,
                 "sub_workflow_tokens": list(workflow.sub_workflow_tokens),
                 "error": workflow.error,
                 "aggregation_error": workflow.aggregation_error,
@@ -3865,8 +4928,8 @@ class ManagerServer(HealthAwareServer):
     def _build_sub_workflow_state_snapshots(
         self,
         job: JobInfo,
-    ) -> dict[str, dict[str, object]]:
-        snapshots: dict[str, dict[str, object]] = {}
+    ) -> dict[str, SubWorkflowStateSnapshot]:
+        snapshots: dict[str, SubWorkflowStateSnapshot] = {}
         for sub_workflow_token, sub_workflow in job.sub_workflows.items():
             snapshots[sub_workflow_token] = {
                 "token": str(sub_workflow.token),
@@ -3901,7 +4964,7 @@ class ManagerServer(HealthAwareServer):
         *,
         require_quorum: bool = False,
     ) -> bool:
-        peer_addrs = list(self._manager_state.get_active_manager_peers())
+        peer_addrs = sorted(self._manager_state.get_active_manager_peers())
         if not peer_addrs:
             return not require_quorum or self._leadership.get_quorum_size() <= 1
 
@@ -3911,9 +4974,12 @@ class ManagerServer(HealthAwareServer):
                     peer_addr,
                     "job_state_sync",
                     sync_msg.dump(),
-                    timeout=2.0,
+                    timeout=self._config.tcp_timeout_short_seconds,
                 )
-                if not response or isinstance(response, Exception):
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response, Exception):
+                    raise response
+                if not response:
                     return False
 
                 ack = JobStateSyncAck.load(response)
@@ -3961,9 +5027,9 @@ class ManagerServer(HealthAwareServer):
             try:
                 await self._clock.sleep(sync_interval)
 
-                if not self.is_leader():
-                    continue
-
+                # Every manager syncs the jobs it leads: job leadership
+                # (AD-31) is not datacenter leadership, and peers accept a
+                # sync from the job's leader whoever leads the datacenter.
                 led_jobs = self._leases.get_led_job_ids()
                 if not led_jobs:
                     continue
@@ -3985,15 +5051,67 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
+    async def _resource_gossip_loop(self) -> None:
+        """AD-41 Part 4: send every peer manager this datacenter's fresh
+        resource reports once per heartbeat interval -- the cadence this
+        manager's report reaches its gates at, so a gateless client's view is
+        as fresh as a gate's."""
+        while self._running:
+            try:
+                await self._clock.sleep(self._config.heartbeat_interval_seconds)
+                if not self._running:
+                    break
+
+                self._resource_gossip.record_own_report(self._build_resource_report())
+                payload = self._resource_gossip.gossip_message().dump()
+                peer_addresses = sorted(self._manager_state.get_active_manager_peers())
+                responses = await asyncio.gather(
+                    *(
+                        self._send_to_peer(
+                            peer_address,
+                            "manager_resource_gossip",
+                            payload,
+                            timeout=self._config.tcp_timeout_short_seconds,
+                        )
+                        for peer_address in peer_addresses
+                    ),
+                    return_exceptions=True,
+                )
+                for peer_address, response in zip(peer_addresses, responses):
+                    if isinstance(response, Exception) or response != b"ok":
+                        # A peer that missed a round hears the next; a dead
+                        # one leaves the active peers.
+                        await self._udp_logger.log(
+                            ServerDebug(
+                                message=(
+                                    f"Resource gossip to peer manager {peer_address} "
+                                    f"not taken: {response!r}"
+                                ),
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Resource gossip error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
     async def _resource_sample_loop(self) -> None:
         """
         Background loop for periodic CPU/memory sampling.
 
         Samples manager's own resource usage and feeds to HybridOverloadDetector
-        for overload state classification. Runs at 1s cadence for responsive
-        detection while balancing overhead.
+        for overload state classification, every OVERLOAD_SAMPLE_INTERVAL_SECONDS.
         """
-        sample_interval = 1.0
+        sample_interval = self.env.OVERLOAD_SAMPLE_INTERVAL_SECONDS
 
         while self._running:
             try:
@@ -4014,7 +5132,7 @@ class ManagerServer(HealthAwareServer):
                     changed,
                 ) = await self._set_manager_health_state(new_state_str)
                 if changed:
-                    self._log_manager_health_transition(previous_state, current_state)
+                    await self._log_manager_health_transition(previous_state, current_state)
 
             except asyncio.CancelledError:
                 break
@@ -4028,7 +5146,7 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
-    def _log_manager_health_transition(
+    async def _log_manager_health_transition(
         self,
         previous_state: str,
         new_state: str,
@@ -4040,8 +5158,7 @@ class ManagerServer(HealthAwareServer):
         is_degradation = new_severity > previous_severity
 
         if is_degradation:
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerWarning(
                     message=f"Manager health degraded: {previous_state} -> {new_state}",
                     node_host=self._host,
@@ -4050,8 +5167,7 @@ class ManagerServer(HealthAwareServer):
                 ),
             )
         else:
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerDebug(
                     message=f"Manager health improved: {previous_state} -> {new_state}",
                     node_host=self._host,
@@ -4060,7 +5176,7 @@ class ManagerServer(HealthAwareServer):
                 ),
             )
 
-    def _log_peer_manager_health_transition(
+    async def _log_peer_manager_health_transition(
         self,
         peer_id: str,
         previous_state: str,
@@ -4072,8 +5188,7 @@ class ManagerServer(HealthAwareServer):
         is_degradation = new_severity > previous_severity
 
         if is_degradation:
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerWarning(
                     message=f"Peer manager {peer_id[:8]}... health degraded: {previous_state} -> {new_state}",
                     node_host=self._host,
@@ -4082,8 +5197,7 @@ class ManagerServer(HealthAwareServer):
                 ),
             )
         else:
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerDebug(
                     message=f"Peer manager {peer_id[:8]}... health improved: {previous_state} -> {new_state}",
                     node_host=self._host,
@@ -4098,28 +5212,28 @@ class ManagerServer(HealthAwareServer):
 
 
     async def _scan_for_orphaned_jobs(self) -> None:
-        """Scan for orphaned jobs from dead managers.
+        """Take over the unfinished jobs of dead managers.
 
-        Called when this node becomes the SWIM cluster leader.
-        Advances fenced leadership for jobs whose leader is in the dead
-        managers set.
+        Run every orphan scan while this node is the SWIM cluster leader:
+        the takeover attempted when a job's leader died happens once, on
+        whichever node led the cluster then, and one that could not finish
+        -- no quorum then, leadership changing under it -- left the job
+        with no leader for good. A job whose copy here ended is settled
+        and not taken over again.
         """
-        dead_managers_snapshot = self._manager_state.get_dead_managers()
-        job_leader_addrs_snapshot = self._manager_state.iter_job_leader_addrs()
-
-        for dead_addr in dead_managers_snapshot:
-            jobs_to_takeover = [
-                job_id
-                for job_id, leader_addr in job_leader_addrs_snapshot
-                if leader_addr == dead_addr
-            ]
-
-            for job_id in jobs_to_takeover:
-                old_leader_id = self._leases.get_job_leader(job_id)
-                await self._take_over_job_leadership_as_cluster_leader(
-                    job_id,
-                    old_leader_id,
-                )
+        dead_managers = set(self._manager_state.get_dead_managers())
+        status_order = JobStatusOrder()
+        for job_id, leader_addr in self._manager_state.iter_job_leader_addrs():
+            if leader_addr not in dead_managers:
+                continue
+            if (job := self._job_manager.get_job_by_id(job_id)) is not None and (
+                status_order.is_terminal(job.status)
+            ):
+                continue
+            await self._take_over_job_leadership_as_cluster_leader(
+                job_id,
+                self._leases.get_job_leader(job_id),
+            )
 
     async def _resume_timeout_tracking_for_all_jobs(self) -> None:
         """Resume timeout tracking for all jobs as new leader."""
@@ -4415,10 +5529,13 @@ class ManagerServer(HealthAwareServer):
         # latency percentiles every probe interval without an extra
         # RPC. Returns SLOSummary.empty() (neutral baseline) when no
         # workflow latencies have been recorded yet.
-        slo_summary = self._manager_state.get_slo_summary()
-        pending_workflow_count, pending_duration_seconds, active_remaining_seconds = (
-            self._capacity_reporter.snapshot()
-        )
+        slo_summary = self._manager_state.get_slo_summary(self._clock.monotonic())
+        (
+            pending_workflow_count,
+            pending_duration_seconds,
+            active_remaining_seconds,
+            cores_freeing_schedule,
+        ) = self._capacity_reporter.snapshot()
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -4445,6 +5562,7 @@ class ManagerServer(HealthAwareServer):
             pending_workflow_count=pending_workflow_count,
             pending_duration_seconds=pending_duration_seconds,
             active_remaining_seconds=active_remaining_seconds,
+            cores_freeing_schedule=cores_freeing_schedule,
             tcp_host=self._host,
             tcp_port=self._tcp_port,
             udp_host=self._host,
@@ -4494,7 +5612,7 @@ class ManagerServer(HealthAwareServer):
         cluster_size = max(
             healthy_managers,
             self._manager_state.get_known_manager_peer_count() + 1,
-            len(self._manager_udp_peers) + 1,
+            len(self._cluster_membership.cohort),
         )
         incarnation = await self._manager_state.increment_external_incarnation()
         datacenter_health = self._classify_xprobe_datacenter_health(
@@ -5458,7 +6576,7 @@ class ManagerServer(HealthAwareServer):
                 "job_status_push_forward",
                 "job_status_push",
                 push.dump(),
-                timeout=5.0,
+                timeout=self._config.tcp_timeout_standard_seconds,
             )
         except Exception as send_error:
             await self._udp_logger.log(
@@ -5541,14 +6659,18 @@ class ManagerServer(HealthAwareServer):
 
         timeout_reason = reason or "Job timed out"
         timestamp = self._clock.monotonic()
-        pending_cancelled = await self._cancellation.cancel_pending_workflows(
-            job_id,
-            timestamp,
-            timeout_reason,
-        )
+        await self._cancellation.cancel_pending_workflows(job_id)
+        # What is in flight on workers, before the timeout fails it.
         workflows_to_cancel = self._cancellation.get_running_workflows_to_cancel(
             job,
-            pending_cancelled,
+            [
+                workflow_info.token.workflow_id or ""
+                for workflow_info in job.workflows.values()
+                if self._job_manager.workflow_lifecycle.get_state(
+                    job_id, workflow_info.token.workflow_id or ""
+                )
+                in (WorkflowState.DISPATCHED, WorkflowState.RUNNING)
+            ],
         )
         timeout_summary = await self._mark_job_timed_out(job, timeout_reason)
         if timeout_summary is None:
@@ -5576,11 +6698,10 @@ class ManagerServer(HealthAwareServer):
 
         _running_cancelled, workflow_errors = await self._cancellation.cancel_running_workflows(
             job,
-            pending_cancelled,
             self._node_id.full,
             timestamp,
             timeout_reason,
-            workflows_to_cancel=workflows_to_cancel,
+            workflows_to_cancel,
         )
         if workflow_errors:
             await self._udp_logger.log(
@@ -5633,6 +6754,7 @@ class ManagerServer(HealthAwareServer):
             WorkflowStatus.CANCELLED,
         }
         workflow_pushes: list[WorkflowResultPush] = []
+        timeout_transitions: list[StateTransition] = []
 
         async with job.lock:
             if job.status in terminal_job_statuses:
@@ -5661,7 +6783,17 @@ class ManagerServer(HealthAwareServer):
             for workflow in job.workflows.values():
                 if workflow.status in terminal_workflow_statuses:
                     continue
-                workflow.status = WorkflowStatus.FAILED
+                timeout_transitions.append(
+                    timeout_transition := self._job_manager.workflow_lifecycle.apply_transition(
+                        job.job_id,
+                        workflow.token.workflow_id or "",
+                        WorkflowState.FAILED,
+                        reason,
+                    )
+                )
+                if not timeout_transition.accepted:
+                    continue
+                workflow.status = WORKFLOW_STATUS_BY_WORKFLOW_STATE[timeout_transition.to_state]
                 workflow.error = reason
                 workflow.terminal_pushed = True
                 workflow.terminal_status = WorkflowStatus.FAILED.value
@@ -5697,6 +6829,7 @@ class ManagerServer(HealthAwareServer):
             if reason and reason not in errors:
                 errors.append(reason)
 
+        await self._job_manager.workflow_lifecycle.publish_transitions(timeout_transitions)
         return (
             workflow_pushes,
             workflow_results,
@@ -5763,7 +6896,7 @@ class ManagerServer(HealthAwareServer):
                     "workflow_result_push",
                     "workflow_result_push",
                     push.dump(),
-                    timeout=5.0,
+                    timeout=self._config.tcp_timeout_standard_seconds,
                 )
             except Exception as send_error:
                 await self._udp_logger.log(
@@ -5834,34 +6967,12 @@ class ManagerServer(HealthAwareServer):
             )
         )
 
-        await self._handle_worker_failure(worker_id)
+        # Our own eviction: not charged to the workflows it ran (AD-44).
+        await self._handle_worker_failure(worker_id, False)
         self._manager_state.clear_worker_deadline(worker_id)
 
         if self._worker_disseminator:
             await self._worker_disseminator.broadcast_worker_dead(worker_id, "evicted")
-
-    def _cleanup_job(self, job_id: str) -> None:
-        """
-        Clean up all state associated with a job.
-
-        Removes job from tracking dictionaries, cleans up workflow state,
-        and notifies relevant systems.
-        """
-        self._task_runner.run(self._job_manager.complete_job, job_id)
-        self._task_runner.run(self._raft.consensus.destroy_job_raft, job_id)
-        if self._resource_enforcer is not None:
-            self._resource_enforcer.release_job(job_id)
-        self._led_workflow_resources.release_job(job_id)
-        self._manager_state.clear_job_state(job_id)
-
-        if self._workflow_dispatcher:
-            self._task_runner.run(
-                self._workflow_dispatcher.cleanup_job,
-                job_id,
-            )
-
-        self._manager_state.remove_workflow_retries_for_job(job_id)
-        self._manager_state.remove_workflow_completion_events_for_job(job_id)
 
     # =========================================================================
     # TCP Send Helpers
@@ -6062,174 +7173,21 @@ class ManagerServer(HealthAwareServer):
         try:
             registration = WorkerRegistration.load(data)
 
-            if registration.cluster_id != self._config.cluster_id:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=f"Worker {registration.node.node_id} rejected: cluster_id mismatch",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                return RegistrationResponse(
-                    accepted=False,
-                    manager_id=self._node_id.full,
-                    healthy_managers=[],
-                    error="Cluster isolation violation: cluster_id mismatch",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
+            (
+                worker_udp_addr,
+                is_same_worker_registration,
+                needs_fresh_liveness,
+                refusal,
+            ) = await self._screen_worker_registration(addr, registration)
+            if refusal is not None:
+                return refusal
 
-            if registration.environment_id != self._config.environment_id:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=f"Worker {registration.node.node_id} rejected: environment_id mismatch",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                return RegistrationResponse(
-                    accepted=False,
-                    manager_id=self._node_id.full,
-                    healthy_managers=[],
-                    error="Environment isolation violation: environment_id mismatch",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            mtls_error = await self._validate_mtls_claims(
-                addr,
-                "Worker",
-                registration.node.node_id,
+            await self._admit_registered_worker(
+                registration,
+                worker_udp_addr,
+                is_same_worker_registration,
+                needs_fresh_liveness,
             )
-            if mtls_error:
-                return RegistrationResponse(
-                    accepted=False,
-                    manager_id=self._node_id.full,
-                    healthy_managers=[],
-                    error=mtls_error,
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            existing_worker = self._registry.get_worker(registration.node.node_id)
-            worker_udp_addr = (registration.node.host, registration.node.udp_port)
-            existing_worker_udp_addr: tuple[str, int] | None = None
-            if existing_worker is not None and existing_worker.node is not None:
-                existing_worker_udp_addr = (
-                    existing_worker.node.host,
-                    existing_worker.node.udp_port,
-                )
-
-            is_new_worker = existing_worker is None
-            is_same_worker_registration = existing_worker_udp_addr == worker_udp_addr
-            node_state = self._incarnation_tracker.get_node_state(worker_udp_addr)
-            needs_fresh_liveness = (
-                is_same_worker_registration
-                and node_state is not None
-                and node_state.status in (b"SUSPECT", b"DEAD")
-            )
-            if needs_fresh_liveness:
-                confirmed_alive, _witness_consulted = (
-                    await self._confirm_peer_reachable_by_swim(
-                        worker_udp_addr,
-                        node_state.incarnation,
-                    )
-                )
-                if not confirmed_alive:
-                    return self._build_worker_registration_response(
-                        accepted=False,
-                        error=(
-                            "Worker registration rejected: "
-                            "stale duplicate registration could not be "
-                            "confirmed over SWIM"
-                        ),
-                    ).dump()
-
-            max_workers = self._config.max_workers_per_manager
-            if (
-                max_workers is not None
-                and max_workers >= 0
-                and is_new_worker
-                and self._manager_state.get_worker_count() >= max_workers
-            ):
-                return RegistrationResponse(
-                    accepted=False,
-                    manager_id=self._node_id.full,
-                    healthy_managers=[],
-                    error=(
-                        "Worker registration rejected: "
-                        f"MAX_WORKERS_PER_MANAGER={max_workers} reached"
-                    ),
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            # A different node id at this worker's address is a previous
-            # incarnation of the process now registering (a node id embeds
-            # its process start time, so a restart always registers anew).
-            # SWIM never declares it dead -- the new process answers its
-            # probes -- so the work it held must be recovered here.
-            superseded_worker_ids = {
-                worker_id
-                for address in (
-                    (registration.node.host, registration.node.port),
-                    worker_udp_addr,
-                )
-                if (worker_id := self._manager_state.get_worker_id_from_addr(address))
-                is not None
-                and worker_id != registration.node.node_id
-            }
-
-            # Register worker
-            self._registry.register_worker(registration)
-
-            # Add to worker pool
-            await self._worker_pool.register_worker(registration)
-
-            # Recover each superseded incarnation as a dead worker: its pool
-            # entry goes and its unfinished workflows are reassigned. The
-            # registry already dropped it, so no eviction notice is owed to
-            # the address the new process now holds, and the new worker is
-            # counted, so this never fails the cluster's work as workerless.
-            if superseded_worker_ids:
-                # The cached transport to this address belongs to the dead
-                # incarnation; the reassigned work must not wait out a send
-                # timeout on it.
-                self._invalidate_tcp_client_transport(
-                    (registration.node.host, registration.node.port)
-                )
-            for superseded_worker_id in sorted(superseded_worker_ids):
-                await self._handle_worker_failure(superseded_worker_id)
-
-            # Add to SWIM
-            if is_same_worker_registration and not needs_fresh_liveness:
-                self.register_peer(worker_udp_addr)
-            else:
-                # TCP registration is the authoritative "fresh start" signal
-                # for this address: it tells the manager that the worker
-                # process at ``worker_udp_addr`` is brand-new (a different
-                # ``node_id`` from any predecessor that may have died there).
-                # ``reset_peer_for_rejoin`` wipes leftover SWIM state and
-                # re-seats the tracker entry at a *bumped* incarnation so
-                # stale DEAD gossip about the predecessor (still in flight
-                # at this point) is rejected by the freshness check rather
-                # than regressing the new instance back to DEAD. Duplicate
-                # registration from the same worker is intentionally
-                # idempotent: it refreshes registry/pool metadata but does not
-                # manufacture a new incarnation or disseminate ALIVE gossip.
-                await self.reset_peer_for_rejoin(worker_udp_addr)
-
-            self._manager_state.set_worker_addr_mapping(
-                worker_udp_addr, registration.node.node_id
-            )
-            self._probe_scheduler.add_member(worker_udp_addr)
-
-            if self._worker_disseminator:
-                await self._worker_disseminator.broadcast_worker_registered(
-                    registration
-                )
 
             response = self._build_worker_registration_response(accepted=True)
 
@@ -6256,6 +7214,371 @@ class ManagerServer(HealthAwareServer):
                 accepted=False,
                 error=str(error),
             ).dump()
+
+    async def _screen_worker_registration(
+        self,
+        addr: tuple[str, int],
+        registration: WorkerRegistration,
+    ) -> tuple[tuple[str, int] | None, bool, bool, bytes | None]:
+        """
+        Decide whether a worker's registration may be admitted.
+
+        Returns the worker's UDP address, whether it re-registers the worker
+        already known at that address, whether that re-registration needed
+        fresh SWIM liveness, and the refusal to send back -- None when the
+        registration is admitted. A refused registration's other fields are
+        not used.
+        """
+        if (refusal := await self._worker_registration_admission_refusal(addr, registration)) is not None:
+            return None, False, False, refusal
+        worker_udp_addr, is_new_worker, is_same_worker_registration = self._worker_registration_identity(
+            registration
+        )
+        needs_fresh_liveness, refusal = await self._worker_reregistration_refusal(
+            worker_udp_addr,
+            is_same_worker_registration,
+            is_new_worker,
+        )
+        return worker_udp_addr, is_same_worker_registration, needs_fresh_liveness, refusal
+
+    async def _worker_registration_admission_refusal(
+        self,
+        addr: tuple[str, int],
+        registration: WorkerRegistration,
+    ) -> bytes | None:
+        """Refuse a worker from another cluster or environment, or one whose mTLS claims do not hold; else None."""
+        if (refusal := await self._worker_isolation_refusal(registration)) is not None:
+            return refusal
+
+        mtls_error = await self._validate_mtls_claims(
+            addr,
+            "Worker",
+            registration.node.node_id,
+        )
+        if mtls_error:
+            return self._worker_registration_refusal_response(mtls_error)
+        return None
+
+    async def _worker_isolation_refusal(self, registration: WorkerRegistration) -> bytes | None:
+        """Refuse, and log, a worker whose cluster id or environment id differs from this manager's; else None."""
+        if registration.cluster_id != self._config.cluster_id:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Worker {registration.node.node_id} rejected: cluster_id mismatch",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return self._worker_registration_refusal_response(
+                "Cluster isolation violation: cluster_id mismatch"
+            )
+
+        if registration.environment_id != self._config.environment_id:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Worker {registration.node.node_id} rejected: environment_id mismatch",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return self._worker_registration_refusal_response(
+                "Environment isolation violation: environment_id mismatch"
+            )
+        return None
+
+    def _worker_registration_refusal_response(self, error: str) -> bytes:
+        """A refused worker registration's response, naming this manager and carrying the reason."""
+        return RegistrationResponse(
+            accepted=False,
+            manager_id=self._node_id.full,
+            healthy_managers=[],
+            error=error,
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+        ).dump()
+
+    def _worker_registration_identity(
+        self,
+        registration: WorkerRegistration,
+    ) -> tuple[tuple[str, int], bool, bool]:
+        """
+        Place a registering worker against the registry.
+
+        Returns the worker's UDP address, whether its node id is new to the
+        registry, and whether the registry's entry for that node id sits at
+        the same UDP address -- a re-registration of the same worker.
+        """
+        existing_worker = self._registry.get_worker(registration.node.node_id)
+        worker_udp_addr = (registration.node.host, registration.node.udp_port)
+        existing_worker_udp_addr = self._registered_worker_udp_addr(existing_worker)
+        return (
+            worker_udp_addr,
+            existing_worker is None,
+            existing_worker_udp_addr == worker_udp_addr,
+        )
+
+    @staticmethod
+    def _registered_worker_udp_addr(
+        existing_worker: WorkerRegistration | None,
+    ) -> tuple[str, int] | None:
+        """The UDP address a registered worker was registered at, or None when there is no such worker or node."""
+        if existing_worker is not None and existing_worker.node is not None:
+            return (
+                existing_worker.node.host,
+                existing_worker.node.udp_port,
+            )
+        return None
+
+    async def _worker_reregistration_refusal(
+        self,
+        worker_udp_addr: tuple[str, int],
+        is_same_worker_registration: bool,
+        is_new_worker: bool,
+    ) -> tuple[bool, bytes | None]:
+        """
+        Refuse a stale duplicate registration or a new worker past this manager's capacity.
+
+        Returns whether the registration needed fresh SWIM liveness, and the
+        refusal -- None when the worker may register.
+        """
+        needs_fresh_liveness, refusal = await self._confirm_reregistering_worker_liveness(
+            worker_udp_addr,
+            is_same_worker_registration,
+        )
+        return needs_fresh_liveness, (
+            refusal if refusal is not None else self._worker_capacity_refusal(is_new_worker)
+        )
+
+    async def _confirm_reregistering_worker_liveness(
+        self,
+        worker_udp_addr: tuple[str, int],
+        is_same_worker_registration: bool,
+    ) -> tuple[bool, bytes | None]:
+        """
+        Confirm over SWIM that a worker re-registering while suspected or dead is alive.
+
+        Returns whether fresh liveness was needed, and the refusal for a
+        stale duplicate registration SWIM could not confirm -- None otherwise.
+        """
+        node_state = self._incarnation_tracker.get_node_state(worker_udp_addr)
+        needs_fresh_liveness = self._needs_fresh_liveness(is_same_worker_registration, node_state)
+        if not needs_fresh_liveness:
+            return needs_fresh_liveness, None
+        confirmed_alive, _witness_consulted = (
+            await self._confirm_peer_reachable_by_swim(
+                worker_udp_addr,
+                node_state.incarnation,
+            )
+        )
+        if not confirmed_alive:
+            return needs_fresh_liveness, self._build_worker_registration_response(
+                accepted=False,
+                error=(
+                    "Worker registration rejected: "
+                    "stale duplicate registration could not be "
+                    "confirmed over SWIM"
+                ),
+            ).dump()
+        return needs_fresh_liveness, None
+
+    @staticmethod
+    def _needs_fresh_liveness(is_same_worker_registration: bool, node_state: NodeState | None) -> bool:
+        """Whether a same-address re-registration finds the worker SUSPECT or DEAD in SWIM."""
+        return (
+            is_same_worker_registration
+            and node_state is not None
+            and node_state.status in (b"SUSPECT", b"DEAD")
+        )
+
+    def _worker_capacity_refusal(self, is_new_worker: bool) -> bytes | None:
+        """Refuse a new worker once this manager holds MAX_WORKERS_PER_MANAGER workers; else None."""
+        max_workers = self._config.max_workers_per_manager
+        if self._worker_capacity_reached(max_workers, is_new_worker):
+            return self._worker_registration_refusal_response(
+                "Worker registration rejected: "
+                f"MAX_WORKERS_PER_MANAGER={max_workers} reached"
+            )
+        return None
+
+    def _worker_capacity_reached(self, max_workers: int | None, is_new_worker: bool) -> bool:
+        """Whether an enforced worker limit is reached for a new worker."""
+        return (
+            self._is_enforced_worker_limit(max_workers)
+            and is_new_worker
+            and self._manager_state.get_worker_count() >= max_workers
+        )
+
+    @staticmethod
+    def _is_enforced_worker_limit(max_workers: int | None) -> bool:
+        """Whether a worker limit is configured and non-negative."""
+        return max_workers is not None and max_workers >= 0
+
+    async def _admit_registered_worker(
+        self,
+        registration: WorkerRegistration,
+        worker_udp_addr: tuple[str, int],
+        is_same_worker_registration: bool,
+        needs_fresh_liveness: bool,
+    ) -> None:
+        """
+        Register an admitted worker everywhere it is tracked, recovering any incarnation it supersedes.
+
+        The worker joins the registry and the worker pool, any previous
+        incarnation at its address is recovered as a dead worker, it joins
+        SWIM, its address is mapped and probed, and its registration is
+        disseminated.
+        """
+        superseded_worker_ids = self._superseded_worker_ids(registration, worker_udp_addr)
+
+        # Register worker
+        await self._registry.register_worker(registration)
+
+        # Add to worker pool
+        await self._worker_pool.register_worker(registration)
+
+        await self._recover_superseded_workers(registration, superseded_worker_ids)
+
+        await self._admit_worker_to_swim(
+            worker_udp_addr,
+            is_same_worker_registration,
+            needs_fresh_liveness,
+        )
+
+        self._manager_state.set_worker_addr_mapping(
+            worker_udp_addr, registration.node.node_id
+        )
+        self._probe_scheduler.add_member(worker_udp_addr)
+
+        if self._worker_disseminator:
+            await self._worker_disseminator.broadcast_worker_registered(
+                registration
+            )
+
+    def _superseded_worker_ids(
+        self,
+        registration: WorkerRegistration,
+        worker_udp_addr: tuple[str, int],
+    ) -> set[str]:
+        """
+        The node ids of previous incarnations registered at the registering worker's TCP or UDP address.
+
+        A different node id at this worker's address is a previous
+        incarnation of the process now registering (a node id embeds its
+        process start time, so a restart always registers anew). SWIM never
+        declares it dead -- the new process answers its probes -- so the work
+        it held must be recovered here.
+        """
+        return {
+            worker_id
+            for address in (
+                (registration.node.host, registration.node.port),
+                worker_udp_addr,
+            )
+            if (
+                worker_id := self._superseded_worker_id_at(
+                    address, registration.node.node_id
+                )
+            )
+            is not None
+        }
+
+    def _superseded_worker_id_at(
+        self,
+        address: tuple[str, int],
+        registering_node_id: str,
+    ) -> str | None:
+        """The node id mapped to an address when it is not the registering worker's own, else None."""
+        worker_id = self._manager_state.get_worker_id_from_addr(address)
+        return worker_id if worker_id != registering_node_id else None
+
+    async def _recover_superseded_workers(
+        self,
+        registration: WorkerRegistration,
+        superseded_worker_ids: set[str],
+    ) -> None:
+        """
+        Recover each superseded incarnation as a dead worker.
+
+        Its pool entry goes and its unfinished workflows are reassigned. The
+        registry already dropped it, so no eviction notice is owed to the
+        address the new process now holds, and the new worker is counted, so
+        this never fails the cluster's work as workerless. The cached
+        transport to the worker's address belongs to the dead incarnation;
+        the reassigned work must not wait out a send timeout on it. The
+        incarnation died unexplained, so it is charged (AD-44).
+        """
+        if superseded_worker_ids:
+            self._invalidate_tcp_client_transport(
+                (registration.node.host, registration.node.port)
+            )
+        for superseded_worker_id in sorted(superseded_worker_ids):
+            await self._handle_worker_failure(superseded_worker_id, True)
+
+    async def _admit_worker_to_swim(
+        self,
+        worker_udp_addr: tuple[str, int],
+        is_same_worker_registration: bool,
+        needs_fresh_liveness: bool,
+    ) -> None:
+        """
+        Add a registered worker to SWIM, re-seating it at a fresh incarnation unless it is a live duplicate.
+
+        TCP registration is the authoritative "fresh start" signal for this
+        address: it tells the manager that the worker process at
+        ``worker_udp_addr`` is brand-new (a different ``node_id`` from any
+        predecessor that may have died there). ``reset_peer_for_rejoin``
+        wipes leftover SWIM state and re-seats the tracker entry at a
+        *bumped* incarnation so stale DEAD gossip about the predecessor
+        (still in flight at this point) is rejected by the freshness check
+        rather than regressing the new instance back to DEAD. Duplicate
+        registration from the same worker is intentionally idempotent: it
+        refreshes registry/pool metadata but does not manufacture a new
+        incarnation or disseminate ALIVE gossip.
+        """
+        if is_same_worker_registration and not needs_fresh_liveness:
+            self.register_peer(worker_udp_addr)
+        else:
+            await self.reset_peer_for_rejoin(worker_udp_addr)
+
+    @tcp.receive()
+    async def manager_resource_gossip(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """AD-41 Part 4: a peer manager's resource reports for this
+        datacenter's view."""
+        try:
+            message = ManagerResourceGossipMessage.load(data)
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Unreadable resource gossip from {addr}: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b"error"
+
+        if not self._resource_gossip.receive(message):
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Resource gossip from {addr} is datacenter "
+                        f"{message.datacenter}'s, not {self._node_id.datacenter}'s"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b"wrong_datacenter"
+
+        return b"ok"
 
     @tcp.receive()
     async def manager_peer_register(
@@ -6353,6 +7676,17 @@ class ManagerServer(HealthAwareServer):
                 error=str(error),
             ).dump()
 
+
+    def _record_held_job_progress(self, job_id: str, worker_id: str | None) -> None:
+        """Record a worker's progress on a job for AD-30 responsiveness
+        tracking -- for a job this manager holds. A report arriving after
+        its job ended here (a worker's last buffered progress) re-created
+        the pair's entry after the job's teardown had removed it; nothing
+        removed it again, and its silence was taken for the worker failing a
+        finished job -- suspected, and escalated toward global death."""
+        if worker_id and self._job_manager.get_job_by_id(job_id) is not None:
+            self._worker_health_monitor.record_job_progress(job_id, worker_id)
+
     @tcp.receive()
     async def workflow_progress(
         self,
@@ -6364,19 +7698,13 @@ class ManagerServer(HealthAwareServer):
         try:
             progress = WorkflowProgress.load(data)
 
-            # Record job progress for AD-30 responsiveness tracking
             worker_id = self._manager_state.get_worker_id_from_addr(addr)
-            if worker_id:
-                self._worker_health_monitor.record_job_progress(progress.job_id, worker_id)
+            self._record_held_job_progress(progress.job_id, worker_id)
 
-            # Update job manager
-            await self._job_manager.update_workflow_progress(
-                sub_workflow_token=progress.workflow_id,
-                progress=progress,
-            )
+            await self._report_workflow_progress_to_timeout(progress)
+            await self._update_worker_cores_from_workflow_progress(worker_id, progress)
+            await self._record_workflow_progress_stats(addr, worker_id, progress)
 
-            stats_worker_id = worker_id or f"{addr[0]}:{addr[1]}"
-            await self._stats.record_progress_update(stats_worker_id, progress)
             # AD-41: resources are the job leader's to account and judge;
             # a non-leader that got this progress points the worker at
             # the leader in its ack.
@@ -6384,23 +7712,7 @@ class ManagerServer(HealthAwareServer):
                 self._track_led_workflow_resources(progress)
                 await self._enforce_workflow_resources(progress, worker_id)
 
-            # Get backpressure signal
-            backpressure = self._stats.get_backpressure_signal()
-            job_leader_addr = self._manager_state.get_job_leader_addr(progress.job_id)
-            if isinstance(job_leader_addr, list):
-                job_leader_addr = tuple(job_leader_addr)
-
-            ack = WorkflowProgressAck(
-                manager_id=self._node_id.full,
-                is_leader=self.is_leader(),
-                healthy_managers=self._get_healthy_managers(),
-                job_leader_addr=job_leader_addr,
-                backpressure_level=backpressure.level.value,
-                backpressure_delay_ms=backpressure.delay_ms,
-                backpressure_batch_only=backpressure.batch_only,
-            )
-
-            return ack.dump()
+            return self._workflow_progress_ack(progress.job_id)
 
         except Exception as error:
             await self._udp_logger.log(
@@ -6421,6 +7733,77 @@ class ManagerServer(HealthAwareServer):
                 backpressure_delay_ms=0,
                 backpressure_batch_only=False,
             ).dump()
+
+    async def _report_workflow_progress_to_timeout(self, progress: WorkflowProgress) -> None:
+        """
+        Record a workflow's progress in the job manager and report advancing work to the job's timeout.
+
+        Work that advanced is the job's progress (AD-34): a workflow
+        completing actions is not stuck, however long it runs.
+        """
+        if await self._job_manager.update_workflow_progress(
+            sub_workflow_token=progress.workflow_id,
+            progress=progress,
+        ) and (
+            timeout_strategy := self._manager_state.get_job_timeout_strategy(
+                progress.job_id
+            )
+        ) is not None:
+            await timeout_strategy.report_progress(progress.job_id, "workflow_progress")
+
+    async def _update_worker_cores_from_workflow_progress(
+        self,
+        worker_id: str | None,
+        progress: WorkflowProgress,
+    ) -> None:
+        """
+        Update a known worker's free cores from its progress report, signalling the dispatcher when they changed.
+
+        The worker's free cores as of this report are fresher than its last
+        heartbeat (cores a workflow finished with are freed as it reports),
+        and proof its dispatch is counted in them.
+        """
+        if await self._worker_cores_changed_by_progress(worker_id, progress) and self._workflow_dispatcher:
+            self._workflow_dispatcher.signal_cores_available()
+
+    async def _worker_cores_changed_by_progress(self, worker_id: str | None, progress: WorkflowProgress) -> bool:
+        """Whether a known worker's progress report updated its free cores
+        (an unknown worker's report updates nothing)."""
+        return bool(worker_id) and await self._worker_pool.update_worker_cores_from_progress(
+            worker_id,
+            progress.worker_available_cores,
+            progress.workflow_id,
+            progress.worker_cores_version,
+        )
+
+    async def _record_workflow_progress_stats(
+        self,
+        addr: tuple[str, int],
+        worker_id: str | None,
+        progress: WorkflowProgress,
+    ) -> None:
+        """Record a progress update in the stats, under the worker's id or, when unknown, its address."""
+        stats_worker_id = worker_id or f"{addr[0]}:{addr[1]}"
+        await self._stats.record_progress_update(stats_worker_id, progress)
+
+    def _workflow_progress_ack(self, job_id: str) -> bytes:
+        """Ack a progress update with this manager's view, the job's leader, and the current backpressure."""
+        backpressure = self._stats.get_backpressure_signal()
+        job_leader_addr = self._manager_state.get_job_leader_addr(job_id)
+        if isinstance(job_leader_addr, list):
+            job_leader_addr = tuple(job_leader_addr)
+
+        ack = WorkflowProgressAck(
+            manager_id=self._node_id.full,
+            is_leader=self.is_leader(),
+            healthy_managers=self._get_healthy_managers(),
+            job_leader_addr=job_leader_addr,
+            backpressure_level=backpressure.level.value,
+            backpressure_delay_ms=backpressure.delay_ms,
+            backpressure_batch_only=backpressure.batch_only,
+        )
+
+        return ack.dump()
 
     def _resource_budget_rejection(self, submission: JobSubmission) -> str | None:
         """Why this manager cannot enforce the job's own AD-41 budget, if
@@ -6649,18 +8032,11 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-        await self._handle_worker_failure(worker_id)
+        # AD-41: it ignored resource kills -- over-budget evidence, charged.
+        await self._handle_worker_failure(worker_id, True)
         if self._worker_disseminator:
             await self._worker_disseminator.broadcast_worker_dead(worker_id, "evicted")
         return True
-
-    def _record_workflow_latency_from_results(self, results: list[dict]) -> None:
-        for stats in results:
-            if not (stats and isinstance(stats, dict) and "elapsed" in stats):
-                continue
-            elapsed_seconds = stats.get("elapsed", 0)
-            if isinstance(elapsed_seconds, (int, float)) and elapsed_seconds > 0:
-                self._manager_state.record_workflow_latency(elapsed_seconds * 1000.0)
 
     async def _handle_parent_workflow_completion(
         self,
@@ -6670,20 +8046,34 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         if not (result_recorded and parent_complete):
             return
+        await self._complete_parent_workflow(result)
 
+    async def _complete_parent_workflow(self, result: WorkflowFinalResult) -> None:
+        """
+        Close a parent workflow whose every sub-workflow reported, and push its result.
+
+        Aggregates across *all* sub-workflows for the parent rather than
+        forwarding whichever result happened to be the last to land. A
+        worker that died mid-execution races the manager's reassignment
+        path: its CANCELLED final-result can arrive after the surviving
+        workers reported COMPLETED, and using ``result.status`` directly
+        would push that misleading CANCELLED terminal state to the client.
+        The aggregator returns the same payload shape the legacy path
+        produced when only one sub-workflow existed.
+
+        The aggregated WorkflowResultPush goes to the client when no gate is
+        involved. The model docstring spells out the contract: "Sent from
+        Manager to Client (aggregated) or Manager to Gate (raw)". Without
+        this push, L1/L2 jobs (no gate) silently complete on the manager and
+        the client's on_workflow_result callback never fires. Gates handle
+        the cross-DC aggregation case via their own workflow_result_push
+        handler.
+        """
         sub_token = TrackingToken.parse(result.workflow_id)
         parent_workflow_token = sub_token.workflow_token
         if not parent_workflow_token:
             return
 
-        # Aggregate across *all* sub-workflows for the parent rather than
-        # forwarding whichever result happened to be the last to land. A
-        # worker that died mid-execution races the manager's reassignment
-        # path: its CANCELLED final-result can arrive after the surviving
-        # workers reported COMPLETED, and using ``result.status`` directly
-        # would push that misleading CANCELLED terminal state to the
-        # client. The aggregator returns the same payload shape the legacy
-        # path produced when only one sub-workflow existed.
         aggregate = await self._job_manager.aggregate_parent_workflow_outcome(
             result.workflow_id
         )
@@ -6691,20 +8081,10 @@ class ManagerServer(HealthAwareServer):
             return
         aggregate_status, aggregate_error, aggregated_results = aggregate
 
-        if aggregate_status == WorkflowStatus.COMPLETED.value:
-            await self._job_manager.mark_workflow_completed(parent_workflow_token)
-        elif aggregate_status == WorkflowStatus.FAILED.value:
-            await self._job_manager.mark_workflow_failed(
-                parent_workflow_token, aggregate_error or "workflow failed"
-            )
+        await self._mark_parent_workflow_outcome(
+            result, sub_token, parent_workflow_token, aggregate_status, aggregate_error
+        )
 
-        # Push aggregated WorkflowResultPush to the client when no gate is
-        # involved. The model docstring spells out the contract:
-        #   "Sent from Manager to Client (aggregated) or Manager to Gate (raw)"
-        # Without this push, L1/L2 jobs (no gate) silently complete on the
-        # manager and the client's on_workflow_result callback never fires.
-        # Gates handle the cross-DC aggregation case via their own
-        # workflow_result_push handler.
         await self._push_workflow_result_to_client(
             result,
             sub_token,
@@ -6712,6 +8092,89 @@ class ManagerServer(HealthAwareServer):
             aggregate_error=aggregate_error,
             aggregated_results=aggregated_results,
         )
+
+    async def _mark_parent_workflow_outcome(
+        self,
+        result: WorkflowFinalResult,
+        sub_token: TrackingToken,
+        parent_workflow_token: str,
+        aggregate_status: str,
+        aggregate_error: str | None,
+    ) -> None:
+        """Mark a parent workflow completed when its aggregate completed, else close it as unsuccessful."""
+        if aggregate_status == WorkflowStatus.COMPLETED.value:
+            await self._job_manager.mark_workflow_completed(parent_workflow_token)
+            return
+        await self._mark_unsuccessful_parent_workflow(
+            result, sub_token, parent_workflow_token, aggregate_status, aggregate_error
+        )
+
+    async def _mark_unsuccessful_parent_workflow(
+        self,
+        result: WorkflowFinalResult,
+        sub_token: TrackingToken,
+        parent_workflow_token: str,
+        aggregate_status: str,
+        aggregate_error: str | None,
+    ) -> None:
+        """Mark a parent workflow whose aggregate failed as failed, else close it as cancelled."""
+        if aggregate_status == WorkflowStatus.FAILED.value:
+            await self._job_manager.mark_workflow_failed(
+                parent_workflow_token, aggregate_error or "workflow failed"
+            )
+            return
+        await self._close_cancelled_parent_workflow(
+            result, sub_token, parent_workflow_token, aggregate_error
+        )
+
+    async def _close_cancelled_parent_workflow(
+        self,
+        result: WorkflowFinalResult,
+        sub_token: TrackingToken,
+        parent_workflow_token: str,
+        aggregate_error: str | None,
+    ) -> None:
+        """
+        Close a parent workflow every sub of which came back cancelled.
+
+        A workflow that was cancelling finishes its cancellation: every sub
+        came back cancelled. One nothing was cancelling (a cancellation turns
+        it CANCELLING before it sends a single cancel) was stopped by this
+        manager -- an AD-41 resource kill of a sub -- or the worker, so it
+        failed. The job's arithmetic must close on it: unmarked, the job
+        stood until AD-34 declared a misleading timeout.
+        """
+        workflow_id = sub_token.workflow_id or ""
+        if self._job_manager.workflow_lifecycle.get_state(
+            result.job_id, workflow_id
+        ) == WorkflowState.CANCELLING:
+            await self._job_manager.finish_workflow_cancellation(
+                result.job_id, workflow_id
+            )
+            return
+        cancellation = self._manager_state.get_cancelled_workflow(
+            result.job_id, result.workflow_id
+        )
+        await self._job_manager.mark_workflow_failed(
+            parent_workflow_token,
+            self._uncancelled_workflow_failure_reason(cancellation, aggregate_error),
+        )
+
+    @classmethod
+    def _uncancelled_workflow_failure_reason(
+        cls,
+        cancellation: CancelledWorkflowInfo | None,
+        aggregate_error: str | None,
+    ) -> str:
+        """The failure reason of a workflow stopped before completing: its cancellation's reason, else the error."""
+        if cancellation_reason := cls._cancellation_reason(cancellation):
+            return f"cancelled before completing: {cancellation_reason}"
+        return aggregate_error or "cancelled before completing"
+
+    @staticmethod
+    def _cancellation_reason(cancellation: CancelledWorkflowInfo | None):
+        """A recorded cancellation's reason, or a falsy value when there is no cancellation or no reason."""
+        return cancellation is not None and cancellation.reason
 
     async def _push_workflow_result_to_client(
         self,
@@ -6722,24 +8185,61 @@ class ManagerServer(HealthAwareServer):
         aggregated_results: list[dict] | None = None,
     ) -> None:
         callback_addr = self._get_job_callback_addr(result.job_id)
-        if not callback_addr:
-            if not self._manager_state.get_job_origin_gate(result.job_id):
-                return
-        # The aggregate computed across every sub-workflow is the
-        # authoritative terminal state for the parent. Falling back to
-        # ``result.*`` keeps callers without an aggregate (legacy paths)
-        # working unchanged, but the standard push goes through the
-        # aggregated values so a CANCELLED sub-workflow from a dying
-        # worker cannot override a sibling's COMPLETED result.
-        push_status = aggregate_status if aggregate_status is not None else result.status
-        push_error = aggregate_error if aggregate_status is not None else result.error
-        if aggregated_results is not None:
-            push_results = aggregated_results
-        else:
-            push_results = list(result.results) if result.results else []
+        if self._has_no_workflow_result_destination(result.job_id, callback_addr):
+            return
+        push = self._build_workflow_result_push(
+            result,
+            sub_token,
+            callback_addr,
+            aggregate_status,
+            aggregate_error,
+            aggregated_results,
+        )
+        await self._send_workflow_result_push(result, callback_addr, push)
+
+    def _has_no_workflow_result_destination(
+        self,
+        job_id: str,
+        callback_addr: tuple[str, int] | None,
+    ) -> bool:
+        """Whether a job has neither a client callback nor an origin gate to push results to."""
+        return not callback_addr and not self._manager_state.get_job_origin_gate(job_id)
+
+    def _build_workflow_result_push(
+        self,
+        result: WorkflowFinalResult,
+        sub_token: TrackingToken,
+        callback_addr: tuple[str, int] | None,
+        aggregate_status: str | None,
+        aggregate_error: str | None,
+        aggregated_results: list[dict] | None,
+    ) -> WorkflowResultPush:
+        """
+        Build the workflow result push for a parent workflow's terminal outcome.
+
+        The aggregate computed across every sub-workflow is the
+        authoritative terminal state for the parent. Falling back to
+        ``result.*`` keeps callers without an aggregate (legacy paths)
+        working unchanged, but the standard push goes through the
+        aggregated values so a CANCELLED sub-workflow from a dying worker
+        cannot override a sibling's COMPLETED result. Whether the workflow
+        drives load decides how its results combine, here and at the gate: a
+        test workflow's per-core results merge into one set of load-test
+        stats, any other workflow's travel as they are. The push left
+        ``is_test`` at its default (True), so every workflow's results were
+        merged as load-test stats. The workflow ran as long as its longest
+        run on any worker.
+        """
+        push_status, push_error = self._workflow_result_push_outcome(
+            result, aggregate_status, aggregate_error
+        )
+        push_results = self._workflow_result_push_results(result, aggregated_results)
+        is_test = self._is_test_workflow(self._parent_workflow_info(result, sub_token))
+        is_client_ready = not bool(self._manager_state.get_job_origin_gate(result.job_id))
+        push_results = self._client_bound_push_results(push_results, is_client_ready, is_test)
         target_dcs = self._get_job_target_dcs_for_push(result.job_id)
         workflow_id = sub_token.workflow_id or result.workflow_id
-        push = WorkflowResultPush(
+        return WorkflowResultPush(
             job_id=result.job_id,
             workflow_id=workflow_id,
             workflow_name=result.workflow_name,
@@ -6748,21 +8248,102 @@ class ManagerServer(HealthAwareServer):
             fence_token=self._leases.get_fence_token(result.job_id),
             results=push_results,
             error=push_error,
-            elapsed_seconds=0.0,
+            elapsed_seconds=self._longest_result_elapsed_seconds(push_results),
             completed_at=self._clock.time(),
             callback_addr=callback_addr,
+            is_test=is_test,
             target_dcs=target_dcs,
             target_dc_count=self._get_job_target_dc_count_for_push(
                 result.job_id,
                 target_dcs,
             ),
-            is_client_ready=not bool(
-                self._manager_state.get_job_origin_gate(result.job_id)
-            ),
+            is_client_ready=is_client_ready,
             **self._data_plane_push_fields(
                 result.job_id, workflow_id, self._node_id.datacenter
             ),
         )
+
+    @staticmethod
+    def _workflow_result_push_outcome(
+        result: WorkflowFinalResult,
+        aggregate_status: str | None,
+        aggregate_error: str | None,
+    ) -> tuple[str, str | None]:
+        """The pushed status and error: the aggregate's when there is one, else the result's own."""
+        if aggregate_status is not None:
+            return aggregate_status, aggregate_error
+        return result.status, result.error
+
+    @staticmethod
+    def _workflow_result_push_results(
+        result: WorkflowFinalResult,
+        aggregated_results: list[dict] | None,
+    ) -> list[dict]:
+        """The pushed results: the aggregated ones when given, else a copy of the result's own (or none)."""
+        if aggregated_results is not None:
+            return aggregated_results
+        return list(result.results) if result.results else []
+
+    def _parent_workflow_info(
+        self,
+        result: WorkflowFinalResult,
+        sub_token: TrackingToken,
+    ) -> WorkflowInfo | None:
+        """The job's record of a sub-workflow token's parent workflow, or None when either is unknown."""
+        job = self._job_manager.get_job_by_id(result.job_id)
+        return (
+            job.workflows.get(str(sub_token.to_parent_workflow_token()))
+            if job is not None and sub_token.is_sub_workflow_token
+            else None
+        )
+
+    @staticmethod
+    def _is_test_workflow(workflow_info: WorkflowInfo | None) -> bool:
+        """Whether a known workflow drives load (a test workflow)."""
+        return workflow_info is not None and workflow_info.is_test
+
+    @classmethod
+    def _client_bound_push_results(
+        cls,
+        push_results: list[dict],
+        is_client_ready: bool,
+        is_test: bool,
+    ) -> list[dict]:
+        """
+        Merge a client-bound test workflow's per-core results into one.
+
+        A client-bound push carries one merged result, as a gate's does: the
+        per-core results are merged here, not left for the client (which
+        reads the first) to drop.
+        """
+        if cls._merges_client_push_results(push_results, is_client_ready, is_test):
+            return [Results().merge_results(push_results)]
+        return push_results
+
+    @staticmethod
+    def _merges_client_push_results(
+        push_results: list[dict],
+        is_client_ready: bool,
+        is_test: bool,
+    ) -> bool:
+        """Whether a client-bound test workflow's push carries more than one result to merge."""
+        return is_client_ready and is_test and len(push_results) > 1
+
+    @staticmethod
+    def _longest_result_elapsed_seconds(push_results: list[dict]) -> float:
+        """The longest elapsed time among the pushed results, or 0.0 when there are none."""
+        return max(
+            (float(stats.get("elapsed", 0.0)) for stats in push_results),
+            default=0.0,
+        )
+
+    async def _send_workflow_result_push(
+        self,
+        result: WorkflowFinalResult,
+        callback_addr: tuple[str, int] | None,
+        push: WorkflowResultPush,
+    ) -> None:
+        """Send a workflow result push to the job's origin, logging a failed send."""
         try:
             await self._send_job_update_to_origin(
                 result.job_id,
@@ -6770,7 +8351,7 @@ class ManagerServer(HealthAwareServer):
                 "workflow_result_push",
                 "workflow_result_push",
                 push.dump(),
-                timeout=5.0,
+                timeout=self._config.tcp_timeout_standard_seconds,
             )
         except Exception as send_error:
             await self._udp_logger.log(
@@ -6786,83 +8367,21 @@ class ManagerServer(HealthAwareServer):
                 )
             )
 
-    async def _fail_unfinished_workflows_with_no_workers(self) -> None:
-        """Fail and notify unfinished workflows when no worker remains."""
-        if not self._job_manager:
-            return
-
-        import traceback as _tb
-        await self._udp_logger.log(
-            ServerError(
-                message=(
-                    f"[FAIL-UNFINISHED] worker_count="
-                    f"{self._manager_state.get_worker_count()} "
-                    f"stack={'/'.join(f.name for f in _tb.extract_stack()[-6:-1])}"
-                ),
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
+    async def _report_lifecycle_progress(self, transition: StateTransition) -> None:
+        """A workflow taking a lifecycle transition is its job's progress
+        (AD-34): the job's timeout strategy hears of it."""
+        if transition.accepted and (
+            timeout_strategy := self._manager_state.get_job_timeout_strategy(
+                transition.job_id
             )
-        )
+        ) is not None:
+            await timeout_strategy.report_progress(
+                transition.job_id, f"workflow_{transition.to_state.value}"
+            )
 
-        reason = "all workers unavailable"
-        failed_workflows = await self._job_manager.fail_unfinished_workflows(reason)
-        completed_job_ids: set[str] = set()
-
-        for job_id, workflow_id, workflow_name, error in failed_workflows:
-            callback_addr = self._get_job_callback_addr(job_id)
-            if callback_addr or self._manager_state.get_job_origin_gate(job_id):
-                target_dcs = self._get_job_target_dcs_for_push(job_id)
-                push = WorkflowResultPush(
-                    job_id=job_id,
-                    workflow_id=workflow_id,
-                    workflow_name=workflow_name,
-                    datacenter=self._node_id.datacenter,
-                    status=WorkflowStatus.FAILED.value,
-                    fence_token=self._leases.get_fence_token(job_id),
-                    results=[],
-                    error=error,
-                    elapsed_seconds=0.0,
-                    completed_at=self._clock.time(),
-                    callback_addr=callback_addr,
-                    target_dcs=target_dcs,
-                    target_dc_count=self._get_job_target_dc_count_for_push(
-                        job_id,
-                        target_dcs,
-                    ),
-                    is_client_ready=not bool(
-                        self._manager_state.get_job_origin_gate(job_id)
-                    ),
-                    **self._data_plane_push_fields(
-                        job_id, workflow_id, self._node_id.datacenter
-                    ),
-                )
-                try:
-                    await self._send_job_update_to_origin(
-                        job_id,
-                        callback_addr,
-                        "workflow_result_push",
-                        "workflow_result_push",
-                        push.dump(),
-                        timeout=5.0,
-                    )
-                except Exception as send_error:
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=(
-                                "Failed to push no-worker workflow failure to origin: "
-                                f"{send_error}"
-                            ),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-
-            if self._is_job_complete(job_id):
-                completed_job_ids.add(job_id)
-
-        for job_id in completed_job_ids:
+    async def _complete_job_if_done(self, job_id: str) -> None:
+        """Complete the job once every workflow of it finished."""
+        if self._is_job_complete(job_id):
             await self._handle_job_completion(job_id)
 
     def _is_job_complete(self, job_id: str) -> bool:
@@ -6870,6 +8389,58 @@ class ManagerServer(HealthAwareServer):
         if not job:
             return False
         return job.workflows_completed + job.workflows_failed >= job.workflows_total
+
+    async def _fail_workflow_for_good(
+        self,
+        job_id: str,
+        workflow_id: str,
+        reason: str,
+    ) -> None:
+        """Fail for good a workflow that cannot run again -- its dispatch
+        failed until its retry budget was spent (AD-44), or it was lost with
+        its workers and cannot be retried: its dependents cascade, its
+        failure goes to the job's origin with the cause, and the job
+        completes if that was its last open workflow -- promptly, never left
+        for the AD-34 timeout. The dispatcher runs this outside the dispatch
+        pass that decided it: completing the job stops that pass's dispatch
+        loop."""
+        if (job := self._job_manager.get_job_by_id(job_id)) is None:
+            return
+        if (workflow := await self._mark_job_workflow_failed(job, workflow_id, reason)) is None:
+            return
+
+        await self._push_timeout_workflow_results(
+            [self._build_timeout_workflow_push(job, workflow, reason)]
+        )
+        # Marking it failed ran its cascade, which completes the job itself
+        # when its dependents closed it; a completed job is already gone.
+        await self._complete_job_if_done(job_id)
+
+    async def _mark_job_workflow_failed(
+        self,
+        job: JobInfo,
+        workflow_id: str,
+        reason: str,
+    ) -> WorkflowInfo | None:
+        """Mark the job's workflow with this id failed; returns it, or None when it is unknown or was not marked."""
+        workflow = self._job_workflow_by_id(job, workflow_id)
+        if workflow is None or not await self._job_manager.mark_workflow_failed(
+            workflow.token, reason
+        ):
+            return None
+        return workflow
+
+    @staticmethod
+    def _job_workflow_by_id(job: JobInfo, workflow_id: str) -> WorkflowInfo | None:
+        """The job's first workflow whose token names this workflow id, or None."""
+        return next(
+            (
+                workflow_info
+                for workflow_info in job.workflows.values()
+                if workflow_info.token.workflow_id == workflow_id
+            ),
+            None,
+        )
 
     async def _handle_workflow_terminal_for_dispatch(
         self, job_id: str, workflow_id: str
@@ -6880,39 +8451,72 @@ class ManagerServer(HealthAwareServer):
 
         Success unblocks dependents (``mark_workflow_completed`` adds to
         their ``completed_dependencies`` and signals ready). Failure
-        cascade-fails every transitive dependent in the dispatcher AND
-        mirrors that failure at the JOB level: a dependent that can
-        never dispatch must count toward ``workflows_failed`` so the job
-        reaches its terminal promptly and truthfully — otherwise it
-        strands until AD-34 declares a misleading ``timeout`` for work
-        that deterministically failed. The job-level mark re-fires this
-        callback for each dependent (transitive levels handled by
-        recursion); every step is idempotent — terminal workflows
-        refuse re-marking and the dispatcher's cascade re-exhausts
-        already-exhausted entries harmlessly.
+        cascade-fails every transitive dependent at the JOB level, in one
+        sweep along the graph the ``JobManager`` stored at registration:
+        a dependent that can never dispatch must count toward
+        ``workflows_failed`` so the job reaches its terminal promptly and
+        truthfully — otherwise it strands until AD-34 declares a
+        misleading ``timeout`` for work that deterministically failed.
+        The sweep announces nothing (no re-entry into this callback), and
+        the failed workflow and every dependent it failed leave the
+        dispatch queue together; the job's tallies are then reported and
+        its completion checked once.
         """
         job = self._job_manager.get_job_by_id(job_id)
         if not job:
             return
 
-        async with job.lock:
-            terminal_status = next(
-                (
-                    workflow_info.status
-                    for workflow_info in job.workflows.values()
-                    if (workflow_info.token.workflow_id or "") == workflow_id
-                ),
-                None,
-            )
-            workflows_completed = job.workflows_completed
-            workflows_failed = job.workflows_failed
+        terminal_status, workflows_completed, workflows_failed = (
+            await self._workflow_terminal_status_and_tallies(job, workflow_id)
+        )
         if terminal_status is None:
             return
 
+        # AD-38 JobProgressReported at LOCAL durability: tallies only
+        # change on a workflow terminal, so this bounds WAL growth by
+        # workflow count; unchanged tallies append nothing.
+        await self._report_job_tallies_to_ledger(job_id, workflows_completed, workflows_failed)
+
+        await self._route_terminal_workflow_to_dispatch(job, job_id, workflow_id, terminal_status)
+
+    @classmethod
+    async def _workflow_terminal_status_and_tallies(
+        cls,
+        job: JobInfo,
+        workflow_id: str,
+    ) -> tuple[WorkflowStatus | None, int, int]:
+        """Under the job's lock, read the workflow's status and the job's completed and failed tallies."""
+        async with job.lock:
+            terminal_status = cls._job_workflow_status(job, workflow_id)
+            workflows_completed = job.workflows_completed
+            workflows_failed = job.workflows_failed
+        return terminal_status, workflows_completed, workflows_failed
+
+    @classmethod
+    def _job_workflow_status(cls, job: JobInfo, workflow_id: str) -> WorkflowStatus | None:
+        """The status of the job's first workflow whose token names this workflow id, or None."""
+        return next(
+            (
+                workflow_info.status
+                for workflow_info in job.workflows.values()
+                if cls._workflow_token_id(workflow_info) == workflow_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _workflow_token_id(workflow_info: WorkflowInfo) -> str:
+        """The workflow id a workflow's token names, or an empty string when it names none."""
+        return workflow_info.token.workflow_id or ""
+
+    async def _report_job_tallies_to_ledger(
+        self,
+        job_id: str,
+        workflows_completed: int,
+        workflows_failed: int,
+    ) -> None:
+        """Report the job's workflow tallies to the job ledger at LOCAL durability, when this manager keeps one."""
         if self._job_ledger is not None:
-            # AD-38 JobProgressReported at LOCAL durability: tallies only
-            # change on a workflow terminal, so this bounds WAL growth by
-            # workflow count; unchanged tallies append nothing.
             await self._job_ledger.report_progress(
                 job_id,
                 datacenter_id=self._node_id.datacenter,
@@ -6921,6 +8525,14 @@ class ManagerServer(HealthAwareServer):
                 durability=DurabilityLevel.LOCAL,
             )
 
+    async def _route_terminal_workflow_to_dispatch(
+        self,
+        job: JobInfo,
+        job_id: str,
+        workflow_id: str,
+        terminal_status: WorkflowStatus,
+    ) -> None:
+        """Unblock a succeeded workflow's dependents, or cascade a failed one's failure through them."""
         if terminal_status in (
             WorkflowStatus.COMPLETED,
             WorkflowStatus.AGGREGATED,
@@ -6929,53 +8541,42 @@ class ManagerServer(HealthAwareServer):
                 job_id, workflow_id
             )
             return
+        await self._cascade_failed_workflow_dependents(job, job_id, workflow_id)
 
-        cascade_failed_workflow_ids = (
-            await self._workflow_dispatcher.mark_workflow_failed(
-                job_id, workflow_id
-            )
-        )
-        for dependent_workflow_id in cascade_failed_workflow_ids:
-            await self._fail_undispatchable_dependent(
-                job_id, dependent_workflow_id, workflow_id
-            )
-        if cascade_failed_workflow_ids and self._is_job_complete(job_id):
-            await self._handle_job_completion(job_id)
-
-    async def _fail_undispatchable_dependent(
+    async def _cascade_failed_workflow_dependents(
         self,
+        job: JobInfo,
         job_id: str,
-        dependent_workflow_id: str,
-        failed_dependency_id: str,
+        workflow_id: str,
     ) -> None:
-        """Mark one cascade-failed dependent FAILED at the job level,
-        loudly. The dependent never dispatched, so no worker will ever
-        report a final result for it — without this mirror the job's
-        completion arithmetic never closes."""
-        job = self._job_manager.get_job_by_id(job_id)
-        if not job:
-            return
+        """
+        Fail every dependent of a failed workflow and drop them all from the dispatch queue.
 
-        async with job.lock:
-            dependent_token = next(
-                (
-                    token_str
-                    for token_str, workflow_info in job.workflows.items()
-                    if (workflow_info.token.workflow_id or "")
-                    == dependent_workflow_id
-                ),
-                None,
-            )
-        if dependent_token is None:
-            return
-
-        await self._job_manager.mark_workflow_failed(
-            dependent_token,
-            (
-                f"dependency {failed_dependency_id} failed — dependent "
-                "workflow can never dispatch"
-            ),
+        When dependents were failed, the job's new tallies are reported and
+        its completion checked.
+        """
+        cascade_failed_workflow_ids = await self._job_manager.fail_workflow_dependents(
+            job_id,
+            workflow_id,
+            f"dependency {workflow_id} failed — dependent workflow can never dispatch",
         )
+        await self._workflow_dispatcher.remove_pending_workflows(
+            job_id, [workflow_id, *cascade_failed_workflow_ids]
+        )
+        if not cascade_failed_workflow_ids:
+            return
+
+        if self._job_ledger is not None:
+            await self._report_locked_job_tallies(job, job_id)
+
+        await self._complete_job_if_done(job_id)
+
+    async def _report_locked_job_tallies(self, job: JobInfo, job_id: str) -> None:
+        """Read the job's tallies under its lock and report them to the job ledger."""
+        async with job.lock:
+            workflows_completed = job.workflows_completed
+            workflows_failed = job.workflows_failed
+        await self._report_job_tallies_to_ledger(job_id, workflows_completed, workflows_failed)
 
     def _is_known_terminal_job(self, job_id: str) -> bool:
         """Whether this manager knows ``job_id`` ended: its tracked job is
@@ -6983,10 +8584,14 @@ class ManagerServer(HealthAwareServer):
         ledger records it terminal."""
         if (job := self._job_manager.get_job(job_id)) is not None:
             return JobStatusOrder().is_terminal(job.status)
-        if self._job_ledger is not None:
-            ledger_job = self._job_ledger.get_job(job_id)
-            return ledger_job is not None and ledger_job.is_terminal
-        return False
+        return self._ledger_records_job_terminal(job_id)
+
+    def _ledger_records_job_terminal(self, job_id: str) -> bool:
+        """Whether this manager keeps a job ledger and it records the job as terminal."""
+        if self._job_ledger is None:
+            return False
+        ledger_job = self._job_ledger.get_job(job_id)
+        return ledger_job is not None and ledger_job.is_terminal
 
     def _workflow_final_result_ack(
         self,
@@ -7028,6 +8633,22 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
     ) -> bytes:
         leader_addr = self._resolve_job_leader_addr_for_result(result.job_id)
+        if (refusal := self._unforwardable_workflow_final_result_ack(leader_addr)) is not None:
+            return refusal
+
+        response, _clock = await self.send_tcp(
+            leader_addr,
+            "workflow_final_result",
+            data,
+            timeout=self._config.tcp_timeout_standard_seconds,
+        )
+        return self._leader_workflow_final_result_answer(response, leader_addr)
+
+    def _unforwardable_workflow_final_result_ack(
+        self,
+        leader_addr: tuple[str, int] | None,
+    ) -> bytes | None:
+        """Refuse a final result when no job leader is known or the known leader is this manager; else None."""
         if leader_addr is None:
             return self._workflow_final_result_ack(
                 accepted=False,
@@ -7041,13 +8662,14 @@ class ManagerServer(HealthAwareServer):
                 error="local manager does not own job lease",
                 reason="local_lease_not_held",
             )
+        return None
 
-        response, _clock = await self.send_tcp(
-            leader_addr,
-            "workflow_final_result",
-            data,
-            timeout=5.0,
-        )
+    def _leader_workflow_final_result_answer(
+        self,
+        response: bytes | Exception | None,
+        leader_addr: tuple[str, int],
+    ) -> bytes:
+        """Relay the job leader's answer to a forwarded final result, or refuse when the forward failed or was rejected."""
         if isinstance(response, Exception):
             return self._workflow_final_result_ack(
                 accepted=False,
@@ -7055,7 +8677,7 @@ class ManagerServer(HealthAwareServer):
                 error=str(response),
                 reason="forward_failed",
             )
-        if response and isinstance(response, bytes) and response != b"error":
+        if self._is_leader_workflow_final_result_reply(response):
             return response
         return self._workflow_final_result_ack(
             accepted=False,
@@ -7063,6 +8685,11 @@ class ManagerServer(HealthAwareServer):
             error="leader rejected workflow final result",
             reason="leader_rejected",
         )
+
+    @staticmethod
+    def _is_leader_workflow_final_result_reply(response: bytes | None):
+        """Whether a forwarded final result's response is a non-empty answer other than the error marker."""
+        return response and isinstance(response, bytes) and response != b"error"
 
     @tcp.receive()
     async def workflow_final_result(
@@ -7073,90 +8700,15 @@ class ManagerServer(HealthAwareServer):
     ) -> bytes:
         try:
             result = WorkflowFinalResult.load(data)
-            # A result for a job that already ended cannot change it --
-            # whichever manager leads it, and after its lease is gone.
-            # Ack it stale so the worker drops it instead of retrying
-            # it against a job nobody leads any more.
-            if self._is_known_terminal_job(result.job_id):
-                return self._workflow_final_result_ack(
-                    accepted=True,
-                    stale=True,
-                    leader_addr=(self._host, self._tcp_port),
-                    reason="job_terminal",
-                )
-            is_leader = self._leases.is_job_leader(result.job_id)
-
-            if not is_leader:
-                return await self._forward_workflow_final_result_to_leader(
-                    result,
-                    data,
-                )
-
-            (
-                result_recorded,
-                parent_complete,
-                duplicate_result,
-                stale_result,
-                record_reason,
-            ) = await self._job_manager.record_sub_workflow_result_checked(
-                sub_workflow_token=result.workflow_id,
-                result=result,
+            answer, result_recorded, parent_complete = await self._record_workflow_final_result(
+                result, data
             )
+            if answer is not None:
+                return answer
 
-            if duplicate_result or stale_result:
-                return self._workflow_final_result_ack(
-                    accepted=True,
-                    duplicate=duplicate_result,
-                    stale=stale_result,
-                    leader_addr=(self._host, self._tcp_port),
-                    reason=record_reason or "",
-                )
-
-            if not result_recorded:
-                return self._workflow_final_result_ack(
-                    accepted=False,
-                    leader_addr=(self._host, self._tcp_port),
-                    error=record_reason or "workflow final result was not recorded",
-                    reason=record_reason or "not_recorded",
-                )
-
-            self._record_workflow_latency_from_results(result.results)
-
-            # The run's final counts: the job's totals are built from them.
-            if result.final_progress is not None:
-                await self._job_manager.set_final_workflow_progress(
-                    result.workflow_id, result.final_progress
-                )
-
-            if result.context_updates:
-                await self._job_manager.apply_workflow_context(
-                    job_id=result.job_id,
-                    workflow_name=result.workflow_name,
-                    context_updates_bytes=result.context_updates,
-                )
-
-            if result.worker_id:
-                cores_updated = (
-                    await self._worker_pool.update_worker_cores_from_progress(
-                        result.worker_id,
-                        result.worker_available_cores,
-                    )
-                )
-                if cores_updated and self._workflow_dispatcher:
-                    self._workflow_dispatcher.signal_cores_available()
-
-            await self._handle_parent_workflow_completion(
+            await self._apply_recorded_workflow_final_result(
                 result, result_recorded, parent_complete
             )
-
-            # Phase F2: close the AD-26 outcome feedback loop. Emits
-            # an H8 ExtensionOutcomeEvent, disseminates via #|o, and
-            # mirrors into TimeoutTrackingState. Idempotent on
-            # workflow_id — duplicate result deliveries are safe.
-            self._emit_workflow_outcome_event(result)
-
-            if self._is_job_complete(result.job_id):
-                await self._handle_job_completion(result.job_id)
 
             return self._workflow_final_result_ack(
                 accepted=True,
@@ -7177,6 +8729,170 @@ class ManagerServer(HealthAwareServer):
                 error=str(error),
                 reason="exception",
             )
+
+    async def _record_workflow_final_result(
+        self,
+        result: WorkflowFinalResult,
+        data: bytes,
+    ) -> tuple[bytes | None, bool, bool]:
+        """
+        Route a workflow final result to its job's leader, or record it here as that leader.
+
+        Returns the answer to send back when the result is not newly
+        recorded here -- for an ended job, a job led elsewhere, a duplicate
+        or stale result, or one the job manager did not record -- else None,
+        with whether the result was recorded and completed its parent.
+        """
+        if (answer := await self._route_workflow_final_result(result, data)) is not None:
+            return answer, False, False
+        (
+            result_recorded,
+            parent_complete,
+            duplicate_result,
+            stale_result,
+            record_reason,
+        ) = await self._job_manager.record_sub_workflow_result_checked(
+            sub_workflow_token=result.workflow_id,
+            result=result,
+        )
+        return (
+            self._unrecorded_workflow_final_result_ack(
+                result_recorded, duplicate_result, stale_result, record_reason
+            ),
+            result_recorded,
+            parent_complete,
+        )
+
+    async def _route_workflow_final_result(
+        self,
+        result: WorkflowFinalResult,
+        data: bytes,
+    ) -> bytes | None:
+        """
+        Answer a final result this manager does not record as the job's leader, or return None.
+
+        A result for a job that already ended cannot change it -- whichever
+        manager leads it, and after its lease is gone. It is acked stale so
+        the worker drops it instead of retrying it against a job nobody
+        leads any more. A result for a job led elsewhere is forwarded to its
+        leader.
+        """
+        if self._is_known_terminal_job(result.job_id):
+            return self._workflow_final_result_ack(
+                accepted=True,
+                stale=True,
+                leader_addr=(self._host, self._tcp_port),
+                reason="job_terminal",
+            )
+        if not self._leases.is_job_leader(result.job_id):
+            return await self._forward_workflow_final_result_to_leader(
+                result,
+                data,
+            )
+        return None
+
+    def _unrecorded_workflow_final_result_ack(
+        self,
+        result_recorded: bool,
+        duplicate_result: bool,
+        stale_result: bool,
+        record_reason: str | None,
+    ) -> bytes | None:
+        """Ack a duplicate or stale result as accepted, refuse an unrecorded one, and return None for a new one."""
+        if self._is_repeated_workflow_final_result(duplicate_result, stale_result):
+            return self._repeated_workflow_final_result_ack(
+                duplicate_result, stale_result, record_reason
+            )
+        if not result_recorded:
+            return self._not_recorded_workflow_final_result_ack(record_reason)
+        return None
+
+    def _repeated_workflow_final_result_ack(
+        self,
+        duplicate_result: bool,
+        stale_result: bool,
+        record_reason: str | None,
+    ) -> bytes:
+        """Ack a duplicate or stale final result as accepted, so the worker stops resending it."""
+        return self._workflow_final_result_ack(
+            accepted=True,
+            duplicate=duplicate_result,
+            stale=stale_result,
+            leader_addr=(self._host, self._tcp_port),
+            reason=record_reason or "",
+        )
+
+    @staticmethod
+    def _is_repeated_workflow_final_result(duplicate_result: bool, stale_result: bool) -> bool:
+        """Whether a final result was already recorded or is stale."""
+        return duplicate_result or stale_result
+
+    def _not_recorded_workflow_final_result_ack(self, record_reason: str | None) -> bytes:
+        """Refuse a final result the job manager did not record, with its reason."""
+        return self._workflow_final_result_ack(
+            accepted=False,
+            leader_addr=(self._host, self._tcp_port),
+            error=record_reason or "workflow final result was not recorded",
+            reason=record_reason or "not_recorded",
+        )
+
+    async def _apply_recorded_workflow_final_result(
+        self,
+        result: WorkflowFinalResult,
+        result_recorded: bool,
+        parent_complete: bool,
+    ) -> None:
+        """
+        Act on a newly recorded final result: its counts, context and cores, its parent, and its job.
+
+        Phase F2: closes the AD-26 outcome feedback loop. Emits an H8
+        ExtensionOutcomeEvent, disseminates via #|o, and mirrors into
+        TimeoutTrackingState. Idempotent on workflow_id -- duplicate result
+        deliveries are safe. The job completes when this was its last open
+        workflow.
+        """
+        await self._record_final_result_progress_and_context(result)
+
+        if result.worker_id:
+            await self._update_worker_cores_from_final_result(result)
+
+        await self._handle_parent_workflow_completion(
+            result, result_recorded, parent_complete
+        )
+
+        self._emit_workflow_outcome_event(result)
+
+        await self._complete_job_if_done(result.job_id)
+
+    async def _record_final_result_progress_and_context(self, result: WorkflowFinalResult) -> None:
+        """
+        Store a final result's run counts and apply its context updates, when it carries them.
+
+        The run's final counts: the job's totals are built from them.
+        """
+        if result.final_progress is not None:
+            await self._job_manager.set_final_workflow_progress(
+                result.workflow_id, result.final_progress
+            )
+
+        if result.context_updates:
+            await self._job_manager.apply_workflow_context(
+                job_id=result.job_id,
+                context_updates_bytes=result.context_updates,
+            )
+
+    async def _update_worker_cores_from_final_result(self, result: WorkflowFinalResult) -> None:
+        """Update the reporting worker's available cores, signalling the dispatcher when they changed."""
+        cores_updated = (
+            await self._worker_pool.update_worker_cores_from_progress(
+                result.worker_id,
+                result.worker_available_cores,
+                result.workflow_id,
+                result.worker_cores_version,
+            )
+        )
+        if cores_updated and self._workflow_dispatcher:
+            self._workflow_dispatcher.signal_cores_available()
 
 
     @tcp.receive()
@@ -7345,12 +9061,24 @@ class ManagerServer(HealthAwareServer):
                         )
                     )
 
-            # Notify timeout strategies of extension (AD-34 Part 10.4.7)
-            await self._notify_timeout_strategies_of_extension(
-                worker_id=worker_id,
-                extension_seconds=response.extension_seconds,
-                worker_progress=request.current_progress,
-            )
+            # Notify timeout strategies of extension (AD-34 Part 10.4.7) --
+            # only a grant the worker earned with progress: AD-34 stretches
+            # a job's timeout for legitimately long work. A request showing
+            # none (the dispatch-time one, protecting the worker's liveness
+            # through workflow startup) extends the worker's deadline and
+            # SWIM bracket above, never the job's -- or every dispatch
+            # would add a full grant to the job's explicit timeout.
+            if (
+                request.current_progress > 0.0
+                or (request.completed_items or 0) > 0
+                or request.step_transitions > 0
+                or request.actions_completed > 0
+            ):
+                await self._notify_timeout_strategies_of_extension(
+                    worker_id=worker_id,
+                    extension_seconds=response.extension_seconds,
+                    worker_progress=request.current_progress,
+                )
 
             await self._udp_logger.log(
                 ServerInfo(
@@ -7393,40 +9121,51 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ) -> bytes:
-        """Handle ping request."""
-        try:
-            request = PingRequest.load(data)
+        """Handle ping request: this manager's status, its workers' health
+        and its active jobs. A request that cannot be answered gets the
+        server's error reply, and the failure is logged there."""
+        request = PingRequest.load(data)
 
-            # Build worker status list
-            worker_statuses = [
-                WorkerStatus(
-                    worker_id=worker_id,
-                    state=self._worker_health_monitor.get_worker_health_status(worker_id),
-                    available_cores=worker.available_cores,
-                    total_cores=worker.total_cores,
-                )
-                for worker_id, worker in self._manager_state.iter_workers()
-            ]
-
-            response = ManagerPingResponse(
-                manager_id=self._node_id.full,
-                is_leader=self.is_leader(),
-                state=self._manager_state.manager_state_enum.value,
-                state_version=self._manager_state.state_version,
-                worker_count=self._manager_state.get_worker_count(),
-                healthy_worker_count=self._worker_health_monitor.get_healthy_worker_count(),
-                active_job_count=self._job_manager.job_count,
-                workers=worker_statuses,
+        worker_statuses = [
+            WorkerStatus(
+                worker_id=worker_id,
+                state=self._worker_health_monitor.get_worker_health_status(worker_id),
+                available_cores=worker.available_cores,
+                total_cores=worker.total_cores,
             )
+            for worker_id, worker in self._manager_state.iter_workers()
+        ]
+        status_order = JobStatusOrder()
+        active_jobs = [
+            job for job in self._job_manager.iter_jobs() if not status_order.is_terminal(job.status)
+        ]
 
-            return response.dump()
-
-        except Exception as error:
-            return ManagerPingResponse(
-                manager_id=self._node_id.full,
-                is_leader=False,
-                error=str(error),
-            ).dump()
+        return ManagerPingResponse(
+            request_id=request.request_id,
+            manager_id=self._node_id.full,
+            datacenter=self._node_id.datacenter,
+            host=self._host,
+            port=self._tcp_port,
+            is_leader=self.is_leader(),
+            state=self._manager_state.manager_state_enum.value,
+            term=self._leader_election.state.current_term,
+            total_cores=sum(worker_status.total_cores for worker_status in worker_statuses),
+            available_cores=sum(
+                worker_status.available_cores
+                for worker_status in worker_statuses
+                if worker_status.state == "healthy"
+            ),
+            worker_count=self._manager_state.get_worker_count(),
+            healthy_worker_count=self._worker_health_monitor.get_healthy_worker_count(),
+            workers=worker_statuses,
+            active_job_ids=[job.job_id for job in active_jobs],
+            active_job_count=len(active_jobs),
+            active_workflow_count=sum(
+                job.workflows_total - job.workflows_completed for job in active_jobs
+            ),
+            peer_managers=sorted(self._manager_state.get_active_manager_peers()),
+            resources=self._resource_gossip.view(),
+        ).dump()
 
     async def _track_registered_gate(self, gate_info: GateInfo) -> None:
         """Record a gate learned through a registration handshake.
@@ -7463,7 +9202,7 @@ class ManagerServer(HealthAwareServer):
             is not None
         )
 
-        self._registry.register_gate(gate_info)
+        await self._registry.register_gate(gate_info)
         self._manager_state.set_gate_udp_to_tcp_mapping(
             gate_udp_addr, gate_tcp_addr
         )
@@ -7567,7 +9306,7 @@ class ManagerServer(HealthAwareServer):
                 capabilities=gate_caps_set,
             )
             try:
-                negotiated = self._version_skew.negotiate_with_gate(registration.node_id, gate_caps)
+                negotiated = await self._version_skew.negotiate_with_gate(registration.node_id, gate_caps)
             except ValueError:
                 return GateRegistrationResponse(
                     accepted=False,
@@ -7681,11 +9420,11 @@ class ManagerServer(HealthAwareServer):
 
             worker_id = heartbeat.node_id
             if self._manager_state.has_worker(worker_id):
+                # Cores the worker reports freed wake every job's dispatch
+                # loop through the pool's capacity generation. No dispatch
+                # runs inside this reply: a pass per job here held the
+                # worker's notification open through every dispatch it sent.
                 await self._worker_pool.process_heartbeat(worker_id, heartbeat)
-
-            if self._workflow_dispatcher:
-                for job_id, submission in self._manager_state.iter_job_submissions():
-                    await self._workflow_dispatcher.try_dispatch(job_id, submission)
 
             return b"ok"
 
@@ -7768,52 +9507,11 @@ class ManagerServer(HealthAwareServer):
     ) -> bytes:
         try:
             batch = WorkflowReassignmentBatch.from_bytes(data)
-            if batch is None:
-                return b"invalid"
+            if (refusal := await self._workflow_reassignment_batch_refusal(batch)) is not None:
+                return refusal
 
-            if batch.originating_manager_id == self._node_id.full:
-                return b"self"
-
-            await self._udp_logger.log(
-                ServerDebug(
-                    message=f"Received {len(batch.reassignments)} workflow reassignments from {batch.originating_manager_id[:8]}... (worker {batch.failed_worker_id[:8]}... {batch.reason})",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-
-            if not self._job_manager or not self._workflow_dispatcher:
-                return b"not_ready"
-
-            applied_reassignments = 0
-            requeued_workflows = 0
-
-            for job_id, workflow_id, sub_workflow_token in batch.reassignments:
-                applied, requeued = await self._apply_workflow_reassignment_state(
-                    job_id=job_id,
-                    workflow_id=workflow_id,
-                    sub_workflow_token=sub_workflow_token,
-                    failed_worker_id=batch.failed_worker_id,
-                    reason=batch.reason,
-                )
-                if applied:
-                    applied_reassignments += 1
-                if requeued:
-                    requeued_workflows += 1
-
-            if applied_reassignments or requeued_workflows:
-                await self._udp_logger.log(
-                    ServerDebug(
-                        message=(
-                            "Applied workflow reassignment updates: "
-                            f"applied={applied_reassignments}, requeued={requeued_workflows}"
-                        ),
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
+            applied_reassignments, requeued_workflows = await self._apply_workflow_reassignment_batch(batch)
+            await self._log_applied_workflow_reassignments(applied_reassignments, requeued_workflows)
 
             return b"accepted"
 
@@ -7828,101 +9526,125 @@ class ManagerServer(HealthAwareServer):
             )
             return b"error"
 
-    @tcp.receive()
-    async def context_forward(
+    async def _workflow_reassignment_batch_refusal(
         self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ) -> bytes:
-        """Handle context forwarded from non-leader manager."""
-        try:
-            forward = ContextForward.load(data)
+        batch: WorkflowReassignmentBatch | None,
+    ) -> bytes | None:
+        """
+        Answer a reassignment batch this manager does not apply, or return None to apply it.
 
-            # Verify we are the job leader
-            if not self._is_job_leader(forward.job_id):
-                return b"not_leader"
+        An unreadable batch is invalid and this manager's own batch is
+        ignored; any other is logged, then refused while this manager is not
+        ready to apply it.
+        """
+        if (answer := self._unusable_workflow_reassignment_batch_answer(batch)) is not None:
+            return answer
 
-            # Apply context updates
-            await self._apply_context_updates(
-                forward.job_id,
-                forward.workflow_id,
-                forward.context_updates,
-                forward.context_timestamps,
+        await self._udp_logger.log(
+            ServerDebug(
+                message=f"Received {len(batch.reassignments)} workflow reassignments from {batch.originating_manager_id[:8]}... (worker {batch.failed_worker_id[:8]}... {batch.reason})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
             )
+        )
 
-            return b"ok"
+        return self._workflow_reassignment_not_ready_answer()
 
-        except Exception as error:
+    def _unusable_workflow_reassignment_batch_answer(
+        self,
+        batch: WorkflowReassignmentBatch | None,
+    ) -> bytes | None:
+        """Answer an unreadable batch as invalid and this manager's own batch as self; else None."""
+        if batch is None:
+            return b"invalid"
+
+        if batch.originating_manager_id == self._node_id.full:
+            return b"self"
+        return None
+
+    def _workflow_reassignment_not_ready_answer(self) -> bytes | None:
+        """Answer not ready while this manager has no job manager or workflow dispatcher; else None."""
+        if not self._job_manager or not self._workflow_dispatcher:
+            return b"not_ready"
+        return None
+
+    async def _apply_workflow_reassignment_batch(
+        self,
+        batch: WorkflowReassignmentBatch,
+    ) -> tuple[int, int]:
+        """Apply each reassignment in a batch; returns how many were applied and how many requeued."""
+        applied_reassignments = 0
+        requeued_workflows = 0
+
+        for job_id, workflow_id, sub_workflow_token in batch.reassignments:
+            applied_count, requeued_count = self._workflow_reassignment_tallies(
+                *await self._apply_one_workflow_reassignment(
+                    batch, job_id, workflow_id, sub_workflow_token
+                )
+            )
+            applied_reassignments += applied_count
+            requeued_workflows += requeued_count
+
+        return applied_reassignments, requeued_workflows
+
+    @staticmethod
+    def _workflow_reassignment_tallies(applied: bool, requeued: bool) -> tuple[int, int]:
+        """Count one reassignment's outcome: one applied when applied, one requeued when requeued."""
+        return (1 if applied else 0), (1 if requeued else 0)
+
+    async def _apply_one_workflow_reassignment(
+        self,
+        batch: WorkflowReassignmentBatch,
+        job_id: str,
+        workflow_id: str,
+        sub_workflow_token: str,
+    ) -> tuple[bool, bool]:
+        """
+        Apply one reassignment from a batch; returns (applied, requeued).
+
+        Only the job's leader decides its workflows' retries; a follower
+        mirrors the superseded sub and requeues nothing.
+        """
+        if not self._leases.is_job_leader(job_id):
+            applied, _lost_every_sub = await self._job_manager.apply_workflow_reassignment(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                sub_workflow_token=sub_workflow_token,
+                failed_worker_id=batch.failed_worker_id,
+            )
+            return applied, False
+        return await self._apply_workflow_reassignment_state(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            sub_workflow_token=sub_workflow_token,
+            failed_worker_id=batch.failed_worker_id,
+            reason=batch.reason,
+            loss_is_charged=self._workflow_reassignment_loss_is_charged(batch),
+        )
+
+    def _workflow_reassignment_loss_is_charged(self, batch: WorkflowReassignmentBatch) -> bool:
+        """Whether a batch's worker loss is charged to its workflows: not our own eviction, nor a systemic hold."""
+        return batch.reason != "worker_evicted" and not self._systemic_eviction_hold
+
+    async def _log_applied_workflow_reassignments(
+        self,
+        applied_reassignments: int,
+        requeued_workflows: int,
+    ) -> None:
+        """Log a batch's applied and requeued counts when either is non-zero."""
+        if applied_reassignments or requeued_workflows:
             await self._udp_logger.log(
-                ServerError(
-                    message=f"Context forward error: {error}",
+                ServerDebug(
+                    message=(
+                        "Applied workflow reassignment updates: "
+                        f"applied={applied_reassignments}, requeued={requeued_workflows}"
+                    ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
-            return b"error"
-
-    @tcp.receive()
-    async def context_layer_sync(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ) -> bytes:
-        """Handle context layer sync from job leader."""
-        try:
-            sync = ContextLayerSync.load(data)
-
-            # Check if this is a newer layer version
-            current_version = self._manager_state.get_job_layer_version(
-                sync.job_id, default=-1
-            )
-            if sync.layer_version <= current_version:
-                return ContextLayerSyncAck(
-                    job_id=sync.job_id,
-                    layer_version=sync.layer_version,
-                    applied=False,
-                    responder_id=self._node_id.full,
-                ).dump()
-
-            # Apply context snapshot
-            context_dict = cloudpickle.loads(sync.context_snapshot)
-
-            context = self._manager_state.get_or_create_job_context(sync.job_id)
-            for workflow_name, values in context_dict.items():
-                await context.from_dict(workflow_name, values)
-
-            # Update layer version
-            self._manager_state.set_job_layer_version(sync.job_id, sync.layer_version)
-
-            # Update job leader if not set
-            if not self._manager_state.has_job_leader(sync.job_id):
-                self._manager_state.set_job_leader(sync.job_id, sync.source_node_id)
-
-            return ContextLayerSyncAck(
-                job_id=sync.job_id,
-                layer_version=sync.layer_version,
-                applied=True,
-                responder_id=self._node_id.full,
-            ).dump()
-
-        except Exception as context_sync_error:
-            await self._udp_logger.log(
-                ServerError(
-                    message=f"Context layer sync failed: {context_sync_error}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return ContextLayerSyncAck(
-                job_id="unknown",
-                layer_version=-1,
-                applied=False,
-                responder_id=self._node_id.full,
-            ).dump()
 
     @tcp.receive()
     async def job_submission(
@@ -7935,384 +9657,975 @@ class ManagerServer(HealthAwareServer):
         submission: JobSubmission | None = None
         idempotency_key: IdempotencyKey | None = None
         idempotency_reserved = False
+        claimed_job_id: str | None = None
+        # The job this request created, until it is handed to dispatch: a
+        # failure before then takes it down again, so a refused submission
+        # leaves no job behind -- one a retry would be told was accepted.
+        unadmitted_job: JobInfo | None = None
 
         try:
-            # Rate limit check (AD-24)
-            client_id = f"{addr[0]}:{addr[1]}"
-            rate_limit_result = await self._rate_limiter.check_rate_limit(
-                client_id, "job_submit"
-            )
-            if not rate_limit_result.allowed:
-                return RateLimitResponse(
-                    operation="job_submit",
-                    retry_after_seconds=rate_limit_result.retry_after_seconds,
-                ).dump()
-
-            if self._load_shedder.should_shed_handler("job_submission"):
-                overload_state = self._load_shedder.get_current_state()
-                return JobAck(
-                    job_id="",
-                    accepted=False,
-                    error=f"System under load ({overload_state.value}), please retry later",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
+            if (refusal := await self._job_submission_load_refusal(addr)) is not None:
+                return refusal
 
             submission = JobSubmission.load(data)
+            negotiated_caps_str, idempotency_key, refusal = self._screen_job_submission(submission)
+            if refusal is not None:
+                return refusal
+            self._job_submissions_in_progress.add(submission.job_id)
+            claimed_job_id = submission.job_id
 
-            # Protocol version negotiation (AD-25)
-            client_version = ProtocolVersion(
-                major=getattr(submission, "protocol_version_major", 1),
-                minor=getattr(submission, "protocol_version_minor", 0),
+            idempotency_reserved, refusal = await self._admit_and_reserve_job_submission(
+                submission, idempotency_key
             )
+            if refusal is not None:
+                return refusal
 
-            negotiated_caps_str = self._version_skew.negotiate_with_client(
-                client_version, getattr(submission, "capabilities", "")
-            )
-            if negotiated_caps_str is None:
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=f"Incompatible protocol version: {client_version}",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            # AD-41: a job's own resource budget must be enforceable here
-            if (budget_error := self._resource_budget_rejection(submission)) is not None:
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=budget_error,
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            if submission.idempotency_key and self._idempotency_ledger is not None:
-                try:
-                    idempotency_key = IdempotencyKey.parse(submission.idempotency_key)
-                except ValueError as error:
-                    return JobAck(
-                        job_id=submission.job_id,
-                        accepted=False,
-                        error=str(error),
-                    ).dump()
-
-                existing_entry = self._idempotency_ledger.get_by_key(idempotency_key)
-                if existing_entry is not None:
-                    if existing_entry.result_serialized is not None:
-                        return existing_entry.result_serialized
-                    if existing_entry.status in (
-                        IdempotencyStatus.COMMITTED,
-                        IdempotencyStatus.REJECTED,
-                    ):
-                        return JobAck(
-                            job_id=submission.job_id,
-                            accepted=(
-                                existing_entry.status == IdempotencyStatus.COMMITTED
-                            ),
-                            error="Duplicate request"
-                            if existing_entry.status == IdempotencyStatus.REJECTED
-                            else None,
-                        ).dump()
-                    return JobAck(
-                        job_id=submission.job_id,
-                        accepted=False,
-                        error="Request pending, please retry",
-                    ).dump()
-
-            # Only active managers accept jobs
-            if self._manager_state.manager_state_enum != ManagerStateEnum.ACTIVE:
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=f"Manager is {self._manager_state.manager_state_enum.value}, not accepting jobs",
-                ).dump()
-
-            if self._is_clock_fenced():
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error="Manager clock fenced (offset beyond bound), not accepting jobs",
-                ).dump()
-
-            # Leader fencing: only DC leader accepts new jobs to prevent duplicates
-            # during multi-gate submit storms (FIX 2.5)
-            if not self.is_leader():
-                # Multi-source leader resolution — election state +
-                # peer heartbeats + last-known-leader scan. Returns
-                # ``None`` only when no peer has ever reported a
-                # leader, in which case the client treats the
-                # response as transient and round-robins.
-                leader_addr = self._resolve_dc_leader_addr()
-                leader_hint = (
-                    f"{leader_addr[0]}:{leader_addr[1]}" if leader_addr else "unknown"
-                )
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=f"Not DC leader, retry at leader: {leader_hint}",
-                    leader_addr=leader_addr,
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            # AD-3: leadership is not enough to accept writes. A node
-            # isolated from configured quorum may still have a locally
-            # valid leader lease for a short window, but accepting a
-            # new job in that state creates a partition-side write that
-            # cannot be safely replicated or fenced.
-            if not self._leadership.has_quorum():
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error="No quorum available; rejecting job submission",
-                    leader_addr=None,
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            # Capacity fencing: an ACTIVE leader with ZERO registered
-            # workers must reject, not accept-then-strand. Accepting
-            # without capacity guarantees the dispatch fails ~5s later
-            # (or strands to the AD-34 timeout) — the client's retry
-            # loop is BUILT for rejection-until-capacity ("the manager
-            # rejects submissions until it is leader with registered
-            # capacity"), so refusing here is the honest, retryable
-            # signal. Workers registered but busy is NOT a rejection:
-            # queueing behind busy capacity is legitimate.
-            if self._manager_state.get_worker_count() < 1:
-                return JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=(
-                        "No workers registered in this datacenter; "
-                        "rejecting job submission"
-                    ),
-                    leader_addr=None,
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            if idempotency_key is not None and self._idempotency_ledger is not None:
-                found, entry = await self._idempotency_ledger.check_or_reserve(
-                    idempotency_key,
-                    submission.job_id,
-                )
-                if found and entry is not None:
-                    if entry.result_serialized is not None:
-                        return entry.result_serialized
-                    if entry.status in (
-                        IdempotencyStatus.COMMITTED,
-                        IdempotencyStatus.REJECTED,
-                    ):
-                        return JobAck(
-                            job_id=submission.job_id,
-                            accepted=entry.status == IdempotencyStatus.COMMITTED,
-                            error="Duplicate request"
-                            if entry.status == IdempotencyStatus.REJECTED
-                            else None,
-                        ).dump()
-                    return JobAck(
-                        job_id=submission.job_id,
-                        accepted=False,
-                        error="Request pending, please retry",
-                    ).dump()
-                idempotency_reserved = True
-
-            # Unpickle workflows
-            workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(
-                submission.workflows
-            )
-
-            # Create job using JobManager
-            callback_addr = None
-            if submission.callback_addr:
-                callback_addr = (
-                    tuple(submission.callback_addr)
-                    if isinstance(submission.callback_addr, list)
-                    else submission.callback_addr
-                )
+            workflows = self._prepare_submission_workflows(submission)
+            callback_addr = self._submission_callback_address(submission)
+            await self._clear_refused_job_record(submission.job_id)
 
             job_info = await self._job_manager.create_job(
                 submission=submission,
                 callback_addr=callback_addr,
             )
+            if job_info.submission is not submission:
+                # The job arrived while this submission was being decided
+                # -- announced by a peer deciding the same job id. It is
+                # that peer's to decide: nothing here registers over it,
+                # and the retry is answered once it is decided. A key
+                # reserved here is released, or it would answer "in
+                # progress" until its reservation lapsed.
+                idempotency_reserved = await self._release_contested_idempotency_key(
+                    idempotency_reserved, idempotency_key
+                )
+                return self._contested_submission_ack(submission.job_id, job_info.leader_node_id)
+            unadmitted_job = job_info
 
-            job_info.leader_node_id = self._node_id.full
-            job_info.leader_addr = (self._host, self._tcp_port)
-            job_info.fencing_token = 1
+            await self._admit_submitted_job(job_info, submission, workflows, callback_addr, addr)
+            # Dispatch can reach workers from here: the job is admitted, and
+            # whatever happens next happens to a job that runs.
+            unadmitted_job = None
+            await self._dispatch_admitted_job(submission)
 
-            # Store submission for dispatch
-            self._manager_state.set_job_submission(submission.job_id, submission)
-            self._assign_resource_budget(submission)
-
-            # Start timeout tracking (AD-34)
-            timeout_strategy = self._select_timeout_strategy(submission)
-            await timeout_strategy.start_tracking(
-                job_id=submission.job_id,
-                timeout_seconds=submission.timeout_seconds,
-                gate_addr=tuple(submission.origin_gate_addr)
-                if submission.origin_gate_addr
-                else None,
+            return await self._accept_job_submission(
+                submission, negotiated_caps_str, idempotency_reserved, idempotency_key
             )
-            self._manager_state.set_job_timeout_strategy(
-                submission.job_id, timeout_strategy
-            )
-
-            self._leases.claim_job_leadership(
-                job_id=submission.job_id,
-                tcp_addr=(self._host, self._tcp_port),
-            )
-            self._leases.initialize_job_context(submission.job_id)
-            await self._raft.consensus.create_job_raft(submission.job_id)
-
-            # Store callbacks
-            if submission.callback_addr:
-                self._manager_state.set_job_callback(
-                    submission.job_id, submission.callback_addr
-                )
-                self._manager_state.set_progress_callback(
-                    submission.job_id, submission.callback_addr
-                )
-
-            if submission.origin_gate_addr:
-                self._manager_state.set_job_origin_gate(
-                    submission.job_id, submission.origin_gate_addr
-                )
-
-            await self._manager_state.increment_state_version()
-
-            # Broadcast job leadership to peers, including the
-            # client callback + origin gate addresses so any peer
-            # that later takes over leadership can push terminal-
-            # state notifications back to the originating client.
-            workflow_names = [wf.name for _, _, wf in workflows]
-            await self._broadcast_job_leadership(
-                submission.job_id,
-                len(workflows),
-                workflow_names,
-                callback_addr=submission.callback_addr,
-                origin_gate_addr=submission.origin_gate_addr,
-            )
-
-            if self._job_ledger is not None:
-                # Durable acceptance record (AD-38 REGIONAL: fsynced
-                # here, then committed in the job's Raft group). Written
-                # AFTER the leadership broadcast: peers create the job's
-                # group on the announcement, and a REGIONAL commit needs
-                # a majority of members to hold the group. A restart
-                # after this point recovers the job instead of
-                # forgetting it.
-                # The requestor contact is the client's CALLBACK
-                # listener when it registered one (where a restarted
-                # manager can reach it), else the submitting socket.
-                requestor_contact = (
-                    f"{callback_addr[0]}:{callback_addr[1]}"
-                    if callback_addr
-                    else f"{addr[0]}:{addr[1]}"
-                )
-                _ledger_job_id, create_result = (
-                    await self._job_ledger.create_job(
-                        spec_hash=hashlib.sha256(
-                            submission.workflows
-                        ).digest(),
-                        assigned_datacenters=(self._node_id.datacenter,),
-                        requestor_id=requestor_contact,
-                        durability=DurabilityLevel.REGIONAL,
-                        job_id=submission.job_id,
-                    )
-                )
-                # A shortfall means the record IS durable here and
-                # applied to ledger state, just not replicated: a
-                # durability warning, not a reason to abort acceptance
-                # of a job that exists.
-                await self._log_ledger_shortfall(
-                    "JobCreated", submission.job_id, create_result
-                )
-                await self._log_ledger_shortfall(
-                    "JobAccepted",
-                    submission.job_id,
-                    await self._job_ledger.accept_job(
-                        submission.job_id,
-                        datacenter_id=self._node_id.datacenter,
-                        worker_count=len(self._worker_pool.iter_workers()),
-                        durability=DurabilityLevel.REGIONAL,
-                    ),
-                )
-                # Persist the submission payload itself: the ledger
-                # records THAT the job exists; the payload is what a
-                # restarted manager needs to RESUME it rather than
-                # fail it. Crash between the two records degrades to
-                # the fail-loudly path — never silence.
-                await self._persist_submission_payload(submission)
-
-            # Dispatch workflows
-            await self._dispatch_job_workflows(submission, workflows)
-
-            ack_response = JobAck(
-                job_id=submission.job_id,
-                accepted=True,
-                queued_position=self._job_manager.job_count,
-                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                capabilities=negotiated_caps_str,
-            ).dump()
-
-            if (
-                idempotency_reserved
-                and idempotency_key is not None
-                and self._idempotency_ledger is not None
-            ):
-                await self._idempotency_ledger.commit(idempotency_key, ack_response)
-
-            return ack_response
 
         except Exception as error:
+            return await self._answer_failed_job_submission(
+                error, submission, unadmitted_job, idempotency_reserved, idempotency_key
+            )
+        finally:
+            if claimed_job_id is not None:
+                self._job_submissions_in_progress.discard(claimed_job_id)
+
+    async def _job_submission_load_refusal(self, addr: tuple[str, int]) -> bytes | None:
+        """
+        Refuse a submission this manager is too loaded to take, before it is parsed.
+
+        Returns the AD-24 rate-limit response when the submitting address is
+        over its job-submission rate, the overload refusal when the load
+        shedder sheds job submissions, and None when the submission may be
+        read.
+        """
+        client_id = f"{addr[0]}:{addr[1]}"
+        rate_limit_result = await self._rate_limiter.check_rate_limit(
+            client_id, "job_submit"
+        )
+        if not rate_limit_result.allowed:
+            return RateLimitResponse(
+                operation="job_submit",
+                retry_after_seconds=rate_limit_result.retry_after_seconds,
+            ).dump()
+
+        if self._load_shedder.should_shed_handler("job_submission"):
+            overload_state = self._load_shedder.get_current_state()
+            return JobAck(
+                job_id="",
+                accepted=False,
+                error=f"System under load ({overload_state.value}), please retry later",
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
+        return None
+
+    def _screen_job_submission(
+        self,
+        submission: JobSubmission,
+    ) -> tuple[str | None, IdempotencyKey | None, bytes | None]:
+        """
+        Screen a parsed submission before its job id is claimed.
+
+        Negotiates the protocol version (AD-25), checks the submission's own
+        contract, parses its idempotency key and looks for an answer already
+        decided for that key or job id. Returns the negotiated capabilities,
+        the parsed idempotency key, and the refusal or earlier answer to send
+        back -- None when the submission goes on to be decided here.
+        """
+        client_version = ProtocolVersion(
+            major=getattr(submission, "protocol_version_major", 1),
+            minor=getattr(submission, "protocol_version_minor", 0),
+        )
+        negotiated_caps_str = self._version_skew.negotiate_with_client(
+            client_version, getattr(submission, "capabilities", "")
+        )
+        if (
+            refusal := self._submission_contract_refusal(
+                submission, negotiated_caps_str, client_version
+            )
+        ) is not None:
+            return negotiated_caps_str, None, refusal
+
+        idempotency_key, refusal = self._parse_submission_idempotency_key(submission)
+        if refusal is not None:
+            return negotiated_caps_str, idempotency_key, refusal
+        return (
+            negotiated_caps_str,
+            idempotency_key,
+            self._existing_job_submission_answer(submission, negotiated_caps_str),
+        )
+
+    def _submission_contract_refusal(
+        self,
+        submission: JobSubmission,
+        negotiated_caps_str: str | None,
+        client_version: ProtocolVersion,
+    ) -> bytes | None:
+        """
+        Refuse a submission whose protocol version or resource budget this manager cannot honor.
+
+        Returns the refusal for a client version no capability set was
+        negotiated with, then for a job whose own resource budget (AD-41)
+        cannot be enforced here, and None when neither applies.
+        """
+        if negotiated_caps_str is None:
+            return JobAck(
+                job_id=submission.job_id,
+                accepted=False,
+                error=f"Incompatible protocol version: {client_version}",
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
+
+        if (budget_error := self._resource_budget_rejection(submission)) is not None:
+            return JobAck(
+                job_id=submission.job_id,
+                accepted=False,
+                error=budget_error,
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
+        return None
+
+    def _submission_carries_ledgered_idempotency_key(self, submission: JobSubmission):
+        """Whether a submission names an idempotency key and this manager keeps an idempotency ledger."""
+        return submission.idempotency_key and self._idempotency_ledger is not None
+
+    def _parse_submission_idempotency_key(
+        self,
+        submission: JobSubmission,
+    ) -> tuple[IdempotencyKey | None, bytes | None]:
+        """
+        Parse a submission's idempotency key and answer from the ledger when the key was seen before.
+
+        Returns (None, None) when the submission names no key or this manager
+        keeps no idempotency ledger, (None, refusal) when the key does not
+        parse, and otherwise the parsed key with the answer the ledger already
+        holds for it -- None when the key is new.
+        """
+        if not self._submission_carries_ledgered_idempotency_key(submission):
+            return None, None
+        try:
+            idempotency_key = IdempotencyKey.parse(submission.idempotency_key)
+        except ValueError as error:
+            return None, JobAck(
+                job_id=submission.job_id,
+                accepted=False,
+                error=str(error),
+            ).dump()
+        return idempotency_key, self._recorded_idempotency_answer(idempotency_key, submission.job_id)
+
+    def _recorded_idempotency_answer(
+        self,
+        idempotency_key: IdempotencyKey,
+        job_id: str,
+    ) -> bytes | None:
+        """Return the answer the idempotency ledger holds for a key, or None when the ledger has no entry for it."""
+        existing_entry = self._idempotency_ledger.get_by_key(idempotency_key)
+        if existing_entry is None:
+            return None
+        return self._duplicate_idempotency_answer(existing_entry, job_id)
+
+    def _duplicate_idempotency_answer(
+        self,
+        entry: IdempotencyLedgerEntry,
+        job_id: str,
+    ) -> bytes:
+        """
+        Answer a submission whose idempotency key the ledger already holds.
+
+        AD-40: an entry with a recorded answer is replayed -- the original
+        decision, for the original job, marked as a duplicate's answer. A
+        committed or rejected entry without one is answered from its status.
+        A pending entry is transient by the shared vocabulary: the attempt
+        holding the key is decided shortly. Worded otherwise, the gate took it
+        for a refusal and dispatched the job to another datacenter while this
+        one ran it.
+        """
+        if entry.result_serialized is not None:
+            original_ack = JobAck.load(entry.result_serialized)
+            original_ack.was_duplicate = True
+            original_ack.original_job_id = original_ack.job_id
+            return original_ack.dump()
+        if entry.status in (
+            IdempotencyStatus.COMMITTED,
+            IdempotencyStatus.REJECTED,
+        ):
+            return self._decided_idempotency_answer(entry, job_id)
+        return self._submission_in_progress_ack(job_id)
+
+    @staticmethod
+    def _decided_idempotency_answer(
+        entry: IdempotencyLedgerEntry,
+        job_id: str,
+    ) -> bytes:
+        """Answer a duplicate submission from a committed or rejected idempotency entry that recorded no answer."""
+        original_job_id = entry.job_id or job_id
+        return JobAck(
+            job_id=original_job_id,
+            accepted=entry.status == IdempotencyStatus.COMMITTED,
+            error="Duplicate request"
+            if entry.status == IdempotencyStatus.REJECTED
+            else None,
+            was_duplicate=True,
+            original_job_id=original_job_id,
+        ).dump()
+
+    @staticmethod
+    def _submission_in_progress_ack(job_id: str) -> bytes:
+        """The transient refusal telling a submitter its job id is still being decided, so it retries."""
+        return JobAck(
+            job_id=job_id,
+            accepted=False,
+            error="submission in progress, retry",
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+        ).dump()
+
+    def _accepted_submission_ack(self, job_id: str, negotiated_caps_str: str | None) -> bytes:
+        """The acceptance answer for a job id, queued behind the jobs this manager holds."""
+        return JobAck(
+            job_id=job_id,
+            accepted=True,
+            queued_position=self._job_manager.job_count,
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            capabilities=negotiated_caps_str,
+        ).dump()
+
+    def _existing_job_submission_answer(
+        self,
+        submission: JobSubmission,
+        negotiated_caps_str: str | None,
+    ) -> bytes | None:
+        """
+        Answer a submission for a job id this manager already knows, or return None for a new one.
+
+        A job id's submission is decided once, by one request at a time. A
+        retry -- its earlier attempt's answer was lost or late -- waits out an
+        attempt still being decided, and is answered from the job once there
+        is one: re-running the submission reset the job's fence, restarted
+        its timeout, re-recorded it in the ledger and registered its
+        workflows again over the ones running.
+        """
+        if submission.job_id in self._job_submissions_in_progress:
+            return self._submission_in_progress_ack(submission.job_id)
+        existing_job = self._job_manager.get_job_by_id(submission.job_id)
+        if self._is_admitted_job(existing_job):
+            return self._admitted_job_submission_answer(existing_job, submission, negotiated_caps_str)
+        return self._announced_job_submission_answer(existing_job, submission.job_id)
+
+    @staticmethod
+    def _is_admitted_job(job: JobInfo | None):
+        """Whether a job exists and was admitted -- its submission is held here or its workflows are known."""
+        return job is not None and (job.submission is not None or job.workflows)
+
+    def _admitted_job_submission_answer(
+        self,
+        existing_job: JobInfo,
+        submission: JobSubmission,
+        negotiated_caps_str: str | None,
+    ) -> bytes:
+        """
+        Answer a submission for a job that was already admitted.
+
+        An admitted job -- submitted here, or replicated here by the leader
+        that admitted it -- was accepted, whatever this manager's role now.
+        Its spec is compared where this manager has it (a job a peer leads is
+        known by id only): a different spec under the same id is refused.
+        """
+        if (
+            existing_job.submission is not None
+            and existing_job.submission.workflows != submission.workflows
+        ):
+            return JobAck(
+                job_id=submission.job_id,
+                accepted=False,
+                error=f"Job id {submission.job_id} is in use by another job",
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
+        return self._accepted_submission_ack(submission.job_id, negotiated_caps_str)
+
+    def _announced_job_submission_answer(
+        self,
+        existing_job: JobInfo | None,
+        job_id: str,
+    ) -> bytes | None:
+        """
+        Answer a submission for a job announced but not admitted, or return None.
+
+        The manager that announced it is still deciding it -- or died deciding
+        it, and its takeover settles it -- so the submitter retries. A job
+        that ended unadmitted was refused and is decided afresh, as is an
+        unknown job id.
+        """
+        if existing_job is not None and not JobStatusOrder().is_terminal(existing_job.status):
+            return self._submission_in_progress_ack(job_id)
+        return None
+
+    async def _admit_and_reserve_job_submission(
+        self,
+        submission: JobSubmission,
+        idempotency_key: IdempotencyKey | None,
+    ) -> tuple[bool, bytes | None]:
+        """
+        Refuse a claimed submission this manager may not admit, else reserve its idempotency key.
+
+        Returns (False, refusal) when the manager's role, the cluster or the
+        datacenter's capacity refuses the job, and otherwise the outcome of
+        reserving the idempotency key: whether it was reserved, and the
+        earlier answer to send back when the key was already held.
+        """
+        if (refusal := self._job_admission_refusal(submission.job_id)) is not None:
+            return False, refusal
+        return await self._reserve_submission_idempotency_key(idempotency_key, submission.job_id)
+
+    def _job_admission_refusal(self, job_id: str) -> bytes | None:
+        """
+        Refuse a new job this manager may not admit now, or return None when it may.
+
+        The checks run in order -- the manager's own state, its leadership and
+        quorum, the cluster's membership, then the datacenter's worker
+        capacity -- and the first refusal is the answer.
+        """
+        for admission_check in (
+            self._manager_state_admission_refusal,
+            self._leadership_admission_refusal,
+            self._cluster_admission_refusal,
+            self._capacity_admission_refusal,
+        ):
+            if (refusal := admission_check(job_id)) is not None:
+                return refusal
+        return None
+
+    def _manager_state_admission_refusal(self, job_id: str) -> bytes | None:
+        """Refuse a job when this manager is not ACTIVE or its clock is fenced; otherwise return None."""
+        # Only active managers accept jobs
+        if self._manager_state.manager_state_enum != ManagerStateEnum.ACTIVE:
+            return JobAck(
+                job_id=job_id,
+                accepted=False,
+                error=f"Manager is {self._manager_state.manager_state_enum.value}, not accepting jobs",
+            ).dump()
+
+        if self._is_clock_fenced():
+            return JobAck(
+                job_id=job_id,
+                accepted=False,
+                error="Manager clock fenced (offset beyond bound), not accepting jobs",
+            ).dump()
+        return None
+
+    def _leadership_admission_refusal(self, job_id: str) -> bytes | None:
+        """
+        Refuse a job when this manager is not the datacenter leader or lacks quorum; otherwise return None.
+
+        Leader fencing: only the DC leader accepts new jobs, to prevent
+        duplicates during multi-gate submit storms (FIX 2.5). AD-3:
+        leadership is not enough to accept writes. A node isolated from
+        configured quorum may still have a locally valid leader lease for a
+        short window, but accepting a new job in that state creates a
+        partition-side write that cannot be safely replicated or fenced.
+        """
+        if not self.is_leader():
+            return self._not_leader_submission_ack(job_id)
+
+        if not self._leadership.has_quorum():
+            return JobAck(
+                job_id=job_id,
+                accepted=False,
+                error="No quorum available; rejecting job submission",
+                leader_addr=None,
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
+        return None
+
+    def _not_leader_submission_ack(self, job_id: str) -> bytes:
+        """
+        Refuse a job at a follower, naming the datacenter leader to retry at.
+
+        Multi-source leader resolution -- election state, peer heartbeats and
+        a last-known-leader scan -- yields None only when no peer has ever
+        reported a leader, in which case the client treats the response as
+        transient and round-robins.
+        """
+        leader_addr = self._resolve_dc_leader_addr()
+        leader_hint = (
+            f"{leader_addr[0]}:{leader_addr[1]}" if leader_addr else "unknown"
+        )
+        return JobAck(
+            job_id=job_id,
+            accepted=False,
+            error=f"Not DC leader, retry at leader: {leader_hint}",
+            leader_addr=leader_addr,
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+        ).dump()
+
+    def _cluster_admission_refusal(self, job_id: str) -> bytes | None:
+        """
+        Refuse a job while the cluster's membership is unformed or read-only; otherwise return None.
+
+        AD-52: a job's Raft group is founded with the cluster's committed
+        members -- there are none until the cluster forms. AD-52 section 13:
+        an operator may put the cluster in read-only mode.
+        """
+        if not self._cluster_membership.formed:
+            return JobAck(
+                job_id=job_id,
+                accepted=False,
+                error="Cluster membership not formed yet; retry",
+                leader_addr=None,
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
+
+        if self._cluster_membership.read_only:
+            return JobAck(
+                job_id=job_id,
+                accepted=False,
+                error="Cluster is read-only: job submissions are refused",
+                leader_addr=None,
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
+        return None
+
+    def _capacity_admission_refusal(self, job_id: str) -> bytes | None:
+        """
+        Refuse a job when no worker is registered in this datacenter; otherwise return None.
+
+        Capacity fencing: an ACTIVE leader with ZERO registered workers must
+        reject, not accept-then-strand. Accepting without capacity guarantees
+        the dispatch fails ~5s later (or strands to the AD-34 timeout) -- the
+        client's retry loop is BUILT for rejection-until-capacity, so refusing
+        here is the honest, retryable signal. Workers registered but busy is
+        NOT a rejection: queueing behind busy capacity is legitimate.
+        """
+        if self._manager_state.get_worker_count() < 1:
+            return JobAck(
+                job_id=job_id,
+                accepted=False,
+                error=(
+                    "No workers registered in this datacenter; "
+                    "rejecting job submission"
+                ),
+                leader_addr=None,
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
+        return None
+
+    def _idempotency_ledger_tracks(self, idempotency_key: IdempotencyKey | None) -> bool:
+        """Whether there is an idempotency key and this manager keeps an idempotency ledger to record it in."""
+        return idempotency_key is not None and self._idempotency_ledger is not None
+
+    async def _reserve_submission_idempotency_key(
+        self,
+        idempotency_key: IdempotencyKey | None,
+        job_id: str,
+    ) -> tuple[bool, bytes | None]:
+        """
+        Reserve a submission's idempotency key in the ledger for the job id being decided.
+
+        Returns (False, None) when there is no key or no ledger to reserve it
+        in, (False, answer) when another attempt already holds the key, and
+        (True, None) once the key is reserved for this attempt.
+        """
+        if not self._idempotency_ledger_tracks(idempotency_key):
+            return False, None
+        found, entry = await self._idempotency_ledger.check_or_reserve(
+            idempotency_key,
+            job_id,
+        )
+        return self._idempotency_reservation_outcome(found, entry, job_id)
+
+    def _idempotency_reservation_outcome(
+        self,
+        found: bool,
+        entry: IdempotencyLedgerEntry | None,
+        job_id: str,
+    ) -> tuple[bool, bytes | None]:
+        """Turn the ledger's check-or-reserve result into (reserved, earlier answer to send back or None)."""
+        if found and entry is not None:
+            return False, self._duplicate_idempotency_answer(entry, job_id)
+        return True, None
+
+    def _prepare_submission_workflows(
+        self,
+        submission: JobSubmission,
+    ) -> list[tuple[str, list[str], Workflow]]:
+        """
+        Unpickle and validate a submission's workflows, and settle its timeout.
+
+        Before any job state exists, a job whose workflows cannot all run in
+        dependency order is refused with the reason (the validation raises).
+        A gate re-running a lost datacenter's unfinished share here (AD-36)
+        names it: those workflows and their ancestors run. A job submitted
+        without a timeout of its own (a gate fills it in for the jobs it
+        dispatches) has as long as its longest chain of dependent workflows
+        may take; the submission is updated with it.
+        """
+        workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(
+            submission.workflows
+        )
+        validate_workflow_dependencies(workflows)
+        if submission.rerun_workflow_ids:
+            workflows = select_rerun_workflows(
+                workflows, submission.rerun_workflow_ids
+            )
+        if submission.timeout_seconds <= 0.0:
+            submission.timeout_seconds = resolve_job_deadline_seconds(
+                workflows,
+                self.env.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            )
+        return workflows
+
+    @staticmethod
+    def _submission_callback_address(submission: JobSubmission):
+        """The submission's callback address as a tuple (a list off the wire becomes one), or None when it has none."""
+        if not submission.callback_addr:
+            return None
+        return (
+            tuple(submission.callback_addr)
+            if isinstance(submission.callback_addr, list)
+            else submission.callback_addr
+        )
+
+    async def _clear_refused_job_record(self, job_id: str) -> None:
+        """
+        Remove a refused submission's record so the submission decided now takes its place.
+
+        A refused submission's record -- announced, never admitted, ended --
+        holds the job id until the retention sweep.
+        """
+        if self._is_refused_job_record(self._job_manager.get_job_by_id(job_id)):
+            await self._cleanup_job_state(job_id)
+
+    @classmethod
+    def _is_refused_job_record(cls, record: JobInfo | None):
+        """Whether a job record exists and belongs to a refused submission: unadmitted and terminal."""
+        return record is not None and cls._is_unadmitted_terminal_job(record)
+
+    @staticmethod
+    def _is_unadmitted_terminal_job(record: JobInfo):
+        """Whether a job holds no submission and no workflows and has reached a terminal status."""
+        return (
+            record.submission is None
+            and not record.workflows
+            and JobStatusOrder().is_terminal(record.status)
+        )
+
+    async def _release_contested_idempotency_key(
+        self,
+        idempotency_reserved: bool,
+        idempotency_key: IdempotencyKey | None,
+    ) -> bool:
+        """
+        Release an idempotency key reserved for a submission whose job a peer is deciding.
+
+        Returns whether the key is still reserved: False once released, or
+        the reservation unchanged when there was nothing to release.
+        """
+        if not (idempotency_reserved and self._idempotency_ledger_tracks(idempotency_key)):
+            return idempotency_reserved
+        await self._idempotency_ledger.release(idempotency_key)
+        return False
+
+    @staticmethod
+    def _contested_submission_ack(job_id: str, leader_node_id: str | None) -> bytes:
+        """The transient refusal naming the manager deciding the same job id, so the submitter retries."""
+        return JobAck(
+            job_id=job_id,
+            accepted=False,
+            error=(
+                f"submission in progress at manager "
+                f"{leader_node_id}, retry"
+            ),
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+        ).dump()
+
+    async def _admit_submitted_job(
+        self,
+        job_info: JobInfo,
+        submission: JobSubmission,
+        workflows: list[tuple[str, list[str], Workflow]],
+        callback_addr: tuple[str, int] | None,
+        addr: tuple[str, int],
+    ) -> None:
+        """
+        Admit a created job: lead it, record it, announce it, and register its workflows.
+
+        Broadcasts job leadership to peers, including the client callback
+        and origin gate addresses, so any peer that later takes over
+        leadership can push terminal-state notifications back to the
+        originating client. The ledger records the job after that broadcast.
+        """
+        await self._start_submitted_job_tracking(job_info, submission)
+        self._record_submitted_job_contacts(submission)
+
+        await self._manager_state.increment_state_version()
+
+        workflow_names = [wf.name for _, _, wf in workflows]
+        await self._broadcast_job_leadership(
+            submission.job_id,
+            len(workflows),
+            workflow_names,
+            callback_addr=submission.callback_addr,
+            origin_gate_addr=submission.origin_gate_addr,
+        )
+
+        if self._job_ledger is not None:
+            await self._record_submitted_job_in_ledger(submission, callback_addr, addr)
+
+        await self._register_job_workflows(submission, workflows)
+
+    async def _start_submitted_job_tracking(
+        self,
+        job_info: JobInfo,
+        submission: JobSubmission,
+    ) -> None:
+        """
+        Make this manager the job's leader and start its timeout, lease and consensus group.
+
+        Stores the submission for dispatch, assigns its resource budget,
+        starts AD-34 timeout tracking, claims the job's leadership lease and
+        creates the job's Raft group with the managers live now -- every peer
+        joins it with these voters (AD-52).
+        """
+        job_info.leader_node_id = self._node_id.full
+        job_info.leader_addr = (self._host, self._tcp_port)
+        job_info.fencing_token = 1
+
+        self._manager_state.set_job_submission(submission.job_id, submission)
+        self._assign_resource_budget(submission)
+
+        timeout_strategy = self._select_timeout_strategy(submission)
+        await timeout_strategy.start_tracking(
+            job_id=submission.job_id,
+            timeout_seconds=submission.timeout_seconds,
+            gate_addr=tuple(submission.origin_gate_addr)
+            if submission.origin_gate_addr
+            else None,
+        )
+        self._manager_state.set_job_timeout_strategy(
+            submission.job_id, timeout_strategy
+        )
+
+        await self._leases.claim_job_leadership(
+            job_id=submission.job_id,
+            tcp_addr=(self._host, self._tcp_port),
+        )
+        await self._raft.consensus.create_job_raft(
+            submission.job_id, self._raft.consensus.current_members()
+        )
+
+    def _record_submitted_job_contacts(self, submission: JobSubmission) -> None:
+        """Store the submission's client callback (for job and progress pushes) and its origin gate, when given."""
+        if submission.callback_addr:
+            self._manager_state.set_job_callback(
+                submission.job_id, submission.callback_addr
+            )
+            self._manager_state.set_progress_callback(
+                submission.job_id, submission.callback_addr
+            )
+
+        if submission.origin_gate_addr:
+            self._manager_state.set_job_origin_gate(
+                submission.job_id, submission.origin_gate_addr
+            )
+
+    async def _record_submitted_job_in_ledger(
+        self,
+        submission: JobSubmission,
+        callback_addr: tuple[str, int] | None,
+        addr: tuple[str, int],
+    ) -> None:
+        """
+        Write the job's durable acceptance record and persist its submission payload.
+
+        AD-38 REGIONAL: fsynced here, then committed in the job's Raft group.
+        Written after the leadership broadcast: peers create the job's group
+        on the announcement, and a REGIONAL commit needs a majority of
+        members to hold the group. A restart after this point recovers the
+        job instead of forgetting it. The requestor contact is the client's
+        callback listener when it registered one (where a restarted manager
+        can reach it), else the submitting socket. A shortfall means the
+        record is durable here and applied to ledger state, just not
+        replicated: a durability warning, not a reason to abort acceptance of
+        a job that exists. The payload is what a restarted manager needs to
+        resume the job rather than fail it; a crash between the two records
+        degrades to the fail-loudly path, never silence.
+        """
+        requestor_contact = (
+            f"{callback_addr[0]}:{callback_addr[1]}"
+            if callback_addr
+            else f"{addr[0]}:{addr[1]}"
+        )
+        _ledger_job_id, create_result = (
+            await self._job_ledger.create_job(
+                spec_hash=hashlib.sha256(
+                    submission.workflows
+                ).digest(),
+                assigned_datacenters=(self._node_id.datacenter,),
+                requestor_id=requestor_contact,
+                durability=DurabilityLevel.REGIONAL,
+                job_id=submission.job_id,
+            )
+        )
+        await self._log_ledger_shortfall(
+            "JobCreated", submission.job_id, create_result
+        )
+        await self._log_ledger_shortfall(
+            "JobAccepted",
+            submission.job_id,
+            await self._job_ledger.accept_job(
+                submission.job_id,
+                datacenter_id=self._node_id.datacenter,
+                worker_count=len(self._worker_pool.iter_workers()),
+                durability=DurabilityLevel.REGIONAL,
+            ),
+        )
+        await self._persist_submission_payload(submission)
+
+    async def _dispatch_admitted_job(self, submission: JobSubmission) -> None:
+        """
+        Start dispatching an admitted job's workflows, logging a failure instead of refusing the job.
+
+        The job is admitted -- its workflows may be on workers -- and its
+        timeout (AD-34) bounds it whatever its dispatch did. Refused now, it
+        would be submitted elsewhere and run twice.
+        """
+        try:
+            await self._dispatch_job_workflows(submission)
+        except Exception as dispatch_error:
             await self._udp_logger.log(
                 ServerError(
                     message=(
-                        f"Job submission error: {type(error).__name__}: {error}\n"
-                        + "".join(traceback.format_exception(error))
+                        f"Starting the dispatch of admitted job "
+                        f"{submission.job_id} raised "
+                        f"{type(dispatch_error).__name__}: {dispatch_error}\n"
+                        + "".join(traceback.format_exception(dispatch_error))
                     ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
-            job_id = submission.job_id if submission is not None else "unknown"
-            error_ack = JobAck(
-                job_id=job_id,
-                accepted=False,
-                error=str(error),
-            ).dump()
-            if (
-                idempotency_reserved
-                and idempotency_key is not None
-                and self._idempotency_ledger is not None
-            ):
-                try:
-                    await self._idempotency_ledger.reject(
-                        idempotency_key, error_ack
-                    )
-                except Exception as reject_error:
-                    # The ledger write itself failing (disk full is the
-                    # canonical case) must not raise INSIDE this error
-                    # handler — that degrades the structured JobAck to
-                    # the transport's raw error bytes. Log it; the
-                    # client still gets the real rejection.
-                    await self._udp_logger.log(
-                        ServerError(
-                            message=(
-                                "Failed to record idempotency rejection "
-                                f"for {idempotency_key}: {reject_error}"
-                            ),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-            return error_ack
+
+    async def _accept_job_submission(
+        self,
+        submission: JobSubmission,
+        negotiated_caps_str: str | None,
+        idempotency_reserved: bool,
+        idempotency_key: IdempotencyKey | None,
+    ) -> bytes:
+        """Build the acceptance answer for an admitted job and commit it under the idempotency key reserved for it."""
+        ack_response = self._accepted_submission_ack(submission.job_id, negotiated_caps_str)
+        if idempotency_reserved and self._idempotency_ledger_tracks(idempotency_key):
+            await self._commit_idempotency_answer(idempotency_key, ack_response, submission.job_id)
+        return ack_response
+
+    async def _commit_idempotency_answer(
+        self,
+        idempotency_key: IdempotencyKey,
+        ack_response: bytes,
+        job_id: str,
+    ) -> None:
+        """
+        Record an accepted job's answer under its idempotency key, logging a disk failure.
+
+        The job runs, so the answer is that it was accepted. When the commit
+        fails, the key stays reserved: a retry carrying it is told the
+        submission is in progress until the reservation lapses, and then
+        finds the job.
+        """
+        try:
+            await self._idempotency_ledger.commit(idempotency_key, ack_response)
+        except OSError as commit_error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=(
+                        f"Job {job_id} was accepted, but its "
+                        f"idempotency key {idempotency_key} could not be "
+                        f"recorded: {commit_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _answer_failed_job_submission(
+        self,
+        error: Exception,
+        submission: JobSubmission | None,
+        unadmitted_job: JobInfo | None,
+        idempotency_reserved: bool,
+        idempotency_key: IdempotencyKey | None,
+    ) -> bytes:
+        """
+        Log a submission that raised, take down the job it created, and refuse it.
+
+        The refusal carries the error, and is recorded as the idempotency
+        key's rejection when this submission reserved the key.
+        """
+        await self._udp_logger.log(
+            ServerError(
+                message=(
+                    f"Job submission error: {type(error).__name__}: {error}\n"
+                    + "".join(traceback.format_exception(error))
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        if unadmitted_job is not None:
+            await self._take_down_unadmitted_job(unadmitted_job, error)
+        error_ack = self._failed_submission_ack(error, submission)
+        await self._record_failed_submission_rejection(idempotency_reserved, idempotency_key, error_ack)
+        return error_ack
+
+    async def _take_down_unadmitted_job(self, unadmitted_job: JobInfo, error: Exception) -> None:
+        """
+        Remove a job whose submission failed before dispatch from everywhere the submission put it.
+
+        Nothing of the job reached a worker, so a retry decides the job
+        afresh. A payload persisted to resume it goes BEFORE its ledger record
+        closes, so a restart in between fails it rather than resuming a job
+        its submitter was refused. The job's own state goes LAST, and
+        whatever the durable steps did: the record closes through the job's
+        consensus group, which the teardown destroys (a ledger write after it
+        re-created the group, to leak it), and peers that heard the
+        announcement hear it is terminal. A teardown failure is logged: raised
+        inside the submission's error handler, it would replace the refusal
+        with the transport's raw error bytes.
+        """
+        unadmitted_job.status = JobStatus.FAILED.value
+        try:
+            try:
+                await self._discard_persisted_submission(unadmitted_job.job_id)
+                if self._job_ledger is not None:
+                    await self._fail_unadmitted_job_in_ledger(unadmitted_job, error)
+            finally:
+                await self._cleanup_job_state(unadmitted_job.job_id)
+        except Exception as teardown_error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=(
+                        f"Taking down refused job {unadmitted_job.job_id} "
+                        f"failed: {type(teardown_error).__name__}: "
+                        f"{teardown_error}\n"
+                        + "".join(traceback.format_exception(teardown_error))
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _fail_unadmitted_job_in_ledger(self, unadmitted_job: JobInfo, error: Exception) -> None:
+        """Close the ledger record of a job whose submission failed before dispatch as failed, with the reason."""
+        await self._log_ledger_shortfall(
+            "JobFailed",
+            unadmitted_job.job_id,
+            await self._job_ledger.fail_job(
+                unadmitted_job.job_id,
+                error_message=(
+                    "its submission failed before dispatch: "
+                    f"{type(error).__name__}: {error}"
+                ),
+                failed_datacenter=self._node_id.datacenter,
+                total_completed=0,
+                total_failed=0,
+                duration_ms=0,
+                durability=DurabilityLevel.REGIONAL,
+            ),
+        )
+
+    @staticmethod
+    def _failed_submission_ack(error: Exception, submission: JobSubmission | None) -> bytes:
+        """The refusal for a submission that raised, carrying the error; its job id is "unknown" before it parsed."""
+        job_id = submission.job_id if submission is not None else "unknown"
+        return JobAck(
+            job_id=job_id,
+            accepted=False,
+            error=str(error),
+        ).dump()
+
+    async def _record_failed_submission_rejection(
+        self,
+        idempotency_reserved: bool,
+        idempotency_key: IdempotencyKey | None,
+        error_ack: bytes,
+    ) -> None:
+        """Record a failed submission's refusal under the idempotency key it reserved, when it reserved one."""
+        if idempotency_reserved and self._idempotency_ledger_tracks(idempotency_key):
+            await self._record_idempotency_rejection(idempotency_key, error_ack)
+
+    async def _record_idempotency_rejection(
+        self,
+        idempotency_key: IdempotencyKey,
+        error_ack: bytes,
+    ) -> None:
+        """
+        Record a refusal under its idempotency key, logging a ledger failure instead of raising it.
+
+        The ledger write itself failing (disk full is the canonical case)
+        must not raise inside the submission's error handler -- that degrades
+        the structured JobAck to the transport's raw error bytes. The client
+        still gets the real rejection.
+        """
+        try:
+            await self._idempotency_ledger.reject(
+                idempotency_key, error_ack
+            )
+        except Exception as reject_error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=(
+                        "Failed to record idempotency rejection "
+                        f"for {idempotency_key}: {reject_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     @tcp.receive()
     async def job_status(
@@ -8321,53 +10634,30 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ) -> bytes:
-        """Client status query — the gateless (L2) poll path.
+        """Client status query -- the gateless (L2) poll path -- at the
+        consistency the reader asks (AD-38 Part 8; a bare job id is an
+        EVENTUAL read, as older clients send).
 
-        Answers from live in-memory state first, then the durable
-        ledger (jobs recovered from a restart, terminal/archived
-        jobs), so a client polling after a manager restart reads the
-        truth instead of silence. Empty bytes = unknown job (the
-        client's poll treats that as no answer). Ledger-internal
-        statuses map onto the client vocabulary at this boundary.
+        Answers from live in-memory state first, then the durable ledger
+        (jobs recovered from a restart, terminal/archived jobs). EVENTUAL
+        reads, and any read of a terminal status (which never changes),
+        are answered from what this manager holds. Otherwise the job's
+        leader answers -- for STRONG, once a quorum of its peers accepted
+        its state again -- and a follower answers SESSION and
+        BOUNDED_STALENESS reads its leader's last sync satisfies, passing
+        the rest to the leader. Empty bytes = no answer (unknown job, or
+        none at the level asked): the client asks elsewhere.
         """
-        ledger_status_vocabulary = {
-            "pending": JobStatus.SUBMITTED.value,
-            "cancelling": JobStatus.RUNNING.value,
-        }
         try:
-            job_id = data.decode()
-
-            job = self._job_manager.get_job_by_id(job_id)
-            if job is not None:
-                total_completed, total_failed, overall_rate = (
-                    self._aggregate_job_progress(job)
-                )
-                return GlobalJobStatus(
-                    job_id=job_id,
-                    status=job.status,
-                    total_completed=total_completed,
-                    total_failed=total_failed,
-                    overall_rate=overall_rate,
-                    elapsed_seconds=job.elapsed_seconds(),
-                ).dump()
-
-            if self._job_ledger is not None:
-                job_state = self._job_ledger.get_job(job_id)
-                if job_state is None:
-                    job_state = await self._job_ledger.get_archived_job(
-                        job_id
-                    )
-                if job_state is not None:
-                    return GlobalJobStatus(
-                        job_id=job_id,
-                        status=ledger_status_vocabulary.get(
-                            job_state.status, job_state.status
-                        ),
-                        total_completed=job_state.completed_count,
-                        total_failed=job_state.failed_count,
-                    ).dump()
-
-            return b""
+            query = self._parse_job_status_query(data)
+            consistency = ReadConsistency(query.consistency)
+            job_id = query.job_id
+            local_status = await self._local_job_status(job_id)
+            if (
+                answer := await self._answer_job_status_locally(query, consistency, local_status)
+            ) is not None:
+                return answer
+            return await self._forward_job_status_query(query)
         except Exception as query_error:
             await self._udp_logger.log(
                 ServerWarning(
@@ -8378,6 +10668,216 @@ class ManagerServer(HealthAwareServer):
                 )
             )
             return b""
+
+    @staticmethod
+    def _parse_job_status_query(data: bytes) -> JobStatusQuery:
+        """
+        Read a job status query off the wire.
+
+        A pickled query begins with the pickle protocol marker; a bare job
+        id is text, and reads as an EVENTUAL query for that job.
+        """
+        return (
+            JobStatusQuery.load(data)
+            if data[:1] == b"\x80"
+            else JobStatusQuery(job_id=data.decode())
+        )
+
+    async def _answer_job_status_locally(
+        self,
+        query: JobStatusQuery,
+        consistency: ReadConsistency,
+        local_status: GlobalJobStatus | None,
+    ) -> bytes | None:
+        """
+        Answer a status query from what this manager holds, or return None to pass it to the job's leader.
+
+        A held EVENTUAL or terminal status answers as is; the job's leader
+        answers at any level; a follower answers from its leader's last
+        sync when that view satisfies the read.
+        """
+        if self._held_status_answers_read(local_status, consistency):
+            return local_status.dump()
+        if self._leases.is_job_leader(query.job_id):
+            return await self._answer_job_status_as_leader(query.job_id, consistency, local_status)
+        return self._answer_job_status_from_leader_view(query, consistency, local_status)
+
+    @staticmethod
+    def _held_status_answers_read(
+        local_status: GlobalJobStatus | None,
+        consistency: ReadConsistency,
+    ):
+        """Whether a held status answers the read as is: an EVENTUAL read, or a terminal status that never changes."""
+        return local_status is not None and (
+            consistency is ReadConsistency.EVENTUAL
+            or JobStatusOrder().is_terminal(local_status.status)
+        )
+
+    async def _answer_job_status_as_leader(
+        self,
+        job_id: str,
+        consistency: ReadConsistency,
+        local_status: GlobalJobStatus | None,
+    ) -> bytes:
+        """
+        Answer a status query as the job's leader, stamped with its fence token and view time.
+
+        Empty bytes when this manager holds no status, or when a STRONG read
+        could not be confirmed by a quorum.
+        """
+        if local_status is None:
+            return b""
+        if await self._strong_read_unconfirmed(job_id, consistency):
+            return b""
+        local_status.fence_token = self._leases.get_fence_token(job_id)
+        local_status.view_time = self._clock.monotonic()
+        return local_status.dump()
+
+    async def _strong_read_unconfirmed(self, job_id: str, consistency: ReadConsistency) -> bool:
+        """
+        Whether a STRONG read fails to re-replicate the job's state to a quorum.
+
+        STRONG: this manager is still the job's leader by a quorum's word --
+        its peers accept a sync only from the current fenced leader -- and
+        the state answered is now held by that quorum. Other levels need no
+        confirmation.
+        """
+        return consistency is ReadConsistency.STRONG and not await self._sync_job_state_to_peers(
+            job_id, self._job_manager.get_job_by_id(job_id), require_quorum=True
+        )
+
+    def _answer_job_status_from_leader_view(
+        self,
+        query: JobStatusQuery,
+        consistency: ReadConsistency,
+        local_status: GlobalJobStatus | None,
+    ) -> bytes | None:
+        """Answer a follower's status query from its leader's last sync, or return None when it holds neither."""
+        if local_status is None:
+            return None
+        if (leader_view := self._manager_state.get_job_leader_view(query.job_id)) is None:
+            return None
+        return self._answer_from_leader_view(query, consistency, local_status, leader_view)
+
+    def _answer_from_leader_view(
+        self,
+        query: JobStatusQuery,
+        consistency: ReadConsistency,
+        local_status: GlobalJobStatus,
+        leader_view: tuple[int, float, float],
+    ) -> bytes | None:
+        """
+        Answer a SESSION or BOUNDED_STALENESS read the leader's last sync satisfies, else return None.
+
+        The view's age is at most the time since it arrived plus the longest
+        a sync takes to arrive (its send timeout).
+        """
+        view_fence_token, view_time, received_at = leader_view
+        view_age_bound = (
+            self._clock.monotonic() - received_at + self._config.tcp_timeout_short_seconds
+        )
+        if not self._leader_view_satisfies_read(
+            query, consistency, (view_fence_token, view_time), view_age_bound
+        ):
+            return None
+        local_status.fence_token = view_fence_token
+        local_status.view_time = view_time
+        return local_status.dump()
+
+    @classmethod
+    def _leader_view_satisfies_read(
+        cls,
+        query: JobStatusQuery,
+        consistency: ReadConsistency,
+        view_position: tuple[int, float],
+        view_age_bound: float,
+    ) -> bool:
+        """Whether a leader's view satisfies a SESSION read's observed position or a BOUNDED_STALENESS read's bound."""
+        return cls._session_read_satisfied(
+            query, consistency, view_position
+        ) or cls._bounded_staleness_read_satisfied(query, consistency, view_age_bound)
+
+    @staticmethod
+    def _session_read_satisfied(
+        query: JobStatusQuery,
+        consistency: ReadConsistency,
+        view_position: tuple[int, float],
+    ) -> bool:
+        """Whether a SESSION read's leader view is at or past the fence token and view time the reader observed."""
+        return consistency is ReadConsistency.SESSION and view_position >= (
+            query.observed_fence_token,
+            query.observed_view_time,
+        )
+
+    @staticmethod
+    def _bounded_staleness_read_satisfied(
+        query: JobStatusQuery,
+        consistency: ReadConsistency,
+        view_age_bound: float,
+    ) -> bool:
+        """Whether a BOUNDED_STALENESS read's leader view is no older than the reader allows."""
+        return (
+            consistency is ReadConsistency.BOUNDED_STALENESS
+            and view_age_bound <= query.max_staleness_seconds
+        )
+
+    async def _forward_job_status_query(self, query: JobStatusQuery) -> bytes:
+        """
+        Pass a status query to the job's leader once, returning its answer.
+
+        Empty bytes when the query was already forwarded, the leader is
+        unknown or is this manager, or the leader's answer is not bytes.
+        """
+        leader_addr = self._manager_state.get_job_leader_addr(query.job_id)
+        if self._job_status_query_unforwardable(query, leader_addr):
+            return b""
+        query.forwarded = True
+        response, _clock = await self.send_tcp(
+            tuple(leader_addr),
+            "job_status",
+            query.dump(),
+            timeout=self._config.tcp_timeout_standard_seconds,
+        )
+        return response if isinstance(response, bytes) else b""
+
+    def _job_status_query_unforwardable(
+        self,
+        query: JobStatusQuery,
+        leader_addr: tuple[str, int] | None,
+    ):
+        """Whether a status query was already forwarded, or its job's leader is unknown or is this manager."""
+        return query.forwarded or leader_addr is None or tuple(leader_addr) == (self._host, self._tcp_port)
+
+    async def _local_job_status(self, job_id: str) -> GlobalJobStatus | None:
+        """``job_id``'s status as this manager holds it: its live state, or
+        its durable ledger record (a job recovered from a restart, or
+        terminal and archived); None when it holds neither. Ledger-internal
+        statuses map onto the client vocabulary here."""
+        job = self._job_manager.get_job_by_id(job_id)
+        if job is not None:
+            total_completed, total_failed, overall_rate = self._aggregate_job_progress(job)
+            return GlobalJobStatus(
+                job_id=job_id,
+                status=job.status,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                overall_rate=overall_rate,
+                elapsed_seconds=job.elapsed_seconds(),
+            )
+        if self._job_ledger is None:
+            return None
+        if (job_state := self._job_ledger.get_job(job_id)) is None:
+            job_state = await self._job_ledger.get_archived_job(job_id)
+        # A record this manager relinquished is not its to answer from: the
+        # job's leader is another manager.
+        if job_state is None or job_state.status == JOB_RELINQUISHED_STATUS:
+            return None
+        return GlobalJobStatus(
+            job_id=job_id,
+            status=_LEDGER_STATUS_VOCABULARY.get(job_state.status, job_state.status),
+            total_completed=job_state.completed_count,
+            total_failed=job_state.failed_count,
+        )
 
     @tcp.receive()
     async def job_global_timeout(
@@ -8428,79 +10928,12 @@ class ManagerServer(HealthAwareServer):
             return b""
 
     @tcp.receive()
-    async def provision_request(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ) -> bytes:
-        """Handle provision request from leader for quorum."""
-        try:
-            request = ProvisionRequest.load(data)
-
-            # Check if we can confirm
-            worker = self._worker_pool.get_worker(request.target_worker)
-            can_confirm = (
-                worker is not None
-                and self._worker_pool.is_worker_healthy(request.target_worker)
-                and (worker.available_cores - worker.reserved_cores)
-                >= request.cores_required
-            )
-
-            return ProvisionConfirm(
-                job_id=request.job_id,
-                workflow_id=request.workflow_id,
-                confirming_node=self._node_id.full,
-                confirmed=can_confirm,
-                version=self._manager_state.state_version,
-                error=None if can_confirm else "Worker not available",
-            ).dump()
-
-        except Exception as error:
-            return ProvisionConfirm(
-                job_id="unknown",
-                workflow_id="unknown",
-                confirming_node=self._node_id.full,
-                confirmed=False,
-                version=self._manager_state.state_version,
-                error=str(error),
-            ).dump()
-
-    @tcp.receive()
-    async def provision_commit(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ) -> bytes:
-        """Handle provision commit from leader."""
-        try:
-            ProvisionCommit.load(data)  # Validate message format
-            await self._manager_state.increment_state_version()
-            return b"ok"
-
-        except Exception as error:
-            await self._udp_logger.log(
-                ServerError(
-                    message=f"Provision commit error: {error}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return b"error"
-
-    @tcp.receive()
     async def workflow_cancellation_query(self, addr: tuple[str, int], data: bytes, clock_time: int) -> bytes:
         return await self._cancellation.handle_workflow_cancellation_query(addr, data, clock_time)
 
     @tcp.receive()
     async def receive_cancel_single_workflow(self, addr: tuple[str, int], data: bytes, clock_time: int) -> bytes:
         return await self._cancellation.handle_cancel_single_workflow(addr, data, clock_time)
-
-    @tcp.receive()
-    async def receive_workflow_cancellation_peer_notification(self, addr: tuple[str, int], data: bytes, clock_time: int) -> bytes:
-        return await self._cancellation.handle_workflow_cancellation_peer_notification(addr, data, clock_time)
 
     @tcp.receive()
     async def job_leadership_announcement(
@@ -8546,11 +10979,22 @@ class ManagerServer(HealthAwareServer):
                     announcement.job_id, tuple(announcement.origin_gate_addr)
                 )
 
-            # Initialize context for this job
-            self._manager_state.get_or_create_job_context(announcement.job_id)
-
-            self._manager_state.setdefault_job_layer_version(announcement.job_id, 0)
-            await self._raft.consensus.create_job_raft(announcement.job_id)
+            if announcement.raft_voters:
+                await self._raft.consensus.create_job_raft(
+                    announcement.job_id, frozenset(announcement.raft_voters)
+                )
+            else:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Leadership announcement of job {announcement.job_id} names "
+                            "no Raft voters: its group is joined when the job's sync does"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
             # Track remote job
             await self._job_manager.track_remote_job(
@@ -8580,39 +11024,22 @@ class ManagerServer(HealthAwareServer):
         self,
         sync_msg: JobStateSyncMessage,
         source_addr: tuple[str, int],
+        *,
+        sender_leads_job: bool,
     ) -> JobInfo:
-        """Apply peer-replicated executable job state to the local manager."""
-        leader_addr = (
-            tuple(sync_msg.leader_addr)
-            if sync_msg.leader_addr is not None
-            else source_addr
-        )
-        leader_id = sync_msg.leader_id
-        fencing_token = sync_msg.fencing_token
-        current_fencing_token = self._leases.get_fence_token(sync_msg.job_id)
-        current_leader_id = self._leases.get_job_leader(sync_msg.job_id)
-        current_leader_addr = self._manager_state.get_job_leader_addr(sync_msg.job_id)
-        if (
-            current_leader_id is not None
-            and current_leader_addr is not None
-            and current_fencing_token > sync_msg.fencing_token
-        ):
-            leader_id = current_leader_id
-            leader_addr = tuple(current_leader_addr)
-            fencing_token = current_fencing_token
+        """Apply peer-replicated executable job state to the local manager.
 
-        callback_addr = (
-            tuple(sync_msg.callback_addr)
-            if sync_msg.callback_addr is not None
-            else None
-        )
+        ``sender_leads_job``: the message is the job leader's own view (a
+        sync or a takeover claim from it), not a peer's copy of the job.
+        """
+        leader_id, leader_addr, fencing_token = self._job_sync_leadership(sync_msg, source_addr)
+        callback_addr = self._job_sync_callback_addr(sync_msg)
 
         accepted = self._leases.apply_job_leadership(
             job_id=sync_msg.job_id,
             leader_id=leader_id,
             leader_addr=leader_addr,
             fencing_token=fencing_token,
-            layer_version=sync_msg.layer_version,
         )
         if not accepted:
             raise RuntimeError(
@@ -8620,7 +11047,14 @@ class ManagerServer(HealthAwareServer):
                 f"from leader {sync_msg.leader_id} at fence {sync_msg.fencing_token}"
             )
 
+        # This manager's own job only moves forward on a peer's view of
+        # it; a follower mirrors its fenced leader (AD-54) -- the leader
+        # alone. A peer's copy is evidence of how far the job got, merged
+        # forward: mirrored, a peer that missed the leader's last syncs
+        # regressed the job here, and a workflow the leader saw finish ran
+        # again once this manager took the job over.
         job = await self._job_manager.hydrate_remote_job_state(
+            merge_forward_only=self._job_sync_merges_forward_only(sync_msg.job_id, sender_leads_job),
             job_id=sync_msg.job_id,
             leader_node_id=leader_id,
             leader_addr=leader_addr,
@@ -8638,26 +11072,145 @@ class ManagerServer(HealthAwareServer):
             replace_existing=sync_msg.replace_existing,
         )
 
-        # Members that learn a live job by state sync rather than the
-        # leadership announcement (e.g. after a restart) join its Raft
-        # group here; RPCs no longer create groups on arrival. A terminal
-        # job takes no further ledger entries, so its group goes now
-        # rather than heartbeating until the retention sweep.
-        if JobStatusOrder().is_terminal(job.status):
-            await self._raft.consensus.destroy_job_raft(sync_msg.job_id)
-        else:
-            await self._raft.consensus.create_job_raft(sync_msg.job_id)
-
-        if sync_msg.context_snapshot and sync_msg.layer_version >= job.layer_version:
-            async with job.lock:
-                for workflow_name, values in sync_msg.context_snapshot.items():
-                    await job.context.from_dict(workflow_name, values)
-                job.layer_version = sync_msg.layer_version
+        await self._reconcile_job_raft_group_after_sync(sync_msg, job)
+        await self._apply_job_sync_context(sync_msg, job)
 
         self._leases.update_fence_token_if_higher(
             sync_msg.job_id, fencing_token
         )
+        if sender_leads_job:
+            self._manager_state.record_job_leader_view(
+                sync_msg.job_id, sync_msg.fencing_token, sync_msg.timestamp, self._clock.monotonic()
+            )
 
+        self._record_job_sync_contacts(sync_msg, callback_addr)
+
+        return job
+
+    def _job_sync_leadership(
+        self,
+        sync_msg: JobStateSyncMessage,
+        source_addr: tuple[str, int],
+    ) -> tuple[str, tuple[str, int], int]:
+        """
+        The leader id, leader address and fencing token a job state sync is applied under.
+
+        The sync's own leadership (its leader address defaulting to the
+        sender's) -- unless this manager already holds a newer fenced
+        leadership for the job, which is kept.
+        """
+        leader_addr = (
+            tuple(sync_msg.leader_addr)
+            if sync_msg.leader_addr is not None
+            else source_addr
+        )
+        current_fencing_token = self._leases.get_fence_token(sync_msg.job_id)
+        current_leader_id = self._leases.get_job_leader(sync_msg.job_id)
+        current_leader_addr = self._manager_state.get_job_leader_addr(sync_msg.job_id)
+        if self._holds_newer_job_leadership(
+            current_leader_id,
+            current_leader_addr,
+            current_fencing_token,
+            sync_msg.fencing_token,
+        ):
+            return current_leader_id, tuple(current_leader_addr), current_fencing_token
+        return sync_msg.leader_id, leader_addr, sync_msg.fencing_token
+
+    @staticmethod
+    def _holds_newer_job_leadership(
+        current_leader_id: str | None,
+        current_leader_addr: tuple[str, int] | None,
+        current_fencing_token: int,
+        synced_fencing_token: int,
+    ) -> bool:
+        """Whether a known leader at a known address holds the job at a fence above the synced one."""
+        return (
+            current_leader_id is not None
+            and current_leader_addr is not None
+            and current_fencing_token > synced_fencing_token
+        )
+
+    @staticmethod
+    def _job_sync_callback_addr(sync_msg: JobStateSyncMessage) -> tuple[str, int] | None:
+        """The client callback address a job state sync carries, as a tuple, or None."""
+        return (
+            tuple(sync_msg.callback_addr)
+            if sync_msg.callback_addr is not None
+            else None
+        )
+
+    def _job_sync_merges_forward_only(self, job_id: str, sender_leads_job: bool) -> bool:
+        """Whether a sync only moves the job forward: this manager leads the job, or the sender does not."""
+        return self._leases.is_job_leader(job_id) or not sender_leads_job
+
+    async def _reconcile_job_raft_group_after_sync(
+        self,
+        sync_msg: JobStateSyncMessage,
+        job: JobInfo,
+    ) -> None:
+        """
+        Destroy a terminal synced job's Raft group, or join a live one's.
+
+        Members that learn a live job by state sync rather than the
+        leadership announcement (e.g. after a restart) join its Raft group
+        here; RPCs no longer create groups on arrival. A terminal job takes
+        no further ledger entries, so its group goes now rather than
+        heartbeating until the retention sweep.
+        """
+        if JobStatusOrder().is_terminal(job.status):
+            await self._raft.consensus.destroy_job_raft(sync_msg.job_id)
+            return
+        await self._join_synced_job_raft_group(sync_msg)
+
+    async def _join_synced_job_raft_group(self, sync_msg: JobStateSyncMessage) -> None:
+        """
+        Join a live synced job's Raft group with the voters the sync names.
+
+        With the voters every member of the group has (AD-52). A sync naming
+        none, for a job whose group this manager does not hold, is logged:
+        its sender holds no group for it, so none is joined here.
+        """
+        if sync_msg.raft_voters:
+            await self._raft.consensus.create_job_raft(
+                sync_msg.job_id, frozenset(sync_msg.raft_voters)
+            )
+        elif self._raft.consensus.get_node(sync_msg.job_id) is None:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Sync of live job {sync_msg.job_id} names no Raft voters: "
+                        "its sender holds no group for it, so none is joined here"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _apply_job_sync_context(
+        self,
+        sync_msg: JobStateSyncMessage,
+        job: JobInfo,
+    ) -> None:
+        """Load a sync's context snapshot into the job under its lock when the sync's layer is not older."""
+        if not self._sync_carries_current_context(sync_msg, job):
+            return
+        async with job.lock:
+            for workflow_name, values in sync_msg.context_snapshot.items():
+                await job.context.from_dict(workflow_name, values)
+            job.layer_version = sync_msg.layer_version
+
+    @staticmethod
+    def _sync_carries_current_context(sync_msg: JobStateSyncMessage, job: JobInfo):
+        """Whether a sync carries a context snapshot at a layer version at or above the job's."""
+        return sync_msg.context_snapshot and sync_msg.layer_version >= job.layer_version
+
+    def _record_job_sync_contacts(
+        self,
+        sync_msg: JobStateSyncMessage,
+        callback_addr: tuple[str, int] | None,
+    ) -> None:
+        """Store the client callback (for job and progress pushes) and the origin gate a sync carries, when given."""
         if callback_addr is not None:
             self._manager_state.set_job_callback(sync_msg.job_id, callback_addr)
             self._manager_state.set_progress_callback(sync_msg.job_id, callback_addr)
@@ -8666,8 +11219,6 @@ class ManagerServer(HealthAwareServer):
             self._manager_state.set_job_origin_gate(
                 sync_msg.job_id, tuple(sync_msg.origin_gate_addr)
             )
-
-        return job
 
     @tcp.receive()
     async def job_state_sync(
@@ -8684,23 +11235,15 @@ class ManagerServer(HealthAwareServer):
             current_leader = self._leases.get_job_leader(sync_msg.job_id)
             current_fencing_token = self._leases.get_fence_token(sync_msg.job_id)
             if (
-                current_leader
-                and current_leader != sync_msg.leader_id
-                and sync_msg.fencing_token <= current_fencing_token
-            ):
-                return JobStateSyncAck(
-                    job_id=sync_msg.job_id,
-                    responder_id=self._node_id.full,
-                    accepted=False,
-                ).dump()
+                refusal := await self._job_state_sync_refusal(
+                    sync_msg, current_leader, current_fencing_token
+                )
+            ) is not None:
+                return refusal
 
-            await self._apply_job_state_sync_message(sync_msg, addr)
+            await self._apply_job_state_sync_message(sync_msg, addr, sender_leads_job=True)
 
-            return JobStateSyncAck(
-                job_id=sync_msg.job_id,
-                responder_id=self._node_id.full,
-                accepted=True,
-            ).dump()
+            return self._job_state_sync_ack(sync_msg.job_id, True)
 
         except Exception as error:
             await self._udp_logger.log(
@@ -8712,6 +11255,79 @@ class ManagerServer(HealthAwareServer):
                 )
             )
             return b"error"
+
+    async def _job_state_sync_refusal(
+        self,
+        sync_msg: JobStateSyncMessage,
+        current_leader: str | None,
+        current_fencing_token: int,
+    ) -> bytes | None:
+        """
+        Refuse a job state sync from a sender that does not lead the job here; else return None.
+
+        A sync from another leader at a fence no newer than the current one
+        is stale. A sync from another leader at a newer fence is a takeover
+        claim, refused when the job ended or its consensus group has not
+        settled here.
+        """
+        if self._is_stale_job_state_sync(sync_msg, current_leader, current_fencing_token):
+            return self._job_state_sync_ack(sync_msg.job_id, False)
+        if self._is_job_takeover_claim(sync_msg, current_leader):
+            return await self._job_takeover_claim_refusal(sync_msg, current_leader)
+        return None
+
+    @staticmethod
+    def _is_job_takeover_claim(sync_msg: JobStateSyncMessage, current_leader: str | None):
+        """Whether a sync names a different leader than the one this manager knows for the job."""
+        return current_leader and current_leader != sync_msg.leader_id
+
+    @classmethod
+    def _is_stale_job_state_sync(
+        cls,
+        sync_msg: JobStateSyncMessage,
+        current_leader: str | None,
+        current_fencing_token: int,
+    ):
+        """Whether a sync names a different leader at a fence no newer than the job's current one."""
+        return (
+            cls._is_job_takeover_claim(sync_msg, current_leader)
+            and sync_msg.fencing_token <= current_fencing_token
+        )
+
+    async def _job_takeover_claim_refusal(
+        self,
+        sync_msg: JobStateSyncMessage,
+        current_leader: str,
+    ) -> bytes | None:
+        """
+        Refuse a takeover claim for a job that ended or whose consensus group has not settled; else None.
+
+        A job this member knows ended -- its copy is terminal, or the job's
+        replicated ledger records its end -- is not taken over: its leader
+        died after finishing it, and the claimant missed the end; a live
+        copy here is ended with the replicated status. Nor is one whose
+        consensus group has not settled on its dead leader's last entries
+        here (no new group leader yet, or an entry held unapplied): an end
+        may be among them. A REGIONAL end is on a majority, so the members
+        refusing here keep any claimant short of quorum.
+        """
+        status_order = JobStatusOrder()
+        job = self._job_manager.get_job_by_id(sync_msg.job_id)
+        replicated_state = self._ledger_replica.job_state(sync_msg.job_id)
+        if self._job_group_unsettled(sync_msg.job_id, current_leader):
+            return self._job_state_sync_ack(sync_msg.job_id, False)
+        if self._job_ended(replicated_state, job, status_order):
+            await self._settle_ended_job_copy(sync_msg.job_id, job, replicated_state, status_order)
+            return self._job_state_sync_ack(sync_msg.job_id, False)
+        return None
+
+    def _job_state_sync_ack(self, job_id: str, accepted: bool) -> bytes:
+        """This manager's answer to a job state sync, accepting or refusing it."""
+        return JobStateSyncAck(
+            job_id=job_id,
+            responder_id=self._node_id.full,
+            accepted=accepted,
+        ).dump()
 
     @tcp.receive()
     async def job_leader_gate_transfer(
@@ -8972,20 +11588,28 @@ class ManagerServer(HealthAwareServer):
             fence_token=self._leases.get_fence_token(job_id),
             callback_addr=callback_addr,
             origin_gate_addr=origin_gate_addr,
+            raft_voters=(
+                sorted(job_group.initial_voters)
+                if (job_group := self._raft.consensus.get_node(job_id)) is not None
+                else []
+            ),
         )
 
         # Snapshot before iterating — the loop body awaits send_tcp,
         # so a concurrent peer-death handler removing from the live
         # set would otherwise raise ``Set changed size during
         # iteration`` mid-broadcast.
-        for peer_addr in list(self._manager_state.get_active_manager_peers()):
+        for peer_addr in sorted(self._manager_state.get_active_manager_peers()):
             try:
-                await self.send_tcp(
+                announcement_reply, _ = await self.send_tcp(
                     peer_addr,
                     "job_leadership_announcement",
                     announcement.dump(),
-                    timeout=2.0,
+                    timeout=self._config.tcp_timeout_short_seconds,
                 )
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(announcement_reply, Exception):
+                    raise announcement_reply
             except Exception as announcement_error:
                 await self._udp_logger.log(
                     ServerWarning(
@@ -8996,38 +11620,48 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
-    async def _dispatch_job_workflows(
+    async def _register_job_workflows(
         self,
         submission: JobSubmission,
         workflows: list[tuple[str, list[str], Workflow]],
     ) -> None:
-        """Dispatch workflows respecting dependencies."""
+        """Register the job's workflows and replicate the job to a quorum
+        of managers: everything its dispatch needs, with nothing sent to a
+        worker yet."""
         if self._workflow_dispatcher:
             registered = await self._workflow_dispatcher.register_workflows(
                 submission,
                 workflows,
             )
-            if registered:
-                job = self._job_manager.get_job_by_id(submission.job_id)
-                if job is None:
-                    raise RuntimeError(
-                        f"Registered workflows for missing job {submission.job_id}"
-                    )
-                replicated = await self._sync_job_state_to_peers(
-                    submission.job_id,
-                    job,
-                    require_quorum=True,
+            if not registered:
+                raise RuntimeError(
+                    f"Could not register the workflows of job {submission.job_id}"
                 )
-                if not replicated:
-                    raise RuntimeError(
-                        f"Could not quorum-replicate job {submission.job_id} before dispatch"
-                    )
-                await self._workflow_dispatcher.start_job_dispatch(
-                    submission.job_id, submission
+
+            job = self._job_manager.get_job_by_id(submission.job_id)
+            if job is None:
+                raise RuntimeError(
+                    f"Registered workflows for missing job {submission.job_id}"
                 )
-                await self._workflow_dispatcher.try_dispatch(
-                    submission.job_id, submission
+            replicated = await self._sync_job_state_to_peers(
+                submission.job_id,
+                job,
+                require_quorum=True,
+            )
+            if not replicated:
+                raise RuntimeError(
+                    f"Could not quorum-replicate job {submission.job_id} before dispatch"
                 )
+
+    async def _dispatch_job_workflows(self, submission: JobSubmission) -> None:
+        """Dispatch the job's registered workflows, respecting dependencies."""
+        if self._workflow_dispatcher:
+            await self._workflow_dispatcher.start_job_dispatch(
+                submission.job_id, submission
+            )
+            await self._workflow_dispatcher.try_dispatch(
+                submission.job_id, submission
+            )
 
         # NOTE: ``get_job`` expects a token string, not a bare job_id;
         # the previous code passed ``submission.job_id`` and got
@@ -9081,7 +11715,7 @@ class ManagerServer(HealthAwareServer):
             memory_mb=0,
         )
 
-        self._registry.register_worker(registration)
+        await self._registry.register_worker(registration)
 
         self._worker_pool.register_worker(
             worker_id=worker_id,
@@ -9095,31 +11729,6 @@ class ManagerServer(HealthAwareServer):
         """Check if this manager is the leader for a job."""
         leader_id = self._leases.get_job_leader(job_id)
         return leader_id == self._node_id.full
-
-    async def _apply_context_updates(
-        self,
-        job_id: str,
-        workflow_id: str,
-        updates_bytes: bytes,
-        timestamps_bytes: bytes,
-    ) -> None:
-        """Apply context updates from workflow completion."""
-        context = self._manager_state.get_or_create_job_context(job_id)
-
-        updates = cloudpickle.loads(updates_bytes)
-        timestamps = cloudpickle.loads(timestamps_bytes) if timestamps_bytes else {}
-
-        for key, value in updates.items():
-            timestamp = timestamps.get(
-                key, await self._manager_state.increment_context_lamport_clock()
-            )
-            await context.update(
-                workflow_id,
-                key,
-                value,
-                timestamp=timestamp,
-                source_node=self._node_id.full,
-            )
 
     def _get_healthy_managers(self) -> list[ManagerInfo]:
         """Get list of healthy managers including self."""
@@ -9187,24 +11796,23 @@ class ManagerServer(HealthAwareServer):
                 )
             )
 
-    async def _resume_recovered_job(self, submission: JobSubmission) -> None:
+    async def _resume_recovered_job(
+        self, submission: JobSubmission, elapsed_seconds: float
+    ) -> None:
         """Re-activate a recovered ACTIVE job from its persisted
         submission — the tail of the submit handler, minus quorum and
-        idempotency (both settled when the job was first accepted).
+        idempotency (both settled when the job was first accepted). It
+        has what is left of its budget: ``elapsed_seconds`` of it passed
+        since it was first accepted.
 
         Workflow execution is AT-LEAST-ONCE across a manager restart: a
         worker may still be running the pre-restart dispatch while this
         re-dispatch runs fresh. The client-facing outcome stays
         exactly-once (the ledger refuses a second terminal transition).
         """
-        workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(
-            submission.workflows
-        )
-        callback_addr = (
-            tuple(submission.callback_addr)
-            if submission.callback_addr
-            else None
-        )
+        workflows = self._recovered_submission_workflows(submission)
+        remaining_timeout_seconds = submission.timeout_seconds - elapsed_seconds
+        callback_addr = self._recovered_callback_address(submission)
 
         job_info = await self._job_manager.create_job(
             submission=submission,
@@ -9217,36 +11825,19 @@ class ManagerServer(HealthAwareServer):
         self._manager_state.set_job_submission(submission.job_id, submission)
         self._assign_resource_budget(submission)
 
-        timeout_strategy = self._select_timeout_strategy(submission)
-        await timeout_strategy.start_tracking(
-            job_id=submission.job_id,
-            timeout_seconds=submission.timeout_seconds,
-            gate_addr=tuple(submission.origin_gate_addr)
-            if submission.origin_gate_addr
-            else None,
-        )
-        self._manager_state.set_job_timeout_strategy(
-            submission.job_id, timeout_strategy
-        )
+        await self._start_recovered_job_timeout(submission, remaining_timeout_seconds)
 
-        self._leases.claim_job_leadership(
+        await self._leases.claim_job_leadership(
             job_id=submission.job_id,
             tcp_addr=(self._host, self._tcp_port),
         )
-        self._leases.initialize_job_context(submission.job_id)
-        await self._raft.consensus.create_job_raft(submission.job_id)
+        # No peer holds the job (its recovery asked them): its group is new,
+        # with the managers live now.
+        await self._raft.consensus.create_job_raft(
+            submission.job_id, self._raft.consensus.current_members()
+        )
 
-        if submission.callback_addr:
-            self._manager_state.set_job_callback(
-                submission.job_id, submission.callback_addr
-            )
-            self._manager_state.set_progress_callback(
-                submission.job_id, submission.callback_addr
-            )
-        if submission.origin_gate_addr:
-            self._manager_state.set_job_origin_gate(
-                submission.job_id, submission.origin_gate_addr
-            )
+        self._record_submitted_job_contacts(submission)
 
         await self._manager_state.increment_state_version()
 
@@ -9261,76 +11852,382 @@ class ManagerServer(HealthAwareServer):
 
         # The dispatcher queues when no worker is registered yet (the
         # late-joiner path) and dispatches as workers re-register.
-        await self._dispatch_job_workflows(submission, workflows)
+        await self._register_job_workflows(submission, workflows)
+        await self._dispatch_job_workflows(submission)
+
+    def _recovered_submission_workflows(
+        self,
+        submission: JobSubmission,
+    ) -> list[tuple[str, list[str], Workflow]]:
+        """
+        Unpickle a recovered submission's workflows and settle its timeout.
+
+        Only the workflows a re-run names, and their ancestors, run; a
+        submission without a timeout of its own gets as long as its longest
+        chain of dependent workflows may take.
+        """
+        workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(
+            submission.workflows
+        )
+        if submission.rerun_workflow_ids:
+            workflows = select_rerun_workflows(workflows, submission.rerun_workflow_ids)
+        if submission.timeout_seconds <= 0.0:
+            submission.timeout_seconds = resolve_job_deadline_seconds(
+                workflows,
+                self.env.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            )
+        return workflows
+
+    @staticmethod
+    def _recovered_callback_address(submission: JobSubmission) -> tuple[str, int] | None:
+        """A recovered submission's callback address as a tuple, or None when it has none."""
+        return (
+            tuple(submission.callback_addr)
+            if submission.callback_addr
+            else None
+        )
+
+    async def _start_recovered_job_timeout(
+        self,
+        submission: JobSubmission,
+        remaining_timeout_seconds: float,
+    ) -> None:
+        """
+        Start a resumed job's timeout tracking with what is left of its budget.
+
+        Restarted from zero, a job resumed after each restart ran past its
+        budget. One timeout check of grace when the budget ran out
+        meanwhile: a completion already on its way wins.
+        """
+        timeout_strategy = self._select_timeout_strategy(submission)
+        await timeout_strategy.start_tracking(
+            job_id=submission.job_id,
+            timeout_seconds=(
+                remaining_timeout_seconds
+                if remaining_timeout_seconds > 0.0
+                else self._config.job_timeout_check_interval_seconds
+            ),
+            gate_addr=tuple(submission.origin_gate_addr)
+            if submission.origin_gate_addr
+            else None,
+        )
+        self._manager_state.set_job_timeout_strategy(
+            submission.job_id, timeout_strategy
+        )
 
     async def _fail_recovered_active_jobs(self) -> None:
         """Restart handling for jobs recovered ACTIVE from the WAL.
 
-        Jobs with a persisted submission payload RESUME: the job
+        Each job is first asked about across the datacenter. A peer
+        holding it -- live, or ended -- has it from a takeover while this
+        manager was down: its leader is another manager now, and this
+        manager's record of it is relinquished. Resuming it ran it twice
+        under two leaders; failing it told its requestor it failed while
+        it ran on.
+
+        A job a quorum of the datacenter knows nowhere died with this
+        manager. With a persisted submission payload it RESUMES: the job
         re-activates under the same job id and re-dispatches (workflow
-        execution is at-least-once across the restart; the client
-        outcome stays exactly-once). Jobs without a payload — or whose
-        resume fails — transition to FAILED durably, and the client's
+        execution is at-least-once across the restart; the client outcome
+        stays exactly-once). Without a payload -- or when its resume
+        fails -- it transitions to FAILED durably, and the client's
         recorded callback contact gets a best-effort final push; the
-        durable record lands FIRST, so a missed notification still
-        leaves status queries truthful.
+        durable record lands FIRST, so a missed notification still leaves
+        status queries truthful.
+
+        A job no quorum could be heard on (a partition at boot) is asked
+        about again every peer-sync interval until it is settled.
         """
         if self._job_ledger is None:
             return
 
-        recovered_active = dict(self._job_ledger.get_all_jobs())
-        for job_id, job_state in recovered_active.items():
-            if await self._try_resume_recovered_job(job_id):
-                continue
-            await self._log_ledger_shortfall(
-                "JobFailed",
-                job_id,
-                await self._job_ledger.fail_job(
-                    job_id,
-                    error_message=(
-                        "manager restarted and the job could not be resumed "
-                        "(no persisted submission, or its resume failed)"
-                    ),
-                    failed_datacenter=self._node_id.datacenter,
-                    total_completed=job_state.completed_count,
-                    total_failed=job_state.failed_count,
-                    duration_ms=0,
-                    durability=DurabilityLevel.REGIONAL,
-                ),
+        undecided_job_ids = await self._settle_recovered_jobs_once()
+
+        if undecided_job_ids:
+            self._task_runner.run(
+                self._settle_undecided_recovered_jobs,
+                undecided_job_ids,
+                alias="settle_recovered_jobs",
             )
-            await self._discard_persisted_submission(job_id)
+
+    async def _settle_recovered_jobs_once(self) -> list[str]:
+        """Try to settle every job the ledger recovered ACTIVE; returns the ids of those left undecided."""
+        undecided_job_ids: list[str] = []
+        for job_id, job_state in dict(self._job_ledger.get_all_jobs()).items():
+            if not await self._settle_recovered_job(job_id, job_state):
+                undecided_job_ids.append(job_id)
+        return undecided_job_ids
+
+    async def _settle_undecided_recovered_jobs(self, job_ids: list[str]) -> None:
+        """Ask about the recovered jobs not yet settled until each is
+        settled or this manager stops: the moment the cluster's membership
+        forms, while it has not; every peer-sync interval while no quorum
+        of the datacenter is heard on them."""
+        undecided_job_ids = job_ids
+        while undecided_job_ids and self._running:
+            await self._wait_for_recovered_job_settle_turn()
+            undecided_job_ids = await self._settle_still_undecided_jobs(undecided_job_ids)
+
+    async def _wait_for_recovered_job_settle_turn(self) -> None:
+        """Wait a peer-sync interval once the cluster's membership formed, else until it forms."""
+        if self._cluster_membership.formed:
+            await self._clock.sleep(self._config.peer_job_sync_interval_seconds)
+        else:
+            await self._cluster_membership.wait_formed()
+
+    async def _settle_still_undecided_jobs(self, undecided_job_ids: list[str]) -> list[str]:
+        """Try again to settle each undecided recovered job; returns the ids still undecided."""
+        recovered_active = self._job_ledger.get_all_jobs()
+        still_undecided_job_ids: list[str] = []
+        for job_id in undecided_job_ids:
+            if await self._recovered_job_still_undecided(job_id, recovered_active):
+                still_undecided_job_ids.append(job_id)
+        return still_undecided_job_ids
+
+    async def _recovered_job_still_undecided(
+        self,
+        job_id: str,
+        recovered_active: dict[str, JobState],
+    ) -> bool:
+        """Whether a job the ledger still holds as recovered could not be settled this time."""
+        return (
+            job_state := recovered_active.get(job_id)
+        ) is not None and not await self._settle_recovered_job(job_id, job_state)
+
+    async def _settle_recovered_job(self, job_id: str, job_state: JobState) -> bool:
+        """Settle one job this manager's ledger recovered ACTIVE (see
+        ``_fail_recovered_active_jobs``); False when no quorum of the
+        datacenter could be heard on it, to be asked about again."""
+        if self._held_job_submitted_since_restart(job_id):
+            # Submitted here since the restart: the record is that job's.
+            return True
+
+        peer_addresses, answers = await self._ask_peers_about_recovered_job(job_id)
+        if (verdict := await self._recovered_job_peer_verdict(job_id, peer_addresses, answers)) is not None:
+            return verdict
+
+        await self._resume_or_fail_recovered_job(job_id, job_state)
+        return True
+
+    def _held_job_submitted_since_restart(self, job_id: str) -> bool:
+        """Whether this manager holds the job with a submission: it was submitted here since the restart."""
+        return (
+            held_job := self._job_manager.get_job_by_id(job_id)
+        ) is not None and held_job.submission is not None
+
+    async def _ask_peers_about_recovered_job(
+        self,
+        job_id: str,
+    ) -> tuple[list[tuple[str, int]], list[bytes | None]]:
+        """
+        Ask every active manager peer, concurrently, for a recovered job's status.
+
+        Returns the peers asked, in sorted order, and each one's answer: None
+        for a peer whose ask failed, else the bytes it answered (empty when
+        it does not hold the job).
+        """
+        peer_addresses = sorted(self._manager_state.get_active_manager_peers())
+
+        async def ask(peer_address: tuple[str, int]) -> bytes | None:
+            answer = await self._send_to_peer(
+                peer_address,
+                "job_status",
+                job_id.encode(),
+                timeout=self._config.tcp_timeout_short_seconds,
+            )
+            return None if isinstance(answer, Exception) else answer
+
+        answers = await asyncio.gather(*(ask(peer_address) for peer_address in peer_addresses))
+        return peer_addresses, answers
+
+    async def _recovered_job_peer_verdict(
+        self,
+        job_id: str,
+        peer_addresses: list[tuple[str, int]],
+        answers: list[bytes | None],
+    ) -> bool | None:
+        """
+        Settle a recovered job from its peers' answers, or return None when this manager decides it.
+
+        Returns True once a job a peer holds is relinquished, False when the
+        job is to be asked about again, and None when this manager is to
+        resume or fail it.
+        """
+        if holders := self._recovered_job_holders(peer_addresses, answers):
+            await self._relinquish_recovered_job(job_id, holders[0])
+            return True
+        if not await self._recovered_job_decidable_here(job_id, answers):
+            return False
+        return None
+
+    @staticmethod
+    def _recovered_job_holders(
+        peer_addresses: list[tuple[str, int]],
+        answers: list[bytes | None],
+    ) -> list[tuple[str, int]]:
+        """The peers whose answer shows they hold the recovered job."""
+        return [
+            peer_address for peer_address, answer in zip(peer_addresses, answers) if answer
+        ]
+
+    async def _relinquish_recovered_job(self, job_id: str, holder: tuple[str, int]) -> None:
+        """Relinquish a recovered job a peer holds: close its record here, discard its payload, and log it."""
+        await self._log_ledger_shortfall(
+            "JobRelinquished",
+            job_id,
+            await self._job_ledger.relinquish_job(
+                job_id, held_by=f"{holder[0]}:{holder[1]}"
+            ),
+        )
+        await self._discard_persisted_submission(job_id)
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    f"Recovered job {job_id} is held by manager "
+                    f"{holder[0]}:{holder[1]}: relinquished, "
+                    "not resumed"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _recovered_job_decidable_here(
+        self,
+        job_id: str,
+        answers: list[bytes | None],
+    ) -> bool:
+        """
+        Whether this manager may decide a recovered job no peer holds now.
+
+        Not while no quorum of the datacenter answered. Nor, for a job that
+        can be resumed, while the cluster's membership has not formed: it
+        resumes from its persisted submission into a Raft group founded with
+        the cluster's committed members, so it is asked about again once the
+        cluster has formed. One that cannot be resumed fails durably now --
+        that needs no membership.
+        """
+        if self._recovered_job_lacks_quorum(answers):
+            return False
+        return not await self._recovered_job_awaits_membership(job_id)
+
+    def _recovered_job_lacks_quorum(self, answers: list[bytes | None]) -> bool:
+        """Whether this manager and the peers that answered fall short of the datacenter's quorum."""
+        return sum(answer is not None for answer in answers) + 1 < self._leadership.get_quorum_size()
+
+    async def _recovered_job_awaits_membership(self, job_id: str) -> bool:
+        """Whether a recovered job has a persisted submission to resume from while the cluster has not formed."""
+        return (
+            self._config.wal_data_dir is not None
+            and not self._cluster_membership.formed
+            and await self._storage_filesystem.exists(
+                self._config.wal_data_dir / "submissions" / f"{job_id}.bin"
+            )
+        )
+
+    async def _resume_or_fail_recovered_job(self, job_id: str, job_state: JobState) -> None:
+        """Resume a recovered job no peer holds, or fail it durably when it cannot be resumed."""
+        resumed, left_behind = await self._try_resume_recovered_job(job_id, job_state)
+        if resumed:
+            return
+        await self._fail_recovered_job(job_id, job_state, left_behind)
+
+    async def _fail_recovered_job(
+        self,
+        job_id: str,
+        job_state: JobState,
+        left_behind: JobInfo | None,
+    ) -> None:
+        """
+        Fail a recovered job that could not be resumed, and tell its requestor.
+
+        The durable record closes first, then its payload goes, then what a
+        failed resume built, and the requestor gets a best-effort push.
+        """
+        await self._log_ledger_shortfall(
+            "JobFailed",
+            job_id,
+            await self._job_ledger.fail_job(
+                job_id,
+                error_message=(
+                    "manager restarted and the job could not be resumed "
+                    "(no persisted submission, or its resume failed)"
+                ),
+                failed_datacenter=self._node_id.datacenter,
+                total_completed=job_state.completed_count,
+                total_failed=job_state.failed_count,
+                duration_ms=0,
+                durability=DurabilityLevel.REGIONAL,
+            ),
+        )
+        await self._discard_persisted_submission(job_id)
+        if left_behind is not None:
+            await self._take_down_failed_resume(job_id, left_behind)
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    f"Recovered job {job_id} failed on restart: in-flight "
+                    "state was lost with the previous process"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        await self._notify_requestor_of_restart_failure(job_id, job_state.requestor_id)
+
+    async def _take_down_failed_resume(self, job_id: str, left_behind: JobInfo) -> None:
+        """
+        Remove what a failed resume built, after the job's record closed.
+
+        It goes through the job's consensus group, which this destroys: left
+        here, it would run on -- or time out -- under its FAILED record. A
+        teardown failure is logged: raised here, it would end recovery for
+        every job after this one.
+        """
+        left_behind.status = JobStatus.FAILED.value
+        try:
+            await self._cleanup_job_state(job_id)
+        except Exception as teardown_error:
             await self._udp_logger.log(
-                ServerInfo(
+                ServerError(
                     message=(
-                        f"Recovered job {job_id} failed on restart: "
-                        "in-flight state was lost with the previous "
-                        "process"
+                        f"Taking down failed resume of job {job_id} "
+                        f"failed: {type(teardown_error).__name__}: "
+                        f"{teardown_error}"
                     ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
-            await self._notify_requestor_of_restart_failure(
-                job_id, job_state.requestor_id
-            )
 
-    async def _try_resume_recovered_job(self, job_id: str) -> bool:
-        """Attempt payload-based resume; returns False to fall through
-        to the durable-FAIL path (payload missing or resume raised)."""
+    async def _try_resume_recovered_job(
+        self, job_id: str, job_state: JobState
+    ) -> tuple[bool, JobInfo | None]:
+        """Attempt payload-based resume. Not resumed (payload missing, or
+        the resume raised) falls through to the durable-FAIL path, with
+        the job a failed resume left behind -- one it created, not one a
+        peer's announcement brought -- for that path to take down."""
         if self._config.wal_data_dir is None:
-            return False
+            return False, None
         submission_path = (
             self._config.wal_data_dir / "submissions" / f"{job_id}.bin"
         )
         if not await self._storage_filesystem.exists(submission_path):
-            return False
+            return False, None
 
+        submission: JobSubmission | None = None
         try:
             submission = JobSubmission.load(
                 await self._storage_filesystem.read_bytes(submission_path)
             )
-            await self._resume_recovered_job(submission)
+            await self._resume_recovered_job(
+                submission,
+                # Since the job was first accepted: its record's creation.
+                max((self._hlc.now().wall_ms - job_state.created_hlc.wall_ms) / 1000.0, 0.0),
+            )
         except Exception as resume_error:
             await self._udp_logger.log(
                 ServerError(
@@ -9344,7 +12241,14 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return False
+            resumed_job = self._job_manager.get_job_by_id(job_id)
+            return False, (
+                resumed_job
+                if submission is not None
+                and resumed_job is not None
+                and resumed_job.submission is submission
+                else None
+            )
 
         await self._udp_logger.log(
             ServerInfo(
@@ -9357,7 +12261,7 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-        return True
+        return True, None
 
     async def _notify_requestor_of_restart_failure(
         self,
@@ -9377,12 +12281,15 @@ class ManagerServer(HealthAwareServer):
             is_final=True,
         )
         try:
-            await self.send_tcp(
+            push_reply, _ = await self.send_tcp(
                 (host, int(port_text)),
                 "job_status_push",
                 push.dump(),
-                timeout=5.0,
+                timeout=self._config.tcp_timeout_standard_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(push_reply, Exception):
+                raise push_reply
         except Exception as send_error:
             await self._udp_logger.log(
                 ServerWarning(
@@ -9398,14 +12305,21 @@ class ManagerServer(HealthAwareServer):
             )
 
     async def _handle_job_completion(self, job_id: str) -> None:
-        """Handle job completion with notification and cleanup."""
+        """Handle job completion with notification and cleanup -- once.
+
+        Completion triggers can race (two workflows finishing together each
+        find the job complete). The first completes it; another that finds
+        it already completing, or already gone, has nothing to do: a second
+        completion re-sent every result and, once the job was dropped,
+        announced a bare COMPLETED -- even for a failed job.
+        """
         job = self._job_manager.get_job_by_id(job_id)
         if not job:
-            return await self._send_job_completion_to_gate(
-                job_id, JobStatus.COMPLETED.value, [], [], 0, 0, 0.0
-            )
+            return
 
         async with job.lock:
+            if job.status == JobStatus.COMPLETED.value:
+                return
             job.status = JobStatus.COMPLETED.value
             job.completed_at = self._clock.time()
             elapsed_seconds = job.elapsed_seconds()
@@ -9428,6 +12342,19 @@ class ManagerServer(HealthAwareServer):
                     duration_ms=int(elapsed_seconds * 1000),
                 )
                 await self._discard_persisted_submission(job_id)
+
+        # A client that submitted directly gets every workflow's results
+        # ahead of the terminal status: result pushes still in flight (or
+        # lost) cannot leave its view of the job incomplete.
+        await self._send_final_result_to_client(
+            job_id,
+            final_status,
+            workflow_results,
+            errors,
+            total_completed,
+            total_failed,
+            elapsed_seconds,
+        )
 
         # Tier-1 terminal push to whoever registered the job callback.
         # The gate path below covers L3 deployments; without this push,
@@ -9454,6 +12381,54 @@ class ManagerServer(HealthAwareServer):
             total_failed,
             elapsed_seconds,
         )
+
+    async def _send_final_result_to_client(
+        self,
+        job_id: str,
+        final_status: str,
+        workflow_results: list[WorkflowResult],
+        errors: list[str],
+        total_completed: int,
+        total_failed: int,
+        elapsed_seconds: float,
+    ) -> None:
+        """Send a directly submitted job's final result -- every workflow's
+        results -- to its client. A gate-routed job's client gets the
+        gate's global result instead."""
+        callback_addr = self._get_job_callback_addr(job_id)
+        if callback_addr is None or self._manager_state.get_job_origin_gate(job_id):
+            return
+
+        final_result = JobFinalResult(
+            job_id=job_id,
+            datacenter=self._node_id.datacenter,
+            status=final_status,
+            workflow_results=workflow_results,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            errors=errors,
+            elapsed_seconds=elapsed_seconds,
+            fence_token=self._leases.get_fence_token(job_id),
+            **self._data_plane_provenance(job_id),
+        )
+        response = await self._send_to_client(
+            tuple(callback_addr),
+            "receive_job_final_result",
+            final_result.dump(),
+            timeout=self._config.tcp_timeout_standard_seconds,
+        )
+        if isinstance(response, Exception) or response not in (b"ok", None):
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Final result for job {job_id[:8]}... was not taken by "
+                        f"client {callback_addr}: {response!r}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _log_ledger_shortfall(
         self,
@@ -9646,7 +12621,7 @@ class ManagerServer(HealthAwareServer):
             # acks. One un-retried send here turned completed work into
             # a client-observed timeout whenever a partition covered
             # the completion instant.
-            self._register_completion_notice_obligation(
+            await self._register_completion_notice_obligation(
                 job_id, origin_gate_addr, final_result_payload
             )
 
@@ -9674,7 +12649,7 @@ class ManagerServer(HealthAwareServer):
                 origin_gate_addr,
                 "job_final_result",
                 final_result_payload,
-                timeout=5.0,
+                timeout=self._config.tcp_timeout_standard_seconds,
             )
             if isinstance(response, Exception):
                 raise response
@@ -9702,7 +12677,7 @@ class ManagerServer(HealthAwareServer):
             )
             return False
 
-    def _register_completion_notice_obligation(
+    async def _register_completion_notice_obligation(
         self,
         job_id: str,
         origin_gate_addr: tuple[str, int],
@@ -9720,8 +12695,7 @@ class ManagerServer(HealthAwareServer):
         if len(self._completion_notice_obligations) > 256:
             evicted_job_id = next(iter(self._completion_notice_obligations))
             del self._completion_notice_obligations[evicted_job_id]
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerError(
                     message=(
                         "Completion-notice obligation map overflow — "
@@ -9734,7 +12708,7 @@ class ManagerServer(HealthAwareServer):
                 ),
             )
 
-    def _resend_completion_notices(self, now: float) -> None:
+    async def _resend_completion_notices(self, now: float) -> None:
         """Re-send owed completion notices on capped exponential
         backoff (same reap-loop cadence as eviction notices). Age-
         expired obligations are dropped LOUDLY — the gate's own AD-34
@@ -9748,8 +12722,7 @@ class ManagerServer(HealthAwareServer):
         ):
             if obligation.expired(now, max_age):
                 del self._completion_notice_obligations[job_id]
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerError(
                         message=(
                             f"Completion notice for {job_id[:8]}... to gate "
@@ -9793,19 +12766,35 @@ class ManagerServer(HealthAwareServer):
             )
 
     async def _cleanup_job_state(self, job_id: str) -> None:
-        # Tell peers the job is terminal BEFORE dropping it: the periodic
-        # peer sync only covers jobs this manager still holds, so without
-        # this followers kept the job non-terminal forever -- never
-        # eligible for their retention sweep, its Raft group never
-        # destroyed, and a takeover candidate for a finished job.
-        if (job := self._job_manager.get_job_by_id(job_id)) is not None:
+        # The one teardown of a job this manager drops -- at its completion
+        # and at the retention sweep alike -- so nothing kept for the job
+        # outlives it on either path.
+        #
+        # The job's leader tells peers the job is terminal BEFORE dropping
+        # it: the periodic peer sync only covers jobs this manager still
+        # holds, so without this followers kept the job non-terminal
+        # forever -- never eligible for their retention sweep, its Raft
+        # group never destroyed, and a takeover candidate for a finished
+        # job. A follower dropping its copy has nothing to announce.
+        if (
+            self._leases.is_job_leader(job_id)
+            and (job := self._job_manager.get_job_by_id(job_id)) is not None
+        ):
             await self._sync_job_state_to_peers(job_id, job)
         self._leases.clear_job_leases(job_id)
         self._worker_health_monitor.cleanup_job_progress(job_id)
         self._worker_health_monitor.clear_job_suspicions(job_id)
         self._manager_state.clear_job_state(job_id)
-        job_token = self._job_manager.create_job_token(job_id)
-        await self._job_manager.remove_job(job_token)
+        await self._job_manager.remove_job(job_id)
+        # The dispatcher's per-job state goes with the job: the retention
+        # sweep that also cleans it walks the JobManager's jobs, and this
+        # job just left them, so its queue entries, retry budget and
+        # dispatch loop were otherwise held for the process's lifetime.
+        if self._workflow_dispatcher is not None:
+            await self._workflow_dispatcher.cleanup_job(job_id)
+        # A dispatch no report ever showed here (its result went to
+        # another manager) leaves its reservation with the job.
+        await self._worker_pool.release_job_reservations(job_id)
         await self._raft.consensus.destroy_job_raft(job_id)
         if self._resource_enforcer is not None:
             self._resource_enforcer.release_job(job_id)
@@ -9897,6 +12886,140 @@ class ManagerServer(HealthAwareServer):
         """Handle incoming Raft AppendEntriesResponse from a manager peer."""
         await self._raft.handle_append_entries_response(data)
         return b""
+
+    # =========================================================================
+    # Cluster Membership Group TCP Handlers (AD-52 slice C)
+    # =========================================================================
+
+    @tcp.receive()
+    async def cluster_hello(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Answer a founder's greeting with where this node stands in its
+        cluster's formation."""
+        return await self._cluster_membership.handle_hello(data)
+
+    @tcp.receive()
+    async def found_cluster(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Adopt a proposed founding that names this node, if it holds no
+        membership group."""
+        return await self._cluster_membership.handle_found(data)
+
+    @tcp.receive()
+    async def cluster_join(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Take a node of the cohort into the formed cluster (leader only)."""
+        return await self._cluster_membership.handle_join(data)
+
+    @tcp.receive()
+    async def cluster_mode(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Set the cluster's mode: open, frozen or read-only (AD-52
+        section 13)."""
+        return await self._cluster_membership.handle_mode(data)
+
+    @tcp.receive()
+    async def cluster_resize(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Add an address to the cluster's cohort, or remove one (AD-52
+        ``ResizeCluster``)."""
+        return await self._cluster_membership.handle_resize(data)
+
+    @tcp.receive()
+    async def cluster_status(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """The cluster's membership as of now -- a linearizable read (AD-52
+        section 11)."""
+        return await self._cluster_membership.handle_status(data)
+
+    @tcp.receive()
+    async def cluster_watch(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """A membership watch's long poll (AD-52 section 9)."""
+        return await self._cluster_membership.handle_watch(data)
+
+    @tcp.receive()
+    async def cluster_metrics(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """This node's metrics of its cluster's membership (AD-52 section
+        18)."""
+        return await self._cluster_membership.handle_metrics(data)
+
+    @tcp.receive()
+    async def cluster_leave(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Release a member's address: a member draining itself, or an
+        operator removing one that is gone (AD-52 section 13)."""
+        return await self._cluster_membership.handle_leave(data)
+
+    @tcp.receive()
+    async def cluster_raft_request_vote(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle the membership group's RequestVote."""
+        response = await self._cluster_membership.handle_request_vote(data)
+        return response if response is not None else b""
+
+    @tcp.receive()
+    async def cluster_raft_append_entries(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle the membership group's AppendEntries."""
+        response = await self._cluster_membership.handle_append_entries(data)
+        return response if response is not None else b""
+
+    @tcp.receive()
+    async def cluster_raft_install_snapshot(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Install the membership group's snapshot from its leader."""
+        response = await self._cluster_membership.handle_install_snapshot(data)
+        return response if response is not None else b""
 
 
 __all__ = ["ManagerServer"]

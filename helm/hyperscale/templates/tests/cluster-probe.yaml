@@ -1,0 +1,77 @@
+{{- $name := printf "%s-probe" (include "hyperscale.fullname" .) }}
+{{- $gateName := include "hyperscale.gate.name" . }}
+{{- $gateTcp := include "hyperscale.podAddresses" (dict "root" . "name" $gateName "replicas" .Values.gates.replicas "port" .Values.gates.ports.tcp) }}
+# `helm test`: one workflow submitted through the gates, run to completion.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyperscale.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+data:
+  cluster_probe.py: |-
+    {{- .Files.Get "files/cluster_probe.py" | nindent 4 }}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyperscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: probe
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  containers:
+    - name: probe
+      image: {{ include "hyperscale.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      command: ["python", "/probe/cluster_probe.py"]
+      workingDir: /home/hyperscale/run
+      env:
+        - name: PROBE_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: PROBE_PORT
+          value: {{ .Values.probe.port | quote }}
+        - name: PROBE_GATES
+          value: {{ $gateTcp | quote }}
+        - name: PROBE_TIMEOUT_SECONDS
+          value: {{ .Values.probe.timeoutSeconds | quote }}
+        - name: MERCURY_SYNC_AUTH_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "hyperscale.secretName" . }}
+              key: {{ .Values.clusterSecret.key }}
+      volumeMounts:
+        - name: probe
+          mountPath: /probe
+          readOnly: true
+        - name: run
+          mountPath: /home/hyperscale/run
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: probe
+      configMap:
+        name: {{ $name }}
+    - name: run
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}

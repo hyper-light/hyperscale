@@ -9,13 +9,12 @@ import asyncio
 from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
-    ManagerInfo,
     WorkflowDispatch,
     WorkflowProgress,
+    WorkflowStatus,
     PendingTransfer,
 )
 from hyperscale.distributed.reliability import BackpressureLevel
-from hyperscale.distributed.swim.core import ErrorStats
 
 from hyperscale.distributed.runtime import Clock, RealClock
 
@@ -36,8 +35,8 @@ class WorkerState:
 
     Lock ordering (acquire in this order to avoid deadlock):
         1. _resource_creation_lock — outermost; held only briefly while
-           creating per-resource locks (e.g. _manager_state_locks,
-           _job_leader_transfer_locks). Never held across an await on any
+           creating per-resource locks (_job_leader_transfer_locks). Never
+           held across an await on any
            other lock here.
         2. _version_lock — guards _state_version. Independent of other
            locks below; never nested with _counter_lock.
@@ -47,31 +46,33 @@ class WorkerState:
            transfer metrics, fence tokens, throughput counters. Never
            held across awaits on any other lock above.
 
-    Per-resource locks (_manager_state_locks[id], _job_leader_transfer_locks[id])
-    are leaf locks: acquired after the lookup-time critical section in
+    Per-resource locks (_job_leader_transfer_locks[id]) are leaf locks: acquired after the lookup-time critical section in
     _resource_creation_lock has been released, and never held while
     acquiring any of the locks above.
     """
 
-    def __init__(self, core_allocator: "CoreAllocator") -> None:
+    def __init__(
+        self,
+        core_allocator: "CoreAllocator",
+        *,
+        throughput_interval_seconds: float,
+        completion_times_max_samples: int,
+    ) -> None:
         """
         Initialize empty state containers.
 
         Args:
             core_allocator: The CoreAllocator instance for core management
+            throughput_interval_seconds: The window AD-19 health throughput
+                (completions per second) is measured over
+                (``WORKER_THROUGHPUT_INTERVAL_SECONDS``)
+            completion_times_max_samples: Recent completion times kept for
+                the expected throughput (``WORKER_COMPLETION_TIMES_MAX_SAMPLES``)
         """
+        self._throughput_interval_seconds = throughput_interval_seconds
+        self._completion_times_max_samples = completion_times_max_samples
         # Core allocation
         self._core_allocator: "CoreAllocator" = core_allocator
-
-        # Manager tracking
-        self._known_managers: dict[str, ManagerInfo] = {}
-        self._healthy_manager_ids: set[str] = set()
-        self._primary_manager_id: str | None = None
-        self._manager_unhealthy_since: dict[str, float] = {}
-        self._manager_circuits: dict[str, ErrorStats] = {}
-        self._manager_addr_circuits: dict[tuple[str, int], ErrorStats] = {}
-        self._manager_state_locks: dict[str, asyncio.Lock] = {}
-        self._manager_state_epoch: dict[str, int] = {}
 
         # Workflow tracking
         self._active_workflows: dict[str, WorkflowProgress] = {}
@@ -104,6 +105,13 @@ class WorkerState:
 
         # Orphaned workflow tracking (Section 2.7)
         self._orphaned_workflows: dict[str, float] = {}
+        # Manager heartbeats received so far, and the count when each
+        # orphaned workflow was orphaned: heartbeats since then are the
+        # progress an orphan grace extension is granted on (AD-26). The
+        # longest an orphan has waited for its new leader raises the grace.
+        self._manager_heartbeats_received = 0
+        self._orphan_heartbeat_baselines: dict[str, int] = {}
+        self._longest_orphan_rescue_seconds = 0.0
 
         # Job leadership transfer (Section 8)
         self._job_leader_transfer_locks: dict[str, asyncio.Lock] = {}
@@ -180,63 +188,6 @@ class WorkerState:
         return self._state_version
 
     # =========================================================================
-    # Manager Tracking
-    # =========================================================================
-
-    def add_manager(self, manager_id: str, manager_info: ManagerInfo) -> None:
-        """
-        Add or update a known manager.
-
-        Args:
-            manager_id: Manager node identifier
-            manager_info: Manager information
-        """
-        self._known_managers[manager_id] = manager_info
-
-    def get_manager(self, manager_id: str) -> ManagerInfo | None:
-        """Get manager info by ID."""
-        return self._known_managers.get(manager_id)
-
-    def mark_manager_healthy(self, manager_id: str) -> None:
-        """Mark a manager as healthy."""
-        self._healthy_manager_ids.add(manager_id)
-        self._manager_unhealthy_since.pop(manager_id, None)
-
-    async def mark_manager_unhealthy(self, manager_id: str) -> None:
-        async with self._get_counter_lock():
-            self._healthy_manager_ids.discard(manager_id)
-            if manager_id not in self._manager_unhealthy_since:
-                self._manager_unhealthy_since[manager_id] = _DEFAULT_CLOCK.monotonic()
-
-    def is_manager_healthy(self, manager_id: str) -> bool:
-        """Check if a manager is in the healthy set."""
-        return manager_id in self._healthy_manager_ids
-
-    def get_healthy_manager_tcp_addrs(self) -> list[tuple[str, int]]:
-        """Get TCP addresses of all healthy managers."""
-        return [
-            (manager.tcp_host, manager.tcp_port)
-            for manager_id in self._healthy_manager_ids
-            if (manager := self._known_managers.get(manager_id))
-        ]
-
-    async def get_or_create_manager_lock(self, manager_id: str) -> asyncio.Lock:
-        async with self._get_resource_creation_lock():
-            if manager_id not in self._manager_state_locks:
-                self._manager_state_locks[manager_id] = asyncio.Lock()
-            return self._manager_state_locks[manager_id]
-
-    async def increment_manager_epoch(self, manager_id: str) -> int:
-        async with self._get_counter_lock():
-            current = self._manager_state_epoch.get(manager_id, 0)
-            self._manager_state_epoch[manager_id] = current + 1
-            return self._manager_state_epoch[manager_id]
-
-    async def get_manager_epoch(self, manager_id: str) -> int:
-        async with self._get_counter_lock():
-            return self._manager_state_epoch.get(manager_id, 0)
-
-    # =========================================================================
     # Workflow Tracking
     # =========================================================================
 
@@ -272,6 +223,7 @@ class WorkerState:
         self._workflow_tokens.pop(workflow_id, None)
         self._workflow_id_to_name.pop(workflow_id, None)
         self._orphaned_workflows.pop(workflow_id, None)
+        self._orphan_heartbeat_baselines.pop(workflow_id, None)
         self._workflow_start_times.pop(workflow_id, None)
         self._workflow_timeout_seconds.pop(workflow_id, None)
         self._suppressed_final_result_reasons.pop(workflow_id, None)
@@ -280,14 +232,18 @@ class WorkerState:
         # workflow_executor termination path as well as the worker
         # server's _cleanup_workflow_state path; everyone goes through
         # remove_active_workflow eventually.
+        # Every callback runs even when one fails; the failures then raise
+        # together, after this workflow's state is gone.
+        callback_errors: list[Exception] = []
         for callback in list(self._workflow_termination_callbacks):
             try:
                 callback(workflow_id)
-            except Exception:
-                # Don't let one callback's failure cascade into others
-                # — per-callback failures are already a downstream
-                # bug; surface them separately.
-                pass
+            except Exception as callback_error:
+                callback_errors.append(callback_error)
+        if callback_errors:
+            raise ExceptionGroup(
+                f"workflow {workflow_id} termination callbacks failed", callback_errors
+            )
         return progress
 
     def register_workflow_termination_callback(
@@ -396,10 +352,37 @@ class WorkerState:
     def mark_workflow_orphaned(self, workflow_id: str) -> None:
         if workflow_id not in self._orphaned_workflows:
             self._orphaned_workflows[workflow_id] = _DEFAULT_CLOCK.monotonic()
+            self._orphan_heartbeat_baselines[workflow_id] = self._manager_heartbeats_received
 
     def clear_workflow_orphaned(self, workflow_id: str) -> None:
-        """Clear orphaned status for a workflow."""
+        """Clear orphaned status for a workflow -- its new leader was found:
+        how long that took is a rescue the orphan grace learns from."""
+        if (orphaned_at := self._orphaned_workflows.pop(workflow_id, None)) is not None:
+            self._longest_orphan_rescue_seconds = max(
+                self._longest_orphan_rescue_seconds, _DEFAULT_CLOCK.monotonic() - orphaned_at
+            )
+        self._orphan_heartbeat_baselines.pop(workflow_id, None)
+
+    def drop_orphan(self, workflow_id: str) -> None:
+        """Stop tracking an orphan the worker gives up on (not a rescue)."""
         self._orphaned_workflows.pop(workflow_id, None)
+        self._orphan_heartbeat_baselines.pop(workflow_id, None)
+
+    def record_manager_heartbeat(self) -> None:
+        """A manager heartbeat reached this worker."""
+        self._manager_heartbeats_received += 1
+
+    @property
+    def manager_heartbeats_received(self) -> int:
+        return self._manager_heartbeats_received
+
+    @property
+    def longest_orphan_rescue_seconds(self) -> float:
+        return self._longest_orphan_rescue_seconds
+
+    def orphan_heartbeat_baseline(self, workflow_id: str) -> int:
+        """The manager heartbeats received when ``workflow_id`` was orphaned."""
+        return self._orphan_heartbeat_baselines.get(workflow_id, self._manager_heartbeats_received)
 
     def is_workflow_orphaned(self, workflow_id: str) -> bool:
         """Check if a workflow is orphaned."""
@@ -551,18 +534,22 @@ class WorkerState:
     # Throughput Tracking (AD-19)
     # =========================================================================
 
-    async def record_completion(self, duration_seconds: float) -> None:
+    async def record_completion(self, status: str, duration_seconds: float) -> None:
+        """A workflow run ended: a completed one counts toward the AD-19
+        health throughput and its duration toward the expected throughput."""
+        if status != WorkflowStatus.COMPLETED.value:
+            return
         async with self._get_counter_lock():
             self._throughput_completions += 1
             self._completion_times.append(duration_seconds)
-            if len(self._completion_times) > 50:
+            if len(self._completion_times) > self._completion_times_max_samples:
                 self._completion_times.pop(0)
 
     def get_throughput(self) -> float:
         """Get current throughput (completions per second)."""
         current_time = _DEFAULT_CLOCK.monotonic()
         elapsed = current_time - self._throughput_interval_start
-        if elapsed >= 10.0:
+        if elapsed >= self._throughput_interval_seconds:
             self._throughput_last_value = self._throughput_completions / elapsed
             self._throughput_completions = 0
             self._throughput_interval_start = current_time
@@ -580,11 +567,6 @@ class WorkerState:
     def get_completion_sample_count(self) -> int:
         """Get count of completion time samples."""
         return len(self._completion_times)
-
-    def remove_manager_lock(self, manager_id: str) -> None:
-        """Remove lock and epoch when manager disconnects to prevent memory leak."""
-        self._manager_state_locks.pop(manager_id, None)
-        self._manager_state_epoch.pop(manager_id, None)
 
     def remove_job_transfer_lock(self, job_id: str) -> None:
         """Remove transfer lock and token when job completes to prevent memory leak."""

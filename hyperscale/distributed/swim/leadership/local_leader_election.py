@@ -71,6 +71,9 @@ class LocalLeaderElection:
     # leader election never converged.
     _broadcast_message: Callable[[bytes], Awaitable[None]] | None = None
     _get_member_count: Callable[[], int] | None = None
+    # Whether a vote from this address counts toward a majority: only the
+    # members the majority is counted over vote (Raft section 5.2).
+    _is_cohort_voter: Callable[[tuple[str, int]], bool] | None = None
     _get_lhm_score: Callable[[], int] | None = None
     _send_to_node: Callable[[tuple[str, int], bytes], None] | None = None
     _should_refuse_leadership: Callable[[], bool] | None = None  # Graceful degradation check
@@ -89,11 +92,17 @@ class LocalLeaderElection:
     _heartbeat_task: asyncio.Task | None = field(default=None, repr=False)
     _election_task: asyncio.Task | None = field(default=None, repr=False)
     _election_wake_event: asyncio.Event | None = field(default=None, repr=False)
+    # When this node, leaderless, stands for election: drawn once per
+    # leaderless spell (see ``_election_loop``), cleared on following or
+    # leading.
+    _stand_for_election_at: float | None = field(default=None, repr=False)
     _running: bool = False
     
     # Track fallback tasks created when TaskRunner not available
     _pending_error_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
     _unmanaged_tasks_created: int = 0
+    # Debug log records lost because the logger's write itself failed.
+    _log_write_failures: int = 0
     
     # Logger for structured logging (optional)
     _logger: LoggerProtocol | None = None
@@ -135,7 +144,9 @@ class LocalLeaderElection:
                     node_id=self._node_id,
                 ))
             except Exception:
-                pass  # Don't let logging errors propagate
+                # The logger itself failed: nowhere left to report it but
+                # this election's status.
+                self._log_write_failures += 1
 
     def _log_debug_sync(self, message: str) -> None:
         """Schedule a debug log from a synchronous code path.
@@ -159,7 +170,7 @@ class LocalLeaderElection:
                 ),
             )
         except Exception:
-            pass
+            self._log_write_failures += 1
     
     def set_callbacks(
         self,
@@ -173,10 +184,12 @@ class LocalLeaderElection:
         task_runner: TaskRunnerProtocol | None = None,
         on_election_started: Callable[[], None] | None = None,
         on_heartbeat_sent: Callable[[], None] | None = None,
+        is_cohort_voter: Callable[[tuple[str, int]], bool] | None = None,
     ) -> None:
         """Set callback functions for election operations."""
         self._broadcast_message = broadcast_message
         self._get_member_count = get_member_count
+        self._is_cohort_voter = is_cohort_voter
         self._get_lhm_score = get_lhm_score
         self.self_addr = self_addr
         self._on_error = on_error
@@ -262,18 +275,26 @@ class LocalLeaderElection:
         self._running = False
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
                 await self._heartbeat_task
             except asyncio.CancelledError:
-                pass
+                # The task we cancelled ended; a cancel aimed at this task
+                # while it waited goes on.
+                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                    raise
             self._heartbeat_task = None
         
         if self._election_task:
             self._election_task.cancel()
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
                 await self._election_task
             except asyncio.CancelledError:
-                pass
+                # The task we cancelled ended; a cancel aimed at this task
+                # while it waited goes on.
+                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                    raise
             self._election_task = None
         self._election_wake_event = None
 
@@ -329,6 +350,7 @@ class LocalLeaderElection:
         while self._running:
             try:
                 if self.state.is_leader():
+                    self._stand_for_election_at = None
                     # Leader: check if we should step down
                     if self.should_step_down():
                         await self._log_debug(
@@ -344,6 +366,27 @@ class LocalLeaderElection:
 
                 elif self.state.should_start_election():
                     # No leader or lease expired: maybe start election
+
+                    # Raft's randomized election timeout (section 5.2): stand
+                    # only after a random wait, drawn once per leaderless
+                    # spell. Every follower of a leader that went quiet saw
+                    # the same last heartbeat (and every node boots
+                    # leaderless together): standing at one instant, each
+                    # voted for itself -- a split first round, and a full
+                    # election timeout lost, on every failover and boot.
+                    # The first to stand now asks peers still waiting, who
+                    # vote for it. Later rounds are already spread by the
+                    # randomized vote wait in ``_run_election``.
+                    now = self._clock.monotonic()
+                    if self._stand_for_election_at is None:
+                        self._stand_for_election_at = now + self._random.uniform(
+                            0, self.election_timeout_jitter
+                        )
+                    if now < self._stand_for_election_at:
+                        await self._wait_for_election_wake(
+                            self._stand_for_election_at - now
+                        )
+                        continue
 
                     # Check flapping - delay election if needed
                     should_delay, delay = self.flapping_detector.should_delay_election()
@@ -377,10 +420,13 @@ class LocalLeaderElection:
                         )
 
                 else:
-                    # Following a leader, wait for lease to expire
+                    # Following a leader, wait for lease to expire. Woken at
+                    # expiry, a lapsed lease starts the randomized wait
+                    # above -- the spread a fixed slack here never gave.
+                    self._stand_for_election_at = None
                     wait_time = self.state.time_until_lease_expiry()
                     await self._wait_for_election_wake(
-                        min(wait_time + 0.5, self.heartbeat_interval)
+                        min(wait_time, self.heartbeat_interval)
                     )
 
             except asyncio.CancelledError:
@@ -430,9 +476,9 @@ class LocalLeaderElection:
                     self._pending_error_tasks.add(task)
                     self._unmanaged_tasks_created += 1
                 except RuntimeError:
-                    # No running loop - error cannot be logged asynchronously
-                    # This is an edge case; error is silently dropped
-                    pass
+                    # No running loop to report through: the sync caller
+                    # gets the error itself rather than losing it.
+                    raise error
     
     async def _run_pre_vote(self) -> bool:
         """
@@ -481,9 +527,14 @@ class LocalLeaderElection:
                 f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
             )
             await self._broadcast_message(pre_vote_msg)
-            
-            # Wait for pre-votes with timeout protection
-            await self._wait_for_election_wake(self.pre_vote_timeout)
+
+            # Wait for pre-votes with timeout protection -- unless our own
+            # already makes the majority (a cohort of one): nothing more can
+            # arrive that the outcome waits on.
+            if len(self.state.pre_votes_received) < max(
+                1, ((self._get_member_count() if self._get_member_count else 1) // 2) + 1
+            ):
+                await self._wait_for_election_wake(self.pre_vote_timeout)
             
             # Check if a valid leader was discovered during pre-vote
             # This prevents continuing with election if we've already
@@ -585,9 +636,14 @@ class LocalLeaderElection:
         )
         await self._broadcast_message(claim_msg)
 
-        # Wait for votes
-        election_timeout = self.get_election_timeout()
-        await self._wait_for_election_wake(election_timeout)
+        # Wait for votes -- unless our own already makes the majority (a
+        # cohort of one): Raft's candidate becomes leader the moment it
+        # holds a majority (section 5.2), as ``handle_vote`` wakes us for
+        # one that peers' votes complete.
+        if len(self.state.votes_received) < (
+            (self._get_member_count() if self._get_member_count else 1) // 2
+        ) + 1:
+            await self._wait_for_election_wake(self.get_election_timeout())
 
         # Check if we won
         if self.state.role == 'candidate':  # Still candidate
@@ -732,7 +788,9 @@ class LocalLeaderElection:
         """
         if term != self.state.current_term or not self.state.is_candidate():
             return False
-        
+        if self._is_cohort_voter is not None and not self._is_cohort_voter(voter):
+            return False
+
         vote_count = self.state.record_vote(voter)
         n_members = self._get_member_count() if self._get_member_count else 1
         votes_needed = (n_members // 2) + 1
@@ -845,7 +903,9 @@ class LocalLeaderElection:
         )
         if term != self.state.pre_vote_term or not self.state.pre_voting_in_progress:
             return
-        
+        if self._is_cohort_voter is not None and not self._is_cohort_voter(voter):
+            return
+
         if granted:
             self.state.record_pre_vote(voter)
             n_members = self._get_member_count() if self._get_member_count else 1
@@ -914,6 +974,7 @@ class LocalLeaderElection:
             'pre_voting': self.state.pre_voting_in_progress,
             'pre_votes': len(self.state.pre_votes_received),
             'flapping': self.flapping_detector.is_flapping,
+            'log_write_failures': self._log_write_failures,
             'flapping_cooldown': self.flapping_detector.current_cooldown,
         }
     

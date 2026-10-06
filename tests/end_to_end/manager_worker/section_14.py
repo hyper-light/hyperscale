@@ -219,8 +219,8 @@ async def validate_14_3_all_workflows_cancelled() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._cancellation_completion_events, dict), (
-            "All workflows cancelled expected cancellation events"
+        assert isinstance(state._cancellation_pending_workflows, dict), (
+            "All workflows cancelled expected pending cancellation tracking"
         )
     finally:
         await runtime.stop_cluster()
@@ -239,8 +239,8 @@ async def validate_14_3_completion_event() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._cancellation_completion_events, dict), (
-            "Completion event expected cancellation events"
+        assert isinstance(state._cancellation_pending_workflows, dict), (
+            "Completion event expected pending cancellation tracking"
         )
     finally:
         await runtime.stop_cluster()
@@ -299,8 +299,8 @@ async def validate_14_4_timeout_handling() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._cancellation_completion_events, dict), (
-            "Timeout handling expected cancellation events"
+        assert isinstance(state._cancellation_pending_workflows, dict), (
+            "Timeout handling expected pending cancellation tracking"
         )
     finally:
         await runtime.stop_cluster()

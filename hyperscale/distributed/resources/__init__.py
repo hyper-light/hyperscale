@@ -1,14 +1,14 @@
 from hyperscale.distributed.resources.adaptive_kalman_filter import AdaptiveKalmanFilter
 from hyperscale.distributed.resources.health_piggyback import HealthPiggyback
-from hyperscale.distributed.resources.manager_cluster_view import (
-    ManagerClusterResourceView,
-)
-from hyperscale.distributed.resources.manager_local_view import ManagerLocalView
 from hyperscale.distributed.resources.manager_resource_gossip import (
     ManagerResourceGossip,
 )
-from hyperscale.distributed.resources.node_health_tracker import HealthSignals
-from hyperscale.distributed.resources.node_health_tracker import NodeHealthTracker
+from hyperscale.distributed.resources.manager_resource_gossip_entry import (
+    ManagerResourceGossipEntry,
+)
+from hyperscale.distributed.resources.manager_resource_gossip_message import (
+    ManagerResourceGossipMessage,
+)
 from hyperscale.distributed.resources.process_resource_monitor import (
     ProcessResourceMonitor,
 )
@@ -19,11 +19,9 @@ from hyperscale.distributed.resources.worker_resource_report import WorkerResour
 __all__ = [
     "AdaptiveKalmanFilter",
     "HealthPiggyback",
-    "HealthSignals",
-    "ManagerClusterResourceView",
-    "ManagerLocalView",
     "ManagerResourceGossip",
-    "NodeHealthTracker",
+    "ManagerResourceGossipEntry",
+    "ManagerResourceGossipMessage",
     "ProcessResourceMonitor",
     "ResourceMetrics",
     "ScalarKalmanFilter",

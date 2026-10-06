@@ -101,7 +101,7 @@ def multi_manager_client_entry(
     manager_tcp_addresses,
     sustained=False,
     job_timeout_seconds=30.0,
-    wait_timeout_seconds=45.0,
+    wait_timeout_seconds=None,
 ) -> None:
     """Client child: submit to a peered manager tier (several managers in
     one datacenter, no gate) and await completion — the client ranks the
@@ -173,14 +173,27 @@ def _run_client_submission(
     datacenters=None,
     workflow_class=SimPingWorkflow,
     job_timeout_seconds=30.0,
-    wait_timeout_seconds=45.0,
+    wait_timeout_seconds=None,
 ) -> None:
     """Shared submit -> watch -> await-completion flow for the client
     entries; identical await ordering regardless of target tier so the
     pinned schedules of existing scenarios stay byte-for-byte.
     ``datacenters=None`` matches ``submit_job``'s own default, so
     existing entries are unchanged; a list applies the placement
-    constraint."""
+    constraint.
+
+    The client waits, by default, as long as the cluster can take to
+    end the job: its timeout, the AD-34 check that finds it past (one
+    check interval at most), and the terminal push (one standard send).
+    A shorter wait makes the client's patience, not the cluster, decide
+    a timed-out job's outcome; a wait that does expire is logged."""
+    if wait_timeout_seconds is None:
+        settings = _env()
+        wait_timeout_seconds = (
+            job_timeout_seconds
+            + settings.JOB_TIMEOUT_CHECK_INTERVAL
+            + settings.MANAGER_TCP_TIMEOUT_STANDARD
+        )
 
     async def run() -> None:
         await client.start()
@@ -224,7 +237,12 @@ def _run_client_submission(
                 await asyncio.sleep(0.5)
 
         status_watcher = context.loop.create_task(watch_status())
-        result = await client.wait_for_job(job_id, timeout=wait_timeout_seconds)
+        try:
+            result = await client.wait_for_job(job_id, timeout=wait_timeout_seconds)
+        except asyncio.TimeoutError:
+            status_watcher.cancel()
+            log.append(("job-wait-expired", round(context.loop.time(), 6)))
+            return
         status_watcher.cancel()
         log.append(("job-finished", result.status, round(context.loop.time(), 6)))
 

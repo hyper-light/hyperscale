@@ -1,31 +1,37 @@
+"""
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
+"""
+
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Awaitable
-
 from hyperscale.distributed.reliability.robust_queue import (
     RobustMessageQueue,
     RobustQueueConfig,
     QueuePutResult,
     QueueState,
 )
-from hyperscale.distributed.reliability.backpressure import (
-    BackpressureLevel,
-    BackpressureSignal,
-)
+from hyperscale.distributed.reliability.backpressure import BackpressureLevel, BackpressureSignal
 from hyperscale.logging.hyperscale_logging_models import WALError
-
-from hyperscale.distributed.runtime import (
-    Clock,
-    Filesystem,
-    RealClock,
-    RealFilesystem,
-)
-
-
+from hyperscale.distributed.runtime import Clock, Filesystem, RealClock, RealFilesystem
 from hyperscale.distributed.ledger.storage_health import StorageHealth
+
+from .wal_backpressure_error import WALBackpressureError
+from .wal_writer_config import WALWriterConfig
+from .wal_writer_metrics import WALWriterMetrics
+from .write_batch import WriteBatch
+from .write_request import WriteRequest
+
+if TYPE_CHECKING:
+    from hyperscale.logging import Logger
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
@@ -34,73 +40,6 @@ _DEFAULT_CLOCK: Clock = RealClock()
 # ``swap_defaults`` rebinds it to the SIM filesystem so WAL commits
 # become deterministic and storage-faultable under replay.
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
-
-if TYPE_CHECKING:
-    from hyperscale.logging import Logger
-
-
-class WALBackpressureError(Exception):
-    """Raised when WAL rejects a write due to backpressure."""
-
-    def __init__(
-        self,
-        message: str,
-        queue_state: QueueState,
-        backpressure: BackpressureSignal,
-    ) -> None:
-        super().__init__(message)
-        self.queue_state = queue_state
-        self.backpressure = backpressure
-
-
-@dataclass(slots=True)
-class WriteRequest:
-    data: bytes
-    future: asyncio.Future[None]
-
-
-@dataclass(slots=True)
-class WriteBatch:
-    requests: list[WriteRequest] = field(default_factory=list)
-    total_bytes: int = 0
-
-    def add(self, request: WriteRequest) -> None:
-        self.requests.append(request)
-        self.total_bytes += len(request.data)
-
-    def clear(self) -> None:
-        self.requests.clear()
-        self.total_bytes = 0
-
-    def __len__(self) -> int:
-        return len(self.requests)
-
-
-@dataclass(slots=True)
-class WALWriterConfig:
-    batch_timeout_microseconds: int = 500
-    batch_max_entries: int = 1000
-    batch_max_bytes: int = 1024 * 1024
-    queue_max_size: int = 10000
-    overflow_size: int = 1000
-    preserve_newest: bool = True
-    throttle_threshold: float = 0.70
-    batch_threshold: float = 0.85
-    reject_threshold: float = 0.95
-
-
-@dataclass(slots=True)
-class WALWriterMetrics:
-    total_submitted: int = 0
-    total_written: int = 0
-    total_batches: int = 0
-    total_bytes_written: int = 0
-    total_fsyncs: int = 0
-    total_rejected: int = 0
-    total_overflow: int = 0
-    total_errors: int = 0
-    peak_queue_size: int = 0
-    peak_batch_size: int = 0
 
 
 class WALWriter:
@@ -130,6 +69,7 @@ class WALWriter:
         "_committed_length",
         "_storage_failure",
         "_storage_health",
+        "_file_lock",
     )
 
     def __init__(
@@ -158,7 +98,9 @@ class WALWriter:
         queue_config = RobustQueueConfig(
             maxsize=self._config.queue_max_size,
             overflow_size=self._config.overflow_size,
-            preserve_newest=self._config.preserve_newest,
+            # A write the queue cannot hold is refused, never dropped:
+            # each queued write holds an LSN and an appender awaiting it.
+            preserve_newest=False,
             throttle_threshold=self._config.throttle_threshold,
             batch_threshold=self._config.batch_threshold,
             reject_threshold=self._config.reject_threshold,
@@ -179,6 +121,9 @@ class WALWriter:
         # leave a torn partial record past this point; it is cut back
         # here before the writer continues.
         self._committed_length = 0
+        # Held by each group commit and by a rewrite: a batch appended
+        # between a rewrite's read and its rename would be lost.
+        self._file_lock = asyncio.Lock()
         # The most recent storage failure a group commit hit (cleared by
         # the next successful commit).
         self._storage_failure: OSError | None = None
@@ -255,19 +200,27 @@ class WALWriter:
                 await _DEFAULT_CLOCK.wait_for(self._writer_task, timeout=5.0)
             except asyncio.TimeoutError:
                 self._writer_task.cancel()
+                cancels_requested_before_wait = asyncio.current_task().cancelling()
                 try:
                     await self._writer_task
                 except asyncio.CancelledError:
-                    pass
+                    # The task we cancelled ended; a cancel aimed at this task
+                    # while it waited goes on.
+                    if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                        raise
             finally:
                 self._writer_task = None
 
         if self._state_change_task is not None and not self._state_change_task.done():
             self._state_change_task.cancel()
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
                 await self._state_change_task
             except asyncio.CancelledError:
-                pass
+                # The task we cancelled ended; a cancel aimed at this task
+                # while it waited goes on.
+                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                    raise
 
         await self._fail_pending_requests(RuntimeError("WAL writer stopped"))
 
@@ -432,22 +385,17 @@ class WALWriter:
             await self._fail_pending_requests(exception)
 
     async def _collect_batch(self) -> None:
-        batch_timeout = self._config.batch_timeout_microseconds / 1_000_000
+        # An idle writer sleeps until a write (or stop's sentinel) arrives;
+        # a batch is whatever queued meanwhile -- during the last commit.
+        # Waiting with a timeout here woke an idle writer ~1,500 times a
+        # second for nothing (4.5% of a core, measured).
+        request = await self._queue.get()
 
-        try:
-            request = await _DEFAULT_CLOCK.wait_for(
-                self._queue.get(),
-                timeout=batch_timeout,
-            )
-
-            if request is None:
-                self._running = False
-                return
-
-            self._current_batch.add(request)
-
-        except asyncio.TimeoutError:
+        if request is None:
+            self._running = False
             return
+
+        self._current_batch.add(request)
 
         while (
             len(self._current_batch) < self._config.batch_max_entries
@@ -476,11 +424,29 @@ class WALWriter:
         combined_data = b"".join(request.data for request in requests)
 
         try:
-            # One durable unit per group commit through the storage
-            # seam — the same append+flush+fsync sequence as before, as
-            # a single job on the filesystem's own executor.
-            await self._filesystem.append_fsync(self._path, combined_data)
-            self._committed_length += len(combined_data)
+            # The append and, if it fails, the cut back to the committed
+            # length are one unit against a concurrent rewrite.
+            async with self._file_lock:
+                try:
+                    # One durable unit per group commit through the storage
+                    # seam -- the same append+flush+fsync sequence as before,
+                    # as a single job on the filesystem's own executor.
+                    await self._filesystem.append_fsync(self._path, combined_data)
+                except OSError as storage_error:
+                    # The device refused the append (full, read-only, I/O
+                    # error). The batch fails; the log is cut back to its
+                    # last committed record so the torn tail cannot cost
+                    # later records at recovery; the writer keeps serving --
+                    # the condition may clear. Only if the cut itself fails
+                    # is the log unusable.
+                    self._metrics.total_errors += 1
+                    for request in requests:
+                        if not request.future.done():
+                            request.future.set_exception(storage_error)
+                    await self._discard_failed_append(storage_error, len(combined_data))
+                    return
+                self._committed_length += len(combined_data)
+
             self._storage_failure = None
             if self._storage_health is not None:
                 self._storage_health.record_success(len(combined_data))
@@ -497,18 +463,6 @@ class WALWriter:
             for request in requests:
                 if not request.future.done():
                     request.future.set_result(None)
-
-        except OSError as storage_error:
-            # The device refused the append (full, read-only, I/O error).
-            # The batch fails; the log is cut back to its last committed
-            # record so the torn tail cannot cost later records at
-            # recovery; the writer keeps serving -- the condition may
-            # clear. Only if the cut itself fails is the log unusable.
-            self._metrics.total_errors += 1
-            for request in requests:
-                if not request.future.done():
-                    request.future.set_exception(storage_error)
-            await self._discard_failed_append(storage_error, len(combined_data))
 
         except BaseException as exception:
             self._error = exception
@@ -550,6 +504,23 @@ class WALWriter:
                     error_type=type(storage_error).__name__,
                 )
             )
+
+    async def rewrite(self, transform: Callable[[bytes], bytes]) -> int:
+        """Replace the log with ``transform`` of its committed bytes,
+        atomically and with no group commit in flight; returns how many
+        bytes it shrank by. A crash leaves the old log or the new, never
+        a mix (the filesystem's atomic write: temp file, fsync, rename,
+        directory fsync)."""
+        async with self._file_lock:
+            if not await self._filesystem.exists(self._path):
+                return 0
+            committed = await self._filesystem.read_bytes(self._path)
+            rewritten = transform(committed)
+            if rewritten is committed:
+                return 0
+            await self._filesystem.atomic_write(self._path, rewritten)
+            self._committed_length = len(rewritten)
+            return len(committed) - len(rewritten)
 
     async def _drain_remaining(self) -> None:
         while not self._queue.empty():
@@ -593,3 +564,14 @@ class WALWriter:
                     request.future.set_exception(exception)
             except asyncio.QueueEmpty:
                 break
+
+_REHOMED = (
+    WALBackpressureError,
+    WriteRequest,
+    WriteBatch,
+    WALWriterConfig,
+    WALWriterMetrics,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

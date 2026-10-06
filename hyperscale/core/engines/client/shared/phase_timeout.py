@@ -1,5 +1,6 @@
 import asyncio
-from typing import Awaitable, Optional, TypeVar
+from types import TracebackType
+from typing import Awaitable, Optional, Type, TypeVar
 
 T = TypeVar("T")
 
@@ -57,6 +58,8 @@ class PhaseTimeout:
         "_deadline",
         "_task",
         "_expired",
+        "_timeout",
+        "_cancelling",
     )
 
     def __init__(self) -> None:
@@ -65,14 +68,42 @@ class PhaseTimeout:
         self._deadline: Optional[float] = None
         self._task: Optional[asyncio.Task] = None
         self._expired = False
+        # The phase's timeout, from within(), and its task's cancelling()
+        # count when the phase began.
+        self._timeout: Optional[float] = None
+        self._cancelling = 0
 
     async def run(self, awaitable: Awaitable[T], timeout: Optional[float]) -> T:
-        if timeout is None:
-            return await awaitable
-
-        if timeout <= 0:
+        if timeout is not None and timeout <= 0:
             # wait_for's own path for a timeout already used up.
             return await asyncio.wait_for(awaitable, timeout)
+
+        with self.within(timeout):
+            return await awaitable
+
+    def within(self, timeout: Optional[float]) -> "PhaseTimeout":
+        """
+        Bounds the phase a ``with`` block awaits by ``timeout``, as ``run``
+        bounds the awaitable it is given:
+
+            with phase_timeout.within(timeout):
+                result = await phase
+
+        The phase runs in the caller's coroutine rather than inside one of
+        its own, so the bound costs no coroutine frame on each suspension and
+        wake-up. A timeout already used up (zero or less) raises TimeoutError
+        before the phase runs, the outcome wait_for gives one -- so create the
+        phase's coroutine inside the block, where it is then never made.
+        """
+        self._timeout = timeout
+        return self
+
+    def __enter__(self) -> None:
+        if (timeout := self._timeout) is None:
+            return
+
+        if timeout <= 0:
+            raise TimeoutError()
 
         task = asyncio.current_task()
         if task is None:
@@ -80,8 +111,8 @@ class PhaseTimeout:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        cancelling = task.cancelling()
 
+        self._cancelling = task.cancelling()
         self._task = task
         self._expired = False
         self._deadline = deadline
@@ -89,34 +120,36 @@ class PhaseTimeout:
         if self._timer is None or self._timer_deadline > deadline:
             self._arm(loop, deadline)
 
-        try:
-            result = await awaitable
+    def __exit__(
+        self,
+        exception_type: Optional[Type[BaseException]],
+        exception: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        if (task := self._task) is None:
+            # Unbounded: nothing was armed.
+            return
 
-        except asyncio.CancelledError as cancellation:
-            if self._expired and task.uncancel() <= cancelling:
-                raise TimeoutError from cancellation
+        self._deadline = None
+        self._task = None
 
-            raise
+        if not self._expired:
+            return
 
-        except BaseException as error:
-            if self._expired and task.uncancel() <= cancelling:
-                insert_timeout_error(error)
+        if exception is None:
+            # The phase swallowed the timeout's cancellation and returned.
+            task.uncancel()
+            return
 
-                if isinstance(error, ExceptionGroup):
-                    for member in error.exceptions:
-                        insert_timeout_error(member)
+        if task.uncancel() <= self._cancelling:
+            if isinstance(exception, asyncio.CancelledError):
+                raise TimeoutError from exception
 
-            raise
+            insert_timeout_error(exception)
 
-        else:
-            if self._expired:
-                task.uncancel()
-
-            return result
-
-        finally:
-            self._deadline = None
-            self._task = None
+            if isinstance(exception, ExceptionGroup):
+                for member in exception.exceptions:
+                    insert_timeout_error(member)
 
     def cancel(self) -> None:
         """Stop the timer once this PhaseTimeout will bound no more phases."""

@@ -1,9 +1,8 @@
 import asyncio
 import pathlib
-from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import (
-    Any,
+    Awaitable,
     Callable,
     Dict,
     Generic,
@@ -23,6 +22,8 @@ from hyperscale.distributed.runtime import Clock, RealClock
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
+FINISHED_RUN_STATUSES = frozenset((RunStatus.COMPLETE, RunStatus.CANCELLED, RunStatus.FAILED))
+
 T = TypeVar("T")
 
 
@@ -30,10 +31,10 @@ class Task(Generic[T]):
     def __init__(
         self,
         name: str,
-        task: Callable[[], T] | str,
+        task: Callable[..., Awaitable[T]] | str,
         executor: ProcessPoolExecutor | ThreadPoolExecutor | None,
         semaphore: asyncio.Semaphore,
-        *args: tuple[Any, ...],
+        *args: object,
         schedule: str | None = None,
         trigger: Literal["MANUAL", "ON_START"] = "MANUAL",
         repeat: Literal["NEVER", "ALWAYS"] | int = "NEVER",
@@ -65,7 +66,10 @@ class Task(Generic[T]):
         if isinstance(timeout, str):
             self.timeout = TimeParser(timeout).time
 
-        self.keep = keep
+        # The finished runs retained (and the runs allowed at once); unset,
+        # the task's default. Left None, every retention sweep raised on
+        # ``len(...) > None`` and no run was ever released.
+        self.keep: int = keep if keep is not None else 10
 
         self.max_age: float | None = None
         if max_age:
@@ -76,15 +80,14 @@ class Task(Generic[T]):
         self.call = task
         self.task_type = task_type
 
-        self._runs: Dict[int, Run] = {}
+        self._runs: Dict[int, Run[T]] = {}
+        # A schedule is keyed by the id of its first run (the token its
+        # caller holds); its later runs take fresh ids. Both maps hold a
+        # schedule only while it runs -- it removes itself when it ends.
         self._schedules: Dict[int, asyncio.Task] = {}
-        self._schedule_running_statuses: Dict[int, bool] = defaultdict(lambda: False)
+        self._schedule_running_statuses: Dict[int, bool] = {}
 
-        keep = self.keep
-        if keep is None:
-            keep = 10
-
-        self._sem = asyncio.Semaphore(keep)
+        self._sem = asyncio.Semaphore(self.keep)
         self._executor = executor
         self._executor_semaphore = semaphore
 
@@ -128,48 +131,35 @@ class Task(Generic[T]):
         if run := self._runs.get(run_id):
             await run.cancel()
 
-    async def cancel_schedule(self, run_id: str):
-        if run := self._runs.get(run_id) and self._schedules.get(run_id):
-            self._schedule_running_statuses[run_id] = False
+    async def cancel_schedule(self, run_id: int):
+        """Stop the schedule ``run_id`` started: no further runs, and the
+        run in flight cancelled (the schedule cancels it on its way out)."""
+        if (schedule := self._schedules.get(run_id)) is None:
+            return
 
-            schedule = self._schedules.get(run_id)
-            if schedule and not schedule.done():
-                try:
-                    schedule.cancel()
-                except Exception:
-                    pass
-
-            await run.cancel()
+        self._schedule_running_statuses[run_id] = False
+        if not schedule.done():
+            schedule.cancel()
 
     async def shutdown(self):
-        # Snapshot to avoid dict mutation during iteration
+        # Snapshots: schedules remove themselves as they end.
+        for schedule_id, schedule in list(self._schedules.items()):
+            self._schedule_running_statuses[schedule_id] = False
+            if not schedule.done():
+                schedule.cancel()
+
         for run in list(self._runs.values()):
             await run.cancel()
 
-            schedule = self._schedules.get(run.run_id)
-            if schedule:
-                self._schedule_running_statuses[run.run_id] = False
-
-                if not schedule.done():
-                    try:
-                        schedule.cancel()
-                    except Exception:
-                        pass
-
     def abort(self):
-        # Snapshot to avoid dict mutation during iteration
+        # Snapshots: schedules remove themselves as they end.
+        for schedule_id, schedule in list(self._schedules.items()):
+            self._schedule_running_statuses[schedule_id] = False
+            if not schedule.done():
+                schedule.cancel()
+
         for run in list(self._runs.values()):
             run.abort()
-
-            schedule = self._schedules.get(run.run_id)
-            if schedule:
-                self._schedule_running_statuses[run.run_id] = False
-
-                if not schedule.done():
-                    try:
-                        schedule.cancel()
-                    except Exception:
-                        pass
 
     async def cleanup(self):
         match self.keep_policy:
@@ -187,34 +177,33 @@ class Task(Generic[T]):
                 pass
 
     async def _execute_count_policy(self):
-        removed_runs: List[Run] = []
-        if len(self._runs) > self.keep:
-            run_ids = list(sorted(self._runs))
-            for run_id in run_ids[: self.keep]:
-                removed_runs.append(self._runs[run_id])
-                del self._runs[run_id]
-
-        if len(removed_runs) > 0:
-            await asyncio.gather(
-                *[run.cancel() for run in removed_runs], return_exceptions=True
-            )
+        # Release finished runs beyond the newest ``keep``. Retention never
+        # cancels a run still working: the old policy cancelled the OLDEST
+        # ``keep`` runs, live ones included.
+        finished_run_ids = sorted(
+            run_id
+            for run_id, run in self._runs.items()
+            if run.status in FINISHED_RUN_STATUSES
+        )
+        for run_id in finished_run_ids[: max(0, len(finished_run_ids) - self.keep)]:
+            del self._runs[run_id]
 
     async def _execute_age_policy(self):
-        removed_runs: List[Run] = []
+        # Release finished runs older than ``max_age``; a run's own timeout,
+        # not retention, bounds how long it works.
+        if self.max_age is None:
+            return
         current_time = _DEFAULT_CLOCK.monotonic()
-        for run_id, run in list(self._runs.items()):
-            if current_time - run.start > self.max_age:
-                removed_runs.append(run)
-                del self._runs[run_id]
-
-        if len(removed_runs) > 0:
-            await asyncio.gather(
-                *[run.cancel() for run in removed_runs], return_exceptions=True
-            )
+        for run_id in [
+            run_id
+            for run_id, run in self._runs.items()
+            if run.status in FINISHED_RUN_STATUSES and current_time - run.start > self.max_age
+        ]:
+            del self._runs[run_id]
 
     def run_shell(
         self,
-        *args: tuple[Any, ...],
+        *args: str,
         env: Dict[str, str] | None = None,
         cwd: str | pathlib.Path | None = None,
         shell: bool = False,
@@ -280,9 +269,9 @@ class Task(Generic[T]):
         return run
 
     def stop_schedules(self):
-        # Snapshot keys to avoid dict mutation during iteration
-        for run_id in list(self._schedule_running_statuses.keys()):
-            self._schedule_running_statuses[run_id] = False
+        """Let every schedule finish its current interval and stop."""
+        for schedule_id in list(self._schedule_running_statuses):
+            self._schedule_running_statuses[schedule_id] = False
 
     def run_schedule(
         self,
@@ -297,10 +286,7 @@ class Task(Generic[T]):
         if timeout is None:
             timeout = self.timeout
 
-        if (
-            self._schedules.get(run_id) is None
-            and self._schedule_running_statuses[run_id] is False
-        ):
+        if self._schedules.get(run_id) is None:
             self._schedule_running_statuses[run_id] = True
             run = Run(
                 run_id,
@@ -313,7 +299,7 @@ class Task(Generic[T]):
             )
 
             self._schedules[run_id] = asyncio.ensure_future(
-                self._run_schedule(run, *args, **kwargs)
+                self._run_schedule(run_id, run, *args, **kwargs)
             )
 
             return run
@@ -322,7 +308,7 @@ class Task(Generic[T]):
 
     def run_shell_schedule(
         self,
-        *args: tuple[Any, ...],
+        *args: str,
         env: Dict[str, str] | None = None,
         cwd: str | pathlib.Path | None = None,
         shell: bool = False,
@@ -336,10 +322,7 @@ class Task(Generic[T]):
         if timeout is None:
             timeout = self.timeout
 
-        if (
-            self._schedules.get(run_id) is None
-            and self._schedule_running_statuses[run_id] is False
-        ):
+        if self._schedules.get(run_id) is None:
             self._schedule_running_statuses[run_id] = True
             run = Run(
                 run_id,
@@ -353,6 +336,7 @@ class Task(Generic[T]):
 
             self._schedules[run_id] = asyncio.ensure_future(
                 self._run_shell_schedule(
+                    run_id,
                     run,
                     *args,
                     env=env,
@@ -366,60 +350,67 @@ class Task(Generic[T]):
 
         return self.latest()
 
-    async def _run_schedule(self, run: Run, *args, **kwargs):
-        self._runs[run.run_id] = run
+    async def _run_schedule(
+        self,
+        schedule_id: int,
+        run: Run[T],
+        *args,
+        **kwargs,
+    ):
+        """Execute ``run``, then a fresh run every ``schedule`` seconds --
+        always, or ``repeat`` times -- until the schedule is stopped.
 
-        if self.repeat == "ALWAYS":
-            while self._schedule_running_statuses[run.run_id]:
+        The schedule's own flag (``schedule_id``) decides each interval;
+        keying it by the current run's id lost a stop the moment the first
+        interval passed. Cancelled, it cancels the run in flight; ending
+        any way, it releases its future and flag.
+        """
+        remaining_runs = None if self.repeat == "ALWAYS" else self.repeat
+        try:
+            while self._schedule_running_statuses.get(schedule_id, False) and (
+                remaining_runs is None or remaining_runs > 0
+            ):
+                self._runs[run.run_id] = run
                 run.execute(*args, **kwargs)
+                if remaining_runs is not None:
+                    remaining_runs -= 1
 
                 await _DEFAULT_CLOCK.sleep(self.schedule)
                 run = Run(
                     self.generate_id(),
                     self.name,
                     self.call,
+                    TaskType.CALLABLE,
                     self._executor,
                     self._executor_semaphore,
                     timeout=self.timeout,
                 )
 
-                self._runs[run.run_id] = run
-                self._schedule_running_statuses[run.run_id] = True
+        except asyncio.CancelledError:
+            await run.cancel()
+            raise
 
-        elif isinstance(self.repeat, int):
-            for _ in range(self.repeat):
-                if self._schedule_running_statuses[run.run_id] is False:
-                    await run.cancel()
-                    break
-
-                run.execute(*args, **kwargs)
-
-                await _DEFAULT_CLOCK.sleep(self.schedule)
-                run = Run(
-                    self.generate_id(),
-                    self.name,
-                    self.call,
-                    self._executor,
-                    self._executor_semaphore,
-                    timeout=self.timeout,
-                )
-
-                self._runs[run.run_id] = run
-                self._schedule_running_statuses[run.run_id] = True
+        finally:
+            self._schedules.pop(schedule_id, None)
+            self._schedule_running_statuses.pop(schedule_id, None)
 
     async def _run_shell_schedule(
         self,
-        run: Run,
+        schedule_id: int,
+        run: Run[T],
         *args: tuple[str, ...],
         env: Dict[str, str] | None = None,
         cwd: str | pathlib.Path | None = None,
         shell: bool = False,
         poll_interval: int | float = 0.5,
     ):
-        self._runs[run.run_id] = run
-
-        if self.repeat == "ALWAYS":
-            while self._schedule_running_statuses[run.run_id]:
+        """``_run_schedule`` for a shell command."""
+        remaining_runs = None if self.repeat == "ALWAYS" else self.repeat
+        try:
+            while self._schedule_running_statuses.get(schedule_id, False) and (
+                remaining_runs is None or remaining_runs > 0
+            ):
+                self._runs[run.run_id] = run
                 run.execute_shell(
                     *args,
                     env=env,
@@ -427,47 +418,29 @@ class Task(Generic[T]):
                     shell=shell,
                     poll_interval=poll_interval,
                 )
+                if remaining_runs is not None:
+                    remaining_runs -= 1
 
                 await _DEFAULT_CLOCK.sleep(self.schedule)
                 run = Run(
                     self.generate_id(),
                     self.name,
                     self.call,
+                    TaskType.SHELL,
                     self._executor,
                     self._executor_semaphore,
                     timeout=self.timeout,
                 )
 
-                self._runs[run.run_id] = run
-                self._schedule_running_statuses[run.run_id] = True
+        except asyncio.CancelledError:
+            await run.cancel()
+            raise
 
-        elif isinstance(self.repeat, int):
-            for _ in range(self.repeat):
-                if self._schedule_running_statuses[run.run_id] is False:
-                    await run.cancel()
-                    break
+        finally:
+            self._schedules.pop(schedule_id, None)
+            self._schedule_running_statuses.pop(schedule_id, None)
 
-                run.execute_shell(
-                    *args,
-                    env=env,
-                    cwd=cwd,
-                    shell=shell,
-                )
-
-                await _DEFAULT_CLOCK.sleep(self.schedule)
-                run = Run(
-                    self.generate_id(),
-                    self.name,
-                    self.call,
-                    self._executor,
-                    self._executor_semaphore,
-                    timeout=self.timeout,
-                )
-
-                self._runs[run.run_id] = run
-                self._schedule_running_statuses[run.run_id] = True
-
-    async def _run(self, run: Run, *args, **kwargs):
+    async def _run(self, run: Run[T], *args, **kwargs):
         run.update_status(RunStatus.PENDING)
 
         async with self._sem:

@@ -103,7 +103,7 @@ class GatePingHandler:
             active_job_ids = self._get_all_job_ids()
 
             # Get peer gate addresses
-            peer_gates = list(self._state._active_gate_peers)
+            peer_gates = sorted(self._state._active_gate_peers)
 
             node_id = self._get_node_id()
             response = GatePingResponse(

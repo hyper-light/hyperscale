@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.raft.models import (
     AppendEntries,
     RequestVote,
@@ -44,7 +45,7 @@ def make_node() -> tuple[RaftNode, AsyncMock, Fence]:
     node = RaftNode(
         job_id="job-1",
         node_id="node-1",
-        members=MEMBERS,
+        initial_voters=frozenset(MEMBERS),
         member_addrs=MEMBER_ADDRS,
         send_message=send_message,
         apply_command=AsyncMock(),
@@ -53,7 +54,7 @@ def make_node() -> tuple[RaftNode, AsyncMock, Fence]:
         logger=logger,
         configured_cluster_size=len(MEMBERS),
         clock=new_hybrid_logical_clock(),
-        may_lead=fence.may_lead,
+        may_lead=fence.may_lead, storage=VolatileRaftStorage()
     )
     return node, send_message, fence
 
@@ -128,7 +129,8 @@ async def test_a_fenced_leader_relinquishes_on_its_next_tick_keeping_term_and_vo
     await node.tick()
 
     assert (node.role, node.current_term) == ("follower", term)
-    assert await pending_proposal == (False, 1)
+    # Index 2: the term opened with its blank entry at index 1 (Raft 8).
+    assert await pending_proposal == (False, 2)
     # It voted for itself in this term: no other candidate gets its vote.
     response = await node.handle_request_vote(vote_request(term, "node-3"))
     assert response.vote_granted is False

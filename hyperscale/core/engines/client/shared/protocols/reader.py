@@ -1,7 +1,7 @@
 import asyncio
 from asyncio import AbstractEventLoop, Future, Transport, get_event_loop
 from asyncio.exceptions import LimitOverrunError
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .constants import _DEFAULT_LIMIT
 
@@ -137,7 +137,8 @@ class Reader:
         # to a read coroutine. Running two read coroutines at the same time
         # would have an unexpected behaviour. It would not possible to know
         # which coroutine would get the next data.
-        if self._waiter:
+        # A waiter already done has nobody waiting on it.
+        if self._waiter is not None and not self._waiter.done():
             raise RuntimeError(
                 f"{func_name}() called while another coroutine is "
                 f"already waiting for incoming data"
@@ -213,6 +214,37 @@ class Reader:
         return None
 
     async def read(self, n=-1):
+        """
+        Up to ``n`` bytes, waiting for some while none are buffered, and b""
+        at the end of the stream; with ``n`` negative, everything until the
+        end of the stream. Raises the transport's error -- as
+        StreamReader.read() does all of this.
+        """
+        if self._exception is not None:
+            raise self._exception
+
+        if n == 0:
+            return b""
+
+        if n < 0:
+            # A limit-sized block at a time until the end of the stream, as
+            # StreamReader.read() collects it.
+            blocks: List[bytes] = []
+            while True:
+                if self._exception is not None:
+                    raise self._exception
+
+                if not self._buffer and not self._eof:
+                    await self._wait_for_data("read")
+
+                if not self._buffer:
+                    return b"".join(blocks)
+
+                blocks.append(bytes(memoryview(self._buffer)[: self._limit]))
+                del self._buffer[: self._limit]
+
+                self._maybe_resume_transport()
+
         if not self._buffer and not self._eof:
             await self._wait_for_data("read")
 

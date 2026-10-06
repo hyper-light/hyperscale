@@ -1800,7 +1800,8 @@ hyperscale/distributed_rewrite/
 ├── datacenters/                  # DC-level coordination
 │   ├── __init__.py
 │   ├── datacenter_health.py      # DatacenterHealthManager
-│   ├── manager_dispatcher.py     # ManagerDispatcher
+│   ├── (manager_dispatcher.py)   # removed 2026-10-04: never read; gate
+│   │                             #   dispatch is GateDispatchCoordinator
 │   └── lease_manager.py          # DC lease management
 │
 ├── reliability/                  # Cross-cutting reliability
@@ -11896,7 +11897,30 @@ The architecture consists of five key components that work together:
 
 ### Component 4: Client Reconnection
 
-**Status: IMPLEMENTED**
+**Status: IMPLEMENTED** (client half since 2026-10; see "As built")
+
+**As built (2026-10)**: the gate half (``register_callback`` re-registers
+the callback and replays the job's recorded updates) long existed; no
+client ever sent ``RegisterCallback``, so updates a gate could not deliver
+stayed in its history and a job ended with their workflow results listed
+missing. Now:
+
+* the gate replays from the client's *position* -- the last update below
+  which every update reached that callback; an update landing ahead of an
+  earlier failed one no longer moves it past the failure (it was
+  overwritten with each delivery), and a gap older than the retained
+  history closes, since nothing can resend it;
+* a client whose completed job still lacks workflow results once the
+  in-flight ones had a result-drain window to land re-registers its
+  callback with the job's gate (``RegisterCallback(last_sequence=0)``:
+  the gate's own position) and waits one more window for the replay; the
+  gate answers after sending it;
+* the client applies a workflow's result once and its status in lifecycle
+  order, so a replayed update changes nothing it already has.
+
+Clients address the job's gate as they submit (``get_gate_for_job``), not
+by computing hash-ring ownership; gateless (L2) managers keep no update
+history, so a gateless client has nothing to ask.
 
 **Decision**: Sophisticated approach - Clients compute job owner deterministically.
 
@@ -15246,7 +15270,10 @@ class Gate:
 
 ---
 
-# AD-33: Workflow State Machine for Complete Lifecycle Management
+# AD-54: Workflow State Machine for Complete Lifecycle Management
+
+> Renumbered from AD-33 (2026-10): AD-33 is Federated Health Monitoring, published
+> first. The decision record is `docs/architecture/AD_54.md`.
 
 ## Overview
 
@@ -15370,7 +15397,7 @@ A comprehensive state machine that governs the **entire workflow lifecycle**, fr
 ```python
 class WorkflowState(Enum):
     """
-    Complete workflow lifecycle states (AD-33).
+    Complete workflow lifecycle states (AD-54).
     
     State machine ensures workflows can only transition through valid paths,
     preventing race conditions and maintaining system invariants.
@@ -15459,7 +15486,7 @@ class StateTransition:
 
 class WorkflowStateMachine:
     """
-    Manages workflow state transitions with validation (AD-33).
+    Manages workflow state transitions with validation (AD-54).
     
     Ensures workflows can only transition through valid paths,
     preventing race conditions and maintaining system invariants.
@@ -15555,7 +15582,7 @@ When a worker fails:
 ```python
 async def _handle_worker_failure(self, worker_node_id: str) -> None:
     """
-    Handle worker becoming unavailable (AD-33 state machine).
+    Handle worker becoming unavailable (AD-54 state machine).
     
     Flow:
     1. Identify workflows in RUNNING/DISPATCHED states on failed worker
@@ -16241,7 +16268,7 @@ workflow_state_transitions_total{from="failed_ready_for_retry",to="pending"} 8
 
 ## Summary
 
-AD-33 introduces a **complete workflow lifecycle state machine** that:
+AD-54 introduces a **complete workflow lifecycle state machine** that:
 
 ✅ **Enforces valid transitions** - prevents impossible states  
 ✅ **Prevents race conditions** - atomic state changes with locking  
@@ -16252,6 +16279,35 @@ AD-33 introduces a **complete workflow lifecycle state machine** that:
 ✅ **Works with WorkflowDispatcher** - reuses existing dependency-aware dispatch  
 
 This is the **most robust and correct** approach to workflow lifecycle management.
+
+---
+
+## Part 13: As Built (2026-10)
+
+The machine is live: `JobManager.workflow_lifecycle`
+(`hyperscale/distributed/workflow/workflow_lifecycle_state_machine.py`) is
+the single source of truth for every workflow's lifecycle, and
+`WorkflowInfo.status` is only ever written as its projection. Where the
+design above and the build differ, the build is authoritative:
+
+| Aspect | As built |
+|--------|----------|
+| Ownership | `JobManager` owns the one machine; the dispatcher, the cancellation coordinator and the server move workflows only through `JobManager` methods. |
+| Keying | `(job_id, workflow_id)` -- workflow ids are client-generated and stable; token strings embed a manager's id and differ after a takeover or restart. |
+| Atomicity | `apply_transition` / `install_state` are synchronous, so they are atomic under asyncio without a lock; callers apply inside their own `job.lock` sections and publish (logs, observers) after releasing it. No global lock. |
+| Projection | `WORKFLOW_STATUS_BY_WORKFLOW_STATE`: DISPATCHED -> ASSIGNED (a dispatched workflow stays cancellable), AGGREGATED -> COMPLETED (clients read anything else as failure), FAILED_* -> FAILED / PENDING, CANCELLING -> CANCELLED. |
+| Unit | The parent workflow; sub-workflows (one per worker) are data on it. AGGREGATED when results merged from more than one sub. |
+| History | Bounded per workflow: registration + max budgeted retries x 6 + 3 + 2 transitions. |
+| DISPATCHED -> RUNNING | On the first progress report or result -- the evidence it executes. A worker's dispatch ack keeps it DISPATCHED. A superseded sub's late report proves nothing. |
+| Claim | PENDING -> DISPATCHED once cores are allocated, before anything is sent, so a cancellation racing the send sees it dispatched; sends are withheld for a workflow that left DISPATCHED/RUNNING, and plans a worker took after it did are cancelled again. |
+| Failed dispatch | Capacity waits (no cores; readiness refusals; stale pool entries; withheld sends) are not failures: the workflow returns to PENDING, spends no retry budget, waits event-driven, bounded by the job's deadline (AD-34). Undeliverable or refused dispatches spend one AD-44 unit and back off; once the budget is spent the workflow fails for good, its dependents cascade, and the job closes with the cause. `max_dispatch_attempts` is gone. |
+| Retry chain | FAILED -> FAILED_CANCELING_DEPENDENTS -> FAILED_READY_FOR_RETRY -> PENDING is applied in one synchronous step: an observable FAILED is always terminal. Its dependents wait on its completion, so none can have started. |
+| Worker loss | Decided by the job's leader only (followers mirror the superseded subs). A loss is charged to the workflow's retry budget when attributable (an unexplained death, a restarted incarnation, an AD-41 over-budget eviction, an AD-30 stall, an orphan); our own deadline eviction and anything during the AD-19 systemic hold are not. Without a dispatch entry to run it again (a takeover without its payload) it fails loudly. |
+| Dependencies | Stored on `WorkflowInfo.dependency_workflow_ids`; a failure cascades along them in one iterative sweep (no recursion), dependents leave the dispatch queue with it. |
+| Cancellation | PENDING -> CANCELLING -> CANCELLED at once; DISPATCHED/RUNNING -> CANCELLING until the workers confirm (or the cancelled results arrive, or the worker is lost); a workflow cancelled while its job goes on counts as failed. Single-workflow cancel is real: the leader cancels the workflow and (by request) its dependents, or fails them. CANCELLING past the cancel window (`CANCELLED_WORKFLOW_TIMEOUT`) is forced to CANCELLED. |
+| Snapshots | Carry `lifecycle_state`, `retry_generation`, `dependency_workflow_ids`. A follower mirrors its fenced leader; the job's own leader -- and a worker's report, which is evidence only -- merges forward by `(retry_generation, WORKFLOW_STATE_RANK)` and never regresses. |
+| AD-34 progress | Lifecycle transitions and worker reports whose completed/failed counts advanced restart the stuck clock; each AD-26 extension adds its (log-decaying) grant to the tolerated silence. Only work in flight can be stuck. |
+| Verification | `tests/unit/simulation/sim/test_multiprocess_workflow_lifecycle.py` runs real jobs and judges every manager's recorded history with `WorkflowLifecycleOracle`. |
 
 ---
 
@@ -17276,7 +17332,7 @@ class ManagerServer:
 ### Progress Reporting Integration
 
 ```python
-# Integrate with WorkflowStateMachine from AD-33
+# Integrate with WorkflowStateMachine from AD-54
 async def _on_workflow_state_transition(
     self,
     job_id: str,
@@ -17504,7 +17560,7 @@ If partition lasts 5+ minutes:
 
 ## Part 9: Complete Workflow Integration
 
-### Progress Tracking with AD-33 State Machine
+### Progress Tracking with AD-54 State Machine
 
 ```python
 # Enhance WorkflowStateMachine to track progress
@@ -17657,7 +17713,7 @@ ServerWarning: "Failed to send global timeout to us-east: Connection refused"
 | `distributed_rewrite/models/distributed.py` | JobProgressReport, JobTimeoutReport, JobGlobalTimeout, JobLeaderTransfer messages |
 | `nodes/manager.py` | Strategy selection, unified timeout loop, leader transfer handling |
 | `nodes/gate.py` | GateJobTracker, global timeout loop, broadcast coordination |
-| `distributed_rewrite/workflow/state_machine.py` | Progress tracking integration (from AD-33) |
+| `distributed_rewrite/workflow/state_machine.py` | Progress tracking integration (from AD-54) |
 
 ---
 
@@ -17678,7 +17734,7 @@ ServerWarning: "Failed to send global timeout to us-east: Connection refused"
 - Implement GateJobTracker and global timeout loop
 - Enable gate_addr-based strategy selection
 
-**Phase 4**: Integration with AD-33
+**Phase 4**: Integration with AD-54
 - Connect WorkflowStateMachine progress events
 - Timeout strategies receive workflow state transitions
 - Complete stuck workflow detection
@@ -17692,7 +17748,7 @@ AD-34 introduces **adaptive job timeout with multi-DC coordination** that:
 ✅ **Auto-detects topology** - Uses local authority (single-DC) or gate coordination (multi-DC)
 ✅ **Robust to failures** - Leader transfers, gate failures, network partitions
 ✅ **Race condition safe** - Fence tokens, timestamps, status corrections
-✅ **Detects stuck workflows** - Progress tracking via AD-33 state machine
+✅ **Detects stuck workflows** - Progress tracking via AD-54 state machine
 ✅ **Global consistency** - Gate ensures timeout cancels job in ALL DCs
 ✅ **Fallback protection** - Managers timeout locally if gate unreachable (5 min)
 ✅ **Zero configuration** - Strategy chosen per-job based on `gate_addr`
@@ -20477,6 +20533,17 @@ Different operations require different durability guarantees. Using GLOBAL durab
 
 ## Part 3.3: Acknowledgment Windows (Worker Communication)
 
+> **As built (2026-10):** realized without a separate ack-window manager.
+> Dispatch never blocks on a worker: a dispatched workflow stays DISPATCHED
+> until its first progress report or result proves it runs (AD-54). A
+> worker that never received it is found by the manager's orphan
+> reconciliation (`_orphan_scan_loop`: the manager asks each worker what it
+> holds and re-places what it lost), and a worker that holds it but goes
+> silent by AD-30's per-job responsiveness suspicion
+> (`_job_responsiveness_loop`), with AD-26 extensions as the healthy-but-busy
+> "extend window" path. The state machine below is the design those pieces
+> implement.
+
 Workers under load cannot provide timely acks. Instead of blocking on worker responses, use **Acknowledgment Windows**.
 
 **Traditional Approach (WRONG for workers under load)**:
@@ -20829,6 +20896,31 @@ Resolution priority (deterministic):
 
 ## Part 6: Anti-Entropy and Repair
 
+> **Not the design (decided 2026-10): Raft's log repair is.** This part
+> assumed regions replicate a job's events asynchronously and drift apart,
+> so a Merkle tree over job ranges finds what diverged and Part 5's
+> conflict rules merge it. As built, a job's ledger events are entries in
+> the job's Raft log -- the manager tier's group for REGIONAL, the gate
+> tier's group, whose members span the regions, for GLOBAL
+> (`raft/ledger_replicator.py`) -- and every member applies them, in the one
+> committed order, into its `JobLedgerReplica`. The steps below map onto
+> what Raft already does:
+>
+> | Here | As built |
+> |---|---|
+> | Root-hash exchange finds a divergent replica | AppendEntries' consistency check (previous index and term) finds the first entry a member lacks or holds wrongly |
+> | Drill down to the divergent job range | The leader backs that member's next index up to the point of agreement (Raft §5.3) |
+> | Fetch events from the authority | The leader resends its log from there; a member added later (a learner, AD-52) receives the whole log |
+> | Merge with conflict resolution | Nothing to merge: one leader orders every event, and a member's conflicting suffix is uncommitted and replaced (log matching). Competing writers for one job are fenced by AD-10 tokens |
+> | Recompute and verify hashes | The commit index: an entry counts as REGIONAL or GLOBAL only once a quorum holds it (`RaftNode.members_holding`) |
+>
+> State kept outside a job's log has its own repair: each job's leader
+> re-syncs the job to its peer managers every
+> `MANAGER_PEER_JOB_SYNC_INTERVAL`, a follower's copy that falls silent asks
+> the job's leader before retention drops it, and gates version job
+> replicas by (fence, sequence) so a takeover adopts the freshest one a
+> quorum holds.
+
 Merkle tree-based consistency verification:
 
 **Merkle Tree Structure**:
@@ -21001,6 +21093,14 @@ Efficient recovery through periodic snapshots:
 ---
 
 ## Part 8: Session Consistency Guarantees
+
+> **Not built (2026-10).** Reads are not leveled: `JobLedger.get_job` answers
+> from the node's own ledger (the jobs it leads or took over, read-your-writes
+> for writes made through it), and `JobLedgerReplica` answers for jobs whose
+> groups the node is a member of. An unused `ConsistencyLevel` parameter that
+> `get_job` ignored was removed. A STRONG (linearizable) read would confirm
+> the job group leader's commit index with a quorum before answering -- Raft's
+> ReadIndex, part of AD-52's remaining work.
 
 Read consistency levels for different use cases:
 
@@ -23024,6 +23124,13 @@ class CircuitOpenError(Exception):
 
 ## Part 11: File Organization
 
+> **Planned layout, not the tree as built.** The ledger lives in
+> `hyperscale/distributed/ledger/` (events, WAL, checkpoint, archive,
+> storage format, commit pipeline, replica); its REGIONAL and GLOBAL legs
+> are the per-job Raft groups in `hyperscale/distributed/raft/`. There is no
+> `consensus/`, `anti_entropy/` (Part 6), `session/` or `coordination/`
+> package: Part 3.3's acknowledgment windows are AD-54's DISPATCHED state.
+
 ```
 hyperscale/distributed_rewrite/ledger/
 ├── __init__.py
@@ -23109,7 +23216,7 @@ ManagerNode
 │   └── Aggregates worker progress (uses Logger)
 ├── CircuitBreaker (AD-38)
 │   └── For cross-DC gate communication
-├── WorkflowStateMachine (AD-33)
+├── WorkflowStateMachine (AD-54)
 │   └── Persists state transitions to WAL
 ├── FederatedHealthMonitor (AD-33)
 │   └── Reads global ledger for cross-DC state
@@ -23179,6 +23286,23 @@ WorkerNode
 ---
 
 ## Part 14: Per-Job Viewstamped Replication
+
+> **Not the design (decided 2026-10): per-job Raft is.** This section argued
+> for Viewstamped Replication over Raft; the system was built on per-job
+> Raft groups instead, and AD-52's membership work builds on that Raft. The
+> ideas below map onto what was built:
+>
+> | VSR here | As built (per-job Raft, `hyperscale/distributed/raft/`) |
+> |---|---|
+> | View number / fencing token | Raft term; job fence tokens are derived from it (AD-10) |
+> | Primary from hash ring + lease | Leader elected by the job's group (PreVote, leader stickiness, randomized timeouts); the job leader proposes through it |
+> | View change on lease expiry | Election when the leader goes quiet past the election timeout |
+> | Durable-before-ack quorum | AD-38 REGIONAL: an entry commits once a quorum of the group's voters holds it -- never fewer than a majority of the configured cohort |
+> | Replica set | The group's voters and learners (`RaftConfiguration`), changed only through the log by joint consensus (AD-52 slice A) |
+> | Log matching "not needed" | Raft's log matching and leader completeness hold, and are checked by `tests/unit/simulation/sim/test_raft_membership_vopr.py` |
+>
+> Cross-datacenter (GLOBAL) placement is judged on the same groups
+> (`RaftNode.members_holding`); see `raft/ledger_replicator.py`.
 
 This section defines the maximally correct, robust, and performant architecture for global job ledger replication across datacenters, integrated with the existing per-job leadership model.
 
@@ -28117,12 +28241,13 @@ def portable_fsync(file) -> None:
     """
     Portable fsync that works correctly on all platforms.
 
-    Python's os.fsync() handles platform differences:
-    - Linux: fdatasync() or fsync()
-    - macOS: fcntl(F_FULLFSYNC) when available
-    - Windows: FlushFileBuffers()
-
-    For extra safety on macOS (which may lie about fsync):
+    Python's os.fsync() calls the platform's fsync (FlushFileBuffers on
+    Windows). On macOS that only moves data to the drive, which may keep
+    it in its volatile cache (fsync(2)), so a durable sync there is
+    fcntl(F_FULLFSYNC) -- os.fsync never issues it. Implemented as
+    RealFilesystem._sync_durably (hyperscale/core/runtime/real_filesystem.py),
+    which every filesystem sync goes through: F_FULLFSYNC on macOS, fsync
+    on a filesystem that reports it unsupported, any other error raised.
     """
     import sys
 
@@ -28473,6 +28598,18 @@ This is the implementation documented in Part 12 (WALWriter/WALReader classes) a
 ---
 
 ## Part 14: High-Concurrency Reading and Buffer Architecture
+
+> **Superseded (2026-10) -- Parts 14-16 describe a buffer layer that was
+> never built and is not needed.** The ledger WAL stack that was built
+> instead has neither problem these parts solve: `NodeWAL` recovery reads
+> the whole log in ONE `Filesystem.read_bytes` call and parses its frames
+> in memory (no per-entry executor round trips -- Part 14's reading
+> problem), and `WALWriter` is a single writer task draining a bounded
+> queue with batched group commit and one durable sync per batch (Part
+> 15's single writer), behind the `Filesystem` seam that also gives SIM
+> its storage faults. `BufferPool`, `DoubleBuffer`, `SingleWriterBuffer`,
+> `SingleReaderBuffer`, `ReaderPool`, `IndexedReader` and `wait_durable`
+> do not exist; read the code in `hyperscale/distributed/ledger/wal/`.
 
 This section addresses two critical questions:
 1. **How do we implement high-concurrency reading that is asyncio-compatible and portable?**
@@ -32841,11 +32978,13 @@ class GateJobHandler:
                     original_job_id=entry.job_id or "",
                 )
             else:
-                # PENDING with no result - shouldn't happen if wait_for_pending=True
+                # PENDING with no result - shouldn't happen if wait_for_pending=True.
+                # Worded in the shared transient vocabulary
+                # (protocol/transient_errors.py): the sender retries.
                 return JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error="Request pending, please retry",
+                    error="submission in progress, retry",
                 )
 
         # New request - forward to manager
@@ -32930,11 +33069,13 @@ class ManagerJobHandler:
                     original_job_id=entry.job_id,
                 )
             else:
-                # Still PENDING - race condition, return pending response
+                # Still PENDING - race condition, return pending response,
+                # worded in the shared transient vocabulary so the gate
+                # retries this manager instead of dispatching elsewhere
                 return JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error="Request pending",
+                    error="submission in progress, retry",
                 )
 
         # Process submission

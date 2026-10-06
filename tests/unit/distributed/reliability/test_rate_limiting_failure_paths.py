@@ -27,7 +27,6 @@ from hyperscale.distributed.reliability import (
     RateLimitResult,
     ServerRateLimiter,
     SlidingWindowCounter,
-    TokenBucket,
 )
 from hyperscale.distributed.reliability.rate_limiting import (
     RateLimitRetryConfig,
@@ -109,68 +108,6 @@ class TestSlidingWindowCounterEdgeCases:
         # Some should succeed after window rotation
         success_count = sum(1 for r in results if r)
         assert success_count >= 1
-
-
-class TestTokenBucketEdgeCases:
-    """Test edge cases in TokenBucket (legacy)."""
-
-    def test_acquire_zero_tokens(self) -> None:
-        """Test acquiring zero tokens."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)
-
-        result = bucket.acquire(0)
-        assert result is True
-        assert bucket.available_tokens == pytest.approx(10.0, abs=0.1)
-
-    def test_acquire_more_than_bucket_size(self) -> None:
-        """Test acquiring more tokens than bucket size."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)
-
-        result = bucket.acquire(100)
-        assert result is False
-
-    def test_bucket_with_zero_size(self) -> None:
-        """Test bucket with zero size."""
-        bucket = TokenBucket(bucket_size=0, refill_rate=1.0)
-
-        assert bucket.available_tokens == 0.0
-        result = bucket.acquire(1)
-        assert result is False
-
-    def test_bucket_with_zero_refill_rate(self) -> None:
-        """Test bucket with zero refill rate."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=0.0)
-
-        bucket.acquire(10)
-        time.sleep(0.1)
-        assert bucket.available_tokens == pytest.approx(0.0, abs=0.01)
-
-    def test_try_acquire_zero_refill_returns_infinity(self) -> None:
-        """Test try_acquire with zero refill returns infinity wait."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=0.0)
-
-        bucket.acquire(10)
-        acquired, wait_time = bucket.try_acquire(1)
-
-        assert acquired is False
-        assert wait_time == float("inf")
-
-    def test_bucket_with_very_high_refill_rate(self) -> None:
-        """Test bucket with very high refill rate."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=10000.0)
-
-        bucket.acquire(100)
-        time.sleep(0.01)
-        assert bucket.available_tokens == pytest.approx(100.0, abs=1.0)
-
-    @pytest.mark.asyncio
-    async def test_acquire_async_with_zero_wait(self) -> None:
-        """Test async acquire with zero max_wait."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)
-        bucket.acquire(10)
-
-        result = await bucket.acquire_async(5, max_wait=0.0)
-        assert result is False
 
 
 class TestAdaptiveRateLimiterEdgeCases:

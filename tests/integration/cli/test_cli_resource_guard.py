@@ -205,7 +205,12 @@ async def test_over_budget_workflow_is_killed_before_it_would_finish(
         assert await manager.wait_for_output("Resource kill of workflow", "requested", within=0.0), (
             "".join(manager.lines[-40:])
         )
-        assert result.status != "completed", result
+        # The killed workflow failed, and the job fails on it at once with the
+        # kill's reason -- not at its AD-34 timeout (a workflow whose
+        # sub-workflows all come back CANCELLED outside a job cancel was
+        # left unmarked, so the job's arithmetic never closed).
+        assert result.status == "failed", result
+        assert "resource budget exceeded" in (result.error or ""), result
         assert ended_after < BURN_DURATION_SECONDS, (
             f"job ended after {ended_after:.1f}s: it ran to its own duration, it was not killed"
         )

@@ -311,3 +311,114 @@ async def run_join(node: str, target: str, client_port: int) -> tuple[int, str]:
         process.communicate(), timeout=default_join_timeout_seconds(Env()) * 2
     )
     return process.returncode, output.decode(errors="replace")
+
+
+async def run_remove(node: str, member: str, client_port: int) -> tuple[int, str]:
+    """Run `hyperscale remove --node NODE --member MEMBER`; (returncode,
+    output). Bounded by twice the CLI's own budget: the slower tier's
+    standard TCP timeout plus a formation interval, per node it asks."""
+    environment = Env()
+    remove_budget = (
+        max(environment.MANAGER_TCP_TIMEOUT_STANDARD, environment.GATE_TCP_TIMEOUT_STANDARD)
+        + environment.CLUSTER_FORMATION_INTERVAL_SECONDS
+    )
+    process = await asyncio.create_subprocess_exec(
+        HYPERSCALE, "remove", "--node", node, "--member", member, "--port", str(client_port),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await asyncio.wait_for(process.communicate(), timeout=remove_budget * 2 * 2)
+    return process.returncode, output.decode(errors="replace")
+
+
+async def run_membership_mode(node: str, mode: str, client_port: int) -> tuple[int, str]:
+    """Run `hyperscale membership --node NODE --mode MODE`; (returncode,
+    output). Bounded like `run_remove`: one leader hop plus a commit, twice
+    over."""
+    environment = Env()
+    mode_budget = (
+        max(environment.MANAGER_TCP_TIMEOUT_STANDARD, environment.GATE_TCP_TIMEOUT_STANDARD)
+        + environment.CLUSTER_FORMATION_INTERVAL_SECONDS
+    )
+    process = await asyncio.create_subprocess_exec(
+        HYPERSCALE, "membership", "--node", node, "--mode", mode, "--port", str(client_port),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await asyncio.wait_for(process.communicate(), timeout=mode_budget * 2 * 2)
+    return process.returncode, output.decode(errors="replace")
+
+
+async def run_resize(node: str, change: str, member: str, client_port: int) -> tuple[int, str]:
+    """Run `hyperscale resize --node NODE --add|--remove MEMBER`;
+    (returncode, output). Bounded by twice the CLI's own budget: a hop and
+    the leader's greeting of every voter (one standard request each), plus
+    a formation interval for the commit."""
+    environment = Env()
+    standard_timeout = max(environment.MANAGER_TCP_TIMEOUT_STANDARD, environment.GATE_TCP_TIMEOUT_STANDARD)
+    resize_budget = 2 * standard_timeout + environment.CLUSTER_FORMATION_INTERVAL_SECONDS
+    process = await asyncio.create_subprocess_exec(
+        HYPERSCALE, "resize", "--node", node, f"--{change}", member, "--port", str(client_port),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await asyncio.wait_for(process.communicate(), timeout=resize_budget * 2)
+    return process.returncode, output.decode(errors="replace")
+
+
+async def run_cluster_status(node: str, client_port: int) -> tuple[int, str]:
+    """Run `hyperscale cluster --node NODE`; (returncode, output). Bounded
+    by twice the CLI's own budget: a hop plus the leader's confirmation."""
+    environment = Env()
+    status_budget = (
+        max(environment.MANAGER_TCP_TIMEOUT_STANDARD, environment.GATE_TCP_TIMEOUT_STANDARD)
+        + environment.CLUSTER_FORMATION_INTERVAL_SECONDS
+    )
+    process = await asyncio.create_subprocess_exec(
+        HYPERSCALE, "cluster", "--node", node, "--port", str(client_port),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await asyncio.wait_for(process.communicate(), timeout=status_budget * 2)
+    return process.returncode, output.decode(errors="replace")
+
+
+async def run_cluster_metrics(node: str, client_port: int) -> tuple[int, str]:
+    """Run `hyperscale cluster --node NODE --metrics`; (returncode, output),
+    bounded like `run_cluster_status`."""
+    environment = Env()
+    metrics_budget = (
+        max(environment.MANAGER_TCP_TIMEOUT_STANDARD, environment.GATE_TCP_TIMEOUT_STANDARD)
+        + environment.CLUSTER_FORMATION_INTERVAL_SECONDS
+    )
+    process = await asyncio.create_subprocess_exec(
+        HYPERSCALE, "cluster", "--node", node, "--metrics", "--port", str(client_port),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await asyncio.wait_for(process.communicate(), timeout=metrics_budget * 2)
+    return process.returncode, output.decode(errors="replace")
+
+
+async def run_job_command(
+    subcommand: str,
+    job_id: str,
+    managers: list[str],
+    client_port: int,
+    tier_flag: str = "--managers",
+    extra_arguments: tuple[str, ...] = (),
+) -> tuple[int, str]:
+    """Run `hyperscale job SUBCOMMAND --job-id JOB TIER_FLAG NODES... EXTRA...`
+    (``managers`` are the nodes asked: gates with ``tier_flag="--gates"``);
+    (returncode, output). Bounded by twice the slowest tier's standard TCP
+    timeout per node asked -- a forwarded read is one more request."""
+    environment = Env()
+    budget = 2 * len(managers) * max(environment.MANAGER_TCP_TIMEOUT_STANDARD, environment.GATE_TCP_TIMEOUT_STANDARD)
+    process = await asyncio.create_subprocess_exec(
+        HYPERSCALE, "job", subcommand, "--job-id", job_id, tier_flag, *managers, *extra_arguments,
+        "--port", str(client_port),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await asyncio.wait_for(process.communicate(), timeout=budget)
+    return process.returncode, output.decode(errors="replace")

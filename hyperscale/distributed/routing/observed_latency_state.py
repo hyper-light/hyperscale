@@ -11,11 +11,6 @@ import statistics
 from collections import deque
 from typing import Deque
 
-from hyperscale.distributed.runtime import Clock, RealClock
-
-
-_DEFAULT_CLOCK: Clock = RealClock()
-
 
 @dataclass(slots=True)
 class ObservedLatencyState:
@@ -50,18 +45,16 @@ class ObservedLatencyState:
         self,
         latency_ms: float,
         alpha: float,
-        now: float | None = None,
+        now: float,
     ) -> None:
         """
-        Record an observed job completion latency.
+        Record an observed job latency.
 
         Args:
             latency_ms: Observed latency in milliseconds.
             alpha: EWMA decay factor (0.0-1.0, higher = more responsive).
-            now: Current monotonic time for testing.
+            now: The observing node's monotonic time.
         """
-        current_time = now or _DEFAULT_CLOCK.monotonic()
-
         if self.sample_count == 0:
             self.ewma_ms = latency_ms
             self.ewma_variance = 0.0
@@ -73,7 +66,7 @@ class ObservedLatencyState:
             )
 
         self.sample_count += 1
-        self.last_update = current_time
+        self.last_update = now
 
         # Jitter tracking (Task 61)
         if self._last_latency_ms > 0:
@@ -118,9 +111,8 @@ class ObservedLatencyState:
             return 0.0
         return self.ewma_variance**0.5
 
-    def is_stale(self, max_age_seconds: float, now: float | None = None) -> bool:
+    def is_stale(self, max_age_seconds: float, now: float) -> bool:
         """Return True when observations are stale."""
-        current_time = now or _DEFAULT_CLOCK.monotonic()
-        if self.last_update == 0.0:
+        if self.sample_count == 0:
             return True
-        return (current_time - self.last_update) > max_age_seconds
+        return (now - self.last_update) > max_age_seconds

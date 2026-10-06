@@ -64,6 +64,16 @@ TRANSIENT_ERRORS = frozenset({
     # warmup window (JobAck error "initializing" from the gate's
     # submission handler): capacity is seconds away, retry.
     "initializing",
+    # A manager with no registered worker ("No workers registered in
+    # this datacenter; rejecting job submission") refuses until workers
+    # register -- the boot window, or workers rejoining after a restart.
+    "no workers registered",
+    # AD-52: a manager or gate whose tier has not formed its cluster
+    # membership ("Cluster membership not formed yet; retry") -- at boot,
+    # or while a cluster that could no longer commit is founded anew. A
+    # job's Raft group is founded with the membership's members, so the
+    # node refuses until it forms, within a few formation rounds.
+    "membership not formed",
 })
 
 

@@ -5,9 +5,10 @@ Gossip buffer for SWIM membership update dissemination.
 import heapq
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Callable
 
 from hyperscale.distributed.swim.core.types import UpdateType
+from .gossip_buffer_stats import GossipBufferStats
 from .piggyback_update import PiggybackUpdate
 
 from hyperscale.distributed.runtime import Clock, RealClock
@@ -62,9 +63,9 @@ class GossipBuffer:
     _overflow_count: int = 0  # Times we had to evict due to capacity
     
     # Callbacks
-    _on_overflow: Any = None  # Callable[[int, int], None] - (evicted, capacity)
+    _on_overflow: Callable[[int, int], None] | None = None  # (evicted, capacity)
     
-    def set_overflow_callback(self, callback: Any) -> None:
+    def set_overflow_callback(self, callback: Callable[[int, int], None]) -> None:
         """Set callback to be called when buffer overflows and eviction occurs."""
         self._on_overflow = callback
 
@@ -352,10 +353,9 @@ class GossipBuffer:
         if evicted > 0:
             self._overflow_count += 1
             if self._on_overflow:
-                try:
-                    self._on_overflow(evicted, self.max_updates)
-                except Exception:
-                    pass  # Don't let callback errors affect buffer operations
+                # Eviction is complete: a failing callback raises to the
+                # caller with the buffer already consistent.
+                self._on_overflow(evicted, self.max_updates)
         
         return evicted
     
@@ -413,7 +413,7 @@ class GossipBuffer:
             'pending_updates': len(self.updates),
         }
     
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> GossipBufferStats:
         """Get buffer statistics for monitoring."""
         return {
             'pending_updates': len(self.updates),

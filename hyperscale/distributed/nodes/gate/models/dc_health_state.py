@@ -2,32 +2,21 @@
 Datacenter health state tracking.
 
 Tracks datacenter manager health, registration, and backpressure.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
-
-from hyperscale.distributed.models import (
-    ManagerHeartbeat,
-    DatacenterRegistrationState,
-)
-from hyperscale.distributed.health import (
-    ManagerHealthState,
-    ManagerHealthConfig,
-)
+from hyperscale.distributed.models import ManagerHeartbeat, DatacenterRegistrationState
+from hyperscale.distributed.health import ManagerHealthState, ManagerHealthConfig
 from hyperscale.distributed.reliability import BackpressureLevel
 from hyperscale.distributed.slo import SLOSummary
 
-
-@dataclass(slots=True)
-class ManagerTracking:
-    """Tracks a single manager's state."""
-
-    address: tuple[str, int]
-    datacenter_id: str
-    last_heartbeat: ManagerHeartbeat | None = None
-    last_status_time: float = 0.0
-    health_state: ManagerHealthState | None = None
-    backpressure_level: BackpressureLevel = BackpressureLevel.NONE
+from .manager_tracking import ManagerTracking
 
 
 @dataclass(slots=True)
@@ -145,3 +134,10 @@ class DCHealthState:
             datacenter_id: self.get_dc_slo_summary(datacenter_id)
             for datacenter_id in self.manager_status
         }
+
+_REHOMED = (
+    ManagerTracking,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

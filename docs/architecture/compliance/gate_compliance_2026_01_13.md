@@ -30,7 +30,7 @@
 | AD-10 | Versioned State Clock | `VersionedStateClock` in server.events |
 | AD-11 | Job Ledger | `JobLedger` in distributed.ledger |
 | AD-12 | Consistent Hash Ring | `ConsistentHashRing` in jobs.gates |
-| AD-13 | Job Forwarding | `JobForwardingTracker` in jobs.gates |
+| AD-13 | Job Forwarding | gate `_forward_job_*_to_peers` (single hop: `job_final_result_forwarded` never re-forwards) |
 | AD-14 | Stats CRDT | `JobStatsCRDT` in models |
 | AD-15 | Windowed Stats | `WindowedStatsCollector`, `WindowedStatsPush` in jobs |
 | AD-16 | DC Health Classification | 4-state model (HEALTHY/BUSY/DEGRADED/UNHEALTHY), `classify_datacenter_health` in health_coordinator |

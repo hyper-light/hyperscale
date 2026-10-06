@@ -4,11 +4,11 @@ import asyncio
 import binascii
 import base64
 import mimetypes
+import pathlib
 import ssl
 import secrets
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from typing import (
     Any,
@@ -63,6 +63,10 @@ from .models.http import (
     HTTPResponse,
 )
 from .protocols import HTTPConnection
+
+# A file's content type by its name: guess_file_type from Python 3.13,
+# guess_type before it.
+_guess_file_type = getattr(mimetypes, "guess_file_type", mimetypes.guess_type)
 
 
 class MercurySyncHTTPConnection:
@@ -645,13 +649,10 @@ class MercurySyncHTTPConnection:
             self._optimized[optimized_param.call_name] = optimized_param
 
     async def _optimize_url(self, optimized_url: URL):
-
-        upgrade_ssl: bool = False
         (
             _,
             connection,
             url,
-            upgrade_ssl,
             _
         ) = await asyncio.wait_for(
             self._connect_to_url_location(
@@ -660,26 +661,13 @@ class MercurySyncHTTPConnection:
             ),
             timeout=self.timeouts.request_timeout,
         )
-        if upgrade_ssl:
-            optimized_url.data = optimized_url.data.replace("http://", "https://")
 
-            await optimized_url.optimize()
+        # Plain-string requests for the same address reuse this lookup: the
+        # resolved URL, under the key the connect path reads. One that never
+        # resolved is left for the connect path to look up.
+        if url.ip_addresses:
+            self._url_cache[url.target] = url
 
-            (
-                _,
-                connection,
-                url,
-                _,
-                _,
-            ) = await asyncio.wait_for(
-                self._connect_to_url_location(
-                    None,
-                    optimized_url,
-                ),
-                timeout=self.timeouts.request_timeout,
-            )
-
-        self._url_cache[optimized_url.optimized.hostname] = url
         self._optimized[optimized_url.call_name] = url
 
         connection.reset()
@@ -745,25 +733,11 @@ class MercurySyncHTTPConnection:
         if redirect and (
             location := result.headers.get(b'location')
         ):
-            location = location.decode()
+            # Each location resolves against the address it came from (RFC
+            # 3986: absolute, host-relative and path-relative alike).
+            location = urljoin(url.data if isinstance(url, URL) else url, location.decode())
 
             redirects_taken = 1
-
-            upgrade_ssl = False
-
-            if "http" not in location and "https" not in location:
-                parsed_url: ParseResult = urlparse(url)
-
-                if parsed_url.params:
-                    location += parsed_url.params
-
-                location = urljoin(
-                    f'{parsed_url.scheme}://{parsed_url.hostname}',
-                    location
-                )
-
-            if "https" in location and "https" not in url:
-                upgrade_ssl = True
 
             for idx in range(redirects):
 
@@ -773,7 +747,6 @@ class MercurySyncHTTPConnection:
                         location,
                         idx + 1,
                         redirects,
-                        is_ssl_upgrade=upgrade_ssl,
                     )
 
                 (
@@ -790,7 +763,6 @@ class MercurySyncHTTPConnection:
                     params=params,
                     data=data,
                     files=files,
-                    upgrade_ssl=upgrade_ssl,
                     redirect_url=location,
                     timings=timings,
                     span=span,
@@ -799,11 +771,10 @@ class MercurySyncHTTPConnection:
                 if redirect is False:
                     break
 
-                location = result.headers.get(b"location").decode()
+                if (next_location := result.headers.get(b"location")) is None:
+                    break
 
-                upgrade_ssl = False
-                if "https" in location and "https" not in url:
-                    upgrade_ssl = True
+                location = urljoin(location, next_location.decode())
 
                 redirects_taken += 1
 
@@ -832,7 +803,6 @@ class MercurySyncHTTPConnection:
             | Data
         ) = None,
         files: str | File | list[File | str] | None = None,
-        upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
             Literal[
@@ -883,38 +853,15 @@ class MercurySyncHTTPConnection:
                 error,
                 connection,
                 url,
-                upgrade_ssl,
                 span,
             ) = await phase_timeout.run(
                 self._connect_to_url_location(
                     connection,
                     request_url,
-                    ssl_redirect_url=request_url if upgrade_ssl else None,
                     span=span,
                 ),
                 timeout=self.timeouts.request_timeout,
             )
-
-            if upgrade_ssl:
-                ssl_redirect_url = request_url.replace("http://", "https://")
-
-                (
-                    error,
-                    connection,
-                    url,
-                    _,
-                    span,
-                ) = await phase_timeout.run(
-                    self._connect_to_url_location(
-                        connection,
-                        request_url,
-                        ssl_redirect_url=ssl_redirect_url,
-                        span=span,
-                    ),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-                request_url = ssl_redirect_url
 
             encoded_data: Optional[bytes | List[bytes]] = None
             content_type: Optional[str] = None
@@ -964,7 +911,9 @@ class MercurySyncHTTPConnection:
             encoded_data: Optional[bytes | List[bytes]] = None
             content_type: Optional[str] = None
 
-            if data:
+            # Data that is falsy but encodes to bytes ({} or []) is a body like
+            # any other.
+            if data is not None:
                 encoded_data, content_type = self._encode_data(data)
 
             if files:
@@ -976,6 +925,7 @@ class MercurySyncHTTPConnection:
                 ) = await self._upload_files(
                     files,
                     encoded_data,
+                    content_type,
                     headers,
                 )
 
@@ -1020,7 +970,9 @@ class MercurySyncHTTPConnection:
                 params=params,
                 headers=headers,
                 cookies=cookies,
-                data=data,
+                # With files the body is the multipart one: its length, not
+                # a Data model's.
+                data=None if files else data,
                 encoded_data=encoded_data,
                 content_type=content_type,
             )
@@ -1033,7 +985,8 @@ class MercurySyncHTTPConnection:
                     encoded_headers,
                 )
 
-            if isinstance(encoded_data, Iterator):
+            if isinstance(encoded_data, list):
+                # The framed chunks, then the last chunk that ends the body.
                 for chunk in encoded_data:
                     connection.write(chunk)
 
@@ -1045,7 +998,7 @@ class MercurySyncHTTPConnection:
 
                 connection.write(("0" + NEW_LINE * 2).encode())
 
-            elif data:
+            elif data or encoded_data:
                 connection.write(encoded_data)
 
                 if span and self.trace.enabled:
@@ -1260,33 +1213,24 @@ class MercurySyncHTTPConnection:
         self,
         connection: HTTPConnection | None,
         request_url: str | URL,
-        ssl_redirect_url: Optional[str | URL] = None,
         span: Span | None = None
     ) -> Tuple[
         Optional[Exception],
         HTTPConnection,
         HTTPUrl,
-        bool,
         Span,
     ]:
         if span and self.trace.enabled:
             span = await self.trace.on_connection_create_start(
                 span,
                 request_url,
-                ssl_upgrade_url=ssl_redirect_url,
             )
 
-        has_optimized_url = isinstance(request_url, URL)
-
-        if has_optimized_url:
-            parsed_url = request_url.optimized
-
-        elif ssl_redirect_url:
-            parsed_url = HTTPUrl(
-                ssl_redirect_url,
-                family=self.address_family,
-                protocol=self.address_protocol,
-            )
+        if isinstance(request_url, URL):
+            # Resolved when the workflow prepared it: never looked up here,
+            # and never read from or added to the lookup cache.
+            url = parsed_url = request_url.optimized
+            do_dns_lookup = False
 
         else:
             parsed_url = HTTPUrl(
@@ -1295,62 +1239,60 @@ class MercurySyncHTTPConnection:
                 protocol=self.address_protocol,
             )
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+            # A lookup serves only the address it resolved: its target (scheme
+            # and authority), not the hostname every port on a host shares.
+            cache_key = parsed_url.target
+            url = self._url_cache.get(cache_key)
+            do_dns_lookup = url is None
 
-        do_dns_lookup = (
-            url is None or ssl_redirect_url
-        ) and has_optimized_url is False
+            if do_dns_lookup:
+                if span and self.trace.enabled:
+                    span = await self.trace.on_dns_cache_miss(span)
 
-        if span and self.trace.enabled and do_dns_lookup:
-            span = await self.trace.on_dns_cache_miss(span)
+                dns_lock = self._dns_lock[cache_key]
+                dns_waiter = self._dns_waiters[cache_key]
 
-        if do_dns_lookup and dns_lock.locked() is False:
+                if dns_lock.locked() is False:
+                    if span and self.trace.enabled:
+                        span = await self.trace.on_dns_resolve_host_start(span)
 
-            if span and self.trace.enabled:
-                span = await self.trace.on_dns_resolve_host_start(span)
+                    try:
+                        async with dns_lock:
+                            url = parsed_url
+                            await url.lookup()
 
-            try:
-                async with dns_lock:
-                    url = parsed_url
-                    await url.lookup()
+                            if span and self.trace.enabled:
+                                span = await self.trace.on_dns_resolve_host_end(
+                                    span,
+                                    [address for address, _ in url],
+                                    url.port,
+                                )
+
+                            self._url_cache[cache_key] = url
+
+                    finally:
+                        # However the lookup ended, release its waiters; after
+                        # a failed or cancelled lookup the next request looks
+                        # up again with a fresh waiter.
+                        if dns_waiter.done() is False:
+                            dns_waiter.set_result(None)
+
+                        if cache_key not in self._url_cache:
+                            del self._dns_waiters[cache_key]
+
+                else:
+                    # Shielded: a waiter's cancellation must not cancel the
+                    # lookup future every other waiter shares.
+                    await asyncio.shield(dns_waiter)
+                    url = self._url_cache.get(cache_key)
 
                     if span and self.trace.enabled:
-                        span = await self.trace.on_dns_resolve_host_end(
+                        span = await self.trace.on_dns_cache_hit(
                             span,
                             [address for address, _ in url],
                             url.port,
                         )
 
-                    self._url_cache[parsed_url.hostname] = url
-
-            finally:
-                # However the lookup ended, release its waiters; after a
-                # failed or cancelled lookup the next request looks up
-                # again with a fresh waiter.
-                if dns_waiter.done() is False:
-                    dns_waiter.set_result(None)
-
-                if parsed_url.hostname not in self._url_cache:
-                    del self._dns_waiters[parsed_url.hostname]
-
-        elif do_dns_lookup:
-            # Shielded: a waiter's cancellation must not cancel the
-            # lookup future every other waiter shares.
-            await asyncio.shield(dns_waiter)
-            url = self._url_cache.get(parsed_url.hostname)
-
-            if span and self.trace.enabled:
-                span = await self.trace.on_dns_cache_hit(
-                    span,
-                    [address for address, _ in url],
-                    url.port,
-                )
-
-        elif has_optimized_url:
-            url = request_url.optimized
-            
         if span and self.trace.enabled and do_dns_lookup is False:
             span = await self.trace.on_dns_cache_hit(
                 span,
@@ -1365,14 +1307,12 @@ class MercurySyncHTTPConnection:
             # Reuses the connection's transport for this host; otherwise
             # races a new one across the host's addresses.
             address, socket_config, new_transport = await connection.connect_to_any(
+                parsed_url.target,
                 url.hostname,
                 url.ip_addresses,
                 url.port,
                 url.address_rotation,
-                ssl=self._client_ssl_context
-                if url.is_ssl or ssl_redirect_url
-                else None,
-                ssl_upgrade=ssl_redirect_url is not None,
+                ssl=self._client_ssl_context if url.is_ssl else None,
             )
 
             if new_transport:
@@ -1391,20 +1331,10 @@ class MercurySyncHTTPConnection:
                 err,
                 connection,
                 parsed_url,
-                False,
                 span,
             )
 
         except Exception as err:
-            if "server_hostname is only meaningful with ssl" in str(err):
-                return (
-                    err,
-                    connection,
-                    parsed_url,
-                    True,
-                    span,
-                )
-
             connection_error = err
 
         if span and self.trace.enabled:
@@ -1419,7 +1349,6 @@ class MercurySyncHTTPConnection:
                 connection_error,
                 connection,
                 parsed_url,
-                False,
                 span,
             )
 
@@ -1459,7 +1388,7 @@ class MercurySyncHTTPConnection:
         elif isinstance(data, str):
             encoded_data = data.encode()
 
-        elif isinstance(data, (memoryview, bytearray)):
+        elif isinstance(data, (bytes, memoryview, bytearray)):
             encoded_data = bytes(data)
 
         return encoded_data, content_type
@@ -1483,12 +1412,15 @@ class MercurySyncHTTPConnection:
 
         url_path = url.path
 
-        if isinstance(params, Params):
-            url_path += params.optimized
+        # The params follow any query the address has of its own: after "&"
+        # then, else after "?" (RFC 3986 3.4).
+        if params and isinstance(params, Params):
+            query = params.optimized[1:]
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
         elif params and len(params) > 0:
-            url_params = urlencode(params)
-            url_path += f"?{url_params}"
+            query = urlencode(params)
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
         port = url.port or (443 if url.scheme == "https" else 80)
         hostname = url.hostname.encode("idna").decode()
@@ -1500,13 +1432,13 @@ class MercurySyncHTTPConnection:
             f"{method} {url_path} HTTP/1.1{NEW_LINE}HOST: {hostname}{NEW_LINE}"
         )
 
-        if isinstance(auth, Auth):
+        if auth and isinstance(auth, Auth):
             header_items += auth.optimized
 
         elif auth:
             header_items += self._serialize_auth(auth)
 
-        if isinstance(headers, Headers):
+        if headers and isinstance(headers, Headers):
             header_items += headers.optimized
         elif headers:
             header_items += f"Keep-Alive: timeout=60, max=100000{NEW_LINE}User-Agent: hyperscale/client{NEW_LINE}"
@@ -1517,23 +1449,26 @@ class MercurySyncHTTPConnection:
         else:
             header_items += f"Keep-Alive: timeout=60, max=100000{NEW_LINE}User-Agent: hyperscale/client{NEW_LINE}"
 
-        size: int = 0
+        if isinstance(encoded_data, list):
+            # An iterator's body, framed chunk by chunk (RFC 9112 7.1): its
+            # length is not known ahead, so it goes chunked.
+            header_items += f"Transfer-Encoding: chunked{NEW_LINE}"
 
-        if isinstance(data, Data):
-            size = data.content_length
+        else:
+            size: int = 0
 
-        elif encoded_data and isinstance(encoded_data, Iterator):
-            size = sum([len(chunk) for chunk in encoded_data])
+            if data and isinstance(data, Data):
+                size = data.content_length
 
-        elif encoded_data:
-            size = len(encoded_data)
+            elif encoded_data:
+                size = len(encoded_data)
 
-        header_items += f"Content-Length: {size}{NEW_LINE}"
+            header_items += f"Content-Length: {size}{NEW_LINE}"
 
         if content_type:
             header_items += f"Content-Type: {content_type}{NEW_LINE}"
 
-        if isinstance(cookies, Cookies):
+        if cookies and isinstance(cookies, Cookies):
             header_items += cookies.optimized
 
         elif cookies:
@@ -1573,152 +1508,93 @@ class MercurySyncHTTPConnection:
     async def _upload_files(
         self,
         files: str | File | list[File | str],
-        body: bytes | None,
+        body: bytes | list[bytes] | None,
+        body_content_type: str | None,
         headers: dict[str, str] | Headers,
     ):
-        
-        with ThreadPoolExecutor(max_workers=len(files)) as exc:
+        """
+        The request's body as multipart/form-data (RFC 7578): a "data" part
+        holding the request's own data, when it has some, then one "file" part
+        per file -- its filename and content type, then its bytes -- and the
+        closing delimiter. Files named by path are read in the loop's executor;
+        File models were read when optimized. Returns the headers (unchanged),
+        the body, its content type, and the error that stopped it, if any.
+        """
+        try:
+            if isinstance(body, list):
+                raise ValueError("Data from an iterator cannot be sent alongside files")
 
-            try:
-                uploaded: list[tuple[str, str, str | bytes] | tuple[None, None, Exception]] = []
-                uploading: list[tuple[str, str, str] | tuple[None, None, Exception]] = []
+            file_list = files if isinstance(files, list) else [files]
+            loop = asyncio.get_running_loop()
 
-                if isinstance(files, File):
-                    (
-                        _,
-                        file_data,
-                        attrs
-                    ) = files.optimized
-                    uploaded.append((
-                        attrs.mime_type,
-                        attrs.encoding,
-                        file_data,
-                    ))
+            # Every path read at once, off the event loop.
+            loaded = await asyncio.gather(
+                *[
+                    loop.run_in_executor(None, self._load_file, file)
+                    for file in file_list
+                    if not isinstance(file, File)
+                ]
+            )
 
-                elif isinstance(files, list):
-                    for file in files:
-                        if isinstance(file, File):
-                            uploaded.append(file.optimized)
-                        else:
-                            uploading.append(
-                                asyncio.create_task(
-                                    self._loop.run_in_executor(
-                                        exc,
-                                        self._load_file,
-                                        file,
-                                    )
-                                )
-                            )
+            delimiter = self._boundary_break
+            buffer = bytearray()
 
-                else:
-                    uploading.append(
-                        asyncio.create_task(
-                            self._loop.run_in_executor(
-                                exc,
-                                self._load_file,
-                                files,
-                            )
-                        )
-                    )
-                    
-                if len(uploading) > 0:
-                    uploaded.extend(
-                        await asyncio.gather(*uploading)
-                    )
+            if body:
+                buffer += delimiter + b'\r\nContent-Disposition: form-data; name="data"\r\n'
+                if body_content_type:
+                    buffer += f"Content-Type: {body_content_type}\r\n".encode("latin-1")
 
-                for _, _, result in uploaded:
-                    
-                    if isinstance(result, Exception):
-                        return (
-                            None,
-                            None,
-                            None,
-                            result,
-                        )    
-                    
-                
-                buffer = bytearray()
+                buffer += b"\r\n" + body + b"\r\n"
 
-                if body:
-                    buffer.extend(body)
-                    content_length = len(body)
+            loaded_index = 0
+            for file in file_list:
+                if isinstance(file, File):
+                    (_, file_data, attributes) = file.optimized
+                    if file_data is None:
+                        raise IsADirectoryError(f"Cannot upload a directory: {file.data['path']}")
 
-                for content_type, encoding, upload_data in uploaded:
-
-                    if isinstance(upload_data, str):
-                        upload_data = upload_data.encode(encoding=encoding)
-
-                    if isinstance(headers, Headers):
-
-                        upload_headers = str(headers.optimized)
-                        upload_headers += f"Content-Disposition: form/data{NEW_LINE}Content-Type: {content_type}{NEW_LINE}"
-                        
-                        buffer.extend(
-                            b'\r\n'.join([
-                                self._boundary_break,
-                                upload_headers.encode(),
-                                upload_data,
-                            ])
-                        )
-
-                    else:
-                        headers_data = dict(headers)
-                        headers_data.update({
-                            "Content-Dispostition": "form/data",
-                            "Content-Type": content_type,
-                        })
-
-                        joined_headers = ""
-
-                        for key, value in headers_data.items():
-                            joined_headers += f"{key}: {value}{NEW_LINE}"
-                        
-                        buffer.extend(
-                            b'\r\n'.join([
-                                self._boundary_break,
-                                joined_headers.encode(),
-                                upload_data,
-                            ])
-                        )
-
-                content_length = len(buffer)
-
-                if isinstance(headers, Headers):
-                   
-                    headers.optimized += (
-                        f'boundary: {self._boundary}{NEW_LINE}'
-                        f'Content-Length: {content_length}{NEW_LINE}'
-                    )
+                    filename = pathlib.Path(file.data["path"]).name
+                    file_content_type = attributes.mime_type or "application/octet-stream"
 
                 else:
-                    headers.update({
-                        "boundary": self._boundary,
-                        "Content-Length": content_length,
-                    })
+                    filename, file_content_type, file_data = loaded[loaded_index]
+                    loaded_index += 1
 
-                return (
-                    headers,
-                    buffer,
-                    f"multipart/form-data; boundary={self._boundary}",
-                    None,
-                )
-                
+                # A quote, CR or LF in the filename is escaped as browsers
+                # escape it (WHATWG multipart/form-data): %22, %0D, %0A.
+                escaped_filename = filename.replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A")
+                buffer += delimiter + (
+                    f'\r\nContent-Disposition: form-data; name="file"; filename="{escaped_filename}"'
+                    f"\r\nContent-Type: {file_content_type}\r\n\r\n"
+                ).encode()
+                buffer += file_data + b"\r\n"
 
-            except Exception as err:
-                return (
-                    None,
-                    None,
-                    None,
-                    err,
-                )
-            
+            buffer += delimiter + b"--\r\n"
+
+            return (
+                headers,
+                bytes(buffer),
+                f"multipart/form-data; boundary={self._boundary}",
+                None,
+            )
+
+        except Exception as err:
+            return (
+                None,
+                None,
+                None,
+                err,
+            )
+
     def _load_file(
         self,
         path: str,
-        headers: dict[str, str],
-    ):
-        
-        mime_type, _ = mimetypes.guess_file_type(path)
+    ) -> tuple[str, str, bytes]:
+        """A file's name, content type and bytes: run in the loop's executor."""
+        filepath = pathlib.Path(path)
+        file_content_type, _ = _guess_file_type(filepath)
+
+        return filepath.name, file_content_type or "application/octet-stream", filepath.read_bytes()
 
     def close(self):
         for connection in self._connections:

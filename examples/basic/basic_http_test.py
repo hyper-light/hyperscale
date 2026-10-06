@@ -21,7 +21,7 @@ class Test(Workflow):
     @step()
     async def get_httpbin(
         self,
-        url: URL = 'https://httpbin.org/get',
+        url: URL = 'https://blazedemo.com/',
     ) -> HTTPResponse:
         '''
         Hyperscale uses type annotations for both parameters

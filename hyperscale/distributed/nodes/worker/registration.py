@@ -33,6 +33,7 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerWarning,
 )
+from collections.abc import Awaitable, Callable
 
 # Per-attempt bound on one worker_register round trip. Named so callers
 # that must outwait a whole registration (e.g. `hyperscale join`) derive
@@ -98,7 +99,7 @@ class WorkerRegistrationHandler:
         available_memory_mb: int,
         cluster_id: str,
         environment_id: str,
-        send_func: callable,
+        send_func: Callable[[tuple[str, int], bytes, float], Awaitable[bytes | Exception]],
         max_retries: int = 3,
         base_delay: float = 0.5,
     ) -> bool:
@@ -166,7 +167,7 @@ class WorkerRegistrationHandler:
             result = await send_func(
                 manager_addr,
                 registration.dump(),
-                timeout=REGISTRATION_ATTEMPT_TIMEOUT_SECONDS,
+                REGISTRATION_ATTEMPT_TIMEOUT_SECONDS,
             )
             if isinstance(result, Exception):
                 raise result
@@ -198,9 +199,9 @@ class WorkerRegistrationHandler:
         node_host: str,
         node_port: int,
         node_id_short: str,
-        add_unconfirmed_peer: callable,
-        add_to_probe_scheduler: callable,
-        mark_registered: callable | None = None,
+        add_unconfirmed_peer: Callable[[tuple[str, int]], Awaitable[None]],
+        add_to_probe_scheduler: Callable[[tuple[str, int]], None],
+        mark_registered: Callable[[tuple[str, int]], None] | None = None,
     ) -> tuple[bool, str | None]:
         """
         Process registration response from manager.
@@ -308,9 +309,9 @@ class WorkerRegistrationHandler:
         node_id_full: str,
         total_cores: int,
         available_cores: int,
-        add_unconfirmed_peer: callable,
-        add_to_probe_scheduler: callable,
-        mark_registered: callable | None = None,
+        add_unconfirmed_peer: Callable[[tuple[str, int]], Awaitable[None]],
+        add_to_probe_scheduler: Callable[[tuple[str, int]], None],
+        mark_registered: Callable[[tuple[str, int]], None] | None = None,
     ) -> bytes:
         """
         Process registration request from a manager.
@@ -396,9 +397,9 @@ class WorkerRegistrationHandler:
     async def _update_known_managers(
         self,
         managers: list[ManagerInfo],
-        add_unconfirmed_peer: callable,
-        add_to_probe_scheduler: callable,
-        mark_registered: callable | None = None,
+        add_unconfirmed_peer: Callable[[tuple[str, int]], Awaitable[None]],
+        add_to_probe_scheduler: Callable[[tuple[str, int]], None],
+        mark_registered: Callable[[tuple[str, int]], None] | None = None,
     ) -> None:
         """
         Update known managers from a list.

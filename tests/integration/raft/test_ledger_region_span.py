@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.ledger.events.event_type import JobEventType
 from hyperscale.distributed.ledger.events.job_event import JobCreated
@@ -27,7 +28,6 @@ from hyperscale.distributed.nodes.gate.ledger_region_span import LedgerRegionSpa
 from hyperscale.distributed.nodes.gate.raft_integration import GateRaftIntegration
 from hyperscale.distributed.raft import LedgerReplicator
 from hyperscale.distributed.raft.models import LedgerPlacementQuery, LedgerProposal
-from hyperscale.distributed.raft.models.gate_commands import gate_ledger_append_command
 from hyperscale.distributed.raft.raft_node import ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.taskex import TaskRunner
@@ -50,6 +50,9 @@ class GateLedgerCluster:
 
     def __init__(self, regions: list[str]) -> None:
         self.addresses = [("127.0.0.1", 9100 + index) for index in range(len(regions))]
+        # The gate cluster's committed membership (AD-52): every gate, formed
+        # from the start.
+        self.cluster_members = {_gate_id(addr): addr for addr in self.addresses}
         self.region_by_gate = {_gate_id(addr): region for addr, region in zip(self.addresses, regions)}
         self.task_runners = {addr: TaskRunner(0, Env()) for addr in self.addresses}
         self.isolated: set[tuple[str, int]] = set()
@@ -69,17 +72,16 @@ class GateLedgerCluster:
                 cluster_size=lambda: len(self.addresses),
                 proposal_timeout_seconds=LIVENESS_CEILING_SECONDS,
                 node_id=_gate_id(addr),
-                job_manager=MagicMock(),
-                leadership_tracker=MagicMock(),
-                gate_state=MagicMock(),
                 logger=logger,
                 task_runner=self.task_runners[addr],
                 send_tcp=self._tuple_reply(send_tcp),
+                request_timeout_seconds=Env().GATE_TCP_TIMEOUT_STANDARD,
+                cluster_members=lambda: self.cluster_members,
+                storage=VolatileRaftStorage(),
             )
             consensus = self.integrations[addr].consensus
             self.replicators[addr] = LedgerReplicator(
                 consensus=consensus,
-                build_command=gate_ledger_append_command,
                 node_id=_gate_id(addr),
                 send_tcp=send_tcp,
                 forward_method="gate_raft_ledger_proposal",
@@ -124,15 +126,11 @@ class GateLedgerCluster:
         return send_tcp
 
     async def start(self) -> None:
-        for addr, integration in self.integrations.items():
-            peers = [peer for peer in self.addresses if peer != addr]
-            integration.set_initial_membership(
-                {_gate_id(peer) for peer in peers},
-                {_gate_id(peer): peer for peer in peers},
-            )
-            # As the committed job replica does on every gate.
-            await integration.consensus.create_job_raft(JOB_ID)
-            integration.start()
+        for integration in self.integrations.values():
+            # As the committed job replica does on every gate: the group's
+            # voters are the cluster's committed members.
+            await integration.consensus.create_job_raft(JOB_ID, frozenset(self.cluster_members))
+            await integration.start()
 
     async def stop(self) -> None:
         for integration in self.integrations.values():

@@ -1,11 +1,12 @@
 import asyncio
+import copy
 import inspect
 import math
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
+from types import MethodType
 from typing import (
     Any,
-    AsyncGenerator,
     Awaitable,
     Callable,
     Coroutine,
@@ -25,6 +26,7 @@ from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models.env import Env
+from hyperscale.core.jobs.models.workflow_run_control import WorkflowRunControl
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.utils.cancel_and_release_task import cancel_and_release_task
 from hyperscale.core.monitoring import CPUMonitor, MemoryMonitor
@@ -50,6 +52,15 @@ StepStatsType = Literal[
     "err",
 ]
 
+# What a run returns: its run id, results, context, error, and terminal status.
+RunOutcome = Tuple[
+    int,
+    WorkflowStats | Dict[str, Any | Exception] | None,
+    WorkflowContext | None,
+    Exception | None,
+    WorkflowStatus,
+]
+
 
 warnings.simplefilter("ignore")
 
@@ -61,25 +72,16 @@ async def guard_optimize_call(optimize_call: Coroutine[Any, Any, None]):
         pass
 
 
-def guard_result(result: asyncio.Task):
-    try:
-        return result.result()
-
-    except Exception as err:
-        return err
-
-
-# Frozen-clock anchor tuning for the VU generator loops. The spin
-# threshold is the count of CONSECUTIVE generator iterations whose
-# ``loop.time()`` reading was bit-identical before a timed sleep is
-# injected: a real event loop can never hold one reading across ten
-# thousand yield+spawn iterations (each costs microseconds against
-# nanosecond-resolution clocks), so on real hosts the anchor never
-# fires and the generators keep their exact maximum-throughput
-# sleep(0) hot path; under a virtual (timer-driven) clock the reading
-# is frozen by construction whenever no timer is pending, the
-# threshold trips, and the 1ms anchor gives the clock a timer to
-# advance on instead of spinning at one instant forever.
+# Frozen-clock anchor tuning for the VUs. The spin threshold is the
+# count of CONSECUTIVE iterations of a VU whose ``loop.time()`` reading
+# was bit-identical before a timed sleep is injected: a real event loop
+# can never hold one reading across ten thousand iterations (each costs
+# microseconds against nanosecond-resolution clocks), so on real hosts
+# the anchor never fires and the VUs keep their exact maximum-throughput
+# hot path; under a virtual (timer-driven) clock the reading is frozen
+# by construction whenever no timer is pending, the threshold trips,
+# and the 1ms anchor gives the clock a timer to advance on instead of
+# spinning at one instant forever.
 _FROZEN_CLOCK_SPINS: int = 10_000
 _FROZEN_CLOCK_ANCHOR_SECONDS: float = 0.001
 
@@ -104,10 +106,10 @@ class WorkflowRunner:
         self._monitors_enabled = monitors_enabled
 
         # SIM seam. Replay compares serialized results byte for byte, so
-        # under a simulation transport each hook set's finished tasks
-        # are consumed in step-name order (see ``_spawn_vu``). ``False``
-        # in REAL mode, where the order carries no meaning: no
-        # per-request sorting.
+        # under a simulation transport each layer's steps run and are
+        # consumed in step-name order (see ``_run_long_lived_vu`` and
+        # ``_execute_non_test_workflow``). ``False`` in REAL mode, where
+        # the order carries no meaning: no per-request sorting.
         self._deterministic_step_order = deterministic_step_order
 
         self._worker_id = worker_id
@@ -119,21 +121,18 @@ class WorkflowRunner:
         self._node_id = node_id
         self.run_statuses: Dict[int, Dict[str, WorkflowStatus]] = defaultdict(dict)
 
+        # AD-41 THROTTLE, per workflow: the slots its VUs hold (one per VU
+        # in an iteration), the VUs waiting in line for one, and the cap
+        # on slots -- the worker's VUs until a throttle cuts it.
         self._active: Dict[int, Dict[str, int]] = defaultdict(dict)
-        self._active_waiters: Dict[int, Dict[str, asyncio.Future]] = defaultdict(dict)
+        self._active_waiters: Dict[int, Dict[str, deque[asyncio.Future[None]]]] = defaultdict(dict)
         self._max_active: Dict[int, Dict[str, int]] = defaultdict(dict)
         # AD-41 THROTTLE: the concurrency cap a throttled workflow had
         # before its first throttle (restored on release), and which
-        # workflows run a concurrency-gated (TEST) spawn loop at all.
+        # workflows run concurrency-gated (TEST) VUs at all.
         self._throttle_base_cap: Dict[int, Dict[str, int]] = defaultdict(dict)
         self._concurrency_gated: Dict[int, set[str]] = defaultdict(set)
         self._run_tasks: Dict[int, Dict[str, asyncio.Future]] = defaultdict(dict)
-        self._failed: Dict[int, Dict[str, List[asyncio.Task]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
-        self._pending: Dict[int, Dict[str, List[asyncio.Task]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
         self._threads = psutil.cpu_count(logical=False)
         self._workflows_sem: asyncio.Semaphore | None = None
         self._workflow_hooks: Dict[int, Dict[str, List[str]]] = defaultdict(dict)
@@ -164,11 +163,11 @@ class WorkflowRunner:
         self._cpu_monitor = CPUMonitor(env)
         self._memory_monitor = MemoryMonitor(env)
         self._logger = Logger()
-        self._is_cancelled: asyncio.Event = asyncio.Event()
-        self._is_stopped: asyncio.Event = asyncio.Event()
 
-        # Cancellation flag - checked by generators to stop spawning new VUs
-        self._running: bool = False
+        # Each registered submission of a workflow's run on this node (see
+        # register_run), as cancellation reaches it: by run id and
+        # workflow. More than one when a run is resubmitted to the node.
+        self._run_controls: Dict[int, Dict[str, set[WorkflowRunControl]]] = defaultdict(dict)
 
     def setup(self):
         if self._workflows_sem is None:
@@ -179,23 +178,81 @@ class WorkflowRunner:
 
         self._clear()
 
-    async def await_cancellation(self) -> None:
+    def register_run(self, run_id: int, workflow_name: str) -> WorkflowRunControl:
         """
-        Wait for the current workflow to finish (by cancellation or completion).
-
-        This event is set when either _execute_test_workflow or
-        _execute_non_test_workflow completes, regardless of whether
-        the workflow was cancelled or finished normally.
+        Register a submission of the workflow's run on this node -- before
+        anything can ask to cancel it -- and return its control, for
+        ``run``. Cancellation reaches it by run id and workflow from then
+        on, and the run's stats stay readable until ``release_run``.
         """
-        await self._is_cancelled.wait()
+        control = WorkflowRunControl()
+        self._run_controls[run_id].setdefault(workflow_name, set()).add(control)
+        return control
 
-    def request_cancellation(self) -> None:
+    def release_run(self, run_id: int, workflow_name: str, control: WorkflowRunControl) -> None:
         """
-        Request graceful cancellation of the current workflow.
+        Drop a submission ``register_run`` registered, once nothing reads
+        its run's stats. With the workflow's last submission in the run
+        gone, so is everything kept for it: its status, counts, step
+        stats and hooks, its slots, and its CPU and memory samples.
+        """
+        run_controls = self._run_controls.get(run_id, {})
+        if (controls := run_controls.get(workflow_name)) is None:
+            return
 
-        This sets a flag that causes the VU generators (_generate, _generate_constant)
-        to stop yielding new VUs. Already-spawned tasks complete normally, and the
-        standard cleanup path runs without throwing exceptions.
+        controls.discard(control)
+        if controls:
+            return
+
+        del run_controls[workflow_name]
+        if not run_controls:
+            del self._run_controls[run_id]
+
+        for run_states in (
+            self.run_statuses,
+            self._completed_counts,
+            self._failed_counts,
+            self._workflow_hooks,
+            self._active,
+            self._max_active,
+            self._run_tasks,
+            self._running_workflows,
+        ):
+            if (workflow_states := run_states.get(run_id)) is not None:
+                workflow_states.pop(workflow_name, None)
+                if not workflow_states:
+                    del run_states[run_id]
+
+        if (step_stats := self._workflow_step_stats.get(run_id)) is not None:
+            for stats_key in [stats_key for stats_key in step_stats if stats_key[0] == workflow_name]:
+                del step_stats[stats_key]
+
+            if not step_stats:
+                del self._workflow_step_stats[run_id]
+
+        self._cpu_monitor.release_run(run_id, workflow_name)
+        self._memory_monitor.release_run(run_id, workflow_name)
+
+    async def await_cancellation(self, run_id: int, workflow_name: str) -> None:
+        """
+        Wait for every registered submission of the workflow's run to end,
+        cancelled, failed or finished: at once when none is registered
+        (each ended and was released, or none was made).
+        """
+        await asyncio.gather(
+            *[control.ended.wait() for control in self._run_controls.get(run_id, {}).get(workflow_name, ())]
+        )
+
+    def request_cancellation(self, run_id: int, workflow_name: str) -> bool:
+        """
+        Request graceful cancellation of the workflow's run on this node.
+
+        The VUs of each registered submission of it check its control
+        before they start an iteration: none starts a new one. Iterations
+        already under way complete normally, and the standard cleanup path
+        runs without throwing exceptions. Other runs are untouched. False
+        when no submission is registered: the run already ended, or none
+        was made.
 
         NOTE: only the duration-governed (TEST) execution path consults
         this flag. ACTION workflows run their step DAG with plain awaits
@@ -203,10 +260,12 @@ class WorkflowRunner:
         cancellation is a no-op for them. ``hard_cancel`` is the
         escalation that actually stops in-flight execution when the
         graceful window expires.
-
-        Thread-safe: GIL ensures atomic bool write.
         """
-        self._running = False
+        controls = self._run_controls.get(run_id, {}).get(workflow_name, ())
+        for control in controls:
+            control.running = False
+
+        return bool(controls)
 
     def hard_cancel(self, run_id: int, workflow_name: str) -> bool:
         """
@@ -214,14 +273,16 @@ class WorkflowRunner:
 
         Cancels the run task (CancelledError propagates to whoever is
         awaiting the run — the worker's executor already maps it to the
-        CANCELLED terminal), cancels every pending VU task, clears the
-        pacing state (the ``replace`` duplicate-policy cleanup, which
-        this mirrors), and — because the completion events are normally
-        set only at the END of natural execution — sets ``_is_cancelled``
-        and ``_is_stopped`` directly so ``await_cancellation`` observers
-        converge instead of waiting on an execution that will never
-        finish. Idempotent; returns True when a live run task was
-        actually cancelled.
+        CANCELLED terminal — and each executor cancels its VUs or steps
+        as it unwinds), cancels the VUs waiting in line on a throttle,
+        clears the pacing state (the ``replace`` duplicate-policy
+        cleanup, which this mirrors), and — because a run's end is
+        normally marked only at the END of natural execution — marks each
+        registered submission of it ended, so ``await_cancellation``
+        observers converge instead of waiting on an execution that will
+        never finish (the run's stop event is set as the cancellation
+        unwinds ``run``). Other runs are untouched. Idempotent; returns
+        True when a live run task was actually cancelled.
 
         Without this escalation, "cancelling" an ACTION workflow meant
         waiting for it to complete: a hard-timed-out 100s workflow kept
@@ -229,7 +290,9 @@ class WorkflowRunner:
         of zombie execution past the client's timeout terminal, with the
         manager re-cancelling on a ~6s cadence the whole way).
         """
-        self._running = False
+        controls = self._run_controls.get(run_id, {}).get(workflow_name, ())
+        for control in controls:
+            control.running = False
 
         cancelled_live_task = False
         run_task = self._run_tasks.get(run_id, {}).get(workflow_name)
@@ -237,36 +300,30 @@ class WorkflowRunner:
             run_task.cancel()
             cancelled_live_task = True
 
-        for pending_task in self._pending.get(run_id, {}).get(workflow_name, []):
-            cancel_and_release_task(pending_task)
-        if self._pending.get(run_id, {}).get(workflow_name):
-            self._pending[run_id][workflow_name].clear()
-
         if run_id in self._active and workflow_name in self._active[run_id]:
             self._active[run_id][workflow_name] = 0
-        if self._active_waiters.get(run_id, {}).get(workflow_name):
-            waiter = self._active_waiters[run_id][workflow_name]
-            if waiter is not None and not waiter.done():
-                waiter.cancel()
-            del self._active_waiters[run_id][workflow_name]
+        if (parked := self._active_waiters.get(run_id, {}).pop(workflow_name, None)) is not None:
+            for parked_vu in parked:
+                parked_vu.cancel()
+            parked.clear()
         if self._running_workflows.get(run_id, {}).get(workflow_name):
             del self._running_workflows[run_id][workflow_name]
 
-        if not self._is_stopped.is_set():
-            self._is_stopped.set()
-        if not self._is_cancelled.is_set():
-            self._is_cancelled.set()
+        for control in controls:
+            control.ended.set()
 
         return cancelled_live_task
 
     def throttle_workflow(self, run_id: int, workflow_name: str, scale: float) -> int | None:
         """AD-41 THROTTLE: cut a running workflow's concurrency to ``scale``
-        of its current operating point (the lower of its cap and the steps
-        actually in flight), never below one; repeated throttles compound.
+        of its current operating point (the lower of its cap and the VUs
+        actually in an iteration), never below one; repeated throttles
+        compound. A VU in an iteration finishes it, and one starts an
+        iteration only while fewer than the cap are under way.
 
         Returns the new cap, or None when the workflow runs no
-        concurrency-gated spawn loop (not running, or an ACTION workflow,
-        whose steps run once) -- there is nothing to throttle.
+        concurrency-gated VUs (not running, or an ACTION workflow, whose
+        steps run once) -- there is nothing to throttle.
         """
         if not 0.0 < scale <= 1.0:
             raise ValueError(f"throttle scale must be in (0, 1], got {scale}")
@@ -280,21 +337,23 @@ class WorkflowRunner:
         return caps[workflow_name]
 
     def release_workflow_throttle(self, run_id: int, workflow_name: str) -> bool:
-        """Restore a throttled workflow's original cap and wake its spawn
-        loop if it is parked on the throttled one. False when it was not
+        """Restore a throttled workflow's original cap and hand the slots it
+        frees to the VUs waiting in line for one. False when it was not
         throttled."""
         base_cap = self._throttle_base_cap.get(run_id, {}).pop(workflow_name, None)
         if base_cap is None:
             return False
         if workflow_name in self._concurrency_gated.get(run_id, ()):
             self._max_active[run_id][workflow_name] = base_cap
-        # Wake it the way _spawn_vu does: resolve, then clear the slot so
-        # the spawn loop can park on the restored cap again.
-        waiter = self._active_waiters.get(run_id, {}).get(workflow_name)
-        if waiter is not None:
-            if not waiter.done():
-                waiter.set_result(None)
-            self._active_waiters[run_id][workflow_name] = None
+        # First come, first served: each freed slot goes to the VU that has
+        # waited longest (one cancelled while waiting is passed over), as a
+        # VU ending an iteration hands its own on (see _run_long_lived_vu).
+        if parked := self._active_waiters.get(run_id, {}).get(workflow_name):
+            active = self._active[run_id]
+            while parked and active[workflow_name] < base_cap:
+                if not (parked_vu := parked.popleft()).done():
+                    active[workflow_name] += 1
+                    parked_vu.set_result(None)
         return True
 
     def _end_concurrency_gate(self, run_id: int, workflow_name: str) -> None:
@@ -304,15 +363,12 @@ class WorkflowRunner:
         self._throttle_base_cap.get(run_id, {}).pop(workflow_name, None)
         if run_id in self._throttle_base_cap and not self._throttle_base_cap[run_id]:
             del self._throttle_base_cap[run_id]
-
-    async def await_stop(self) -> None:
-        return await self._is_stopped.wait()
-        
-
-    @property
-    def is_cancelled(self) -> bool:
-        """Check if cancellation has been requested."""
-        return self._running is False
+        # The run's VUs have ended or are cancelled: none waits in line, and
+        # none hands a slot on.
+        if (parked := self._active_waiters.get(run_id, {}).pop(workflow_name, None)) is not None:
+            parked.clear()
+        if run_id in self._active_waiters and not self._active_waiters[run_id]:
+            del self._active_waiters[run_id]
 
     @property
     def pending(self):
@@ -329,14 +385,19 @@ class WorkflowRunner:
         self,
         run_id: int,
         workflow: str,
-    ) -> Tuple[WorkflowStatus, int, int, Dict[str, Dict[StepStatsType, int]]]:
+    ) -> Tuple[WorkflowStatus, int, int, Dict[str, Dict[StepStatsType, int]]] | None:
+        """
+        The run's status, completed and failed counts and per-step stats;
+        None when no submission of it is registered -- once released (see
+        ``release_run``), nothing is kept to report.
+        """
+        if not self._run_controls.get(run_id, {}).get(workflow):
+            return None
+
         status = self.run_statuses.get(
             run_id,
             {},
         ).get(workflow, WorkflowStatus.UNKNOWN)
-
-        completed_count = 0
-        failed_count = 0
 
         workflow_hooks = self._workflow_hooks[run_id].get(workflow, [])
 
@@ -344,37 +405,25 @@ class WorkflowRunner:
             hook: {"total": 0, "ok": 0, "err": 0} for hook in workflow_hooks
         }
 
-        try:
-            completed_counter = self._completed_counts[run_id].get(
-                workflow, CompletionCounter()
-            )
-            completed_count = completed_counter.value()
+        completed_counter = self._completed_counts[run_id].get(
+            workflow, CompletionCounter()
+        )
+        completed_count = completed_counter.value()
 
-        except Exception:
-            pass
+        failed_counter = self._failed_counts[run_id].get(
+            workflow, CompletionCounter()
+        )
+        failed_count = failed_counter.value()
 
-        try:
-            failed_counter = self._failed_counts[run_id].get(
-                workflow, CompletionCounter()
-            )
-            failed_count = failed_counter.value()
-
-        except Exception:
-            pass
-
-        try:
-            for (workflow_name, hook_name), stats in self._workflow_step_stats[
-                run_id
-            ].items():
-                if workflow_name == workflow:
-                    worklow_hook_stats[hook_name] = {
-                        "total": stats["total"].value(),
-                        "ok": stats["ok"].value(),
-                        "err": stats["err"].value(),
-                    }
-
-        except Exception:
-            pass
+        for (workflow_name, hook_name), stats in self._workflow_step_stats[
+            run_id
+        ].items():
+            if workflow_name == workflow:
+                worklow_hook_stats[hook_name] = {
+                    "total": stats["total"].value(),
+                    "ok": stats["ok"].value(),
+                    "err": stats["err"].value(),
+                }
 
         return (
             status,
@@ -406,18 +455,9 @@ class WorkflowRunner:
         workflow_context: Dict[str, Any],
         vus: int,
         await_start: Callable[[], Awaitable[None]] | None = None,
-    ) -> Tuple[
-        int,
-        WorkflowStats
-        | Dict[
-            str,
-            Any | Exception,
-        ]
-        | None,
-        WorkflowContext | None,
-        Exception | None,
-        WorkflowStatus,
-    ]:
+        stop_event: asyncio.Event | None = None,
+        control: WorkflowRunControl | None = None,
+    ) -> RunOutcome:
         """
         Run the workflow on this node and return its results, context,
         error, and terminal status.
@@ -426,11 +466,49 @@ class WorkflowRunner:
         before it executes: the node's start gate, which lets every node
         running the workflow start together however long each one's
         setup took.
-        """
-        # Reset cancellation state for new workflow run
-        self._running = True
-        self._is_cancelled.clear()
 
+        ``stop_event``, when given, is this submission's own stop signal:
+        set as the run's load generation ends -- or, however else the
+        submission ends (rejected, failed, cancelled), when it does.
+
+        ``control``, when given, is this submission's registration (see
+        ``register_run``), made before anything could ask to cancel it;
+        its caller releases it. Without one, the run registers itself
+        and is released as it ends.
+        """
+        registered_here = control is None
+        if control is None:
+            control = self.register_run(run_id, workflow.name)
+
+        try:
+            return await self._run(
+                run_id,
+                workflow,
+                workflow_context,
+                vus,
+                await_start,
+                stop_event,
+                control,
+            )
+
+        finally:
+            control.ended.set()
+            if stop_event is not None:
+                stop_event.set()
+
+            if registered_here:
+                self.release_run(run_id, workflow.name, control)
+
+    async def _run(
+        self,
+        run_id: int,
+        workflow: Workflow,
+        workflow_context: Dict[str, Any],
+        vus: int,
+        await_start: Callable[[], Awaitable[None]] | None,
+        stop_event: asyncio.Event | None,
+        control: WorkflowRunControl,
+    ) -> RunOutcome:
         default_config = {
             "node_id": self._node_id,
             "workflow": workflow.name,
@@ -469,75 +547,68 @@ class WorkflowRunner:
         async with self._logger.context(
             name=f"{workflow_slug}_{run_id}_logger",
         ) as ctx:
-            await self._run_check_lock.acquire()
-
-            await ctx.log_prepared(
-                message=f"Run {run_id} of Workflow {workflow.name} entering pre-pnding execution check",
-                name="info",
-            )
-
-            already_running = (
-                self.run_statuses[run_id].get(workflow.name) == WorkflowStatus.RUNNING
-            )
-
-            if self.pending >= self._max_pending_workflows:
+            # Held for exactly the check: however it exits -- a rejection,
+            # an error, a cancellation -- the next run's check can begin.
+            async with self._run_check_lock:
                 await ctx.log_prepared(
-                    message=f"Run {run_id} of Workflow {workflow.name} failed to start due to exceeded max pending workflow limit of {self._max_pending_workflows}",
-                    name="error",
+                    message=f"Run {run_id} of Workflow {workflow.name} entering pre-pnding execution check",
+                    name="info",
                 )
 
-                self._run_check_lock.release()
-
-                return (
-                    run_id,
-                    None,
-                    None,
-                    Exception("Err. - Run rejected. Too many pending workflows."),
-                    WorkflowStatus.REJECTED,
+                already_running = (
+                    self.run_statuses[run_id].get(workflow.name) == WorkflowStatus.RUNNING
                 )
 
-            elif already_running and self._duplicate_job_policy == "reject":
+                if self.pending >= self._max_pending_workflows:
+                    await ctx.log_prepared(
+                        message=f"Run {run_id} of Workflow {workflow.name} failed to start due to exceeded max pending workflow limit of {self._max_pending_workflows}",
+                        name="error",
+                    )
+
+                    return (
+                        run_id,
+                        None,
+                        None,
+                        Exception("Err. - Run rejected. Too many pending workflows."),
+                        WorkflowStatus.REJECTED,
+                    )
+
+                elif already_running and self._duplicate_job_policy == "reject":
+                    await ctx.log_prepared(
+                        message=f"Run {run_id} of Workflow {workflow.name} failed to start due to workflow already being in running stats with duplicate job policy of REJECT",
+                        name="error",
+                    )
+
+                    return (
+                        run_id,
+                        None,
+                        None,
+                        Exception("Err. - Run rejected. Already running."),
+                        WorkflowStatus.REJECTED,
+                    )
+
+                elif already_running and self._duplicate_job_policy == "replace":
+                    workflow_name = workflow.name
+
+                    self._active[run_id][workflow_name] = 0
+
+                    if self._run_tasks[run_id].get(workflow_name):
+                        self._run_tasks[run_id][workflow_name].cancel()
+                        await asyncio.sleep(0)
+
+                    if self._active_waiters[run_id].get(workflow_name):
+                        del self._active_waiters[run_id][workflow_name]
+
+                    # Absent when the running one is not set up yet.
+                    self._max_active[run_id].pop(workflow_name, None)
+
+                    if self._running_workflows[run_id].get(workflow.name):
+                        del self._running_workflows[run_id][workflow.name]
+
                 await ctx.log_prepared(
-                    message=f"Run {run_id} of Workflow {workflow.name} failed to start due to workflow already being in running stats with duplicate job policy of REJECT",
-                    name="error",
+                    message=f"Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.PENDING.name} state",
+                    name="info",
                 )
-
-                self._run_check_lock.release()
-
-                return (
-                    run_id,
-                    None,
-                    None,
-                    Exception("Err. - Run rejected. Already running."),
-                    WorkflowStatus.REJECTED,
-                )
-
-            elif already_running and self._duplicate_job_policy == "replace":
-                workflow_name = workflow.name
-
-                self._active[run_id][workflow_name] = 0
-
-                if self._run_tasks[run_id].get(workflow_name):
-                    self._run_tasks[run_id][workflow_name].cancel()
-                    await asyncio.sleep(0)
-
-                if self._active_waiters[run_id].get(workflow_name):
-                    del self._active_waiters[run_id][workflow_name]
-
-                if self._max_active[run_id][workflow_name]:
-                    del self._max_active[run_id][workflow_name]
-
-                self._pending[run_id][workflow_name].clear()
-
-                if self._running_workflows[run_id].get(workflow.name):
-                    del self._running_workflows[run_id][workflow.name]
-
-            await ctx.log_prepared(
-                message=f"Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.PENDING.name} state",
-                name="info",
-            )
-
-            self._run_check_lock.release()
 
             self.run_statuses[run_id][workflow.name] = WorkflowStatus.PENDING
 
@@ -549,36 +620,38 @@ class WorkflowRunner:
                     name="info",
                 )
 
-                if self._monitors_enabled:
-                    await self._cpu_monitor.start_background_monitor(
-                        run_id, workflow_name
-                    )
-                    await self._memory_monitor.start_background_monitor(
-                        run_id, workflow_name
-                    )
-
-                self.run_statuses[run_id][workflow_name] = WorkflowStatus.CREATED
-
                 context = Context()
-
-                await asyncio.gather(
-                    *[
-                        context.update(workflow_name, hook_name, value)
-                        for hook_name, value in workflow_context.items()
-                    ]
-                )
-
-                await ctx.log_prepared(
-                    message=f"Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.RUNNING.name} state",
-                    name="info",
-                )
-
-                self.run_statuses[run_id][workflow.name] = WorkflowStatus.RUNNING
-
-                self._running_workflows[run_id][workflow.name] = workflow
 
                 run_task: asyncio.Future | None = None
                 try:
+                    # Inside the try: however the run ends, its monitors
+                    # stop (finally, below).
+                    if self._monitors_enabled:
+                        await self._cpu_monitor.start_background_monitor(
+                            run_id, workflow_name
+                        )
+                        await self._memory_monitor.start_background_monitor(
+                            run_id, workflow_name
+                        )
+
+                    self.run_statuses[run_id][workflow_name] = WorkflowStatus.CREATED
+
+                    await asyncio.gather(
+                        *[
+                            context.update(workflow_name, hook_name, value)
+                            for hook_name, value in workflow_context.items()
+                        ]
+                    )
+
+                    await ctx.log_prepared(
+                        message=f"Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.RUNNING.name} state",
+                        name="info",
+                    )
+
+                    self.run_statuses[run_id][workflow.name] = WorkflowStatus.RUNNING
+
+                    self._running_workflows[run_id][workflow.name] = workflow
+
                     run_task = asyncio.ensure_future(
                         self._run_workflow(
                             run_id,
@@ -586,6 +659,8 @@ class WorkflowRunner:
                             context,
                             vus,
                             await_start,
+                            stop_event,
+                            control,
                         )
                     )
                     self._run_tasks[run_id][workflow_name] = run_task
@@ -619,16 +694,6 @@ class WorkflowRunner:
 
                     self.run_statuses[run_id][workflow_name] = WorkflowStatus.COMPLETED
 
-                    if self._monitors_enabled:
-                        await self._cpu_monitor.stop_background_monitor(
-                            run_id,
-                            workflow_name,
-                        )
-                        await self._memory_monitor.stop_background_monitor(
-                            run_id,
-                            workflow_name,
-                        )
-
                     return (
                         run_id,
                         results,
@@ -637,6 +702,12 @@ class WorkflowRunner:
                         WorkflowStatus.COMPLETED,
                     )
 
+                except asyncio.CancelledError:
+                    # Hard-cancelled (hard_cancel cancelled the run task),
+                    # or cancelled with whatever awaited the run.
+                    self.run_statuses[run_id][workflow_name] = WorkflowStatus.CANCELLED
+                    raise
+
                 except Exception as err:
                     await ctx.log_prepared(
                         message=f"Run {run_id} of Workflow {workflow.name} encountered error {str(err)}",
@@ -644,15 +715,6 @@ class WorkflowRunner:
                     )
 
                     self.run_statuses[run_id][workflow.name] = WorkflowStatus.FAILED
-                    if self._monitors_enabled:
-                        await self._cpu_monitor.stop_background_monitor(
-                            run_id,
-                            workflow_name,
-                        )
-                        await self._memory_monitor.stop_background_monitor(
-                            run_id,
-                            workflow_name,
-                        )
 
                     return (
                         run_id,
@@ -663,6 +725,19 @@ class WorkflowRunner:
                     )
 
                 finally:
+                    # However the run ended -- completed, failed or
+                    # cancelled -- its monitors stop: a cancelled run's
+                    # used to sample until the runner closed.
+                    if self._monitors_enabled:
+                        await self._cpu_monitor.stop_background_monitor(
+                            run_id,
+                            workflow_name,
+                        )
+                        await self._memory_monitor.stop_background_monitor(
+                            run_id,
+                            workflow_name,
+                        )
+
                     # However the run ended (completed, failed, cancelled,
                     # replaced), release it: its workflow and finished task
                     # leave the runner and its engine clients close.
@@ -706,6 +781,8 @@ class WorkflowRunner:
         context: Context,
         vus: int,
         await_start: Callable[[], Awaitable[None]] | None,
+        stop_event: asyncio.Event | None,
+        control: WorkflowRunControl,
     ) -> Tuple[
         WorkflowStats
         | Dict[
@@ -762,6 +839,9 @@ class WorkflowRunner:
                 )
 
                 self._concurrency_gated[run_id].add(workflow.name)
+                # Where its VUs wait in line on a throttle (see
+                # _run_long_lived_vu), until the gate ends.
+                self._active_waiters[run_id][workflow.name] = deque()
                 try:
                     # Inside the concurrency gate: a throttle that arrives
                     # while the run waits to start applies once it does.
@@ -775,6 +855,8 @@ class WorkflowRunner:
                         hooks,
                         context,
                         config,
+                        stop_event,
+                        control,
                     )
 
                 finally:
@@ -795,6 +877,7 @@ class WorkflowRunner:
                     traversal_order,
                     context,
                     config,
+                    stop_event,
                 )
 
             await ctx.log_prepared(
@@ -812,16 +895,27 @@ class WorkflowRunner:
             return (results, context)
 
     def _setup_state_actions(self, workflow: Workflow) -> Dict[str, ContextHook]:
+        # This run's own copies of the workflow class's state hooks, read
+        # from the class (an instance set up before holds bound calls in
+        # their place): the class's are shared by every instance -- and by
+        # any run of the class at the same time -- so a run binds and
+        # fills only its own.
         state_actions: Dict[str, ContextHook] = {
-            name: hook
+            name: copy.copy(hook)
             for name, hook in inspect.getmembers(
-                workflow,
+                type(workflow),
                 predicate=lambda member: isinstance(member, ContextHook),
             )
         }
 
         for action in state_actions.values():
-            action._call = action._call.__get__(workflow, workflow.__class__)
+            # Bound to this run's workflow from the unbound function:
+            # binding a method already bound to another instance keeps that
+            # instance from Python 3.14 (3.12 rebinds).
+            action._call = MethodType(
+                action._call.__func__ if isinstance(action._call, MethodType) else action._call,
+                workflow,
+            )
             setattr(workflow, action.name, action._call)
 
         return state_actions
@@ -888,10 +982,14 @@ class WorkflowRunner:
             self._completed_counts[run_id][workflow.name] = CompletionCounter()
             self._failed_counts[run_id][workflow.name] = CompletionCounter()
 
+            # This run's own copies of the workflow class's hooks, read from
+            # the class (as the state hooks are): the class's are shared by
+            # every instance -- and by any run of the class at the same time
+            # -- so a run binds and fills only its own (below).
             hooks: Dict[str, Hook] = {
-                name: hook
+                name: copy.copy(hook)
                 for name, hook in inspect.getmembers(
-                    workflow,
+                    type(workflow),
                     predicate=lambda member: isinstance(member, Hook),
                 )
             }
@@ -927,21 +1025,17 @@ class WorkflowRunner:
             )
 
             config["vus"] = vus_per_engine
+            # The worker's VUs: a task each.
+            config["worker_vus"] = vus
             config["duration"] = TimeParser(config["duration"]).time
 
             if (interval := config.get("interval")) and interval is not None:
                 config["interval"] = TimeParser(interval).time
 
-            threads = config.get("threads")
-
-            # Floor-based approach - commented out for testing
-            # self._max_active[run_id][workflow.name] = vus * 10
-
-            # Original CPU-aware formula: scales with CPU count to account for
-            # less powerful individual cores on high-CPU systems
-            self._max_active[run_id][workflow.name] = math.ceil(
-                (vus * (psutil.cpu_count() ** 2)) / threads
-            )
+            # AD-41 THROTTLE: each of the worker's VUs can be in an
+            # iteration at once, until a throttle cuts the cap (see
+            # throttle_workflow).
+            self._max_active[run_id][workflow.name] = vus
 
             for client in workflow.client:
                 setup_client(
@@ -980,7 +1074,15 @@ class WorkflowRunner:
 
                 step_graph.add_node(hook.name)
 
-                hook.call = hook.call.__get__(workflow, workflow.__class__)
+                # Bound to this run's workflow from the unbound callable (as
+                # the state actions are), with argument dicts of its own: the
+                # copy still shares its class hook's.
+                hook.call = MethodType(
+                    hook.call.__func__ if isinstance(hook.call, MethodType) else hook.call,
+                    workflow,
+                )
+                hook.context_args = dict(hook.context_args)
+                hook.optimized_args = dict(hook.optimized_args)
                 setattr(workflow, hook.name, hook.call)
 
                 if hook.hook_type == HookType.TEST:
@@ -1027,8 +1129,6 @@ class WorkflowRunner:
                     {hook_name: hooks.get(hook_name) for hook_name in traversal_layer}
                 )
 
-            self._active_waiters[run_id][workflow.name] = None
-
             return (
                 workflow,
                 hooks,
@@ -1044,120 +1144,285 @@ class WorkflowRunner:
         hooks: Dict[str, Hook],
         context: Context,
         config: Dict[str, Any],
+        stop_event: asyncio.Event | None,
+        control: WorkflowRunControl,
     ):
+        """
+        A test workflow run by long-lived VUs: a task per VU for the whole
+        run, each running the step graph again until the deadline -- k6's VU
+        model. A VU starts its next iteration as soon as the last one
+        finishes or, with an interval, one interval after the last one
+        started: one iteration per VU per interval. An AD-41 throttle caps
+        how many VUs are in an iteration at once. The engines' slots bound
+        the requests in flight, and a VU still in an iteration at the
+        deadline gets one more second to finish it.
+        """
         loop = asyncio.get_event_loop()
 
         workflow_name = workflow.name
 
         workflow_context = context[workflow_name].dict()
 
-        # Loop time, not wall time: on a real event loop ``loop.time()``
-        # IS the monotonic clock, so REAL behavior is unchanged; under
-        # SIM it is virtual time, so a workflow's duration and elapsed
-        # measurement follow the deterministic schedule instead of
-        # host-dependent wall time.
         start = loop.time()
+        deadline = start + config["duration"]
 
-        # Each VU's results are reduced into the step aggregates as the VU
-        # finishes, and the VU is dropped: a run holds only the VUs still in
-        # flight, not every VU it ran, so nothing is left to sweep at the end.
         workflow_results = Results(hooks)
         step_aggregates = workflow_results.create_aggregates(hooks)
-        in_flight: Set[asyncio.Task] = set()
-        vu_errors: List[BaseException] = []
 
-        def collect_vu(vu_task: asyncio.Task) -> None:
-            if vu_task not in in_flight:
-                # Already collected, or abandoned at the deadline.
-                return
+        # Where the VUs wait in line on a throttle.
+        parked = self._active_waiters[run_id][workflow_name]
 
-            in_flight.discard(vu_task)
-
-            if vu_task.cancelled():
-                return
-
-            if (vu_error := vu_task.exception()) is not None:
-                vu_errors.append(vu_error)
-                return
-
-            for hook_task in vu_task.result():
-                if (result := guard_result(hook_task)) is not None:
-                    workflow_results.aggregate_result(
-                        step_aggregates,
-                        hook_task.get_name(),
-                        result,
-                    )
-
-        generator = (
-            self._generate(
-                run_id,
-                workflow_name,
-                config,
-            )
-            if config.get("interval") is None
-            else self._generate_constant(
-                run_id,
-                workflow_name,
-                config,
-            )
-        )
-
-        async for remaining in generator:
-            vu_task = loop.create_task(
-                self._spawn_vu(
+        vu_tasks: Set[asyncio.Task] = {
+            loop.create_task(
+                self._run_long_lived_vu(
                     run_id,
                     workflow_name,
                     traversal_order,
-                    remaining,
                     workflow_context,
+                    workflow_results,
+                    step_aggregates,
+                    deadline,
+                    config.get("interval"),
+                    parked,
+                    control,
                 ),
-                name=workflow.name,
+                name=workflow_name,
             )
-            in_flight.add(vu_task)
-            vu_task.add_done_callback(collect_vu)
+            for _ in range(config["worker_vus"])
+        }
 
-        if in_flight:
-            await asyncio.wait(in_flight, timeout=1)
+        try:
+            # Load generation ends at the deadline, where the VUs stop
+            # starting iterations; one still in an iteration gets one more
+            # second to finish it.
+            running = vu_tasks
+            if vu_tasks:
+                _, running = await asyncio.wait(vu_tasks, timeout=max(deadline - loop.time(), 0))
 
-        elapsed = loop.time() - start
+            if self._monitors_enabled:
+                await self._cpu_monitor.stop_background_monitor(
+                    run_id,
+                    workflow_name,
+                )
 
-        if not self._is_stopped.set():
-            self._is_stopped.set()
+            if running:
+                await asyncio.wait(running, timeout=1)
 
-        # Cancel and release all pending tasks
-        for pend in self._pending[run_id][workflow.name]:
-            cancel_and_release_task(pend)
-        self._pending[run_id][workflow.name].clear()
+            elapsed = loop.time() - start
 
-        # A VU done by the deadline counts even if its callback has yet to
-        # run; one still running is cancelled and does not.
-        for vu_task in list(in_flight):
-            if vu_task.done():
-                collect_vu(vu_task)
+        finally:
+            # Past the grace, or cancelled: a VU still in an iteration is
+            # cancelled, and that iteration does not count.
+            for vu_task in vu_tasks:
+                if not vu_task.done():
+                    cancel_and_release_task(vu_task)
 
-            else:
-                in_flight.discard(vu_task)
-                cancel_and_release_task(vu_task)
+        # This run's load generation is over.
+        if stop_event is not None:
+            stop_event.set()
 
-        if len(self._failed[run_id][workflow_name]) > 0:
-            await asyncio.gather(
-                *self._failed[run_id][workflow_name],
-                return_exceptions=True,
-            )
+        for vu_task in vu_tasks:
+            if vu_task.done() and not vu_task.cancelled() and (vu_error := vu_task.exception()) is not None:
+                raise vu_error
 
-        if vu_errors:
-            raise vu_errors[0]
-
-        processed_results = workflow_results.process_aggregates(
+        return workflow_results.process_aggregates(
             workflow_name,
             step_aggregates,
             elapsed,
         )
 
-        if not self._is_cancelled.is_set():
-            self._is_cancelled.set()
+    async def _run_long_lived_vu(
+        self,
+        run_id: int,
+        workflow_name: str,
+        traversal_order: List[Dict[str, Hook]],
+        workflow_context: Dict[str, Any],
+        workflow_results: Results,
+        step_aggregates: Dict[str, Any],
+        deadline: float,
+        interval: float | None,
+        parked: deque[asyncio.Future[None]],
+        control: WorkflowRunControl,
+    ) -> None:
+        """
+        One long-lived VU: the step graph, layer by layer, again and again
+        until the deadline, each step counted and its result aggregated.
+        Each layer's steps run together, each given the context values its
+        keyword arguments name. With an interval, each iteration starts one
+        interval after the last one started, or at once if that one ran
+        longer. An iteration holds one of the workflow's AD-41 slots: with
+        none free, the VU waits in line (``parked``) until a VU hands it
+        one. Once its run's ``control`` stops running, it starts no further
+        iteration. An iteration under way when the VU is cancelled is
+        dropped.
+        """
+        loop = asyncio.get_event_loop()
+        current_task = asyncio.current_task()
+        count_completed = self._completed_counts[run_id][workflow_name].increment
+        count_failed = self._failed_counts[run_id][workflow_name].increment
+        aggregate_result = workflow_results.aggregate_result
+        step_stats = self._workflow_step_stats[run_id]
+        active = self._active[run_id]
+        caps = self._max_active[run_id]
 
-        return processed_results
+        # What an iteration needs from each layer, looked up once (under
+        # simulation in step-name order, so results replay byte for byte):
+        # the hooks that take context values, with the keys they take; each
+        # step's call and arguments; each step's counters. Before a layer,
+        # every iteration's context holds the same keys -- the workflow
+        # context's, then each earlier step's name, as every step stores its
+        # result -- so the keys a hook's keyword arguments name are matched
+        # here once, not each iteration.
+        layers = []
+        context_keys = dict.fromkeys(workflow_context)
+        for hook_set in traversal_order:
+            layer_hooks = sorted(hook_set.items()) if self._deterministic_step_order else hook_set.items()
+            layers.append(
+                (
+                    [
+                        (hook.context_args, argument_keys)
+                        for _, hook in layer_hooks
+                        if (argument_keys := [key for key in context_keys if key in hook.kwarg_names])
+                    ],
+                    [(hook.call, hook.context_args) for _, hook in layer_hooks],
+                    [
+                        (
+                            step_name,
+                            step_stats[(workflow_name, step_name)]["total"].increment,
+                            step_stats[(workflow_name, step_name)]["ok"].increment,
+                            step_stats[(workflow_name, step_name)]["err"].increment,
+                        )
+                        for step_name, _ in layer_hooks
+                    ],
+                )
+            )
+            context_keys.update(dict.fromkeys(step_name for step_name, _ in layer_hooks))
+
+        frozen_clock_spins = 0
+        previous_now = None
+        # Whether the VU first in line handed this one its slot.
+        holds_slot = False
+        while control.running and (now := loop.time()) < deadline:
+            # An iteration runs in one of the workflow's slots. With all of
+            # them taken, or VUs already waiting for one, this VU waits at the
+            # back of the line until a VU hands it its slot.
+            if holds_slot:
+                holds_slot = False
+
+            elif parked or active[workflow_name] >= caps[workflow_name]:
+                parked_vu = loop.create_future()
+                parked.append(parked_vu)
+                await parked_vu
+                holds_slot = True
+                continue
+
+            else:
+                active[workflow_name] += 1
+
+            context = dict(workflow_context)
+            # Whether a layer had to wait: an iteration in which none did
+            # ends with a yield (below).
+            waited = False
+
+            try:
+                for layer_arguments, layer_calls, layer_steps in layers:
+                    # This iteration's values for the keys each hook takes.
+                    for step_arguments, argument_keys in layer_arguments:
+                        step_arguments.update({key: context[key] for key in argument_keys})
+
+                    # Each step's task starts at once, in this VU's turn, and
+                    # runs until it first waits, instead of a loop pass later.
+                    gathered = asyncio.gather(
+                        *[
+                            asyncio.Task(step_call(**step_arguments), loop=loop, eager_start=True)
+                            for step_call, step_arguments in layer_calls
+                        ],
+                        return_exceptions=True,
+                    )
+                    if not gathered.done():
+                        waited = True
+
+                    results = await gathered
+                    if current_task.cancelling():
+                        return
+
+                    for (step_name, count_total, count_ok, count_error), result in zip(layer_steps, results):
+                        failed = isinstance(result, BaseException)
+                        count_total()
+                        if failed:
+                            count_failed()
+                            count_error()
+
+                        else:
+                            count_ok()
+
+                        context[step_name] = result
+                        count_completed()
+
+                        # A result, or a failure's exception, is aggregated;
+                        # nothing, or a CancelledError, is not.
+                        if result is not None and (not failed or isinstance(result, Exception)):
+                            aggregate_result(step_aggregates, step_name, result)
+
+            except Exception:
+                # A VU that fails hands its slot on, as below, before its
+                # error ends it: no VU waits in line on it.
+                while parked and parked[0].done():
+                    parked.popleft()
+                if parked and active[workflow_name] <= caps[workflow_name]:
+                    parked.popleft().set_result(None)
+
+                else:
+                    active[workflow_name] -= 1
+
+                raise
+
+            # The slot goes to the VU first in line -- passing over any
+            # cancelled while waiting -- while the cap allows it, and back to
+            # the workflow otherwise. A VU cancelled with its run mid-
+            # iteration (above) does neither: the run's counts no longer gate
+            # anything, and a replacing run may already count its own under
+            # the same keys.
+            while parked and parked[0].done():
+                parked.popleft()
+            if parked and active[workflow_name] <= caps[workflow_name]:
+                parked.popleft().set_result(None)
+
+            else:
+                active[workflow_name] -= 1
+
+            # With an interval, the next iteration starts one interval after
+            # this one started -- at once if this one ran longer -- and never
+            # past the deadline: one iteration per VU per interval. Its timed
+            # sleep gives the loop a turn too.
+            pacing_delay = min(now + interval, deadline) - loop.time() if interval else 0.0
+
+            # A step that never suspends would keep this VU from yielding:
+            # an iteration that waited on nothing gives the loop a turn. On a
+            # frozen (simulated) clock, a timed sleep lets it advance (see
+            # _FROZEN_CLOCK_SPINS).
+            frozen_clock_spins = frozen_clock_spins + 1 if now == previous_now else 0
+            previous_now = now
+            if pacing_delay > 0:
+                await asyncio.sleep(pacing_delay)
+
+            elif frozen_clock_spins >= _FROZEN_CLOCK_SPINS:
+                frozen_clock_spins = 0
+                await asyncio.sleep(_FROZEN_CLOCK_ANCHOR_SECONDS)
+
+            elif not waited:
+                await asyncio.sleep(0)
+
+        # Handed a slot as the run ended: it goes on, as above, so every VU
+        # still in line ends too.
+        if holds_slot:
+            while parked and parked[0].done():
+                parked.popleft()
+            if parked and active[workflow_name] <= caps[workflow_name]:
+                parked.popleft().set_result(None)
+
+            else:
+                active[workflow_name] -= 1
 
     async def _execute_non_test_workflow(
         self,
@@ -1166,284 +1431,79 @@ class WorkflowRunner:
         traversal_order: List[Dict[str, Hook]],
         context: Context,
         config: Dict[str, Any],
+        stop_event: asyncio.Event | None,
     ) -> Dict[str, Any | Exception]:
+        """
+        An action workflow: its step graph once, layer by layer. Each layer's
+        steps run together, each given the context values its keyword
+        arguments name, and have the workflow's duration to finish: a step
+        still running then is cancelled and has no result, as is every step
+        still running when the run is cancelled. Returns each finished
+        step's result -- or, once every layer has run, raises the first
+        failed step's exception, in graph order.
+        """
         workflow_name = workflow.name
-        workflow_context = context[workflow_name].dict()
+        step_stats = self._workflow_step_stats[run_id]
+        completed_counter = self._completed_counts[run_id][workflow_name]
+        failed_counter = self._failed_counts[run_id][workflow_name]
+        layer_timeout = config["duration"]
 
-        workflow_duration = config.get(
-            "duration",
-            TimeParser("1m").time,
-        )
-
-        execution_results: List[asyncio.Task] = await self._spawn_vu(
-            run_id,
-            workflow_name,
-            traversal_order,
-            workflow_duration,
-            workflow_context,
-        )
-
-        await asyncio.gather(*execution_results)
-
-        if not self._is_stopped.set():
-            self._is_stopped.set()
-
-        # Cancel and release all pending tasks
-        for pend in self._pending[run_id][workflow_name]:
-            cancel_and_release_task(pend)
-        self._pending[run_id][workflow_name].clear()
-
-        if not self._is_cancelled.is_set():
-            self._is_cancelled.set()
-
-        return {result.get_name(): guard_result(result) for result in execution_results}
-
-    async def _spawn_vu(
-        self,
-        run_id: int,
-        workflow_name: str,
-        traversal_order: List[Dict[str, Hook]],
-        remaining: float,
-        context: Dict[str, Any],
-    ):
-        results: List[asyncio.Task] = []
-        context: Dict[str, Any] = dict(context)
+        step_context: Dict[str, Any] = dict(context[workflow_name].dict())
+        step_results: Dict[str, Any | Exception] = {}
+        first_error: BaseException | None = None
 
         for hook_set in traversal_order:
-            set_count = len(hook_set)
-            self._active[run_id][workflow_name] += set_count
+            # Under simulation in step-name order, so results replay byte
+            # for byte.
+            layer_hooks = sorted(hook_set.items()) if self._deterministic_step_order else hook_set.items()
+            for _, hook in layer_hooks:
+                hook.context_args.update({key: step_context[key] for key in step_context if key in hook.kwarg_names})
 
-            for hook in hook_set.values():
-                hook.context_args.update(
-                    {key: context[key] for key in context if key in hook.kwarg_names}
-                )
-
-            tasks: Tuple[
-                List[asyncio.Task],
-                List[asyncio.Task],
-            ] = await asyncio.wait(
-                [
-                    asyncio.create_task(
-                        hook.call(**hook.context_args),
-                        name=hook_name,
-                    )
-                    for hook_name, hook in hook_set.items()
-                ],
-                timeout=remaining,
-            )
-
-            # Under simulation only, STEP-NAME order everywhere downstream:
-            # ``asyncio.wait`` returns id()-hashed SETS, and both the
-            # results list (serialized per-step result mapping — insertion
-            # order is wire bytes) and the per-step context dict are built
-            # by iterating them. Address order permutes across runs
-            # whenever one wait window completes >=2 steps (the chaos
-            # VOPR's replay-divergence flake); task names are the hook
-            # names — unique per set — so they are a total order.
-            completed, pending = tasks
-            if self._deterministic_step_order:
-                completed = sorted(
-                    completed, key=lambda done_task: done_task.get_name()
-                )
-                pending = sorted(
-                    pending, key=lambda pending_task: pending_task.get_name()
-                )
-
-            results.extend(completed)
-
-            for complete in completed:
-                step_name = complete.get_name()
-
-                self._workflow_step_stats[run_id][(workflow_name, step_name)][
-                    "total"
-                ].increment()
-
-                try:
-                    result = complete.result()
-                    self._workflow_step_stats[run_id][(workflow_name, step_name)][
-                        "ok"
-                    ].increment()
-
-                except (
-                    Exception,
-                    AssertionError,
-                    asyncio.TimeoutError,
-                    asyncio.CancelledError,
-                    asyncio.InvalidStateError,
-                    asyncio.IncompleteReadError,
-                ) as err:
-                    self._failed_counts[run_id][workflow_name].increment()
-                    self._workflow_step_stats[run_id][(workflow_name, step_name)][
-                        "err"
-                    ].increment()
-
-                    result = err
-
-                    self._failed[run_id][workflow_name].append(complete)
-
-                context[step_name] = result
-                self._completed_counts[run_id][workflow_name].increment()
-
-            self._pending[run_id][workflow_name].extend(pending)
-
-            self._active[run_id][workflow_name] -= set_count
-
-            if (
-                self._active[run_id][workflow_name]
-                <= self._max_active[run_id][workflow_name]
-                and self._active_waiters[run_id][workflow_name]
-            ):
-                try:
-                    self._active_waiters[run_id][workflow_name].set_result(None)
-                    self._active_waiters[run_id][workflow_name] = None
-
-                except asyncio.InvalidStateError:
-                    self._active_waiters[run_id][workflow_name] = None
-
-        return results
-
-    async def _generate(
-        self,
-        run_id: int,
-        workflow_name: str,
-        config: Dict[str, Any],
-    ) -> AsyncGenerator[float, None]:
-        duration = config.get("duration")
-
-        elapsed = 0
-
-        # Loop time, not wall time — identical on a real loop, virtual
-        # (deterministic) under SIM. See _execute_test_workflow.
-        loop = asyncio.get_event_loop()
-        start = loop.time()
-        # Frozen-clock anchor (SIM liveness). ``sleep(0)`` re-queues at
-        # the SAME loop instant, so when nothing else has a pending
-        # timer a virtual clock never advances and this loop spins at
-        # one frozen instant forever (the executor SimulationConstraint
-        # abort; a real loop crawls past on wall time). Detection is a
-        # single int compare per iteration — the hot path gains NO
-        # awaits and NO time reads: only after ``_FROZEN_CLOCK_SPINS``
-        # CONSECUTIVE iterations with a bit-identical clock reading —
-        # impossible on any real clock at these iteration costs — does
-        # a 1ms timed sleep run to give the clock a timer to advance
-        # on. Throughput characteristics on a real loop are unchanged.
-        frozen_clock_spins = 0
-        while elapsed < duration and self._running:
+            layer_tasks = [
+                asyncio.create_task(hook.call(**hook.context_args), name=step_name)
+                for step_name, hook in layer_hooks
+            ]
             try:
-                remaining = duration - elapsed
+                await asyncio.wait(layer_tasks, timeout=layer_timeout)
 
-                yield remaining
+            finally:
+                # Out of time, or cancelled with the run: a step still
+                # running is cancelled, and has no result.
+                for layer_task in layer_tasks:
+                    if not layer_task.done():
+                        cancel_and_release_task(layer_task)
 
-                await asyncio.sleep(0)
+            for (step_name, _), layer_task in zip(layer_hooks, layer_tasks):
+                if not layer_task.done():
+                    continue
 
-                if (
-                    self._active[run_id][workflow_name]
-                    > self._max_active[run_id][workflow_name]
-                    and self._active_waiters[run_id][workflow_name] is None
-                ):
-                    self._active_waiters[run_id][workflow_name] = (
-                        loop.create_future()
-                    )
+                stats = step_stats[(workflow_name, step_name)]
+                stats["total"].increment()
+                try:
+                    result = layer_task.result()
+                    stats["ok"].increment()
 
-                    try:
-                        await asyncio.wait_for(
-                            self._active_waiters[run_id][workflow_name],
-                            timeout=remaining,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
+                except (Exception, asyncio.CancelledError) as step_error:
+                    # A failed step's exception is its result, which later
+                    # steps are given; the first fails the workflow (below).
+                    failed_counter.increment()
+                    stats["err"].increment()
+                    result = step_error
+                    if first_error is None:
+                        first_error = step_error
 
-            except Exception:
-                pass
+                step_context[step_name] = result
+                step_results[step_name] = result
+                completed_counter.increment()
 
-            previous_elapsed = elapsed
-            elapsed = loop.time() - start
-            if elapsed == previous_elapsed:
-                frozen_clock_spins += 1
-                if frozen_clock_spins >= _FROZEN_CLOCK_SPINS:
-                    await asyncio.sleep(_FROZEN_CLOCK_ANCHOR_SECONDS)
-                    frozen_clock_spins = 0
-                    elapsed = loop.time() - start
-            else:
-                frozen_clock_spins = 0
+        # This run's load generation is over.
+        if stop_event is not None:
+            stop_event.set()
 
-        if self._monitors_enabled:
-            await self._cpu_monitor.stop_background_monitor(
-                run_id,
-                workflow_name,
-            )
+        if first_error is not None:
+            raise first_error
 
-    async def _generate_constant(
-        self,
-        run_id: int,
-        workflow_name: str,
-        config: Dict[str, Any],
-    ) -> AsyncGenerator[float, None]:
-        duration = config.get("duration")
-        vus = config.get("vus")
-        interval = config.get("interval")
-
-        elapsed = 0
-        generated = 0
-
-        # Loop time, not wall time — identical on a real loop, virtual
-        # (deterministic) under SIM. See _execute_test_workflow.
-        loop = asyncio.get_event_loop()
-        start = loop.time()
-        # Frozen-clock anchor — same SIM-liveness guard as
-        # ``_generate`` (a zero ``interval`` config degenerates this
-        # loop to the same sleep(0) spin); see the comment there.
-        frozen_clock_spins = 0
-        while elapsed < duration and self._running:
-            try:
-                remaining = duration - elapsed
-
-                yield remaining
-
-                generated += 1
-
-                await asyncio.sleep(0)
-
-                if generated >= vus:
-                    await asyncio.sleep(interval)
-                    generated = 0
-
-                if (
-                    self._active[run_id][workflow_name]
-                    > self._max_active[run_id][workflow_name]
-                    and self._active_waiters[run_id][workflow_name] is None
-                ):
-                    self._active_waiters[run_id][workflow_name] = (
-                        loop.create_future()
-                    )
-
-                    try:
-                        await asyncio.wait_for(
-                            self._active_waiters[run_id][workflow_name],
-                            timeout=remaining,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
-
-            except Exception:
-                pass
-
-            previous_elapsed = elapsed
-            elapsed = loop.time() - start
-            if elapsed == previous_elapsed:
-                frozen_clock_spins += 1
-                if frozen_clock_spins >= _FROZEN_CLOCK_SPINS:
-                    await asyncio.sleep(_FROZEN_CLOCK_ANCHOR_SECONDS)
-                    frozen_clock_spins = 0
-                    elapsed = loop.time() - start
-            else:
-                frozen_clock_spins = 0
-
-        if self._monitors_enabled:
-            await self._cpu_monitor.stop_background_monitor(
-                run_id,
-                workflow_name,
-            )
+        return step_results
 
     async def _provide_context(
         self,
@@ -1468,15 +1528,20 @@ class WorkflowRunner:
 
             hook.context_args.update(results)
 
-        await asyncio.gather(
+        provided = await asyncio.gather(
             *[hook.call(**hook.context_args) for hook in provide_actions]
         )
 
+        # A provided value goes to the provider's own namespace -- read by a
+        # consumer naming its source, @state('Provider') -- and to every
+        # namespace it targets -- read by a consumer of its own namespace,
+        # @state(). The value is what the hook returned: ``hook.result`` is
+        # never assigned, so every value written from it was None.
         await asyncio.gather(
             *[
-                context[target].set(hook.name, hook.result)
-                for hook in provide_actions
-                for target in hook.workflows
+                context[namespace].set(hook_name, result)
+                for hook, (hook_name, result) in zip(provide_actions, provided)
+                for namespace in dict.fromkeys((workflow, *hook.workflows))
             ]
         )
 
@@ -1488,13 +1553,13 @@ class WorkflowRunner:
         self._completed_counts.clear()
         self._workflow_step_stats.clear()
         self._workflow_hooks.clear()
-        self._pending.clear()
 
         self._active.clear()
         self._active_waiters.clear()
         self._max_active.clear()
         self._throttle_base_cap.clear()
         self._concurrency_gated.clear()
+        self._run_controls.clear()
 
     async def close(self):
         async with self._logger.context(
@@ -1508,13 +1573,6 @@ class WorkflowRunner:
                     level=LogLevel.INFO,
                 )
             )
-
-            # Cancel and release all pending tasks across all runs/workflows
-            for run_id in self._pending:
-                for workflow_name in self._pending[run_id]:
-                    for pend in self._pending[run_id][workflow_name]:
-                        cancel_and_release_task(pend)
-                    self._pending[run_id][workflow_name].clear()
 
             for job in self._running_workflows.values():
                 for workflow in job.values():
@@ -1532,20 +1590,6 @@ class WorkflowRunner:
 
     def abort(self):
         self._logger.abort()
-
-        # Cancel and release all pending tasks
-        for run_id in self._pending:
-            for workflow_name in self._pending[run_id]:
-                for pend in self._pending[run_id][workflow_name]:
-                    cancel_and_release_task(pend)
-                self._pending[run_id][workflow_name].clear()
-
-        # Cancel and release all failed tasks
-        for run_id in self._failed:
-            for workflow_name in self._failed[run_id]:
-                for pend in self._failed[run_id][workflow_name]:
-                    cancel_and_release_task(pend)
-                self._failed[run_id][workflow_name].clear()
 
         for job in self._running_workflows.values():
             for workflow in job.values():

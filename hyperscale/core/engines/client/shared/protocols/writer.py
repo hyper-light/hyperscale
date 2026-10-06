@@ -49,6 +49,10 @@ class Writer:
     def close(self):
         return self._transport.close()
 
+    def abort(self):
+        """Close the transport now, discarding anything still buffered."""
+        self._transport.abort()
+
     def is_closing(self):
         return self._transport.is_closing()
 

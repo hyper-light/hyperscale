@@ -16,46 +16,23 @@ architectural: use a signal that is per-peer by construction so X's
 failures inflate only X's bracket — and that bracket is itself
 mathematically bounded by the prob-OR composition in
 ``HierarchicalFailureDetector.suspect_global``.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from collections import deque
 from dataclasses import dataclass
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .peer_probe_reliability_config import PeerProbeReliabilityConfig
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
 NodeAddress = tuple[str, int]
-
-
-@dataclass(slots=True)
-class PeerProbeReliabilityConfig:
-    """Configuration for ``PeerProbeReliabilityTracker``.
-
-    ``window_size``
-        Maximum number of recent probe outcomes retained per peer. The
-        empirical reliability is the success-rate over this window. A
-        small window reacts faster to changes; a large window is more
-        stable. The window also bounds memory usage to
-        ``max_tracked_peers × window_size`` ``(timestamp, success)``
-        tuples.
-
-    ``sample_ttl_s``
-        Maximum age (seconds) of a sample before it is ignored on
-        read. Stale outcomes from an outage hours ago must not bias
-        a current suspicion.
-
-    ``max_tracked_peers``
-        Hard cap on the number of peers tracked simultaneously. New
-        peers beyond this cap are silently dropped (the call becomes a
-        no-op). The cap exists to prevent memory exhaustion from
-        adversarial or buggy peer churn.
-    """
-
-    window_size: int = 8
-    sample_ttl_s: float = 60.0
-    max_tracked_peers: int = 10000
 
 
 class PeerProbeReliabilityTracker:
@@ -286,3 +263,10 @@ class PeerProbeReliabilityTracker:
     def get_tracked_peer_count(self) -> int:
         """Number of peers with at least one sample in the window."""
         return len(self._windows)
+
+_REHOMED = (
+    PeerProbeReliabilityConfig,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

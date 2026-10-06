@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from hyperscale.distributed.env import Env
-
 from .latency_observation import LatencyObservation
 from .latency_slo import LatencySLO
 from .slo_compliance_level import SLOComplianceLevel
@@ -29,10 +27,9 @@ class SLOComplianceScore:
         target_id: str,
         observation: LatencyObservation,
         slo: LatencySLO,
-        env: Env | None = None,
+        config: SLOConfig,
     ) -> "SLOComplianceScore":
         """Calculate compliance score from observation."""
-        config = SLOConfig.from_env(env)
         p50_ratio = observation.p50_ms / slo.p50_target_ms
         p95_ratio = observation.p95_ms / slo.p95_target_ms
         p99_ratio = observation.p99_ms / slo.p99_target_ms

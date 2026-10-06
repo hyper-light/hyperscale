@@ -3,8 +3,9 @@ class Timeouts:
     A request/response client (HTTP, HTTP2, HTTP3, gRPC, GraphQL, WebSocket,
     TCP, UDP) bounds each section of a request -- connect, write, read -- by
     ``request_timeout``; a section that runs out ends the request at once
-    with a timeout error. The per-phase timeouts bound the phases of the
-    clients that move files (FTP, SFTP, SCP, SMTP).
+    with a timeout error. The HTTP/2 client bounds connecting and reading by
+    half of ``request_timeout``. The per-phase timeouts bound the phases of
+    the clients that move files (FTP, SFTP, SCP, SMTP).
     """
 
     __slots__ = (

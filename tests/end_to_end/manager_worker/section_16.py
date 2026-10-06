@@ -277,7 +277,7 @@ async def validate_16_4_workflow_latency_digest() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert state._workflow_latency_digest is not None, (
+        assert state._dispatch_latency_digest is not None, (
             "Workflow latency digest expected latency digest"
         )
     finally:
@@ -297,8 +297,11 @@ async def validate_16_4_latency_observations() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert state._workflow_latency_digest is not None, (
-            "Latency observations expected latency digest"
+        # AD-42: every dispatch's round trip to its worker is a sample, so
+        # a scenario that ran a workflow leaves an observation behind.
+        observation = state.get_dispatch_latency_observation(manager._clock.monotonic())
+        assert observation is not None and observation.sample_count > 0, (
+            "Latency observations expected dispatch latency samples"
         )
     finally:
         await runtime.stop_cluster()
@@ -317,7 +320,7 @@ async def validate_16_4_percentile_calculation() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert state._workflow_latency_digest is not None, (
+        assert state._dispatch_latency_digest is not None, (
             "Percentile calculation expected latency digest"
         )
     finally:

@@ -7,9 +7,32 @@ from typing import Callable, Dict, Literal, Union
 PrimaryType = Union[str, int, float, bytes, bool]
 
 
+TRUE_ENVAR_WORDS = frozenset({"y", "yes", "t", "true", "on", "1"})
+FALSE_ENVAR_WORDS = frozenset({"n", "no", "f", "false", "off", "0"})
+
+
 def parse_bool_envar(value: str) -> bool:
-    """Parse a boolean environment variable (``bool("false")`` is True)."""
-    return value.lower() == "true"
+    """
+    Parse a boolean environment variable (``bool("false")`` is True).
+
+    Accepts the words the standard library's ``strtobool`` accepted, in
+    any case; anything else is refused rather than read as False, so a
+    misspelled setting stops the node instead of silently disabling it.
+
+    Raises:
+        ValueError: ``value`` is not a boolean word.
+    """
+    word = value.strip().lower()
+    if word in TRUE_ENVAR_WORDS:
+        return True
+
+    if word in FALSE_ENVAR_WORDS:
+        return False
+
+    raise ValueError(
+        f"invalid boolean {value!r}: expected one of "
+        f"{sorted(TRUE_ENVAR_WORDS | FALSE_ENVAR_WORDS)}"
+    )
 
 
 class Env(BaseModel):
@@ -31,12 +54,28 @@ class Env(BaseModel):
     MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE: StrictInt = 100
     MERCURY_SYNC_ENABLE_REQUEST_CACHING: StrictBool = False
     MERCURY_SYNC_TCP_SERVER_BACKLOG: StrictInt = 4096
+    # Connections a node's TCP server holds at once (connection-storm cap).
+    # 0 sizes it from the process's descriptor soft limit (RLIMIT_NOFILE):
+    # half of it -- nodes form a symmetric mesh, each dialing the peers it
+    # accepts, so accepted and dialed connections share the descriptors
+    # evenly. No cap where the platform reports no limit (Windows, or an
+    # unlimited soft limit).
+    MERCURY_SYNC_MAX_ACCEPTED_TCP_CONNECTIONS: StrictInt = 0
     MERCURY_SYNC_UDP_SERVER_RCVBUF: StrictInt = 4 * 1024 * 1024
     MERCURY_SYNC_VERIFY_SSL_CERT: Literal["REQUIRED", "OPTIONAL", "NONE"] = "REQUIRED"
     # Secure by default: peer certificates are checked against the
     # connected host. Set to "false" only for local certs without
     # matching SAN entries.
     MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "true"
+    # Peers addressed by DNS name (a Kubernetes pod's stable name) are sent
+    # datagrams at the name's resolved IP, cached this many seconds: the
+    # TTL CoreDNS serves Kubernetes records with by default, so a restarted
+    # pod's new IP is used no later than DNS itself would hand it out.
+    MERCURY_SYNC_HOST_RESOLUTION_TTL: StrictFloat = 5.0
+    # Seconds one lookup may take: the system resolver's own per-attempt
+    # default (resolv.conf timeout:5). A failed refresh keeps serving the
+    # last known address.
+    MERCURY_SYNC_HOST_RESOLUTION_TIMEOUT: StrictFloat = 5.0
 
     # Monitor Settings (for CPU/Memory monitors in workers)
     MERCURY_SYNC_MONITOR_SAMPLE_WINDOW: StrictStr = "5s"
@@ -70,6 +109,10 @@ class Env(BaseModel):
         8.0  # Reduced from 15.0 - faster failure declaration
     )
     SWIM_NO_WITNESS_SUSPICION_TIMEOUT: StrictFloat = 30.0
+    # Suspicion bounds of a manager's job layer (the hierarchical detector's
+    # per-job view of its workers), beside the global bounds above.
+    MANAGER_SWIM_JOB_MIN_TIMEOUT: StrictFloat = 2.0
+    MANAGER_SWIM_JOB_MAX_TIMEOUT: StrictFloat = 15.0
     # AD-53 burst-failure cluster-degradation signal.
     # When the prober observes ``BURST_FAILURE_THRESHOLD`` distinct
     # direct+indirect probe failures within
@@ -123,6 +166,54 @@ class Env(BaseModel):
     LEADER_ELECTION_JITTER_MAX: StrictFloat = (
         3.0  # Max random delay before starting first election
     )
+    # AD-52 slice C, the cluster membership group. A formation round
+    # greets every founder once: one per SWIM probe period
+    # (SWIM_UDP_POLL_INTERVAL), the per-peer cadence the failure detector
+    # already pays for. A membership claim that has not committed within a
+    # round is retried in the next.
+    CLUSTER_FORMATION_INTERVAL_SECONDS: StrictFloat = 1.0
+    # AD-52 section 8: a member the membership group's leader has not heard
+    # from for this long no longer holds the cluster back -- its address is
+    # released, and a cluster unable to commit for this long is founded
+    # anew. Minutes, not seconds: brief partitions are common and real
+    # death rare, and service registries that evict on a blip cause
+    # outages (Linkerd and Istio hold endpoints for minutes). A process
+    # restarted at its address takes its place at once, without waiting.
+    CLUSTER_TOMBSTONE_RETENTION_SECONDS: StrictFloat = 600.0
+    # AD-52 section 9: a membership watch is a long poll a member answers at
+    # once when membership changed, else after this long with nothing new.
+    # With the request's own transport budget (MANAGER/GATE_TCP_TIMEOUT_
+    # STANDARD, 5s) it stays under 30s -- the shortest common proxy request
+    # timeout (Google Cloud load balancer backend default 30s; AWS ALB idle
+    # 60s) -- so a watch through one is never cut; longer polls only save
+    # an idle request per wait.
+    CLUSTER_WATCH_WAIT_SECONDS: StrictFloat = 25.0
+    # AD-52 section 7: the membership group snapshots its state once this many
+    # entries were applied since its last snapshot, and keeps the
+    # CLUSTER_SNAPSHOT_CATCH_UP_ENTRIES before the snapshot point in its log:
+    # a member or watcher that far behind catches up from the log, one
+    # further behind is sent the snapshot. etcd's defaults (snapshot count
+    # 10,000 before v3.2 -- 100,000 after, above RaftLog's 50,000 cap -- and
+    # 5,000 catch-up entries); together they stay under that cap.
+    CLUSTER_SNAPSHOT_ENTRIES: StrictInt = 10_000
+    CLUSTER_SNAPSHOT_CATCH_UP_ENTRIES: StrictInt = 5_000
+    # D1: a Raft store found untrustworthy at start is set aside, never
+    # deleted unread, and this many of the newest set-asides are kept. The
+    # newest describes the failure an operator investigates -- older ones
+    # are superseded by it -- and keeping every one would let a disk that
+    # fails at each start fill itself.
+    RAFT_SET_ASIDE_RETAINED: StrictInt = 1
+    # Leader leases (AD-52 section 11; Raft thesis 6.4.1): a leader a quorum
+    # answered serves linearizable reads without a round of its own. Opt-in
+    # -- they assume every member's clock RATE stays within
+    # RAFT_CLOCK_DRIFT_BOUND of the others' (offsets do not matter); off,
+    # every ReadIndex pays one round, with no clock assumption. Every member
+    # of a cluster must agree on the setting.
+    RAFT_LEADER_LEASES_ENABLED: StrictBool = False
+    # The largest relative clock-rate error a lease tolerates: 500 ppm, the
+    # most frequency error NTP's clock discipline corrects (RFC 5905,
+    # MAXFREQ) -- the bound an NTP-synchronized host keeps.
+    RAFT_CLOCK_DRIFT_BOUND: StrictFloat = 500e-6
 
     # Federated Health Monitor Settings (Gate -> DC Leader probing)
     # These are tuned for high-latency, globally distributed links
@@ -183,11 +274,7 @@ class Env(BaseModel):
         5.0  # Seconds between cancellation poll requests
     )
 
-    # Worker Load-Sampling Settings. Consumed by
-    # ``WorkerConfig.from_env`` via ``getattr(env, ...)``; the fields
-    # must exist here or the override silently no-ops (the getattr
-    # falls through to its literal default). Defaults match those
-    # fallbacks so unset behavior is unchanged.
+    # Worker Load-Sampling Settings, consumed by ``WorkerConfig.from_env``.
     WORKER_OVERLOAD_POLL_INTERVAL: StrictFloat = (
         0.25  # Seconds between CPU/overload samples
     )
@@ -205,6 +292,28 @@ class Env(BaseModel):
     WORKER_TCP_TIMEOUT_STANDARD: StrictFloat = (
         5.0  # Standard timeout for progress/result pushes
     )
+    # Seconds a progress send to a job leader may take: the next progress
+    # update supersedes a late one.
+    WORKER_PROGRESS_SEND_TIMEOUT: StrictFloat = 1.0
+    # Seconds a heartbeat send to a manager may take.
+    WORKER_HEARTBEAT_SEND_TIMEOUT: StrictFloat = 1.0
+    # Seconds between cancellation checks while a running workflow's next
+    # status update is awaited.
+    WORKER_EXECUTION_UPDATE_WAIT: StrictFloat = 0.5
+    # Seconds a worker waits for a cancelled workflow to stop.
+    WORKER_WORKFLOW_CANCEL_TIMEOUT: StrictFloat = 5.0
+    # Final results a job leader has not acknowledged: at most
+    # WORKER_PENDING_RESULT_LIMIT are kept, each resent with exponential
+    # backoff from WORKER_RESULT_RETRY_BASE_DELAY up to
+    # WORKER_RESULT_MAX_RETRIES times -- attempts made only while a manager
+    # is reachable, so an isolated worker keeps its results until it can
+    # deliver them (AD-52 section 10).
+    WORKER_PENDING_RESULT_LIMIT: StrictInt = 1000
+    WORKER_RESULT_MAX_RETRIES: StrictInt = 10
+    WORKER_RESULT_RETRY_BASE_DELAY: StrictFloat = 5.0
+    # Recent workflow completion times a worker keeps for its throughput
+    # estimate (AD-19).
+    WORKER_COMPLETION_TIMES_MAX_SAMPLES: StrictInt = 50
     WORKER_REGISTRATION_MAX_RETRIES: StrictInt = 5
     WORKER_REGISTRATION_BASE_DELAY: StrictFloat = 0.25
     # Wait a random jittered delay before this worker's *first* register
@@ -238,12 +347,11 @@ class Env(BaseModel):
     # to absorb that load without operator tuning.
     WORKER_POOL_STARTUP_TIMEOUT_SECONDS: StrictFloat = 60.0
 
-    # Worker Orphan Grace Period Settings (Section 2.7)
-    # Grace period before cancelling workflows when job leader manager fails
-    # Should be longer than expected election + takeover time
-    WORKER_ORPHAN_GRACE_PERIOD: StrictFloat = (
-        5.0  # Seconds to wait for JobLeaderWorkerTransfer
-    )
+    # Worker orphan handling (Section 2.7). The grace a workflow whose job
+    # leader died waits for its new leader is derived from the cluster's
+    # own timings (nodes/worker/config.py derive_orphan_grace_seconds),
+    # learned from the rescues the worker observes, and extended (AD-26)
+    # while managers keep heartbeating it.
     WORKER_ORPHAN_CHECK_INTERVAL: StrictFloat = (
         1.0  # Seconds between orphan grace period checks
     )
@@ -265,9 +373,14 @@ class Env(BaseModel):
     MANAGER_DISPATCH_CORE_WAIT_TIMEOUT: StrictFloat = (
         5.0  # Max seconds to wait per iteration for cores
     )
-    MANAGER_HEARTBEAT_INTERVAL: StrictFloat = (
-        5.0  # Seconds between manager heartbeats to gates
-    )
+    # Seconds between manager heartbeats to gates. A gate's datacenter
+    # health, AD-41 resource view and AD-43 capacity view each go stale
+    # after 30s without one: 5s keeps six heartbeats in that window (the
+    # Kubernetes node heartbeat defaults keep four, 10s against a 40s
+    # grace period), so a few lost or late sends never stale a healthy
+    # datacenter, and placement sees storage, load and capacity changes
+    # within 5s.
+    MANAGER_HEARTBEAT_INTERVAL: StrictFloat = 5.0
     MAX_WORKERS_PER_MANAGER: StrictInt | None = None
     """Optional hard cap for worker registrations accepted by a manager.
 
@@ -276,16 +389,23 @@ class Env(BaseModel):
     bounded worker fan-in per manager.
     """
     MANAGER_PEER_SYNC_INTERVAL: StrictFloat = (
-        10.0  # Seconds between job state sync to peer managers
+        10.0  # Seconds between re-registrations with peer managers that missed a rejoin
     )
+    # Seconds between full job-state syncs from each job's leader to its
+    # peer managers. A backstop: submission, dispatch, takeover and
+    # cleanup sync at once (with quorum where it matters). Full-state
+    # anti-entropy elsewhere runs every 15-60s (memberlist 15/30/60s by
+    # network, Consul 60s); its cost grows with jobs x peers.
+    MANAGER_PEER_JOB_SYNC_INTERVAL: StrictFloat = 15.0
 
-    # Job Cleanup Settings
-    COMPLETED_JOB_MAX_AGE: StrictFloat = (
-        300.0  # Seconds to retain completed jobs (5 minutes)
-    )
-    FAILED_JOB_MAX_AGE: StrictFloat = (
-        3600.0  # Seconds to retain failed/cancelled/timeout jobs (1 hour)
-    )
+    # Job Cleanup Settings. A completed job stays in memory for a while, so
+    # a manager without a ledger acks a late result stale (after cleanup it
+    # refuses it, and the worker's attempt budget settles it); with a
+    # ledger, status and late results are answered from the ledger after
+    # cleanup. Failed, cancelled and
+    # timed-out jobs stay an hour for investigation.
+    COMPLETED_JOB_MAX_AGE: StrictFloat = 300.0
+    FAILED_JOB_MAX_AGE: StrictFloat = 3600.0
     JOB_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between cleanup checks
 
     # AD-41 resource guards: the per-job budget a workflow is enforced
@@ -338,6 +458,23 @@ class Env(BaseModel):
     CLIENT_RESPONSE_FRESHNESS_TIMEOUT: StrictFloat = (
         10.0  # Seconds to consider response stale after leadership change
     )
+    # Seconds a client's job status query may take.
+    CLIENT_STATUS_QUERY_TIMEOUT: StrictFloat = 5.0
+    # Seconds one job submission attempt may take.
+    CLIENT_SUBMISSION_TIMEOUT: StrictFloat = 10.0
+    # Attempts a client makes to submit one job, and the leader redirects
+    # it follows within one attempt.
+    CLIENT_SUBMISSION_MAX_RETRIES: StrictInt = 5
+    CLIENT_SUBMISSION_MAX_REDIRECTS: StrictInt = 3
+    # Seconds a completed job waits for workflow results still in flight
+    # (they travel apart from the terminal status, unordered with it):
+    # one standard manager/gate push timeout, the longest a send already
+    # under way can take to land.
+    CLIENT_RESULT_DRAIN_TIMEOUT: StrictFloat = 5.0
+    # Seconds a client keeps a finished job's status and results: as long
+    # as a manager keeps a completed job (COMPLETED_JOB_MAX_AGE), past
+    # which the cluster could not refresh them either.
+    CLIENT_JOB_RETENTION_SECONDS: StrictFloat = 300.0
 
     # Manager Dead Node Cleanup Settings
     MANAGER_DEAD_WORKER_REAP_INTERVAL: StrictFloat = (
@@ -373,9 +510,19 @@ class Env(BaseModel):
     MANAGER_HEALTH_ALERT_NON_HEALTHY_RATIO: StrictFloat = (
         0.8  # Alert when >= 80% of workers are non-healthy (busy/stressed/overloaded)
     )
+    # Seconds per sample of the dispatch throughput a manager reports in
+    # its health heartbeat (AD-19).
+    MANAGER_THROUGHPUT_INTERVAL_SECONDS: StrictFloat = 10.0
 
     # AD-34: Job Timeout Settings
     JOB_TIMEOUT_CHECK_INTERVAL: StrictFloat = 30.0  # Seconds between job timeout checks
+    # AD-34 stuck detection: seconds a job with work in flight may go
+    # without progress -- a workflow advancing its lifecycle or its
+    # completed/failed counts, or an AD-26 extension -- before it counts as
+    # stuck (AD-34's specified two minutes; the gate's all-DC threshold,
+    # GATE_ALL_DC_STUCK_THRESHOLD, sits above it so a datacenter declares
+    # first).
+    JOB_STUCK_THRESHOLD: StrictFloat = 120.0
 
     # AD-44: Retry Budget Configuration
     RETRY_BUDGET_MAX: StrictInt = 50
@@ -389,12 +536,49 @@ class Env(BaseModel):
     BEST_EFFORT_MIN_DCS_DEFAULT: StrictInt = 1
     BEST_EFFORT_DEADLINE_CHECK_INTERVAL: StrictFloat = 5.0
 
-    # AD-45: Adaptive Route Learning
+    # AD-45: Adaptive Route Learning. The EWMA weight of each new observed
+    # latency sample: a datacenter's time to accept a dispatch is a round
+    # trip through its leader, smoothed as TCP smooths its round-trip time
+    # (RFC 6298 section 2: alpha = 1/8) -- an estimate that follows a
+    # lasting shift within a few dozen samples while one outlier moves it
+    # an eighth of its excess.
     ADAPTIVE_ROUTING_ENABLED: StrictBool = True
-    ADAPTIVE_ROUTING_EWMA_ALPHA: StrictFloat = 0.2
+    ADAPTIVE_ROUTING_EWMA_ALPHA: StrictFloat = 0.125
     ADAPTIVE_ROUTING_MIN_SAMPLES: StrictInt = 10
     ADAPTIVE_ROUTING_MAX_STALENESS_SECONDS: StrictFloat = 300.0
     ADAPTIVE_ROUTING_LATENCY_CAP_MS: StrictFloat = 60000.0
+
+    # AD-42: SLO-aware routing and health -- latency targets and weights,
+    # T-Digest compression and windows, health-classification ratios and
+    # windows, AD-41 resource prediction, and gossip summary limits.
+    SLO_TDIGEST_DELTA: StrictFloat = 100.0
+    SLO_TDIGEST_MAX_UNMERGED: StrictInt = 2048
+    SLO_WINDOW_DURATION_SECONDS: StrictFloat = 60.0
+    SLO_MAX_WINDOWS: StrictInt = 5
+    SLO_EVALUATION_WINDOW_SECONDS: StrictFloat = 300.0
+    SLO_P50_TARGET_MS: StrictFloat = 50.0
+    SLO_P95_TARGET_MS: StrictFloat = 200.0
+    SLO_P99_TARGET_MS: StrictFloat = 500.0
+    SLO_P50_WEIGHT: StrictFloat = 0.2
+    SLO_P95_WEIGHT: StrictFloat = 0.5
+    SLO_P99_WEIGHT: StrictFloat = 0.3
+    SLO_MIN_SAMPLE_COUNT: StrictInt = 100
+    SLO_FACTOR_MIN: StrictFloat = 0.5
+    SLO_FACTOR_MAX: StrictFloat = 3.0
+    SLO_SCORE_WEIGHT: StrictFloat = 0.4
+    SLO_BUSY_P50_RATIO: StrictFloat = 1.5
+    SLO_DEGRADED_P95_RATIO: StrictFloat = 2.0
+    SLO_DEGRADED_P99_RATIO: StrictFloat = 3.0
+    SLO_UNHEALTHY_P99_RATIO: StrictFloat = 5.0
+    SLO_BUSY_WINDOW_SECONDS: StrictFloat = 60.0
+    SLO_DEGRADED_WINDOW_SECONDS: StrictFloat = 180.0
+    SLO_UNHEALTHY_WINDOW_SECONDS: StrictFloat = 300.0
+    SLO_ENABLE_RESOURCE_PREDICTION: StrictBool = True
+    SLO_CPU_LATENCY_CORRELATION: StrictFloat = 0.7
+    SLO_MEMORY_LATENCY_CORRELATION: StrictFloat = 0.4
+    SLO_PREDICTION_BLEND_WEIGHT: StrictFloat = 0.4
+    SLO_GOSSIP_SUMMARY_TTL_SECONDS: StrictFloat = 30.0
+    SLO_GOSSIP_MAX_JOBS_PER_HEARTBEAT: StrictInt = 100
 
     # Manager TCP Timeout Settings
     MANAGER_TCP_TIMEOUT_SHORT: StrictFloat = (
@@ -426,16 +610,44 @@ class Env(BaseModel):
     GATE_TCP_TIMEOUT_FORWARD: StrictFloat = 3.0  # Timeout for forwarding to peers
     # Seconds without a manager heartbeat before a gate counts a datacenter's
     # health as stale.
-    GATE_DATACENTER_HEARTBEAT_STALENESS_THRESHOLD: StrictFloat = 30.0
+    # AD-52 section 8: a gate suspects a datacenter manager by a phi-accrual
+    # detector over its heartbeats' arrival times, not a fixed staleness
+    # window. Suspected at phi 12 -- Cassandra's guidance for cloud and
+    # unstable links (8 is its LAN default; gate-to-datacenter edges cross
+    # regions); intervals over a window of 1,000 and a deviation floor of
+    # 100ms (Akka's and Cassandra's defaults); a 3s pause tolerated beyond
+    # the expected interval (Akka cluster's acceptable-heartbeat-pause).
+    PHI_ACCRUAL_THRESHOLD: StrictFloat = 12.0
+    PHI_ACCRUAL_MAX_SAMPLE_SIZE: StrictInt = 1000
+    PHI_ACCRUAL_MIN_STD_DEVIATION_SECONDS: StrictFloat = 0.1
+    PHI_ACCRUAL_ACCEPTABLE_HEARTBEAT_PAUSE_SECONDS: StrictFloat = 3.0
+    # Seconds per sample of the job-forwarding throughput a gate reports
+    # in its health heartbeat (AD-19).
+    GATE_THROUGHPUT_INTERVAL_SECONDS: StrictFloat = 10.0
     GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS: StrictFloat = 300.0
     GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS: StrictBool = False
+    # Seconds one results reporter may take to connect and submit (and,
+    # separately, to close) -- the gate's for a job's results, the
+    # client's for each workflow's local files -- before it is abandoned
+    # (logged) so a hung reporter neither leaks its submission nor holds
+    # up the job. The longest per-operation deadline the reporter
+    # backends set for themselves is 60 s (CloudwatchConfig.submit_timeout,
+    # NewRelicConfig registration/shutdown_timeout, PrometheusConfig
+    # auth_request_timeout); connect and submit are at most three such
+    # operations (the client submits workflow and step results), so this
+    # never cuts off a backend still within its own limits.
+    REPORTER_SUBMISSION_TIMEOUT_SECONDS: StrictFloat = 180.0
+    # Client update pushes a gate keeps per job for replay to reconnecting
+    # clients.
+    GATE_CLIENT_UPDATE_HISTORY_LIMIT: StrictInt = 200
+    # AD-34 gate timeout tracking: seconds between checks, and seconds
+    # without progress in every datacenter before a job counts as stuck.
+    GATE_TIMEOUT_CHECK_INTERVAL: StrictFloat = 15.0
+    GATE_ALL_DC_STUCK_THRESHOLD: StrictFloat = 180.0
 
-    # Gate Orphan Job Grace Period Settings (Section 7)
-    # Grace period before marking orphaned jobs as failed when job leader manager dies
-    # Should be longer than expected election + takeover time
-    GATE_ORPHAN_GRACE_PERIOD: StrictFloat = (
-        10.0  # Seconds to wait for JobLeaderGateTransfer
-    )
+    # Gate orphan job checks (Section 7). The grace before a lapsed-lease
+    # job is taken over is derived from the gate tier's failure-detection
+    # and election settings (gate/config.py derive_gate_orphan_grace_seconds).
     GATE_ORPHAN_CHECK_INTERVAL: StrictFloat = (
         2.0  # Seconds between orphan grace period checks
     )
@@ -464,12 +676,34 @@ class Env(BaseModel):
     SPILLOVER_ENABLED: StrictBool = True
     CAPACITY_STALENESS_THRESHOLD_SECONDS: StrictFloat = 30.0
 
+    # AD-36 routing load factor: 1 + utilization_weight * utilization +
+    # queue_weight * queue + circuit_pressure_weight * circuit_pressure,
+    # each signal in [0, 1]. The weights sum to 1 so a datacenter loaded
+    # on every signal scores as if twice as far away -- the linear load
+    # penalty of Envoy's least-request balancer at its default
+    # active_request_bias of 1.0 (weight / (1 + load)). Load then decides
+    # among datacenters at comparable distance, and AD-43 spillover, not
+    # the score, moves work across regions when a datacenter cannot take
+    # it. With no evidence that one signal predicts waiting better than
+    # another, each weighs the same, as Kubernetes' NodeResourcesFit
+    # scoring weighs each resource by default.
+    ROUTING_UTILIZATION_WEIGHT: StrictFloat = 1.0 / 3.0
+    ROUTING_QUEUE_WEIGHT: StrictFloat = 1.0 / 3.0
+    ROUTING_CIRCUIT_PRESSURE_WEIGHT: StrictFloat = 1.0 / 3.0
+
     # ==========================================================================
     # Overload Detection Settings (AD-18)
     # ==========================================================================
     OVERLOAD_EMA_ALPHA: StrictFloat = (
         0.1  # Smoothing factor for baseline (lower = more stable)
     )
+    # Seconds between a gate's or manager's own CPU/memory samples. The
+    # detector's windows count samples, so this sets their time constants:
+    # the current average spans OVERLOAD_CURRENT_WINDOW of these, the trend
+    # OVERLOAD_TREND_WINDOW -- ten and twenty seconds at one second. A node
+    # cannot change its overload verdict faster than this, so a request it
+    # sheds is asked to retry after it.
+    OVERLOAD_SAMPLE_INTERVAL_SECONDS: StrictFloat = 1.0
     OVERLOAD_CURRENT_WINDOW: StrictInt = 10  # Samples for current average
     OVERLOAD_TREND_WINDOW: StrictInt = 20  # Samples for trend calculation
     OVERLOAD_MIN_SAMPLES: StrictInt = 3  # Minimum samples before delta detection
@@ -490,25 +724,6 @@ class Env(BaseModel):
     OVERLOAD_MEMORY_BUSY: StrictFloat = 0.7
     OVERLOAD_MEMORY_STRESSED: StrictFloat = 0.85
     OVERLOAD_MEMORY_OVERLOADED: StrictFloat = 0.95
-
-    # ==========================================================================
-    # Health Probe Settings (AD-19)
-    # ==========================================================================
-    # Liveness probe settings
-    LIVENESS_PROBE_TIMEOUT: StrictFloat = 1.0  # Seconds
-    LIVENESS_PROBE_PERIOD: StrictFloat = 10.0  # Seconds between checks
-    LIVENESS_PROBE_FAILURE_THRESHOLD: StrictInt = 3  # Failures before unhealthy
-    LIVENESS_PROBE_SUCCESS_THRESHOLD: StrictInt = 1  # Successes to recover
-    # Readiness probe settings
-    READINESS_PROBE_TIMEOUT: StrictFloat = 2.0  # Seconds
-    READINESS_PROBE_PERIOD: StrictFloat = 10.0  # Seconds between checks
-    READINESS_PROBE_FAILURE_THRESHOLD: StrictInt = 3  # Failures before unhealthy
-    READINESS_PROBE_SUCCESS_THRESHOLD: StrictInt = 1  # Successes to recover
-    # Startup probe settings
-    STARTUP_PROBE_TIMEOUT: StrictFloat = 5.0  # Seconds
-    STARTUP_PROBE_PERIOD: StrictFloat = 5.0  # Seconds between checks
-    STARTUP_PROBE_FAILURE_THRESHOLD: StrictInt = 30  # Allow slow startups (150s)
-    STARTUP_PROBE_SUCCESS_THRESHOLD: StrictInt = 1  # One success = started
 
     # ==========================================================================
     # Rate Limiting Settings (AD-24)
@@ -635,10 +850,6 @@ class Env(BaseModel):
     # Status update processing interval (seconds) - controls how often _process_status_updates runs
     # during workflow completion wait. Lower values = more responsive UI updates.
     STATUS_UPDATE_POLL_INTERVAL: StrictFloat = 0.05  # 50ms default for real-time UI
-
-    # Client rate limiting for progress updates only
-    CLIENT_PROGRESS_RATE_LIMIT: StrictFloat = 100.0  # Max progress callbacks per second
-    CLIENT_PROGRESS_BURST: StrictInt = 20  # Burst allowance for progress callbacks
 
     # ==========================================================================
     # Manager Stats Buffer Settings (AD-23)
@@ -789,8 +1000,8 @@ class Env(BaseModel):
     DISCOVERY_MIN_PEERS_PER_TIER: StrictInt = 1  # Minimum peers per locality tier
 
     # Probing and health
-    DISCOVERY_MAX_CONCURRENT_PROBES: StrictInt = (
-        10  # Max concurrent DNS resolutions/probes
+    DISCOVERY_MAX_CONCURRENT_DNS_RESOLUTIONS: StrictInt = (
+        10  # Most DNS resolutions in flight at once
     )
     DISCOVERY_PROBE_INTERVAL: StrictFloat = 30.0  # Seconds between peer health probes
     DISCOVERY_FAILURE_DECAY_INTERVAL: StrictFloat = (
@@ -878,6 +1089,14 @@ class Env(BaseModel):
             "CLUSTER_STABILIZATION_TIMEOUT": float,
             "CLUSTER_STABILIZATION_POLL_INTERVAL": float,
             "LEADER_ELECTION_JITTER_MAX": float,
+            "CLUSTER_FORMATION_INTERVAL_SECONDS": float,
+            "CLUSTER_TOMBSTONE_RETENTION_SECONDS": float,
+            "CLUSTER_WATCH_WAIT_SECONDS": float,
+            "CLUSTER_SNAPSHOT_ENTRIES": int,
+            "CLUSTER_SNAPSHOT_CATCH_UP_ENTRIES": int,
+            "RAFT_SET_ASIDE_RETAINED": int,
+            "RAFT_LEADER_LEASES_ENABLED": parse_bool_envar,
+            "RAFT_CLOCK_DRIFT_BOUND": float,
             # Federated health monitor settings
             "FEDERATED_PROBE_INTERVAL": float,
             "FEDERATED_PROBE_TIMEOUT": float,
@@ -906,10 +1125,17 @@ class Env(BaseModel):
             # Worker TCP timeout settings
             "WORKER_TCP_TIMEOUT_SHORT": float,
             "WORKER_TCP_TIMEOUT_STANDARD": float,
+            "WORKER_PROGRESS_SEND_TIMEOUT": float,
+            "WORKER_HEARTBEAT_SEND_TIMEOUT": float,
+            "WORKER_EXECUTION_UPDATE_WAIT": float,
+            "WORKER_WORKFLOW_CANCEL_TIMEOUT": float,
+            "WORKER_PENDING_RESULT_LIMIT": int,
+            "WORKER_RESULT_MAX_RETRIES": int,
+            "WORKER_RESULT_RETRY_BASE_DELAY": float,
+            "WORKER_COMPLETION_TIMES_MAX_SAMPLES": int,
             # Worker process pool startup budget
             "WORKER_POOL_STARTUP_TIMEOUT_SECONDS": float,
             # Worker orphan grace period settings
-            "WORKER_ORPHAN_GRACE_PERIOD": float,
             "WORKER_ORPHAN_CHECK_INTERVAL": float,
             # Worker job leadership transfer settings (Section 8)
             "WORKER_PENDING_TRANSFER_TTL": float,
@@ -921,6 +1147,7 @@ class Env(BaseModel):
             "MANAGER_HEARTBEAT_INTERVAL": float,
             "MAX_WORKERS_PER_MANAGER": int,
             "MANAGER_PEER_SYNC_INTERVAL": float,
+            "MANAGER_PEER_JOB_SYNC_INTERVAL": float,
             # Job cleanup settings
             "COMPLETED_JOB_MAX_AGE": float,
             "FAILED_JOB_MAX_AGE": float,
@@ -944,6 +1171,12 @@ class Env(BaseModel):
             "CLIENT_ORPHAN_GRACE_PERIOD": float,
             "CLIENT_ORPHAN_CHECK_INTERVAL": float,
             "CLIENT_RESPONSE_FRESHNESS_TIMEOUT": float,
+            "CLIENT_STATUS_QUERY_TIMEOUT": float,
+            "CLIENT_SUBMISSION_TIMEOUT": float,
+            "CLIENT_SUBMISSION_MAX_RETRIES": int,
+            "CLIENT_SUBMISSION_MAX_REDIRECTS": int,
+            "CLIENT_RESULT_DRAIN_TIMEOUT": float,
+            "CLIENT_JOB_RETENTION_SECONDS": float,
             # Manager dead node cleanup settings
             "MANAGER_DEAD_WORKER_REAP_INTERVAL": float,
             "MANAGER_DEAD_PEER_REAP_INTERVAL": float,
@@ -958,6 +1191,7 @@ class Env(BaseModel):
             # Manager health alert settings
             "MANAGER_HEALTH_ALERT_OVERLOADED_RATIO": float,
             "MANAGER_HEALTH_ALERT_NON_HEALTHY_RATIO": float,
+            "MANAGER_THROUGHPUT_INTERVAL_SECONDS": float,
             # AD-44 retry budget settings
             "RETRY_BUDGET_MAX": int,
             "RETRY_BUDGET_PER_WORKFLOW_MAX": int,
@@ -975,11 +1209,18 @@ class Env(BaseModel):
             "GATE_TCP_TIMEOUT_SHORT": float,
             "GATE_TCP_TIMEOUT_STANDARD": float,
             "GATE_TCP_TIMEOUT_FORWARD": float,
-            "GATE_DATACENTER_HEARTBEAT_STALENESS_THRESHOLD": float,
+            "PHI_ACCRUAL_THRESHOLD": float,
+            "PHI_ACCRUAL_MAX_SAMPLE_SIZE": int,
+            "PHI_ACCRUAL_MIN_STD_DEVIATION_SECONDS": float,
+            "PHI_ACCRUAL_ACCEPTABLE_HEARTBEAT_PAUSE_SECONDS": float,
+            "GATE_THROUGHPUT_INTERVAL_SECONDS": float,
+            "GATE_CLIENT_UPDATE_HISTORY_LIMIT": int,
+            "GATE_TIMEOUT_CHECK_INTERVAL": float,
+            "GATE_ALL_DC_STUCK_THRESHOLD": float,
             "GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS": float,
             "GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS": parse_bool_envar,
+            "REPORTER_SUBMISSION_TIMEOUT_SECONDS": float,
             # Gate orphan grace period settings (Section 7)
-            "GATE_ORPHAN_GRACE_PERIOD": float,
             "GATE_ORPHAN_CHECK_INTERVAL": float,
             "GATE_DEAD_PEER_REAP_INTERVAL": float,
             "GATE_DEAD_PEER_CHECK_INTERVAL": float,
@@ -987,10 +1228,13 @@ class Env(BaseModel):
             # Gate SWIM hierarchical-detector bracket (AD-30)
             "GATE_SWIM_GLOBAL_MIN_TIMEOUT": float,
             "GATE_SWIM_GLOBAL_MAX_TIMEOUT": float,
+            "MANAGER_SWIM_JOB_MIN_TIMEOUT": float,
+            "MANAGER_SWIM_JOB_MAX_TIMEOUT": float,
             "GATE_SWIM_JOB_MIN_TIMEOUT": float,
             "GATE_SWIM_JOB_MAX_TIMEOUT": float,
             # Overload detection settings (AD-18)
             "OVERLOAD_EMA_ALPHA": float,
+            "OVERLOAD_SAMPLE_INTERVAL_SECONDS": float,
             "OVERLOAD_CURRENT_WINDOW": int,
             "OVERLOAD_TREND_WINDOW": int,
             "OVERLOAD_MIN_SAMPLES": int,
@@ -1008,18 +1252,6 @@ class Env(BaseModel):
             "OVERLOAD_MEMORY_STRESSED": float,
             "OVERLOAD_MEMORY_OVERLOADED": float,
             # Health probe settings (AD-19)
-            "LIVENESS_PROBE_TIMEOUT": float,
-            "LIVENESS_PROBE_PERIOD": float,
-            "LIVENESS_PROBE_FAILURE_THRESHOLD": int,
-            "LIVENESS_PROBE_SUCCESS_THRESHOLD": int,
-            "READINESS_PROBE_TIMEOUT": float,
-            "READINESS_PROBE_PERIOD": float,
-            "READINESS_PROBE_FAILURE_THRESHOLD": int,
-            "READINESS_PROBE_SUCCESS_THRESHOLD": int,
-            "STARTUP_PROBE_TIMEOUT": float,
-            "STARTUP_PROBE_PERIOD": float,
-            "STARTUP_PROBE_FAILURE_THRESHOLD": int,
-            "STARTUP_PROBE_SUCCESS_THRESHOLD": int,
             # Rate limiting settings (AD-24)
             "RATE_LIMIT_DEFAULT_BUCKET_SIZE": int,
             "RATE_LIMIT_DEFAULT_REFILL_RATE": float,
@@ -1048,8 +1280,6 @@ class Env(BaseModel):
             "STATS_PUSH_INTERVAL_MS": float,
             "STATS_MAX_WINDOW_AGE_MS": float,
             "STATUS_UPDATE_POLL_INTERVAL": float,
-            "CLIENT_PROGRESS_RATE_LIMIT": float,
-            "CLIENT_PROGRESS_BURST": int,
             # Manager stats buffer settings (AD-23)
             "MANAGER_STATS_HOT_MAX_ENTRIES": int,
             "MANAGER_STATS_THROTTLE_THRESHOLD": float,
@@ -1120,8 +1350,11 @@ class Env(BaseModel):
             # Transport / TLS settings
             "MERCURY_SYNC_AUTH_SECRET_PREVIOUS": str,
             "MERCURY_SYNC_TCP_SERVER_BACKLOG": int,
+            "MERCURY_SYNC_MAX_ACCEPTED_TCP_CONNECTIONS": int,
             "MERCURY_SYNC_VERIFY_SSL_CERT": str,
             "MERCURY_SYNC_TLS_VERIFY_HOSTNAME": str,
+            "MERCURY_SYNC_HOST_RESOLUTION_TTL": float,
+            "MERCURY_SYNC_HOST_RESOLUTION_TIMEOUT": float,
             "MERCURY_SYNC_CONNECT_TIMEOUT": str,
             "MERCURY_SYNC_RETRY_INTERVAL": str,
             "MERCURY_SYNC_SEND_RETRIES": int,
@@ -1150,18 +1383,51 @@ class Env(BaseModel):
             "JOB_RESPONSIVENESS_THRESHOLD": float,
             "JOB_RESPONSIVENESS_CHECK_INTERVAL": float,
             "JOB_TIMEOUT_CHECK_INTERVAL": float,
+            "JOB_STUCK_THRESHOLD": float,
             # Adaptive routing settings
             "ADAPTIVE_ROUTING_ENABLED": parse_bool_envar,
             "ADAPTIVE_ROUTING_EWMA_ALPHA": float,
             "ADAPTIVE_ROUTING_MIN_SAMPLES": int,
             "ADAPTIVE_ROUTING_MAX_STALENESS_SECONDS": float,
             "ADAPTIVE_ROUTING_LATENCY_CAP_MS": float,
+            "SLO_TDIGEST_DELTA": float,
+            "SLO_TDIGEST_MAX_UNMERGED": int,
+            "SLO_WINDOW_DURATION_SECONDS": float,
+            "SLO_MAX_WINDOWS": int,
+            "SLO_EVALUATION_WINDOW_SECONDS": float,
+            "SLO_P50_TARGET_MS": float,
+            "SLO_P95_TARGET_MS": float,
+            "SLO_P99_TARGET_MS": float,
+            "SLO_P50_WEIGHT": float,
+            "SLO_P95_WEIGHT": float,
+            "SLO_P99_WEIGHT": float,
+            "SLO_MIN_SAMPLE_COUNT": int,
+            "SLO_FACTOR_MIN": float,
+            "SLO_FACTOR_MAX": float,
+            "SLO_SCORE_WEIGHT": float,
+            "SLO_BUSY_P50_RATIO": float,
+            "SLO_DEGRADED_P95_RATIO": float,
+            "SLO_DEGRADED_P99_RATIO": float,
+            "SLO_UNHEALTHY_P99_RATIO": float,
+            "SLO_BUSY_WINDOW_SECONDS": float,
+            "SLO_DEGRADED_WINDOW_SECONDS": float,
+            "SLO_UNHEALTHY_WINDOW_SECONDS": float,
+            "SLO_ENABLE_RESOURCE_PREDICTION": parse_bool_envar,
+            "SLO_CPU_LATENCY_CORRELATION": float,
+            "SLO_MEMORY_LATENCY_CORRELATION": float,
+            "SLO_PREDICTION_BLEND_WEIGHT": float,
+            "SLO_GOSSIP_SUMMARY_TTL_SECONDS": float,
+            "SLO_GOSSIP_MAX_JOBS_PER_HEARTBEAT": int,
             # Capacity spillover settings (AD-43)
             "SPILLOVER_MAX_WAIT_SECONDS": float,
             "SPILLOVER_MAX_LATENCY_PENALTY_MS": float,
             "SPILLOVER_MIN_IMPROVEMENT_RATIO": float,
             "SPILLOVER_ENABLED": parse_bool_envar,
             "CAPACITY_STALENESS_THRESHOLD_SECONDS": float,
+            # Routing load factor weights (AD-36)
+            "ROUTING_UTILIZATION_WEIGHT": float,
+            "ROUTING_QUEUE_WEIGHT": float,
+            "ROUTING_CIRCUIT_PRESSURE_WEIGHT": float,
             # Discovery settings (AD-28)
             "DISCOVERY_DNS_NAMES": str,
             "DISCOVERY_DNS_CACHE_TTL": float,
@@ -1181,7 +1447,7 @@ class Env(BaseModel):
             "DISCOVERY_BASELINE_LATENCY_MS": float,
             "DISCOVERY_LATENCY_MULTIPLIER_THRESHOLD": float,
             "DISCOVERY_MIN_PEERS_PER_TIER": int,
-            "DISCOVERY_MAX_CONCURRENT_PROBES": int,
+            "DISCOVERY_MAX_CONCURRENT_DNS_RESOLUTIONS": int,
             "DISCOVERY_PROBE_INTERVAL": float,
             "DISCOVERY_FAILURE_DECAY_INTERVAL": float,
         }
@@ -1287,54 +1553,6 @@ class Env(BaseModel):
             ),
         )
 
-    def get_liveness_probe_config(self):
-        """
-        Get liveness probe configuration (AD-19).
-
-        Liveness probes check if the process is running and responsive.
-        Failure triggers restart/replacement.
-        """
-        from hyperscale.distributed.health.probes import ProbeConfig
-
-        return ProbeConfig(
-            timeout_seconds=self.LIVENESS_PROBE_TIMEOUT,
-            period_seconds=self.LIVENESS_PROBE_PERIOD,
-            failure_threshold=self.LIVENESS_PROBE_FAILURE_THRESHOLD,
-            success_threshold=self.LIVENESS_PROBE_SUCCESS_THRESHOLD,
-        )
-
-    def get_readiness_probe_config(self):
-        """
-        Get readiness probe configuration (AD-19).
-
-        Readiness probes check if the node can accept work.
-        Failure removes from load balancer/routing.
-        """
-        from hyperscale.distributed.health.probes import ProbeConfig
-
-        return ProbeConfig(
-            timeout_seconds=self.READINESS_PROBE_TIMEOUT,
-            period_seconds=self.READINESS_PROBE_PERIOD,
-            failure_threshold=self.READINESS_PROBE_FAILURE_THRESHOLD,
-            success_threshold=self.READINESS_PROBE_SUCCESS_THRESHOLD,
-        )
-
-    def get_startup_probe_config(self):
-        """
-        Get startup probe configuration (AD-19).
-
-        Startup probes check if initialization is complete.
-        Delays liveness/readiness until startup complete.
-        """
-        from hyperscale.distributed.health.probes import ProbeConfig
-
-        return ProbeConfig(
-            timeout_seconds=self.STARTUP_PROBE_TIMEOUT,
-            period_seconds=self.STARTUP_PROBE_PERIOD,
-            failure_threshold=self.STARTUP_PROBE_FAILURE_THRESHOLD,
-            success_threshold=self.STARTUP_PROBE_SUCCESS_THRESHOLD,
-        )
-
     def get_rate_limit_config(self):
         """
         Get rate limiting configuration (AD-24).
@@ -1398,6 +1616,8 @@ class Env(BaseModel):
             min_grant=self.EXTENSION_MIN_GRANT,
             max_extensions=self.EXTENSION_MAX_EXTENSIONS,
             eviction_threshold=self.EXTENSION_EVICTION_THRESHOLD,
+            warning_threshold=self.EXTENSION_EXHAUSTION_WARNING_THRESHOLD,
+            grace_period=self.EXTENSION_EXHAUSTION_GRACE_PERIOD,
         )
 
     def get_extension_tracker_config(self):
@@ -1477,8 +1697,6 @@ class Env(BaseModel):
 
     def get_discovery_config(
         self,
-        cluster_id: str = "hyperscale",
-        environment_id: str = "default",
         node_role: str = "worker",
         static_seeds: list[str] | None = None,
         allow_dynamic_registration: bool = False,
@@ -1487,11 +1705,10 @@ class Env(BaseModel):
         Get discovery service configuration (AD-28).
 
         Creates configuration for peer discovery, locality-aware selection,
-        and adaptive load balancing.
+        and adaptive load balancing, filtering peers by this node's
+        CLUSTER_ID and ENVIRONMENT_ID.
 
         Args:
-            cluster_id: Cluster identifier for filtering peers
-            environment_id: Environment identifier
             node_role: Role of the local node ('worker', 'manager', etc.)
             static_seeds: Static seed addresses in "host:port" format
             allow_dynamic_registration: Allow empty seeds (peers register dynamically)
@@ -1519,8 +1736,8 @@ class Env(BaseModel):
             ]
 
         return DiscoveryConfig(
-            cluster_id=cluster_id,
-            environment_id=environment_id,
+            cluster_id=self.CLUSTER_ID,
+            environment_id=self.ENVIRONMENT_ID,
             node_role=node_role,
             dns_names=dns_names,
             static_seeds=static_seeds or [],
@@ -1543,7 +1760,7 @@ class Env(BaseModel):
             baseline_latency_ms=self.DISCOVERY_BASELINE_LATENCY_MS,
             latency_multiplier_threshold=self.DISCOVERY_LATENCY_MULTIPLIER_THRESHOLD,
             min_peers_per_tier=self.DISCOVERY_MIN_PEERS_PER_TIER,
-            max_concurrent_probes=self.DISCOVERY_MAX_CONCURRENT_PROBES,
+            max_concurrent_dns_resolutions=self.DISCOVERY_MAX_CONCURRENT_DNS_RESOLUTIONS,
             # Dynamic registration mode
             allow_dynamic_registration=allow_dynamic_registration,
         )

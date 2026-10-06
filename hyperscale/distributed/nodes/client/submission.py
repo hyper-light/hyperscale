@@ -206,6 +206,9 @@ class ClientJobSubmitter:
         # Initialize job tracking
         self._tracker.initialize_job_tracking(
             job_id,
+            expected_workflow_ids=frozenset(
+                workflow_id for workflow_id, _, _ in workflows_with_ids
+            ),
             on_status_update=on_status_update,
             on_progress_update=on_progress_update,
             on_workflow_result=on_workflow_result,
@@ -447,7 +450,7 @@ class ClientJobSubmitter:
                 target,
                 "job_submission",
                 submission.dump(),
-                timeout=10.0,
+                timeout=self._config.submission_timeout_seconds,
             )
 
             if isinstance(response, Exception):

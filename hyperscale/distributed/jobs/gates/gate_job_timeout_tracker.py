@@ -8,17 +8,18 @@ The GateJobTimeoutTracker aggregates timeout state from all DCs:
 - Broadcasts JobGlobalTimeout to all DC managers
 
 This is the gate-side counterpart to GateCoordinatedTimeout in manager.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-
-from hyperscale.logging.hyperscale_logging_models import (
-    ServerDebug,
-    ServerInfo,
-    ServerWarning,
-)
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerInfo, ServerWarning
 from hyperscale.distributed.models.distributed import (
     JobProgressReport,
     JobTimeoutReport,
@@ -26,68 +27,14 @@ from hyperscale.distributed.models.distributed import (
     JobLeaderTransfer,
     JobFinalStatus,
 )
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
-
-_DEFAULT_CLOCK: Clock = RealClock()
+from .gate_job_tracking_info import GateJobTrackingInfo
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate import GateServer
 
-
-@dataclass(slots=True)
-class GateJobTrackingInfo:
-    """
-    Gate's view of a job across all DCs (AD-34 Part 5).
-
-    Tracks per-DC progress, timeouts, and extension data to enable
-    global timeout decisions.
-    """
-
-    job_id: str
-    """Job identifier."""
-
-    submitted_at: float
-    """Global start time (monotonic)."""
-
-    timeout_seconds: float
-    """Job timeout in seconds."""
-
-    target_datacenters: list[str]
-    """DCs where this job is running."""
-
-    dc_status: dict[str, str] = field(default_factory=dict)
-    """DC -> "running" | "completed" | "failed" | "timed_out" | "cancelled"."""
-
-    dc_last_progress: dict[str, float] = field(default_factory=dict)
-    """DC -> last progress timestamp (monotonic)."""
-
-    dc_manager_addrs: dict[str, tuple[str, int]] = field(default_factory=dict)
-    """DC -> current manager (host, port) for sending timeout decisions."""
-
-    dc_fence_tokens: dict[str, int] = field(default_factory=dict)
-    """DC -> manager's fence token (for stale rejection)."""
-
-    # Extension tracking (AD-26 integration)
-    dc_total_extensions: dict[str, float] = field(default_factory=dict)
-    """DC -> total extension seconds granted."""
-
-    dc_max_extension: dict[str, float] = field(default_factory=dict)
-    """DC -> largest single extension granted."""
-
-    dc_workers_with_extensions: dict[str, int] = field(default_factory=dict)
-    """DC -> count of workers with active extensions."""
-
-    # Global timeout state
-    globally_timed_out: bool = False
-    """Whether gate has declared global timeout."""
-
-    timeout_reason: str = ""
-    """Reason for global timeout."""
-
-    timeout_fence_token: int = 0
-    """Gate's fence token for this timeout decision."""
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class GateJobTimeoutTracker:
@@ -145,10 +92,14 @@ class GateJobTimeoutTracker:
         self._running = False
         if self._check_task:
             self._check_task.cancel()
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
                 await self._check_task
             except asyncio.CancelledError:
-                pass
+                # The task we cancelled ended; a cancel aimed at this task
+                # while it waited goes on.
+                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                    raise
             self._check_task = None
         async with self._lock:
             self._tracked_jobs.clear()
@@ -228,7 +179,9 @@ class GateJobTimeoutTracker:
         """
         async with self._lock:
             info = self._tracked_jobs.get(report.job_id)
-            if not info:
+            # A datacenter the job moved off reports nothing the job's
+            # timeout depends on.
+            if not info or report.datacenter not in info.target_datacenters:
                 return
 
             if await self._reject_superseded_report(
@@ -265,7 +218,7 @@ class GateJobTimeoutTracker:
         """
         async with self._lock:
             info = self._tracked_jobs.get(report.job_id)
-            if not info:
+            if not info or report.datacenter not in info.target_datacenters:
                 return
 
             if await self._reject_superseded_report(
@@ -297,7 +250,7 @@ class GateJobTimeoutTracker:
         """
         async with self._lock:
             info = self._tracked_jobs.get(report.job_id)
-            if not info:
+            if not info or report.datacenter not in info.target_datacenters:
                 return
 
             if await self._reject_superseded_report(
@@ -329,7 +282,7 @@ class GateJobTimeoutTracker:
         """
         async with self._lock:
             info = self._tracked_jobs.get(report.job_id)
-            if not info:
+            if not info or report.datacenter not in info.target_datacenters:
                 return
 
             # Update DC status
@@ -359,6 +312,46 @@ class GateJobTimeoutTracker:
                         node_id=self._gate._node_id.short,
                     )
                 )
+
+    async def replace_target_datacenter(
+        self,
+        job_id: str,
+        lost_datacenter: str,
+        replacement_datacenter: str,
+    ) -> None:
+        """The job moved off ``lost_datacenter`` to ``replacement_datacenter``
+        (AD-36 mid-flight failover): the replacement is tracked from now --
+        just started, so not stuck -- and the lost one no longer counts
+        toward the job's timeout decisions. "" for a replacement: nothing
+        re-runs, the lost datacenter is only dropped."""
+        async with self._lock:
+            info = self._tracked_jobs.get(job_id)
+            if not info:
+                return
+            now = _DEFAULT_CLOCK.monotonic()
+            info.target_datacenters = [
+                datacenter
+                for datacenter in info.target_datacenters
+                if datacenter != lost_datacenter
+            ]
+            for per_datacenter in (
+                info.dc_status,
+                info.dc_last_progress,
+                info.dc_manager_addrs,
+                info.dc_fence_tokens,
+                info.dc_total_extensions,
+                info.dc_max_extension,
+                info.dc_workers_with_extensions,
+            ):
+                per_datacenter.pop(lost_datacenter, None)
+            if not replacement_datacenter:
+                return
+            info.target_datacenters.append(replacement_datacenter)
+            info.dc_status[replacement_datacenter] = "running"
+            info.dc_last_progress[replacement_datacenter] = now
+            info.dc_total_extensions[replacement_datacenter] = 0.0
+            info.dc_max_extension[replacement_datacenter] = 0.0
+            info.dc_workers_with_extensions[replacement_datacenter] = 0
 
     async def get_job_info(self, job_id: str) -> GateJobTrackingInfo | None:
         """Get tracking info for a job."""
@@ -531,3 +524,10 @@ class GateJobTimeoutTracker:
         """
         async with self._lock:
             self._tracked_jobs.pop(job_id, None)
+
+_REHOMED = (
+    GateJobTrackingInfo,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

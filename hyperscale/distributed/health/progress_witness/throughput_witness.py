@@ -38,6 +38,12 @@ history is statistically distinguishable from the tail at level
 ``acceptable_extension_fpr``, we narrow the window — older samples
 no longer reflect the current regime and would corrupt the
 predictive posterior.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from __future__ import annotations
@@ -46,127 +52,15 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Deque
-
 from hyperscale.distributed.runtime import Clock, RealClock
-from .bocpd import (
-    BayesianOnlineChangePointDetector,
-    BOCPDConfig,
-    RunLengthPosterior,
-)
-from .hierarchical_alpha import (
-    HierarchicalAlphaBudget,
-    HierarchicalAlphaConfig,
-)
-from .kolmogorov_smirnov import (
-    KSResult,
-    TwoSampleKolmogorovSmirnov,
-)
 
-
-# ============================================================================
-# Public types
-# ============================================================================
-
-
-class WitnessVerdictKind(Enum):
-    """Possible witness outcomes for a single observation."""
-
-    COLD_START = auto()
-    """Detector hasn't seen enough samples yet — defer to other
-    witnesses. Default during the first ~5–10 heartbeats per
-    (worker, workflow) pair."""
-
-    STATIONARY = auto()
-    """No change-point detected. Throughput consistent with the
-    learned baseline distribution."""
-
-    REGIME_CHANGE_DOWN = auto()
-    """Change-point detected AND predictive mean dropped. Strong
-    evidence that the workflow's throughput regime has degraded —
-    H5 should deny the extension."""
-
-    REGIME_CHANGE_UP = auto()
-    """Change-point detected AND predictive mean rose. Workflow is
-    recovering from a slowdown — H5 should treat as a healthy
-    signal."""
-
-
-@dataclass(slots=True, frozen=True)
-class WitnessVerdict:
-    """Structured outcome from ``ThroughputWitness.observe``.
-
-    Attributes:
-        kind: Categorical outcome per ``WitnessVerdictKind``.
-        change_point_probability: ``P(r_t = 0 | x_1:t)`` from the
-            BOCPD posterior at this observation.
-        alpha_workflow: The per-workflow false-positive budget the
-            outcome was evaluated against.
-        observation: The throughput sample that produced this
-            verdict (carried for forensics / outcome feedback).
-        observation_count: How many samples the per-stream BOCPD
-            has processed including this one.
-        predictive_mean_before: Posterior-marginalised predictive
-            mean *before* this observation (i.e. the prior
-            expectation we're comparing against).
-        predictive_mean_after: Posterior-marginalised predictive
-            mean *after* the update.
-    """
-
-    kind: WitnessVerdictKind
-    change_point_probability: float
-    alpha_workflow: float
-    observation: float
-    observation_count: int
-    predictive_mean_before: float
-    predictive_mean_after: float
-
-
-# ============================================================================
-# Configuration
-# ============================================================================
-
-
-@dataclass(slots=True, frozen=True)
-class ThroughputWitnessConfig:
-    """Configuration for ``ThroughputWitness``."""
-
-    # Forwarded to the per-stream BOCPD detector.
-    bocpd: BOCPDConfig = field(default_factory=BOCPDConfig)
-    # Forwarded to the hierarchical α-budget allocator.
-    alpha: HierarchicalAlphaConfig = field(default_factory=HierarchicalAlphaConfig)
-    # Below this many samples, the witness returns COLD_START. Picked
-    # so the BOCPD detector has at least a handful of samples to
-    # establish a prior before its decisions are honored.
-    cold_start_min_observations: int = 5
-    # Maximum samples retained per (worker, workflow) for the K-S
-    # adaptive-window test. Bounded so memory stays O(streams ×
-    # max_history_per_stream).
-    max_history_per_stream: int = 1024
-    # When the K-S test rejects stationarity at this level, the
-    # witness narrows the BOCPD's effective baseline to the most
-    # recent half of the history. ``alpha_system`` from the budget
-    # config is used by default — exposing it here lets a deployment
-    # tune the K-S sensitivity independently of the FPR budget.
-    ks_alpha_override: float | None = None
-
-
-# ============================================================================
-# Per-stream state
-# ============================================================================
-
-
-@dataclass(slots=True)
-class _StreamState:
-    """Per-(worker, workflow) BOCPD state plus a bounded history."""
-
-    detector: BayesianOnlineChangePointDetector
-    history: Deque[float]
-    last_observation_time: float = 0.0
-
-
-# ============================================================================
-# ThroughputWitness public API
-# ============================================================================
+from .bocpd import BayesianOnlineChangePointDetector, BOCPDConfig, RunLengthPosterior
+from .hierarchical_alpha import HierarchicalAlphaBudget, HierarchicalAlphaConfig
+from .kolmogorov_smirnov import KSResult, TwoSampleKolmogorovSmirnov
+from .throughput_witness_config import ThroughputWitnessConfig
+from .witness_verdict import WitnessVerdict
+from .witness_verdict_kind import WitnessVerdictKind
+from ._stream_state import _StreamState
 
 
 class ThroughputWitness:
@@ -190,6 +84,11 @@ class ThroughputWitness:
             self._config.alpha
         )
         self._streams: dict[tuple[str, str], _StreamState] = {}
+        # Which workers hold a stream for each workflow, and which
+        # workflows each worker holds one for: a workflow's end or a
+        # worker's departure drops exactly its streams.
+        self._workers_by_workflow: dict[str, set[str]] = {}
+        self._workflows_by_worker: dict[str, set[str]] = {}
         self._clock: Clock = clock if clock is not None else RealClock()
 
     @property
@@ -208,7 +107,38 @@ class ThroughputWitness:
         Also called after the H5 decision *accepts* a regime change,
         so the new regime starts with a fresh prior.
         """
-        self._streams.pop((worker_id, workflow_id), None)
+        if self._streams.pop((worker_id, workflow_id), None) is None:
+            return
+        if (workers := self._workers_by_workflow.get(workflow_id)) is not None:
+            workers.discard(worker_id)
+            if not workers:
+                del self._workers_by_workflow[workflow_id]
+        if (workflows := self._workflows_by_worker.get(worker_id)) is not None:
+            workflows.discard(workflow_id)
+            if not workflows:
+                del self._workflows_by_worker[worker_id]
+
+    def forget_workflow(self, workflow_id: str) -> None:
+        """Drop every stream of a workflow that has ended."""
+        for worker_id in self._workers_by_workflow.pop(workflow_id, set()):
+            self._streams.pop((worker_id, workflow_id), None)
+            if (workflows := self._workflows_by_worker.get(worker_id)) is not None:
+                workflows.discard(workflow_id)
+                if not workflows:
+                    del self._workflows_by_worker[worker_id]
+
+    def forget_worker(self, worker_id: str) -> None:
+        """Drop every stream of a worker that has left."""
+        for workflow_id in self._workflows_by_worker.pop(worker_id, set()):
+            self._streams.pop((worker_id, workflow_id), None)
+            if (workers := self._workers_by_workflow.get(workflow_id)) is not None:
+                workers.discard(worker_id)
+                if not workers:
+                    del self._workers_by_workflow[workflow_id]
+
+    @property
+    def stream_count(self) -> int:
+        return len(self._streams)
 
     def observe(
         self,
@@ -243,6 +173,8 @@ class ThroughputWitness:
                 history=deque(maxlen=self._config.max_history_per_stream),
             )
             self._streams[key] = stream
+            self._workers_by_workflow.setdefault(workflow_id, set()).add(worker_id)
+            self._workflows_by_worker.setdefault(worker_id, set()).add(workflow_id)
 
         # Adaptive baseline window selection via K-S test.
         # If the head of the history is statistically distinguishable
@@ -406,3 +338,13 @@ class ThroughputWitness:
         # narrower data.
         for _ in range(history_len // 2):
             stream.history.popleft()
+
+_REHOMED = (
+    WitnessVerdictKind,
+    WitnessVerdict,
+    ThroughputWitnessConfig,
+    _StreamState,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

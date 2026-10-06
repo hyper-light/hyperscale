@@ -2,31 +2,20 @@
 Negative cache for DNS resolution failures.
 
 Prevents repeated lookups for known-failed hostnames.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .negative_entry import NegativeEntry
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-@dataclass(slots=True)
-class NegativeEntry:
-    """A cached negative result for DNS lookup."""
-
-    hostname: str
-    """The hostname that failed resolution."""
-
-    error_message: str
-    """Description of the failure."""
-
-    cached_at: float
-    """Timestamp when this entry was cached."""
-
-    failure_count: int = 1
-    """Number of consecutive failures for this hostname."""
 
 
 @dataclass
@@ -213,3 +202,10 @@ class NegativeCache:
     def size(self) -> int:
         """Return the number of entries in the cache."""
         return len(self._entries)
+
+_REHOMED = (
+    NegativeEntry,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

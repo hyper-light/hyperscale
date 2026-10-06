@@ -56,7 +56,7 @@ def _build_managers(
                 host,
                 my["tcp"],
                 my["udp"],
-                Env(),
+                Env(MERCURY_SYNC_AUTH_SECRET="sim-smoke-quorum-secret-0123456789"),
                 dc_id=dc_id,
                 seed_managers=peer_tcp,
                 manager_udp_peers=peer_udp,
@@ -88,26 +88,29 @@ def test_three_managers_form_quorum_under_sim():
             # start() is non-blocking: it brings up listeners and spawns
             # the election / raft / probe background loops, then returns.
             await asyncio.gather(*[manager.start() for manager in managers])
-            # Let the election converge, then SAMPLE leadership across a
-            # window so any oscillation is caught, not snapshot-hidden.
-            await asyncio.sleep(30.0)
-            samples = []
-            for _ in range(7):
-                await asyncio.sleep(5.0)
-                samples.append(
-                    (
-                        tuple(
-                            index
-                            for index, manager in enumerate(managers)
-                            if manager.is_leader()
-                        ),
-                        frozenset(
-                            manager.get_current_leader() for manager in managers
-                        ),
-                        all(manager._has_quorum_available() for manager in managers),
+            try:
+                # Let the election converge, then SAMPLE leadership across a
+                # window so any oscillation is caught, not snapshot-hidden.
+                await asyncio.sleep(30.0)
+                samples = []
+                for _ in range(7):
+                    await asyncio.sleep(5.0)
+                    samples.append(
+                        (
+                            tuple(
+                                index
+                                for index, manager in enumerate(managers)
+                                if manager.is_leader()
+                            ),
+                            frozenset(
+                                manager.get_current_leader() for manager in managers
+                            ),
+                            all(manager._leadership.has_quorum() for manager in managers),
+                        )
                     )
-                )
-            return samples
+                return samples
+            finally:
+                await asyncio.gather(*[manager.stop() for manager in managers])
 
         samples = runtime.run(scenario())
 
@@ -143,8 +146,11 @@ def test_quorum_forms_in_zero_wall_time():
 
         async def scenario():
             await asyncio.gather(*[manager.start() for manager in managers])
-            await asyncio.sleep(60.0)
-            return sum(1 for manager in managers if manager.is_leader())
+            try:
+                await asyncio.sleep(60.0)
+                return sum(1 for manager in managers if manager.is_leader())
+            finally:
+                await asyncio.gather(*[manager.stop() for manager in managers])
 
         wall_start = wall_time.monotonic()
         leader_count = runtime.run(scenario())

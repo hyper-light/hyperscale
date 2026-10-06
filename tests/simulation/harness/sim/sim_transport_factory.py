@@ -12,6 +12,8 @@ The three methods map one-to-one onto ``InProcessTransport``:
 - ``register_datagram_endpoint`` → ``register_udp`` (fires
   ``connection_made``, returns the ``FakeUDPTransport``).
 - ``register_stream_server`` → ``register_tcp`` (stores the factory).
+- ``close_stream_server`` → ``close_tcp`` (drops the factory: further
+  dials are refused).
 - ``connect_stream`` → ``connect_tcp`` (builds the paired
   transport/protocol, schedules ``connection_made`` on both sides).
 
@@ -51,6 +53,9 @@ class SimTransportFactory:
         protocol_factory: Callable[[], asyncio.Protocol],
     ) -> None:
         self._transport.register_tcp(sockname, protocol_factory)
+
+    def close_stream_server(self, sockname: tuple[str, int]) -> None:
+        self._transport.close_tcp(sockname)
 
     async def connect_stream(
         self,

@@ -11,6 +11,12 @@ Key design decisions:
 2. Job-specific suspicion is independent - a node can be slow for job A but fine for job B
 3. Result routing uses job layer - for accuracy, check job-specific status
 4. Reconciliation handles disagreements - global alive + job dead = escalate
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
@@ -19,97 +25,23 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable
-
 from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.health.extension_tracker import ExtensionTracker, ExtensionTrackerConfig
+
 from .timing_wheel import TimingWheel, TimingWheelConfig
-
-
-_DEFAULT_CLOCK: Clock = RealClock()
 from .job_suspicion_manager import JobSuspicionManager, JobSuspicionConfig
 from .suspicion_state import SuspicionState
-from hyperscale.distributed.health.extension_tracker import (
-    ExtensionTracker,
-    ExtensionTrackerConfig,
-)
+from .hierarchical_failure_detector_shared import _DEFAULT_CLOCK
+from .hierarchical_failure_detector_shared import NodeAddress
+from .hierarchical_failure_detector_shared import JobId
+from .failure_event import FailureEvent
+from .failure_source import FailureSource
+from .hierarchical_config import HierarchicalConfig
+from .node_status import NodeStatus
 
 if TYPE_CHECKING:
-    from hyperscale.distributed.swim.health.peer_health_awareness import (
-        PeerHealthAwareness,
-    )
+    from hyperscale.distributed.swim.health.peer_health_awareness import PeerHealthAwareness
     from hyperscale.distributed.taskex import TaskRunner
-
-
-# Type aliases
-NodeAddress = tuple[str, int]
-JobId = str
-
-
-class NodeStatus(Enum):
-    """Status of a node from the perspective of failure detection."""
-
-    ALIVE = auto()  # Not suspected at any layer
-    SUSPECTED_GLOBAL = auto()  # Suspected at global layer (machine may be down)
-    SUSPECTED_JOB = auto()  # Suspected for specific job(s) only
-    DEAD_GLOBAL = auto()  # Declared dead at global layer
-    DEAD_JOB = auto()  # Declared dead for specific job
-
-
-class FailureSource(Enum):
-    """Source of a failure detection event."""
-
-    GLOBAL = auto()  # From global timing wheel
-    JOB = auto()  # From job-specific detection
-
-
-@dataclass
-class HierarchicalConfig:
-    """Configuration for hierarchical failure detection."""
-
-    # Global layer config
-    global_min_timeout: float = 5.0
-    global_max_timeout: float = 30.0
-    global_no_witness_timeout: float | None = None
-    global_required_confirmations: int = 2
-
-    # Job layer config
-    job_min_timeout: float = 1.0
-    job_max_timeout: float = 10.0
-
-    # Timing wheel settings (AD-30): coarse_tick_ms=1000, fine_tick_ms=100,
-    # fine_wheel_size=10. See ``TimingWheelConfig`` for the invariant.
-    coarse_tick_ms: int = 1000
-    fine_tick_ms: int = 100
-
-    # Job polling settings
-    poll_interval_far_ms: int = 1000
-    poll_interval_near_ms: int = 50
-
-    # Reconciliation settings
-    reconciliation_interval_s: float = 5.0
-
-    # Resource limits
-    max_global_suspicions: int = 10000
-    max_job_suspicions_per_job: int = 1000
-    max_total_job_suspicions: int = 50000
-
-    # AD-26: Adaptive healthcheck extension settings
-    extension_base_deadline: float = 30.0
-    extension_min_grant: float = 1.0
-    extension_max_extensions: int = 5
-    extension_warning_threshold: int = 1
-    extension_grace_period: float = 10.0
-    max_extension_trackers: int = 10000  # Hard cap to prevent memory exhaustion
-
-
-@dataclass
-class FailureEvent:
-    """Event emitted when a node is declared dead."""
-
-    node: NodeAddress
-    source: FailureSource
-    job_id: JobId | None  # Only set for JOB source
-    incarnation: int
-    timestamp: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
 
 class HierarchicalFailureDetector:
@@ -260,6 +192,8 @@ class HierarchicalFailureDetector:
         self._global_deaths: int = 0
         self._job_deaths: int = 0
         self._reconciliations: int = 0
+        # Errors the ``on_error`` hook failed to report.
+        self._error_report_failures: int = 0
         self._job_suspicions_cleared_by_global: int = 0
 
         # AD-26: Per-node extension trackers for adaptive healthcheck extensions
@@ -359,10 +293,14 @@ class HierarchicalFailureDetector:
 
         if self._reconciliation_task and not self._reconciliation_task.done():
             self._reconciliation_task.cancel()
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
                 await self._reconciliation_task
             except asyncio.CancelledError:
-                pass
+                # The task we cancelled ended; a cancel aimed at this task
+                # while it waited goes on.
+                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                    raise
 
         # Cancel-and-await every pending clear task in parallel; merely
         # cancelling them leaves them alive in asyncio.all_tasks() when the
@@ -687,7 +625,9 @@ class HierarchicalFailureDetector:
                             sync_error,
                         )
                     except Exception:
-                        pass
+                        # The error hook itself failed: nowhere left to
+                        # report it but this detector's stats.
+                        self._error_report_failures += 1
 
         self.remove_extension_tracker(node)
 
@@ -1046,8 +986,17 @@ class HierarchicalFailureDetector:
                     state.min_timeout,
                     state.max_timeout,
                 )
-            except Exception:
-                pass
+            except Exception as diagnostic_error:
+                if self._on_error is not None:
+                    try:
+                        self._on_error(
+                            f"on_expiration_diagnostic failed for {node}",
+                            diagnostic_error,
+                        )
+                    except Exception:
+                        # The error hook itself failed: nowhere left to
+                        # report it but this detector's stats.
+                        self._error_report_failures += 1
 
         # Invoke ``on_global_death`` callback. The callback is a candidate
         # expiry notification, not the commit point: the owning SWIM state
@@ -1072,7 +1021,9 @@ class HierarchicalFailureDetector:
                             callback_error,
                         )
                     except Exception:
-                        pass
+                        # The error hook itself failed: nowhere left to
+                        # report it but this detector's stats.
+                        self._error_report_failures += 1
         else:
             self._dispatch_async_work(
                 self.commit_global_death,
@@ -1125,7 +1076,9 @@ class HierarchicalFailureDetector:
                             callback_error,
                         )
                     except Exception:
-                        pass
+                        # The error hook itself failed: nowhere left to
+                        # report it but this detector's stats.
+                        self._error_report_failures += 1
 
     async def _clear_job_suspicions_for_node(self, node: NodeAddress) -> None:
         """Clear all job suspicions for a globally-dead node."""
@@ -1251,7 +1204,9 @@ class HierarchicalFailureDetector:
                             reconciliation_error,
                         )
                     except Exception:
-                        pass
+                        # The error hook itself failed: nowhere left to
+                        # report it but this detector's stats.
+                        self._error_report_failures += 1
 
     async def _reconcile(self) -> None:
         """Perform reconciliation between layers."""
@@ -1327,6 +1282,8 @@ class HierarchicalFailureDetector:
             "jobs_with_suspicions": job_stats["jobs_with_suspicions"],
             # Reconciliation
             "reconciliations": self._reconciliations,
+            "error_report_failures": self._error_report_failures,
+            "wheel_error_report_failures": global_stats["error_report_failures"],
             "job_suspicions_cleared_by_global": self._job_suspicions_cleared_by_global,
             # Timing wheel internals
             "wheel_entries_added": global_stats["entries_added"],
@@ -1410,3 +1367,13 @@ class HierarchicalFailureDetector:
 
     # Debug attribute (set by HealthAwareServer)
     _node_port: int = 0
+
+_REHOMED = (
+    NodeStatus,
+    FailureSource,
+    HierarchicalConfig,
+    FailureEvent,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

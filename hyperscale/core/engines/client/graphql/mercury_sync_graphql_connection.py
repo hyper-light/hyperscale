@@ -195,13 +195,11 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
 
     async def _optimize_url(self, url: URL):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
-                    url,
-                    upgrade_ssl,
+                    optimized_url,
                     _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
@@ -211,26 +209,11 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                 connection.reset()
                 self._connections.append(connection)
 
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    url,
-                    _,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-                connection.reset()
-                self._connections.append(connection)
-
-            self._url_cache[url.optimized.hostname] = url
+            # Plain-string requests for the same address reuse this lookup:
+            # the resolved URL, under the key the connect path reads. One
+            # that never resolved is left for the connect path to look up.
+            if optimized_url.ip_addresses:
+                self._url_cache[optimized_url.target] = optimized_url
 
         except Exception:
             pass
@@ -298,22 +281,9 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         if redirect and (
             location := result.headers.get(b'location')
         ):
-            location = location.decode()
-            upgrade_ssl = False
-
-            if "http" not in location and "https" not in location:
-                parsed_url: ParseResult = urlparse(url)
-
-                if parsed_url.params:
-                    location += parsed_url.params
-
-                location = urljoin(
-                    f'{parsed_url.scheme}://{parsed_url.hostname}',
-                    location
-                )
-
-            if "https" in location and "https" not in url:
-                upgrade_ssl = True
+            # Each location resolves against the address it came from (RFC
+            # 3986: absolute, host-relative and path-relative alike).
+            location = urljoin(url.data if isinstance(url, URL) else url, location.decode())
 
             for _ in range(redirects):
                 result, redirect, timings = await self._execute(
@@ -324,7 +294,6 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     params=params,
                     headers=headers,
                     data=data,
-                    upgrade_ssl=upgrade_ssl,
                     redirect_url=location,
                     timings=timings,
                 )
@@ -332,11 +301,10 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                 if redirect is False:
                     break
 
-                location = result.headers.get(b"location").decode()
+                if (next_location := result.headers.get(b"location")) is None:
+                    break
 
-                upgrade_ssl = False
-                if "https" in location and "https" not in url:
-                    upgrade_ssl = True
+                location = urljoin(location, next_location.decode())
 
         timings["request_end"] = time.monotonic()
         result.timings.update(timings)
@@ -366,7 +334,6 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             ]
             | Mutation
         ) = None,
-        upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
             Literal[
@@ -407,28 +374,13 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
-            (error, connection, url, upgrade_ssl, _) = await asyncio.wait_for(
+            (error, connection, url, _) = await asyncio.wait_for(
                 self._connect_to_url_location(
                     connection,
                     request_url,
-                    ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
                 timeout=self.timeouts.request_timeout,
             )
-
-            if upgrade_ssl:
-                ssl_redirect_url = request_url.replace("http://", "https://")
-
-                (error, connection, url, _, _) = await asyncio.wait_for(
-                    self._connect_to_url_location(
-                        connection,
-                        request_url,
-                        ssl_redirect_url=ssl_redirect_url,
-                    ),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-                request_url = ssl_redirect_url
 
             if error or connection is None or connection.reader is None:
                 timings["connect_end"] = time.monotonic()
@@ -646,7 +598,8 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         ),
     ):
         if isinstance(data, Mutation):
-            return data.optimized, data.content_type
+            # The body itself: the headers carry its content type.
+            return data.optimized
 
         source = Source(data.get("query"))
         document_node = parse(source)
@@ -694,17 +647,22 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         query_string: str | Query = data.get("query")
 
         if method == "GET" and isinstance(query_string, Query):
-            url_path += query_string
+            # The model's query parameter, URL-encoded when it was optimized:
+            # appending the model itself raised TypeError.
+            query = query_string.optimized[1:]
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
         elif method == "GET":
-            query_string = data.get("query")
-            query_string = "".join(query_string.replace("query", "").split())
-
-            url_path += f"?query={{{query_string}}}"
+            # The query document unaltered and URL-encoded, as GraphQL over
+            # HTTP carries it in a GET -- after "&" when the address has a
+            # query of its own, else after "?" (RFC 3986 3.4).
+            query = urlencode({"query": query_string})
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
         elif params:
-            url_params = urlencode(params)
-            url_path += f"?{url_params}"
+            # The params follow any query the address has of its own.
+            query = urlencode(params)
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
         port = url.port or (443 if url.scheme == "https" else 80)
         hostname = url.parsed.hostname.encode("idna").decode()
@@ -748,7 +706,9 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         header_items += f"Content-Length: {size}{NEW_LINE}"
 
         if method == "POST":
-            header_items += f"Content-Type: application/graphql-response+json{NEW_LINE}"
+            # The body is a JSON request: application/graphql-response+json
+            # names GraphQL over HTTP's response, not its request.
+            header_items += f"Content-Type: application/json{NEW_LINE}"
 
         if isinstance(cookies, Cookies):
             header_items += cookies.optimized

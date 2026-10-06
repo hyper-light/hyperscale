@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hyperscale.distributed.runtime import RealClock
+from hyperscale.distributed.runtime import RealClock, RealRandom
 from hyperscale.distributed.models import GateHeartbeat, GateInfo
 from hyperscale.distributed.nodes.gate.peer_coordinator import GatePeerCoordinator
 from hyperscale.distributed.nodes.gate.server import GateServer
@@ -36,7 +36,7 @@ REAP_INTERVAL = 10.0
 
 
 def make_state() -> GateRuntimeState:
-    state = GateRuntimeState()
+    state = GateRuntimeState(forward_throughput_interval_start=0.0)
     state.set_udp_to_tcp_mapping(DEAD_UDP, DEAD_TCP)
     state.set_gate_peer_heartbeat(
         DEAD_UDP,
@@ -85,7 +85,7 @@ class TwoPassGate:
         gate._dead_peer_reap_interval = REAP_INTERVAL
         gate._clock = SimpleNamespace(sleep=self.sleep, monotonic=lambda: self.now)
         gate._task_runner = SimpleNamespace(run=lambda *args, **kwargs: None)
-        gate._udp_logger = SimpleNamespace(log=None)
+        gate._udp_logger = SimpleNamespace(log=AsyncMock())
         gate._host, gate._tcp_port = "10.0.0.1", 9000
         gate._node_id = SimpleNamespace(short="gate-a")
         gate._versioned_clock = SimpleNamespace(remove_entity=self.remove_entity)
@@ -93,16 +93,16 @@ class TwoPassGate:
         # The loop's other per-tick duties (quorum check, health log,
         # ledger checkpoint) are not under test here.
         gate._check_quorum_status = AsyncMock()
-        gate._log_health_transitions = lambda: None
+        gate._log_health_transitions = AsyncMock()
         gate._checkpoint_ledger_if_due = AsyncMock()
         gate._peer_coordinator = GatePeerCoordinator(
             clock=RealClock(),
+            random=RealRandom(),
             state=state,
-            logger=SimpleNamespace(log=None),
+            logger=SimpleNamespace(log=AsyncMock()),
             task_runner=SimpleNamespace(run=lambda *args, **kwargs: None),
             peer_discovery=SimpleNamespace(remove_peer=lambda peer_id: None),
             job_hash_ring=SimpleNamespace(remove_node=AsyncMock()),
-            job_forwarding_tracker=SimpleNamespace(unregister_peer=lambda gate_id: None),
             job_leadership_tracker=None,
             versioned_clock=None,
             recovery_semaphore=asyncio.Semaphore(1),

@@ -65,6 +65,11 @@ class ProbeScheduler:
     def members(self) -> tuple[tuple[str, int], ...]:
         """Read-only access to current members."""
         return self._members
+
+    @property
+    def cycles_completed(self) -> int:
+        """Round-robin cycles completed: each one probed every member."""
+        return self._cycles_completed
     
     def update_members(self, members: list[tuple[str, int]]) -> None:
         """

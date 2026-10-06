@@ -11,10 +11,7 @@ from .datacenter_capacity import DatacenterCapacity
 from .spillover_config import SpilloverConfig
 from .spillover_decision import SpilloverDecision
 
-from hyperscale.distributed.runtime import Clock, RealClock
-
-
-_DEFAULT_CLOCK: Clock = RealClock()
+from hyperscale.distributed.runtime import Clock
 
 
 class SpilloverEvaluator:
@@ -22,15 +19,18 @@ class SpilloverEvaluator:
     Evaluate whether a job should spillover to another datacenter.
     """
 
-    def __init__(self, config: SpilloverConfig) -> None:
+    def __init__(self, config: SpilloverConfig, clock: Clock) -> None:
+        """``clock`` is the one capacity reports are stamped with (the
+        aggregator's): staleness is measured on it."""
         self._config = config
+        self._clock = clock
 
     @classmethod
-    def from_env(cls, env: Env):
+    def from_env(cls, env: Env, clock: Clock):
         """
         Build a SpilloverEvaluator using environment configuration.
         """
-        return cls(SpilloverConfig.from_env(env))
+        return cls(SpilloverConfig.from_env(env), clock)
 
     def evaluate(
         self,
@@ -75,6 +75,7 @@ class SpilloverEvaluator:
             job_cores_required=job_cores_required,
             fallback_capacities=fallback_capacities,
             primary_rtt_ms=primary_rtt_ms,
+            primary_job_cores=max(min(job_cores_required, primary_capacity.total_cores), 1),
         )
         if candidate is None:
             return self._no_spillover(
@@ -111,11 +112,25 @@ class SpilloverEvaluator:
         job_cores_required: int,
         fallback_capacities: list[tuple[DatacenterCapacity, float]],
         primary_rtt_ms: float,
+        primary_job_cores: int,
     ) -> tuple[DatacenterCapacity, float, float] | None:
+        """
+        The nearest fresh fallback with every core the job would use there
+        free now, where that is at least what the primary would give it
+        (``primary_job_cores``: the job's requirement capped at the
+        primary's cores, and at least one). A datacenter serves a job
+        larger than itself "immediately" when all its cores are free;
+        without the second bound an idle datacenter smaller than the cores
+        the primary already had free took the job for good.
+        """
         best_candidate: tuple[DatacenterCapacity, float, float] | None = None
         best_score = float("inf")
         for capacity, rtt_ms in fallback_capacities:
-            if not capacity.can_serve_immediately(job_cores_required):
+            if not (
+                capacity.available_cores
+                >= min(job_cores_required, capacity.total_cores)
+                >= primary_job_cores
+            ):
                 continue
             if self._is_capacity_stale(capacity):
                 continue
@@ -146,5 +161,5 @@ class SpilloverEvaluator:
         )
 
     def _is_capacity_stale(self, capacity: DatacenterCapacity) -> bool:
-        now = _DEFAULT_CLOCK.monotonic()
+        now = self._clock.monotonic()
         return capacity.is_stale(now, self._config.capacity_staleness_threshold_seconds)

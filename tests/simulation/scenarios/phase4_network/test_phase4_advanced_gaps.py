@@ -357,7 +357,7 @@ async def test_symmetric_two_way_partition_quorum_writes_minority_rejects() -> N
       1. Stabilize. Initial leader elected.
       2. Identify the leader and one non-leader. Partition them from
          the third manager (the minority).
-      3. Wait for the minority manager to observe ``_has_quorum_available()
+      3. Wait for the minority manager to observe ``_leadership.has_quorum()
          == False`` — confirms it knows it's isolated.
       4. Heal — cluster reconverges, no split-brain detected by the
          continuous safety invariants.
@@ -398,7 +398,7 @@ async def test_symmetric_two_way_partition_quorum_writes_minority_rejects() -> N
         # silent queue.
         minority_manager = minority_side[0]
         await wait_until(
-            lambda: not minority_manager.instance._has_quorum_available(),
+            lambda: not minority_manager.instance._leadership.has_quorum(),
             timeout=45.0,
             poll=0.5,
             description=(

@@ -9,7 +9,7 @@ from .slo_config import SLOConfig
 
 @dataclass(frozen=True, slots=True)
 class LatencySLO:
-    """Latency SLO definition with Env-configurable defaults."""
+    """Latency SLO definition, read from Env through SLOConfig."""
 
     p50_target_ms: float
     p95_target_ms: float
@@ -21,8 +21,11 @@ class LatencySLO:
     evaluation_window_seconds: float
 
     @classmethod
-    def from_env(cls, env: Env | None = None) -> "LatencySLO":
-        config = SLOConfig.from_env(env)
+    def from_env(cls, env: Env) -> "LatencySLO":
+        return cls.from_config(SLOConfig.from_env(env))
+
+    @classmethod
+    def from_config(cls, config: SLOConfig) -> "LatencySLO":
         return cls(
             p50_target_ms=config.p50_target_ms,
             p95_target_ms=config.p95_target_ms,

@@ -33,6 +33,9 @@ class TotalRate:
 
         self._elapsed: int | float = 0
         self._start: float | None = None
+        # The elapsed time a run's final total was counted over, once it
+        # arrives: the rate shows the total over that, not this clock's time.
+        self._final_elapsed: float | None = None
 
         self._max_width: int | None = None
         self._total_rate_width = 0
@@ -94,11 +97,13 @@ class TotalRate:
 
     async def update(
         self,
-        update: tuple[int | float | None, bool],
+        update: tuple[int | float | None, bool] | tuple[int | float, bool, float],
     ):
         await self._update_lock.acquire()
 
-        amount, run_timer = update
+        amount, run_timer, *final_elapsed = update
+        if final_elapsed:
+            self._final_elapsed = final_elapsed[0]
 
         # The rate's clock starts with the first running count, not with
         # the first paint (which happens during worker startup).
@@ -189,9 +194,13 @@ class TotalRate:
             reverse=True,
         )
 
-        self._elapsed = (
-            time.monotonic() - self._start if self._start is not None else 0
-        )
+        if self._final_elapsed is not None:
+            self._elapsed = self._final_elapsed
+
+        else:
+            self._elapsed = (
+                time.monotonic() - self._start if self._start is not None else 0
+            )
 
         last_rate = count / self._elapsed if self._elapsed > 0 else 0
 

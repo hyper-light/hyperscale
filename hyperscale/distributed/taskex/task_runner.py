@@ -3,8 +3,8 @@ import functools
 import shlex
 import signal
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from types import FrameType
 from typing import (
-    Any,
     Awaitable,
     Callable,
     Dict,
@@ -32,7 +32,7 @@ T = TypeVar("T")
 def shutdown_executor(
     sig: int,
     executor: ThreadPoolExecutor | ProcessPoolExecutor | None,
-    default_handler: Callable[..., Any],
+    default_handler: Callable[[int, FrameType | None], object] | int | signal.Handlers | None,
 ):
     if executor:
         executor.shutdown(cancel_futures=True)
@@ -63,8 +63,8 @@ class TaskRunner:
         self._id_generator = SnowflakeGenerator(
             instance=self.instance_id & MAX_INSTANCE
         )
-        self.tasks: Dict[str, Task[Any]] = {}
-        self.results: Dict[str, Any] = {}
+        self.tasks: Dict[str, Task[object]] = {}
+        self.results: Dict[str, object] = {}
         self._cleanup_interval = TimeParser(config.MERCURY_SYNC_CLEANUP_INTERVAL).time
         self._cleanup_task: Optional[asyncio.Task] = None
         self._run_cleanup: bool = False
@@ -136,8 +136,8 @@ class TaskRunner:
     def bundle(
         self,
         call: Callable[..., Awaitable[T]],
-        *args: tuple[Any, ...],
-        **kwargs: dict[str, Any],
+        *args: object,
+        **kwargs: object,
     ):
         return functools.partial(
             call,
@@ -147,8 +147,8 @@ class TaskRunner:
 
     def run(
         self,
-        call: Callable[..., Awaitable[T]],
-        *args,
+        call: Callable[..., Awaitable[object]],
+        *args: object,
         alias: str | None = None,
         run_id: int | None = None,
         timeout: str | int | float | None = None,
@@ -158,7 +158,7 @@ class TaskRunner:
         keep: int | None = None,
         max_age: str | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
-        **kwargs,
+        **kwargs: object,
     ):
         if isinstance(timeout, str):
             timeout = TimeParser(timeout).time
@@ -214,9 +214,9 @@ class TaskRunner:
     def command(
         self,
         command: str,
-        *args: tuple[str, ...],
+        *args: str,
         alias: str | None = None,
-        env: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
         cwd: str | None = None,
         shell: bool = False,
         run_id: int | None = None,
@@ -326,7 +326,7 @@ class TaskRunner:
             asyncio.TimeoutError: If timeout is exceeded before task completes.
             KeyError: If task or run doesn't exist.
         """
-        task_name, run_id_str = token.split(":", maxsplit=1)
+        task_name, run_id_str = token.rsplit(":", maxsplit=1)
         run_id = int(run_id_str)
 
         start_time = asyncio.get_event_loop().time()
@@ -350,7 +350,7 @@ class TaskRunner:
         return await self.tasks[task_name].complete(run_id)
 
     async def get_task_update(self, token: str):
-        task_name, run_id = token.split(":", maxsplit=1)
+        task_name, run_id = token.rsplit(":", maxsplit=1)
         return await self.tasks[task_name].get_run_update(
             int(run_id),
         )
@@ -368,19 +368,19 @@ class TaskRunner:
             return task.status
 
     def get_run_status(self, token: str):
-        task_name, run_id = token.split(":", maxsplit=1)
+        task_name, run_id = token.rsplit(":", maxsplit=1)
 
         if task := self.tasks.get(task_name):
             return task.get_run_status(int(run_id))
 
     async def complete(self, token: str):
-        task_name, run_id = token.split(":", maxsplit=1)
+        task_name, run_id = token.rsplit(":", maxsplit=1)
 
         if task := self.tasks.get(task_name):
             return await task.complete(int(run_id))
 
     async def cancel(self, token: str):
-        task_name, run_id = token.split(":", maxsplit=1)
+        task_name, run_id = token.rsplit(":", maxsplit=1)
 
         task = self.tasks.get(task_name)
         if task:
@@ -390,7 +390,7 @@ class TaskRunner:
         self,
         token: str,
     ):
-        task_name, run_id = token.split(":", maxsplit=1)
+        task_name, run_id = token.rsplit(":", maxsplit=1)
 
         task = self.tasks.get(task_name)
         if task:
@@ -414,9 +414,15 @@ class TaskRunner:
         # returns and surfaces as a leaked asyncio task.
         if self._cleanup_task is not None and not self._cleanup_task.done():
             self._cleanup_task.cancel()
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
                 await self._cleanup_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
+                # The task we cancelled ended; a cancel aimed at this task
+                # while it waited goes on.
+                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                    raise
+            except Exception:
                 pass
 
         if self._executor:
@@ -452,10 +458,14 @@ class TaskRunner:
             await _DEFAULT_CLOCK.sleep(self._cleanup_interval)
 
     async def _cleanup_scheduled_tasks(self):
-        try:
-            # Snapshot to avoid dict mutation during iteration
-            for task in list(self.tasks.values()):
+        # Every task is swept even when one fails; the failures then raise
+        # together (they once aborted the sweep, silently, at the first).
+        cleanup_errors: list[Exception] = []
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
+            try:
                 await task.cleanup()
-
-        except Exception:
-            pass
+            except Exception as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            raise ExceptionGroup("task retention sweep failed", cleanup_errors)

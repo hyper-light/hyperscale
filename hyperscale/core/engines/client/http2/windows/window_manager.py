@@ -21,7 +21,7 @@ LARGEST_FLOW_CONTROL_WINDOW = 2**31 - 1
 
 
 class WindowManager:
-    __slots__ = ("max_window_size", "current_window_size", "_bytes_processed")
+    __slots__ = ("max_window_size", "current_window_size", "bytes_processed")
 
     """
     A basic HTTP/2 window manager.
@@ -33,7 +33,7 @@ class WindowManager:
     def __init__(self, max_window_size):
         self.max_window_size = max_window_size
         self.current_window_size = max_window_size
-        self._bytes_processed = 0
+        self.bytes_processed = 0
 
     def window_consumed(self, size):
         """
@@ -86,24 +86,24 @@ class WindowManager:
         if size is None:
             size = 0
 
-        self._bytes_processed += size
-        if not self._bytes_processed:
+        self.bytes_processed += size
+        if not self.bytes_processed:
             return None
 
         max_increment = self.max_window_size - self.current_window_size
         increment = 0
 
         min_threshold = (self.current_window_size == 0) and (
-            self._bytes_processed > min(1024, self.max_window_size // 4)
+            self.bytes_processed > min(1024, self.max_window_size // 4)
         )
-        max_threshold = self._bytes_processed >= (self.max_window_size // 2)
+        max_threshold = self.bytes_processed >= (self.max_window_size // 2)
 
-        # Note that, even though we may increment less than _bytes_processed,
+        # Note that, even though we may increment less than bytes_processed,
         # we still want to set it to zero whenever we emit an increment. This
         # is because we'll always increment up to the maximum we can.
         if min_threshold or max_threshold:
-            increment = min(self._bytes_processed, max_increment)
-            self._bytes_processed = 0
+            increment = min(self.bytes_processed, max_increment)
+            self.bytes_processed = 0
 
         self.current_window_size += increment
         return increment

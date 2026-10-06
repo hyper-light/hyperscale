@@ -19,7 +19,7 @@ from pathlib import Path
 from re import Pattern
 from typing import Literal, Tuple, Callable
 from .protocols import SMTPConnection
-from .protocols.tcp import SMTP_LIMIT
+from .protocols.tcp import IMPLICIT_TLS_PORT, SMTP_LIMIT
 
 from hyperscale.core.engines.client.shared.models import URL as SMTPUrl
 from hyperscale.core.engines.client.shared.models import RequestType
@@ -367,11 +367,14 @@ class MercurySyncSMTPConnection:
                     # An open session for another server or credentials:
                     # SMTP cannot re-authenticate within a session.
                     connection.reset()
+
+                    # The same port: implicit TLS stays TLS from the first byte.
+                    implicit_tls = connection.port == IMPLICIT_TLS_PORT
                     await connection.make_connection(
                         url.full,
                         connection.address_info,
-                        ssl=None,
-                        connection_type=None,
+                        ssl=self._ssl_context if implicit_tls else None,
+                        connection_type='ssl' if implicit_tls else None,
                         timeout=self.timeouts.connect_timeout,
                     )
 
@@ -540,23 +543,6 @@ class MercurySyncSMTPConnection:
 
             else:
                 err = Exception(f'Err. - {code} {message}')
-
-        elif  'starttls' in options and connection.port == 465:
-
-            timings["tls_upgrade_start"] = time.monotonic()
-
-            await connection.make_connection(
-                server,
-                connection.address_info,
-                ssl=self._ssl_context,
-                connection_type='ssl',
-                ssl_upgrade=True,
-                timeout=self.timeouts.connect_timeout,
-            )
-
-            timings["tls_upgrade_end"] = time.monotonic()
-
-            resend_ehlo = True
 
         if err:
             return (code, message, options, err)
@@ -1228,6 +1214,7 @@ class MercurySyncSMTPConnection:
                 connection_type=connection_type,
                 ssl_upgrade=is_upgrade,
                 timeout=self.timeouts.connect_timeout,
+                implicit_tls=self._ssl_context,
             )
 
             if new_transport:

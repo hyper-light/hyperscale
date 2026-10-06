@@ -10,7 +10,7 @@ from hyperscale.core.engines.client.shared.protocols import (
     Writer,
 )
 from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import SocketConfig
-from .tcp import SMTP_LIMIT
+from .tcp import IMPLICIT_TLS_PORT, SMTP_LIMIT
 
 from .tcp import TCPConnection
 
@@ -113,6 +113,7 @@ class SMTPConnection:
         connection_type: Literal['insecure', 'ssl', 'tls'] = 'tls',
         ssl_upgrade: bool = False,
         timeout: int | None = None,
+        implicit_tls: Optional[SSLContext] = None,
     ) -> Tuple[Optional[SocketConfig], Optional[int], bool]:
         """
         Reuse this connection's cached transport for ``hostname`` (unless
@@ -132,6 +133,11 @@ class SMTPConnection:
         if not socket_configs:
             raise ConnectionError(f"No addresses to connect to for {hostname}")
 
+        if self._reader_and_writer:
+            # One SMTP session per connection: another server's transport,
+            # and the session open on it, end before this server's begins.
+            self.reset()
+
         offset = next(address_rotation)
         connection_error: Exception | None = None
 
@@ -139,12 +145,20 @@ class SMTPConnection:
             start = offset % len(port_configs)
             ordered = [*port_configs[start:], *port_configs[:start]]
 
+            # Submission over implicit TLS (RFC 8314): TLS from the first
+            # byte, not a STARTTLS upgrade after the greeting.
+            if port_configs[0][4][1] == IMPLICIT_TLS_PORT:
+                group_ssl, group_connection_type = implicit_tls, 'ssl'
+
+            else:
+                group_ssl, group_connection_type = ssl, connection_type
+
             try:
                 reader, writer, port, winner_index = await self._connection_factory.create_racing(
                     hostname,
                     ordered,
-                    ssl=ssl,
-                    connection_type=connection_type,
+                    ssl=group_ssl,
+                    connection_type=group_connection_type,
                     timeout=timeout,
                 )
 
@@ -161,7 +175,7 @@ class SMTPConnection:
 
             self.address_info = ordered[winner_index]
             self.port = port
-            self.ssl = ssl
+            self.ssl = group_ssl
 
             return self.address_info, port, True
 
@@ -210,6 +224,10 @@ class SMTPConnection:
         return self.reader.read_headers()
 
     def close(self):
+        # The factory closes only its newest transport: abort every one held.
+        for _, writer in self._reader_and_writer.values():
+            writer.abort()
+
         self._reader_and_writer.clear()
         self.reader = None
         self.writer = None
@@ -219,6 +237,10 @@ class SMTPConnection:
         self._connection_factory.close()
 
     def reset(self):
+        # The factory closes only its newest transport: abort every one held.
+        for _, writer in self._reader_and_writer.values():
+            writer.abort()
+
         self._reader_and_writer.clear()
         self.reader = None
         self.writer = None

@@ -17,14 +17,8 @@ from hyperscale.distributed.models import (
     GateStateSyncRequest,
     GateStateSyncResponse,
     JobFinalResult,
-    JobLeadershipNotification,
     LeaseTransfer,
     LeaseTransferAck,
-)
-from hyperscale.distributed.reliability import (
-    JitterStrategy,
-    RetryConfig,
-    RetryExecutor,
 )
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -69,7 +63,7 @@ class GateStateSyncHandler:
         get_state_snapshot: Callable[[], GateStateSnapshot],
         apply_state_snapshot: Callable[[GateStateSnapshot], None],
         peer_forward_timeout_seconds: float,
-        get_known_leader_manager_term: Callable[[str], int] | None = None,
+        get_known_leader_manager_term: Callable[[str], int],
     ) -> None:
         """
         Initialize the state sync handler.
@@ -94,8 +88,8 @@ class GateStateSyncHandler:
                 leader ``ManagerHeartbeat.term`` observed for a DC. Used in
                 ``handle_job_final_result`` to validate the producing
                 manager against per-DC manager leadership independently
-                of any gate-leader fence. ``None`` disables the check
-                (test scaffolds that don't wire heartbeat ingest).
+                of any gate-leader fence; 0 where no term is known yet,
+                which judges no result stale.
         """
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
@@ -115,9 +109,7 @@ class GateStateSyncHandler:
         self._apply_state_snapshot: Callable[[GateStateSnapshot], None] = (
             apply_state_snapshot
         )
-        self._get_known_leader_manager_term: (
-            Callable[[str], int] | None
-        ) = get_known_leader_manager_term
+        self._get_known_leader_manager_term: Callable[[str], int] = get_known_leader_manager_term
 
     async def handle_state_sync_request(
         self,
@@ -141,8 +133,7 @@ class GateStateSyncHandler:
         try:
             request = GateStateSyncRequest.load(data)
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=f"State sync request from gate {request.requester_id[:8]}... (version {request.known_version})",
                     node_host=self._get_host(),
@@ -207,8 +198,7 @@ class GateStateSyncHandler:
         try:
             transfer = LeaseTransfer.load(data)
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=f"Receiving lease transfer from {transfer.source_gate_id[:8]}... "
                     f"for job {transfer.job_id[:8]}...",
@@ -239,8 +229,7 @@ class GateStateSyncHandler:
 
             await self._state.increment_state_version()
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=f"Accepted lease transfer for job {transfer.job_id[:8]}... "
                     f"(new fence token: {new_fence_token})",
@@ -285,53 +274,72 @@ class GateStateSyncHandler:
             )
             return False
 
-        retry_config = RetryConfig(
-            max_attempts=3,
-            base_delay=0.5,
-            max_delay=3.0,
-            jitter=JitterStrategy.FULL,
-            retryable_exceptions=(
-                ConnectionError,
-                TimeoutError,
-                OSError,
-                RuntimeError,
-            ),
-        )
-        retry_executor = RetryExecutor(retry_config)
+        # One attempt: the manager that sent this result holds a
+        # completion-notice obligation and resends until a gate accepts,
+        # so a retry here would only multiply its attempts.
         circuit = await self._peer_circuit_breaker.get_circuit(leader_addr)
-
-        async def send_result() -> None:
-            response, _ = await self._send_tcp(
-                leader_addr,
-                "job_final_result",
-                data,
-                timeout=self._peer_forward_timeout_seconds,
-            )
-            if response not in (b"ok", b"forwarded", b"already_completed"):
-                raise RuntimeError(
-                    f"Unexpected response from leader gate {leader_addr}: {response}"
-                )
-
-        try:
-            await retry_executor.execute(
-                send_result, operation_name="forward_job_final_result"
-            )
+        response, _ = await self._send_tcp(
+            leader_addr,
+            "job_final_result_forwarded",
+            data,
+            timeout=self._peer_forward_timeout_seconds,
+        )
+        if response in (b"ok", b"already_completed"):
             circuit.record_success()
             return True
-        except Exception as error:
-            circuit.record_failure()
-            await self._logger.log(
-                ServerWarning(
-                    message=(
-                        f"Failed to forward final result for job {job_id[:8]}... "
-                        f"to leader gate {leader_addr}: {error}"
-                    ),
-                    node_host=self._get_host(),
-                    node_port=self._get_tcp_port(),
-                    node_id=self._get_node_id().short,
-                )
+
+        circuit.record_failure()
+        await self._logger.log(
+            ServerWarning(
+                message=(
+                    f"Failed to forward final result for job {job_id[:8]}... "
+                    f"to leader gate {leader_addr}: {response!r}"
+                ),
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().short,
             )
+        )
+        return False
+
+    def _manager_term_to_judge(self, result: JobFinalResult) -> int:
+        """The datacenter's highest known manager-leadership term, when
+        ``result`` carries a manager term to judge against it; otherwise
+        the result's own fence, which judges it current."""
+        if result.producer_role != "manager" or result.manager_fence_token <= 0:
+            return result.manager_fence_token
+        return self._get_known_leader_manager_term(result.datacenter)
+
+    async def _is_from_a_stale_producer(self, result: JobFinalResult) -> bool:
+        """Whether a manager produced ``result`` under a manager-leadership
+        term its datacenter has since moved past.
+
+        ``result.fence_token`` is the manager-side fence at the moment the
+        worker delivered the final result, not a gate-leadership claim.
+        Comparing it to the gate's per-job fence (which orphan-takeover
+        bumps) would drop completed work whenever a gate takeover landed
+        before the manager learned the new fence. Gate-leader fencing
+        protects gate-claim messages; manager-originated terminal data is
+        validated at the manager-leadership layer here, before any
+        forwarding or local completion side effects.
+        """
+        known_term = self._manager_term_to_judge(result)
+        if result.manager_fence_token >= known_term:
             return False
+        await self._logger.log(
+            ServerDebug(
+                message=(
+                    f"Rejecting final result for {result.job_id}: "
+                    f"producer {result.producer_id[:8]}... term "
+                    f"{result.manager_fence_token} < DC manager "
+                    f"term {known_term}"
+                ),
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().short,
+            ),
+        )
+        return True
 
     async def handle_job_final_result(
         self,
@@ -342,11 +350,17 @@ class GateStateSyncHandler:
         forward_final_result: Callable[[bytes], "asyncio.Coroutine[None, None, bool]"]
         | None = None,
     ) -> bytes:
+        """Apply a datacenter's final result for a job, or route it to the
+        gate that leads the job.
+
+        ``forward_final_result`` is None for a result a peer gate forwarded
+        (``job_final_result_forwarded``): that hop is the last, so a result
+        no gate leads or knows can never circle between them.
+        """
         try:
             result = JobFinalResult.load(data)
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=f"Received final result for job {result.job_id[:8]}... "
                     f"(status={result.status}, from DC {result.datacenter})",
@@ -356,41 +370,16 @@ class GateStateSyncHandler:
                 ),
             )
 
-            # ``result.fence_token`` is the manager-side fence at the
-            # moment the worker delivered the final result, not a
-            # gate-leadership claim. Comparing it to the gate's
-            # per-job fence (which orphan-takeover bumps) would drop
-            # completed work whenever a gate takeover landed before
-            # the manager learned the new fence. Gate-leader fencing
-            # protects gate-claim messages; manager-originated terminal
-            # data is validated at the manager-leadership layer here,
-            # before any forwarding or local completion side effects.
-            if (
-                self._get_known_leader_manager_term is not None
-                and result.producer_role == "manager"
-                and result.manager_fence_token > 0
-            ):
-                known_term = self._get_known_leader_manager_term(result.datacenter)
-                if known_term > 0 and result.manager_fence_token < known_term:
-                    self._task_runner.run(
-                        self._logger.log,
-                        ServerDebug(
-                            message=(
-                                f"Rejecting final result for {result.job_id}: "
-                                f"producer {result.producer_id[:8]}... term "
-                                f"{result.manager_fence_token} < DC manager "
-                                f"term {known_term}"
-                            ),
-                            node_host=self._get_host(),
-                            node_port=self._get_tcp_port(),
-                            node_id=self._get_node_id().short,
-                        ),
-                    )
-                    return b"stale_producer"
+            if await self._is_from_a_stale_producer(result):
+                return b"stale_producer"
 
             leader_id = self._job_leadership_tracker.get_leader(result.job_id)
             is_job_leader = self._job_leadership_tracker.is_leader(result.job_id)
             if leader_id and not is_job_leader:
+                # A result a peer gate forwarded ends here: forwarding it on
+                # could send it back round the gates that do not lead it.
+                if forward_final_result is None:
+                    return b"not_leader"
                 leader_addr = self._job_leadership_tracker.get_leader_addr(
                     result.job_id
                 )
@@ -462,64 +451,3 @@ class GateStateSyncHandler:
             await handle_exception(error, "handle_job_final_result")
             return b"error"
 
-    async def handle_job_leadership_notification(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        handle_exception: Callable,
-    ) -> bytes:
-        """
-        Handle job leadership notification from peer gate.
-
-        Updates local tracking of which gate owns which job.
-
-        Args:
-            addr: Source gate address
-            data: Serialized JobLeadershipNotification
-            handle_exception: Callback for exception handling
-
-        Returns:
-            b'ok' on success, b'error' on failure
-        """
-        try:
-            notification = JobLeadershipNotification.load(data)
-
-            my_id = self._get_node_id().full
-            if notification.leader_gate_id == my_id:
-                return b"ok"
-
-            if await self._versioned_clock.is_entity_stale(
-                f"job-leader:{notification.job_id}",
-                notification.fence_token,
-            ):
-                return b"ok"
-
-            self._job_leadership_tracker.record_peer_leadership(
-                job_id=notification.job_id,
-                leader_id=notification.leader_gate_id,
-                leader_addr=notification.leader_addr,
-                fence_token=notification.fence_token,
-            )
-
-            self._task_runner.run(
-                self._versioned_clock.update_entity,
-                f"job-leader:{notification.job_id}",
-                notification.fence_token,
-            )
-
-            self._task_runner.run(
-                self._logger.log,
-                ServerDebug(
-                    message=f"Recorded job leadership: {notification.job_id[:8]}... -> "
-                    f"{notification.leader_gate_id[:8]}... (fence {notification.fence_token})",
-                    node_host=self._get_host(),
-                    node_port=self._get_tcp_port(),
-                    node_id=self._get_node_id().short,
-                ),
-            )
-
-            return b"ok"
-
-        except Exception as error:
-            await handle_exception(error, "handle_job_leadership_notification")
-            return b"error"

@@ -44,6 +44,24 @@ from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 # set.
 _CANCEL_RETRYABLE_MARKER = "cancellation pending leader transition"
 
+# How far each datacenter's answer to a single-workflow cancel carries the
+# gate's aggregate: a workflow still being stopped in any datacenter is not
+# cancelled yet, so CANCELLING outranks every finished answer; a datacenter
+# where it had already finished outranks one that never had it.
+_SINGLE_WORKFLOW_CANCEL_STATUS_RANK: dict[str, int] = {
+    status.value: rank
+    for rank, status in enumerate(
+        (
+            WorkflowCancellationStatus.NOT_FOUND,
+            WorkflowCancellationStatus.ALREADY_COMPLETED,
+            WorkflowCancellationStatus.ALREADY_CANCELLED,
+            WorkflowCancellationStatus.PENDING_CANCELLED,
+            WorkflowCancellationStatus.CANCELLED,
+            WorkflowCancellationStatus.CANCELLING,
+        )
+    )
+}
+
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.jobs.gates import GateJobManager
@@ -493,6 +511,9 @@ class GateCancellationHandler:
             cancel_data,
             timeout=self._FORWARD_TIMEOUT_SECONDS,
         )
+        # send_tcp returns transport errors rather than raising.
+        if isinstance(response, Exception):
+            raise response
         return response
 
     def _interpret_manager_cancel_response(
@@ -593,12 +614,15 @@ class GateCancellationHandler:
             # @tcp.receive() handler (``job_cancellation_complete``).
             # A prior incarnation sent ``receive_job_cancellation_complete``
             # which silently mismatched the client's registered handler.
-            await self._send_tcp(
+            response, _ = await self._send_tcp(
                 callback,
                 "job_cancellation_complete",
                 completion.dump(),
                 timeout=self._client_push_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
         except Exception as error:
             await self._logger.log(
                 ServerError(
@@ -662,10 +686,14 @@ class GateCancellationHandler:
                     errors=["Job not found"],
                 ).dump()
 
-            target_dcs: list[tuple[str, tuple[str, int]]] = []
-            for dc_name, dc_managers in self._datacenter_managers.items():
-                if dc_managers:
-                    target_dcs.append((dc_name, dc_managers[0]))
+            # The datacenters the job was dispatched to (as a job cancel
+            # reaches), each through its first manager that answers: a
+            # manager that is not the job's leader forwards to it.
+            target_dcs = [
+                dc_name
+                for dc_name in self._cancellation_target_datacenters(request.job_id)
+                if self._datacenter_managers.get(dc_name)
+            ]
 
             if not target_dcs:
                 return SingleWorkflowCancelResponse(
@@ -679,52 +707,38 @@ class GateCancellationHandler:
             aggregated_dependents: list[str] = []
             aggregated_errors: list[str] = []
             final_status = WorkflowCancellationStatus.NOT_FOUND.value
+            request_data = request.dump()
 
-            for dc_name, dc_addr in target_dcs:
-                try:
-                    response_data, _ = await self._send_tcp(
-                        dc_addr,
-                        "receive_cancel_single_workflow",
-                        request.dump(),
-                        timeout=self._manager_request_timeout_seconds,
-                    )
+            for dc_name in target_dcs:
+                unreachable_manager_errors: list[str] = []
+                for manager_addr in self._datacenter_managers[dc_name]:
+                    try:
+                        response_data, _ = await self._send_tcp(
+                            manager_addr,
+                            "receive_cancel_single_workflow",
+                            request_data,
+                            timeout=self._manager_request_timeout_seconds,
+                        )
+                        # send_tcp returns transport errors rather than raising.
+                        if isinstance(response_data, Exception):
+                            raise response_data
+                    except Exception as error:
+                        unreachable_manager_errors.append(f"DC {dc_name} manager {manager_addr}: {error}")
+                        continue
 
                     if response_data:
                         response = SingleWorkflowCancelResponse.load(response_data)
-
                         aggregated_dependents.extend(response.cancelled_dependents)
                         aggregated_errors.extend(response.errors)
-
                         if (
-                            response.status
-                            == WorkflowCancellationStatus.CANCELLED.value
+                            _SINGLE_WORKFLOW_CANCEL_STATUS_RANK[response.status]
+                            > _SINGLE_WORKFLOW_CANCEL_STATUS_RANK[final_status]
                         ):
-                            final_status = WorkflowCancellationStatus.CANCELLED.value
-                        elif (
-                            response.status
-                            == WorkflowCancellationStatus.PENDING_CANCELLED.value
-                        ):
-                            if (
-                                final_status
-                                == WorkflowCancellationStatus.NOT_FOUND.value
-                            ):
-                                final_status = (
-                                    WorkflowCancellationStatus.PENDING_CANCELLED.value
-                                )
-                        elif (
-                            response.status
-                            == WorkflowCancellationStatus.ALREADY_CANCELLED.value
-                        ):
-                            if (
-                                final_status
-                                == WorkflowCancellationStatus.NOT_FOUND.value
-                            ):
-                                final_status = (
-                                    WorkflowCancellationStatus.ALREADY_CANCELLED.value
-                                )
+                            final_status = response.status
+                    unreachable_manager_errors.clear()
+                    break
 
-                except Exception as error:
-                    aggregated_errors.append(f"DC {dc_name}: {error}")
+                aggregated_errors.extend(unreachable_manager_errors)
 
             return SingleWorkflowCancelResponse(
                 job_id=request.job_id,

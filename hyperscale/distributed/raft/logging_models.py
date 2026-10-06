@@ -4,71 +4,31 @@ Structured logging models for Raft consensus operations.
 Follows the Entry-based pattern from hyperscale/logging/models.
 Each level variant carries contextual fields identifying the
 node, job, and Raft-specific details.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from hyperscale.logging.models import Entry, LogLevel
 
+from .raft_critical import RaftCritical
+from .raft_debug import RaftDebug
+from .raft_error import RaftError
+from .raft_info import RaftInfo
+from .raft_trace import RaftTrace
+from .raft_warning import RaftWarning
 
-# =============================================================================
-# Raft Consensus Logging Models
-# =============================================================================
+_REHOMED = (
+    RaftTrace,
+    RaftDebug,
+    RaftInfo,
+    RaftWarning,
+    RaftError,
+    RaftCritical,
+)
 
-
-class RaftTrace(Entry, kw_only=True):
-    """Trace-level logging for Raft consensus operations."""
-    node_id: str
-    job_id: str = ""
-    term: int = 0
-    role: str = ""
-    commit_index: int = 0
-    level: LogLevel = LogLevel.TRACE
-
-
-class RaftDebug(Entry, kw_only=True):
-    """Debug-level logging for Raft consensus operations."""
-    node_id: str
-    job_id: str = ""
-    term: int = 0
-    role: str = ""
-    commit_index: int = 0
-    level: LogLevel = LogLevel.DEBUG
-
-
-class RaftInfo(Entry, kw_only=True):
-    """Info-level logging for Raft consensus operations."""
-    node_id: str
-    job_id: str = ""
-    term: int = 0
-    role: str = ""
-    commit_index: int = 0
-    level: LogLevel = LogLevel.INFO
-
-
-class RaftWarning(Entry, kw_only=True):
-    """Warning-level logging for Raft consensus operations."""
-    node_id: str
-    job_id: str = ""
-    term: int = 0
-    role: str = ""
-    commit_index: int = 0
-    level: LogLevel = LogLevel.WARN
-
-
-class RaftError(Entry, kw_only=True):
-    """Error-level logging for Raft consensus operations."""
-    node_id: str
-    job_id: str = ""
-    term: int = 0
-    role: str = ""
-    commit_index: int = 0
-    level: LogLevel = LogLevel.ERROR
-
-
-class RaftCritical(Entry, kw_only=True):
-    """Critical-level logging for Raft consensus operations."""
-    node_id: str
-    job_id: str = ""
-    term: int = 0
-    role: str = ""
-    commit_index: int = 0
-    level: LogLevel = LogLevel.CRITICAL
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

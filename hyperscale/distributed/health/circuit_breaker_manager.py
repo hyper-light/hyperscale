@@ -3,25 +3,22 @@ Circuit Breaker Manager for Gate-to-Manager connections.
 
 Manages per-manager circuit breakers to isolate failures and prevent
 cascading failures when a manager becomes unhealthy.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
+from typing import Callable
+from collections.abc import Iterable
 from dataclasses import dataclass
-
-from hyperscale.distributed.swim.core import (
-    ErrorStats,
-    CircuitState,
-)
+from hyperscale.distributed.swim.core import ErrorStats, CircuitState
 from hyperscale.distributed.env import Env
 
-
-@dataclass(slots=True)
-class CircuitBreakerConfig:
-    """Configuration for circuit breakers."""
-
-    max_errors: int = 5
-    window_seconds: float = 60.0
-    half_open_after: float = 30.0
+from .circuit_breaker_config import CircuitBreakerConfig
 
 
 class CircuitBreakerManager:
@@ -32,9 +29,19 @@ class CircuitBreakerManager:
     manager don't affect dispatch to other managers.
     """
 
-    __slots__ = ("_circuits", "_config", "_lock", "_incarnations")
+    __slots__ = ("_circuits", "_config", "_lock", "_incarnations", "_is_peer_suspected")
 
-    def __init__(self, env: Env):
+    def __init__(self, env: Env, is_peer_suspected: Callable[[tuple[str, int]], bool]):
+        """
+        Args:
+            env: Circuit breaker thresholds
+            is_peer_suspected: Whether phi accrual on this node's edge to a
+                peer is past its threshold (AD-52 section 8): a suspected
+                peer's circuit counts OPEN -- requests to it fail fast and
+                routing passes it by -- for as long as the suspicion lasts,
+                however few errors its requests have hit yet.
+        """
+        self._is_peer_suspected = is_peer_suspected
         cb_config = env.get_circuit_breaker_config()
         self._config = CircuitBreakerConfig(
             max_errors=cb_config["max_errors"],
@@ -57,10 +64,27 @@ class CircuitBreakerManager:
 
     async def is_circuit_open(self, manager_addr: tuple[str, int]) -> bool:
         async with self._lock:
+            if self._is_peer_suspected(manager_addr):
+                return True
             circuit = self._circuits.get(manager_addr)
             if not circuit:
                 return False
             return circuit.circuit_state == CircuitState.OPEN
+
+    def count_open_circuits(self, manager_addrs: Iterable[tuple[str, int]]) -> int:
+        """How many of ``manager_addrs`` have an OPEN circuit right now --
+        tripped by errors, or suspected by phi accrual. A half-open circuit
+        admits a probe, so its manager still counts as usable -- the same
+        rule dispatch applies (``is_circuit_open``)."""
+        return sum(
+            1
+            for manager_addr in manager_addrs
+            if self._is_peer_suspected(manager_addr)
+            or (
+                (circuit := self._circuits.get(manager_addr)) is not None
+                and circuit.circuit_state == CircuitState.OPEN
+            )
+        )
 
     def get_circuit_status(self, manager_addr: tuple[str, int]) -> dict | None:
         """
@@ -136,3 +160,10 @@ class CircuitBreakerManager:
                     circuit.reset()
                 return True
             return False
+
+_REHOMED = (
+    CircuitBreakerConfig,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

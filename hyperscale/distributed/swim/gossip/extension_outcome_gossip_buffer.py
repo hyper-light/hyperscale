@@ -10,6 +10,12 @@ A workflow has at most one outcome (it terminates exactly once),
 so dedup is keyed on ``workflow_id`` alone. Higher-leader-term
 events supersede existing slots so a new leader's authoritative
 outcome wins over a stale one.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from __future__ import annotations
@@ -17,44 +23,21 @@ from __future__ import annotations
 import heapq
 import math
 from dataclasses import dataclass, field
-from typing import Any
-
-from hyperscale.distributed.health.extension_outcome import (
-    ExtensionOutcomeEvent,
-)
-
+from typing import Callable
+from hyperscale.distributed.health.extension_outcome import ExtensionOutcomeEvent
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .gossip_buffer import MAX_UDP_PAYLOAD
+from .gossip_buffer_stats import GossipBufferStats
+from .extension_outcome_piggyback_update import ExtensionOutcomePiggybackUpdate
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
 
 MAX_EXTENSION_OUTCOME_PIGGYBACK_SIZE: int = 600
 
 EXTENSION_OUTCOME_SEPARATOR: bytes = b"#|o"
 
 ENTRY_SEPARATOR: bytes = b"|"
-
-
-@dataclass(slots=True, kw_only=True)
-class ExtensionOutcomePiggybackUpdate:
-    """A single outcome event queued for SWIM piggyback.
-
-    Mirror of ``ExtensionDecisionPiggybackUpdate`` (H7b) for the
-    outcome channel. Tracks broadcast count per AD-48's
-    lambda * log(n+1) budget.
-    """
-
-    event: ExtensionOutcomeEvent
-    timestamp: float
-    broadcast_count: int = 0
-    max_broadcasts: int = 10
-
-    def should_broadcast(self) -> bool:
-        return self.broadcast_count < self.max_broadcasts
-
-    def mark_broadcast(self) -> None:
-        self.broadcast_count += 1
 
 
 @dataclass(slots=True)
@@ -80,9 +63,9 @@ class ExtensionOutcomeGossipBuffer:
     _oversized_updates_count: int = 0
     _overflow_count: int = 0
 
-    _on_overflow: Any = None
+    _on_overflow: Callable[[int, int], None] | None = None
 
-    def set_overflow_callback(self, callback: Any) -> None:
+    def set_overflow_callback(self, callback: Callable[[int, int], None]) -> None:
         self._on_overflow = callback
 
     def add_event(
@@ -187,7 +170,6 @@ class ExtensionOutcomeGossipBuffer:
         base_message: bytes,
         max_count: int = 5,
     ) -> bytes:
-        from .gossip_buffer import MAX_UDP_PAYLOAD
 
         remaining = MAX_UDP_PAYLOAD - len(base_message)
         if remaining <= 0:
@@ -241,10 +223,7 @@ class ExtensionOutcomeGossipBuffer:
         if evicted > 0:
             self._overflow_count += 1
             if self._on_overflow is not None:
-                try:
-                    self._on_overflow(evicted, self.max_updates)
-                except Exception:
-                    pass
+                self._on_overflow(evicted, self.max_updates)
 
         return evicted
 
@@ -281,7 +260,7 @@ class ExtensionOutcomeGossipBuffer:
             "pending_updates": len(self.updates),
         }
 
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> GossipBufferStats:
         return {
             "pending_updates": len(self.updates),
             "total_evicted": self._evicted_count,
@@ -292,3 +271,10 @@ class ExtensionOutcomeGossipBuffer:
             "max_piggyback_size": self.max_piggyback_size,
             "max_updates": self.max_updates,
         }
+
+_REHOMED = (
+    ExtensionOutcomePiggybackUpdate,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

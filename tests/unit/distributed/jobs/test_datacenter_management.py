@@ -3,7 +3,6 @@ Integration tests for Datacenter Management (AD-27 Phase 5.2).
 
 Tests:
 - DatacenterHealthManager health classification
-- ManagerDispatcher dispatch and fallback
 - LeaseManager lease lifecycle
 """
 
@@ -11,12 +10,11 @@ import asyncio
 import time
 import pytest
 
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.health.phi_accrual_config import PhiAccrualConfig
 from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
     ManagerInfo,
-    ManagerDispatcher,
-    DispatchResult,
-    DispatchStats,
     LeaseManager,
     LeaseStats,
 )
@@ -28,19 +26,21 @@ from hyperscale.distributed.models import (
     LeaseTransfer,
 )
 
+MANAGER_HEARTBEAT_PHI = PhiAccrualConfig.for_manager_heartbeats(Env())
+
 
 class TestDatacenterHealthManager:
     """Test DatacenterHealthManager operations."""
 
     def test_create_manager(self) -> None:
         """Test creating a DatacenterHealthManager."""
-        manager = DatacenterHealthManager()
+        manager = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
         assert manager.count_active_datacenters() == 0
 
     def test_update_manager_heartbeat(self) -> None:
         """Test updating manager heartbeat."""
-        health_mgr = DatacenterHealthManager()
+        health_mgr = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
         heartbeat = ManagerHeartbeat(
             node_id="manager-1",
@@ -64,7 +64,7 @@ class TestDatacenterHealthManager:
 
     def test_datacenter_healthy(self) -> None:
         """Test healthy datacenter classification."""
-        health_mgr = DatacenterHealthManager()
+        health_mgr = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
         heartbeat = ManagerHeartbeat(
             node_id="manager-1",
@@ -88,7 +88,7 @@ class TestDatacenterHealthManager:
 
     def test_datacenter_unhealthy_no_managers(self) -> None:
         """Test unhealthy classification when no managers."""
-        health_mgr = DatacenterHealthManager()
+        health_mgr = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
         health_mgr.add_datacenter("dc-1")
 
         status = health_mgr.get_datacenter_health("dc-1")
@@ -106,7 +106,7 @@ class TestDatacenterHealthManager:
         bring-up. Zero available capacity is still reported so routing
         prefers datacenters with real capacity.
         """
-        health_mgr = DatacenterHealthManager()
+        health_mgr = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
         heartbeat = ManagerHeartbeat(
             node_id="manager-1",
@@ -134,6 +134,7 @@ class TestDatacenterHealthManager:
         INITIALIZING (pre-first-heartbeat warmup), distinct from
         UNHEALTHY (heartbeats existed and stopped, or a broken DC)."""
         health_mgr = DatacenterHealthManager(
+            MANAGER_HEARTBEAT_PHI,
             get_configured_managers=lambda dc_id: [("10.0.0.1", 8080)],
         )
 
@@ -142,7 +143,7 @@ class TestDatacenterHealthManager:
 
     def test_datacenter_busy(self) -> None:
         """Test busy classification when capacity utilization is 75%."""
-        health_mgr = DatacenterHealthManager()
+        health_mgr = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
         heartbeat = ManagerHeartbeat(
             node_id="manager-1",
@@ -165,7 +166,7 @@ class TestDatacenterHealthManager:
 
     def test_datacenter_degraded_workers(self) -> None:
         """Test degraded classification when worker overload ratio exceeds 50%."""
-        health_mgr = DatacenterHealthManager()
+        health_mgr = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
         heartbeat = ManagerHeartbeat(
             node_id="manager-1",
@@ -189,7 +190,7 @@ class TestDatacenterHealthManager:
 
     def test_get_leader_address(self) -> None:
         """Test getting leader address."""
-        health_mgr = DatacenterHealthManager()
+        health_mgr = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
         # Non-leader
         heartbeat1 = ManagerHeartbeat(
@@ -229,7 +230,7 @@ class TestDatacenterHealthManager:
 
     def test_get_alive_managers(self) -> None:
         """Test getting alive managers."""
-        health_mgr = DatacenterHealthManager()
+        health_mgr = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
         heartbeat = ManagerHeartbeat(
             node_id="manager-1",
@@ -253,7 +254,7 @@ class TestDatacenterHealthManager:
 
     def test_mark_manager_dead(self) -> None:
         """Test marking a manager as dead."""
-        health_mgr = DatacenterHealthManager()
+        health_mgr = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
         heartbeat = ManagerHeartbeat(
             node_id="manager-1",
@@ -274,165 +275,6 @@ class TestDatacenterHealthManager:
 
         alive = health_mgr.get_alive_managers("dc-1")
         assert len(alive) == 0
-
-
-class TestManagerDispatcher:
-    """Test ManagerDispatcher operations."""
-
-    def test_create_dispatcher(self) -> None:
-        """Test creating a ManagerDispatcher."""
-        dispatcher = ManagerDispatcher()
-
-        assert dispatcher.get_all_datacenters() == []
-
-    def test_add_datacenter(self) -> None:
-        """Test adding a datacenter."""
-        dispatcher = ManagerDispatcher()
-
-        dispatcher.add_datacenter("dc-1", [("10.0.0.1", 8080), ("10.0.0.2", 8080)])
-
-        assert dispatcher.has_datacenter("dc-1")
-        assert len(dispatcher.get_managers("dc-1")) == 2
-
-    def test_set_leader(self) -> None:
-        """Test setting DC leader."""
-        dispatcher = ManagerDispatcher()
-
-        dispatcher.add_datacenter("dc-1", [("10.0.0.1", 8080), ("10.0.0.2", 8080)])
-        dispatcher.set_leader("dc-1", ("10.0.0.2", 8080))
-
-        assert dispatcher.get_leader("dc-1") == ("10.0.0.2", 8080)
-
-    @pytest.mark.asyncio
-    async def test_dispatch_success(self) -> None:
-        """Test successful dispatch."""
-        dispatcher = ManagerDispatcher()
-        dispatcher.add_datacenter("dc-1", [("10.0.0.1", 8080)])
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> tuple[bytes, float]:
-            return (b"success", 0.01)
-
-        result = await dispatcher.dispatch_to_datacenter(
-            dc_id="dc-1",
-            endpoint="job_submission",
-            data=b"test_data",
-            send_tcp=mock_send_tcp,
-        )
-
-        assert result.success is True
-        assert result.datacenter == "dc-1"
-        assert result.response == b"success"
-
-    @pytest.mark.asyncio
-    async def test_dispatch_no_managers(self) -> None:
-        """Test dispatch with no managers configured."""
-        dispatcher = ManagerDispatcher()
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> tuple[bytes, float]:
-            return (b"success", 0.01)
-
-        result = await dispatcher.dispatch_to_datacenter(
-            dc_id="dc-unknown",
-            endpoint="job_submission",
-            data=b"test_data",
-            send_tcp=mock_send_tcp,
-        )
-
-        assert result.success is False
-        assert "No managers" in (result.error or "")
-
-    @pytest.mark.asyncio
-    async def test_dispatch_with_retry(self) -> None:
-        """Test dispatch retries on failure."""
-        dispatcher = ManagerDispatcher()
-        dispatcher.add_datacenter("dc-1", [("10.0.0.1", 8080), ("10.0.0.2", 8080)])
-
-        call_count = 0
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> tuple[bytes, float]:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise ConnectionError("First manager failed")
-            return (b"success", 0.01)
-
-        result = await dispatcher.dispatch_to_datacenter(
-            dc_id="dc-1",
-            endpoint="job_submission",
-            data=b"test_data",
-            send_tcp=mock_send_tcp,
-        )
-
-        assert result.success is True
-        assert call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_dispatch_with_fallback(self) -> None:
-        """Test dispatch with fallback to another DC."""
-        dispatcher = ManagerDispatcher()
-        dispatcher.add_datacenter("dc-1", [("10.0.0.1", 8080)])
-        dispatcher.add_datacenter("dc-2", [("10.0.0.2", 8080)])
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> tuple[bytes, float]:
-            if addr[0] == "10.0.0.1":
-                raise ConnectionError("DC-1 failed")
-            return (b"success", 0.01)
-
-        successful, failed = await dispatcher.dispatch_with_fallback(
-            endpoint="job_submission",
-            data=b"test_data",
-            send_tcp=mock_send_tcp,
-            primary_dcs=["dc-1"],
-            fallback_dcs=["dc-2"],
-        )
-
-        assert "dc-2" in successful
-        assert len(failed) == 0
-
-    @pytest.mark.asyncio
-    async def test_broadcast_to_all(self) -> None:
-        """Test broadcasting to all DCs."""
-        dispatcher = ManagerDispatcher()
-        dispatcher.add_datacenter("dc-1", [("10.0.0.1", 8080)])
-        dispatcher.add_datacenter("dc-2", [("10.0.0.2", 8080)])
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> tuple[bytes, float]:
-            return (b"ok", 0.01)
-
-        results = await dispatcher.broadcast_to_all(
-            endpoint="notification",
-            data=b"broadcast_data",
-            send_tcp=mock_send_tcp,
-        )
-
-        assert len(results) == 2
-        assert results["dc-1"].success is True
-        assert results["dc-2"].success is True
 
 
 class TestLeaseManager:
@@ -590,94 +432,6 @@ class TestLeaseManager:
 
 class TestIntegrationScenarios:
     """Test realistic integration scenarios."""
-
-    @pytest.mark.asyncio
-    async def test_job_dispatch_with_health_check(self) -> None:
-        """
-        Test job dispatch with health checking.
-
-        Scenario:
-        1. Gate checks DC health
-        2. Gate acquires lease
-        3. Gate dispatches to healthy DC
-        4. DC becomes unhealthy
-        5. Gate fails over to another DC
-        """
-        # Setup
-        health_mgr = DatacenterHealthManager()
-        dispatcher = ManagerDispatcher()
-        lease_mgr = LeaseManager(node_id="gate-1", lease_timeout=30.0)
-
-        # Configure DCs
-        dispatcher.add_datacenter("dc-1", [("10.0.0.1", 8080)])
-        dispatcher.add_datacenter("dc-2", [("10.0.0.2", 8080)])
-
-        # DC-1 is healthy
-        heartbeat1 = ManagerHeartbeat(
-            node_id="manager-1",
-            datacenter="dc-1",
-            is_leader=True,
-            term=1,
-            version=1,
-            active_jobs=0,
-            active_workflows=0,
-            worker_count=4,
-            healthy_worker_count=4,
-            available_cores=32,
-            total_cores=40,
-        )
-        health_mgr.update_manager("dc-1", ("10.0.0.1", 8080), heartbeat1)
-
-        # DC-2 is healthy
-        heartbeat2 = ManagerHeartbeat(
-            node_id="manager-2",
-            datacenter="dc-2",
-            is_leader=True,
-            term=1,
-            version=1,
-            active_jobs=0,
-            active_workflows=0,
-            worker_count=4,
-            healthy_worker_count=4,
-            available_cores=32,
-            total_cores=40,
-        )
-        health_mgr.update_manager("dc-2", ("10.0.0.2", 8080), heartbeat2)
-
-        # Step 1: Check health
-        assert health_mgr.is_datacenter_healthy("dc-1") is True
-
-        # Step 2: Acquire lease
-        lease = lease_mgr.acquire_lease("job-123", "dc-1")
-        assert lease_mgr.is_lease_holder("job-123", "dc-1") is True
-
-        # Step 3: Dispatch succeeds
-        dispatch_success = False
-
-        async def mock_send_tcp(
-            addr: tuple[str, int],
-            endpoint: str,
-            data: bytes,
-            timeout: float = 5.0,
-        ) -> tuple[bytes, float]:
-            nonlocal dispatch_success
-            if addr[0] == "10.0.0.1":
-                raise ConnectionError("DC-1 is down")
-            dispatch_success = True
-            return (b"ok", 0.01)
-
-        # Step 4 & 5: DC-1 fails, fall back to DC-2
-        successful, failed = await dispatcher.dispatch_with_fallback(
-            endpoint="job_submission",
-            data=b"test",
-            send_tcp=mock_send_tcp,
-            primary_dcs=["dc-1"],
-            fallback_dcs=["dc-2"],
-            get_dc_health=lambda dc: health_mgr.get_datacenter_health(dc).health,
-        )
-
-        assert "dc-2" in successful
-        assert dispatch_success is True
 
     def test_lease_lifecycle(self) -> None:
         """

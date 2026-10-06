@@ -8,13 +8,14 @@ from typing import TYPE_CHECKING
 
 from .logging_models import RaftWarning
 from .models import AppendEntries, RequestVote
+from .snapshot import InstallSnapshot
 
 if TYPE_CHECKING:
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
 
-RaftRequest = RequestVote | AppendEntries
+RaftRequest = RequestVote | AppendEntries | InstallSnapshot
 PeerAddress = tuple[str, int]
 
 

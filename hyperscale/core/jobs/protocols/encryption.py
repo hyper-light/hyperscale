@@ -127,7 +127,7 @@ class AESGCMFernet:
         
         # Handle fallback secret for key rotation
         self._fallback_secret_bytes: bytes | None = None
-        previous_secret = getattr(env, 'MERCURY_SYNC_AUTH_SECRET_PREVIOUS', None)
+        previous_secret = env.MERCURY_SYNC_AUTH_SECRET_PREVIOUS
         if previous_secret:
             if isinstance(previous_secret, str):
                 self._fallback_secret_bytes = previous_secret.encode('utf-8')

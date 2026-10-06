@@ -1,41 +1,25 @@
 """
 Leadership tracking state for client.
 
-Tracks gate and manager leaders, fence tokens, and orphaned job status.
+Tracks gate and manager leaders and fence tokens.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass
+from hyperscale.distributed.models import GateLeaderInfo, ManagerLeaderInfo
 
-from hyperscale.distributed.models import (
-    GateLeaderInfo,
-    ManagerLeaderInfo,
-    OrphanedJobInfo,
+from .gate_leader_tracking import GateLeaderTracking
+from .manager_leader_tracking import ManagerLeaderTracking
+
+_REHOMED = (
+    GateLeaderTracking,
+    ManagerLeaderTracking,
 )
 
-
-@dataclass(slots=True)
-class GateLeaderTracking:
-    """Tracks gate leader for a job."""
-
-    job_id: str
-    leader_info: GateLeaderInfo
-    last_updated: float
-
-
-@dataclass(slots=True)
-class ManagerLeaderTracking:
-    """Tracks manager leader for a job+datacenter."""
-
-    job_id: str
-    datacenter_id: str
-    leader_info: ManagerLeaderInfo
-    last_updated: float
-
-
-@dataclass(slots=True)
-class OrphanedJob:
-    """Tracks orphaned job state."""
-
-    job_id: str
-    orphan_info: OrphanedJobInfo
-    orphaned_at: float
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

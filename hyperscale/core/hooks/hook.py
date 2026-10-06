@@ -1,5 +1,5 @@
 import inspect
-import threading
+import os
 import uuid
 from inspect import signature
 from typing import (
@@ -44,7 +44,7 @@ class Hook:
             timeouts = Timeouts()
 
         id_generator = SnowflakeGenerator(
-            (uuid.uuid1().int + threading.get_native_id()) >> 64
+            (uuid.uuid1().int + os.getpid()) >> 64
         )
 
         call_signature = signature(call)

@@ -12,24 +12,35 @@ from .colors.highlight import Highlight, HighlightName
 
 RESET = "\033[0m"
 
+# The terminal's answer -- sys.stdout is a terminal and TERM is not "dumb" --
+# with the stream it is for: asked once per stream instead of on every render,
+# as neither changes while a stream is in use.
+_terminal_colour: tuple[object, bool] | None = None
+
 
 async def _can_do_colour(
     *,
     no_color: bool | None = None,
     force_color: bool | None = None,
 ) -> bool:
+    global _terminal_colour
+
     if no_color is not None and no_color:
         return False
     if force_color is not None and force_color:
         return True
 
-    loop = asyncio.get_event_loop()
+    stdout = sys.stdout
+    if _terminal_colour is None or _terminal_colour[0] is not stdout:
+        loop = asyncio.get_event_loop()
+        _terminal_colour = (
+            stdout,
+            hasattr(stdout, "isatty")
+            and await loop.run_in_executor(None, stdout.isatty)
+            and await loop.run_in_executor(None, os.environ.get, "TERM") != "dumb",
+        )
 
-    return (
-        hasattr(sys.stdout, "isatty")
-        and await loop.run_in_executor(None, sys.stdout.isatty)
-        and await loop.run_in_executor(None, os.environ.get, "TERM") != "dumb"
-    )
+    return _terminal_colour[1]
 
 
 async def stylize(

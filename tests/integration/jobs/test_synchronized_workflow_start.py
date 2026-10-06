@@ -269,9 +269,13 @@ async def run_workflow_across_workers(
 
         await asyncio.wait_for(submission, timeout=40)
         outcome["released_seconds"] = time.monotonic() - submitted_at
+        stop_completion = leader._stop_completion_events[run_id][workflow.name]
+        outcome["stopped_at_release"] = stop_completion.is_set()
 
         await asyncio.wait_for(completion_state.completion_event.wait(), timeout=40)
         outcome["completed_seconds"] = time.monotonic() - submitted_at
+        await asyncio.wait_for(stop_completion.wait(), timeout=10)
+        outcome["stopped_after_completion"] = stop_completion.is_set()
 
         node_errors = {str(error) for error in leader._errors[run_id][workflow.name].values()}
         outcome["node_errors"] = sorted(node_errors - {"None", ""})
@@ -382,6 +386,24 @@ async def test_cancelling_a_run_that_waits_to_start_settles_without_its_release(
     assert outcome["cancel_settle_seconds"] <= settle_bound_seconds
     assert outcome["completed_seconds"] <= slow_setup_seconds + TIMING_TOLERANCE_SECONDS
     assert_nothing_outlives_the_run(outcome)
+
+
+async def test_each_run_on_the_same_workers_reports_its_own_stop(started_cluster) -> None:
+    leader, events_path, target = started_cluster
+
+    for run_number in range(2):
+        outcome = await run_workflow_across_workers(
+            leader,
+            make_workflow(f"StopReportingWorkflow{run_number}", target, "1s", "10s"),
+            events_path,
+        )
+
+        # A stop signal left over from an earlier run on the same workers
+        # would already have arrived when this one's load started.
+        assert outcome["node_errors"] == []
+        assert outcome["stopped_at_release"] is False
+        assert outcome["stopped_after_completion"] is True
+        assert_nothing_outlives_the_run(outcome)
 
 
 async def test_a_ready_for_a_run_without_a_barrier_is_released_at_once(started_cluster) -> None:

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 import pathlib
 import sys
-import threading
 from typing import Any, Callable, Dict, Literal, TypeVar
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
@@ -312,7 +312,7 @@ class Logger:
                     filename=code.co_filename,
                     function_name=code.co_name,
                     line_number=frame.f_lineno,
-                    thread_id=threading.get_native_id(),
+                    thread_id=os.getpid(),
                     timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
                 ),
                 template=template,
@@ -353,7 +353,7 @@ class Logger:
                             filename=code.co_filename,
                             function_name=code.co_name,
                             line_number=frame.f_lineno,
-                            thread_id=threading.get_native_id(),
+                            thread_id=os.getpid(),
                             timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
                         ),
                     )
@@ -391,7 +391,7 @@ class Logger:
                     filename=code.co_filename,
                     function_name=code.co_name,
                     line_number=frame.f_lineno,
-                    thread_id=threading.get_native_id(),
+                    thread_id=os.getpid(),
                     timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
                 ),
             )

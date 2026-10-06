@@ -11,6 +11,12 @@ Key features:
 - Async-compatible synchronous I/O (file writes are fast)
 - Automatic directory creation
 - Graceful fallback if storage unavailable
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
@@ -18,14 +24,11 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+from hyperscale.distributed.runtime import Clock, Filesystem, RealClock, RealFilesystem
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerError, ServerInfo, ServerWarning
 
-from hyperscale.distributed.runtime import (
-    Clock,
-    Filesystem,
-    RealClock,
-    RealFilesystem,
-)
-
+from .incarnation_record import IncarnationRecord
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
@@ -34,28 +37,6 @@ _DEFAULT_CLOCK: Clock = RealClock()
 # ``swap_defaults`` rebinds it to the SIM filesystem so incarnation
 # persistence becomes deterministic and storage-faultable under replay.
 _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
-
-from hyperscale.distributed.swim.core.protocols import LoggerProtocol
-from hyperscale.logging.hyperscale_logging_models import (
-    ServerDebug,
-    ServerError,
-    ServerInfo,
-    ServerWarning,
-)
-
-
-@dataclass(slots=True)
-class IncarnationRecord:
-    """
-    Record of a node's incarnation history.
-
-    Stores both the last known incarnation and the timestamp when it was
-    last updated. The timestamp enables time-based zombie detection.
-    """
-
-    incarnation: int
-    last_updated_at: float
-    node_address: str
 
 
 @dataclass
@@ -403,3 +384,10 @@ class IncarnationStore:
             "persistence_degraded": self._persistence_degraded,
             "persist_failure_count": self._persist_failure_count,
         }
+
+_REHOMED = (
+    IncarnationRecord,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -3,12 +3,11 @@
 Rate Limiting Server Integration Test.
 
 Tests that:
-1. TokenBucket correctly limits request rates
-2. ServerRateLimiter provides per-client rate limiting
-3. CooperativeRateLimiter respects server-side limits
-4. Rate limit responses include proper Retry-After information
-5. Automatic retry with rate limit handling works correctly
-6. Client cleanup prevents memory leaks
+1. ServerRateLimiter provides per-client rate limiting
+2. CooperativeRateLimiter respects server-side limits
+3. Rate limit responses include proper Retry-After information
+4. Automatic retry with rate limit handling works correctly
+5. Client cleanup prevents memory leaks
 
 This tests the rate limiting infrastructure defined in AD-24.
 """
@@ -22,7 +21,6 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from hyperscale.distributed.reliability import (
-    TokenBucket,
     RateLimitConfig,
     RateLimitResult,
     ServerRateLimiter,
@@ -38,82 +36,9 @@ async def run_test():
 
     try:
         # ==============================================================
-        # TEST 1: Basic TokenBucket functionality
+        # TEST 1: RateLimitConfig per-operation limits
         # ==============================================================
-        print("[1/9] Testing basic TokenBucket functionality...")
-        print("-" * 50)
-
-        bucket = TokenBucket(bucket_size=10, refill_rate=5.0)
-
-        # Initially should have full bucket
-        assert bucket.available_tokens == 10.0, f"Expected 10 tokens, got {bucket.available_tokens}"
-        print(f"  ✓ Initial bucket has {bucket.available_tokens} tokens")
-
-        # Acquire tokens
-        acquired = bucket.acquire(5)
-        assert acquired is True, "Should acquire 5 tokens"
-        assert bucket.available_tokens == 5.0, f"Should have 5 tokens left, got {bucket.available_tokens}"
-        print("  ✓ Successfully acquired 5 tokens")
-
-        # Acquire more tokens
-        acquired = bucket.acquire(5)
-        assert acquired is True, "Should acquire remaining 5 tokens"
-        assert bucket.available_tokens == 0.0, f"Should have 0 tokens, got {bucket.available_tokens}"
-        print("  ✓ Acquired remaining 5 tokens")
-
-        # Should fail when bucket empty
-        acquired = bucket.acquire(1)
-        assert acquired is False, "Should fail to acquire when bucket empty"
-        print("  ✓ Correctly rejected request when bucket empty")
-
-        # Wait for refill
-        await asyncio.sleep(0.5)  # Should refill 2.5 tokens
-        refilled = bucket.available_tokens
-        assert 2.0 <= refilled <= 3.0, f"Expected ~2.5 tokens after 0.5s, got {refilled}"
-        print(f"  ✓ Refilled to {refilled:.2f} tokens after 0.5s (rate=5/s)")
-
-        print()
-
-        # ==============================================================
-        # TEST 2: TokenBucket try_acquire with wait time
-        # ==============================================================
-        print("[2/9] Testing TokenBucket try_acquire with wait time...")
-        print("-" * 50)
-
-        bucket = TokenBucket(bucket_size=10, refill_rate=10.0)
-        bucket._tokens = 0.0  # Empty the bucket
-
-        # Try to acquire when empty
-        acquired, wait_time = bucket.try_acquire(5)
-        assert acquired is False, "Should not acquire when empty"
-        assert 0.4 <= wait_time <= 0.6, f"Wait time should be ~0.5s, got {wait_time}"
-        print(f"  ✓ Try acquire returned wait time: {wait_time:.3f}s")
-
-        # Test async acquire with waiting
-        bucket.reset()  # Full bucket
-        bucket._tokens = 0.0  # Empty again
-
-        # acquire_async should wait and succeed
-        start = time.monotonic()
-        acquired = await bucket.acquire_async(tokens=2, max_wait=1.0)
-        elapsed = time.monotonic() - start
-        assert acquired is True, "Should acquire after waiting"
-        assert 0.15 <= elapsed <= 0.35, f"Should wait ~0.2s, took {elapsed:.3f}s"
-        print(f"  ✓ Async acquire waited {elapsed:.3f}s for tokens")
-
-        # Test max_wait timeout
-        bucket._tokens = 0.0
-        bucket._last_refill = time.monotonic()
-        acquired = await bucket.acquire_async(tokens=100, max_wait=0.1)
-        assert acquired is False, "Should timeout when needing too many tokens"
-        print("  ✓ Async acquire respects max_wait timeout")
-
-        print()
-
-        # ==============================================================
-        # TEST 3: RateLimitConfig per-operation limits
-        # ==============================================================
-        print("[3/9] Testing RateLimitConfig per-operation limits...")
+        print("[1/7] Testing RateLimitConfig per-operation limits...")
         print("-" * 50)
 
         config = RateLimitConfig(
@@ -142,9 +67,9 @@ async def run_test():
         print()
 
         # ==============================================================
-        # TEST 4: ServerRateLimiter per-client buckets
+        # TEST 2: ServerRateLimiter per-client buckets
         # ==============================================================
-        print("[4/9] Testing ServerRateLimiter per-client buckets...")
+        print("[2/7] Testing ServerRateLimiter per-client buckets...")
         print("-" * 50)
 
         config = RateLimitConfig(
@@ -182,9 +107,9 @@ async def run_test():
         print()
 
         # ==============================================================
-        # TEST 5: ServerRateLimiter client stats and reset
+        # TEST 3: ServerRateLimiter client stats and reset
         # ==============================================================
-        print("[5/9] Testing ServerRateLimiter client stats and reset...")
+        print("[3/7] Testing ServerRateLimiter client stats and reset...")
         print("-" * 50)
 
         config = RateLimitConfig(
@@ -217,9 +142,9 @@ async def run_test():
         print()
 
         # ==============================================================
-        # TEST 6: ServerRateLimiter inactive client cleanup
+        # TEST 4: ServerRateLimiter inactive client cleanup
         # ==============================================================
-        print("[6/9] Testing ServerRateLimiter inactive client cleanup...")
+        print("[4/7] Testing ServerRateLimiter inactive client cleanup...")
         print("-" * 50)
 
         limiter = ServerRateLimiter(
@@ -250,9 +175,9 @@ async def run_test():
         print()
 
         # ==============================================================
-        # TEST 7: CooperativeRateLimiter client-side limiting
+        # TEST 5: CooperativeRateLimiter client-side limiting
         # ==============================================================
-        print("[7/9] Testing CooperativeRateLimiter client-side limiting...")
+        print("[5/7] Testing CooperativeRateLimiter client-side limiting...")
         print("-" * 50)
 
         cooperative = CooperativeRateLimiter(default_backoff=1.0)
@@ -301,9 +226,9 @@ async def run_test():
         print()
 
         # ==============================================================
-        # TEST 8: ServerRateLimiter async with wait
+        # TEST 6: ServerRateLimiter async with wait
         # ==============================================================
-        print("[8/9] Testing ServerRateLimiter async check with wait...")
+        print("[6/7] Testing ServerRateLimiter async check with wait...")
         print("-" * 50)
 
         config = RateLimitConfig(
@@ -333,9 +258,9 @@ async def run_test():
         print()
 
         # ==============================================================
-        # TEST 9: execute_with_rate_limit_retry
+        # TEST 7: execute_with_rate_limit_retry
         # ==============================================================
-        print("[9/9] Testing execute_with_rate_limit_retry...")
+        print("[7/7] Testing execute_with_rate_limit_retry...")
         print("-" * 50)
 
         call_count = 0
@@ -409,8 +334,6 @@ async def run_test():
         print("TEST RESULT: ✓ ALL TESTS PASSED")
         print()
         print("  Rate limiting infrastructure verified:")
-        print("  - TokenBucket with configurable size and refill rate")
-        print("  - TokenBucket async acquire with max_wait")
         print("  - RateLimitConfig per-operation limits")
         print("  - ServerRateLimiter per-client buckets")
         print("  - ServerRateLimiter client stats and reset")

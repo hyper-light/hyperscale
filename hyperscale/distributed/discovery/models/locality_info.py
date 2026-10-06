@@ -1,21 +1,17 @@
 """
 Locality models for the discovery system.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass
 from enum import IntEnum
 
-
-class LocalityTier(IntEnum):
-    """
-    Locality tiers for peer preference.
-
-    Lower values are preferred. SAME_DC is most preferred,
-    GLOBAL is least preferred (fallback).
-    """
-    SAME_DC = 0      # Same datacenter (lowest latency, ~1-2ms)
-    SAME_REGION = 1  # Same region, different DC (~10-50ms)
-    GLOBAL = 2       # Different region (~50-200ms+)
+from .locality_tier import LocalityTier
 
 
 @dataclass(slots=True, frozen=True)
@@ -75,3 +71,10 @@ class LocalityInfo:
         if self.zone_id:
             parts.append(f"zone={self.zone_id}")
         return ", ".join(parts) if parts else "unknown"
+
+_REHOMED = (
+    LocalityTier,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

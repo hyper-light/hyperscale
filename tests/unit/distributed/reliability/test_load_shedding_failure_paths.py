@@ -13,10 +13,16 @@ import asyncio
 import pytest
 
 from hyperscale.distributed.reliability.load_shedding import (
-    DEFAULT_MESSAGE_PRIORITIES,
     LoadShedder,
     LoadShedderConfig,
     RequestPriority,
+    classify_handler_to_priority,
+)
+from hyperscale.distributed.reliability.message_class import (
+    CONTROL_HANDLERS,
+    DATA_HANDLERS,
+    DISPATCH_HANDLERS,
+    TELEMETRY_HANDLERS,
 )
 from hyperscale.distributed.reliability.overload import (
     HybridOverloadDetector,
@@ -245,47 +251,10 @@ class TestOverloadDetectorEdgeCases:
 class TestLoadShedderEdgeCases:
     """Test edge cases for LoadShedder."""
 
-    def test_unknown_message_type_defaults_to_normal(self):
-        """Test that unknown message types default to NORMAL priority."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        priority = shedder.classify_request("UnknownMessageType")
+    def test_unknown_handler_defaults_to_normal(self):
+        """Test that unknown handler names default to NORMAL priority."""
+        priority = classify_handler_to_priority("not_a_real_handler")
         assert priority == RequestPriority.NORMAL
-
-    def test_empty_message_type(self):
-        """Test classification of empty message type."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        priority = shedder.classify_request("")
-        assert priority == RequestPriority.NORMAL
-
-    def test_custom_message_priorities(self):
-        """Test LoadShedder with custom priority mapping."""
-        detector = HybridOverloadDetector()
-        custom_priorities = {
-            "CustomMessage": RequestPriority.CRITICAL,
-            "AnotherCustom": RequestPriority.LOW,
-        }
-        shedder = LoadShedder(detector, message_priorities=custom_priorities)
-
-        assert shedder.classify_request("CustomMessage") == RequestPriority.CRITICAL
-        assert shedder.classify_request("AnotherCustom") == RequestPriority.LOW
-        # Default priorities should not be present
-        assert shedder.classify_request("Ping") == RequestPriority.NORMAL
-
-    def test_register_message_priority_override(self):
-        """Test overriding an existing message priority."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        # Ping is CRITICAL by default
-        assert shedder.classify_request("Ping") == RequestPriority.CRITICAL
-
-        # Override to LOW
-        shedder.register_message_priority("Ping", RequestPriority.LOW)
-        assert shedder.classify_request("Ping") == RequestPriority.LOW
 
     def test_none_config_uses_defaults(self):
         """Test that None config uses default configuration."""
@@ -334,7 +303,7 @@ class TestLoadShedderEdgeCases:
             detector.record_latency(10000.0)
 
         # Even in overloaded state, nothing should be shed
-        assert shedder.should_shed("DebugRequest") is False
+        assert shedder.should_shed_handler("cluster_metrics") is False
 
     def test_missing_state_in_thresholds(self):
         """Test behavior when a state is missing from thresholds dict."""
@@ -388,9 +357,9 @@ class TestLoadShedderMetricsEdgeCases:
 
         # Process mix of requests
         for _ in range(10):
-            shedder.should_shed("Ping")  # CRITICAL - not shed
+            shedder.should_shed_handler("ping")  # CRITICAL - not shed
         for _ in range(10):
-            shedder.should_shed("DebugRequest")  # LOW - shed
+            shedder.should_shed_handler("cluster_metrics")  # LOW - shed
 
         metrics = shedder.get_metrics()
         assert metrics["total_requests"] == 20
@@ -407,9 +376,9 @@ class TestLoadShedderMetricsEdgeCases:
             detector.record_latency(10000.0)
 
         # Shed requests at different priorities
-        shedder.should_shed("SubmitJob")  # HIGH
-        shedder.should_shed("JobProgress")  # NORMAL
-        shedder.should_shed("DebugRequest")  # LOW
+        shedder.should_shed_handler("job_submission")  # HIGH
+        shedder.should_shed_handler("receive_job_progress")  # NORMAL
+        shedder.should_shed_handler("cluster_metrics")  # LOW
 
         metrics = shedder.get_metrics()
         shed_by_priority = metrics["shed_by_priority"]
@@ -427,7 +396,7 @@ class TestLoadShedderMetricsEdgeCases:
         # Build up some metrics
         for _ in range(5):
             detector.record_latency(10000.0)
-            shedder.should_shed("DebugRequest")
+            shedder.should_shed_handler("cluster_metrics")
 
         assert shedder.get_metrics()["total_requests"] > 0
 
@@ -451,7 +420,7 @@ class TestLoadShedderMetricsEdgeCases:
         # Simulate concurrent requests (in reality, would need actual threads)
         request_count = 100
         for _ in range(request_count):
-            shedder.should_shed("JobProgress")  # NORMAL - should be shed in stressed
+            shedder.should_shed_handler("receive_job_progress")  # NORMAL - should be shed in stressed
 
         metrics = shedder.get_metrics()
         assert metrics["total_requests"] == request_count
@@ -476,7 +445,7 @@ class TestLoadShedderStateTransitions:
                 detector.record_latency(3000.0)  # High latency
                 cpu = 99.0
 
-            should_shed = shedder.should_shed("JobProgress", cpu_percent=cpu)
+            should_shed = shedder.should_shed_handler("receive_job_progress", cpu_percent=cpu)
             results.append(should_shed)
 
         # Should have mix of shed/not shed decisions
@@ -520,97 +489,32 @@ class TestLoadShedderStateTransitions:
         assert states[-1] in [OverloadState.HEALTHY, OverloadState.BUSY]
 
 
-class TestDefaultMessagePriorities:
-    """Test default message priority mappings."""
+class TestHandlerPriorityClassification:
+    """Test AD-37 handler name to priority classification."""
 
-    def test_all_critical_messages(self):
-        """Verify all critical messages are classified correctly."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
+    def test_all_control_handlers_critical(self):
+        """Verify every CONTROL handler is classified CRITICAL."""
+        for handler_name in sorted(CONTROL_HANDLERS):
+            priority = classify_handler_to_priority(handler_name)
+            assert priority == RequestPriority.CRITICAL, f"{handler_name} should be CRITICAL"
 
-        critical_messages = [
-            "Ping",
-            "Ack",
-            "Nack",
-            "PingReq",
-            "Suspect",
-            "Alive",
-            "Dead",
-            "Join",
-            "JoinAck",
-            "Leave",
-            "JobCancelRequest",
-            "JobCancelResponse",
-            "JobFinalResult",
-            "Heartbeat",
-            "HealthCheck",
-        ]
+    def test_all_dispatch_handlers_high(self):
+        """Verify every DISPATCH handler is classified HIGH."""
+        for handler_name in sorted(DISPATCH_HANDLERS):
+            priority = classify_handler_to_priority(handler_name)
+            assert priority == RequestPriority.HIGH, f"{handler_name} should be HIGH"
 
-        for msg in critical_messages:
-            priority = shedder.classify_request(msg)
-            assert priority == RequestPriority.CRITICAL, f"{msg} should be CRITICAL"
+    def test_all_data_handlers_normal(self):
+        """Verify every DATA handler is classified NORMAL."""
+        for handler_name in sorted(DATA_HANDLERS):
+            priority = classify_handler_to_priority(handler_name)
+            assert priority == RequestPriority.NORMAL, f"{handler_name} should be NORMAL"
 
-    def test_all_high_messages(self):
-        """Verify all HIGH priority messages are classified correctly."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        high_messages = [
-            "SubmitJob",
-            "SubmitJobResponse",
-            "JobAssignment",
-            "WorkflowDispatch",
-            "WorkflowComplete",
-            "StateSync",
-            "StateSyncRequest",
-            "StateSyncResponse",
-            "AntiEntropyRequest",
-            "AntiEntropyResponse",
-            "JobLeaderGateTransfer",
-            "JobLeaderGateTransferAck",
-        ]
-
-        for msg in high_messages:
-            priority = shedder.classify_request(msg)
-            assert priority == RequestPriority.HIGH, f"{msg} should be HIGH"
-
-    def test_all_normal_messages(self):
-        """Verify all NORMAL priority messages are classified correctly."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        normal_messages = [
-            "JobProgress",
-            "JobStatusRequest",
-            "JobStatusResponse",
-            "JobStatusPush",
-            "RegisterCallback",
-            "RegisterCallbackResponse",
-            "StatsUpdate",
-            "StatsQuery",
-        ]
-
-        for msg in normal_messages:
-            priority = shedder.classify_request(msg)
-            assert priority == RequestPriority.NORMAL, f"{msg} should be NORMAL"
-
-    def test_all_low_messages(self):
-        """Verify all LOW priority messages are classified correctly."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        low_messages = [
-            "DetailedStatsRequest",
-            "DetailedStatsResponse",
-            "DebugRequest",
-            "DebugResponse",
-            "DiagnosticsRequest",
-            "DiagnosticsResponse",
-        ]
-
-        for msg in low_messages:
-            priority = shedder.classify_request(msg)
-            assert priority == RequestPriority.LOW, f"{msg} should be LOW"
+    def test_all_telemetry_handlers_low(self):
+        """Verify every TELEMETRY handler is classified LOW."""
+        for handler_name in sorted(TELEMETRY_HANDLERS):
+            priority = classify_handler_to_priority(handler_name)
+            assert priority == RequestPriority.LOW, f"{handler_name} should be LOW"
 
 
 class TestOverloadConfigEdgeCases:
@@ -685,7 +589,7 @@ class TestConcurrentLoadSheddingDecisions:
 
     @pytest.mark.asyncio
     async def test_concurrent_should_shed_calls(self):
-        """Test concurrent should_shed calls."""
+        """Test concurrent should_shed_handler calls."""
         detector = HybridOverloadDetector()
         shedder = LoadShedder(detector)
 
@@ -693,14 +597,14 @@ class TestConcurrentLoadSheddingDecisions:
         for _ in range(5):
             detector.record_latency(1000.0)
 
-        async def make_decision(message_type: str):
+        async def make_decision(handler_name: str):
             # Simulate async workload
             await asyncio.sleep(0.001)
-            return shedder.should_shed(message_type)
+            return shedder.should_shed_handler(handler_name)
 
         # Make concurrent decisions - create fresh coroutines each time
-        message_types = ["JobProgress", "DebugRequest", "Ping", "SubmitJob"] * 25
-        tasks = [make_decision(msg) for msg in message_types]
+        handler_names = ["receive_job_progress", "cluster_metrics", "ping", "job_submission"] * 25
+        tasks = [make_decision(handler_name) for handler_name in handler_names]
 
         results = await asyncio.gather(*tasks)
 
@@ -720,14 +624,14 @@ class TestConcurrentLoadSheddingDecisions:
 
         async def check_and_change():
             # Check shedding decision
-            should_shed = shedder.should_shed("JobProgress")
+            should_shed = shedder.should_shed_handler("receive_job_progress")
 
             # State changes
             for _ in range(5):
                 detector.record_latency(5000.0)
 
             # Check again - should be different
-            should_shed_after = shedder.should_shed("JobProgress")
+            should_shed_after = shedder.should_shed_handler("receive_job_progress")
 
             return should_shed, should_shed_after
 
@@ -743,7 +647,7 @@ class TestNonePriorityHandling:
     """Test handling of None values and edge cases in priority system."""
 
     def test_none_cpu_memory_values(self):
-        """Test should_shed with None CPU/memory values."""
+        """Test should_shed_handler with None CPU/memory values."""
         detector = HybridOverloadDetector()
         shedder = LoadShedder(detector)
 
@@ -752,8 +656,8 @@ class TestNonePriorityHandling:
             detector.record_latency(50.0)
 
         # None values should be handled gracefully
-        result = shedder.should_shed(
-            "JobProgress", cpu_percent=None, memory_percent=None
+        result = shedder.should_shed_handler(
+            "receive_job_progress", cpu_percent=None, memory_percent=None
         )
         assert isinstance(result, bool)
 
@@ -836,7 +740,7 @@ class TestLoadShedderRecoveryScenarios:
                 detector.record_latency(500.0 + cycle * 100)
 
             # Verify state is not healthy
-            shedder.should_shed("JobProgress")
+            shedder.should_shed_handler("receive_job_progress")
 
             # Reset
             detector.reset()

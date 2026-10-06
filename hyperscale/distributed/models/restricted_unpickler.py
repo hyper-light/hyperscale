@@ -17,17 +17,21 @@ Usage:
     
     # Instead of cloudpickle.loads(data)
     obj = restricted_loads(data)
+
+This module is the wire namespace of the models below. Each lives in a
+file of its own and is re-homed here -- its ``__module__`` set to this
+module -- so its pickled form names this module, exactly as before the
+split: mixed-version clusters keep talking and data written earlier
+keeps loading.
 """
 
 import io
 import pickle
+import sys
+import types
 from typing import Any, FrozenSet, Tuple
 
-
-class SecurityError(Exception):
-    """Raised when deserialization attempts to load blocked modules/classes."""
-    pass
-
+from .security_error import SecurityError
 
 # Modules that are completely blocked - no classes from these can be loaded
 BLOCKED_MODULES: FrozenSet[str] = frozenset([
@@ -409,7 +413,7 @@ class RestrictedUnpickler(pickle.Unpickler):
     like os, subprocess, sys, etc.
     """
 
-    def find_class(self, module: str, name: str) -> Any:
+    def find_class(self, module: str, name: str) -> object:
         """
         Override to restrict which classes can be loaded.
         
@@ -442,25 +446,55 @@ class RestrictedUnpickler(pickle.Unpickler):
                     f"Blocked dangerous module: {module}"
                 )
         
-        # Allow explicitly listed modules
-        if module in ALLOWED_MODULES:
-            return super().find_class(module, name)
-        
-        # Allow modules matching allowed prefixes
-        for prefix in ALLOWED_MODULE_PREFIXES:
-            if module.startswith(prefix):
-                return super().find_class(module, name)
-        
-        # Allow __main__ (user's workflow module)
-        if module == '__main__':
-            return super().find_class(module, name)
-        
-        # Block everything else
-        raise SecurityError(
-            f"Module not in allowlist: {module}.{name}. "
-            f"Only hyperscale.* and safe standard library modules are allowed."
+        # Decide whether the named module is permitted: explicit allowlist,
+        # an allowed prefix, or the user's own __main__ workflow module.
+        module_is_permitted = (
+            module in ALLOWED_MODULES
+            or module == '__main__'
+            or any(module.startswith(prefix) for prefix in ALLOWED_MODULE_PREFIXES)
         )
+        if not module_is_permitted:
+            raise SecurityError(
+                f"Module not in allowlist: {module}.{name}. "
+                f"Only hyperscale.* and safe standard library modules are allowed."
+            )
 
+        # Resolve the (possibly dotted) name ourselves rather than delegating
+        # to ``pickle.Unpickler.find_class``. Under pickle protocol >= 4 the
+        # base implementation resolves a dotted ``name`` by walking attributes
+        # from the named module (CPython's ``pickle._getattribute``), which can
+        # step straight out of the vetted module into a sibling module it
+        # merely imported as an attribute -- e.g. module ``logging`` with name
+        # ``os.system`` resolves to ``os.system`` even though ``os`` is blocked.
+        # A legitimate class/function qualname (``Outer.Inner``) never traverses
+        # through a module object, so any hop that lands on a module is a
+        # boundary escape and is refused.
+        return _resolve_inside_module(module, name)
+
+
+
+def _resolve_inside_module(module: str, name: str) -> object:
+    """Resolve a pickled dotted ``name`` from an allowed ``module`` one
+    attribute at a time, never stepping into another module."""
+    __import__(module, level=0)
+    resolved_object = sys.modules[module]
+    for attribute_name in name.split('.'):
+        resolved_object = _attribute_inside_module(resolved_object, attribute_name, module, name)
+    return resolved_object
+
+
+def _attribute_inside_module(owner: object, attribute_name: str, module: str, name: str) -> object:
+    """One step of resolving a pickled dotted ``name`` from ``module``:
+    refused when it names a function's ``<locals>`` or lands on a module
+    object (an escape out of the vetted module; see ``find_class``)."""
+    if attribute_name == '<locals>':
+        raise SecurityError(f"Blocked local object reference: {module}.{name}")
+    attribute = getattr(owner, attribute_name)
+    if isinstance(attribute, types.ModuleType):
+        raise SecurityError(
+            f"Blocked dotted name crossing into module {attribute.__name__!r}: {module}.{name}"
+        )
+    return attribute
 
 def restricted_loads(data: bytes) -> Any:
     """
@@ -481,3 +515,9 @@ def restricted_loads(data: bytes) -> Any:
     """
     return RestrictedUnpickler(io.BytesIO(data)).load()
 
+_WIRE_MODELS = (
+    SecurityError,
+)
+
+for _wire_model in _WIRE_MODELS:
+    _wire_model.__module__ = __name__

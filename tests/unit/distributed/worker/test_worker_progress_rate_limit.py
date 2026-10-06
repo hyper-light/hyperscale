@@ -17,6 +17,8 @@ from hyperscale.distributed.models import (
     RateLimitResponse,
     WorkflowProgress,
 )
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.nodes.worker.config import WorkerConfig
 from hyperscale.distributed.nodes.worker.progress import WorkerProgressReporter
 from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
 from hyperscale.distributed.nodes.worker.state import WorkerState
@@ -46,10 +48,15 @@ class RecordingSendTcp:
 def make_reporter() -> tuple[WorkerProgressReporter, WorkerRegistry]:
     logger = MagicMock()
     logger.log = AsyncMock()
-    registry = WorkerRegistry(logger, select_manager=lambda manager_ids: None)
-    state = WorkerState(core_allocator=MagicMock())
+    registry = WorkerRegistry(logger, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=lambda manager_ids: None)
+    state = WorkerState(
+        core_allocator=MagicMock(),
+        throughput_interval_seconds=Env().WORKER_THROUGHPUT_INTERVAL_SECONDS,
+        completion_times_max_samples=Env().WORKER_COMPLETION_TIMES_MAX_SAMPLES,
+    )
     state.set_workflow_job_leader(WORKFLOW_ID, JOB_LEADER_ADDR)
-    return WorkerProgressReporter(registry=registry, state=state, logger=logger), registry
+    config = WorkerConfig.from_env(env=Env(), host="127.0.0.1", tcp_port=9000, udp_port=9001)
+    return WorkerProgressReporter(registry=registry, state=state, config=config, logger=logger), registry
 
 
 def make_progress(completed_count: int) -> WorkflowProgress:

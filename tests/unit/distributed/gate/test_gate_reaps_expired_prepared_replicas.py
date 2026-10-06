@@ -62,13 +62,14 @@ async def test_the_cleanup_loop_reaps_expired_prepared_and_rollback_entries() ->
     coordinator = make_coordinator()
     coordinator._prepared[EXPIRED_JOB] = object()
     coordinator._prepared_expires_at[EXPIRED_JOB] = 0.0
-    coordinator._commit_rollback_replicas[(EXPIRED_JOB, 1)] = None
-    coordinator._commit_rollback_expires_at[(EXPIRED_JOB, 1)] = 0.0
-    await coordinator._record_prepare(SimpleNamespace(job_id=LIVE_JOB, sequence=1))
+    # Rollback records are keyed by the commit's exact version.
+    coordinator._commit_rollback_replicas[(EXPIRED_JOB, 1, 1)] = None
+    coordinator._commit_rollback_expires_at[(EXPIRED_JOB, 1, 1)] = 0.0
+    await coordinator._record_prepare(SimpleNamespace(job_id=LIVE_JOB, fence_token=1, sequence=1, idempotency_key=""))
     one_pass = OnePassGate(coordinator)
 
     await GateServer._job_cleanup_loop(one_pass.gate)
 
     assert EXPIRED_JOB not in coordinator._prepared
-    assert (EXPIRED_JOB, 1) not in coordinator._commit_rollback_replicas
+    assert (EXPIRED_JOB, 1, 1) not in coordinator._commit_rollback_replicas
     assert LIVE_JOB in coordinator._prepared, "an unexpired prepare is kept"

@@ -2,11 +2,11 @@
 Worker workflow execution module.
 
 Handles actual workflow execution, progress monitoring, and status transitions.
-Extracted from worker_impl.py for modularity (AD-33 compliance).
+Extracted from worker_impl.py for modularity (AD-54 compliance).
 """
 
 import asyncio
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import cloudpickle
 
@@ -34,7 +34,8 @@ from hyperscale.logging.hyperscale_logging_models import (
     WorkerJobFailed,
 )
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.runtime import Clock, RealClock, RunTask
+from collections.abc import Awaitable, Callable
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
     from hyperscale.core.jobs.models.workflow_status_update import WorkflowStatusUpdate
     from hyperscale.logging import Logger
     from hyperscale.distributed.env import Env
+    from hyperscale.reporting.common.results_types import WorkflowContextResult, WorkflowStats
     from hyperscale.distributed.jobs import CoreAllocator
     from .lifecycle import WorkerLifecycleManager
     from .state import WorkerState
@@ -55,7 +57,7 @@ class WorkerWorkflowExecutor:
     Executes workflows on the worker.
 
     Handles dispatch processing, actual execution via RemoteGraphManager,
-    progress monitoring, and status transitions. Maintains AD-33 workflow
+    progress monitoring, and status transitions. Maintains AD-54 workflow
     state machine compliance.
     """
 
@@ -70,6 +72,7 @@ class WorkerWorkflowExecutor:
         *,
         resource_tracker: "WorkflowResourceTracker",
         task_runner: "TaskRunner",
+        execution_update_wait_seconds: float,
     ) -> None:
         """
         Initialize workflow executor.
@@ -94,6 +97,9 @@ class WorkerWorkflowExecutor:
         # measurements), released with each workflow.
         self._resource_tracker = resource_tracker
         self._task_runner = task_runner
+        # Bounds how long a cancellation goes unnoticed while the next
+        # status update of a running workflow is awaited.
+        self._execution_update_wait_seconds = execution_update_wait_seconds
 
         # Event logger for crash forensics (AD-47)
         self._event_logger: Logger | None = None
@@ -131,12 +137,13 @@ class WorkerWorkflowExecutor:
         dispatch: WorkflowDispatch,
         dispatching_addr: tuple[str, int],
         allocated_cores: list[int],
-        task_runner_run: callable,
-        increment_version: callable,
+        cores_version: int,
+        task_runner_run: RunTask,
+        increment_version: Callable[[], Awaitable[int]],
         node_id_full: str,
         node_host: str,
         node_port: int,
-        send_final_result_callback: callable,
+        send_final_result_callback: Callable[[WorkflowFinalResult], Awaitable[None]],
     ) -> bytes:
         """
         Handle the execution phase of a workflow dispatch.
@@ -193,6 +200,7 @@ class WorkerWorkflowExecutor:
             collected_at=_DEFAULT_CLOCK.time(),
             assigned_cores=allocated_cores,
             worker_available_cores=self._core_allocator.available_cores,
+            worker_cores_version=self._core_allocator.availability_version,
             worker_workflow_completed_cores=0,
             worker_workflow_assigned_cores=cores_to_allocate,
         )
@@ -231,6 +239,7 @@ class WorkerWorkflowExecutor:
             workflow_id=workflow_id,
             accepted=True,
             cores_assigned=cores_to_allocate,
+            cores_version=cores_version,
         ).dump()
 
     async def _execute_workflow(
@@ -240,11 +249,11 @@ class WorkerWorkflowExecutor:
         cancel_event: asyncio.Event,
         allocated_vus: int,
         allocated_cores: int,
-        increment_version: callable,
+        increment_version: Callable[[], Awaitable[int]],
         node_id_full: str,
         node_host: str,
         node_port: int,
-        send_final_result_callback: callable,
+        send_final_result_callback: Callable[[WorkflowFinalResult], Awaitable[None]],
     ):
         """
         Execute a workflow using RemoteGraphManager.
@@ -262,7 +271,7 @@ class WorkerWorkflowExecutor:
         run_id = hash(dispatch.workflow_id) % (2**31)
         error: Exception | None = None
         workflow_error: str | None = None
-        workflow_results: Any = {}
+        workflow_results: WorkflowStats | list[WorkflowStats | WorkflowContextResult] = {}
         context_updates: bytes = b""
         progress_monitor_token: str | None = None
 
@@ -401,6 +410,12 @@ class WorkerWorkflowExecutor:
 
         elapsed_seconds = _DEFAULT_CLOCK.monotonic() - start_time
 
+        # AD-19: the worker's health throughput (completions per window)
+        # and expected throughput (from mean completion time) are read off
+        # these samples for every heartbeat; the manager's AD-26 throughput
+        # witness judges extension requests on them.
+        await self._state.record_completion(progress.status, elapsed_seconds)
+
         if self._event_logger is not None:
             if progress.status == WorkflowStatus.COMPLETED.value:
                 await self._event_logger.log(
@@ -446,6 +461,7 @@ class WorkerWorkflowExecutor:
             error=workflow_error,
             worker_id=node_id_full,
             worker_available_cores=self._core_allocator.available_cores,
+            worker_cores_version=self._core_allocator.availability_version,
             fence_token=dispatch.fence_token,
             job_leader_addr=dispatch.job_leader_addr
             or self._state.get_workflow_job_leader(dispatch.workflow_id),
@@ -457,12 +473,13 @@ class WorkerWorkflowExecutor:
                 await send_final_result_callback(final_result)
         finally:
             self._resource_tracker.release(dispatch.workflow_id)
-            self._state.remove_active_workflow(dispatch.workflow_id)
             self._state._workflow_fence_tokens.pop(dispatch.workflow_id, None)
             self._state._workflow_cancel_events.pop(dispatch.workflow_id, None)
             self._state._workflow_tokens.pop(dispatch.workflow_id, None)
             self._state._workflow_id_to_name.pop(dispatch.workflow_id, None)
             self._state._workflow_cores_completed.pop(dispatch.workflow_id, None)
+            # Last: its termination callbacks' failures raise.
+            self._state.remove_active_workflow(dispatch.workflow_id)
 
     def _should_send_final_result(self, workflow_id: str, status: str) -> bool:
         """Return whether this worker may publish the workflow's final result."""
@@ -526,7 +543,7 @@ class WorkerWorkflowExecutor:
                 workflow_status_update = await remote_manager.wait_for_workflow_update(
                     run_id,
                     workflow_name,
-                    timeout=0.5,
+                    timeout=self._execution_update_wait_seconds,
                 )
 
                 if workflow_status_update is None:
@@ -570,18 +587,21 @@ class WorkerWorkflowExecutor:
                 (
                     workflow_assigned_cores,
                     workflow_completed_cores,
-                    worker_available_cores,
+                    _worker_available_cores,
                 ) = self._lifecycle.get_availability()
 
-                if worker_available_cores > 0:
-                    await self._core_allocator.free_subset(
-                        progress.workflow_id,
-                        worker_available_cores,
-                    )
+                # The workflow's cores are freed when its run returns, never
+                # here: its executor nodes stay allocated until then, and the
+                # availability read above is the graph manager's latest for
+                # ANY run -- at a run's first update, often the previous
+                # run's final, all cores free. Freed from it, a running
+                # workflow's cores admitted the next dispatch onto busy
+                # nodes, and that workflow failed "No nodes available".
 
                 progress.worker_workflow_assigned_cores = workflow_assigned_cores
                 progress.worker_workflow_completed_cores = workflow_completed_cores
                 progress.worker_available_cores = self._core_allocator.available_cores
+                progress.worker_cores_version = self._core_allocator.availability_version
 
                 # Estimate cores_completed
                 total_cores = len(progress.assigned_cores)

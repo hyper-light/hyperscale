@@ -27,7 +27,7 @@ Module Structure:
 - Coordinators: Business logic (leadership, dispatch, stats, cancellation, peer, health)
 - Handlers: TCP message processing (job, manager, cancellation, state sync, ping)
 - State: GateRuntimeState for mutable runtime state
-- Config: GateConfig for immutable configuration
+- Configuration: Env, read directly (derived settings in ``config``)
 """
 
 import asyncio
@@ -39,10 +39,14 @@ from typing import TYPE_CHECKING, Callable
 
 import cloudpickle
 
+from hyperscale.distributed.idempotency.idempotency_key import IdempotencyKey
+from hyperscale.distributed.slo.latency_slo import LatencySLO
+from hyperscale.distributed.slo.slo_health_classifier import SLOHealthClassifier
 from hyperscale.distributed.server import tcp
 from hyperscale.distributed.leases import JobLeaseManager
 from hyperscale.distributed.jobs.job_status_order import JobStatusOrder
-from hyperscale.distributed.ledger import JobLedger
+from hyperscale.distributed.ledger import DatacenterReassignment, JobLedger
+from hyperscale.distributed.health.phi_accrual_config import PhiAccrualConfig
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.ledger.pipeline.commit_pipeline import (
     REGIONAL_TIMEOUT_SECONDS,
@@ -51,7 +55,6 @@ from hyperscale.distributed.ledger.pipeline.commit_pipeline import (
 from hyperscale.distributed.raft import LedgerReplicator
 from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
 from hyperscale.distributed.raft.models import LedgerPlacementQuery, LedgerProposal
-from hyperscale.distributed.raft.models.gate_commands import gate_ledger_append_command
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
@@ -59,6 +62,19 @@ from hyperscale.reporting.common.types import ReporterTypes
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed.server.events import VersionedStateClock
 from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
+from hyperscale.distributed.cluster.cluster_membership import ClusterMembership
+from hyperscale.distributed.cluster.cluster_view_cache import ClusterViewCache
+from hyperscale.distributed.cluster.models import ClusterMetricsReply
+from hyperscale.distributed.cluster.cluster_watch_follower import ClusterWatchFollower
+from hyperscale.distributed.cluster.models.cluster_view import ClusterView
+from hyperscale.distributed.jobs.logical_id_generator import LogicalIdGenerator
+from hyperscale.distributed.cluster.joined_peer import JoinedPeer
+from hyperscale.distributed.cluster.joined_peer_store import JoinedPeerStore
+from hyperscale.distributed.runtime import Filesystem, RealFilesystem
+from hyperscale.distributed.raft.store.raft_storage import RaftStorage
+from hyperscale.distributed.raft.store.raft_store import RaftStore
+from hyperscale.distributed.swim.core.node_id import NodeId
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.swim import HealthAwareServer, GateStateEmbedder
 from hyperscale.distributed.swim.health import (
     FederatedHealthMonitor,
@@ -66,6 +82,8 @@ from hyperscale.distributed.swim.health import (
     CrossClusterAck,
 )
 from hyperscale.distributed.models import (
+    JobStatusQuery,
+    ReadConsistency,
     GateRegistrationResponse,
     GateInfo,
     GateState,
@@ -89,6 +107,7 @@ from hyperscale.distributed.models import (
     JobCancelResponse,
     GateStateSnapshot,
     DatacenterHealth,
+    DatacenterSubstitution,
     DatacenterRegistrationState,
     DatacenterStatus,
     UpdateTier,
@@ -136,6 +155,7 @@ from hyperscale.distributed.swim.detection import HierarchicalConfig
 from hyperscale.distributed.health import (
     ManagerHealthConfig,
     CircuitBreakerManager,
+    GateHealthState,
     LatencyTracker,
 )
 from hyperscale.distributed.monitoring import ProcessResourceMonitor, ResourceMetrics
@@ -147,7 +167,6 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.distributed.jobs.gates import (
     GateJobManager,
-    JobForwardingTracker,
     ConsistentHashRing,
     GateJobTimeoutTracker,
 )
@@ -164,7 +183,6 @@ from hyperscale.distributed.idempotency import (
 from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
     DatacenterOverloadConfig,
-    ManagerDispatcher,
     LeaseManager as DatacenterLeaseManager,
     CrossDCCorrelationDetector,
 )
@@ -177,13 +195,16 @@ from hyperscale.distributed.discovery.security.role_validator import (
     RoleValidator,
 )
 from hyperscale.distributed.routing import (
+    BlendedScoringConfig,
     DatacenterCandidate,
-    DispatchTimeTracker,
+    DatacenterLatencyEstimator,
     ObservedLatencyTracker,
     BlendedLatencyScorer,
     GateJobRouter,
+    JobDispatchCooldowns,
+    RoutingScorer,
+    ScoringConfig,
 )
-from hyperscale.distributed.swim.coordinates import CoordinateTracker
 from hyperscale.distributed.hlc import (
     ClockFenceVerdict,
     ClockOffsetMonitor,
@@ -207,14 +228,19 @@ from hyperscale.distributed.resources.datacenter_resource_aggregator import (
 from hyperscale.distributed.slo.resource_aware_predictor import (
     ResourceAwareSLOPredictor,
 )
+from hyperscale.logging import LogLevel
 from hyperscale.logging.hyperscale_logging_models import (
+    ClusterWatchConnectivityChanged,
+    DatacenterRegenerated,
     ServerInfo,
     ServerWarning,
     ServerDebug,
+    StaleObservationsDecayed,
 )
 
 from .stats_coordinator import GateStatsCoordinator
 from .dispatch_coordinator import GateDispatchCoordinator
+from .job_failover_coordinator import GateJobFailoverCoordinator
 from .ledger_region_span import LedgerRegionSpan
 from .leadership_coordinator import GateLeadershipCoordinator
 from .peer_coordinator import GatePeerCoordinator
@@ -223,7 +249,10 @@ from .orphan_job_coordinator import GateOrphanJobCoordinator
 from .datacenter_manager_selector import DatacenterManagerSelector
 from .raft_integration import GateRaftIntegration
 from .replication_coordinator import GateJobReplicationCoordinator
-from .config import GateConfig, create_gate_config
+from .config import (
+    derive_datacenter_leader_failover_seconds,
+    derive_gate_orphan_grace_seconds,
+)
 from .state import GateRuntimeState
 from .handlers import (
     GatePingHandler,
@@ -238,12 +267,17 @@ if TYPE_CHECKING:
     from hyperscale.distributed.runtime import Clock, Random, TransportFactory
 
 
+# Storage seam (borrowed, never shut down here; swap_defaults rebinds it
+# under SIM).
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
+
+
 class GateServer(HealthAwareServer):
     """
     Gate node in the distributed Hyperscale system.
 
     This is the composition root that wires together all gate modules:
-    - Configuration (GateConfig)
+    - Configuration (Env)
     - Runtime state (GateRuntimeState)
     - Coordinators (leadership, dispatch, stats, cancellation, peer, health)
     - Handlers (TCP/UDP message handlers)
@@ -274,6 +308,7 @@ class GateServer(HealthAwareServer):
         clock: "Clock | None" = None,
         random_source: "Random | None" = None,
         transport_factory: "TransportFactory | None" = None,
+        raft_store: RaftStore | None = None,
     ):
         """
         Initialize the Gate server.
@@ -301,7 +336,16 @@ class GateServer(HealthAwareServer):
             random_source=random_source,
             transport_factory=transport_factory,
             incarnation_storage_dir=incarnation_storage_dir,
+            # D1: an identity the Raft store resumed keeps its start time,
+            # so this node is the member its groups knew.
+            node_created_ms=(
+                None if raft_store is None else NodeId.created_ms_of(raft_store.identity.node_id_full)
+            ),
         )
+        # Where every Raft group of this node keeps its persistent state
+        # (D1): the opened store the node was given, or none -- each start
+        # then a new member of every group. Borrowed: its opener closes it.
+        self._raft_storage: RaftStorage = raft_store if raft_store is not None else VolatileRaftStorage()
 
         # Store reference to env
         self.env = env
@@ -314,23 +358,41 @@ class GateServer(HealthAwareServer):
         # gate (the pre-Phase-8 behavior, unchanged).
         self._wal_data_dir = wal_data_dir
         self._job_ledger: JobLedger | None = None
+        # Managers this gate was joined to at runtime, kept in its data
+        # directory (created at start, once the logger exists).
+        self._joined_peer_store: JoinedPeerStore | None = None
+        # AD-52 section 10: each datacenter's manager membership as last
+        # observed through its watch -- the cache routing's manager lists
+        # follow, so a resize of a datacenter's managers reaches this gate.
+        self._datacenter_views: dict[str, ClusterViewCache] = {}
+        self._datacenter_watches: dict[str, ClusterWatchFollower] = {}
+        # The cluster each datacenter's managers last answered as: a
+        # different one means the datacenter was founded again.
+        self._datacenter_cluster_uuids: dict[str, str] = {}
         # AD-38 replication of the ledger; built with the Raft integration
         # in _init_coordinators (ledger writes only happen after start).
         self._ledger_replicator: LedgerReplicator | None = None
         self._ledger_tier_spans_regions: bool | None = None
 
         # Create modular runtime state
-        self._modular_state = GateRuntimeState()
-        client_update_history_limit = int(
-            getattr(env, "GATE_CLIENT_UPDATE_HISTORY_LIMIT", 200)
+        self._modular_state = GateRuntimeState(
+            forward_throughput_interval_start=self._clock.monotonic(),
         )
         self._modular_state.set_client_update_history_limit(
-            max(1, client_update_history_limit)
+            env.GATE_CLIENT_UPDATE_HISTORY_LIMIT
         )
 
         # Datacenter -> manager addresses mapping
         self._datacenter_managers = datacenter_managers or {}
         self._datacenter_manager_udp = datacenter_manager_udp or {}
+        # Operator-declared managers -- configured, or joined with
+        # `hyperscale join` -- stay expected members of their datacenters;
+        # managers learned from heartbeats and gossip are forgotten again
+        # when the stale-manager reaper retires them.
+        self._declared_datacenter_managers: dict[str, frozenset[tuple[str, int]]] = {
+            datacenter_id: frozenset(manager_addrs)
+            for datacenter_id, manager_addrs in self._datacenter_managers.items()
+        }
 
         # Per-DC registration state tracking (AD-27)
         self._dc_registration_states: dict[str, DatacenterRegistrationState] = {}
@@ -340,8 +402,15 @@ class GateServer(HealthAwareServer):
                 configured_managers=list(manager_addrs),
             )
 
-        self._circuit_breaker_manager = CircuitBreakerManager(env)
-        self._peer_gate_circuit_breaker = CircuitBreakerManager(env)
+        # A manager's circuit also opens while phi accrual on its heartbeats
+        # suspects it (AD-52 section 8); the health manager is built below.
+        self._circuit_breaker_manager = CircuitBreakerManager(
+            env,
+            is_peer_suspected=lambda manager_addr: self._dc_health_manager.is_manager_suspected(manager_addr),
+        )
+        # Peer gates are watched by SWIM, with no phi detector on their
+        # edges yet: only request errors open theirs.
+        self._peer_gate_circuit_breaker = CircuitBreakerManager(env, is_peer_suspected=lambda _gate_addr: False)
 
         # Gate peers
         self._gate_peers = gate_peers or []
@@ -376,17 +445,18 @@ class GateServer(HealthAwareServer):
 
         # Backpressure tracking (AD-37) - state managed by _modular_state
 
-        self._forward_throughput_interval_seconds: float = getattr(
-            env, "GATE_THROUGHPUT_INTERVAL_SECONDS", 10.0
+        self._forward_throughput_interval_seconds: float = (
+            env.GATE_THROUGHPUT_INTERVAL_SECONDS
         )
 
         # Rate limiting (AD-24)
         # Health-gated (AD-24): limits tighten with the overload state the
         # node's resource sampler settles on.
         self._rate_limiter = ServerRateLimiter(
-            inactive_cleanup_seconds=300.0,
+            inactive_cleanup_seconds=env.RATE_LIMIT_CLIENT_IDLE_TIMEOUT,
             overload_detector=self._overload_detector,
             detector_sampled_externally=True,
+            overload_retry_after_seconds=env.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
         )
 
         # Protocol version (AD-25)
@@ -411,28 +481,29 @@ class GateServer(HealthAwareServer):
             str, dict[str, dict[str, WorkflowResultPush]]
         ] = {}
         self._workflow_dc_results_lock = asyncio.Lock()
-        self._workflow_result_timeout_seconds: float = getattr(
-            env, "GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS", 300.0
+        self._workflow_result_timeout_seconds: float = (
+            env.GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS
         )
-        self._allow_partial_workflow_results: bool = getattr(
-            env, "GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS", False
+        self._reporter_submission_timeout_seconds: float = (
+            env.REPORTER_SUBMISSION_TIMEOUT_SECONDS
+        )
+        self._allow_partial_workflow_results: bool = (
+            env.GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS
         )
         self._workflow_result_timeout_tokens: dict[str, dict[str, str]] = {}
         self._workflow_result_expected_dc_counts: dict[str, dict[str, int]] = {}
 
-        # Data-plane idempotency: highest finalized result_sequence per
-        # ``(job_id, workflow_id, datacenter)``. Populated when an
-        # incoming ``WorkflowResultPush`` for that triple is accepted
-        # for aggregation; consulted on every subsequent inbound push
-        # so a late-arriving duplicate (after aggregation has popped
-        # ``_workflow_dc_results``) is acked idempotently without
-        # re-aggregating or re-delivering. Cleaned up alongside other
-        # per-job state in the cancellation / completion cleanup
-        # paths. Bounded by the number of in-flight job-workflow-dc
-        # triples — same scaling envelope as ``_workflow_dc_results``.
-        self._finalized_workflow_result_sequences: dict[
-            tuple[str, str, str], int
-        ] = {}
+        # Data-plane idempotency: the ``(job_id, workflow_id)`` pairs whose
+        # aggregate this gate has claimed -- one aggregate per workflow.
+        # Marked when the per-datacenter results are taken for
+        # aggregation (all reported, the per-workflow timeout, or the job
+        # completing without some datacenters); every later push for the
+        # pair is acked without re-aggregating: a duplicate, a result a
+        # manager rebuilt (under a new sequence) after a failover, or a
+        # datacenter's result arriving after the timeout recorded it
+        # missing. Cleaned up with the job's other per-job state; bounded
+        # by its workflows.
+        self._finalized_workflow_results: set[tuple[str, str]] = set()
 
         # Per-job leadership tracking
         self._job_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
@@ -445,10 +516,10 @@ class GateServer(HealthAwareServer):
             node_id="",
             default_duration=env.JOB_LEASE_DURATION,
             cleanup_interval=env.JOB_LEASE_CLEANUP_INTERVAL,
+            # As long as the gate keeps the job itself.
+            released_retention_seconds=env.FAILED_JOB_MAX_AGE,
+            logger=self._udp_logger,
         )
-
-        self._partition_detected_callbacks: list[Callable[[list[str]], None]] = []
-        self._partition_healed_callbacks: list[Callable[[list[str]], None]] = []
 
         # Windowed stats
         self._windowed_stats = WindowedStatsCollector(
@@ -476,11 +547,11 @@ class GateServer(HealthAwareServer):
             clock=self._clock,
         )
         self._leadership_refusals.append(self._is_clock_fenced)
+        self._leadership_refusals.append(self._refuses_leadership_for_a_ready_peer)
 
         self._job_aggregated_workflow_stats: dict[
             str, dict[str, list[WorkflowStats]]
         ] = {}
-        self._jobs_with_reporter_submissions: set[str] = set()
 
         # CRDT stats (AD-14)
         self._job_stats_crdt: dict[str, JobStatsCRDT] = {}
@@ -504,7 +575,7 @@ class GateServer(HealthAwareServer):
         # Zero-worker / no-heartbeat unhealth is untouched (those are
         # structural signals, not capacity).
         self._dc_health_manager = DatacenterHealthManager(
-            heartbeat_timeout=env.GATE_DATACENTER_HEARTBEAT_STALENESS_THRESHOLD,
+            phi_config=PhiAccrualConfig.for_manager_heartbeats(env),
             get_configured_managers=lambda dc: self._datacenter_managers.get(dc, []),
             overload_config=DatacenterOverloadConfig(
                 capacity_utilization_unhealthy_threshold=float("inf"),
@@ -513,30 +584,30 @@ class GateServer(HealthAwareServer):
         for datacenter_id in self._datacenter_managers.keys():
             self._dc_health_manager.add_datacenter(datacenter_id)
 
-        self._capacity_aggregator = DatacenterCapacityAggregator()
-        self._spillover_evaluator = SpilloverEvaluator.from_env(env)
+        self._capacity_aggregator = DatacenterCapacityAggregator(
+            clock=self._clock,
+            staleness_threshold_seconds=env.CAPACITY_STALENESS_THRESHOLD_SECONDS,
+        )
+        self._spillover_evaluator = SpilloverEvaluator.from_env(env, self._clock)
 
         # Route learning (AD-45)
-        self._dispatch_time_tracker = DispatchTimeTracker()
+        self._route_learning_config = BlendedScoringConfig.from_env(env)
         self._observed_latency_tracker = ObservedLatencyTracker(
-            alpha=getattr(env, "ROUTE_LEARNING_EWMA_ALPHA", 0.1),
-            min_samples_for_confidence=getattr(env, "ROUTE_LEARNING_MIN_SAMPLES", 10),
-            max_staleness_seconds=getattr(
-                env, "ROUTE_LEARNING_MAX_STALENESS_SECONDS", 300.0
-            ),
+            config=self._route_learning_config,
+            clock=self._clock,
         )
-        self._blended_scorer = BlendedLatencyScorer(self._observed_latency_tracker)
-
-        # Vivaldi coordinate tracking (AD-35)
-        self._coordinate_tracker = CoordinateTracker()
-
-        # Manager dispatcher
-        self._manager_dispatcher = ManagerDispatcher(
-            dispatch_timeout=env.GATE_TCP_TIMEOUT_STANDARD,
-            max_retries_per_dc=2,
+        self._blended_scorer = BlendedLatencyScorer(
+            self._observed_latency_tracker,
+            adaptive_routing_enabled=self._route_learning_config.adaptive_routing_enabled,
         )
-        for datacenter_id, manager_addrs in self._datacenter_managers.items():
-            self._manager_dispatcher.add_datacenter(datacenter_id, manager_addrs)
+        # One latency estimate per datacenter for routing and spillover
+        # alike: Vivaldi and observed evidence, a conservative prior where
+        # either is missing (AD-36, AD-45).
+        self._latency_estimator = DatacenterLatencyEstimator(
+            coordinate_tracker=self._coordinate_tracker,
+            get_datacenter_coordinate=self._get_datacenter_coordinate,
+            get_observed_latency=self._blended_scorer.get_observed_latency,
+        )
 
         # Datacenter lease manager
         self._dc_lease_manager = DatacenterLeaseManager(
@@ -544,17 +615,12 @@ class GateServer(HealthAwareServer):
             lease_timeout=lease_timeout,
         )
 
-        # Job forwarding tracker
-        self._job_forwarding_tracker = JobForwardingTracker(
-            local_gate_id="",
-            forward_timeout=env.GATE_TCP_TIMEOUT_FORWARD,
-            max_forward_attempts=3,
-        )
-
         # Orphan job tracking
-        self._orphan_grace_period: float = env.GATE_ORPHAN_GRACE_PERIOD
+        self._orphan_grace_period: float = derive_gate_orphan_grace_seconds(env)
         self._orphan_check_interval: float = env.GATE_ORPHAN_CHECK_INTERVAL
-        self._resource_sampling_token: str | None = None
+        # Every background loop's run token: stopping the gate cancels each
+        # before the ledger and caches they write to are closed.
+        self._background_loop_tokens: list[str] = []
 
         self._dead_peer_reap_interval: float = env.GATE_DEAD_PEER_REAP_INTERVAL
         self._dead_peer_check_interval: float = env.GATE_DEAD_PEER_CHECK_INTERVAL
@@ -566,8 +632,8 @@ class GateServer(HealthAwareServer):
         # Job timeout tracker (AD-34)
         self._job_timeout_tracker = GateJobTimeoutTracker(
             gate=self,
-            check_interval=getattr(env, "GATE_TIMEOUT_CHECK_INTERVAL", 15.0),
-            stuck_threshold=getattr(env, "GATE_ALL_DC_STUCK_THRESHOLD", 180.0),
+            check_interval=env.GATE_TIMEOUT_CHECK_INTERVAL,
+            stuck_threshold=env.GATE_ALL_DC_STUCK_THRESHOLD,
         )
 
         # Idempotency cache (AD-40); its cleanup task starts in start()
@@ -627,8 +693,9 @@ class GateServer(HealthAwareServer):
                 on_gate_heartbeat=self._handle_gate_peer_heartbeat,
                 get_known_gates=self._get_known_gates_for_piggyback,
                 get_job_leaderships=self._get_job_leaderships_for_piggyback,
-                get_health_has_dc_connectivity=lambda: len(self._datacenter_managers)
-                > 0,
+                # Reachable, not merely configured: a datacenter counts
+                # while its managers' heartbeats keep it out of UNHEALTHY.
+                get_health_has_dc_connectivity=lambda: self._count_active_datacenters() > 0,
                 get_health_connected_dc_count=self._count_active_datacenters,
                 get_health_throughput=self._get_forward_throughput,
                 get_health_expected_throughput=self._get_expected_forward_throughput,
@@ -703,7 +770,6 @@ class GateServer(HealthAwareServer):
         self._discovery_failure_decay_interval: float = (
             env.DISCOVERY_FAILURE_DECAY_INTERVAL
         )
-        self._discovery_maintenance_task: asyncio.Task | None = None
 
         for datacenter_id, manager_addrs in self._datacenter_managers.items():
             for manager_addr in manager_addrs:
@@ -798,7 +864,6 @@ class GateServer(HealthAwareServer):
             job_manager=self._job_manager,
             job_timeout_tracker=self._job_timeout_tracker,
             persist_accepted_job=self._persist_accepted_job_durable,
-            dispatch_time_tracker=self._dispatch_time_tracker,
             circuit_breaker_manager=self._circuit_breaker_manager,
             datacenter_managers=self._datacenter_managers,
             quorum_circuit=self._quorum_circuit,
@@ -809,36 +874,88 @@ class GateServer(HealthAwareServer):
             confirm_manager_for_dc=self._confirm_manager_for_dc,
             suspect_manager_for_dc=self._suspect_manager_for_dc,
             record_forward_throughput_event=self._record_forward_throughput_event,
+            record_forward_attempt_event=self._record_forward_attempt_event,
             get_node_host=lambda: self._host,
             get_node_port=lambda: self._tcp_port,
             get_node_id_short=lambda: self._node_id.short,
             capacity_aggregator=self._capacity_aggregator,
             spillover_evaluator=self._spillover_evaluator,
             observed_latency_tracker=self._observed_latency_tracker,
+            estimate_datacenter_latencies_ms=lambda: self._latency_estimator.estimate(
+                self._datacenter_managers.keys()
+            ),
             manager_selector=self._manager_selector,
             finalize_failed_job=self._finalize_failed_job,
-            on_job_dispatched=self._start_best_effort_tracking,
+            on_job_dispatched=self._on_job_dispatched,
             record_dispatch_failure=lambda job_id,
             datacenter_id: self._job_router.record_dispatch_failure(
                 job_id,
                 datacenter_id,
             ),
             manager_dispatch_timeout_seconds=self.env.GATE_TCP_TIMEOUT_STANDARD,
+            datacenter_leader_failover_seconds=derive_datacenter_leader_failover_seconds(self.env),
+            leader_heartbeat_interval_seconds=self.env.LEADER_HEARTBEAT_INTERVAL,
+            record_fallback_used=lambda from_datacenter, to_datacenter: self._job_router.record_fallback_used(
+                from_datacenter, to_datacenter
+            ),
+        )
+
+        # AD-36 Part 13: a job's unfinished share moves off a datacenter it
+        # lost mid-run. Checked every manager heartbeat interval, the
+        # fastest a datacenter's health classification changes.
+        self._job_failover_coordinator = GateJobFailoverCoordinator(
+            state=self._modular_state,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            job_manager=self._job_manager,
+            job_leadership_tracker=self._job_leadership_tracker,
+            job_timeout_tracker=self._job_timeout_tracker,
+            dispatch_coordinator=self._dispatch_coordinator,
+            datacenter_managers=self._datacenter_managers,
+            clock=self._clock,
+            send_tcp=self._send_tcp,
+            get_node_addr=lambda: (self._host, self._tcp_port),
+            get_node_id_short=lambda: self._node_id.short,
+            is_running=lambda: self._running,
+            # As routing sees it: an UNHEALTHY verdict held at DEGRADED
+            # during a correlated failure or a partition is no loss
+            # (AD-36 Part 13, AD-33 Part 6).
+            classify_datacenter_health=lambda datacenter: (
+                self._health_coordinator.build_datacenter_candidates([datacenter])[0]
+                .health_bucket.lower()
+            ),
+            route_replacement=lambda job_id, placement_constraint, occupied_datacenters: next(
+                iter(
+                    self._job_router.route_job(
+                        job_id,
+                        1,
+                        placement_constraint,
+                        occupied_datacenters=occupied_datacenters,
+                    ).primary_datacenters
+                ),
+                None,
+            ),
+            delivered_workflow_ids=self._delivered_workflow_ids,
+            release_workflow_timeouts=self._release_workflow_result_timeouts,
+            replicate_placement=self._replicate_job_placement,
+            record_reassignment=self._record_datacenter_reassignment_durable,
+            check_interval_seconds=self.env.MANAGER_HEARTBEAT_INTERVAL,
+            cancel_timeout_seconds=self._tcp_timeout_standard,
         )
 
         self._peer_coordinator = GatePeerCoordinator(
             clock=self._clock,
+            random=self._random,
             state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
             peer_discovery=self._peer_discovery,
             job_hash_ring=self._job_hash_ring,
-            job_forwarding_tracker=self._job_forwarding_tracker,
             job_leadership_tracker=self._job_leadership_tracker,
             versioned_clock=self._versioned_clock,
             recovery_semaphore=self._recovery_semaphore,
-            recovery_jitter_min=0.0,
-            recovery_jitter_max=getattr(self.env, "GATE_RECOVERY_JITTER_MAX", 1.0),
+            recovery_jitter_min=self.env.RECOVERY_JITTER_MIN,
+            recovery_jitter_max=self.env.RECOVERY_JITTER_MAX,
             get_node_id=lambda: self._node_id,
             get_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
@@ -849,6 +966,7 @@ class GateServer(HealthAwareServer):
             is_leader=self.is_leader,
         )
 
+        self._slo_health_classifier = SLOHealthClassifier.from_env(self.env)
         self._health_coordinator = GateHealthCoordinator(
             clock=self._clock,
             state=self._modular_state,
@@ -859,7 +977,6 @@ class GateServer(HealthAwareServer):
             cross_dc_correlation=self._cross_dc_correlation,
             track_manager=self._manager_selector.track_manager,
             versioned_clock=self._versioned_clock,
-            manager_dispatcher=self._manager_dispatcher,
             manager_health_config=self._manager_health_config,
             datacenter_managers=self._datacenter_managers,
             get_node_id=lambda: self._node_id,
@@ -867,19 +984,30 @@ class GateServer(HealthAwareServer):
             get_tcp_port=lambda: self._tcp_port,
             confirm_manager_for_dc=self._confirm_manager_for_dc,
             record_manager_heartbeat=self._record_manager_heartbeat,
-            capacity_aggregator=self._capacity_aggregator,
             on_partition_healed=self._on_partition_healed,
             on_partition_detected=self._on_partition_detected,
+            capacity_aggregator=self._capacity_aggregator,
+            circuit_breaker_manager=self._circuit_breaker_manager,
             resource_aggregator=DatacenterResourceAggregator(
                 clock=self._clock,
                 staleness_seconds=self.env.RESOURCE_VIEW_STALENESS_SECONDS,
             ),
             resource_predictor=ResourceAwareSLOPredictor.from_env(self.env),
+            latency_slo=LatencySLO.from_env(self.env),
+            slo_health_classifier=self._slo_health_classifier,
         )
 
+        # A datacenter that failed a job's dispatch is tried last for that
+        # job for as long as the gate holds off a failed manager -- its
+        # circuit breaker's open-to-half-open interval.
         self._job_router = GateJobRouter(
-            coordinate_tracker=self._coordinate_tracker,
             get_datacenter_candidates=self._get_datacenter_candidates_for_router,
+            latency_estimator=self._latency_estimator,
+            scorer=RoutingScorer(ScoringConfig.from_env(self.env)),
+            dispatch_cooldowns=JobDispatchCooldowns(
+                clock=self._clock,
+                cooldown_seconds=self.env.CIRCUIT_BREAKER_HALF_OPEN_AFTER,
+            ),
         )
 
         self._replication_coordinator = GateJobReplicationCoordinator(
@@ -915,21 +1043,51 @@ class GateServer(HealthAwareServer):
             is_cluster_leader=self.is_leader,
             orphan_check_interval_seconds=self._orphan_check_interval,
             orphan_grace_period_seconds=self._orphan_grace_period,
+            orphan_extension_min_grant_seconds=self.env.EXTENSION_MIN_GRANT,
+            orphan_extension_max_extensions=self.env.EXTENSION_MAX_EXTENSIONS,
         )
 
         # Raft consensus integration. Members are keyed by full gate node
         # id (iter_known_gates); the self id must use the same form, or a
         # follower knows its leader by an id it cannot resolve.
         self._ledger_replica = JobLedgerReplica()
+        # AD-52 slice C: the gate tier keeps its membership in one Raft
+        # group -- the configured gates found it, and every job group takes
+        # its members from it.
+        self._cluster_membership = ClusterMembership(
+            self._node_id.full,
+            (self._host, self._tcp_port),
+            frozenset(self._gate_peers),
+            send_request=lambda address, action, payload: self._send_to_gate_peer(
+                address, action, payload, float(self.env.GATE_TCP_TIMEOUT_STANDARD)
+            ),
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            hlc=self._hlc,
+            clock=self._clock,
+            may_lead=self._may_lead,
+            cluster_uuids=LogicalIdGenerator(scope=self._node_id.full, clock=self._clock),
+            formation_interval_seconds=self.env.CLUSTER_FORMATION_INTERVAL_SECONDS,
+            tombstone_retention_seconds=self.env.CLUSTER_TOMBSTONE_RETENTION_SECONDS,
+            request_timeout_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
+            watch_wait_ceiling_seconds=self.env.CLUSTER_WATCH_WAIT_SECONDS,
+            on_cohort_change=self._on_cohort_change,
+            snapshot_entries=self.env.CLUSTER_SNAPSHOT_ENTRIES,
+            snapshot_catch_up_entries=self.env.CLUSTER_SNAPSHOT_CATCH_UP_ENTRIES,
+            leader_lease_drift_bound=(
+                self.env.RAFT_CLOCK_DRIFT_BOUND if self.env.RAFT_LEADER_LEASES_ENABLED else None
+            ),
+            storage=self._raft_storage,
+        )
         self._raft = GateRaftIntegration(
             ledger_replica=self._ledger_replica,
             cluster_size=self._configured_gate_count,
             # The gate's quorum timeout -- the bound its replica 2PC uses.
             proposal_timeout_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
+            request_timeout_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
+            cluster_members=self._cluster_membership.node_addresses,
+            storage=self._raft_storage,
             node_id=self._node_id.full,
-            job_manager=self._job_manager,
-            leadership_tracker=self._job_leadership_tracker,
-            gate_state=self._modular_state,
             logger=self._udp_logger,
             task_runner=self._task_runner,
             send_tcp=self._send_tcp,
@@ -938,11 +1096,18 @@ class GateServer(HealthAwareServer):
             clock=self._hlc,
             may_lead=self._may_lead,
         )
+        # AD-39 measures the configured gates, one entry per address, from
+        # the start: before the cluster's membership forms, and never
+        # counting one address twice under two processes' ids.
+        self._clock_probe_peers = {
+            f"{peer_host}:{peer_port}": (peer_host, peer_port)
+            for peer_host, peer_port in self._gate_peers
+        }
         self._clock_offset_prober = ClockOffsetProber(
             node_id=self._node_id.full,
             hlc=self._hlc,
             monitor=self._clock_offset_monitor,
-            peers=self._raft.consensus.member_addresses,
+            peers=lambda: self._clock_probe_peers,
             exchange=tcp_probe_exchange(self.send_tcp),
             clock=self._clock,
             probe_interval_seconds=self.env.HLC_OFFSET_PROBE_INTERVAL_SECONDS,
@@ -956,7 +1121,6 @@ class GateServer(HealthAwareServer):
         )
         self._ledger_replicator = LedgerReplicator(
             consensus=self._raft.consensus,
-            build_command=gate_ledger_append_command,
             node_id=self._node_id.full,
             send_tcp=self._send_to_gate_peer,
             forward_method="gate_raft_ledger_proposal",
@@ -1025,6 +1189,12 @@ class GateServer(HealthAwareServer):
             get_active_peer_addrs=lambda: list(
                 self._modular_state.get_active_peers_list()
             ),
+            default_timeout_multiplier=self.env.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            current_raft_members=lambda: self._raft.consensus.current_members(),
+            cluster_formed=lambda: self._cluster_membership.formed,
+            cluster_read_only=lambda: self._cluster_membership.read_only,
+            overload_retry_after_seconds=self.env.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+            replication_retry_after_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
         )
 
         self._manager_handler = GateManagerHandler(
@@ -1103,6 +1273,10 @@ class GateServer(HealthAwareServer):
         # restarted gate rejoins above its pre-restart value.
         await self.initialize_incarnation_store()
 
+        # Managers this gate was joined to in earlier runs: registered
+        # with at boot exactly like configured ones.
+        await self._restore_joined_managers()
+
         if self._wal_data_dir is not None:
             # Phase 8 gate durable tier; ledger events share the gate's
             # clock.
@@ -1125,9 +1299,8 @@ class GateServer(HealthAwareServer):
         # Set node_id on trackers
         self._job_leadership_tracker.node_id = self._node_id.full
         self._job_leadership_tracker.node_addr = (self._host, self._tcp_port)
-        self._job_lease_manager._node_id = self._node_id.full
+        self._job_lease_manager.node_id = self._node_id.full
         self._dc_lease_manager.set_node_id(self._node_id.full)
-        self._job_forwarding_tracker.set_local_gate_id(self._node_id.full)
 
         await self._job_hash_ring.add_node(
             node_id=self._node_id.full,
@@ -1193,18 +1366,12 @@ class GateServer(HealthAwareServer):
         await self._dc_health_monitor.start()
 
         # Start job lease manager cleanup
-        await self._job_lease_manager.start_cleanup_task()
 
         # Start background tasks
+        # An expired lease is an orphan candidate from the cleanup's first
+        # pass on (the cleanup starts with the background loops).
+        self._job_lease_manager.set_on_lease_expired(self._orphan_job_coordinator.on_lease_expired)
         self._start_background_loops()
-
-        # Discovery maintenance (AD-28)
-        # Phase 6b: explicit ``loop.create_task`` so the task binds to
-        # the loop the gate server was started on rather than implicitly
-        # going through ``get_running_loop`` at task-creation time.
-        self._discovery_maintenance_task = asyncio.get_running_loop().create_task(
-            self._discovery_maintenance_loop()
-        )
 
         # Start timeout tracker (AD-34)
         await self._job_timeout_tracker.start()
@@ -1213,28 +1380,46 @@ class GateServer(HealthAwareServer):
         self._best_effort_manager.start_deadline_loop()
         self._accepting_requests = True
 
-        # Start Raft consensus tick loop and seed membership from known gate peers
-        self._raft.start()
+        # Start Raft consensus, the gate tier's membership group (whose
+        # handlers answer now that requests are accepted) and clock offset
+        # probing.
+        await self._raft.start()
+        await self._cluster_membership.start()
         self._task_runner.run(self._clock_offset_prober.run, alias="clock_offset_prober")
-        raft_members: set[str] = set()
-        raft_addrs: dict[str, tuple[str, int]] = {}
-        for gate_id, gate_info in self._modular_state.iter_known_gates():
-            raft_members.add(gate_id)
-            raft_addrs[gate_id] = (gate_info.tcp_host, gate_info.tcp_port)
-        self._raft.set_initial_membership(raft_members, raft_addrs)
 
-        self._job_lease_manager._on_lease_expired = (
-            self._orphan_job_coordinator.on_lease_expired
-        )
         await self._orphan_job_coordinator.start()
 
         if self._datacenter_managers:
             await self._register_with_managers()
+        for datacenter_id in sorted(self._datacenter_managers):
+            self._watch_datacenter_membership(datacenter_id)
 
         await self._udp_logger.log(
             ServerInfo(
                 message=f"Gate started with {len(self._datacenter_managers)} DCs, "
                 f"state={self._modular_state.get_gate_state().value}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def leave_cluster(self) -> None:
+        """Drain this node's cluster membership (AD-52 section 13): the
+        group releases its address now rather than after the tombstone
+        retention, so the cluster's quorum stops counting a node that is
+        going away. The outcome is logged; a refusal leaves the release to
+        the leader's silence detection."""
+        if not self._cluster_membership.formed:
+            return
+        reply = await self._cluster_membership.leave()
+        await self._udp_logger.log(
+            (ServerInfo if reply.released else ServerWarning)(
+                message=(
+                    f"Left cluster membership as {reply.released_member_id}"
+                    if reply.released
+                    else f"Cluster membership drain refused: {reply.refusal}"
+                ),
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -1247,18 +1432,19 @@ class GateServer(HealthAwareServer):
         broadcast_leave: bool = True,
     ) -> None:
         """Stop the gate server."""
+        # Drain membership first, while its loops and this transport run.
+        if broadcast_leave and self._running:
+            await self.leave_cluster()
         self._running = False
         await self._stop_background_loops()
 
-        if (
-            self._discovery_maintenance_task
-            and not self._discovery_maintenance_task.done()
-        ):
-            self._discovery_maintenance_task.cancel()
-            try:
-                await self._discovery_maintenance_task
-            except asyncio.CancelledError:
-                pass
+        # The datacenter membership watches end with the gate; their
+        # tasks end with the task runner's shutdown below.
+        for follower in self._datacenter_watches.values():
+            follower.stop()
+        self._datacenter_watches.clear()
+        self._datacenter_views.clear()
+        self._datacenter_cluster_uuids.clear()
 
         await self._dc_health_monitor.stop()
         await self._job_timeout_tracker.stop()
@@ -1270,7 +1456,8 @@ class GateServer(HealthAwareServer):
         await self._orphan_job_coordinator.stop()
         await self._idempotency_cache.close()
 
-        # Stop Raft consensus and clock offset probing
+        # Stop the membership group, Raft consensus and clock offset probing
+        await self._cluster_membership.stop()
         self._clock_offset_prober.stop()
         await self._raft.stop()
 
@@ -1280,37 +1467,47 @@ class GateServer(HealthAwareServer):
         )
 
     def _start_background_loops(self) -> None:
-        self._task_runner.run(self._lease_cleanup_loop)
-        self._task_runner.run(self._job_cleanup_loop)
-        self._task_runner.run(self._rate_limit_cleanup_loop)
-        self._task_runner.run(self._batch_stats_loop)
-        self._task_runner.run(self._windowed_stats_push_loop)
-        self._task_runner.run(self._dead_peer_reap_loop)
+        loops = [
+            self._lease_cleanup_loop,
+            self._job_cleanup_loop,
+            self._rate_limit_cleanup_loop,
+            self._batch_stats_loop,
+            self._windowed_stats_push_loop,
+            self._dead_peer_reap_loop,
+            self._datacenter_correlation_loop,
+            self._job_failover_coordinator.run,
+            self._resource_sampling_loop,
+            # AD-28 discovery maintenance.
+            self._discovery_maintenance_loop,
+            # Job lease expiry (AD-31 orphan detection).
+            self._job_lease_manager.run_cleanup,
+        ]
         if self._gate_udp_peers:
-            self._task_runner.run(self._gate_peer_readmission_loop)
-
-        run = self._task_runner.run(self._resource_sampling_loop)
-        if run:
-            self._resource_sampling_token = f"{run.task_name}:{run.run_id}"
+            loops.append(self._gate_peer_readmission_loop)
+        self._background_loop_tokens = [
+            f"{run.task_name}:{run.run_id}" for loop in loops if (run := self._task_runner.run(loop))
+        ]
 
     async def _stop_background_loops(self) -> None:
+        """Cancel every background loop -- each one, even when another's
+        cancel fails -- then raise the first failure."""
         cleanup_error: Exception | None = None
+        background_loop_tokens = self._background_loop_tokens
+        self._background_loop_tokens = []
 
-        if self._resource_sampling_token:
+        for token in background_loop_tokens:
             try:
-                await self._task_runner.cancel(self._resource_sampling_token)
+                await self._task_runner.cancel(token)
             except Exception as error:
-                cleanup_error = error
+                cleanup_error = cleanup_error or error
                 await self._udp_logger.log(
                     ServerWarning(
-                        message=f"Failed to cancel resource sampling loop: {error}",
+                        message=f"Failed to cancel background loop {token}: {error}",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
                     )
                 )
-            finally:
-                self._resource_sampling_token = None
 
         if cleanup_error:
             raise cleanup_error
@@ -1394,7 +1591,7 @@ class GateServer(HealthAwareServer):
         """Handle manager discovery broadcast from peer gate."""
         if self._accepting_requests:
             return await self._manager_handler.handle_discovery(
-                addr, data, self.handle_exception
+                addr, data, self._datacenter_manager_udp, self.handle_exception
             )
         return b"error"
 
@@ -1446,16 +1643,19 @@ class GateServer(HealthAwareServer):
         ).dump()
 
     @tcp.receive()
-    async def receive_job_status_request(
+    async def job_status(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ):
-        """Handle job status request from client."""
+        """A client's status query -- the same action a manager answers, so
+        a client asks either tier alike (this one was named
+        ``receive_job_status_request``, which no client sent: every status
+        poll to a gate failed for want of a handler)."""
         if self._accepting_requests:
             return await self._job_handler.handle_status_request(
-                addr, data, self._gather_job_status
+                addr, data, self._answer_job_status_query
             )
         return b""
 
@@ -1474,13 +1674,16 @@ class GateServer(HealthAwareServer):
         return b"error"
 
     @tcp.receive()
-    async def receive_gate_ping(
+    async def ping(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ):
-        """Handle ping request."""
+        """A ping, from a client or a peer gate proving it is alive -- the
+        action a manager answers too, so a client pings either tier alike.
+        (Named ``receive_gate_ping``, which only peer gates sent, every
+        client's gate ping failed for want of a handler.)"""
         if self._accepting_requests:
             return await self._ping_handler.handle_ping(
                 addr, data, self.handle_exception
@@ -1578,59 +1781,40 @@ class GateServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle job final result from manager."""
-        result: JobFinalResult | None = None
-        try:
-            result = JobFinalResult.load(data)
-            success = result.status in ("COMPLETED", "completed")
-            latency_ms = await self._dispatch_time_tracker.record_completion(
-                result.job_id,
-                result.datacenter,
-                success=success,
-            )
-            if latency_ms is not None:
-                await self._observed_latency_tracker.record_job_latency(
-                    result.datacenter, latency_ms
-                )
-        except Exception as route_learning_error:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerWarning(
-                    message=f"Route learning latency recording failed: {route_learning_error}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                ),
-            )
+        """Handle a datacenter's final result for a job from its manager.
 
+        One datacenter's result is not the job's: the client gets the
+        global result, once every datacenter reported (``_complete_job``).
+        Forwarded to a peer gate's client callback, it was taken for the
+        whole job -- the message a gateless manager sends for its one
+        datacenter.
+        """
         if self._accepting_requests:
-            response = await self._state_sync_handler.handle_job_final_result(
+            return await self._state_sync_handler.handle_job_final_result(
                 addr,
                 data,
                 self._complete_job,
                 self.handle_exception,
                 self._forward_job_final_result_to_peers,
             )
-            if response == b"ok" and result is not None:
-                await self._maybe_push_global_job_result(result)
-                await self._forward_job_final_result_to_peer_callbacks(
-                    result.job_id,
-                    data,
-                )
-            return response
         return b"error"
 
     @tcp.receive()
-    async def job_leadership_notification(
+    async def job_final_result_forwarded(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ):
-        """Handle job leadership notification from peer gate."""
+        """A datacenter's final result a peer gate forwarded: applied here
+        if this gate leads the job, and never forwarded again."""
         if self._accepting_requests:
-            return await self._state_sync_handler.handle_job_leadership_notification(
-                addr, data, self.handle_exception
+            return await self._state_sync_handler.handle_job_final_result(
+                addr,
+                data,
+                self._complete_job,
+                self.handle_exception,
+                None,
             )
         return b"error"
 
@@ -1713,8 +1897,7 @@ class GateServer(HealthAwareServer):
             report = JobFinalStatus.load(data)
             dedup_key = (report.job_id, report.datacenter)
             if dedup_key in self._job_final_statuses:
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerWarning(
                         message=(
                             "Duplicate final status ignored for job "
@@ -1746,7 +1929,7 @@ class GateServer(HealthAwareServer):
             push = WorkflowResultPush.load(data)
             callback = self._resolve_job_callback(push.job_id, push.callback_addr)
 
-            stale_response = self._validate_workflow_result_producer(push)
+            stale_response = await self._validate_workflow_result_producer(push)
             if stale_response is not None:
                 return stale_response
 
@@ -1765,24 +1948,11 @@ class GateServer(HealthAwareServer):
             # (``GateJobReplica``, ``JobLeaderGateTransfer``), not on
             # manager-originated data-plane results.
 
-            # Data-plane idempotency: if this exact ``(job_id,
-            # workflow_id, datacenter)`` triple has already been
-            # aggregated and delivered (we recorded the sequence on
-            # successful ``_forward_aggregated_workflow_result``),
-            # ack a late duplicate without re-running the aggregation
-            # or re-delivering. Uses ``result_sequence`` only — fence
-            # tokens never enter dedup. ``result_sequence == 0`` is
-            # the wire-compat fallback for pushes from older nodes
-            # that don't stamp the field; we accept those into the
-            # aggregator path so behavior matches pre-split.
-            finalized_key = (push.job_id, push.workflow_id, push.datacenter)
-            finalized_sequence = (
-                self._finalized_workflow_result_sequences.get(finalized_key, 0)
-            )
-            if (
-                push.result_sequence > 0
-                and push.result_sequence <= finalized_sequence
-            ):
+            # Data-plane idempotency: a workflow has one aggregate. A push
+            # for a workflow already claimed for it is acked without
+            # re-aggregating or re-delivering (re-checked under the results
+            # lock below, where the claim is made).
+            if (push.job_id, push.workflow_id) in self._finalized_workflow_results:
                 return b"ok"
 
             if push.is_client_ready:
@@ -1799,8 +1969,7 @@ class GateServer(HealthAwareServer):
 
             if not self._job_manager.has_job(push.job_id):
                 if callback is None:
-                    self._task_runner.run(
-                        self._udp_logger.log,
+                    await self._udp_logger.log(
                         ServerWarning(
                             message=(
                                 "Rejecting workflow result for unknown job "
@@ -1814,8 +1983,7 @@ class GateServer(HealthAwareServer):
                     return b"no_callback"
                 self._recover_job_from_workflow_push(push, callback)
 
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerDebug(
                     message=f"Received workflow result for {push.job_id}:{push.workflow_id} from DC {push.datacenter}",
                     node_host=self._host,
@@ -1835,8 +2003,35 @@ class GateServer(HealthAwareServer):
             )
 
             async with self._workflow_dc_results_lock:
-                if target_dcs_from_push:
+                if (push.job_id, push.workflow_id) in self._finalized_workflow_results:
+                    return b"ok"
+                # This gate's own placement of the job decides whose results
+                # count. A push names the datacenters its manager was sent
+                # the job for -- not where a fallback or a failover moved
+                # it -- so it only seeds a gate that holds no placement of
+                # the job (a survivor, recovering it from the push).
+                if target_dcs_from_push and not self._job_manager.get_target_dcs(push.job_id):
                     self._job_manager.set_target_dcs(push.job_id, target_dcs_from_push)
+                expected_dcs = self._job_manager.expected_workflow_datacenters(
+                    push.job_id, push.workflow_id
+                )
+                if expected_dcs and push.datacenter not in expected_dcs:
+                    # A datacenter the job moved off (lost, or released at
+                    # dispatch), or a replacement re-running a workflow only
+                    # for the context its dependents read: acked, not counted.
+                    await self._udp_logger.log(
+                        ServerDebug(
+                            message=(
+                                f"Dropped result of workflow {push.workflow_id} of job "
+                                f"{push.job_id} from DC {push.datacenter}: its result "
+                                f"comes from {sorted(expected_dcs)}"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        ),
+                    )
+                    return b"ok"
                 if expected_dc_count > 0:
                     expected_counts = self._workflow_result_expected_dc_counts.setdefault(
                         push.job_id,
@@ -1859,12 +2054,11 @@ class GateServer(HealthAwareServer):
                     ] = push
                     state_updated = True
 
-                target_dcs = self._job_manager.get_target_dcs(push.job_id)
                 received_dcs = set(
                     self._workflow_dc_results[push.job_id][push.workflow_id].keys()
                 )
-                should_aggregate = bool(target_dcs and received_dcs >= target_dcs)
-                if not should_aggregate and not target_dcs and expected_dc_count > 0:
+                should_aggregate = bool(expected_dcs and received_dcs >= expected_dcs)
+                if not should_aggregate and not expected_dcs and expected_dc_count > 0:
                     should_aggregate = len(received_dcs) >= expected_dc_count
 
                 has_timeout = (
@@ -1877,7 +2071,14 @@ class GateServer(HealthAwareServer):
                     workflow_results, timeout_token = self._pop_workflow_results_locked(
                         push.job_id, push.workflow_id
                     )
-                elif (target_dcs or expected_dc_count > 1) and not has_timeout:
+                    if expected_dcs:
+                        # Stored before the job moved off its datacenter.
+                        workflow_results = {
+                            datacenter: result
+                            for datacenter, result in workflow_results.items()
+                            if datacenter in expected_dcs
+                        }
+                elif (expected_dcs or expected_dc_count > 1) and not has_timeout:
                     should_schedule_timeout = True
 
             if state_updated:
@@ -1892,31 +2093,16 @@ class GateServer(HealthAwareServer):
                 await self._cancel_workflow_result_timeout(timeout_token)
 
             if workflow_results:
-                delivered = await self._forward_aggregated_workflow_result(
+                # Accepted once recorded: the aggregate reaches the client
+                # now or on its callback's (re)registration. Answered
+                # "error", the manager re-sent its result, which came back
+                # as a fresh partial -- the other datacenters' results were
+                # taken -- and the timeout then delivered a second, wrong
+                # aggregate calling them missing.
+                await self._forward_aggregated_workflow_result(
                     push.job_id, push.workflow_id, workflow_results
                 )
-                if delivered:
-                    # Record the highest result_sequence we observed
-                    # for each (job_id, workflow_id, datacenter) we
-                    # just aggregated. Late duplicates of any of
-                    # these triples will be acked idempotently at
-                    # the dedup check above without re-aggregating.
-                    for dc_push in workflow_results.values():
-                        triple = (
-                            dc_push.job_id,
-                            dc_push.workflow_id,
-                            dc_push.datacenter,
-                        )
-                        existing = (
-                            self._finalized_workflow_result_sequences.get(
-                                triple, 0
-                            )
-                        )
-                        if dc_push.result_sequence > existing:
-                            self._finalized_workflow_result_sequences[triple] = (
-                                dc_push.result_sequence
-                            )
-                return b"ok" if delivered else b"error"
+                return b"ok"
 
             return b"stored"
 
@@ -1972,8 +2158,7 @@ class GateServer(HealthAwareServer):
 
             elapsed = self._clock.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
 
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerInfo(
                     message=f"Client reconnected for job {job_id}, registered callback {request.callback_addr}",
                     node_host=self._host,
@@ -2190,8 +2375,7 @@ class GateServer(HealthAwareServer):
                     self._record_job_callback(announcement.job_id, callback)
                 self._orphan_job_coordinator.clear_orphaned_job(announcement.job_id)
 
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerDebug(
                         message=f"Recorded job {announcement.job_id[:8]}... leader: {announcement.leader_id[:8]}...",
                         node_host=self._host,
@@ -2269,8 +2453,7 @@ class GateServer(HealthAwareServer):
                 or transfer.job_id in self._job_leadership_tracker
             )
             if not job_known:
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerWarning(
                         message=(
                             "Received manager transfer for unknown job "
@@ -2309,8 +2492,7 @@ class GateServer(HealthAwareServer):
                         transfer.job_id, transfer.datacenter_id
                     )
                 )
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerDebug(
                         message=(
                             "Rejected stale manager transfer for job "
@@ -2332,8 +2514,7 @@ class GateServer(HealthAwareServer):
                 transfer.job_id, transfer.datacenter_id, transfer.new_manager_addr
             )
 
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerInfo(
                     message=(
                         f"Updated job {transfer.job_id[:8]}... DC {transfer.datacenter_id} manager: "
@@ -2420,8 +2601,7 @@ class GateServer(HealthAwareServer):
             push: WindowedStatsPush = cloudpickle.loads(data)
 
             if not self._job_manager.has_job(push.job_id):
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerDebug(
                         message=(
                             "Discarding windowed stats for unknown job "
@@ -2444,8 +2624,7 @@ class GateServer(HealthAwareServer):
 
             if not job or job.status in terminal_states:
                 status = job.status if job else "missing"
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerDebug(
                         message=(
                             "Discarding windowed stats for job "
@@ -2526,34 +2705,6 @@ class GateServer(HealthAwareServer):
 
         except Exception as error:
             await self.handle_exception(error, "job_status_push_forward")
-            return b"error"
-
-    @tcp.receive()
-    async def job_final_result_forward(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ):
-        """Handle forwarded job final result from peer gate."""
-        try:
-            result = JobFinalResult.load(data)
-            callback = self._job_manager.get_callback(result.job_id)
-            if not callback:
-                return b"no_callback"
-
-            delivered = await self._record_and_send_client_update(
-                result.job_id,
-                callback,
-                "receive_job_final_result",
-                data,
-                log_failure=True,
-            )
-
-            return b"ok" if delivered else b"forwarded"
-
-        except Exception as error:
-            await self.handle_exception(error, "job_final_result_forward")
             return b"error"
 
     # =========================================================================
@@ -2790,20 +2941,19 @@ class GateServer(HealthAwareServer):
         Peers learned the job through the committed replica and never
         heard it end: their copy stayed SUBMITTED forever, so their
         cleanup sweep (terminal jobs only) never removed it and its Raft
-        group never retired. The replica protocol orders updates by
-        ``sequence``, so the terminal status goes out one sequence above
+        group never retired. The terminal status goes out as a revision of
         the committed replica, reusing the protocol that created it.
         """
-        committed = self._replication_coordinator.get_committed_replica(job_id)
         job = self._job_manager.get_job(job_id)
-        if committed is None or job is None or committed.status_seed == job.status:
+        if job is None or self._replication_coordinator.get_committed_replica(job_id) is None:
             return
 
-        replicated = await self._replication_coordinator.replicate_with_quorum(
-            replica=dataclasses.replace(
-                committed,
-                sequence=committed.sequence + 1,
-                status_seed=job.status,
+        replicated = await self._replication_coordinator.revise_committed_replica(
+            job_id,
+            lambda committed: (
+                None
+                if committed.status_seed == job.status
+                else dataclasses.replace(committed, status_seed=job.status)
             ),
             peer_addrs=list(self._modular_state.get_active_peers_list()),
             quorum_size=self._quorum_size(),
@@ -2947,6 +3097,34 @@ class GateServer(HealthAwareServer):
         response, _clock = await self.send_tcp(addr, method, data, timeout=timeout)
         return response
 
+    async def _record_datacenter_reassignment_durable(
+        self,
+        job_id: str,
+        substitution: DatacenterSubstitution,
+    ) -> None:
+        """Durably record that the job moved off a datacenter it lost
+        mid-run (AD-38 ``JobDatacenterReassigned``, AD-36), at the gate
+        tier's level for the job's record: a gate recovering the job from
+        its ledger awaits its results where it runs now. No-op for
+        volatile gates."""
+        if self._job_ledger is None:
+            return
+        await self._log_ledger_shortfall(
+            "JobDatacenterReassigned",
+            job_id,
+            await self._job_ledger.reassign_datacenter(
+                job_id,
+                DatacenterReassignment(
+                    lost_datacenter=substitution.lost_datacenter,
+                    replacement_datacenter=substitution.replacement_datacenter,
+                    completed_workflow_ids=tuple(substitution.completed_workflow_ids),
+                    total_completed=substitution.total_completed,
+                    total_failed=substitution.total_failed,
+                ),
+                durability=await self._ledger_target_durability(),
+            ),
+        )
+
     async def _log_ledger_shortfall(
         self,
         event_name: str,
@@ -2998,17 +3176,14 @@ class GateServer(HealthAwareServer):
                 0.0,
             )
             remaining_timeout = job_state.timeout_seconds - elapsed_seconds
-            if job_state.timeout_seconds <= 0.0:
-                # Pre-Phase-8 record with no budget persisted: track
-                # with a minimal grace so AD-34 resolves it loudly
-                # rather than stranding it silently.
-                remaining_timeout = 30.0
-            elif remaining_timeout <= 0.0:
-                # Budget expired while this gate was down: one tracker
-                # tick of grace lets a completion already in flight
-                # (the manager's owed notice) win the race before the
-                # loud timeout fires.
-                remaining_timeout = 1.0
+            if job_state.timeout_seconds <= 0.0 or remaining_timeout <= 0.0:
+                # One timeout check of grace. A pre-Phase-8 record with
+                # no budget persisted is resolved loudly at the next check
+                # rather than stranded silently; a budget that ran out
+                # while this gate was down lets a completion already in
+                # flight (the manager's owed notice) win the race before
+                # the loud timeout fires.
+                remaining_timeout = self.env.GATE_TIMEOUT_CHECK_INTERVAL
 
             job = GlobalJobStatus(
                 job_id=job_state.job_id,
@@ -3018,8 +3193,31 @@ class GateServer(HealthAwareServer):
                 fence_token=job_state.fence_token,
             )
             self._job_manager.set_job(job_state.job_id, job)
+            # Where the job runs now: a datacenter it lost mid-run was
+            # replaced in its assigned datacenters (AD-36), keeping the
+            # result slots of the workflows it delivered.
             self._job_manager.set_target_dcs(
                 job_state.job_id, set(job_state.assigned_datacenters)
+            )
+            self._job_manager.set_datacenter_substitutions(
+                job_state.job_id,
+                [
+                    DatacenterSubstitution(
+                        lost_datacenter=reassignment.lost_datacenter,
+                        replacement_datacenter=reassignment.replacement_datacenter,
+                        completed_workflow_ids=list(reassignment.completed_workflow_ids),
+                        total_completed=reassignment.total_completed,
+                        total_failed=reassignment.total_failed,
+                    )
+                    for reassignment in job_state.datacenter_reassignments
+                ],
+            )
+            self._job_manager.set_released_datacenters(
+                job_state.job_id,
+                {
+                    reassignment.lost_datacenter
+                    for reassignment in job_state.datacenter_reassignments
+                },
             )
             self._job_manager.set_fence_token(
                 job_state.job_id, job_state.fence_token
@@ -3035,13 +3233,25 @@ class GateServer(HealthAwareServer):
                 callback_host, _, callback_port_text = (
                     job_state.requestor_id.rpartition(":")
                 )
-                try:
+                if callback_port_text.isdigit():
                     self._job_manager.set_callback(
                         job_state.job_id,
                         (callback_host, int(callback_port_text)),
                     )
-                except ValueError:
-                    pass
+                else:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=(
+                                f"Recovered job {job_state.job_id[:8]}... has a "
+                                f"malformed requestor contact "
+                                f"{job_state.requestor_id!r}: its client is "
+                                "reached only if it polls"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
             await self._job_timeout_tracker.start_tracking_job(
                 job_id=job_state.job_id,
                 timeout_seconds=remaining_timeout,
@@ -3140,6 +3350,13 @@ class GateServer(HealthAwareServer):
         global_result: GlobalJobResult,
     ) -> None:
         """Deliver a job's global result and make it terminal everywhere."""
+        if global_result.unreported_datacenters:
+            # AD-44: the per-workflow results that were waiting on the
+            # datacenters this job completed without go out from those that
+            # reported, ahead of the terminal result -- a client takes its
+            # results from them.
+            await self._release_workflow_results(job_id)
+
         await self._push_global_job_result(global_result)
 
         async with self._job_manager.lock_job(job_id):
@@ -3213,7 +3430,9 @@ class GateServer(HealthAwareServer):
             return
 
         try:
-            reporter_configs = cloudpickle.loads(submission.reporting_configs)
+            # The client's payload: read through the restricted unpickler,
+            # as its workflows are.
+            reporter_configs = restricted_loads(submission.reporting_configs)
         except Exception as config_error:
             await self._udp_logger.log(
                 ServerWarning(
@@ -3239,42 +3458,67 @@ class GateServer(HealthAwareServer):
             "results": [],
         }
 
+        # Each reporter in a run of its own: one that fails or hangs holds
+        # up neither the job's completion nor any other reporter.
         for reporter_config in reporter_configs:
             reporter_type = getattr(reporter_config, "reporter_type", None)
-            reporter_type_name = reporter_type.name if reporter_type else "unknown"
-
-            async def submit_to_reporter(
-                config: object,
-                stats: WorkflowStats,
-                r_type: str,
-            ) -> None:
-                try:
-                    reporter = Reporter(config)
-                    await reporter.connect()
-                    await reporter.submit_workflow_results(stats)
-                    await self._udp_logger.log(
-                        ServerDebug(
-                            message=f"Submitted results for job {job_id[:8]}... to {r_type}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                except Exception as submit_error:
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=f"Failed to submit results for job {job_id[:8]}... to {r_type}: {submit_error}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-
             self._task_runner.run(
-                submit_to_reporter,
+                self._submit_to_reporter,
+                job_id,
                 reporter_config,
                 workflow_stats,
-                reporter_type_name,
+                reporter_type.name if reporter_type else "unknown",
+            )
+
+    async def _submit_to_reporter(
+        self,
+        job_id: str,
+        reporter_config: object,
+        workflow_stats: WorkflowStats,
+        reporter_type_name: str,
+    ) -> None:
+        """
+        Submit a job's results to one reporter: connect and submit within
+        one ``REPORTER_SUBMISSION_TIMEOUT_SECONDS`` deadline, then close --
+        however the submission ended -- within another. A failure or
+        timeout is logged; it is the reporter's alone.
+
+        A method, not a closure: the task runner keeps the first callable
+        it is given under a name, so a closure over one job's id logged
+        every later job's submissions under that first job.
+        """
+        deadline = self._clock.monotonic() + self._reporter_submission_timeout_seconds
+        try:
+            reporter = Reporter(reporter_config)
+            try:
+                # A connect that failed or timed out may have opened part of
+                # its backend: it is closed all the same.
+                await self._clock.wait_for(reporter.connect(), max(deadline - self._clock.monotonic(), 0.0))
+                await self._clock.wait_for(
+                    reporter.submit_workflow_results(workflow_stats),
+                    max(deadline - self._clock.monotonic(), 0.0),
+                )
+            finally:
+                # A deadline of its own: one spent by a hung submission
+                # would cancel the close before it began.
+                await self._clock.wait_for(reporter.close(), self._reporter_submission_timeout_seconds)
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Submitted results for job {job_id[:8]}... to {reporter_type_name}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        except Exception as submit_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Failed to submit results for job {job_id[:8]}... to {reporter_type_name}: "
+                    f"{type(submit_error).__name__}: {submit_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
             )
 
     async def handle_global_timeout(
@@ -3353,11 +3597,15 @@ class GateServer(HealthAwareServer):
 
             job.status = JobStatus.TIMEOUT.value
             job.resolution_details = "global_timeout"
-            if reason:
-                errors = list(getattr(job, "errors", []))
-                if reason not in errors:
-                    errors.append(reason)
-                job.errors = errors
+            reported_datacenters = self._job_manager.get_all_dc_results(job_id)
+            errors = list(job.errors) + [
+                f"{datacenter_id}: missing final result"
+                for datacenter_id in sorted(self._job_manager.get_target_dcs(job_id))
+                if datacenter_id not in reported_datacenters
+            ]
+            if reason and reason not in errors:
+                errors.append(reason)
+            job.errors = errors
             if job.timestamp > 0:
                 job.elapsed_seconds = self._clock.monotonic() - job.timestamp
 
@@ -3398,10 +3646,16 @@ class GateServer(HealthAwareServer):
         if not target_dcs:
             return
 
+        # Unfenced, as every cancel the gate forwards for a client is: a
+        # manager checks ``fence_token`` against ITS lease fence for the
+        # job, a counter the gate's lease fence (sent here before) has
+        # nothing to do with, and an exact-match check refused almost every
+        # timeout cancel -- the job ran on past its global timeout. A cancel
+        # is fail-safe; no leadership epoch needs to authorize it.
         cancel_payload = CancelJob(
             job_id=job_id,
             reason=reason or "global_timeout",
-            fence_token=self._job_manager.get_fence_token(job_id),
+            fence_token=0,
         ).dump()
         job_dc_managers = self._modular_state.get_job_dc_managers(job_id)
         errors: list[str] = []
@@ -3419,6 +3673,9 @@ class GateServer(HealthAwareServer):
                     cancel_payload,
                     timeout=self._tcp_timeout_standard,
                 )
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response, Exception):
+                    raise response
             except Exception as error:
                 errors.append(f"DC {dc_id} cancel error: {error}")
                 continue
@@ -3603,7 +3860,8 @@ class GateServer(HealthAwareServer):
         await self._udp_logger.log(
             ServerWarning(
                 message=(
-                    f"Failed to deliver global timeout result for job {job_id[:8]}..."
+                    f"Failed to deliver the global result of job {job_id[:8]}...: "
+                    "it is replayed when its client's callback re-registers"
                 ),
                 node_host=self._host,
                 node_port=self._tcp_port,
@@ -3611,61 +3869,56 @@ class GateServer(HealthAwareServer):
             )
         )
 
-    async def _gather_job_status(self, job_id: str) -> GlobalJobStatus:
-        async with self._job_manager.lock_job(job_id):
-            job = self._job_manager.get_job(job_id)
-            if not job:
-                raise ValueError(f"Job {job_id} not found")
-            previous_status = job.status
-            target_dcs = self._job_manager.get_target_dcs(job_id)
+    async def _answer_job_status_query(self, query: JobStatusQuery) -> bytes:
+        """A status read at its consistency level (AD-38 Part 8). EVENTUAL
+        reads, and any read of a terminal status (which never changes), are
+        answered from what this gate holds. Otherwise the job's leader gate
+        answers -- for STRONG, once a quorum of gates committed its replica
+        again (they accept only the job's current fence: it still leads,
+        and what it answers is held by that quorum). A gate that follows
+        the job passes the read to its leader; it keeps no synced view to
+        judge SESSION or BOUNDED_STALENESS reads by. Empty bytes: no answer."""
+        consistency = ReadConsistency(query.consistency)
+        job_id = query.job_id
+        status = await self._gather_job_status(job_id)
+        if status is not None and (
+            consistency is ReadConsistency.EVENTUAL or JobStatusOrder().is_terminal(status.status)
+        ):
+            return status.dump()
 
+        if self._job_leadership_tracker.is_leader(job_id):
+            if status is None:
+                return b""
+            if consistency is ReadConsistency.STRONG and not await self._replication_coordinator.revise_committed_replica(
+                job_id,
+                lambda committed_replica: committed_replica,
+                peer_addrs=list(self._modular_state.get_active_peers_list()),
+                quorum_size=self._quorum_size(),
+            ):
+                return b""
+            status.view_time = self._clock.monotonic()
+            return status.dump()
+
+        leader_addr = self._job_leadership_tracker.get_leader_addr(job_id)
+        if query.forwarded or leader_addr is None or tuple(leader_addr) == (self._host, self._tcp_port):
+            return b""
+        query.forwarded = True
+        response, _clock = await self._send_tcp(
+            tuple(leader_addr),
+            "job_status",
+            query.dump(),
+            timeout=self._tcp_timeout_standard,
+        )
+        return response if isinstance(response, bytes) else b""
+
+    async def _gather_job_status(self, job_id: str) -> GlobalJobStatus | None:
+        """A client's status poll: the job as this gate holds it, or None
+        when it holds no such job. A read -- only the job's terminal paths
+        decide its status."""
+        async with self._job_manager.lock_job(job_id):
             status = self._job_manager.aggregate_job_status(job_id)
             if status is None:
-                raise ValueError(f"Job {job_id} not found")
-
-            terminal_statuses = {
-                JobStatus.COMPLETED.value,
-                JobStatus.FAILED.value,
-                JobStatus.CANCELLED.value,
-                JobStatus.TIMEOUT.value,
-            }
-
-            if (
-                previous_status != status.status
-                and status.status in terminal_statuses
-                and status.resolution_details
-                and target_dcs
-            ):
-                errors_summary = ""
-                if status.errors:
-                    errors_preview = status.errors[:3]
-                    errors_summary = "; ".join(errors_preview)
-                    if len(status.errors) > 3:
-                        errors_summary = (
-                            f"{errors_summary}; +{len(status.errors) - 3} more"
-                        )
-
-                resolution_message = (
-                    f"Resolved job {job_id[:8]}... {status.status} "
-                    f"({status.completed_datacenters} completed, "
-                    f"{status.failed_datacenters} failed, "
-                    f"{len(target_dcs)} total) "
-                    f"[{status.resolution_details}]"
-                )
-
-                if errors_summary:
-                    resolution_message = (
-                        f"{resolution_message} errors: {errors_summary}"
-                    )
-
-                await self._udp_logger.log(
-                    ServerInfo(
-                        message=resolution_message,
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
+                return None
 
             return GlobalJobStatus(
                 job_id=status.job_id,
@@ -3719,11 +3972,14 @@ class GateServer(HealthAwareServer):
         try:
             response, _clock = await self._send_tcp(
                 tcp_addr,
-                "receive_gate_ping",
+                "ping",
                 request.dump(),
                 timeout=self._tcp_timeout_short,
             )
-            if not response or response == b"error" or isinstance(response, Exception):
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
+            if not response or response == b"error":
                 return None
 
             parsed = GatePingResponse.load(response)
@@ -3815,7 +4071,6 @@ class GateServer(HealthAwareServer):
             self._modular_state.remove_known_gate(stale_gate_id)
             await self._versioned_clock.remove_entity(stale_gate_id)
             await self._job_hash_ring.remove_node(stale_gate_id)
-            self._job_forwarding_tracker.unregister_peer(stale_gate_id)
 
         self._modular_state.set_udp_to_tcp_mapping(udp_addr, tcp_addr)
         self._modular_state.add_known_gate(gate_info.node_id, gate_info)
@@ -3828,11 +4083,6 @@ class GateServer(HealthAwareServer):
 
         await self._job_hash_ring.add_node(
             node_id=gate_info.node_id,
-            tcp_host=gate_info.tcp_host,
-            tcp_port=gate_info.tcp_port,
-        )
-        self._job_forwarding_tracker.register_peer(
-            gate_id=gate_info.node_id,
             tcp_host=gate_info.tcp_host,
             tcp_port=gate_info.tcp_port,
         )
@@ -3871,10 +4121,6 @@ class GateServer(HealthAwareServer):
         )
         if gate_tcp_addr:
             self._dead_gate_addrs.add(gate_tcp_addr)
-            for gate_id, gate_info in self._modular_state.iter_known_gates():
-                if (gate_info.udp_host, gate_info.udp_port) == node_addr:
-                    self._raft.on_node_leave(gate_id)
-                    break
             self._task_runner.run(
                 self._handle_gate_peer_failure, node_addr, gate_tcp_addr
             )
@@ -3884,10 +4130,6 @@ class GateServer(HealthAwareServer):
         gate_tcp_addr = self._modular_state.get_tcp_addr_for_udp(node_addr)
         if gate_tcp_addr:
             self._dead_gate_addrs.discard(gate_tcp_addr)
-            for gate_id, gate_info in self._modular_state.iter_known_gates():
-                if (gate_info.udp_host, gate_info.udp_port) == node_addr:
-                    self._raft.on_node_join(gate_id, gate_tcp_addr)
-                    break
             self._task_runner.run(
                 self._handle_gate_peer_recovery, node_addr, gate_tcp_addr
             )
@@ -3903,21 +4145,18 @@ class GateServer(HealthAwareServer):
         )
 
     def _get_datacenter_candidates_for_router(self) -> list[DatacenterCandidate]:
-        datacenter_ids = list(self._datacenter_managers.keys())
-        candidates = self._health_coordinator.build_datacenter_candidates(
-            datacenter_ids
+        return self._health_coordinator.build_datacenter_candidates(
+            list(self._datacenter_managers.keys())
         )
 
-        for candidate in candidates:
-            predicted_rtt = candidate.rtt_ucb_ms
-            blended = self._blended_scorer.get_latency_for_scoring(
-                datacenter_id=candidate.datacenter_id,
-                predicted_rtt_ms=predicted_rtt,
-                use_blending=True,
-            )
-            candidate.rtt_ucb_ms = blended
-
-        return candidates
+    def _get_datacenter_coordinate(self, datacenter_id: str) -> NetworkCoordinate | None:
+        """The Vivaldi coordinate a datacenter is reached at: that of its
+        most authoritative manager (the leader, while its heartbeat is
+        fresh). Coordinates are learned per manager node."""
+        heartbeat, _, _ = self._health_coordinator.get_best_manager_heartbeat(datacenter_id)
+        if heartbeat is None:
+            return None
+        return self._coordinate_tracker.get_peer_coordinate(heartbeat.node_id)
 
     async def _handle_gate_peer_failure(
         self,
@@ -3944,23 +4183,33 @@ class GateServer(HealthAwareServer):
         committed fenced value regardless of whether this gate is the leader
         or a peer, keeping local identity out of the commit path.
         """
+        # The submission instant, on this gate's own monotonic clock.
+        submitted_monotonic = self._clock.monotonic() - max(
+            0.0, self._clock.time() - replica.submitted_wall_time
+        )
         job = self._job_manager.get_job(replica.job_id)
         if job is None:
             job = GlobalJobStatus(
                 job_id=replica.job_id,
                 status=replica.status_seed,
                 datacenters=[],
-                timestamp=replica.submitted_at,
+                timestamp=submitted_monotonic,
                 fence_token=replica.fence_token,
             )
         else:
             job.status = replica.status_seed
             job.fence_token = replica.fence_token
             if job.timestamp <= 0:
-                job.timestamp = replica.submitted_at
+                job.timestamp = submitted_monotonic
         self._job_manager.set_job(replica.job_id, job)
         self._job_manager.set_target_dcs(
             replica.job_id, set(replica.target_dcs)
+        )
+        self._job_manager.set_datacenter_substitutions(
+            replica.job_id, list(replica.datacenter_substitutions)
+        )
+        self._job_manager.set_released_datacenters(
+            replica.job_id, set(replica.released_datacenters)
         )
         self._job_manager.set_fence_token(replica.job_id, replica.fence_token)
 
@@ -3972,6 +4221,13 @@ class GateServer(HealthAwareServer):
         self._modular_state._job_workflow_ids[replica.job_id] = set(
             replica.workflow_ids
         )
+
+        # AD-40: the key is decided for this job on every gate that holds
+        # its replica -- a retry at any of them is answered for it.
+        if replica.idempotency_key:
+            await self._idempotency_cache.adopt_committed(
+                IdempotencyKey.parse(replica.idempotency_key), replica.job_id, replica.leader_id
+            )
 
         if replica.submission_payload:
             try:
@@ -4004,7 +4260,10 @@ class GateServer(HealthAwareServer):
         if JobStatusOrder().is_terminal(replica.status_seed):
             await self._raft.consensus.destroy_job_raft(replica.job_id)
         else:
-            await self._raft.consensus.create_job_raft(replica.job_id)
+            # With the voters the accepting gate decided (AD-52).
+            await self._raft.consensus.create_job_raft(
+                replica.job_id, frozenset(replica.raft_voters)
+            )
 
         await self._modular_state.increment_state_version()
 
@@ -4070,52 +4329,118 @@ class GateServer(HealthAwareServer):
         return orphaned_job_ids
 
     async def _commit_gate_job_leadership_takeover(self, job_id: str) -> int | None:
-        """Quorum-commit a gate job leadership takeover by the SWIM leader."""
+        """Quorum-commit a gate job leadership takeover by the SWIM leader.
+
+        The takeover is built from the freshest replica a quorum of gates
+        committed, adopted here first: this gate may have missed the old
+        leader's last revision of the job. When that replica names a
+        leader other than the one being replaced, the job is led already
+        and nothing is taken over.
+        """
         if not self.is_leader():
             return None
 
-        job = self._job_manager.get_job(job_id)
-        if job is None:
+        if self._job_manager.get_job(job_id) is None:
             return None
 
-        target_dcs = sorted(self._job_manager.get_target_dcs(job_id))
-        current_fence_token = max(
-            self._job_manager.get_fence_token(job_id),
-            self._job_leadership_tracker.get_fencing_token(job_id),
-        )
-        next_fence_token = max(2, current_fence_token + 1)
-        callback_addr = self._job_manager.get_callback(job_id)
         node_addr = (self._host, self._tcp_port)
         old_leader_id = self._job_leadership_tracker.get_leader(job_id)
-        workflow_ids = sorted(self._modular_state._job_workflow_ids.get(job_id, set()))
-        submission = self._modular_state._job_submissions.get(job_id)
-        submission_payload = submission.dump() if submission is not None else b""
 
-        replica = GateJobReplica(
-            job_id=job_id,
-            sequence=next_fence_token,
-            fence_token=next_fence_token,
-            leader_id=self._node_id.full,
-            leader_addr=node_addr,
-            origin_gate_addr=node_addr,
-            callback_addr=callback_addr,
-            target_dcs=target_dcs,
-            target_dc_count=len(target_dcs),
-            status_seed=job.status,
-            submitted_at=job.timestamp,
-            workflow_ids=workflow_ids,
-            submission_payload=submission_payload,
-        )
-        committed = await self._replication_coordinator.replicate_with_quorum(
-            replica=replica,
+        def build_takeover() -> GateJobReplica | None:
+            job = self._job_manager.get_job(job_id)
+            if job is None or self._job_leadership_tracker.get_leader(job_id) != old_leader_id:
+                return None
+            target_dcs = sorted(self._job_manager.get_target_dcs(job_id))
+            next_fence_token = max(
+                2,
+                max(
+                    self._job_manager.get_fence_token(job_id),
+                    self._job_leadership_tracker.get_fencing_token(job_id),
+                )
+                + 1,
+            )
+            submission = self._modular_state._job_submissions.get(job_id)
+            # The job's group keeps its voters: those of the replica this
+            # gate adopted -- or, with no replica anywhere, the group is
+            # founded here, with the gates live now (AD-52).
+            committed = self._replication_coordinator.get_committed_replica(job_id)
+            return GateJobReplica(
+                job_id=job_id,
+                # The coordinator orders it after every revision it knows.
+                sequence=0,
+                fence_token=next_fence_token,
+                leader_id=self._node_id.full,
+                leader_addr=node_addr,
+                origin_gate_addr=node_addr,
+                callback_addr=self._job_manager.get_callback(job_id),
+                target_dcs=target_dcs,
+                target_dc_count=len(target_dcs),
+                status_seed=job.status,
+                submitted_wall_time=(
+                    self._clock.time() - (self._clock.monotonic() - job.timestamp)
+                    if job.timestamp > 0
+                    else self._clock.time()
+                ),
+                raft_voters=(
+                    list(committed.raft_voters)
+                    if committed is not None
+                    else sorted(self._raft.consensus.current_members())
+                ),
+                workflow_ids=sorted(self._modular_state._job_workflow_ids.get(job_id, set())),
+                submission_payload=submission.dump() if submission is not None else b"",
+                datacenter_substitutions=self._job_manager.get_datacenter_substitutions(job_id),
+                released_datacenters=sorted(self._job_manager.get_released_datacenters(job_id)),
+                idempotency_key=(
+                    committed.idempotency_key
+                    if committed is not None
+                    else (submission.idempotency_key or "") if submission is not None else ""
+                ),
+            )
+
+        replica = await self._replication_coordinator.take_over_committed_replica(
+            job_id,
+            build_takeover,
             peer_addrs=list(self._modular_state.get_active_peers_list()),
             quorum_size=self._quorum_size(),
         )
-        if not committed:
+        if replica is None:
             return None
+        next_fence_token = replica.fence_token
+        target_dcs = list(replica.target_dcs)
+        submission = self._modular_state._job_submissions.get(job_id)
 
-        await self._adopt_replicated_ledger_history(job_id)
+        await self._adopt_replicated_ledger_history(job_id, old_leader_id, next_fence_token)
         await self._resume_best_effort_tracking(job_id, submission, target_dcs)
+        # AD-34: a job's global timeout is its leader gate's to track --
+        # this gate's now, for what is left of the budget (one timeout check
+        # of grace if it ran out meanwhile, so a completion in flight can
+        # win). Untracked, a job whose leader gate died never timed out.
+        if submission is not None:
+            remaining_timeout = submission.timeout_seconds - max(
+                0.0, self._clock.time() - replica.submitted_wall_time
+            )
+            await self._job_timeout_tracker.start_tracking_job(
+                job_id=job_id,
+                timeout_seconds=(
+                    remaining_timeout
+                    if remaining_timeout > 0.0
+                    else self.env.GATE_TIMEOUT_CHECK_INTERVAL
+                ),
+                target_dcs=target_dcs,
+            )
+        else:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Took over job {job_id[:8]}... without its submission: "
+                        "its global timeout budget is unknown, and it is bounded "
+                        "by its managers' timeouts alone"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
         self._task_runner.run(
             self._notify_managers_gate_job_leader_transfer,
             job_id,
@@ -4125,7 +4450,9 @@ class GateServer(HealthAwareServer):
         )
         return next_fence_token
 
-    async def _adopt_replicated_ledger_history(self, job_id: str) -> None:
+    async def _adopt_replicated_ledger_history(
+        self, job_id: str, previous_leader_id: str | None, lease_fence_token: int
+    ) -> None:
         """AD-38: take over the job's ledger record along with the job.
 
         The previous leader gate's ledger held the job; this gate mirrored
@@ -4152,6 +4479,11 @@ class GateServer(HealthAwareServer):
 
         adopted = await self._job_ledger.adopt_replicated_history(
             job_id, self._ledger_replica.history(job_id)
+        )
+        # The takeover is recorded beside the history (AD-38
+        # JobLeadershipAcquired).
+        await self._job_ledger.record_leadership_acquired(
+            job_id, self._node_id.full, previous_leader_id, lease_fence_token
         )
         await self._udp_logger.log(
             ServerInfo(
@@ -4220,6 +4552,9 @@ class GateServer(HealthAwareServer):
                 transfer.dump(),
                 timeout=self.env.GATE_TCP_TIMEOUT_STANDARD,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
             if not response:
                 return
             ack = JobLeaderGateTransferAck.load(response)
@@ -4253,8 +4588,7 @@ class GateServer(HealthAwareServer):
     async def _handle_job_leader_failure(self, tcp_addr: tuple[str, int]) -> None:
         orphaned_job_ids = await self._mark_confirmed_orphans_for_dead_gate(tcp_addr)
         if orphaned_job_ids:
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerInfo(
                     message=f"Marked {len(orphaned_job_ids)} jobs as orphaned from failed gate {tcp_addr}",
                     node_host=self._host,
@@ -4319,15 +4653,6 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             ),
         )
-
-    async def _check_gate_raft_leader_takeover(self, job_id: str) -> None:
-        """Deprecated per-job Raft takeover hook.
-
-        Gate job leadership is independent of SWIM cluster leadership during
-        steady state, but failover is coordinated only by the SWIM cluster
-        leader through the gate replica quorum-commit path.
-        """
-        return
 
     async def _scan_for_orphaned_gate_jobs(self) -> None:
         """Scan for orphaned gate jobs from dead gate peers.
@@ -4424,12 +4749,19 @@ class GateServer(HealthAwareServer):
         *,
         use_version_clock: bool = True,
     ) -> tuple[str, tuple[str, int]] | None:
-        return await self._health_coordinator.ingest_manager_heartbeat(
+        ingested = await self._health_coordinator.ingest_manager_heartbeat(
             heartbeat,
             source_addr,
             manager_addr,
             use_version_clock=use_version_clock,
         )
+        # A datacenter this gate learned from its managers -- one that
+        # joined this gate, or registered with it -- has its membership
+        # followed from here on, like one the gate joined (AD-52 section
+        # 10); not after ``stop`` cleared the watches.
+        if ingested is not None:
+            self._watch_datacenter_membership(ingested[0])
+        return ingested
 
     async def _handle_gate_peer_heartbeat(
         self,
@@ -4437,6 +4769,8 @@ class GateServer(HealthAwareServer):
         udp_addr: tuple[str, int],
     ) -> None:
         """Handle gate peer heartbeat from SWIM."""
+        if heartbeat.tcp_host and heartbeat.tcp_port:
+            self._modular_state.record_gate_peer_heartbeat((heartbeat.tcp_host, heartbeat.tcp_port))
         if heartbeat.node_id and heartbeat.tcp_host and heartbeat.tcp_port:
             gate_info = GateInfo(
                 node_id=heartbeat.node_id,
@@ -4482,10 +4816,15 @@ class GateServer(HealthAwareServer):
         )
 
     def _get_expected_forward_throughput(self) -> float:
-        return 100.0
+        """AD-19 progress: the dispatches this gate attempted per second,
+        against which the accepted ones (its throughput) are judged."""
+        return self._modular_state.get_forward_attempt_rate()
 
     def _record_forward_throughput_event(self) -> None:
         self._task_runner.run(self._modular_state.record_forward)
+
+    def _record_forward_attempt_event(self) -> None:
+        self._task_runner.run(self._modular_state.record_forward_attempt)
 
     def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
         return self._health_coordinator.classify_datacenter_health(dc_id)
@@ -4493,12 +4832,11 @@ class GateServer(HealthAwareServer):
     def _get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
         return self._health_coordinator.get_all_datacenter_health()
 
-    def _log_health_transitions(self) -> None:
+    async def _log_health_transitions(self) -> None:
         transitions = self._dc_health_manager.get_and_clear_health_transitions()
         for dc_id, previous_health, new_health in transitions:
             if new_health in ("degraded", "unhealthy"):
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerWarning(
                         message=f"DC {dc_id} health changed: {previous_health} -> {new_health}",
                         node_host=self._host,
@@ -4509,8 +4847,7 @@ class GateServer(HealthAwareServer):
 
                 status = self._dc_health_manager.get_datacenter_health(dc_id)
                 if getattr(status, "leader_overloaded", False):
-                    self._task_runner.run(
-                        self._udp_logger.log,
+                    await self._udp_logger.log(
                         ServerWarning(
                             message=f"ALERT: DC {dc_id} leader manager is OVERLOADED - control plane saturated",
                             node_host=self._host,
@@ -4519,25 +4856,55 @@ class GateServer(HealthAwareServer):
                         ),
                     )
 
-    def _select_datacenters_with_fallback(
+    async def _select_datacenters_with_fallback(
         self,
         count: int,
-        preferred: list[str] | None = None,
-        job_id: str | None = None,
+        preferred: list[str] | None,
+        job_id: str,
     ) -> tuple[list[str], list[str], str]:
         """The datacenters to place a job in: its primaries, fallbacks and
-        their worst health bucket.
+        the worst health bucket among the primaries.
 
-        While a datacenter the job could use has not reported yet, a
-        selection short of ``count`` is refused as "initializing" (the
-        client retries): placing the job in fewer datacenters than it
-        asked for, because one was still starting, would silently shrink
-        it.
+        The AD-36 router decides alone. While a datacenter the job could
+        use has not reported yet, a selection short of ``count`` is
+        refused as "initializing" (the client retries): placing the job in
+        fewer datacenters than it asked for, because one was still
+        starting, would silently shrink it. With no eligible datacenter at
+        all the job is refused as "unhealthy".
         """
-        primary, fallback, worst_health = self._route_datacenters(count, preferred, job_id)
-        if len(primary) < count and self._has_initializing_datacenter(preferred):
+        decision = self._job_router.route_job(
+            job_id,
+            count,
+            set(preferred) if preferred else None,
+        )
+        if len(decision.primary_datacenters) < count and self._has_initializing_datacenter(
+            preferred
+        ):
             return ([], [], "initializing")
-        return (primary, fallback, worst_health)
+        if decision.worst_primary_health_bucket is None:
+            return ([], [], "unhealthy")
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    f"Routed job {job_id[:8]}... to DCs {decision.primary_datacenters} "
+                    f"(worst bucket={decision.worst_primary_health_bucket}, "
+                    f"fallbacks={decision.fallback_datacenters}, "
+                    f"scores={ {datacenter_id: round(score.final_score, 3) for datacenter_id, score in decision.scores.items()} }, "
+                    f"excluded={ {datacenter_id: reason.value for datacenter_id, reason in decision.exclusions.items()} }, "
+                    f"cooling={sorted(decision.cooling_datacenters)})"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
+
+        return (
+            decision.primary_datacenters,
+            decision.fallback_datacenters,
+            decision.worst_primary_health_bucket.lower(),
+        )
 
     def _has_initializing_datacenter(self, preferred: list[str] | None) -> bool:
         """Whether a datacenter in the job's scope has not reported yet."""
@@ -4547,59 +4914,6 @@ class GateServer(HealthAwareServer):
             for datacenter_id, status in self._get_all_datacenter_health().items()
             if in_scope is None or datacenter_id in in_scope
         )
-
-    def _route_datacenters(
-        self,
-        count: int,
-        preferred: list[str] | None,
-        job_id: str | None,
-    ) -> tuple[list[str], list[str], str]:
-        if job_id is None:
-            return self._legacy_select_datacenters(count, preferred)
-
-        preferred_set = set(preferred) if preferred else None
-        decision = self._job_router.route_job(job_id, preferred_set)
-
-        if not decision.primary_datacenters:
-            return self._legacy_select_datacenters(count, preferred)
-
-        primary = decision.primary_datacenters[:count]
-        fallback = decision.fallback_datacenters
-
-        health_bucket = decision.primary_bucket or "healthy"
-
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=(
-                    f"Routed job {job_id[:8]}... to DCs {primary} "
-                    f"(bucket={health_bucket}, reason={decision.reason}, "
-                    f"fallbacks={fallback})"
-                ),
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short if self._node_id else "unknown",
-            ),
-        )
-
-        return (primary, fallback, health_bucket.lower())
-
-    def _legacy_select_datacenters(
-        self,
-        count: int,
-        preferred: list[str] | None = None,
-    ) -> tuple[list[str], list[str], str]:
-        dc_health = self._get_all_datacenter_health()
-        return self._health_coordinator.legacy_select_datacenters(
-            count,
-            dc_health,
-            len(self._datacenter_managers),
-            preferred,
-        )
-
-    def _build_datacenter_candidates(self) -> list[DatacenterCandidate]:
-        datacenter_ids = list(self._datacenter_managers.keys())
-        return self._health_coordinator.build_datacenter_candidates(datacenter_ids)
 
     async def _check_rate_limit_for_operation(
         self,
@@ -4625,6 +4939,35 @@ class GateServer(HealthAwareServer):
     def _is_clock_fenced(self) -> bool:
         return self._clock_offset_monitor.is_fenced
 
+    def _refuses_leadership_for_a_ready_peer(self) -> bool:
+        """AD-19: a gate that cannot do a leader's work -- no reachable
+        datacenter, or shedding load -- leaves leadership to a live peer
+        whose latest heartbeat says it can. When no peer can, every gate
+        stands as usual: refusing everywhere would leave the tier without
+        a leader exactly when one is needed (a global datacenter outage).
+        """
+        connected_datacenter_count = self._count_active_datacenters()
+        if GateHealthState(
+            gate_id=self._node_id.full,
+            has_dc_connectivity=connected_datacenter_count > 0,
+            connected_dc_count=connected_datacenter_count,
+            overload_state=self._gate_health_state,
+        ).readiness:
+            return False
+
+        for _udp_addr, heartbeat in self._modular_state.iter_gate_peer_heartbeats():
+            if not self._modular_state.is_peer_active((heartbeat.tcp_host, heartbeat.tcp_port)):
+                continue
+            if GateHealthState(
+                gate_id=heartbeat.node_id,
+                has_dc_connectivity=heartbeat.health_has_dc_connectivity,
+                connected_dc_count=heartbeat.health_connected_dc_count,
+                overload_state=heartbeat.health_overload_state,
+            ).readiness:
+                return True
+
+        return False
+
     def _may_lead(self) -> bool:
         return not self._clock_offset_monitor.is_fenced
 
@@ -4634,14 +4977,80 @@ class GateServer(HealthAwareServer):
         if verdict.fenced and self.is_leader():
             self._task_runner.run(self._leader_election._step_down)
 
+    def _declare_datacenter_managers(
+        self,
+        datacenter_id: str,
+        manager_addrs: list[tuple[str, int]],
+    ) -> None:
+        """Record operator-declared managers, which the stale-manager reaper
+        keeps in their datacenter's address lists."""
+        self._declared_datacenter_managers[datacenter_id] = self._declared_datacenter_managers.get(
+            datacenter_id, frozenset()
+        ).union(manager_addrs)
+
+    def _forget_learned_manager_addresses(self, manager_addr: tuple[str, int]) -> None:
+        """Remove a retired, runtime-learned manager from its datacenter's
+        address lists, which count the datacenter's expected managers.
+        Declared managers stay; a manager that returns is re-learned
+        from its next heartbeat."""
+        for datacenter_id, manager_addrs in self._datacenter_managers.items():
+            if manager_addr not in manager_addrs or manager_addr in (
+                self._declared_datacenter_managers.get(datacenter_id, frozenset())
+            ):
+                continue
+
+            heartbeat = self._modular_state.get_manager_status(datacenter_id, manager_addr)
+            manager_addrs.remove(manager_addr)
+            if heartbeat is None or not heartbeat.udp_host:
+                continue
+
+            udp_addrs = self._datacenter_manager_udp.get(datacenter_id, [])
+            if (udp_addr := (heartbeat.udp_host, heartbeat.udp_port)) in udp_addrs:
+                udp_addrs.remove(udp_addr)
+
+    def _get_election_member_count(self) -> int:
+        """The gate tier's SWIM election uses the one cluster size every
+        gate quorum decision uses. The base class counts every same-role
+        peer ever seen, a count that only grew."""
+        return self._configured_gate_count()
+
+    def _is_election_cohort_voter(self, voter_udp_address: tuple[str, int]) -> bool:
+        """Only the gate cohort votes (Raft section 5.2): a gate outside it
+        -- removed, or never in it -- cannot carry a minority of the cohort
+        to a majority."""
+        return self._modular_state.get_tcp_addr_for_udp(voter_udp_address) in self._cluster_membership.cohort
+
     def _configured_gate_count(self) -> int:
-        """The gate cluster size every quorum decision uses: this gate plus
-        every peer it is configured with, knows of, or holds active."""
+        """The gate cluster size every quorum decision uses: the gate
+        cohort -- this gate and the peers it was configured with, until a
+        committed resize changes it (AD-52) -- or more, while it knows of
+        or holds active more peers than that."""
         return max(
             1,
             self._modular_state.get_known_gate_count() + 1,
-            len(self._gate_peers) + 1,
+            len(self._cluster_membership.cohort),
             self._modular_state.get_active_peer_count() + 1,
+        )
+
+    def _on_cohort_change(self, cohort: frozenset[tuple[str, int]]) -> None:
+        """A committed resize changed the gate cohort (AD-52
+        ``ResizeCluster``): job groups count its majority, and clock offsets
+        are measured to its members. Quorum decisions read the cohort as
+        they count."""
+        self._raft.set_cohort_size(self._configured_gate_count())
+        self._clock_probe_peers = {
+            f"{peer_host}:{peer_port}": (peer_host, peer_port)
+            for peer_host, peer_port in cohort
+            if (peer_host, peer_port) != (self._host, self._tcp_port)
+        }
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate cohort resized to {sorted(cohort)}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
         )
 
     def _get_healthy_gates(self) -> list[GateInfo]:
@@ -4708,7 +5117,7 @@ class GateServer(HealthAwareServer):
 
         return self._modular_state.get_job_dc_managers(job_id).get(datacenter)
 
-    def _validate_manager_result_producer(
+    async def _validate_manager_result_producer(
         self,
         push: WorkflowResultPush,
     ) -> bytes | None:
@@ -4723,8 +5132,7 @@ class GateServer(HealthAwareServer):
                 expected_manager_addr is not None
                 and producer_addr != expected_manager_addr
             ):
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerDebug(
                         message=(
                             f"Rejecting workflow result for {push.job_id}: "
@@ -4745,8 +5153,7 @@ class GateServer(HealthAwareServer):
         if known_term <= 0 or push.manager_fence_token >= known_term:
             return None
 
-        self._task_runner.run(
-            self._udp_logger.log,
+        await self._udp_logger.log(
             ServerDebug(
                 message=(
                     f"Rejecting workflow result for {push.job_id}: producer "
@@ -4760,7 +5167,7 @@ class GateServer(HealthAwareServer):
         )
         return b"stale_producer"
 
-    def _validate_gate_result_producer(
+    async def _validate_gate_result_producer(
         self,
         push: WorkflowResultPush,
     ) -> bytes | None:
@@ -4772,8 +5179,7 @@ class GateServer(HealthAwareServer):
         if push.gate_fence_token >= current_fence:
             return None
 
-        self._task_runner.run(
-            self._udp_logger.log,
+        await self._udp_logger.log(
             ServerDebug(
                 message=(
                     f"Rejecting workflow result for {push.job_id}: gate "
@@ -4787,15 +5193,15 @@ class GateServer(HealthAwareServer):
         )
         return b"stale_producer"
 
-    def _validate_workflow_result_producer(
+    async def _validate_workflow_result_producer(
         self,
         push: WorkflowResultPush,
     ) -> bytes | None:
         """Validate producer provenance for a workflow result push."""
         if push.producer_role == "manager":
-            return self._validate_manager_result_producer(push)
+            return await self._validate_manager_result_producer(push)
         if push.producer_role == "gate":
-            return self._validate_gate_result_producer(push)
+            return await self._validate_gate_result_producer(push)
         return None
 
     def _resolve_job_callback(
@@ -4885,12 +5291,15 @@ class GateServer(HealthAwareServer):
 
                 circuit = await self._peer_gate_circuit_breaker.get_circuit(owner_addr)
                 try:
-                    await self.send_tcp(
+                    response, _ = await self.send_tcp(
                         owner_addr,
                         "receive_job_progress",
                         progress.dump(),
                         timeout=self._tcp_timeout_forward,
                     )
+                    # send_tcp returns transport errors rather than raising.
+                    if isinstance(response, Exception):
+                        raise response
                     circuit.record_success()
                     return True
                 except Exception as forward_error:
@@ -4938,7 +5347,7 @@ class GateServer(HealthAwareServer):
         progress_data: bytes | None = None,
     ) -> None:
         """Handle update by tier (AD-15)."""
-        tier = self._classify_update_tier(job_id, old_status, new_status)
+        tier = self._stats_coordinator.classify_update_tier(job_id, old_status, new_status)
 
         if tier == UpdateTier.IMMEDIATE.value:
             self._task_runner.run(
@@ -4947,31 +5356,6 @@ class GateServer(HealthAwareServer):
                 f"status:{old_status}->{new_status}",
                 progress_data,
             )
-
-    def _classify_update_tier(
-        self,
-        job_id: str,
-        old_status: str | None,
-        new_status: str,
-    ) -> str:
-        """Classify update tier."""
-        terminal_states = {
-            JobStatus.COMPLETED.value,
-            JobStatus.FAILED.value,
-            JobStatus.CANCELLED.value,
-            JobStatus.TIMEOUT.value,
-        }
-
-        if new_status in terminal_states:
-            return UpdateTier.IMMEDIATE.value
-
-        if old_status is None and new_status == JobStatus.RUNNING.value:
-            return UpdateTier.IMMEDIATE.value
-
-        if old_status != new_status:
-            return UpdateTier.IMMEDIATE.value
-
-        return UpdateTier.PERIODIC.value
 
     async def _replay_job_status_to_callback(
         self,
@@ -5038,25 +5422,8 @@ class GateServer(HealthAwareServer):
             )
             await self._stats_coordinator.send_progress_replay(job_id)
             await self._stats_coordinator.push_windowed_stats_for_job(job_id)
-            await self._replay_pending_workflow_results(job_id)
         except Exception as error:
             await self.handle_exception(error, "replay_job_status_to_callback")
-
-    async def _replay_pending_workflow_results(self, job_id: str) -> None:
-        async with self._workflow_dc_results_lock:
-            workflow_results = self._workflow_dc_results.get(job_id, {})
-            results_snapshot = {
-                workflow_id: dict(dc_results)
-                for workflow_id, dc_results in workflow_results.items()
-            }
-
-        for workflow_id, dc_results in results_snapshot.items():
-            if dc_results:
-                await self._forward_aggregated_workflow_result(
-                    job_id,
-                    workflow_id,
-                    dc_results,
-                )
 
     async def _send_immediate_update(
         self,
@@ -5183,12 +5550,15 @@ class GateServer(HealthAwareServer):
 
             circuit = await self._peer_gate_circuit_breaker.get_circuit(peer_addr)
             try:
-                await self.send_tcp(
+                response, _ = await self.send_tcp(
                     peer_addr,
                     "manager_discovery",
                     broadcast.dump(),
                     timeout=self._tcp_timeout_short,
                 )
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response, Exception):
+                    raise response
                 circuit.record_success()
             except Exception as discovery_error:
                 circuit.record_failure()
@@ -5213,8 +5583,13 @@ class GateServer(HealthAwareServer):
             }
             for job_id, workflow_results in self._workflow_dc_results.items()
         }
+        # ``is_leader`` and ``term`` are required: without them building the
+        # snapshot raised TypeError, and every state-sync request a peer
+        # gate made was answered with an error.
         return GateStateSnapshot(
             node_id=self._node_id.full,
+            is_leader=self.is_leader(),
+            term=self._leader_election.state.current_term,
             version=self._modular_state.get_state_version(),
             jobs={job_id: job for job_id, job in self._job_manager.items()},
             datacenter_managers=dict(self._datacenter_managers),
@@ -5306,28 +5681,6 @@ class GateServer(HealthAwareServer):
             )
             return False
 
-    def register_partition_detected_callback(
-        self,
-        callback: Callable[[list[str]], None],
-    ) -> None:
-        """Register a callback invoked when partitions are detected."""
-        self._partition_detected_callbacks.append(callback)
-
-    def register_partition_healed_callback(
-        self,
-        callback: Callable[[list[str]], None],
-    ) -> None:
-        """Register a callback invoked when partitions are healed."""
-        self._partition_healed_callbacks.append(callback)
-
-    def _notify_partition_reroute(self, job_ids: list[str]) -> None:
-        for job_id in job_ids:
-            self._task_runner.run(
-                self._send_immediate_update,
-                job_id,
-                "partition_reroute",
-            )
-
     def _on_dc_health_change(self, datacenter: str, new_health: str) -> None:
         """Handle DC health change."""
         self._task_runner.run(
@@ -5341,20 +5694,6 @@ class GateServer(HealthAwareServer):
         )
 
     def _on_partition_detected(self, affected_datacenters: list[str]) -> None:
-        for callback in self._partition_detected_callbacks:
-            try:
-                callback(affected_datacenters)
-            except Exception as error:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=f"Partition detected callback failed: {error}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    ),
-                )
-
         self._task_runner.run(
             self._udp_logger.log,
             ServerWarning(
@@ -5367,20 +5706,6 @@ class GateServer(HealthAwareServer):
 
     def _on_partition_healed(self, healed_datacenters: list[str]) -> None:
         """Handle partition healed notifications."""
-        for callback in self._partition_healed_callbacks:
-            try:
-                callback(healed_datacenters)
-            except Exception as error:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=f"Partition healed callback failed: {error}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    ),
-                )
-
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -5401,13 +5726,12 @@ class GateServer(HealthAwareServer):
             probe_type="federated",
         )
 
-    def _on_federated_probe_error(
+    async def _on_federated_probe_error(
         self,
         error_message: str,
         affected_datacenters: list[str],
     ) -> None:
-        self._task_runner.run(
-            self._udp_logger.log,
+        await self._udp_logger.log(
             ServerWarning(
                 message=f"Federated health probe error: {error_message} "
                 f"(DCs: {affected_datacenters})",
@@ -5509,18 +5833,20 @@ class GateServer(HealthAwareServer):
 
             circuit = await self._peer_gate_circuit_breaker.get_circuit(peer_addr)
             try:
-                await self.send_tcp(
+                response, _ = await self.send_tcp(
                     peer_addr,
                     "dc_leader_announcement",
                     announcement.dump(),
                     timeout=self._tcp_timeout_short,
                 )
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response, Exception):
+                    raise response
                 circuit.record_success()
                 broadcast_count += 1
             except Exception as error:
                 circuit.record_failure()
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerDebug(
                         message=f"Failed DC leader announcement to {peer_addr}: {error}",
                         node_host=self._host,
@@ -5539,79 +5865,6 @@ class GateServer(HealthAwareServer):
                 ),
             )
 
-    async def _forward_workflow_result_to_peers(self, push: WorkflowResultPush) -> bool:
-        candidates = await self._job_hash_ring.get_nodes(push.job_id, count=3)
-
-        for candidate in candidates:
-            if candidate.node_id == self._node_id.full:
-                continue
-
-            gate_addr = (candidate.tcp_host, candidate.tcp_port)
-            if await self._peer_gate_circuit_breaker.is_circuit_open(gate_addr):
-                continue
-
-            circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
-            try:
-                response, _ = await self.send_tcp(
-                    gate_addr,
-                    "workflow_result_push",
-                    push.dump(),
-                    timeout=self._tcp_timeout_forward,
-                )
-                if response not in (b"ok", b"stored", None):
-                    raise RuntimeError(
-                        f"workflow_result_push rejected with {response!r}"
-                    )
-                circuit.record_success()
-                return True
-            except Exception as push_error:
-                circuit.record_failure()
-                await self._udp_logger.log(
-                    ServerDebug(
-                        message=f"Failed to push result to candidate gate: {push_error}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                continue
-
-        for gate_id, gate_info in list(self._modular_state.iter_known_gates()):
-            if gate_id == self._node_id.full:
-                continue
-
-            gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
-            if await self._peer_gate_circuit_breaker.is_circuit_open(gate_addr):
-                continue
-
-            circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
-            try:
-                response, _ = await self.send_tcp(
-                    gate_addr,
-                    "workflow_result_push",
-                    push.dump(),
-                    timeout=self._tcp_timeout_forward,
-                )
-                if response not in (b"ok", b"stored", None):
-                    raise RuntimeError(
-                        f"workflow_result_push rejected with {response!r}"
-                    )
-                circuit.record_success()
-                return True
-            except Exception as fallback_push_error:
-                circuit.record_failure()
-                await self._udp_logger.log(
-                    ServerDebug(
-                        message=f"Failed to push result to fallback gate: {fallback_push_error}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                continue
-
-        return False
-
     async def _forward_job_final_result_to_peers(self, data: bytes) -> bool:
         for gate_id, gate_info in list(self._modular_state.iter_known_gates()):
             if gate_id == self._node_id.full:
@@ -5625,11 +5878,14 @@ class GateServer(HealthAwareServer):
             try:
                 response, _ = await self.send_tcp(
                     gate_addr,
-                    "job_final_result",
+                    "job_final_result_forwarded",
                     data,
                     timeout=self._tcp_timeout_forward,
                 )
-                if response in (b"ok", b"forwarded"):
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response, Exception):
+                    raise response
+                if response in (b"ok", b"already_completed"):
                     circuit.record_success()
                     return True
             except Exception as forward_error:
@@ -5637,47 +5893,6 @@ class GateServer(HealthAwareServer):
                 await self._udp_logger.log(
                     ServerDebug(
                         message=f"Failed to forward job final result to gate: {forward_error}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                continue
-
-        return False
-
-    async def _forward_job_final_result_to_peer_callbacks(
-        self,
-        job_id: str,
-        data: bytes,
-    ) -> bool:
-        for gate_id, gate_info in list(self._modular_state.iter_known_gates()):
-            if gate_id == self._node_id.full:
-                continue
-
-            gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
-            if await self._peer_gate_circuit_breaker.is_circuit_open(gate_addr):
-                continue
-
-            circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
-            try:
-                response, _ = await self.send_tcp(
-                    gate_addr,
-                    "job_final_result_forward",
-                    data,
-                    timeout=self._tcp_timeout_forward,
-                )
-                if response in (b"ok", b"forwarded"):
-                    circuit.record_success()
-                    return True
-            except Exception as forward_error:
-                circuit.record_failure()
-                await self._udp_logger.log(
-                    ServerDebug(
-                        message=(
-                            f"Failed to forward job final result for {job_id} to gate "
-                            f"{gate_id}: {forward_error}"
-                        ),
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
@@ -5715,6 +5930,9 @@ class GateServer(HealthAwareServer):
                     push_data,
                     timeout=self._tcp_timeout_forward,
                 )
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response, Exception):
+                    raise response
                 if response in (b"ok", None):
                     circuit.record_success()
                     return True
@@ -5856,9 +6074,17 @@ class GateServer(HealthAwareServer):
         if not workflow_results:
             return
 
-        target_dcs = self._job_manager.get_target_dcs(job_id)
-        missing_dcs = set(target_dcs) if target_dcs else set()
-        missing_dcs -= set(workflow_results.keys())
+        # Any stored result names the workflow, counted or not.
+        stored_results = workflow_results
+        expected_dcs = self._job_manager.expected_workflow_datacenters(job_id, workflow_id)
+        if expected_dcs:
+            # Stored before the job moved off its datacenter.
+            workflow_results = {
+                datacenter: result
+                for datacenter, result in stored_results.items()
+                if datacenter in expected_dcs
+            }
+        missing_dcs = set(expected_dcs) - set(workflow_results.keys())
         if not missing_dcs and expected_dc_count > len(workflow_results):
             missing_count = expected_dc_count - len(workflow_results)
             missing_dcs = {
@@ -5879,9 +6105,9 @@ class GateServer(HealthAwareServer):
                 )
             )
 
-            first_push = next(iter(workflow_results.values()))
+            first_push = next(iter(stored_results.values()))
             fence_token = max(
-                dc_push.fence_token for dc_push in workflow_results.values()
+                dc_push.fence_token for dc_push in stored_results.values()
             )
             for datacenter in missing_dcs:
                 workflow_results[datacenter] = self._build_missing_workflow_result(
@@ -5902,6 +6128,11 @@ class GateServer(HealthAwareServer):
         job_id: str,
         workflow_id: str,
     ) -> tuple[dict[str, WorkflowResultPush], str | None]:
+        """Take a workflow's per-datacenter results for its one aggregate:
+        the workflow is finalized here, under the results lock, so a push
+        arriving while the aggregate is recorded is acked, not stored to be
+        aggregated a second time. Caller holds ``_workflow_dc_results_lock``."""
+        self._finalized_workflow_results.add((job_id, workflow_id))
         job_results = self._workflow_dc_results.get(job_id, {})
         workflow_results = job_results.pop(workflow_id, {})
         if not job_results and job_id in self._workflow_dc_results:
@@ -5927,6 +6158,7 @@ class GateServer(HealthAwareServer):
         dc_push: WorkflowResultPush,
         is_test_workflow: bool,
         workflow_stats: list[WorkflowStats],
+        rerun_of: str,
     ) -> WorkflowDCResult:
         if is_test_workflow:
             dc_aggregated_stats: WorkflowStats | None = None
@@ -5941,6 +6173,7 @@ class GateServer(HealthAwareServer):
                 stats=dc_aggregated_stats,
                 error=dc_push.error,
                 elapsed_seconds=dc_push.elapsed_seconds,
+                rerun_of=rerun_of,
             )
 
         return WorkflowDCResult(
@@ -5950,6 +6183,7 @@ class GateServer(HealthAwareServer):
             error=dc_push.error,
             elapsed_seconds=dc_push.elapsed_seconds,
             raw_results=workflow_stats,
+            rerun_of=rerun_of,
         )
 
     def _normalize_workflow_result_stats(self, results: object) -> list[WorkflowStats]:
@@ -5971,6 +6205,7 @@ class GateServer(HealthAwareServer):
 
     def _aggregate_workflow_results(
         self,
+        job_id: str,
         workflow_results: dict[str, WorkflowResultPush],
         is_test_workflow: bool,
     ) -> tuple[
@@ -6003,6 +6238,9 @@ class GateServer(HealthAwareServer):
                     dc_push,
                     is_test_workflow,
                     dc_workflow_stats,
+                    # A replacement holds only the slots its lost datacenter
+                    # passed on: each result it delivers re-ran that share.
+                    self._job_manager.rerun_origin(job_id, datacenter) or "",
                 )
             )
 
@@ -6235,8 +6473,16 @@ class GateServer(HealthAwareServer):
                 self._normalize_final_status(missing_result.status)
             )
 
-        total_completed = sum(result.total_completed for result in ordered_results)
-        total_failed = sum(result.total_failed for result in ordered_results)
+        # AD-36: a datacenter lost mid-job did its work until it was lost
+        # -- counted with the rest -- and its replacement's final result
+        # stands among the others for its share.
+        substitutions = self._job_manager.get_datacenter_substitutions(job_id)
+        total_completed = sum(result.total_completed for result in ordered_results) + sum(
+            substitution.total_completed for substitution in substitutions
+        )
+        total_failed = sum(result.total_failed for result in ordered_results) + sum(
+            substitution.total_failed for substitution in substitutions
+        )
 
         status = self._resolve_global_result_status(normalized_statuses)
 
@@ -6257,7 +6503,155 @@ class GateServer(HealthAwareServer):
             failed_datacenters=failed_datacenters,
             errors=errors,
             elapsed_seconds=max_elapsed,
+            datacenter_substitutions=substitutions,
         )
+
+    async def _on_job_dispatched(
+        self,
+        submission: JobSubmission,
+        dispatched_datacenters: list[str],
+    ) -> None:
+        """The job is placed. Its datacenters -- those that took it, which
+        a fallback or spillover may have changed -- and those its dispatch
+        released go to peer gates in its replica, so a gate taking it over
+        awaits results from where it runs; per-workflow results a dropped
+        slot left complete are aggregated; AD-44 tracking starts."""
+        job_id = submission.job_id
+        await self._replicate_job_placement(
+            job_id,
+            sorted(self._job_manager.get_target_dcs(job_id)),
+            self._job_manager.get_datacenter_substitutions(job_id),
+            sorted(self._job_manager.get_released_datacenters(job_id)),
+        )
+        await self._aggregate_complete_workflow_results(job_id)
+        await self._start_best_effort_tracking(submission, dispatched_datacenters)
+
+    async def _replicate_job_placement(
+        self,
+        job_id: str,
+        target_dcs: list[str],
+        substitutions: list[DatacenterSubstitution],
+        released_datacenters: list[str],
+    ) -> bool:
+        """Commit a placement of the job -- its datacenters, its lost
+        datacenters' substitutions, the datacenters it released -- to a
+        quorum of peer gates (True when they hold it already). Built on
+        the replica committed last, with the job's current status (the
+        replica's own would roll this gate's back); committed, it is this
+        gate's placement too."""
+        job = self._job_manager.get_job(job_id)
+        if job is None or self._replication_coordinator.get_committed_replica(job_id) is None:
+            return False
+
+        def revise(committed: GateJobReplica) -> GateJobReplica | None:
+            if (
+                sorted(committed.target_dcs),
+                committed.datacenter_substitutions,
+                sorted(committed.released_datacenters),
+            ) == (target_dcs, substitutions, released_datacenters):
+                return None
+            return dataclasses.replace(
+                committed,
+                target_dcs=target_dcs,
+                target_dc_count=len(target_dcs),
+                datacenter_substitutions=substitutions,
+                released_datacenters=released_datacenters,
+                status_seed=job.status,
+            )
+
+        replicated = await self._replication_coordinator.revise_committed_replica(
+            job_id,
+            revise,
+            peer_addrs=list(self._modular_state.get_active_peers_list()),
+            quorum_size=self._quorum_size(),
+        )
+        if not replicated:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Placement of job {job_id[:8]}... (datacenters {target_dcs}) "
+                        "did not reach a quorum of peer gates"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        return replicated
+
+    async def _delivered_workflow_ids(self, job_id: str, datacenter: str) -> set[str]:
+        """The job's workflows whose results need nothing more from
+        ``datacenter``: those it delivered a result for, and those already
+        aggregated (with or without it)."""
+        async with self._workflow_dc_results_lock:
+            return {
+                workflow_id
+                for workflow_id, datacenter_results in self._workflow_dc_results.get(
+                    job_id, {}
+                ).items()
+                if datacenter in datacenter_results
+            } | {
+                workflow_id
+                for finalized_job_id, workflow_id in self._finalized_workflow_results
+                if finalized_job_id == job_id
+            }
+
+    async def _release_workflow_result_timeouts(
+        self, job_id: str, workflow_ids: set[str]
+    ) -> None:
+        """Stop the per-workflow result timeouts of these workflows of the
+        job: their result slots moved to a datacenter re-running them."""
+        async with self._workflow_dc_results_lock:
+            timeout_tokens = [
+                timeout_token
+                for workflow_id in workflow_ids
+                if (
+                    timeout_token := self._pop_workflow_timeout_token_locked(
+                        job_id, workflow_id
+                    )
+                )
+                is not None
+            ]
+        for timeout_token in timeout_tokens:
+            await self._cancel_workflow_result_timeout(timeout_token)
+
+    async def _aggregate_complete_workflow_results(self, job_id: str) -> None:
+        """Aggregate each of the job's stored workflow results whose
+        datacenters have all reported. After the job's placement changed,
+        a workflow's last awaited result may be one stored already, or
+        from a slot that is gone -- and no push is coming to aggregate it
+        but its timeout's."""
+        ready_workflows: list[tuple[str, dict[str, WorkflowResultPush], str | None]] = []
+        async with self._workflow_dc_results_lock:
+            for workflow_id, datacenter_results in list(
+                self._workflow_dc_results.get(job_id, {}).items()
+            ):
+                expected_dcs = self._job_manager.expected_workflow_datacenters(
+                    job_id, workflow_id
+                )
+                if not expected_dcs or not set(datacenter_results) >= expected_dcs:
+                    continue
+                workflow_results, timeout_token = self._pop_workflow_results_locked(
+                    job_id, workflow_id
+                )
+                ready_workflows.append(
+                    (
+                        workflow_id,
+                        {
+                            datacenter: result
+                            for datacenter, result in workflow_results.items()
+                            if datacenter in expected_dcs
+                        },
+                        timeout_token,
+                    )
+                )
+
+        for workflow_id, workflow_results, timeout_token in ready_workflows:
+            if timeout_token:
+                await self._cancel_workflow_result_timeout(timeout_token)
+            await self._forward_aggregated_workflow_result(
+                job_id, workflow_id, workflow_results
+            )
 
     async def _start_best_effort_tracking(
         self,
@@ -6355,11 +6749,14 @@ class GateServer(HealthAwareServer):
         reason: str,
     ) -> None:
         """AD-44: the job completed without these datacenters -- cancel what
-        they still run, and release the per-workflow results that were
-        waiting on them so those are delivered from the datacenters that
-        reported."""
+        they still run (the per-workflow results that were waiting on them
+        were released when the job completed)."""
         manager_addresses = dict(self._modular_state.get_job_dc_managers(job_id))
         await self._cancel_job_for_timeout(job_id, reason, datacenters, manager_addresses)
+
+    async def _release_workflow_results(self, job_id: str) -> None:
+        """Deliver every per-workflow result of the job still waiting on a
+        datacenter, from the datacenters that reported."""
         for workflow_id in list(self._workflow_dc_results.get(job_id, {})):
             await self._aggregate_and_forward_workflow_result(job_id, workflow_id)
 
@@ -6376,6 +6773,24 @@ class GateServer(HealthAwareServer):
             # manager are validated separately. Mixing the two drops
             # legitimate completed work whenever a gate takeover
             # landed before the manager learned the new fence.
+
+            target_dcs = set(self._job_manager.get_target_dcs(result.job_id))
+            if target_dcs and result.datacenter not in target_dcs:
+                # A datacenter the job moved off -- lost and replaced, or
+                # released at dispatch: its result is not the job's (the
+                # replacement's is), and it was told to stop.
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=(
+                            f"Dropped final result of job {result.job_id[:8]}... from "
+                            f"DC {result.datacenter}: the job runs in {sorted(target_dcs)}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return None
 
             self._job_manager.set_dc_result(result.job_id, result.datacenter, result)
 
@@ -6400,7 +6815,6 @@ class GateServer(HealthAwareServer):
                     result.job_id, per_dc_results, reason, success
                 )
 
-            target_dcs = set(self._job_manager.get_target_dcs(result.job_id))
             missing_dcs = target_dcs - set(per_dc_results.keys())
             if target_dcs and missing_dcs:
                 normalized_statuses = [
@@ -6411,12 +6825,6 @@ class GateServer(HealthAwareServer):
                     return None
 
         return self._build_global_job_result(result.job_id, per_dc_results, target_dcs)
-
-    async def _maybe_push_global_job_result(self, result: JobFinalResult) -> None:
-        global_result = await self._record_job_final_result(result)
-        if not global_result:
-            return
-        await self._push_global_job_result(global_result)
 
     async def _aggregate_and_forward_workflow_result(
         self,
@@ -6440,7 +6848,12 @@ class GateServer(HealthAwareServer):
         job_id: str,
         workflow_id: str,
         workflow_results: dict[str, WorkflowResultPush],
-    ) -> bool:
+    ) -> None:
+        """Record a workflow's one aggregate for the job's client and send
+        it on. The record is what is owed: it is replayed when the client's
+        callback (re)registers, so a send that fails -- or a job with no
+        callback yet -- loses nothing (the results it was built from are
+        already taken)."""
         first_dc_push = next(iter(workflow_results.values()))
         is_test_workflow = first_dc_push.is_test
         fence_token = max(dc_push.fence_token for dc_push in workflow_results.values())
@@ -6454,7 +6867,7 @@ class GateServer(HealthAwareServer):
             max_elapsed,
             completed_datacenters,
             failed_datacenters,
-        ) = self._aggregate_workflow_results(workflow_results, is_test_workflow)
+        ) = self._aggregate_workflow_results(job_id, workflow_results, is_test_workflow)
 
         status = JobStatus.FAILED.value if has_failure else JobStatus.COMPLETED.value
         if (
@@ -6488,38 +6901,48 @@ class GateServer(HealthAwareServer):
             **self._data_plane_provenance(job_id),
         )
 
-        if callback:
-            self._record_job_callback(job_id, callback)
-            payload = client_push.dump()
-            delivered = await self._record_and_send_client_update(
-                job_id,
-                callback,
-                "workflow_result_push",
-                payload,
-                timeout=self._tcp_timeout_standard,
-                log_failure=False,
-            )
-            if not delivered:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=f"Failed to send workflow result to client {callback}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    ),
-                )
-            return delivered
-
-        await self._udp_logger.log(
-            ServerWarning(
-                message=f"Failed to send workflow result for {job_id}: no callback",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
+        payload = client_push.dump()
+        sequence = await self._modular_state.record_client_update(
+            job_id,
+            "workflow_result_push",
+            payload,
+            self._clock.monotonic(),
         )
-        return False
+        if callback is None:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Workflow result for {job_id} recorded with no callback "
+                        "to send it to: it goes out when one registers"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        self._record_job_callback(job_id, callback)
+        if not await self._deliver_client_update(
+            job_id,
+            callback,
+            sequence,
+            "workflow_result_push",
+            payload,
+            timeout=self._tcp_timeout_standard,
+            log_failure=False,
+        ):
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to send workflow result to client {callback}: "
+                        "it is replayed when its callback re-registers"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _query_all_datacenters(
         self,
@@ -6536,7 +6959,10 @@ class GateServer(HealthAwareServer):
                     request.dump(),
                     timeout=self._tcp_timeout_standard,
                 )
-                if isinstance(response_data, Exception) or response_data == b"error":
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response_data, Exception):
+                    raise response_data
+                if response_data == b"error":
                     return
 
                 manager_response = WorkflowQueryResponse.load(response_data)
@@ -6659,6 +7085,9 @@ class GateServer(HealthAwareServer):
                 request.dump(),
                 timeout=self._tcp_timeout_standard,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(result, Exception):
+                raise result
 
             if isinstance(result, bytes) and len(result) > 0:
                 response = GateStateSyncResponse.load(result)
@@ -6718,6 +7147,224 @@ class GateServer(HealthAwareServer):
                 f"manager {target_addr[0]}:{target_addr[1]} refused registration: "
                 f"{registration.error}"
             )
+
+        await self._join_datacenter_managers(target_addr, registration)
+
+    async def _restore_joined_managers(self) -> None:
+        """Add the managers saved by earlier runs' joins to their
+        datacenters' address lists."""
+        if self._wal_data_dir is None:
+            return
+
+        self._joined_peer_store = JoinedPeerStore(
+            Path(self._wal_data_dir),
+            _DEFAULT_FILESYSTEM,
+            self._udp_logger,
+            self._host,
+            self._tcp_port,
+        )
+        for joined_manager in await self._joined_peer_store.load():
+            self._declare_datacenter_managers(joined_manager.datacenter, [joined_manager.tcp_address])
+            manager_addrs = self._datacenter_managers.setdefault(joined_manager.datacenter, [])
+            if joined_manager.tcp_address not in manager_addrs:
+                manager_addrs.append(joined_manager.tcp_address)
+
+            udp_addrs = self._datacenter_manager_udp.setdefault(joined_manager.datacenter, [])
+            if joined_manager.udp_address not in udp_addrs:
+                udp_addrs.append(joined_manager.udp_address)
+
+    async def _join_datacenter_managers(
+        self,
+        joined_manager_addr: tuple[str, int],
+        registration: GateRegistrationResponse,
+    ) -> None:
+        """Learn every healthy manager the joined manager reported for its
+        datacenter, and register with each one not yet known, so every
+        manager of the datacenter heartbeats this gate -- not only the
+        one the operator named. The joined managers are declared: they
+        stay expected members of the datacenter, across restarts too."""
+        datacenter_id = registration.datacenter
+        # Its membership is followed from here on (AD-52 section 10).
+        self._watch_datacenter_membership(datacenter_id)
+        manager_addrs = self._datacenter_managers.setdefault(datacenter_id, [])
+        udp_addrs = self._datacenter_manager_udp.setdefault(datacenter_id, [])
+        self._declare_datacenter_managers(
+            datacenter_id,
+            [(manager_info.tcp_host, manager_info.tcp_port) for manager_info in registration.healthy_managers],
+        )
+
+        if self._joined_peer_store is not None:
+            await self._joined_peer_store.add(
+                [
+                    JoinedPeer(
+                        datacenter=datacenter_id,
+                        tcp_address=(manager_info.tcp_host, manager_info.tcp_port),
+                        udp_address=(manager_info.udp_host, manager_info.udp_port),
+                    )
+                    for manager_info in registration.healthy_managers
+                ]
+            )
+
+        for manager_info in registration.healthy_managers:
+            manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+            if (udp_addr := (manager_info.udp_host, manager_info.udp_port)) not in udp_addrs:
+                udp_addrs.append(udp_addr)
+
+            if manager_addr in manager_addrs:
+                continue
+
+            manager_addrs.append(manager_addr)
+            if manager_addr == joined_manager_addr:
+                continue
+
+            try:
+                peer_registration = await self._register_with_manager(manager_addr)
+                if not peer_registration.accepted:
+                    raise ClusterJoinError(
+                        f"registration refused: {peer_registration.error}"
+                    )
+
+            except ClusterJoinError as register_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Joined {datacenter_id} through {joined_manager_addr}, "
+                            f"but its manager {manager_addr} did not take this "
+                            f"gate's registration: {register_error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    def _watch_datacenter_membership(self, datacenter_id: str) -> None:
+        """Follow ``datacenter_id``'s manager membership (AD-52 sections
+        9-10) into its soft-state cache, from the managers this gate knows
+        there; each change reconciles the datacenter's manager lists. Not
+        once ``stop`` cleared the watches: a late heartbeat starts none."""
+        if datacenter_id in self._datacenter_watches or not self._running:
+            return
+        request_timeout_seconds = float(self.env.GATE_TCP_TIMEOUT_STANDARD)
+        cache = ClusterViewCache(
+            poll_wait_seconds=self.env.CLUSTER_WATCH_WAIT_SECONDS,
+            request_timeout_seconds=request_timeout_seconds,
+        )
+        follower = ClusterWatchFollower(
+            cache,
+            seeds=lambda watched_datacenter=datacenter_id: self._datacenter_managers.get(watched_datacenter, []),
+            send_watch=self._send_datacenter_watch,
+            clock=self._clock,
+            poll_wait_seconds=self.env.CLUSTER_WATCH_WAIT_SECONDS,
+            request_timeout_seconds=request_timeout_seconds,
+            on_view_changed=lambda view, watched_datacenter=datacenter_id: self._task_runner.run(
+                self._reconcile_datacenter_managers, watched_datacenter, view
+            ),
+            on_disconnected_changed=lambda disconnected, watched_datacenter=datacenter_id: self._udp_logger.log(
+                ClusterWatchConnectivityChanged(
+                    message=(
+                        f"Lost {watched_datacenter}'s manager membership: routing it by the view last observed"
+                        if disconnected
+                        else f"Following {watched_datacenter}'s manager membership"
+                    ),
+                    node_id=self._node_id.short,
+                    watched=watched_datacenter,
+                    disconnected=disconnected,
+                    staleness_seconds=cache.read(self._clock.monotonic())[1],
+                    level=LogLevel.WARN if disconnected else LogLevel.INFO,
+                )
+            ),
+        )
+        self._datacenter_views[datacenter_id] = cache
+        self._datacenter_watches[datacenter_id] = follower
+        self._task_runner.run(follower.run, alias=f"datacenter-watch-{datacenter_id}")
+
+    async def _send_datacenter_watch(
+        self,
+        manager_addr: tuple[str, int],
+        payload: bytes,
+        timeout: float,
+    ) -> bytes | Exception | None:
+        response, _clock = await self._send_tcp(manager_addr, "cluster_watch", payload, timeout=timeout)
+        return response
+
+    async def _reconcile_datacenter_managers(self, datacenter_id: str, view: ClusterView) -> None:
+        """A datacenter's watched membership changed: its cohort -- what the
+        datacenter's managers committed -- becomes the managers this gate
+        routes to there. An address the cohort dropped is forgotten (here
+        and for restarts); one it added is registered with, so it
+        heartbeats this gate. Answering as a different cluster than before
+        -- the datacenter was founded again -- forgets what this gate
+        learned of its old incarnation."""
+        previous_cluster_uuid = self._datacenter_cluster_uuids.get(datacenter_id)
+        if view.cluster_uuid is not None:
+            # Recorded before any wait, so of two reconciliations of the
+            # new cluster's views only the first forgets.
+            self._datacenter_cluster_uuids[datacenter_id] = view.cluster_uuid
+        if previous_cluster_uuid is not None and view.cluster_uuid not in (None, previous_cluster_uuid):
+            await self._observed_latency_tracker.remove_datacenter(datacenter_id)
+            self._slo_health_classifier.forget(datacenter_id)
+            await self._udp_logger.log(
+                DatacenterRegenerated(
+                    message=(
+                        f"{datacenter_id} answers as cluster {view.cluster_uuid}, not {previous_cluster_uuid}: "
+                        "forgot its observed latency and SLO violations"
+                    ),
+                    node_id=self._node_id.short,
+                    datacenter_id=datacenter_id,
+                    previous_cluster_uuid=previous_cluster_uuid,
+                    cluster_uuid=view.cluster_uuid,
+                )
+            )
+        if not view.cohort:
+            return
+        manager_addrs = self._datacenter_managers.setdefault(datacenter_id, [])
+        departed = [manager_addr for manager_addr in manager_addrs if manager_addr not in view.cohort]
+        arrived = [manager_addr for manager_addr in sorted(view.cohort) if manager_addr not in manager_addrs]
+        self._declared_datacenter_managers[datacenter_id] = view.cohort
+        if departed or arrived:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        f"{datacenter_id}'s manager membership changed: joined "
+                        f"{[f'{host}:{port}' for host, port in arrived]}, left "
+                        f"{[f'{host}:{port}' for host, port in departed]}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        for manager_addr in departed:
+            self._forget_learned_manager_addresses(manager_addr)
+        if departed and self._joined_peer_store is not None:
+            await self._joined_peer_store.remove(departed)
+
+        udp_addrs = self._datacenter_manager_udp.setdefault(datacenter_id, [])
+        for manager_addr in arrived:
+            manager_addrs.append(manager_addr)
+            try:
+                registration = await self._register_with_manager(manager_addr)
+                if not registration.accepted:
+                    raise ClusterJoinError(f"registration refused: {registration.error}")
+            except ClusterJoinError as register_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"{datacenter_id}'s membership added manager {manager_addr}, which did not "
+                            f"take this gate's registration: {register_error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
+            for manager_info in registration.healthy_managers:
+                if (manager_info.tcp_host, manager_info.tcp_port) == manager_addr and (
+                    udp_addr := (manager_info.udp_host, manager_info.udp_port)
+                ) not in udp_addrs:
+                    udp_addrs.append(udp_addr)
 
     async def _register_with_manager(
         self,
@@ -6817,22 +7464,19 @@ class GateServer(HealthAwareServer):
         for job_id, job in list(self._job_manager.items()):
             if not status_order.is_terminal(job.status):
                 continue
-            age = now - getattr(job, "timestamp", now)
-            if age > self._job_max_age:
+            # Retained for the max age after it ended -- measured from when
+            # this gate first found it terminal, however it ended (here, or
+            # learned from a peer): its timestamp is its submission.
+            if now - self._job_manager.terminal_since(job_id, now) > self._job_max_age:
                 jobs_to_remove.append(job_id)
 
         return jobs_to_remove
 
-    def _cancel_reporter_tasks(self, tasks: dict[str, asyncio.Task] | None) -> None:
-        if not tasks:
-            return
-        for task in tasks.values():
-            if task and not task.done():
-                task.cancel()
-
     async def _cleanup_single_job(self, job_id: str) -> None:
         await self._raft.consensus.destroy_job_raft(job_id)
         self._job_manager.delete_job(job_id)
+        # Never released, every job's lock stayed for the gate's lifetime.
+        self._job_manager.cleanup_job_lock(job_id)
         workflow_timeout_tokens: dict[str, str] | None = None
         async with self._workflow_dc_results_lock:
             self._workflow_dc_results.pop(job_id, None)
@@ -6840,16 +7484,13 @@ class GateServer(HealthAwareServer):
             workflow_timeout_tokens = self._workflow_result_timeout_tokens.pop(
                 job_id, None
             )
-            # Drop any finalized result-sequence rows for this job.
-            # Bounded by the number of in-flight triples for the job;
-            # in practice O(workflows × DCs).
-            finalized_keys = [
-                key
-                for key in self._finalized_workflow_result_sequences
-                if key[0] == job_id
-            ]
-            for key in finalized_keys:
-                self._finalized_workflow_result_sequences.pop(key, None)
+            # Drop the job's finalized workflows (one row per workflow).
+            for finalized_workflow in [
+                finalized_workflow
+                for finalized_workflow in self._finalized_workflow_results
+                if finalized_workflow[0] == job_id
+            ]:
+                self._finalized_workflow_results.discard(finalized_workflow)
         if workflow_timeout_tokens:
             await self._cancel_workflow_result_timeouts(workflow_timeout_tokens)
         if self._job_final_statuses:
@@ -6866,16 +7507,13 @@ class GateServer(HealthAwareServer):
 
         self._job_stats_crdt.pop(job_id, None)
 
-        state_reporter_tasks = self._modular_state.pop_job_reporter_tasks(job_id)
-        self._cancel_reporter_tasks(state_reporter_tasks)
-
         self._task_runner.run(self._windowed_stats.cleanup_job_windows, job_id)
-        await self._dispatch_time_tracker.remove_job(job_id)
         self._job_router.cleanup_job_state(job_id)
 
         self._modular_state.cleanup_job_progress_tracking(job_id)
         await self._modular_state.cleanup_job_update_state(job_id)
         self._replication_coordinator.clear_for_job(job_id)
+        self._job_failover_coordinator.forget_job(job_id)
 
     async def _job_cleanup_loop(self) -> None:
         while self._running:
@@ -6944,9 +7582,9 @@ class GateServer(HealthAwareServer):
         Background loop for periodic CPU/memory sampling.
 
         Samples gate resource usage and feeds HybridOverloadDetector for overload
-        state classification. Runs at 1s cadence for responsive detection.
+        state classification, every OVERLOAD_SAMPLE_INTERVAL_SECONDS.
         """
-        sample_interval = 1.0
+        sample_interval = self.env.OVERLOAD_SAMPLE_INTERVAL_SECONDS
 
         while self._running:
             try:
@@ -6964,7 +7602,7 @@ class GateServer(HealthAwareServer):
                 if new_state_str != self._gate_health_state:
                     self._previous_gate_health_state = self._gate_health_state
                     self._gate_health_state = new_state_str
-                    self._log_gate_health_transition(
+                    await self._log_gate_health_transition(
                         self._previous_gate_health_state,
                         new_state_str,
                     )
@@ -6981,15 +7619,14 @@ class GateServer(HealthAwareServer):
                     )
                 )
 
-    def _log_gate_health_transition(self, previous_state: str, new_state: str) -> None:
+    async def _log_gate_health_transition(self, previous_state: str, new_state: str) -> None:
         state_severity = {"healthy": 0, "busy": 1, "stressed": 2, "overloaded": 3}
         previous_severity = state_severity.get(previous_state, 0)
         new_severity = state_severity.get(new_state, 0)
         is_degradation = new_severity > previous_severity
 
         if is_degradation:
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerWarning(
                     message=f"Gate health degraded: {previous_state} -> {new_state}",
                     node_host=self._host,
@@ -6998,8 +7635,7 @@ class GateServer(HealthAwareServer):
                 ),
             )
         else:
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerDebug(
                     message=f"Gate health improved: {previous_state} -> {new_state}",
                     node_host=self._host,
@@ -7013,6 +7649,8 @@ class GateServer(HealthAwareServer):
         self._peer_discovery.decay_failures()
 
     async def _cleanup_stale_manager(self, manager_addr: tuple[str, int]) -> None:
+        # Before its heartbeat is dropped: it names the manager's UDP address.
+        self._forget_learned_manager_addresses(manager_addr)
         await self._modular_state.remove_manager(manager_addr)
         self._manager_selector.forget_manager(manager_addr)
         await self._clear_manager_backpressure(manager_addr)
@@ -7037,13 +7675,34 @@ class GateServer(HealthAwareServer):
                 for manager_addr in stale_manager_addrs:
                     await self._cleanup_stale_manager(manager_addr)
 
-                await self._dispatch_time_tracker.cleanup_stale_entries()
-                await self._observed_latency_tracker.cleanup_stale_entries()
+                if forgotten_datacenters := await self._observed_latency_tracker.cleanup_stale_entries():
+                    await self._udp_logger.log(
+                        StaleObservationsDecayed(
+                            message=(
+                                f"Observed latency of {', '.join(forgotten_datacenters)} decayed to no "
+                                "confidence: routing them by prediction alone"
+                            ),
+                            datacenter_ids=forgotten_datacenters,
+                        )
+                    )
 
             except asyncio.CancelledError:
                 break
             except Exception as error:
                 await self.handle_exception(error, "discovery_maintenance_loop")
+
+    async def _datacenter_correlation_loop(self) -> None:
+        """AD-33 Part 6: every datacenter's health, sampled into the
+        cross-datacenter correlation detector each heartbeat interval --
+        the fastest a datacenter's classification can change."""
+        while self._running:
+            try:
+                await self._clock.sleep(self.env.MANAGER_HEARTBEAT_INTERVAL)
+                self._health_coordinator.sample_datacenter_correlation()
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self.handle_exception(error, "datacenter_correlation_loop")
 
     async def _dead_peer_reap_loop(self) -> None:
         while self._running:
@@ -7068,8 +7727,7 @@ class GateServer(HealthAwareServer):
                     await self._modular_state.remove_active_peer(peer_addr)
                     self._modular_state.mark_peer_dead(peer_addr, now)
 
-                    self._task_runner.run(
-                        self._udp_logger.log,
+                    await self._udp_logger.log(
                         ServerInfo(
                             message=f"Reaped dead gate peer {peer_addr[0]}:{peer_addr[1]}",
                             node_host=self._host,
@@ -7078,8 +7736,7 @@ class GateServer(HealthAwareServer):
                         ),
                     )
 
-                    self._task_runner.run(
-                        self._udp_logger.log,
+                    await self._udp_logger.log(
                         ServerDebug(
                             message=(
                                 "Removed gate peer from unhealthy tracking during reap: "
@@ -7107,8 +7764,7 @@ class GateServer(HealthAwareServer):
                         await self._versioned_clock.remove_entity(gate_id)
                     await self._peer_gate_circuit_breaker.remove_circuit(peer_addr)
 
-                    self._task_runner.run(
-                        self._udp_logger.log,
+                    await self._udp_logger.log(
                         ServerDebug(
                             message=(
                                 "Completed dead peer cleanup for gate "
@@ -7122,7 +7778,7 @@ class GateServer(HealthAwareServer):
 
                 await self._check_quorum_status()
 
-                self._log_health_transitions()
+                await self._log_health_transitions()
 
                 await self._checkpoint_ledger_if_due()
 
@@ -7163,7 +7819,7 @@ class GateServer(HealthAwareServer):
         machinery (manager-rejoin watch + eviction-notice nudge): on
         the dead-peer check cadence, every CONFIGURED peer this gate
         holds DEAD is liveness-verified over TCP (the same
-        ``receive_gate_ping`` proof ``authorize_rejoin_reset`` trusts
+        ``ping`` proof ``authorize_rejoin_reset`` trusts
         for inbound JOINs); on proof of life the peer is re-admitted
         through the established rejoin composite and a fresh JOIN is
         sent so a one-sidedly evicted peer re-admits US symmetrically.
@@ -7199,8 +7855,9 @@ class GateServer(HealthAwareServer):
             # seed OK at the rejoin incarnation (also re-gossips ALIVE
             # so third parties supersede their stale DEAD entries),
             # re-enrol in the probe rotation, and drive the canonical
-            # join pipeline (dead-addr clear, raft rejoin, peer
-            # recovery -> active-peer restoration + state sync).
+            # join pipeline (dead-addr clear, peer recovery -> active-peer
+            # restoration + state sync). Its Raft membership is the gate
+            # tier's membership group's to change (AD-52), not this path's.
             await self._ingest_gate_peer_info(gate_info)
             await self.reset_peer_for_rejoin(udp_addr)
             self._probe_scheduler.add_member(udp_addr)
@@ -7239,8 +7896,7 @@ class GateServer(HealthAwareServer):
                 >= self._quorum_stepdown_consecutive_failures
                 and self._leader_election.state.is_leader()
             ):
-                self._task_runner.run(
-                    self._udp_logger.log,
+                await self._udp_logger.log(
                     ServerWarning(
                         message=f"Quorum lost ({active_peer_count}/{known_gate_count} active, "
                         f"need {quorum_size}). Stepping down as leader after "
@@ -7378,11 +8034,190 @@ class GateServer(HealthAwareServer):
             await self._raft.handle_append_entries_response(data)
         return b""
 
+    # =========================================================================
+    # Cluster Membership Group TCP Handlers (AD-52 slice C)
+    # =========================================================================
+
+    @tcp.receive()
+    async def cluster_hello(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Answer a founder's greeting with where this node stands in its
+        cluster's formation. Nothing
+        answers before the gate accepts requests: its peers' rounds wait."""
+        if not self._accepting_requests:
+            return b""
+        return await self._cluster_membership.handle_hello(data)
+
+    @tcp.receive()
+    async def found_cluster(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Adopt a proposed founding that names this node, if it holds no
+        membership group."""
+        if not self._accepting_requests:
+            return b""
+        return await self._cluster_membership.handle_found(data)
+
+    @tcp.receive()
+    async def cluster_join(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Take a node of the cohort into the formed cluster (leader only)."""
+        if not self._accepting_requests:
+            return b""
+        return await self._cluster_membership.handle_join(data)
+
+    @tcp.receive()
+    async def cluster_mode(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Set the cluster's mode: open, frozen or read-only (AD-52
+        section 13)."""
+        if not self._accepting_requests:
+            return b""
+        return await self._cluster_membership.handle_mode(data)
+
+    @tcp.receive()
+    async def cluster_resize(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Add an address to the cluster's cohort, or remove one (AD-52
+        ``ResizeCluster``)."""
+        if not self._accepting_requests:
+            return b""
+        return await self._cluster_membership.handle_resize(data)
+
+    @tcp.receive()
+    async def cluster_status(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """The cluster's membership as of now -- a linearizable read (AD-52
+        section 11)."""
+        if not self._accepting_requests:
+            return b""
+        return await self._cluster_membership.handle_status(data)
+
+    @tcp.receive()
+    async def cluster_watch(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """A membership watch's long poll (AD-52 section 9)."""
+        if not self._accepting_requests:
+            return b""
+        return await self._cluster_membership.handle_watch(data)
+
+    @tcp.receive()
+    async def cluster_metrics(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """This node's metrics of its cluster's membership (AD-52 section
+        18), with its AD-45 route learning per datacenter."""
+        if not self._accepting_requests:
+            return b""
+        if not (membership_metrics := await self._cluster_membership.handle_metrics(data)):
+            return membership_metrics
+        reply = ClusterMetricsReply.load(membership_metrics)
+        observed_by_datacenter = self._observed_latency_tracker.get_metrics()["per_dc"]
+        blended_by_datacenter = self._latency_estimator.estimate(self._datacenter_managers.keys())
+        for datacenter_id, blended_latency_ms in blended_by_datacenter.items():
+            observed_latency_ms, confidence = self._blended_scorer.get_observed_latency(datacenter_id)
+            reply.route_learning[datacenter_id] = {
+                "observed_latency_ms": observed_latency_ms,
+                "blended_latency_ms": blended_latency_ms,
+                "confidence": confidence,
+                "sample_count": float(observed_by_datacenter.get(datacenter_id, {}).get("sample_count", 0)),
+            }
+        reply.routing = self._job_router.get_metrics()
+        now = self._clock.monotonic()
+        for datacenter_id, cache in self._datacenter_views.items():
+            watched_view, staleness_seconds = cache.read(now)
+            reply.datacenter_watches[datacenter_id] = {
+                "staleness_seconds": staleness_seconds,
+                "disconnected": float(cache.is_disconnected(now)),
+                "applied_index": float(watched_view.applied_index),
+            }
+        return reply.dump()
+
+    @tcp.receive()
+    async def cluster_leave(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Release a member's address: a member draining itself, or an
+        operator removing one that is gone (AD-52 section 13)."""
+        if not self._accepting_requests:
+            return b""
+        return await self._cluster_membership.handle_leave(data)
+
+    @tcp.receive()
+    async def cluster_raft_request_vote(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle the membership group's RequestVote."""
+        if not self._accepting_requests:
+            return b""
+        response = await self._cluster_membership.handle_request_vote(data)
+        return response if response is not None else b""
+
+    @tcp.receive()
+    async def cluster_raft_append_entries(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle the membership group's AppendEntries."""
+        if not self._accepting_requests:
+            return b""
+        response = await self._cluster_membership.handle_append_entries(data)
+        return response if response is not None else b""
+
+    @tcp.receive()
+    async def cluster_raft_install_snapshot(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Install the membership group's snapshot from its leader."""
+        if not self._accepting_requests:
+            return b""
+        response = await self._cluster_membership.handle_install_snapshot(data)
+        return response if response is not None else b""
+
 
 __all__ = [
     "GateServer",
-    "GateConfig",
-    "create_gate_config",
     "GateRuntimeState",
     "GateStatsCoordinator",
     "GateDispatchCoordinator",

@@ -5,12 +5,16 @@ Handles manager registration, health tracking, and peer management.
 """
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import ManagerInfo
 from hyperscale.distributed.swim.core import ErrorStats, CircuitState
 
 from hyperscale.distributed.runtime import Clock, RealClock
+
+from .models.manager_circuit_lookup_error import ManagerCircuitLookupError
+from .models.manager_circuit_status import ManagerCircuitStatus
+from .models.manager_circuit_summary import ManagerCircuitSummary
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -35,6 +39,7 @@ class WorkerRegistry:
         recovery_semaphore_size: int = 5,
         *,
         select_manager: Callable[[set[str]], str | None],
+        circuit_breaker_config: dict[str, int | float],
     ) -> None:
         """
         Initialize worker registry.
@@ -47,9 +52,12 @@ class WorkerRegistry:
             select_manager: AD-28 selection over a set of healthy manager
                 ids (weighted rendezvous + power of two choices + EWMA);
                 returns the chosen id or None when it cannot choose
+            circuit_breaker_config: The configured breaker for each manager
+                link (``Env.get_circuit_breaker_config``)
         """
         self._logger: "Logger" = logger
         self._select_manager: Callable[[set[str]], str | None] = select_manager
+        self._circuit_breaker_config = circuit_breaker_config
         self._recovery_jitter_min: float = recovery_jitter_min
         self._recovery_jitter_max: float = recovery_jitter_max
         self._recovery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
@@ -260,36 +268,16 @@ class WorkerRegistry:
             self._manager_addr_circuits.pop(manager_addr, None)
         self._signal_healthy_set_changed()
 
-    def get_or_create_circuit(
-        self,
-        manager_id: str,
-        error_threshold: int = 5,
-        error_rate_threshold: float = 0.5,
-        half_open_after: float = 30.0,
-    ) -> ErrorStats:
-        """Get or create a circuit breaker for a manager."""
+    def get_or_create_circuit(self, manager_id: str) -> ErrorStats:
+        """Get or create the configured circuit breaker for a manager."""
         if manager_id not in self._manager_circuits:
-            self._manager_circuits[manager_id] = ErrorStats(
-                error_threshold=error_threshold,
-                error_rate_threshold=error_rate_threshold,
-                half_open_after=half_open_after,
-            )
+            self._manager_circuits[manager_id] = ErrorStats(**self._circuit_breaker_config)
         return self._manager_circuits[manager_id]
 
-    def get_or_create_circuit_by_addr(
-        self,
-        addr: tuple[str, int],
-        error_threshold: int = 5,
-        error_rate_threshold: float = 0.5,
-        half_open_after: float = 30.0,
-    ) -> ErrorStats:
-        """Get or create a circuit breaker by manager address."""
+    def get_or_create_circuit_by_addr(self, addr: tuple[str, int]) -> ErrorStats:
+        """Get or create the configured circuit breaker by manager address."""
         if addr not in self._manager_addr_circuits:
-            self._manager_addr_circuits[addr] = ErrorStats(
-                error_threshold=error_threshold,
-                error_rate_threshold=error_rate_threshold,
-                half_open_after=half_open_after,
-            )
+            self._manager_addr_circuits[addr] = ErrorStats(**self._circuit_breaker_config)
         return self._manager_addr_circuits[addr]
 
     def is_circuit_open(self, manager_id: str) -> bool:
@@ -304,7 +292,9 @@ class WorkerRegistry:
             return circuit.circuit_state == CircuitState.OPEN
         return False
 
-    def get_circuit_status(self, manager_id: str | None = None) -> dict[str, Any]:
+    def get_circuit_status(
+        self, manager_id: str | None = None
+    ) -> ManagerCircuitStatus | ManagerCircuitLookupError | ManagerCircuitSummary:
         """Get circuit breaker status for a specific manager or summary."""
         if manager_id:
             if not (circuit := self._manager_circuits.get(manager_id)):

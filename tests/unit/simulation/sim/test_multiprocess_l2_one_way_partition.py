@@ -25,17 +25,21 @@ Traced mechanism the bounds derive from:
   times out at H+5-e, sleeps 5, and the next poll at H+10-e
   converges — the terminal must land in (H, H + 10.5].
 
-Measured on seed 97 (30s workflow, cut [40, 60)): baseline completion
-push at 45.782414 (submit 15.742414, execution 15.75 -> 45.75). Under
-the cut: the client's polls run at submit + 5k (20.74, 25.74, ...);
-polls at 40.74/50.74 time out at +5 and re-phase the cycle to 10s, so
-the first post-heal poll lands at 60.74 and the terminal converges at
-60.862414 — heal + 0.862, deep inside the 10.5s budget. The worker's
-drain sample moves 46.0 -> 51.5: the manager's completion handler
-awaits its (cut) client push inline for the full 5s send timeout, and
-the worker's final-result ack rides behind it — the cut client link
-back-pressures the worker drain by one push timeout, a mechanism this
-scenario deliberately leaves visible in the pinned worker log.
+Measured on seed 97 (30s workflow, cut [27, 47), re-probed 2026-10-04):
+baseline completion push at 32.729669 (submit 2.649669, execution 2.75
+-> 33.0). Under the cut the terminal push is lost and the poll fallback
+learns ``completed`` at 48.15 (heal + 1.15); the workflow's result push
+was lost in the cut too, so ``wait_for_job`` waits its result drain,
+asks the manager to replay what it kept for the client (results are
+kept until delivered), and returns at 52.77 -- heal + 5.77, inside the
+10.5s budget. The worker's drain sample moves 33.0 -> 38.25: the
+manager's completion handler awaits its (cut) client push inline for
+the full 5s send timeout, and the worker's final-result ack rides behind
+it -- the cut client link back-pressures the worker drain by one push
+timeout, a mechanism this scenario deliberately leaves visible in the
+pinned worker log. (Submission was 15.74 while the lone manager waited
+out a full pre-vote and vote wait for a majority its own vote already
+made; the cut was then [40, 60).)
 """
 
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
@@ -53,9 +57,9 @@ _SEED = 97
 _WORKFLOW_DURATION_SECONDS = 30.0
 # Baseline (fault-free) completion push instant for this seed, probed:
 # the cut is placed to STRADDLE it.
-_BASELINE_COMPLETION = 45.782414
-_CUT_AT = 40.0
-_HEAL_AT = 60.0
+_BASELINE_COMPLETION = 32.729669
+_CUT_AT = 27.0
+_HEAL_AT = 47.0
 _CEILING = 130.0
 # Poll-fallback convergence budget after heal: one straddling poll
 # timeout (5) + one poll sleep (5) + RTT slop.

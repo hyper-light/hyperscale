@@ -7,7 +7,6 @@ from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.snowflake.constants import MAX_INSTANCE
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 
-from .cancel import cancel
 from .task_hook import Task
 
 T = TypeVar("T")
@@ -76,14 +75,14 @@ class TaskRunner:
     def stop(
         self,
         task_name: str,
-        run_id: Optional[str] = None,
+        run_id: int,
     ):
-        """Stop a task's schedules — all of them, or only the schedule
-        started under ``run_id`` (concurrent runs must not stop each
-        other's schedules)."""
+        """Stop the task's schedule started under ``run_id`` -- only
+        that one: concurrent runs must not stop each other's
+        schedules."""
         task = self.tasks.get(task_name)
         if task:
-            task.stop(run_id=run_id)
+            task.stop(run_id)
 
     def get_task_status(self, task_name: str):
         if task := self.tasks.get(task_name):

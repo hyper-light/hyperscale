@@ -45,6 +45,18 @@ def test_setting_is_parsed_as_its_declared_type(field_name: str) -> None:
     assert any(types_map[field_name] is parser for parser in allowed_parsers), (field_name, types_map[field_name])
 
 
-@pytest.mark.parametrize("text", ["false", "False", "0", "no", "off"])
+@pytest.mark.parametrize("text", ["false", "False", "0", "no", "off", "N", " f "])
 def test_false_text_disables_a_boolean(text: str) -> None:
     assert parse_bool_envar(text) is False
+
+
+@pytest.mark.parametrize("text", ["true", "TRUE", "1", "yes", "on", "Y", " t "])
+def test_true_text_enables_a_boolean(text: str) -> None:
+    assert parse_bool_envar(text) is True
+
+
+@pytest.mark.parametrize("text", ["", "ture", "enabled", "2", "-1"])
+def test_text_that_is_not_a_boolean_is_refused(text: str) -> None:
+    # Read as False before: "ture" silently disabled the setting.
+    with pytest.raises(ValueError, match="invalid boolean"):
+        parse_bool_envar(text)

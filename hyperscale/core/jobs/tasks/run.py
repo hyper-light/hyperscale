@@ -48,13 +48,8 @@ class Run:
         self.elapsed = 0
         self.timeout = timeout
 
-        bound_instance = call.__self__
-
         self.call = call
         self.result: Any | None = None
-
-        self.call = self.call.__get__(bound_instance, self.call.__class__)
-        setattr(bound_instance, self.call.__name__, self.call)
 
         self._task: Optional[asyncio.Task] = None
 

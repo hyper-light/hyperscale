@@ -27,10 +27,12 @@ not kill in-flight work), the worker drains and stays registered to
 the ceiling (orphan cleanup must not poison worker health), and the
 whole timeline replays byte-identically.
 
-Measured (seed 311): dispatch 9.5, client killed 20.0, workflow drains
-75.25 (dispatch + 60s + push-failure slack — the completion push has
+Measured (seed 311): dispatch 4.0, client killed 20.0, workflow drains
+69.75 (dispatch + 60s + push-failure slack — the completion push has
 no live destination and fails loudly manager-side), worker-count holds
-1 from 3.5 to the 420 ceiling.
+1 from 3.5 to the 420 ceiling. Dispatch was 9.5 while the lone manager
+waited out a full pre-vote and vote wait for a majority its own vote
+already made (Raft section 5.2: a candidate leads once it holds one).
 """
 
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
@@ -50,8 +52,8 @@ _WORKFLOW_DURATION_SECONDS = 60.0
 _CLIENT_KILL_AT = 20.0
 # Nearly 3x the old ~vanish+150 spin instant: the ceiling IS the test.
 _CEILING = 420.0
-# Probed: dispatch 9.5 + 60s execution + completion-push failure slack.
-_NATURAL_DRAIN = 75.25
+# Probed: dispatch 4.0 + 60s execution + completion-push failure slack.
+_NATURAL_DRAIN = 69.75
 
 
 def _run_client_orphan() -> dict:

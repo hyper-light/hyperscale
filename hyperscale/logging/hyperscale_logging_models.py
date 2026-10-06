@@ -210,9 +210,12 @@ class SilentDropStats(Entry, kw_only=True):
     decompression_too_large_count: int
     decryption_failed_count: int
     malformed_message_count: int
+    replay_detected_count: int
     load_shed_count: int = (
         0  # AD-32: Messages dropped due to priority-based load shedding
     )
+    # Log records lost because the logger's own write failed.
+    log_write_failed_count: int
     total_dropped: int
     interval_seconds: float
     level: LogLevel = LogLevel.WARN
@@ -470,3 +473,152 @@ class WorkerExtensionDecision(Entry, kw_only=True):
     extension_seconds: float
     denial_reason: str
     level: LogLevel = LogLevel.DEBUG
+
+
+class WorkflowLifecycleTransitionTaken(Entry, kw_only=True):
+    manager_id: str
+    datacenter: str
+    job_id: str
+    workflow_id: str
+    from_state: str
+    to_state: str
+    reason: str
+    level: LogLevel = LogLevel.DEBUG
+
+
+class WorkflowLifecycleTransitionRefused(Entry, kw_only=True):
+    manager_id: str
+    datacenter: str
+    job_id: str
+    workflow_id: str
+    from_state: str
+    to_state: str
+    reason: str
+    level: LogLevel = LogLevel.WARN
+
+
+class WorkflowLifecycleCallbackFailed(Entry, kw_only=True):
+    manager_id: str
+    datacenter: str
+    job_id: str
+    workflow_id: str
+    error_type: str
+    level: LogLevel = LogLevel.ERROR
+
+
+class ClusterMembershipEvent(Entry, kw_only=True):
+    """A significant change in a cluster's membership, as one member applied
+    it (AD-52 section 18): ``event`` is ``member_added`` (as a learner),
+    ``member_promoted``, ``member_removed``, ``member_resumed`` (from its disk), ``leader_elected``,
+    ``cluster_formed``, ``mode_changed`` or ``cohort_resized``; ``subject``
+    names the member, mode or cohort. Together they let a membership
+    decision be reconstructed after the fact."""
+
+    node_id: str
+    cluster_uuid: str
+    event: str
+    subject: str
+    level: LogLevel = LogLevel.INFO
+
+
+class ClusterWatchConnectivityChanged(Entry, kw_only=True):
+    """AD-52 section 10: a node's watch of a cluster's membership lost the
+    cluster (``disconnected``: its view grew staler than a healthy watch
+    lets it, and is still served, aging) or reached it again. ``watched``
+    names what is watched -- a datacenter's managers, or this node's own
+    datacenter."""
+
+    node_id: str
+    watched: str
+    disconnected: bool
+    staleness_seconds: float
+    level: LogLevel = LogLevel.WARN
+
+
+class DatacenterRegenerated(Entry, kw_only=True):
+    """AD-52 section 10: a datacenter's managers answer as a different
+    cluster than before -- it was founded again -- so what this gate
+    learned of its old incarnation (observed latency, SLO violations under
+    way) is forgotten."""
+
+    node_id: str
+    datacenter_id: str
+    previous_cluster_uuid: str
+    cluster_uuid: str
+    level: LogLevel = LogLevel.WARN
+
+
+class RaftStoreOpened(Entry, kw_only=True):
+    """D1: a node opened its Raft store -- resumed under the identity on
+    its disk (``resumed``), or made a new one -- with how many groups it
+    recovered and how many bytes of a torn last record it dropped."""
+
+    node_id: str
+    path: str
+    resumed: bool
+    groups_recovered: int
+    torn_bytes_dropped: int
+    level: LogLevel = LogLevel.INFO
+
+
+class RaftStoreSetAside(Entry, kw_only=True):
+    """D1: a node's Raft store could not be trusted -- ``reason`` says why
+    -- and was moved to ``set_aside_path`` unread; the node starts under a
+    new identity, as a new member."""
+
+    node_id: str
+    path: str
+    set_aside_path: str
+    reason: str
+    level: LogLevel = LogLevel.ERROR
+
+
+class RaftStoreCompacted(Entry, kw_only=True):
+    """D1: a node's Raft store was rewritten with only what its live
+    groups need."""
+
+    node_id: str
+    path: str
+    bytes_reclaimed: int
+    live_bytes: int
+    level: LogLevel = LogLevel.DEBUG
+
+
+class RaftStoreCompactionFailed(Entry, kw_only=True):
+    """D1: a rewrite of a node's Raft store failed; the store is unchanged
+    (the rewrite is atomic) and the next compaction retries it."""
+
+    node_id: str
+    path: str
+    error: str
+    level: LogLevel = LogLevel.ERROR
+
+
+class ObservedLatencyRecorded(Entry, kw_only=True):
+    """AD-45: a datacenter's time to accept a dispatch, folded into the
+    gate's observed latency for it."""
+
+    datacenter_id: str
+    latency_ms: float
+    observed_latency_ms: float
+    sample_count: int
+    level: LogLevel = LogLevel.DEBUG
+
+
+class StaleObservationsDecayed(Entry, kw_only=True):
+    """AD-45: datacenters whose observed latency decayed to no confidence
+    (no sample within the staleness bound) and were forgotten -- routing
+    falls back to prediction alone for them."""
+
+    datacenter_ids: list[str]
+    level: LogLevel = LogLevel.INFO
+
+
+class JobLeaseExpiryCallbackFailed(Entry, kw_only=True):
+    """A job lease's expiry handling raised: the lease expired, but what was
+    to follow it (an orphan check, say) did not run for this job."""
+
+    node_id: str
+    job_id: str
+    error_type: str
+    level: LogLevel = LogLevel.ERROR

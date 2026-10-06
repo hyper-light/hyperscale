@@ -7,7 +7,7 @@ Why this exists
 
 Phase 5 seamed the wall clock, the RNG, and the transport; disk IO is
 the remaining environmental input. The production storage surface is
-eight components (survey order = durability rank): RaftWAL and NodeWAL
+eight components (survey order = durability rank): RaftStore and NodeWAL
 (both committing through the shared ``WALWriter`` group-commit fsync
 engine), the ManagerIdempotencyLedger's own WAL, the IncarnationStore,
 the CheckpointManager, the JobArchiveStore, the LoggerStream, and the

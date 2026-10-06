@@ -14,8 +14,9 @@ Pinned:
 * east/east/west: every gate mirrors the job's ledger events through the
   job's gate group; the leader's records reach GLOBAL (its global
   watermark equals its newest LSN: holders span two regions); every
-  group retires with the terminal and every gate releases the job within
-  retention + one cleanup interval + one sample of finishing.
+  group retires with the terminal and every gate keeps the job for its
+  retention after it saw the job end, then releases it within one cleanup
+  interval (and one sample of its watcher).
 * east/east/east: GLOBAL is unachievable, so it is never claimed — the
   records are REGIONAL (regional watermark == newest LSN, global 0) and
   the job still completes.
@@ -66,20 +67,26 @@ def test_two_region_tier_records_reach_global_and_every_gate_releases_the_job():
     assert (active, terminal) == (0, 1), results[leader]
     assert regional_lsn == global_lsn == synced_lsn, results[leader]
 
-    release_bound = (
-        finished_at
-        + _JOB_MAX_AGE_SECONDS
-        + _JOB_CLEANUP_INTERVAL_SECONDS
-        + WATCH_INTERVAL_SECONDS
-    )
     for host in GATE_HOSTS:
         log = results[host]
         assert max(count for count, _ in _rows(log, "replica-events")) >= 1, (host, log)
         assert _rows(log, "replica-events")[-1][0] == 0, (host, log)
         assert max(count for count, _ in _rows(log, "raft-groups")) == 1, (host, log)
-        assert _rows(log, "raft-groups")[-1][0] == 0, (host, log)
+        group_retired_count, group_retired_seen_at = _rows(log, "raft-groups")[-1]
+        assert group_retired_count == 0, (host, log)
+        # Retention runs from when THIS gate saw the job end -- a peer
+        # learns it through the job's group, which retires with the
+        # terminal, so no later than this gate's sample of the retirement
+        # (the client may see the end first). It releases one retention,
+        # at most one cleanup interval and one sample of its watcher later.
+        release_bound = (
+            group_retired_seen_at
+            + _JOB_MAX_AGE_SECONDS
+            + _JOB_CLEANUP_INTERVAL_SECONDS
+            + WATCH_INTERVAL_SECONDS
+        )
         final_jobs, released_at = _rows(log, "jobs")[-1]
-        assert final_jobs == 0 and released_at <= release_bound, (host, log)
+        assert final_jobs == 0 and finished_at + _JOB_MAX_AGE_SECONDS <= released_at <= release_bound, (host, log)
 
 
 def test_single_region_tier_never_claims_global():

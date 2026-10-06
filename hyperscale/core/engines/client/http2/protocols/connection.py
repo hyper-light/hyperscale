@@ -5,7 +5,6 @@ from typing import Iterator, Optional, Sequence, Tuple
 
 from hyperscale.core.engines.client.http2.frames import FrameBuffer
 from hyperscale.core.engines.client.http2.streams import Stream
-from hyperscale.core.engines.client.shared.protocols import _DEFAULT_LIMIT
 from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import SocketConfig
 
 from .tcp import TCPConnection
@@ -19,6 +18,7 @@ class HTTP2Connection:
         "stream_id",
         "stream",
         "connected",
+        "target",
         "reset_connections",
         "consecutive_read_timeouts",
         "_connection_factory",
@@ -43,6 +43,8 @@ class HTTP2Connection:
         )
 
         self.connected = False
+        # The origin (scheme and authority) the open transport serves.
+        self.target: Tuple[str, str] | None = None
         self.reset_connections = reset_connections
         # Read timeouts in a row on this transport; a second means it is dead.
         self.consecutive_read_timeouts = 0
@@ -73,47 +75,60 @@ class HTTP2Connection:
             self.port = port
             self.ssl = ssl
         else:
-            self.stream.update_stream_id()
+            # The next stream: client streams are odd (RFC 9113 5.1.1), and
+            # every id starts odd, so a step of two keeps it odd.
+            self.stream.stream_id += 2
 
     def reuse_transport(
         self,
+        target: Tuple[str, str],
         addresses: Sequence[Tuple[str, SocketConfig]],
-        port: int,
-        ssl_upgrade: bool = False,
     ) -> Optional[Tuple[str, SocketConfig]]:
         """
-        When this connection's transport already reaches one of ``addresses``
-        on ``port``, move to the next stream and return that address and its
-        socket config; otherwise None. Synchronous, so the common case -- a
-        request on an open connection -- awaits nothing.
+        When this connection's transport serves ``target`` (the request's
+        scheme and authority) at one of ``addresses``, move to the next
+        stream and return that address and its socket config; otherwise
+        None. Another host on the same address and port gets its own
+        transport: this one's TLS session names this host. Synchronous, so
+        the common case -- a request on an open connection -- awaits nothing.
         """
-        if self.connected and ssl_upgrade is False and self.port == port:
+        if self.connected and self.target == target:
+            # A transport the server closed while it sat in the pool -- its
+            # reader at the end of the stream, or holding the error -- is not
+            # reused: the request opens a new one.
+            reader = self.stream.reader
+            if reader is None or reader._eof or reader._exception is not None:
+                return None
+
             for address, socket_config in addresses:
                 if address == self.dns_address:
-                    self.stream.update_stream_id()
+                    # The next stream: client streams are odd (RFC 9113
+                    # 5.1.1), and every id starts odd, so a step of two keeps
+                    # it odd.
+                    self.stream.stream_id += 2
                     return address, socket_config
 
         return None
 
     async def connect_to_any(
         self,
+        target: Tuple[str, str],
         hostname: str,
         addresses: Sequence[Tuple[str, SocketConfig]],
         port: int,
         address_rotation: Iterator[int],
         ssl: Optional[SSLContext] = None,
-        ssl_upgrade: bool = False,
     ) -> Tuple[str, SocketConfig, bool]:
         """
-        Reuse this connection's transport when it already reaches one of the
-        host's ``addresses`` on ``port``. Otherwise open a new one, racing the
+        Reuse this connection's transport when it already serves ``target``
+        at one of the host's ``addresses``. Otherwise open a new one, racing the
         addresses (RFC 8305) from the next offset in ``address_rotation`` so
         a pool's connections spread across all of them.
 
         Returns the address and socket config connected to, and whether the
         transport is new.
         """
-        if (reused := self.reuse_transport(addresses, port, ssl_upgrade)) is not None:
+        if (reused := self.reuse_transport(target, addresses)) is not None:
             return *reused, False
 
         if not addresses:
@@ -138,36 +153,15 @@ class HTTP2Connection:
         self.stream.writer = writer
 
         self.connected = True
+        self.target = target
         self.dns_address = address
         self.port = port
         self.ssl = ssl
 
         return address, socket_config, True
 
-    @property
-    def empty(self):
-        return not self.stream.reader._buffer
-
-    def read(self, limit: int = _DEFAULT_LIMIT):
-        return self.stream.reader.read(n=_DEFAULT_LIMIT)
-
-    def readexactly(self, n_bytes: int):
-        return self.stream.reader.readexactly(n=n_bytes)
-
-    def readuntil(self, sep=b"\n"):
-        return self.stream.reader.readuntil(separator=sep)
-
-    def readline(self):
-        return self.stream.reader.readline()
-
     def write(self, data):
         self.stream.writer.write(data)
-
-    def reset_buffer(self):
-        self.stream.reader._buffer = bytearray()
-
-    def read_headers(self):
-        return self.stream.reader.read_headers()
 
     def close(self):
         if self.stream.reader:
@@ -183,6 +177,7 @@ class HTTP2Connection:
 
     def reset(self):
         self.connected = False
+        self.target = None
         self.consecutive_read_timeouts = 0
 
         # Bytes buffered from the old transport mean nothing on the next one.

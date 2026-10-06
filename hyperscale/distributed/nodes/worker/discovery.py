@@ -1,19 +1,12 @@
 """
 Worker discovery service manager (AD-28).
 
-Handles discovery service integration and maintenance loop
-for adaptive peer selection and DNS-based discovery.
+Handles discovery service integration for adaptive peer selection; the
+discovery maintenance (DNS, failure decay) runs in the worker's
+background loops.
 """
 
-import asyncio
 from typing import TYPE_CHECKING
-
-from hyperscale.logging.hyperscale_logging_models import ServerWarning
-
-from hyperscale.distributed.runtime import Clock, RealClock
-
-
-_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.discovery import DiscoveryService
@@ -32,7 +25,6 @@ class WorkerDiscoveryManager:
         self,
         discovery_service: "DiscoveryService",
         logger: "Logger",
-        failure_decay_interval: float = 60.0,
     ) -> None:
         """
         Initialize discovery manager.
@@ -40,60 +32,9 @@ class WorkerDiscoveryManager:
         Args:
             discovery_service: DiscoveryService instance for peer selection
             logger: Logger instance for logging
-            failure_decay_interval: Interval for decaying failure counts
         """
         self._discovery_service: "DiscoveryService" = discovery_service
         self._logger: "Logger" = logger
-        self._failure_decay_interval: float = failure_decay_interval
-        self._running: bool = False
-
-    async def run_maintenance_loop(self) -> None:
-        """
-        Background loop for discovery service maintenance (AD-28).
-
-        Periodically:
-        - Runs DNS discovery for new managers
-        - Decays failure counts to allow recovery
-        - Cleans up expired DNS cache entries
-        """
-        self._running = True
-        while self._running:
-            try:
-                await _DEFAULT_CLOCK.sleep(self._failure_decay_interval)
-
-                # Decay failure counts to allow peers to recover
-                self._discovery_service.decay_failures()
-
-                # Clean up expired DNS cache entries
-                self._discovery_service.cleanup_expired_dns()
-
-                # Optionally discover new peers via DNS (if configured)
-                if self._discovery_service.config.dns_names:
-                    await self._discovery_service.discover_peers()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as maintenance_error:
-                dns_names = (
-                    self._discovery_service.config.dns_names
-                    if self._discovery_service.config
-                    else []
-                )
-                await self._logger.log(
-                    ServerWarning(
-                        message=(
-                            f"Discovery maintenance loop error: {maintenance_error} "
-                            f"(dns_names={dns_names}, decay_interval={self._failure_decay_interval}s)"
-                        ),
-                        node_host="worker",
-                        node_port=0,
-                        node_id="discovery",
-                    )
-                )
-
-    def stop(self) -> None:
-        """Stop the maintenance loop."""
-        self._running = False
 
     def select_best_manager(
         self,

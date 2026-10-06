@@ -11,7 +11,9 @@ from hyperscale.distributed.capacity.execution_time_estimator import (
     ExecutionTimeEstimator,
 )
 from hyperscale.distributed.models.distributed import WorkflowStatus
+from hyperscale.distributed.runtime import Clock
 from hyperscale.distributed.taskex.util.time_parser import TimeParser
+from hyperscale.distributed.workflow import WorkflowState
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.job_manager import JobManager
@@ -41,29 +43,44 @@ class ManagerCapacityReporter:
         get_workflow_dispatcher: Callable[[], WorkflowDispatcher | None],
         get_total_cores: Callable[[], int],
         node_id: str,
+        clock: Clock,
     ) -> None:
         self._job_manager = job_manager
+        # The clock dispatches are stamped with: the estimator measures
+        # their remaining time on it.
+        self._clock = clock
         self._get_workflow_dispatcher = get_workflow_dispatcher
         self._get_total_cores = get_total_cores
         self._node_id = node_id
 
-    def snapshot(self) -> tuple[int, float, float]:
-        """Return ``(pending_count, pending_duration_seconds, active_remaining_seconds)``."""
+    def snapshot(self) -> tuple[int, float, float, list[tuple[float, int]]]:
+        """Return ``(pending_count, pending_duration_seconds,
+        active_remaining_seconds, cores_freeing_schedule)``."""
         dispatcher = self._get_workflow_dispatcher()
-        pending_workflows = dispatcher.get_pending_workflows() if dispatcher else {}
+        lifecycle = self._job_manager.workflow_lifecycle
+        # Queued work that will still run: the queue's PENDING workflows
+        # (the entries of taken or finished ones stay until job cleanup).
+        awaiting_workflows = (
+            {
+                key: pending
+                for key, pending in dispatcher.get_pending_workflows().items()
+                if lifecycle.get_state(pending.job_id, pending.workflow_id) == WorkflowState.PENDING
+            }
+            if dispatcher
+            else {}
+        )
 
         estimator = ExecutionTimeEstimator(
             active_dispatches=self._active_dispatches(),
-            pending_workflows=pending_workflows,
+            pending_workflows=awaiting_workflows,
             total_cores=self._get_total_cores(),
-        )
-        pending_count = sum(
-            1 for pending in pending_workflows.values() if pending.is_awaiting_dispatch
+            clock=self._clock,
         )
         return (
-            pending_count,
+            len(awaiting_workflows),
             estimator.get_pending_duration_sum(),
             estimator.get_active_remaining_sum(),
+            estimator.get_release_schedule(),
         )
 
     def _active_dispatches(self) -> dict[str, ActiveDispatch]:

@@ -2,71 +2,21 @@
 Exponentially Weighted Moving Average (EWMA) latency tracker.
 
 Tracks per-peer latency with exponential smoothing for load-aware selection.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .ewma_config import EWMAConfig
+from .peer_latency_stats import PeerLatencyStats
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-@dataclass(slots=True)
-class PeerLatencyStats:
-    """Latency statistics for a single peer."""
-
-    peer_id: str
-    """The peer this tracks."""
-
-    ewma_ms: float = 0.0
-    """Current EWMA latency in milliseconds."""
-
-    sample_count: int = 0
-    """Number of samples recorded."""
-
-    last_sample_ms: float = 0.0
-    """Most recent latency sample."""
-
-    last_updated: float = 0.0
-    """Timestamp of last update (monotonic)."""
-
-    min_ms: float = float("inf")
-    """Minimum observed latency."""
-
-    max_ms: float = 0.0
-    """Maximum observed latency."""
-
-    failure_count: int = 0
-    """Number of consecutive failures (reset on success)."""
-
-
-@dataclass
-class EWMAConfig:
-    """Configuration for EWMA tracking."""
-
-    alpha: float = 0.3
-    """
-    Smoothing factor for EWMA (0 < alpha <= 1).
-
-    Higher alpha gives more weight to recent samples:
-    - 0.1: Very smooth, slow to react to changes
-    - 0.3: Balanced (default)
-    - 0.5: Responsive, moderate smoothing
-    - 0.9: Very responsive, minimal smoothing
-    """
-
-    initial_estimate_ms: float = 50.0
-    """Initial latency estimate for new peers (ms)."""
-
-    failure_penalty_ms: float = 1000.0
-    """Latency penalty per consecutive failure (ms)."""
-
-    max_failure_penalty_ms: float = 10000.0
-    """Maximum total failure penalty (ms)."""
-
-    decay_interval_seconds: float = 60.0
-    """Interval for decaying failure counts."""
 
 
 @dataclass
@@ -277,3 +227,11 @@ class EWMATracker:
     def tracked_peer_count(self) -> int:
         """Return the number of tracked peers."""
         return len(self._stats)
+
+_REHOMED = (
+    PeerLatencyStats,
+    EWMAConfig,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

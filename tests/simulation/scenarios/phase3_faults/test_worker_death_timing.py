@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hyperscale.distributed.jobs.dispatch_outcome import DispatchOutcome
 from hyperscale.distributed.models import WorkflowDispatch
 from hyperscale.distributed.testing.workflows import LongRunningWorkflow, SimpleWorkflow
 from tests.simulation.harness import (
@@ -94,7 +95,7 @@ async def test_worker_dies_mid_dispatch_before_ack() -> None:
         async def reset_dispatch_to_selected_worker(
             worker_id: str,
             dispatch: WorkflowDispatch,
-        ) -> bool:
+        ) -> tuple[DispatchOutcome, str]:
             nonlocal fault_landed
             if not fault_landed:
                 selected_worker = _worker_handle_by_node_id(
@@ -143,7 +144,7 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
         async def send_dispatch_then_kill(
             worker_id: str,
             dispatch: WorkflowDispatch,
-        ) -> bool:
+        ) -> tuple[DispatchOutcome, str]:
             nonlocal execution_deferred, fault_landed
             selected_worker = _worker_handle_by_node_id(
                 cluster,
@@ -172,7 +173,7 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
 
             selected_worker.instance._task_runner.run = defer_workflow_execution
             try:
-                accepted = await original_send_dispatch(worker_id, dispatch)
+                outcome, detail = await original_send_dispatch(worker_id, dispatch)
             finally:
                 if (
                     selected_worker.instance._task_runner.run
@@ -182,11 +183,15 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
                         original_task_runner_run
                     )
 
-            if accepted and selected_dispatch_deferred and not fault_landed:
+            if (
+                outcome == DispatchOutcome.ACCEPTED
+                and selected_dispatch_deferred
+                and not fault_landed
+            ):
                 fault_landed = True
                 await cluster.faults.kill(selected_worker)
 
-            return accepted
+            return outcome, detail
 
         dispatcher._send_dispatch = send_dispatch_then_kill
         try:
@@ -236,13 +241,13 @@ async def test_worker_dies_mid_execute() -> None:
         async def capture_dispatch_target(
             worker_id: str,
             dispatch: WorkflowDispatch,
-        ) -> bool:
+        ) -> tuple[DispatchOutcome, str]:
             nonlocal dispatched_worker_id
-            accepted = await original_send_dispatch(worker_id, dispatch)
-            if accepted and dispatched_worker_id is None:
+            outcome, detail = await original_send_dispatch(worker_id, dispatch)
+            if outcome == DispatchOutcome.ACCEPTED and dispatched_worker_id is None:
                 dispatched_worker_id = worker_id
                 dispatch_ack_event.set()
-            return accepted
+            return outcome, detail
 
         dispatcher._send_dispatch = capture_dispatch_target
 
@@ -286,7 +291,7 @@ async def test_worker_dies_post_execute_before_result_push() -> None:
         async def drop_first_final_result_from_selected_worker(
             worker_id: str,
             dispatch: WorkflowDispatch,
-        ) -> bool:
+        ) -> tuple[DispatchOutcome, str]:
             nonlocal patched_worker_id, fault_landed
             if patched_worker_id is None:
                 selected_worker = _worker_handle_by_node_id(

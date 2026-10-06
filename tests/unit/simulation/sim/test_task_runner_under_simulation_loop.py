@@ -56,9 +56,13 @@ def task_runner(loop: SimulationLoop) -> TaskRunner:
 
     ``TaskRunner.__init__`` captures the loop via
     ``asyncio.get_event_loop()`` at construction, so this fixture
-    must run after the ``loop`` fixture sets it.
+    must run after the ``loop`` fixture sets it. The runner is shut
+    down before the loop closes: closing the loop under it left its
+    cleanup task pending, destroyed only when the process exited.
     """
-    return TaskRunner(instance_id=0)
+    task_runner_instance = TaskRunner(instance_id=0)
+    yield task_runner_instance
+    loop.run_until_complete(task_runner_instance.shutdown())
 
 
 def test_task_runner_submits_async_work_under_sim_loop(

@@ -9,6 +9,7 @@ import asyncio
 from types import MappingProxyType
 from typing import Callable, Mapping
 
+from hyperscale.distributed.slo.latency_observation import LatencyObservation
 from hyperscale.distributed.models import (
     GateHeartbeat,
     GateInfo,
@@ -56,8 +57,15 @@ class GateRuntimeState:
     released, and never held while acquiring any of the locks above.
     """
 
-    def __init__(self) -> None:
-        """Initialize empty state containers."""
+    def __init__(self, forward_throughput_interval_start: float) -> None:
+        """
+        Initialize empty state containers.
+
+        Args:
+            forward_throughput_interval_start: Monotonic time, on the gate's
+                clock, at which the first job-forwarding throughput interval
+                (AD-19) begins.
+        """
         # Counter protection lock (for race-free increments)
         self._counter_lock: asyncio.Lock | None = None
 
@@ -101,7 +109,6 @@ class GateRuntimeState:
         self._job_workflow_ids: dict[str, set[str]] = {}
         self._job_dc_managers: dict[str, dict[str, tuple[str, int]]] = {}
         self._job_submissions: dict[str, JobSubmission] = {}
-        self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
         self._job_lease_renewal_tokens: dict[str, str] = {}
 
         # JobProgress sequence tracking for ordering/dedup (Task 31)
@@ -120,6 +127,11 @@ class GateRuntimeState:
         self._job_update_sequences: dict[str, int] = {}
         self._job_update_history: dict[str, list[tuple[int, str, bytes, float]]] = {}
         self._job_client_update_positions: dict[str, dict[tuple[str, int], int]] = {}
+        # Updates a callback received past a gap in its position -- ones
+        # sent after an earlier update that has not reached it.
+        self._job_client_updates_delivered_ahead: dict[
+            str, dict[tuple[str, int], set[int]]
+        ] = {}
 
         # Lease state (legacy)
         self._leases: dict[str, DatacenterLease] = {}
@@ -128,6 +140,24 @@ class GateRuntimeState:
         # Leadership/orphan tracking
         self._dead_job_leaders: set[tuple[str, int]] = set()
         self._orphaned_jobs: dict[str, float] = {}
+        # Each orphan's leader gate (TCP), when known, and the heartbeats
+        # it had sent when the job was orphaned: a leader heard from since
+        # may yet renew, so the orphan grace extends for it (AD-26).
+        self._orphan_leader_addrs: dict[str, tuple[str, int]] = {}
+        self._orphan_heartbeat_baselines: dict[str, int] = {}
+        # Heartbeats received from each peer gate (TCP), for as long as it
+        # is a peer.
+        self._gate_peer_heartbeats_received: dict[tuple[str, int], int] = {}
+        # Heartbeats received from every peer gate together: a tier still
+        # heard from may yet elect the leader a due orphan waits on.
+        self._gate_peer_heartbeats_total: int = 0
+        # The longest a due orphan waited for its takeover (by this gate's
+        # tier leader or a peer's announcement): the takeover window learns
+        # from it.
+        self._longest_orphan_takeover_wait_seconds: float = 0.0
+        # The longest an orphan waited before its leadership was resolved
+        # by a peer: the orphan grace learns from it.
+        self._longest_orphan_rescue_seconds: float = 0.0
 
         # Gate state
         self._gate_state: GateStateEnum = GateStateEnum.SYNCING
@@ -137,10 +167,16 @@ class GateRuntimeState:
         self._dead_gate_peers: set[tuple[str, int]] = set()
         self._dead_gate_timestamps: dict[tuple[str, int], float] = {}
 
-        # Throughput tracking (AD-19)
+        # Throughput tracking (AD-19): dispatches a datacenter accepted, and
+        # dispatches attempted -- the demand the accepted ones are judged
+        # against -- over the same intervals.
         self._forward_throughput_count: int = 0
-        self._forward_throughput_interval_start: float = 0.0
+        self._forward_throughput_interval_start: float = (
+            forward_throughput_interval_start
+        )
         self._forward_throughput_last_value: float = 0.0
+        self._forward_attempt_count: int = 0
+        self._forward_attempt_last_value: float = 0.0
 
     def initialize_locks(self) -> None:
         self._counter_lock = asyncio.Lock()
@@ -201,6 +237,7 @@ class GateRuntimeState:
         self._dead_gate_timestamps.pop(peer_addr, None)
         self._dead_job_leaders.discard(peer_addr)
         self._active_gate_peers.discard(peer_addr)
+        self._gate_peer_heartbeats_received.pop(peer_addr, None)
         self.remove_peer_lock(peer_addr)
 
     def cleanup_peer_udp_tracking(self, peer_addr: tuple[str, int]) -> set[str]:
@@ -351,6 +388,28 @@ class GateRuntimeState:
         if freshest is None:
             return 1.0
         return freshest.slo_routing_factor
+
+    def get_dc_latency_observation(self, datacenter_id: str) -> LatencyObservation | None:
+        """AD-42: the datacenter's freshest latency percentiles -- from the
+        manager that reported most recently -- or None when none of its
+        managers has observed any workflow latency yet."""
+        freshest: ManagerHeartbeat | None = None
+        for heartbeat in self._datacenter_manager_status.get(datacenter_id, {}).values():
+            if heartbeat.slo_sample_count > 0 and (
+                freshest is None or heartbeat.slo_updated_at > freshest.slo_updated_at
+            ):
+                freshest = heartbeat
+        if freshest is None:
+            return None
+        return LatencyObservation(
+            target_id=datacenter_id,
+            p50_ms=freshest.slo_p50_ms,
+            p95_ms=freshest.slo_p95_ms,
+            p99_ms=freshest.slo_p99_ms,
+            sample_count=freshest.slo_sample_count,
+            window_start=freshest.slo_updated_at,
+            window_end=freshest.slo_updated_at,
+        )
 
     def get_dc_backpressure_level(self, datacenter_id: str) -> BackpressureLevel:
         """Get the backpressure level for a datacenter."""
@@ -514,13 +573,63 @@ class GateRuntimeState:
         """Check if a leader is marked as dead."""
         return leader_addr in self._dead_job_leaders
 
-    def mark_job_orphaned(self, job_id: str, timestamp: float) -> None:
-        """Mark a job as orphaned."""
+    def mark_job_orphaned(
+        self,
+        job_id: str,
+        timestamp: float,
+        leader_addr: tuple[str, int] | None,
+    ) -> None:
+        """Mark a job as orphaned, led by ``leader_addr`` (TCP) when known."""
         self._orphaned_jobs[job_id] = timestamp
+        if leader_addr is None:
+            return
+        self._orphan_leader_addrs[job_id] = leader_addr
+        self._orphan_heartbeat_baselines[job_id] = self._gate_peer_heartbeats_received.get(leader_addr, 0)
 
     def clear_orphaned_job(self, job_id: str) -> None:
-        """Clear orphaned status for a job."""
+        """Stop tracking an orphan (not a rescue: ended, failed, or taken
+        over by this gate)."""
         self._orphaned_jobs.pop(job_id, None)
+        self._orphan_leader_addrs.pop(job_id, None)
+        self._orphan_heartbeat_baselines.pop(job_id, None)
+
+    def rescue_orphaned_job(self, job_id: str, now: float) -> None:
+        """A peer resolved an orphan's leadership: how long that took is a
+        rescue the orphan grace learns from."""
+        if (orphaned_at := self._orphaned_jobs.get(job_id)) is not None:
+            self._longest_orphan_rescue_seconds = max(self._longest_orphan_rescue_seconds, now - orphaned_at)
+        self.clear_orphaned_job(job_id)
+
+    def record_gate_peer_heartbeat(self, peer_addr: tuple[str, int]) -> None:
+        """A heartbeat from the peer gate at ``peer_addr`` (TCP) arrived."""
+        self._gate_peer_heartbeats_received[peer_addr] = self._gate_peer_heartbeats_received.get(peer_addr, 0) + 1
+        self._gate_peer_heartbeats_total += 1
+
+    @property
+    def gate_peer_heartbeats_total(self) -> int:
+        return self._gate_peer_heartbeats_total
+
+    def record_orphan_takeover_wait(self, waited_seconds: float) -> None:
+        """A due orphan was taken over ``waited_seconds`` after it came due."""
+        self._longest_orphan_takeover_wait_seconds = max(self._longest_orphan_takeover_wait_seconds, waited_seconds)
+
+    @property
+    def longest_orphan_takeover_wait_seconds(self) -> float:
+        return self._longest_orphan_takeover_wait_seconds
+
+    def orphan_leader_heartbeats(self, job_id: str) -> tuple[int, int] | None:
+        """The heartbeats an orphan's leader has sent, and had sent when the
+        job was orphaned -- None when its leader is unknown."""
+        if (leader_addr := self._orphan_leader_addrs.get(job_id)) is None:
+            return None
+        return (
+            self._gate_peer_heartbeats_received.get(leader_addr, 0),
+            self._orphan_heartbeat_baselines[job_id],
+        )
+
+    @property
+    def longest_orphan_rescue_seconds(self) -> float:
+        return self._longest_orphan_rescue_seconds
 
     def is_job_orphaned(self, job_id: str) -> bool:
         """Check if a job is orphaned."""
@@ -530,37 +639,34 @@ class GateRuntimeState:
         """Get all orphaned jobs with their timestamps."""
         return dict(self._orphaned_jobs)
 
-    def set_job_reporter_task(
-        self, job_id: str, reporter_type: str, task: asyncio.Task
-    ) -> None:
-        self._job_reporter_tasks.setdefault(job_id, {})[reporter_type] = task
-
-    def remove_job_reporter_task(self, job_id: str, reporter_type: str) -> None:
-        job_tasks = self._job_reporter_tasks.get(job_id)
-        if not job_tasks:
-            return
-        job_tasks.pop(reporter_type, None)
-        if not job_tasks:
-            self._job_reporter_tasks.pop(job_id, None)
-
-    def pop_job_reporter_tasks(self, job_id: str) -> dict[str, asyncio.Task] | None:
-        return self._job_reporter_tasks.pop(job_id, None)
-
     async def record_forward(self) -> None:
         async with self._get_counter_lock():
             self._forward_throughput_count += 1
 
+    async def record_forward_attempt(self) -> None:
+        async with self._get_counter_lock():
+            self._forward_attempt_count += 1
+
     def calculate_throughput(self, now: float, interval_seconds: float) -> float:
-        """Calculate and reset throughput for the current interval."""
+        """Calculate and reset throughput for the current interval (and the
+        attempt rate over the same interval)."""
         elapsed = now - self._forward_throughput_interval_start
         if elapsed >= interval_seconds:
             throughput = (
                 self._forward_throughput_count / elapsed if elapsed > 0 else 0.0
             )
             self._forward_throughput_last_value = throughput
+            self._forward_attempt_last_value = (
+                self._forward_attempt_count / elapsed if elapsed > 0 else 0.0
+            )
             self._forward_throughput_count = 0
+            self._forward_attempt_count = 0
             self._forward_throughput_interval_start = now
         return self._forward_throughput_last_value
+
+    def get_forward_attempt_rate(self) -> float:
+        """Dispatches attempted per second over the last full interval."""
+        return self._forward_attempt_last_value
 
     async def increment_state_version(self) -> int:
         async with self._get_counter_lock():
@@ -607,9 +713,35 @@ class GateRuntimeState:
         callback: tuple[str, int],
         sequence: int,
     ) -> None:
+        """Record update ``sequence`` delivered to ``callback``.
+
+        The position is the last sequence below which every update reached
+        the callback -- what a replay resends from. An update landing ahead
+        of an earlier one that failed (or is still in flight) is held aside
+        and does not move it: overwritten with the latest delivery, the
+        position skipped the failed update, which no replay then resent.
+        A gap older than the retained history closes -- what fell out of
+        it cannot be resent -- so the updates held aside never outnumber
+        the history.
+        """
         async with self._get_counter_lock():
             positions = self._job_client_update_positions.setdefault(job_id, {})
-            positions[callback] = sequence
+            position = positions.get(callback, 0)
+            if sequence <= position:
+                return
+
+            delivered_ahead = self._job_client_updates_delivered_ahead.setdefault(
+                job_id, {}
+            ).setdefault(callback, set())
+            delivered_ahead.add(sequence)
+            if history := self._job_update_history.get(job_id):
+                position = max(position, history[0][0] - 1)
+            while position + 1 in delivered_ahead:
+                position += 1
+                delivered_ahead.remove(position)
+            for held_sequence in [held for held in delivered_ahead if held <= position]:
+                delivered_ahead.remove(held_sequence)
+            positions[callback] = position
 
     async def get_client_update_position(
         self,
@@ -642,6 +774,7 @@ class GateRuntimeState:
             self._job_update_sequences.pop(job_id, None)
             self._job_update_history.pop(job_id, None)
             self._job_client_update_positions.pop(job_id, None)
+            self._job_client_updates_delivered_ahead.pop(job_id, None)
 
     # Gate state methods
     def set_gate_state(self, state: GateStateEnum) -> None:
@@ -722,8 +855,9 @@ class GateRuntimeState:
         return self._active_gate_peers
 
     def get_active_peers_list(self) -> list[tuple[str, int]]:
-        """Get list of active peers."""
-        return list(self._active_gate_peers)
+        """Get list of active peers, in address order: an iteration order
+        that does not follow string hashing (one schedule per seed)."""
+        return sorted(self._active_gate_peers)
 
     def has_active_peers(self) -> bool:
         """Check if there are any active peers."""
@@ -750,6 +884,10 @@ class GateRuntimeState:
     ) -> GateHeartbeat | None:
         """Get the last heartbeat from a gate peer."""
         return self._gate_peer_info.get(udp_addr)
+
+    def iter_gate_peer_heartbeats(self):
+        """Iterate over (udp_addr, last heartbeat) for every gate peer."""
+        return iter(list(self._gate_peer_info.items()))
 
     # Known gates methods
     def add_known_gate(self, gate_id: str, gate_info: GateInfo) -> None:

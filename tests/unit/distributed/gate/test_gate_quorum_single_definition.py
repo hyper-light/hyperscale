@@ -30,7 +30,7 @@ PEER_COUNTS = range(0, 5)
 
 
 def make_gate(configured_peers: int, known_gates: int, active_peers: int) -> GateServer:
-    state = GateRuntimeState()
+    state = GateRuntimeState(forward_throughput_interval_start=0.0)
     state.set_gate_state(GateState.ACTIVE)
     for index in range(known_gates):
         state.add_known_gate(
@@ -48,6 +48,11 @@ def make_gate(configured_peers: int, known_gates: int, active_peers: int) -> Gat
     gate = object.__new__(GateServer)
     gate._modular_state = state
     gate._gate_peers = [(f"10.0.3.{index}", 9000) for index in range(configured_peers)]
+    # The gate cohort: this gate and its configured peers (AD-52: the
+    # membership holds it, resized only through its log).
+    gate._cluster_membership = SimpleNamespace(
+        cohort=frozenset(gate._gate_peers) | {("10.0.3.255", 9000)}
+    )
     gate._leadership_coordinator = GateLeadershipCoordinator(
         state=state,
         logger=None,

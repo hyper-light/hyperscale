@@ -19,13 +19,15 @@ import pytest
 
 from hyperscale.distributed.nodes.manager.server import ManagerServer
 from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.slo import SLOConfig
 from hyperscale.distributed.swim.detection.hierarchical_failure_detector import NodeStatus
 
 WORKER = "worker-1"
 
 
 def make_manager(detector_status: NodeStatus) -> tuple[ManagerServer, AsyncMock]:
-    state = ManagerState()
+    state = ManagerState(slo_config=SLOConfig.from_env(Env()))
     state.add_worker(WORKER, SimpleNamespace(node=SimpleNamespace(host="10.0.0.7", udp_port=9101)))
     detector = SimpleNamespace(get_node_status=AsyncMock(return_value=detector_status))
     suspect = AsyncMock()

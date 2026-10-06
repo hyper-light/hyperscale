@@ -1,4 +1,4 @@
-import threading
+import os
 import uuid
 from typing import Optional
 
@@ -8,7 +8,7 @@ from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 class OptimizedArg:
     def __init__(self) -> None:
         self._snowflake = SnowflakeGenerator(
-            (uuid.uuid1().int + threading.get_native_id()) >> 64
+            (uuid.uuid1().int + os.getpid()) >> 64
         )
 
         self.call_name: Optional[str] = None

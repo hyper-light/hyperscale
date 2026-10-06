@@ -15,12 +15,15 @@ responder's job leadership and fence tokens.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from hyperscale.distributed.models import StateSyncRequest, StateSyncResponse
 from hyperscale.distributed.nodes.manager.sync import ManagerStateSync
 from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.slo import SLOConfig
 
 CLUSTER_ID = "hyperscale"
 ENVIRONMENT_ID = "default"
@@ -42,11 +45,17 @@ def make_state_sync(state: ManagerState) -> tuple[ManagerStateSync, RecordingTas
 
     state_sync = ManagerStateSync(
         state=state,
-        config=SimpleNamespace(cluster_id=CLUSTER_ID, environment_id=ENVIRONMENT_ID, datacenter_id="dc-east"),
+        config=SimpleNamespace(
+            cluster_id=CLUSTER_ID,
+            environment_id=ENVIRONMENT_ID,
+            datacenter_id="dc-east",
+            state_sync_retries=Env().MANAGER_STATE_SYNC_RETRIES,
+            state_sync_timeout_seconds=Env().MANAGER_STATE_SYNC_TIMEOUT,
+        ),
         registry=None,
         leases=None,
         job_manager=SimpleNamespace(iter_jobs=lambda: []),
-        logger=SimpleNamespace(log=None),
+        logger=SimpleNamespace(log=AsyncMock()),
         node_id=SimpleNamespace(full="manager-a-full", short="manager-a"),
         node_host="127.0.0.1",
         node_port=9000,
@@ -64,7 +73,7 @@ def make_state_sync(state: ManagerState) -> tuple[ManagerStateSync, RecordingTas
 
 @pytest.mark.asyncio
 async def test_a_requester_behind_the_responders_version_gets_a_full_snapshot() -> None:
-    state = ManagerState()
+    state = ManagerState(slo_config=SLOConfig.from_env(Env()))
     await state.increment_state_version()
     state._job_leaders["job-1"] = "manager-a-full"
     state._job_leader_addrs["job-1"] = ("127.0.0.1", 9000)

@@ -16,7 +16,10 @@ See AD-37 in docs/architecture.md for full specification.
 from enum import Enum, auto
 
 from hyperscale.distributed.server.protocol.in_flight_tracker import (
-    MessagePriority,
+    _CONTROL_HANDLERS,
+    _DATA_HANDLERS,
+    _DISPATCH_HANDLERS,
+    _TELEMETRY_HANDLERS,
 )
 
 
@@ -37,123 +40,13 @@ class MessageClass(Enum):
     TELEMETRY = auto()  # Debug stats, detailed metrics
 
 
-# Mapping from MessageClass to MessagePriority for InFlightTracker (AD-32)
-MESSAGE_CLASS_TO_PRIORITY: dict[MessageClass, MessagePriority] = {
-    MessageClass.CONTROL: MessagePriority.CRITICAL,
-    MessageClass.DISPATCH: MessagePriority.HIGH,
-    MessageClass.DATA: MessagePriority.NORMAL,
-    MessageClass.TELEMETRY: MessagePriority.LOW,
-}
 
-
-# Handler names that belong to each message class
-# Used for automatic classification of incoming requests
-CONTROL_HANDLERS: frozenset[str] = frozenset(
-    {
-        # SWIM protocol
-        "ping",
-        "ping_req",
-        "ack",
-        "nack",
-        "indirect_ping",
-        "indirect_ack",
-        # Cancellation (AD-20)
-        "cancel_workflow",
-        "cancel_job",
-        "workflow_cancelled",
-        "job_cancellation_complete",
-        # Leadership transfer
-        "leadership_transfer",
-        "job_leader_transfer",
-        "receive_job_leader_transfer",
-        "job_leader_worker_transfer",
-        # Failure detection
-        "suspect",
-        "alive",
-        "dead",
-        "leave",
-        # Operator-driven cluster join (hyperscale join)
-        "node_join",
-        # Per-job Raft consensus (manager and gate tiers): its volume is
-        # set by the protocol (one coalesced request per group per peer
-        # per heartbeat), and losing it costs elections, not just data
-        "raft_request_vote",
-        "raft_request_vote_response",
-        "raft_append_entries",
-        "raft_append_entries_response",
-        "raft_ledger_proposal",
-        "gate_raft_request_vote",
-        "gate_raft_request_vote_response",
-        "gate_raft_append_entries",
-        "gate_raft_append_entries_response",
-        "gate_raft_ledger_proposal",
-        "gate_raft_ledger_placement",
-        # AD-39 clock offset measurement: a throttled probe would delay
-        # (or prevent) fencing a node whose clock ran away.
-        "clock_offset_probe",
-    }
-)
-
-DISPATCH_HANDLERS: frozenset[str] = frozenset(
-    {
-        # Job dispatch
-        "submit_job",
-        "receive_submit_job",
-        "dispatch_workflow",
-        "receive_workflow_dispatch",
-        # State sync
-        "state_sync_request",
-        "state_sync_response",
-        "request_state_sync",
-        # Registration
-        "worker_register",
-        "receive_worker_register",
-        "manager_register",
-        "receive_manager_register",
-        # Workflow commands
-        "workflow_dispatch_ack",
-        "workflow_final_result",
-    }
-)
-
-DATA_HANDLERS: frozenset[str] = frozenset(
-    {
-        # Progress updates
-        "workflow_progress",
-        "receive_workflow_progress",
-        "workflow_progress_ack",
-        # Stats updates
-        "receive_stats_update",
-        "send_stats_update",
-        # AD-34 timeout coordination
-        "receive_job_progress_report",
-        "receive_job_timeout_report",
-        "job_global_timeout",
-        "receive_job_final_status",
-        # Heartbeats (non-SWIM)
-        "heartbeat",
-        "manager_heartbeat",
-        "worker_heartbeat",
-        # Job progress (gate handlers)
-        "receive_job_progress",
-    }
-)
-
-TELEMETRY_HANDLERS: frozenset[str] = frozenset(
-    {
-        # Metrics
-        "metrics_report",
-        "debug_stats",
-        "trace_event",
-        # Health probes (non-critical)
-        "health_check",
-        "readiness_check",
-        "liveness_check",
-        # Federated health (best-effort)
-        "xprobe",
-        "xack",
-    }
-)
+# Handler names that belong to each message class -- defined once, beside
+# the protocol-layer admission that classifies every request by them.
+CONTROL_HANDLERS: frozenset[str] = _CONTROL_HANDLERS
+DISPATCH_HANDLERS: frozenset[str] = _DISPATCH_HANDLERS
+DATA_HANDLERS: frozenset[str] = _DATA_HANDLERS
+TELEMETRY_HANDLERS: frozenset[str] = _TELEMETRY_HANDLERS
 
 
 def classify_handler(handler_name: str) -> MessageClass:
@@ -181,33 +74,3 @@ def classify_handler(handler_name: str) -> MessageClass:
     # Default to DATA for unknown handlers (moderate priority)
     return MessageClass.DATA
 
-
-def get_priority_for_handler(handler_name: str) -> MessagePriority:
-    """
-    Get the MessagePriority for a handler name.
-
-    Convenience function that classifies and maps to priority in one call.
-
-    Args:
-        handler_name: Name of the handler being invoked.
-
-    Returns:
-        MessagePriority for the InFlightTracker.
-    """
-    message_class = classify_handler(handler_name)
-    return MESSAGE_CLASS_TO_PRIORITY[message_class]
-
-
-def is_control_message(handler_name: str) -> bool:
-    """Check if a handler is a control message (never backpressured)."""
-    return handler_name in CONTROL_HANDLERS
-
-
-def is_data_message(handler_name: str) -> bool:
-    """Check if a handler is a data message (explicit backpressure)."""
-    return handler_name in DATA_HANDLERS
-
-
-def is_shedable(handler_name: str) -> bool:
-    """Check if a handler can be shed under load (non-CONTROL)."""
-    return handler_name not in CONTROL_HANDLERS

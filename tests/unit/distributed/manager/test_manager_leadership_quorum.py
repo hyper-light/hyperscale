@@ -21,6 +21,8 @@ from hyperscale.distributed.nodes.manager.leadership import (
     ManagerLeadershipCoordinator,
 )
 from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.slo import SLOConfig
 
 
 class RecordingLogger:
@@ -34,7 +36,7 @@ class RecordingLogger:
 def make_coordinator(
     configured_peer_count: int, reachable_peer_count: int, is_leader: bool = True
 ) -> tuple[ManagerLeadershipCoordinator, ManagerState, list[str]]:
-    state = ManagerState()
+    state = ManagerState(slo_config=SLOConfig.from_env(Env()))
     for peer_index in range(reachable_peer_count):
         state._active_manager_peers.add(("10.0.0.1", 9000 + peer_index))
     step_downs: list[str] = []
@@ -47,10 +49,9 @@ def make_coordinator(
         ),
         logger=RecordingLogger(),
         node_id="manager-a",
-        task_runner=None,
         is_leader_fn=lambda: is_leader,
-        get_term_fn=lambda: 1,
         step_down_fn=lambda: step_downs.append("stepped down"),
+        cohort_size_fn=lambda: configured_peer_count + 1,
     )
     return coordinator, state, step_downs
 

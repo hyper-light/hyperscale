@@ -187,17 +187,15 @@ class Task(Generic[T]):
 
         return run
 
-    def stop(self, run_id: Optional[str] = None):
-        """Stop scheduled repetition — every schedule of this task, or
-        just the one started under ``run_id`` when given (concurrent
-        runs of one task must not stop each other's schedules: one
-        workflow completing used to kill every workflow's status
-        pusher on the node)."""
-        if run_id is not None:
-            self._schedule_running_statuses[run_id] = False
-            return
-        # Snapshot to avoid dict mutation during iteration
-        for run_id in list(self._schedule_running_statuses.keys()):
+    def stop(self, run_id: int):
+        """Stop the schedule started under ``run_id`` -- only that one:
+        concurrent runs of one task must not stop each other's
+        schedules (one workflow completing used to kill every
+        workflow's status pusher, and later every workflow's
+        aggregation, on the node). A schedule that already ended, or
+        never ran, is left alone: setting its flag would only leave
+        the flag behind."""
+        if run_id in self._schedule_running_statuses:
             self._schedule_running_statuses[run_id] = False
 
     def run_schedule(
@@ -242,46 +240,52 @@ class Task(Generic[T]):
         # growth of ``_runs`` / ``_schedule_running_statuses``.
         schedule_control_id = run.run_id
 
-        if self.repeat == "ALWAYS":
-            while self._schedule_running_statuses[schedule_control_id]:
-                run.execute(*args, **kwargs)
+        try:
+            if self.repeat == "ALWAYS":
+                while self._schedule_running_statuses[schedule_control_id]:
+                    run.execute(*args, **kwargs)
 
-                await asyncio.sleep(self.schedule)
-                previous_run_id = run.run_id
-                run = Run(
-                    self.create_id(),
-                    self.call,
-                    timeout=self.timeout,
-                )
+                    await asyncio.sleep(self.schedule)
+                    previous_run_id = run.run_id
+                    run = Run(
+                        self.create_id(),
+                        self.call,
+                        timeout=self.timeout,
+                    )
 
-                self._runs[run.run_id] = run
-                # Per-iteration status keys are never the control key;
-                # drop the previous iteration's entry so the dict holds
-                # O(active schedules), not O(iterations ever).
-                if previous_run_id != schedule_control_id:
-                    self._schedule_running_statuses.pop(previous_run_id, None)
+                    self._runs[run.run_id] = run
+                    # Per-iteration status keys are never the control key;
+                    # drop the previous iteration's entry so the dict holds
+                    # O(active schedules), not O(iterations ever).
+                    if previous_run_id != schedule_control_id:
+                        self._schedule_running_statuses.pop(previous_run_id, None)
+
+            elif isinstance(self.repeat, int):
+                for _ in range(self.repeat):
+                    if self._schedule_running_statuses[schedule_control_id] is False:
+                        await run.cancel()
+                        break
+
+                    run.execute(*args, **kwargs)
+
+                    await asyncio.sleep(self.schedule)
+                    previous_run_id = run.run_id
+                    run = Run(
+                        self.create_id(),
+                        self.call,
+                        timeout=self.timeout,
+                    )
+
+                    self._runs[run.run_id] = run
+                    if previous_run_id != schedule_control_id:
+                        self._schedule_running_statuses.pop(previous_run_id, None)
+
+        finally:
+            # However the schedule ended -- stopped, done, cancelled or
+            # failed -- neither its flag nor its future stays behind
+            # (every finished schedule's future used to).
             self._schedule_running_statuses.pop(schedule_control_id, None)
-
-        elif isinstance(self.repeat, int):
-            for _ in range(self.repeat):
-                if self._schedule_running_statuses[schedule_control_id] is False:
-                    await run.cancel()
-                    break
-
-                run.execute(*args, **kwargs)
-
-                await asyncio.sleep(self.schedule)
-                previous_run_id = run.run_id
-                run = Run(
-                    self.create_id(),
-                    self.call,
-                    timeout=self.timeout,
-                )
-
-                self._runs[run.run_id] = run
-                if previous_run_id != schedule_control_id:
-                    self._schedule_running_statuses.pop(previous_run_id, None)
-            self._schedule_running_statuses.pop(schedule_control_id, None)
+            self._schedules.pop(schedule_control_id, None)
 
     async def _run(self, run: Run, *args, **kwargs):
         run.update_status(RunStatus.PENDING)

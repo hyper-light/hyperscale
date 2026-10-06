@@ -12,7 +12,7 @@ Extracted from worker_impl.py for modularity.
 """
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
@@ -20,7 +20,9 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerError,
 )
 
-from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.health.extension_tracker import ExtensionTracker
+from hyperscale.distributed.runtime import Clock, RealClock, RunTask
+from hyperscale.distributed.models import WorkflowProgress
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -76,6 +78,10 @@ class WorkerBackgroundLoops:
         self._dead_manager_check_interval: float = 10.0
         self._orphan_grace_period: float = 120.0
         self._orphan_check_interval: float = 10.0
+        self._orphan_extension_min_grant: float = 1.0
+        self._orphan_extension_max_extensions: int = 5
+        # The AD-26 extensions each orphaned workflow was granted.
+        self._orphan_extensions: dict[str, ExtensionTracker] = {}
         self._discovery_failure_decay_interval: float = 60.0
         self._progress_flush_interval: float = 0.5
 
@@ -87,6 +93,8 @@ class WorkerBackgroundLoops:
         orphan_check_interval: float = 10.0,
         discovery_failure_decay_interval: float = 60.0,
         progress_flush_interval: float = 0.5,
+        orphan_extension_min_grant: float = 1.0,
+        orphan_extension_max_extensions: int = 5,
     ) -> None:
         """
         Configure loop intervals.
@@ -103,6 +111,8 @@ class WorkerBackgroundLoops:
         self._dead_manager_check_interval = dead_manager_check_interval
         self._orphan_grace_period = orphan_grace_period
         self._orphan_check_interval = orphan_check_interval
+        self._orphan_extension_min_grant = orphan_extension_min_grant
+        self._orphan_extension_max_extensions = orphan_extension_max_extensions
         self._discovery_failure_decay_interval = discovery_failure_decay_interval
         self._progress_flush_interval = progress_flush_interval
 
@@ -111,9 +121,9 @@ class WorkerBackgroundLoops:
         node_host: str,
         node_port: int,
         node_id_short: str,
-        task_runner_run: callable,
-        is_running: callable,
-        is_seed_manager: callable | None = None,
+        task_runner_run: RunTask,
+        is_running: Callable[[], bool],
+        is_seed_manager: Callable[[str], bool] | None = None,
     ) -> None:
         """
         Reap managers that have been unhealthy for too long.
@@ -188,11 +198,11 @@ class WorkerBackgroundLoops:
 
     async def run_orphan_check_loop(
         self,
-        cancel_workflow: callable,
+        cancel_workflow: Callable[[str, str], Awaitable[tuple[bool, list[str]]]],
         node_host: str,
         node_port: int,
         node_id_short: str,
-        is_running: callable,
+        is_running: Callable[[], bool],
     ) -> None:
         """
         Check for and cancel orphaned workflows (Section 2.7).
@@ -213,15 +223,59 @@ class WorkerBackgroundLoops:
                 await _DEFAULT_CLOCK.sleep(self._orphan_check_interval)
 
                 workflows_to_cancel: list[tuple[str, str]] = []
+                # Extensions of workflows no longer orphaned (their new
+                # leader was found, or they ended) go with them.
+                for extended_workflow_id in [
+                    workflow_id
+                    for workflow_id in self._orphan_extensions
+                    if workflow_id not in self._state._orphaned_workflows
+                ]:
+                    del self._orphan_extensions[extended_workflow_id]
 
+                # The grace: the cluster's replacement of a dead leader
+                # (derived), or the longest rescue seen here if longer.
+                grace = max(self._orphan_grace_period, self._state.longest_orphan_rescue_seconds)
+                now = _DEFAULT_CLOCK.monotonic()
+                heartbeats = self._state.manager_heartbeats_received
                 for workflow_id, orphan_timestamp in list(
                     self._state._orphaned_workflows.items()
                 ):
-                    elapsed = _DEFAULT_CLOCK.monotonic() - orphan_timestamp
-                    if elapsed >= self._orphan_grace_period:
-                        workflows_to_cancel.append(
-                            (workflow_id, "orphan_grace_period_expired")
+                    tracker = self._orphan_extensions.get(workflow_id)
+                    extended = tracker.total_extended if tracker is not None else 0.0
+                    if now - orphan_timestamp < grace + extended:
+                        continue
+                    # AD-26: managers still heartbeating this worker since
+                    # the last grant (or the orphaning) are a cluster that
+                    # can still take the job over -- extend, decaying. An
+                    # isolated worker has nothing to wait for.
+                    last_heartbeats = (
+                        tracker.last_completed_items
+                        if tracker is not None and tracker.last_completed_items is not None
+                        else self._state.orphan_heartbeat_baseline(workflow_id)
+                    )
+                    if heartbeats > last_heartbeats:
+                        if tracker is None:
+                            tracker = ExtensionTracker(
+                                worker_id=workflow_id,
+                                base_deadline=grace,
+                                min_grant=self._orphan_extension_min_grant,
+                                max_extensions=self._orphan_extension_max_extensions,
+                            )
+                            self._orphan_extensions[workflow_id] = tracker
+                        granted, _grant, _denial, _warning = tracker.request_extension(
+                            "orphaned: awaiting the job's new leader",
+                            current_progress=float(heartbeats),
+                            completed_items=heartbeats,
                         )
+                        if granted:
+                            continue
+                    workflows_to_cancel.append(
+                        (
+                            workflow_id,
+                            f"orphan_grace_period_expired (waited {now - orphan_timestamp:.1f}s; "
+                            f"grace {grace:.1f}s + {extended:.1f}s extended)",
+                        )
+                    )
 
                 for workflow_id, elapsed in self._state.get_stuck_workflows():
                     if workflow_id not in self._state._orphaned_workflows:
@@ -233,7 +287,8 @@ class WorkerBackgroundLoops:
                         )
 
                 for workflow_id, reason in workflows_to_cancel:
-                    self._state._orphaned_workflows.pop(workflow_id, None)
+                    self._state.drop_orphan(workflow_id)
+                    self._orphan_extensions.pop(workflow_id, None)
 
                     if workflow_id not in self._state._active_workflows:
                         continue
@@ -276,22 +331,28 @@ class WorkerBackgroundLoops:
 
     async def run_discovery_maintenance_loop(
         self,
-        is_running: callable,
+        is_running: Callable[[], bool],
+        register_with_manager: Callable[[tuple[str, int]], Awaitable[bool]],
     ) -> None:
         """
         Maintain discovery service state (AD-28).
 
-        Periodically:
+        Each round, at once and then every decay interval:
+        - Discovers managers via DNS if configured, and registers with them
+          while this worker knows no healthy manager (any one answers with
+          the whole manager cohort)
         - Decays failure counts to allow recovery
         - Cleans up expired DNS cache entries
-        - Discovers new peers via DNS if configured
 
         Args:
             is_running: Function to check if worker is running
+            register_with_manager: Registers this worker with a manager
         """
         self._running = True
         while is_running() and self._running:
             try:
+                await self._join_through_dns(register_with_manager)
+
                 await _DEFAULT_CLOCK.sleep(self._discovery_failure_decay_interval)
 
                 # Decay failure counts
@@ -299,10 +360,6 @@ class WorkerBackgroundLoops:
 
                 # Clean up expired DNS cache
                 self._discovery_service.cleanup_expired_dns()
-
-                # Discover new peers via DNS if configured
-                if self._discovery_service.config.dns_names:
-                    await self._discovery_service.discover_peers()
 
             except asyncio.CancelledError:
                 break
@@ -317,15 +374,35 @@ class WorkerBackgroundLoops:
                         )
                     )
 
+    async def _join_through_dns(
+        self,
+        register_with_manager: Callable[[tuple[str, int]], Awaitable[bool]],
+    ) -> None:
+        """Discover managers through the configured DNS names and, while
+        this worker knows no healthy manager, register with every one."""
+        if not self._discovery_service.config.dns_names:
+            return
+
+        await self._discovery_service.discover_peers()
+        if self._registry.get_healthy_manager_tcp_addrs():
+            return
+
+        await asyncio.gather(
+            *(
+                register_with_manager(manager_addr)
+                for manager_addr in self._discovery_service.get_dns_peer_addresses()
+            )
+        )
+
     async def run_progress_flush_loop(
         self,
-        send_progress_to_job_leader: callable,
-        aggregate_progress_by_job: callable,
+        send_progress_to_job_leader: Callable[[WorkflowProgress], Awaitable[bool]],
+        aggregate_progress_by_job: Callable[[dict[str, WorkflowProgress]], dict[str, WorkflowProgress]],
         node_host: str,
         node_port: int,
         node_id_short: str,
-        is_running: callable,
-        get_healthy_managers: callable,
+        is_running: Callable[[], bool],
+        get_healthy_managers: Callable[[], set[str]],
     ) -> None:
         """
         Flush buffered progress updates to managers (AD-37).

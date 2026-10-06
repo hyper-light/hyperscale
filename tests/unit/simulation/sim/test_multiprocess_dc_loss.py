@@ -21,9 +21,10 @@ anchors; see the per-scenario docstrings for the measured timelines):
 * A job stranded on a dead DC ends via the gate's AD-34 global-timeout
   tracker: a LOUD client-observed ``timeout`` at
   submit + job_timeout(60) + up to one 15s tracker tick.
-* There is NO mid-flight cross-DC failover (AD-36 selection is
-  dispatch-time only): the surviving DC never executes the stranded
-  job — pinned here as the TRUE current behavior.
+* A job confined to the datacenter it loses (its placement constraint
+  lists that datacenter alone) has nowhere to fail over to (AD-36 Part
+  13 moves a lost datacenter's share only within the job's placement):
+  the surviving DC never executes the stranded job.
 * The manager's completion notification to the gate
   (``_notify_gate_of_completion``) is a SINGLE 5s-timeout send and the
   manager cleans the job up even when it fails — so a gate<->manager
@@ -55,10 +56,12 @@ _SEED = 61
 _DURATION_SECONDS = 8.0
 _JOB_TIMEOUT_SECONDS = 60.0
 
-# The gate's DC-death classification mechanism (probed): 30s heartbeat
-# staleness - up to one 10s heartbeat period + 0.5s health sampler.
-_DEATH_CLASSIFY_MIN = 20.0
-_DEATH_CLASSIFY_MAX = 31.0
+# The gate's DC-death classification: a phi-accrual detector over each
+# manager's heartbeats (AD-52 section 8). Design bound: never before the
+# heartbeat pause it tolerates, always inside the 30s fixed staleness
+# window it replaced (measured 12.0-16.25s after a loss, seed 61).
+_DEATH_CLASSIFY_MIN = Env().PHI_ACCRUAL_ACCEPTABLE_HEARTBEAT_PAUSE_SECONDS
+_DEATH_CLASSIFY_MAX = 30.0
 
 # AD-34 global-timeout delivery: job_timeout after submission plus up
 # to one 15s tracker check tick plus push/poll latency.
@@ -217,20 +220,22 @@ def _final_health(gate_log: list) -> dict[str, str]:
 # Scenario 1: total loss of the job's OWN datacenter mid-execution
 # ---------------------------------------------------------------------------
 
-# Midpoint of dc-west's probed execution window [8.25, 9.25] (seed 61):
-# inside live execution with margin on both sides. Re-probed 2026-10-01
-# after the gate began answering warmup submissions with a transient
-# "not ready" JobAck (the client now stays on the gate and is accepted
-# at 2.85 instead of failing over: dispatch moved from 12.25 to 8.25).
-_LOSS_AT = 8.75
+# Inside dc-west's probed execution window [3.0, 4.25] (seed 61), half a
+# second after dispatch as before. Re-probed 2026-10-04: dispatch moved
+# from 11.0 to 3.0 once a lone manager leads the moment its own vote is
+# the majority of its cohort (Raft section 5.2), instead of waiting out
+# a full pre-vote and vote wait.
+_LOSS_AT = 3.5
 _LOSS_CEILING = 140.0
 
 
 def _run_stranded_dc_loss() -> dict:
-    """Kill dc-west (manager + worker + both executors) at t=9.8 —
-    probe-pinned to land INSIDE live execution: seed 61 free selection
-    places the job in dc-west, dispatch reaches the worker at 9.5, and
-    the 8s workflow executes over [9.5, 16.3].
+    """Kill dc-west (manager + worker + both executors) at t=3.5 —
+    probe-pinned to land INSIDE live execution: the job is placed in
+    dc-west, dispatch reaches the worker at 3.0, and the workflow (an
+    action hook: about a second whatever its duration) executes over
+    [3.0, 4.25]. Re-probed 2026-10-04; the timeline below is the
+    original probe's.
 
     Measured timeline: submit 2.12, dispatch 9.5, kill 9.8, gate flips
     dc-west unhealthy 38.5, client observes terminal ``timeout`` 77.01
@@ -247,11 +252,12 @@ def _run_stranded_dc_loss() -> dict:
 
 
 def test_dc_loss_strands_job_to_loud_gate_timeout():
-    """A job whose datacenter dies mid-execution must end LOUDLY at the
-    client — the gate's AD-34 global timeout — and the surviving
-    datacenter must NOT execute it (AD-36 selection is dispatch-time
-    only; pinning the absence of mid-flight failover is deliberate:
-    when failover arrives, this assertion is the one it flips)."""
+    """A job confined to a datacenter that dies mid-execution must end
+    LOUDLY at the client — the gate's AD-34 global timeout — and the
+    surviving datacenter must NOT execute it: the job's placement
+    constraint lists dc-west alone, so AD-36's mid-flight failover finds
+    no datacenter to move its share to and asks again every check until
+    the timeout ends the job."""
     results = _run_stranded_dc_loss()
     client_log = results["client-a"]
 
@@ -279,7 +285,7 @@ def test_dc_loss_strands_job_to_loud_gate_timeout():
         f"design bound [{earliest}, {latest}]: {client_log}"
     )
 
-    # NO cross-DC failover: the surviving datacenter never ran it.
+    # Outside the job's placement: the surviving datacenter never ran it.
     assert not _active_rise_times(results["worker-dc-east"]), results[
         "worker-dc-east"
     ]
@@ -311,19 +317,20 @@ def test_dc_loss_strand_is_replay_deterministic():
 # Scenario 2: manager power-loss restart inside one DC, mid-execution
 # ---------------------------------------------------------------------------
 
-# Midpoint of dc-west's probed execution window [8.25, 9.25] (seed 61):
-# inside live execution with margin on both sides. Re-probed 2026-10-01
-# after the gate began answering warmup submissions with a transient
-# "not ready" JobAck (the client now stays on the gate and is accepted
-# at 2.85 instead of failing over: dispatch moved from 12.25 to 8.25).
-_RESTART_AT = 8.75
+# Inside dc-west's probed execution window [3.0, 4.25] (seed 61), half a
+# second after dispatch as before. Re-probed 2026-10-04: dispatch moved
+# from 11.0 to 3.0 once a lone manager leads the moment its own vote is
+# the majority of its cohort (Raft section 5.2), instead of waiting out
+# a full pre-vote and vote wait.
+_RESTART_AT = 3.5
 _RESTART_DOWN_SECONDS = 30.0
 _RESTART_CEILING = 160.0
 
 
 def _run_manager_restart_mid_execution() -> dict:
-    """Power-lose dc-west's manager at t=9.8 (the workflow is running on
-    its worker) and reboot from the surviving durable disk at t=39.8.
+    """Power-lose dc-west's manager at t=3.5 (the workflow is running on
+    its worker) and reboot from the surviving durable disk at t=33.5.
+    Re-probed 2026-10-04; the timeline below is the original probe's.
 
     Measured timeline: dispatch 9.5, restart 9.8, first worker
     execution cycle ends 34.0 (its result had no live manager), gen-2
@@ -416,20 +423,24 @@ def test_manager_restart_mid_execution_is_replay_deterministic():
 # Scenario 3: gate<->DC partition covering the completion push
 # ---------------------------------------------------------------------------
 
-# Midpoint of dc-west's probed execution window [8.25, 9.25] (seed 61):
-# inside live execution with margin on both sides. Re-probed 2026-10-01
-# after the gate began answering warmup submissions with a transient
-# "not ready" JobAck (the client now stays on the gate and is accepted
-# at 2.85 instead of failing over: dispatch moved from 12.25 to 8.25).
-_PUSH_CUT_AT = 8.75
-_PUSH_CUT_HEAL = 25.0
+# Inside dc-west's probed execution window [3.0, 4.25] (seed 61), half a
+# second after dispatch as before. Re-probed 2026-10-04: dispatch moved
+# from 11.0 to 3.0 once a lone manager leads the moment its own vote is
+# the majority of its cohort (Raft section 5.2), instead of waiting out
+# a full pre-vote and vote wait.
+_PUSH_CUT_AT = 3.5
+# Healed before the gate's detector could suspect dc-west (12.0s after the
+# cut at the earliest measured), after the completion send (~4.0) died in
+# the cut: eight seconds after it, as before.
+_PUSH_CUT_HEAL = 11.5
 
 
 def _run_partition_over_completion_push() -> dict:
-    """Cable-cut gate <-> manager-dc-west over [9.8, 25) — the window
-    covers the manager's completion notification (~10.4) but stays
-    under the 30s heartbeat-staleness bound, so classification never
-    flips.
+    """Cable-cut gate <-> manager-dc-west over [3.5, 11.5) — the window
+    covers the manager's completion notification (~4.0) but heals before
+    the gate's phi-accrual detector suspects dc-west, so classification
+    never flips. (Re-probed 2026-10-04; the history below is the original
+    probe.)
 
     Measured (post notice-backoff): the workflow runs to completion on
     dc-west's worker (active 9.5 -> 16.25); the manager's first
@@ -483,13 +494,12 @@ def test_partition_over_completion_push_delivers_after_heal():
         + _TERMINAL_SLACK_SECONDS
     )
     assert _PUSH_CUT_HEAL < finished_time < ad34_backstop, client_log
-    # 60.04 (was 65.06): same one-timeout-window gain as the gate
-    # durable-restart pin — the gate's global-result push no longer
-    # waits out a 5s timeout on an unhandled wire action before the
-    # client's terminal is delivered.
-    assert abs(finished_time - 60.04) <= 2.0, (
+    # Measured 13.99 (2026-10-04): heal 11.5 + the owed notice's next
+    # resend + gate->client delivery. (21.87 with the heal at 19.5; 60.04
+    # when the cut healed at 25 and the resend backoff had grown longer.)
+    assert abs(finished_time - 13.99) <= 2.0, (
         f"post-heal delivery at {finished_time} drifted from the "
-        f"measured 60.04: {client_log}"
+        f"measured 13.99: {client_log}"
     )
 
     # The window stayed under the staleness bound: dc-west must never
@@ -662,24 +672,27 @@ def test_slow_disk_execution_is_replay_deterministic():
 # Scenario 6: disk-full manager — loud dispatch-time failure
 # ---------------------------------------------------------------------------
 
-# Between acceptance (2.85) and dc-west's dispatch-time WAL appends
-# (just before 8.0 -- the old 8.0 arm missed them; re-probed 2026-10-01).
-_DISK_FULL_ARM_AT = 5.5
+# Between the gate's durable acceptance (2.8525) and dc-west's
+# dispatch-time WAL appends, which now follow it at once: probed
+# 2026-10-04, an arm at 2.86 fails the job at its first dispatch write
+# (2.89), one at 2.9 already misses them. Dispatch was ~8.0 before a lone
+# manager led the moment its own vote made the majority.
+_DISK_FULL_ARM_AT = 2.86
 _DISK_FULL_SCHEDULE = (("disk_full", _DISK_FULL_ARM_AT, 1024),)
 
 
 def _run_disk_full_dispatch_failure() -> dict:
-    """dc-west's manager disk accepts 1024 further bytes from t=5.5,
-    then every write raises ENOSPC — armed after submission (2.85, so
-    the job is durably accepted) but before dispatch (~8.0), so the
+    """dc-west's manager disk accepts 1024 further bytes from t=2.86,
+    then every write raises ENOSPC — armed after submission (2.8525, so
+    the job is durably accepted) but before dispatch, so the
     dispatch-time WAL appends exhaust it mid-job.
 
-    Measured: the client observes a LOUD ``failed`` at 8.017 — right
+    Measured: the client observes a LOUD ``failed`` at 2.89 — right
     after the dispatch attempt hit ENOSPC. Neither worker ever runs
     the workflow (no silent cross-DC re-route of a dispatch-time
     storage failure). The refused write makes the manager report its
     storage unwritable, and the gate classifies dc-west UNHEALTHY from
-    the next heartbeat (8.5) for as long as the disk stays full."""
+    the next heartbeat for as long as the disk stays full."""
     coordinator = SimulationCoordinator(
         latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
@@ -753,8 +766,8 @@ _HEARTBEAT_INTERVAL_SECONDS = float(Env().MANAGER_HEARTBEAT_INTERVAL)
 
 
 def _run_full_disk_then_freed() -> dict:
-    """Measured: the pinned job fails loudly at 8.017 and dc-west goes
-    UNHEALTHY at 8.5; the unpinned job submitted at 15.08 is placed in
+    """Measured: the pinned job fails loudly at 2.89 and dc-west goes
+    UNHEALTHY on the next heartbeat; the unpinned job submitted at 15.08 is placed in
     dc-east (running 15.25-16.5) and completes at 16.22; the disk frees
     at 40.0, the manager's next storage probe (60.0) proves the refused
     size fits, and dc-west is HEALTHY again at 60.5."""
@@ -823,7 +836,7 @@ _SECOND_SUBMIT_AT = 250.0
 def _run_chaos_then_quiesce_two_jobs() -> dict:
     """>=400 virtual seconds, two jobs in sequence: job-a is stranded
     by the total loss of its datacenter mid-execution (dc-west killed
-    at 9.8, exactly the scenario-1 chaos), the cluster quiesces for
+    at _LOSS_AT, exactly the scenario-1 chaos), the cluster quiesces for
     ~170s, then job-b submits at t=250 with free DC selection.
 
     Measured: job-a replays scenario 1's timeline exactly (submit 2.12,

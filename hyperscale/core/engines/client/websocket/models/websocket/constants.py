@@ -1,2 +1,20 @@
 WEBSOCKETS_VERSION = 13
 HEADER_LENGTH_INDEX = 6
+
+# RFC 6455, 1.3: appended to the client's key to form Sec-WebSocket-Accept.
+WEBSOCKET_ACCEPT_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# RFC 6455, 5.2: frame opcodes.
+OPCODE_CONTINUATION = 0x0
+OPCODE_TEXT = 0x1
+OPCODE_BINARY = 0x2
+OPCODE_CLOSE = 0x8
+OPCODE_PING = 0x9
+OPCODE_PONG = 0xA
+
+# RFC 6455, 5.5: control frames carry at most 125 payload bytes, unfragmented.
+CONTROL_FRAME_MAX_PAYLOAD = 125
+
+# RFC 6455, 7.4.1: close status codes.
+CLOSE_NORMAL = 1000
+CLOSE_PROTOCOL_ERROR = 1002

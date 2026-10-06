@@ -11,7 +11,6 @@ from .tcp_cancel_job import CancelJobWorkflowsHandler
 from .tcp_state_sync import StateSyncHandler
 from .tcp_leader_transfer import JobLeaderTransferHandler
 from .tcp_status_query import WorkflowStatusQueryHandler
-from .tcp_progress import WorkflowProgressHandler
 
 __all__ = [
     "WorkflowDispatchHandler",
@@ -20,5 +19,4 @@ __all__ = [
     "StateSyncHandler",
     "JobLeaderTransferHandler",
     "WorkflowStatusQueryHandler",
-    "WorkflowProgressHandler",
 ]

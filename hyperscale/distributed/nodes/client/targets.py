@@ -139,7 +139,6 @@ class ClientTargetSelector:
         selections = self._discovery.select_peers(
             job_id,
             count=len(self._target_by_peer_id),
-            use_sticky=False,
         )
         ranked = [
             self._target_by_peer_id[selection.peer_id]

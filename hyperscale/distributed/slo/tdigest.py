@@ -13,7 +13,7 @@ from .slo_config import SLOConfig
 class TDigest:
     """T-Digest for streaming quantile estimation."""
 
-    _config: SLOConfig = field(default_factory=SLOConfig.from_env)
+    _config: SLOConfig
     _centroids: list[Centroid] = field(default_factory=list, init=False)
     _unmerged: list[tuple[float, float]] = field(default_factory=list, init=False)
     _total_weight: float = field(default=0.0, init=False)
@@ -69,16 +69,22 @@ class TDigest:
             self._total_weight = 0.0
             return
 
+        # Dunning & Ertl (2019), "Computing Extremely Accurate Quantiles
+        # Using t-Digests", Algorithm 1: a centroid grows while it spans at
+        # most one unit of k from its left edge, ``q_left``. The limit is
+        # fixed when a centroid opens; re-deriving it from the growing right
+        # edge let a lower-tail centroid hold several units of k and, past
+        # k(q) = delta/2 - 1/2, made the limit negative -- every upper-tail
+        # point became a centroid of its own, without bound in the stream.
         new_centroids: list[Centroid] = []
         current_mean, current_weight = points[0]
-        cumulative_weight = current_weight
+        weight_before_current = 0.0
+        quantile_limit = self._k_inverse(self._k(0.0) + 1.0)
 
         for mean, weight in points[1:]:
-            quantile = cumulative_weight / total_weight
-            limit = self._k_inverse(self._k(quantile) + 1.0) - quantile
-            max_weight = total_weight * limit
-
-            if current_weight + weight <= max_weight:
+            if (
+                weight_before_current + current_weight + weight
+            ) / total_weight <= quantile_limit:
                 new_weight = current_weight + weight
                 current_mean = (
                     current_mean * current_weight + mean * weight
@@ -86,10 +92,12 @@ class TDigest:
                 current_weight = new_weight
             else:
                 new_centroids.append(Centroid(current_mean, current_weight))
+                weight_before_current += current_weight
+                quantile_limit = self._k_inverse(
+                    self._k(weight_before_current / total_weight) + 1.0
+                )
                 current_mean = mean
                 current_weight = weight
-
-            cumulative_weight += weight
 
         new_centroids.append(Centroid(current_mean, current_weight))
         self._centroids = new_centroids
@@ -101,8 +109,12 @@ class TDigest:
         return (self.delta / 2.0) * (np.arcsin(2.0 * quantile - 1.0) / np.pi + 0.5)
 
     def _k_inverse(self, scaled: float) -> float:
-        """Inverse scaling function."""
-        return 0.5 * (np.sin((scaled / (self.delta / 2.0) - 0.5) * np.pi) + 1.0)
+        """Inverse scaling function; k never exceeds k(1) = delta/2, so a
+        scale past it is the whole digest."""
+        return 0.5 * (
+            np.sin((min(scaled, self.delta / 2.0) / (self.delta / 2.0) - 0.5) * np.pi)
+            + 1.0
+        )
 
     def quantile(self, quantile: float) -> float:
         """Get the value at quantile q (0 <= q <= 1)."""
@@ -119,35 +131,38 @@ class TDigest:
         if quantile == 1.0:
             return self._max
 
+        # Dunning & Ertl (2019) section 2.3: a centroid's weight is centred
+        # on its mean, so the estimate interpolates between adjacent
+        # centroids' midpoints -- from the minimum at weight 0 to the first
+        # midpoint, and from the last midpoint to the maximum at the total.
+        # Extrapolating past a centroid's midpoint along the previous
+        # segment broke monotonicity and overshot the maximum.
         target_weight = quantile * self._total_weight
-        cumulative_weight = 0.0
+        first_centroid = self._centroids[0]
+        if target_weight <= first_centroid.weight / 2.0:
+            return self._min + (target_weight / (first_centroid.weight / 2.0)) * (
+                first_centroid.mean - self._min
+            )
 
-        for index, centroid in enumerate(self._centroids):
-            if cumulative_weight + centroid.weight >= target_weight:
-                if index == 0:
-                    weight_after = cumulative_weight + centroid.weight / 2.0
-                    if target_weight <= weight_after:
-                        ratio = target_weight / max(weight_after, 1e-10)
-                        return self._min + ratio * (centroid.mean - self._min)
+        weight_before_previous = 0.0
+        for previous_centroid, centroid in zip(self._centroids, self._centroids[1:]):
+            midpoint_previous = weight_before_previous + previous_centroid.weight / 2.0
+            midpoint_current = (
+                weight_before_previous + previous_centroid.weight + centroid.weight / 2.0
+            )
+            if target_weight <= midpoint_current:
+                ratio = (target_weight - midpoint_previous) / (
+                    midpoint_current - midpoint_previous
+                )
+                return previous_centroid.mean + ratio * (
+                    centroid.mean - previous_centroid.mean
+                )
+            weight_before_previous += previous_centroid.weight
 
-                previous_centroid = self._centroids[index - 1] if index > 0 else None
-                if previous_centroid is not None:
-                    midpoint_previous = (
-                        cumulative_weight - previous_centroid.weight / 2.0
-                    )
-                    midpoint_current = cumulative_weight + centroid.weight / 2.0
-                    ratio = (target_weight - midpoint_previous) / max(
-                        midpoint_current - midpoint_previous, 1e-10
-                    )
-                    return previous_centroid.mean + ratio * (
-                        centroid.mean - previous_centroid.mean
-                    )
-
-                return centroid.mean
-
-            cumulative_weight += centroid.weight
-
-        return self._max
+        last_centroid = self._centroids[-1]
+        midpoint_last = self._total_weight - last_centroid.weight / 2.0
+        ratio = (target_weight - midpoint_last) / (last_centroid.weight / 2.0)
+        return last_centroid.mean + min(ratio, 1.0) * (self._max - last_centroid.mean)
 
     def p50(self) -> float:
         """Median."""
@@ -198,10 +213,10 @@ class TDigest:
         return msgspec.msgpack.encode(payload)
 
     @classmethod
-    def from_bytes(cls, data: bytes, config: SLOConfig | None = None) -> "TDigest":
+    def from_bytes(cls, data: bytes, config: SLOConfig) -> "TDigest":
         """Deserialize from SWIM gossip transfer."""
         parsed = msgspec.msgpack.decode(data)
-        digest = cls(_config=config or SLOConfig.from_env())
+        digest = cls(_config=config)
         digest._centroids = [
             Centroid(mean=mean, weight=weight)
             for mean, weight in parsed.get("centroids", [])

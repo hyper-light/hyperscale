@@ -169,7 +169,7 @@ async def test_quorum_isolating_partition_rejects_submits() -> None:
 
         await cluster.faults.partition([isolated_manager], majority_side)
         await wait_until(
-            lambda: not isolated_manager.instance._has_quorum_available(),
+            lambda: not isolated_manager.instance._leadership.has_quorum(),
             timeout=45.0,
             poll=0.5,
             description="isolated manager observes quorum loss",

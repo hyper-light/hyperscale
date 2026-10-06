@@ -92,7 +92,6 @@ from .distributed import (
     # Job leadership (per-job leader tracking)
     JobLeadershipAnnouncement as JobLeadershipAnnouncement,
     JobLeadershipAck as JobLeadershipAck,
-    JobLeadershipNotification as JobLeadershipNotification,
     # Job state sync (periodic leader -> peer sync)
     JobStateSyncMessage as JobStateSyncMessage,
     JobStateSyncAck as JobStateSyncAck,
@@ -140,13 +139,7 @@ from .distributed import (
     GateStateSyncRequest as GateStateSyncRequest,
     GateStateSyncResponse as GateStateSyncResponse,
     # Context sync (layer-boundary protocol)
-    ContextForward as ContextForward,
-    ContextLayerSync as ContextLayerSync,
-    ContextLayerSyncAck as ContextLayerSyncAck,
     # Quorum
-    ProvisionRequest as ProvisionRequest,
-    ProvisionConfirm as ProvisionConfirm,
-    ProvisionCommit as ProvisionCommit,
     # Cancellation
     CancelJob as CancelJob,
     CancelAck as CancelAck,
@@ -224,6 +217,11 @@ from .client import (
     ClientJobResult as ClientJobResult,
 )
 
+# A lost datacenter and its replacement (AD-36 mid-flight failover)
+from .datacenter_substitution import (
+    DatacenterSubstitution as DatacenterSubstitution,
+)
+
 # Gate-tier job-state replication (AD-31 takeover invariant)
 from .gate_replication import (
     GateJobReplica as GateJobReplica,
@@ -235,3 +233,5 @@ from .gate_replication import (
     GateJobReplicaPrepare as GateJobReplicaPrepare,
     GateJobReplicaStatus as GateJobReplicaStatus,
 )
+from .read_consistency import ReadConsistency as ReadConsistency
+from .job_status_query import JobStatusQuery as JobStatusQuery

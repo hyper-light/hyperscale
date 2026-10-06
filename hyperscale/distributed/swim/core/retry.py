@@ -11,139 +11,30 @@ Phase 5 DI: same shape as ``swim/retry.py`` — ``Clock`` / ``Random``
 threaded through the standalone helpers and the policy's delay
 calculation, defaults bound to the module-level ``RealClock`` /
 ``RealRandom``.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import TypeVar, Callable, Awaitable, Any, ClassVar
+from typing import TypeVar, Callable, Awaitable, ClassVar, ParamSpec
 from enum import Enum, auto
+from hyperscale.distributed.runtime import Clock, Random, RealClock, RealRandom
 
-from hyperscale.distributed.runtime import (
-    Clock,
-    Random,
-    RealClock,
-    RealRandom,
-)
 from .errors import SwimError, ErrorCategory, ErrorSeverity, NetworkError
-
+from .retry_shared import _DEFAULT_RANDOM
+from .retry_decision import RetryDecision
+from .retry_policy import RetryPolicy
+from .retry_result import RetryResult
 
 T = TypeVar('T')
-
+P = ParamSpec('P')
 
 _DEFAULT_CLOCK: Clock = RealClock()
-_DEFAULT_RANDOM: Random = RealRandom()
-
-
-class RetryDecision(Enum):
-    """Decision for whether to retry an operation."""
-    RETRY = auto()       # Retry after delay
-    ABORT = auto()       # Don't retry, give up
-    IMMEDIATE = auto()   # Retry immediately (no delay)
-
-
-@dataclass(slots=True)
-class RetryPolicy:
-    """
-    Configuration for retry behavior.
-    
-    Example:
-        # Aggressive retry for probes
-        probe_policy = RetryPolicy(
-            max_attempts=3,
-            base_delay=0.1,
-            max_delay=2.0,
-            jitter=0.2,
-        )
-        
-        # Conservative retry for elections
-        election_policy = RetryPolicy(
-            max_attempts=2,
-            base_delay=1.0,
-            max_delay=5.0,
-            budget_seconds=10.0,
-        )
-    """
-    
-    max_attempts: int = 3
-    """Maximum number of attempts (including first try)."""
-    
-    base_delay: float = 0.1
-    """Initial delay in seconds."""
-    
-    max_delay: float = 5.0
-    """Maximum delay in seconds (caps exponential growth)."""
-    
-    exponential_base: float = 2.0
-    """Base for exponential backoff (delay = base_delay * base^attempt)."""
-    
-    jitter: float = 0.1
-    """Jitter factor (0-1). Delay varies by ±jitter*delay."""
-    
-    budget_seconds: float | None = None
-    """Total time budget for all retries. None = unlimited."""
-    
-    retryable_categories: set[ErrorCategory] = field(
-        default_factory=lambda: {
-            ErrorCategory.NETWORK,
-            ErrorCategory.RESOURCE,
-        }
-    )
-    """Error categories that should be retried."""
-    
-    retryable_severities: set[ErrorSeverity] = field(
-        default_factory=lambda: {
-            ErrorSeverity.TRANSIENT,
-            ErrorSeverity.DEGRADED,
-        }
-    )
-    """Error severities that should be retried."""
-    
-    def should_retry(self, error: SwimError | Exception) -> RetryDecision:
-        """Determine if an error should trigger a retry."""
-        if isinstance(error, SwimError):
-            if error.category not in self.retryable_categories:
-                return RetryDecision.ABORT
-            if error.severity not in self.retryable_severities:
-                return RetryDecision.ABORT
-            return RetryDecision.RETRY
-        
-        # Standard exceptions
-        if isinstance(error, (asyncio.TimeoutError, ConnectionError, OSError)):
-            return RetryDecision.RETRY
-        if isinstance(error, (ValueError, TypeError, AttributeError)):
-            return RetryDecision.ABORT  # Likely a bug, don't retry
-        
-        return RetryDecision.RETRY  # Default to retry for unknown
-    
-    def get_delay(
-        self,
-        attempt: int,
-        *,
-        random_source: Random | None = None,
-    ) -> float:
-        """
-        Calculate delay for a given attempt number.
-
-        Uses exponential backoff with jitter. ``random_source``
-        defaults to the module-level ``RealRandom``; pass a
-        ``SeededRandom`` from Phase 6 SIM mode for deterministic
-        backoff jitter.
-        """
-        rng = random_source if random_source is not None else _DEFAULT_RANDOM
-
-        # Exponential backoff
-        delay = min(
-            self.base_delay * (self.exponential_base ** attempt),
-            self.max_delay,
-        )
-
-        # Add jitter to prevent thundering herd
-        if self.jitter > 0:
-            jitter_range = delay * self.jitter
-            delay += rng.uniform(-jitter_range, jitter_range)
-
-        return max(0, delay)
-
 
 # Pre-defined policies for common use cases
 PROBE_RETRY_POLICY = RetryPolicy(
@@ -170,37 +61,6 @@ GOSSIP_RETRY_POLICY = RetryPolicy(
     jitter=0.3,
     retryable_categories={ErrorCategory.NETWORK},
 )
-
-
-@dataclass(slots=True)
-class RetryResult:
-    """Result of a retry operation."""
-    
-    success: bool
-    """Whether the operation eventually succeeded."""
-    
-    value: Any = None
-    """Return value if successful."""
-    
-    attempts: int = 0
-    """Number of attempts made."""
-    
-    total_time: float = 0.0
-    """Total time spent including delays."""
-    
-    last_error: Exception | None = None
-    """Last error encountered (if failed)."""
-    
-    errors: list[Exception] = field(default_factory=list)
-    """
-    Errors encountered during retries.
-    
-    Bounded to last MAX_STORED_ERRORS to prevent memory growth
-    during extended retry sequences.
-    """
-    
-    # Maximum errors to store (prevents memory growth during extended retries)
-    MAX_STORED_ERRORS: ClassVar[int] = 10
 
 
 async def retry_with_backoff(
@@ -307,7 +167,7 @@ async def retry_with_result(
     *,
     clock: Clock | None = None,
     random_source: Random | None = None,
-) -> RetryResult:
+) -> RetryResult[T]:
     """
     Retry an async function, returning detailed result.
     
@@ -404,8 +264,8 @@ def with_retry(
         async def send_probe(target: tuple[str, int]) -> bytes:
             # ... probe logic ...
     """
-    def decorator(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
+    def decorator(fn: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             return await retry_with_backoff(
                 lambda: fn(*args, **kwargs),
                 policy=policy,
@@ -414,3 +274,11 @@ def with_retry(
         return wrapper
     return decorator
 
+_REHOMED = (
+    RetryDecision,
+    RetryPolicy,
+    RetryResult,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

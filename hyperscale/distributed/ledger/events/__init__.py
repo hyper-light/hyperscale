@@ -9,8 +9,11 @@ from .job_event import (
     JobCompleted,
     JobFailed,
     JobTimedOut,
+    JobRelinquished,
+    JobDatacenterReassigned,
     JobEventUnion,
 )
+from .job_leadership_acquired import JobLeadershipAcquired
 
 __all__ = [
     "JobEventType",
@@ -23,5 +26,8 @@ __all__ = [
     "JobCompleted",
     "JobFailed",
     "JobTimedOut",
+    "JobRelinquished",
+    "JobDatacenterReassigned",
+    "JobLeadershipAcquired",
     "JobEventUnion",
 ]

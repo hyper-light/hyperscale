@@ -4,6 +4,10 @@ import re
 from hyperscale.distributed.nodes.manager import ManagerServer
 
 from tests.end_to_end.workflows.base_scenario_workflow import BaseScenarioWorkflow
+from tests.end_to_end.workflow_lifecycle_checks import (
+    assert_retry_budgets_released,
+    assert_workflow_lifecycle_sound,
+)
 from tests.framework.results.scenario_outcome import ScenarioOutcome
 from tests.framework.results.scenario_result import ScenarioResult
 from tests.framework.runner.scenario_runner import ScenarioRunner
@@ -112,10 +116,7 @@ async def validate_47_2_ack_without_execution() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "ACK without execution expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "ACK without execution expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -132,10 +133,8 @@ async def validate_47_3_redispatch_after_partial_execution() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Re-dispatch expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Re-dispatch expected workflow retries")
+        assert_retry_budgets_released(manager, "Re-dispatch expected workflow retries")
     finally:
         await runtime.stop_cluster()
 

@@ -77,6 +77,7 @@ class FakeTCPTransport(asyncio.Transport):
         "_sockname",
         "_closing",
         "_protocol",
+        "_partner",
         "_extra",
     )
 
@@ -94,6 +95,8 @@ class FakeTCPTransport(asyncio.Transport):
         self._sockname = sockname
         self._closing = False
         self._protocol: asyncio.Protocol | None = None
+        # The other end of the connection, closed when this end closes.
+        self._partner: "FakeTCPTransport | None" = None
         self._extra: dict[str, Any] = {
             "peername": peername,
             "sockname": sockname,
@@ -113,6 +116,11 @@ class FakeTCPTransport(asyncio.Transport):
         wire the back-reference after construction.
         """
         self._protocol = protocol
+
+    def set_partner(self, partner: "FakeTCPTransport") -> None:
+        """Register the other end of the connection: closing this end
+        closes it, as a REAL close or reset reaches the peer."""
+        self._partner = partner
 
     def get_protocol(self) -> asyncio.Protocol | None:
         """Return the protocol associated with this transport."""
@@ -161,6 +169,8 @@ class FakeTCPTransport(asyncio.Transport):
         self._closing = True
         if self._protocol is not None:
             self._loop.call_soon(self._protocol.connection_lost, None)
+        if self._partner is not None:
+            self._loop.call_soon(self._partner.close)
 
     def abort(self) -> None:
         """Forcibly close. Same semantics as ``close`` for SIM —

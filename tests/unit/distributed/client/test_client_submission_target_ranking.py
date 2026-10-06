@@ -54,10 +54,10 @@ def _selector(
     managers: list[tuple[str, int]] = MANAGERS,
 ) -> tuple[ClientTargetSelector, DiscoveryService]:
     discovery = _discovery()
-    config = ClientConfig(
+    config = ClientConfig.from_env(
         host="localhost",
         tcp_port=8000,
-        env="test",
+        env=Env(),
         managers=managers,
         gates=gates,
     )
@@ -140,7 +140,7 @@ def _submitter(selector: ClientTargetSelector, send_tcp: AsyncMock) -> ClientJob
         selector._config,
         logger,
         selector,
-        ClientJobTracker(state, logger),
+        ClientJobTracker(state, logger, result_drain_timeout_seconds=Env().CLIENT_RESULT_DRAIN_TIMEOUT),
         ClientProtocol(state, logger),
         send_tcp,
         IdempotencyKeyGenerator(client_id="test-client"),

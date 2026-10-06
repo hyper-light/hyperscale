@@ -13,8 +13,9 @@ Key responsibilities:
 """
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Callable, Awaitable
+from typing import TYPE_CHECKING, Callable, Awaitable
 
+from hyperscale.distributed.health.extension_tracker import ExtensionTracker
 from hyperscale.distributed.models import (
     GlobalJobStatus,
     JobLeadershipAnnouncement,
@@ -28,6 +29,7 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
 )
 
+from .models.orphan_job_stats import OrphanJobStats
 from .state import GateRuntimeState
 
 from hyperscale.distributed.runtime import Clock
@@ -88,7 +90,12 @@ class GateOrphanJobCoordinator:
         "_is_cluster_leader",
         "_orphan_check_interval_seconds",
         "_orphan_grace_period_seconds",
-        "_orphan_timeout_seconds",
+        "_orphan_extension_min_grant_seconds",
+        "_orphan_extension_max_extensions",
+        "_orphan_extensions",
+        "_orphan_due_at",
+        "_orphan_due_heartbeats",
+        "_takeover_extensions",
         "_takeover_jitter_min_seconds",
         "_takeover_jitter_max_seconds",
         "_confirmed_orphaned_jobs",
@@ -118,7 +125,8 @@ class GateOrphanJobCoordinator:
         is_cluster_leader: Callable[[], bool] | None = None,
         orphan_check_interval_seconds: float = 15.0,
         orphan_grace_period_seconds: float = 30.0,
-        orphan_timeout_seconds: float = 300.0,
+        orphan_extension_min_grant_seconds: float = 1.0,
+        orphan_extension_max_extensions: int = 5,
         takeover_jitter_min_seconds: float = 0.5,
         takeover_jitter_max_seconds: float = 2.0,
         *,
@@ -143,8 +151,18 @@ class GateOrphanJobCoordinator:
             commit_takeover_callback: Callback that quorum-commits a takeover
             is_cluster_leader: Callback returning whether this gate is SWIM leader
             orphan_check_interval_seconds: How often to scan for orphaned jobs
-            orphan_grace_period_seconds: Time to wait before attempting takeover
-            orphan_timeout_seconds: Max time before orphaned jobs fail
+            orphan_grace_period_seconds: Time to wait before attempting
+                takeover (derived: gate/config.py
+                derive_gate_orphan_grace_seconds); raised by the longest
+                rescue seen, and extended per AD-26 while the job's leader
+                is still heard from
+            orphan_extension_min_grant_seconds: Smallest AD-26 extension
+            orphan_extension_max_extensions: Most AD-26 extensions per orphan
+                A due orphan the tier has not taken over gets one more such
+                window for the tier to produce a leader that can -- raised by
+                the longest takeover seen after a job came due, and extended
+                per AD-26 while peer gates are still heard from -- before it
+                fails
             takeover_jitter_min_seconds: Minimum random jitter before takeover
             takeover_jitter_max_seconds: Maximum random jitter before takeover
         """
@@ -166,7 +184,15 @@ class GateOrphanJobCoordinator:
         self._is_cluster_leader = is_cluster_leader
         self._orphan_check_interval_seconds = orphan_check_interval_seconds
         self._orphan_grace_period_seconds = orphan_grace_period_seconds
-        self._orphan_timeout_seconds = orphan_timeout_seconds
+        self._orphan_extension_min_grant_seconds = orphan_extension_min_grant_seconds
+        self._orphan_extension_max_extensions = orphan_extension_max_extensions
+        # The AD-26 extensions each orphaned job was granted.
+        self._orphan_extensions: dict[str, ExtensionTracker] = {}
+        # When each orphan came due for takeover, and the tier's heartbeats
+        # by then; the AD-26 extensions of its takeover window.
+        self._orphan_due_at: dict[str, float] = {}
+        self._orphan_due_heartbeats: dict[str, int] = {}
+        self._takeover_extensions: dict[str, ExtensionTracker] = {}
         self._takeover_jitter_min_seconds = takeover_jitter_min_seconds
         self._takeover_jitter_max_seconds = takeover_jitter_max_seconds
         self._confirmed_orphaned_jobs: set[str] = set()
@@ -209,10 +235,14 @@ class GateOrphanJobCoordinator:
 
         if self._check_loop_task and not self._check_loop_task.done():
             self._check_loop_task.cancel()
+            cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
                 await self._check_loop_task
             except asyncio.CancelledError:
-                pass
+                # The task we cancelled ended; a cancel aimed at this task
+                # while it waited goes on.
+                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                    raise
 
         self._check_loop_task = None
 
@@ -239,7 +269,7 @@ class GateOrphanJobCoordinator:
 
         now = self._clock.monotonic()
         for job_id in orphaned_job_ids:
-            self._state.mark_job_orphaned(job_id, now)
+            self._state.mark_job_orphaned(job_id, now, failed_gate_addr)
 
         self._state.mark_leader_dead(failed_gate_addr)
 
@@ -290,10 +320,19 @@ class GateOrphanJobCoordinator:
             await self._evaluate_orphan_takeover(job_id, orphaned_at)
 
     def clear_orphaned_job(self, job_id: str) -> None:
-        """Clear orphan tracking for a job after leadership is resolved."""
-        self._clear_orphaned_job(job_id)
+        """A peer resolved an orphan's leadership: a rescue, which the
+        orphan grace learns from."""
+        now = self._clock.monotonic()
+        if (due_at := self._orphan_due_at.get(job_id)) is not None:
+            self._state.record_orphan_takeover_wait(now - due_at)
+        self._state.rescue_orphaned_job(job_id, now)
+        self._confirmed_orphaned_jobs.discard(job_id)
+        self._orphan_extensions.pop(job_id, None)
+        self._orphan_due_at.pop(job_id, None)
+        self._orphan_due_heartbeats.pop(job_id, None)
+        self._takeover_extensions.pop(job_id, None)
 
-    def on_lease_expired(self, lease: "JobLease") -> None:
+    async def on_lease_expired(self, lease: "JobLease") -> None:
         """
         Handle expired job lease callback from LeaseManager.
 
@@ -312,10 +351,14 @@ class GateOrphanJobCoordinator:
 
         now = self._clock.monotonic()
         if not self._state.is_job_orphaned(job_id):
-            self._state.mark_job_orphaned(job_id, now)
+            owner_gate = self._state.get_known_gate(owner_node)
+            self._state.mark_job_orphaned(
+                job_id,
+                now,
+                (owner_gate.tcp_host, owner_gate.tcp_port) if owner_gate is not None else None,
+            )
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=f"Job {job_id[:8]}... lease expired (owner={owner_node[:8]}...), marked for orphan check",
                     node_host=self._get_node_addr()[0],
@@ -335,12 +378,15 @@ class GateOrphanJobCoordinator:
 
         for attempt in range(self.CALLBACK_PUSH_MAX_RETRIES):
             try:
-                await self._send_tcp(
+                response, _ = await self._send_tcp(
                     callback,
                     "job_status_push",
                     push_data,
                     5.0,
                 )
+                # send_tcp returns transport errors rather than raising.
+                if isinstance(response, Exception):
+                    raise response
                 return
             except Exception as send_error:
                 last_error = send_error
@@ -393,16 +439,55 @@ class GateOrphanJobCoordinator:
                 if not orphaned_jobs:
                     continue
 
+                # Tracking of jobs no longer orphaned goes with them.
+                for settled_job_id in [
+                    job_id
+                    for job_id in self._orphan_extensions.keys() | self._orphan_due_at.keys()
+                    if job_id not in orphaned_jobs
+                ]:
+                    self._orphan_extensions.pop(settled_job_id, None)
+                    self._orphan_due_at.pop(settled_job_id, None)
+                    self._orphan_due_heartbeats.pop(settled_job_id, None)
+                    self._takeover_extensions.pop(settled_job_id, None)
+
+                # The grace: the gate tier's verdict on a lapsed leader
+                # (derived), or the longest rescue seen here if longer.
+                grace = max(self._orphan_grace_period_seconds, self._state.longest_orphan_rescue_seconds)
                 now = self._clock.monotonic()
                 jobs_to_evaluate: list[tuple[str, float]] = []
 
                 for job_id, orphaned_at in orphaned_jobs.items():
-                    time_orphaned = now - orphaned_at
-                    if (
-                        job_id in self._confirmed_orphaned_jobs
-                        or time_orphaned >= self._orphan_grace_period_seconds
-                    ):
+                    if job_id in self._confirmed_orphaned_jobs:
                         jobs_to_evaluate.append((job_id, orphaned_at))
+                        continue
+                    tracker = self._orphan_extensions.get(job_id)
+                    extended = tracker.total_extended if tracker is not None else 0.0
+                    if now - orphaned_at < grace + extended:
+                        continue
+                    # AD-26: a leader still heard from since the last grant
+                    # (or the orphaning) may yet renew its lease -- extend,
+                    # decaying. A silent one has nothing to wait for.
+                    if (leader_heartbeats := self._state.orphan_leader_heartbeats(job_id)) is not None:
+                        heartbeats, baseline = leader_heartbeats
+                        if tracker is not None and tracker.last_completed_items is not None:
+                            baseline = tracker.last_completed_items
+                        if heartbeats > baseline:
+                            if tracker is None:
+                                tracker = ExtensionTracker(
+                                    worker_id=job_id,
+                                    base_deadline=grace,
+                                    min_grant=self._orphan_extension_min_grant_seconds,
+                                    max_extensions=self._orphan_extension_max_extensions,
+                                )
+                                self._orphan_extensions[job_id] = tracker
+                            granted, _grant, _denial, _warning = tracker.request_extension(
+                                "orphaned: its leader gate is still heard from",
+                                current_progress=float(heartbeats),
+                                completed_items=heartbeats,
+                            )
+                            if granted:
+                                continue
+                    jobs_to_evaluate.append((job_id, orphaned_at))
 
                 if not jobs_to_evaluate:
                     continue
@@ -425,8 +510,7 @@ class GateOrphanJobCoordinator:
             except asyncio.CancelledError:
                 break
             except Exception as error:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Orphan check loop error: {error}",
                         node_host=self._get_node_addr()[0],
@@ -450,13 +534,48 @@ class GateOrphanJobCoordinator:
             job_id: The orphaned job ID
             orphaned_at: Timestamp when job was marked orphaned
         """
+        # Due now (or earlier): the tier leader takes it over. A tier that
+        # has not by the end of its takeover window -- one more failover
+        # (derived), or the longest takeover seen after coming due if
+        # longer -- has no leader that can; it gets AD-26 extensions while
+        # peer gates are still heard from (they may yet elect one).
+        now = self._clock.monotonic()
+        due_at = self._orphan_due_at.setdefault(job_id, now)
+        tier_heartbeats = self._state.gate_peer_heartbeats_total
+        due_heartbeats = self._orphan_due_heartbeats.setdefault(job_id, tier_heartbeats)
+        takeover_window = max(self._orphan_grace_period_seconds, self._state.longest_orphan_takeover_wait_seconds)
+        tracker = self._takeover_extensions.get(job_id)
+        takeover_window_spent = now - due_at >= takeover_window + (
+            tracker.total_extended if tracker is not None else 0.0
+        )
+        if takeover_window_spent:
+            last_heartbeats = (
+                tracker.last_completed_items
+                if tracker is not None and tracker.last_completed_items is not None
+                else due_heartbeats
+            )
+            if tier_heartbeats > last_heartbeats:
+                if tracker is None:
+                    tracker = ExtensionTracker(
+                        worker_id=job_id,
+                        base_deadline=takeover_window,
+                        min_grant=self._orphan_extension_min_grant_seconds,
+                        max_extensions=self._orphan_extension_max_extensions,
+                    )
+                    self._takeover_extensions[job_id] = tracker
+                granted, _grant, _denial, _warning = tracker.request_extension(
+                    "orphan due: its tier is still heard from",
+                    current_progress=float(tier_heartbeats),
+                    completed_items=tier_heartbeats,
+                )
+                takeover_window_spent = not granted
+
         job = self._job_manager.get_job(job_id)
         if not job:
             job = await self._get_or_repair_job(job_id)
 
             if not job:
-                time_orphaned = self._clock.monotonic() - orphaned_at
-                if time_orphaned >= self._orphan_timeout_seconds:
+                if takeover_window_spent:
                     self._clear_orphaned_job(job_id)
                 return
 
@@ -464,14 +583,12 @@ class GateOrphanJobCoordinator:
             self._clear_orphaned_job(job_id)
             return
 
-        time_orphaned = self._clock.monotonic() - orphaned_at
-        if time_orphaned >= self._orphan_timeout_seconds:
-            await self._fail_orphaned_job(job_id, job, time_orphaned)
+        if takeover_window_spent:
+            await self._fail_orphaned_job(job_id, job, now - orphaned_at)
             return
 
         if not self._is_current_cluster_leader():
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=(
                         f"Job {job_id[:8]}... orphan takeover deferred to the "
@@ -496,6 +613,10 @@ class GateOrphanJobCoordinator:
         """Clear all orphan evidence for ``job_id``."""
         self._state.clear_orphaned_job(job_id)
         self._confirmed_orphaned_jobs.discard(job_id)
+        self._orphan_extensions.pop(job_id, None)
+        self._orphan_due_at.pop(job_id, None)
+        self._orphan_due_heartbeats.pop(job_id, None)
+        self._takeover_extensions.pop(job_id, None)
 
     async def _fail_orphaned_job(
         self,
@@ -558,8 +679,7 @@ class GateOrphanJobCoordinator:
         try:
             repaired = await self._state_repair_callback(job_id)
         except Exception as repair_error:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=(
                         f"State repair for orphaned job {job_id[:8]}... "
@@ -633,6 +753,8 @@ class GateOrphanJobCoordinator:
         async with self._lock:
             if not self._state.is_job_orphaned(job_id):
                 return
+            if (due_at := self._orphan_due_at.get(job_id)) is not None:
+                self._state.record_orphan_takeover_wait(self._clock.monotonic() - due_at)
             self._clear_orphaned_job(job_id)
 
         await self._logger.log(
@@ -680,7 +802,7 @@ class GateOrphanJobCoordinator:
         announcement_data = announcement.dump()
         active_peers = self._get_active_peers()
 
-        for peer_addr in active_peers:
+        for peer_addr in sorted(active_peers):
             self._task_runner.run(
                 self._send_leadership_announcement,
                 peer_addr,
@@ -705,15 +827,17 @@ class GateOrphanJobCoordinator:
             job_id: Job ID for logging
         """
         try:
-            await self._send_tcp(
+            response, _ = await self._send_tcp(
                 peer_addr,
                 "job_leadership_announcement",
                 announcement_data,
                 5.0,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
         except Exception as error:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=f"Failed to send leadership announcement for {job_id[:8]}... to {peer_addr}: {error}",
                     node_host=self._get_node_addr()[0],
@@ -722,7 +846,7 @@ class GateOrphanJobCoordinator:
                 ),
             )
 
-    def get_orphan_stats(self) -> dict[str, Any]:
+    def get_orphan_stats(self) -> OrphanJobStats:
         """
         Get statistics about orphaned job tracking.
 

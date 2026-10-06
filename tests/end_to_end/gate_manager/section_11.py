@@ -174,8 +174,8 @@ async def validate_11_2_timeout_triggers_cancellation() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_completion_events, dict), (
-            "Timeout triggers cancellation expected cancellation events"
+        assert gate._cancellation_handler is not None, (
+            "Timeout triggers cancellation expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()

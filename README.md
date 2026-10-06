@@ -178,7 +178,7 @@ docker pull hyperlightorg/hyperscale:latest
 then execute commands from within the image via:
 
 ```bash
-docker run -e COLUMNS=200 -e LINES=60 -v <TEST_DIR>:/tests hyperscale <ARGS_HERE>
+docker run -e COLUMNS=200 -e LINES=60 -v <TEST_DIR>:/tests hyperlightorg/hyperscale:latest <ARGS_HERE>
 ```
 
 > [!IMPORTANT]  
@@ -200,20 +200,14 @@ To setup your environment run the following script:
 git clone https://github.com/hyper-light/hyperscale.git && \
 cd hyperscale
 
-# We personally recommend uv
-pip install uv
-
-uv venv && \
-source .venv/bin/activate
-
-# Install Hyperscale
+# Development uses uv (https://docs.astral.sh/uv/getting-started/installation/).
+# Create .venv exactly as uv.lock pins it, with the dev tools:
+uv sync --dev
 
 # NOTE: To install ALL dependencies for ALL reporting and
-# client options, uncomment the line below:
+# client options instead, run:
 
-# uv pip install -r requirements.txt.dev
-
-uv pip install -e .
+# uv sync --all-extras --dev
 
 ```
 ___________

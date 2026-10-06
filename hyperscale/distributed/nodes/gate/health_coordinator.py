@@ -10,6 +10,7 @@ Handles datacenter health monitoring and classification:
 """
 
 import asyncio
+from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
@@ -24,12 +25,15 @@ from hyperscale.distributed.datacenters import (
     CrossDCCorrelationDetector,
 )
 from hyperscale.distributed.capacity import DatacenterCapacityAggregator
+from hyperscale.distributed.health.circuit_breaker_manager import CircuitBreakerManager
 from hyperscale.distributed.resources.datacenter_resource_aggregator import (
     DatacenterResourceAggregator,
 )
 from hyperscale.distributed.resources.datacenter_resource_view import (
     DatacenterResourceView,
 )
+from hyperscale.distributed.slo.latency_slo import LatencySLO
+from hyperscale.distributed.slo.slo_health_classifier import SLOHealthClassifier
 from hyperscale.distributed.slo.resource_aware_predictor import (
     ResourceAwareSLOPredictor,
 )
@@ -57,11 +61,45 @@ RecordManagerHeartbeat = Callable[
 ]
 
 
+# Manager heartbeat fields only the manager's TCP status report carries: a
+# heartbeat embedded in SWIM leaves them at their defaults -- its UDP
+# budget has no room for them (swim/core/state_embedder.py). The resource
+# report is the one more, and a SWIM heartbeat's None already leaves the
+# last one in place.
+TCP_REPORTED_MANAGER_FIELDS = (
+    "cluster_id",
+    "environment_id",
+    "overloaded_worker_count",
+    "stressed_worker_count",
+    "busy_worker_count",
+    "lhm_score",
+    "worker_max_lhm_score",
+    "pending_workflow_count",
+    "pending_duration_seconds",
+    "active_remaining_seconds",
+    "cores_freeing_schedule",
+    "slo_p50_ms",
+    "slo_p95_ms",
+    "slo_p99_ms",
+    "slo_sample_count",
+    "slo_compliance_score",
+    "slo_routing_factor",
+    "slo_updated_at",
+)
+
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
-    from hyperscale.distributed.datacenters.manager_dispatcher import ManagerDispatcher
     from hyperscale.distributed.taskex import TaskRunner
+
+
+# Health a datacenter's latency SLO can grade it down to, worst last.
+_SLO_GRADED_HEALTH_SEVERITY: dict[str, int] = {
+    DatacenterHealth.HEALTHY.value: 0,
+    DatacenterHealth.BUSY.value: 1,
+    DatacenterHealth.DEGRADED.value: 2,
+    DatacenterHealth.UNHEALTHY.value: 3,
+}
 
 
 class GateHealthCoordinator:
@@ -85,7 +123,6 @@ class GateHealthCoordinator:
         cross_dc_correlation: CrossDCCorrelationDetector,
         track_manager: Callable[[str, tuple[str, int]], None],
         versioned_clock: "VersionedStateClock",
-        manager_dispatcher: "ManagerDispatcher",
         manager_health_config: "ManagerHealthConfig",
         datacenter_managers: dict[str, list[tuple[str, int]]],
         get_node_id: Callable[[], "NodeId"],
@@ -94,12 +131,15 @@ class GateHealthCoordinator:
         confirm_manager_for_dc: Callable[[str, tuple[str, int]], "asyncio.Task"],
         record_manager_heartbeat: RecordManagerHeartbeat,
         clock: Clock,
-        capacity_aggregator: DatacenterCapacityAggregator | None = None,
         on_partition_healed: Callable[[list[str]], None] | None = None,
         on_partition_detected: Callable[[list[str]], None] | None = None,
         *,
+        capacity_aggregator: DatacenterCapacityAggregator,
+        circuit_breaker_manager: CircuitBreakerManager,
         resource_aggregator: DatacenterResourceAggregator,
         resource_predictor: ResourceAwareSLOPredictor,
+        latency_slo: LatencySLO,
+        slo_health_classifier: SLOHealthClassifier,
     ) -> None:
         self._clock: Clock = clock
         self._state: GateRuntimeState = state
@@ -110,7 +150,6 @@ class GateHealthCoordinator:
         self._cross_dc_correlation: CrossDCCorrelationDetector = cross_dc_correlation
         self._track_manager: Callable[[str, tuple[str, int]], None] = track_manager
         self._versioned_clock: "VersionedStateClock" = versioned_clock
-        self._manager_dispatcher: "ManagerDispatcher" = manager_dispatcher
         self._manager_health_config: "ManagerHealthConfig" = manager_health_config
         self._datacenter_managers: dict[str, list[tuple[str, int]]] = (
             datacenter_managers
@@ -124,13 +163,17 @@ class GateHealthCoordinator:
         self._record_manager_heartbeat: RecordManagerHeartbeat = (
             record_manager_heartbeat
         )
-        self._capacity_aggregator: DatacenterCapacityAggregator | None = (
-            capacity_aggregator
-        )
+        self._capacity_aggregator: DatacenterCapacityAggregator = capacity_aggregator
+        self._circuit_breaker_manager: CircuitBreakerManager = circuit_breaker_manager
         # AD-41: per-datacenter resource pressure from managers' reports,
         # folded into routing through the AD-42 resource-aware predictor.
         self._resource_aggregator = resource_aggregator
         self._resource_predictor = resource_predictor
+        # AD-42: a datacenter missing its latency SLO for long enough is
+        # graded down by it (composite health: the worse of the managers'
+        # health and the SLO's).
+        self._latency_slo = latency_slo
+        self._slo_health_classifier = slo_health_classifier
         self._on_partition_healed: Callable[[list[str]], None] | None = (
             on_partition_healed
         )
@@ -138,6 +181,9 @@ class GateHealthCoordinator:
             on_partition_detected
         )
         self._partitioned_datacenters: set[str] = set()
+        # Each manager's last full (TCP) report and when it arrived, kept
+        # while it is fresh: a SWIM heartbeat carries its fields on.
+        self._manager_reports: dict[tuple[str, int], tuple[ManagerHeartbeat, float]] = {}
 
         self._cross_dc_correlation.register_partition_healed_callback(
             self._handle_partition_healed
@@ -154,13 +200,35 @@ class GateHealthCoordinator:
         """
         Handle ManagerHeartbeat received via SWIM message embedding.
 
-        Uses versioned clock to reject stale updates.
+        Uses versioned clock to reject stale updates. The heartbeat leaves
+        the fields only the TCP report carries at their defaults
+        (``TCP_REPORTED_MANAGER_FIELDS``): ingested as it arrived, every
+        SWIM heartbeat between two reports -- several a second -- zeroed
+        the manager's capacity backlog, worker health and SLO at the gate,
+        at the same version. It carries them on from the manager's last
+        report while that is fresh; once none is, it says what SWIM knows.
 
         Args:
             heartbeat: Received manager heartbeat
             source_addr: UDP source address of the heartbeat
         """
-        await self.ingest_manager_heartbeat(heartbeat, source_addr)
+        manager_addr = self._resolve_manager_addr(heartbeat, source_addr)
+        if (report := self._manager_reports.get(manager_addr)) is not None:
+            last_report, reported_at = report
+            if (
+                self._clock.monotonic() - reported_at
+                <= self._capacity_aggregator.staleness_threshold_seconds
+            ):
+                heartbeat = replace(
+                    heartbeat,
+                    **{
+                        field_name: getattr(last_report, field_name)
+                        for field_name in TCP_REPORTED_MANAGER_FIELDS
+                    },
+                )
+            else:
+                del self._manager_reports[manager_addr]
+        await self.ingest_manager_heartbeat(heartbeat, source_addr, embedded=True)
 
     async def ingest_manager_heartbeat(
         self,
@@ -169,6 +237,7 @@ class GateHealthCoordinator:
         manager_addr: tuple[str, int] | None = None,
         *,
         use_version_clock: bool = True,
+        embedded: bool = False,
     ) -> tuple[str, tuple[str, int]] | None:
         """Ingest a manager heartbeat into every gate-side health store.
 
@@ -176,7 +245,9 @@ class GateHealthCoordinator:
         registration, peer-gate discovery, and SWIM piggyback data. All
         paths must update the same canonical stores or routing sees
         contradictory state: capacity can look available while the
-        datacenter health manager still has zero managers.
+        datacenter health manager still has zero managers. A heartbeat
+        not ``embedded`` in SWIM is a full report: SWIM heartbeats carry
+        its TCP-only fields on while it is fresh.
         """
         datacenter_id = heartbeat.datacenter
         resolved_manager_addr = manager_addr or self._resolve_manager_addr(
@@ -190,6 +261,15 @@ class GateHealthCoordinator:
             return None
 
         self._ensure_manager_known(datacenter_id, resolved_manager_addr)
+        if not embedded:
+            now = self._clock.monotonic()
+            staleness_threshold_seconds = self._capacity_aggregator.staleness_threshold_seconds
+            self._manager_reports = {
+                reporting_addr: report
+                for reporting_addr, report in self._manager_reports.items()
+                if now - report[1] <= staleness_threshold_seconds
+            }
+            self._manager_reports[resolved_manager_addr] = (heartbeat, now)
         await self._state.update_manager_status(
             datacenter_id,
             resolved_manager_addr,
@@ -197,14 +277,17 @@ class GateHealthCoordinator:
             self._clock.monotonic(),
         )
 
-        if self._capacity_aggregator is not None:
-            self._capacity_aggregator.record_heartbeat(heartbeat)
+        self._capacity_aggregator.record_heartbeat(heartbeat)
 
         # Only the TCP status update carries a resource report; a SWIM
         # heartbeat without one leaves the manager's last report in place.
         if heartbeat.resource_report is not None:
+            # Straight from its manager: made as it was sent.
             self._resource_aggregator.record(
-                datacenter_id, resolved_manager_addr, heartbeat.resource_report
+                datacenter_id,
+                resolved_manager_addr,
+                heartbeat.resource_report,
+                age_seconds=0.0,
             )
 
         self._record_manager_heartbeat(
@@ -238,10 +321,6 @@ class GateHealthCoordinator:
         )
 
         if heartbeat.is_leader:
-            self._manager_dispatcher.set_leader(
-                datacenter_id,
-                resolved_manager_addr,
-            )
             self._update_federated_leader(
                 datacenter_id,
                 resolved_manager_addr,
@@ -335,21 +414,10 @@ class GateHealthCoordinator:
             )
             self._state._manager_health[manager_key] = health_state
 
-        has_quorum = getattr(
-            heartbeat,
-            "health_has_quorum",
-            getattr(heartbeat, "has_quorum", True),
-        )
-        accepting_jobs = getattr(
-            heartbeat,
-            "health_accepting_jobs",
-            getattr(heartbeat, "accepting_jobs", True),
-        )
-
         await health_state.update_liveness_async(success=True)
         await health_state.update_readiness_async(
-            has_quorum=has_quorum,
-            accepting=accepting_jobs,
+            has_quorum=heartbeat.health_has_quorum,
+            accepting=heartbeat.health_accepting_jobs,
             worker_count=heartbeat.healthy_worker_count,
         )
 
@@ -371,11 +439,10 @@ class GateHealthCoordinator:
                 lhm_score=heartbeat.lhm_score,
                 node_type="manager",
             )
-        worker_lhm_score = getattr(heartbeat, "worker_max_lhm_score", 0)
-        if worker_lhm_score > 0:
+        if heartbeat.worker_max_lhm_score > 0:
             self._cross_dc_correlation.record_lhm_score(
                 datacenter_id=datacenter_id,
-                lhm_score=worker_lhm_score,
+                lhm_score=heartbeat.worker_max_lhm_score,
                 node_type="worker",
             )
 
@@ -401,6 +468,29 @@ class GateHealthCoordinator:
         )
 
     def classify_datacenter_health(self, datacenter_id: str) -> DatacenterStatus:
+        """Classify a datacenter's health: the worse of what its managers'
+        heartbeats and probes show and what its latency SLO compliance
+        does (AD-42). An initializing datacenter is judged by reachability
+        alone; one with too few latency observations to judge is not
+        graded by them."""
+        status = self._classify_datacenter_reachability(datacenter_id)
+        if status.health not in _SLO_GRADED_HEALTH_SEVERITY:
+            return status
+        observation = self._state.get_dc_latency_observation(datacenter_id)
+        if observation is None or observation.sample_count < self._latency_slo.min_sample_count:
+            self._slo_health_classifier.forget(datacenter_id)
+            return status
+        slo_health = self._slo_health_classifier.compute_health_signal(
+            datacenter_id,
+            self._latency_slo,
+            observation,
+            self._clock.monotonic(),
+        ).lower()
+        if _SLO_GRADED_HEALTH_SEVERITY[slo_health] > _SLO_GRADED_HEALTH_SEVERITY[status.health]:
+            return replace(status, health=slo_health)
+        return status
+
+    def _classify_datacenter_reachability(self, datacenter_id: str) -> DatacenterStatus:
         """
         Classify datacenter health based on TCP heartbeats and UDP probes.
 
@@ -428,24 +518,20 @@ class GateHealthCoordinator:
 
         if federated_health.reachability == DCReachability.UNREACHABLE:
             return self._merge_unreachable_federated_health(
-                datacenter_id,
                 tcp_status,
                 federated_health,
             )
 
+        # A merged status keeps every TCP-derived field it does not
+        # override: building a fresh status here reset the overload
+        # signals (health severity weight, overload ratios) to their
+        # neutral defaults, so a suspected datacenter shed its overload
+        # penalty in routing.
         if federated_health.reachability == DCReachability.SUSPECTED:
             if tcp_status.health == DatacenterHealth.UNHEALTHY.value:
                 return tcp_status
 
-            return DatacenterStatus(
-                dc_id=datacenter_id,
-                health=DatacenterHealth.DEGRADED.value,
-                available_capacity=tcp_status.available_capacity,
-                queue_depth=tcp_status.queue_depth,
-                manager_count=tcp_status.manager_count,
-                worker_count=tcp_status.worker_count,
-                last_update=tcp_status.last_update,
-            )
+            return replace(tcp_status, health=DatacenterHealth.DEGRADED.value)
 
         if federated_health.last_ack:
             reported_health = federated_health.last_ack.dc_health
@@ -453,47 +539,40 @@ class GateHealthCoordinator:
                 reported_health == "UNHEALTHY"
                 and tcp_status.health != DatacenterHealth.UNHEALTHY.value
             ):
-                return DatacenterStatus(
-                    dc_id=datacenter_id,
+                return replace(
+                    tcp_status,
                     health=DatacenterHealth.UNHEALTHY.value,
                     available_capacity=0,
-                    queue_depth=tcp_status.queue_depth,
                     manager_count=federated_health.last_ack.healthy_managers,
                     worker_count=federated_health.last_ack.healthy_workers,
-                    last_update=tcp_status.last_update,
                 )
             if (
                 reported_health == "DEGRADED"
                 and tcp_status.health == DatacenterHealth.HEALTHY.value
             ):
-                return DatacenterStatus(
-                    dc_id=datacenter_id,
+                return replace(
+                    tcp_status,
                     health=DatacenterHealth.DEGRADED.value,
                     available_capacity=federated_health.last_ack.available_cores,
-                    queue_depth=tcp_status.queue_depth,
                     manager_count=federated_health.last_ack.healthy_managers,
                     worker_count=federated_health.last_ack.healthy_workers,
-                    last_update=tcp_status.last_update,
                 )
             if (
                 reported_health == "BUSY"
                 and tcp_status.health == DatacenterHealth.HEALTHY.value
             ):
-                return DatacenterStatus(
-                    dc_id=datacenter_id,
+                return replace(
+                    tcp_status,
                     health=DatacenterHealth.BUSY.value,
                     available_capacity=federated_health.last_ack.available_cores,
-                    queue_depth=tcp_status.queue_depth,
                     manager_count=federated_health.last_ack.healthy_managers,
                     worker_count=federated_health.last_ack.healthy_workers,
-                    last_update=tcp_status.last_update,
                 )
 
         return tcp_status
 
     def _merge_unreachable_federated_health(
         self,
-        datacenter_id: str,
         tcp_status: DatacenterStatus,
         federated_health: DCHealthState,
     ) -> DatacenterStatus:
@@ -505,24 +584,13 @@ class GateHealthCoordinator:
             DatacenterHealth.HEALTHY.value,
             DatacenterHealth.BUSY.value,
         ):
-            return DatacenterStatus(
-                dc_id=datacenter_id,
-                health=DatacenterHealth.DEGRADED.value,
-                available_capacity=tcp_status.available_capacity,
-                queue_depth=tcp_status.queue_depth,
-                manager_count=tcp_status.manager_count,
-                worker_count=tcp_status.worker_count,
-                last_update=tcp_status.last_update,
-            )
+            return replace(tcp_status, health=DatacenterHealth.DEGRADED.value)
 
-        return DatacenterStatus(
-            dc_id=datacenter_id,
+        return replace(
+            tcp_status,
             health=DatacenterHealth.UNHEALTHY.value,
             available_capacity=0,
-            queue_depth=tcp_status.queue_depth,
-            manager_count=tcp_status.manager_count,
             worker_count=0,
-            last_update=tcp_status.last_update,
         )
 
     def get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
@@ -543,7 +611,7 @@ class GateHealthCoordinator:
         Get the most authoritative manager heartbeat for a datacenter.
 
         Strategy:
-        1. Prefer the LEADER's heartbeat if fresh (within 30s)
+        1. Prefer the LEADER's heartbeat while its manager is not suspected
         2. Fall back to any fresh manager heartbeat
         3. Return None if no fresh heartbeats
 
@@ -553,37 +621,19 @@ class GateHealthCoordinator:
         Returns:
             Tuple of (best_heartbeat, alive_manager_count, total_manager_count)
         """
-        manager_statuses = self._state._datacenter_manager_status.get(datacenter_id, {})
-        now = self._clock.monotonic()
-        heartbeat_timeout = 30.0
-
-        best_heartbeat: ManagerHeartbeat | None = None
-        leader_heartbeat: ManagerHeartbeat | None = None
-        alive_count = 0
-
-        for manager_addr, heartbeat in manager_statuses.items():
-            last_seen = self._state._manager_last_status.get(manager_addr, 0)
-            is_fresh = (now - last_seen) < heartbeat_timeout
-
-            if is_fresh:
-                alive_count += 1
-
-                if heartbeat.is_leader:
-                    leader_heartbeat = heartbeat
-
-                if best_heartbeat is None:
-                    best_heartbeat = heartbeat
-
-        if leader_heartbeat is not None:
-            best_heartbeat = leader_heartbeat
-
-        return best_heartbeat, alive_count, len(manager_statuses)
+        # One judgement of a manager's liveness: the datacenter health
+        # manager's phi-accrual detectors (AD-52 section 8).
+        return self._dc_health_manager.get_best_manager_heartbeat(datacenter_id)
 
     def count_active_datacenters(self) -> int:
+        """Datacenters this gate reaches: their managers' heartbeats arrive.
+        One whose heartbeats stopped (UNHEALTHY) or never began
+        (INITIALIZING) is not reached."""
         return sum(
             1
             for status in self.get_all_datacenter_health().values()
-            if status.health != DatacenterHealth.UNHEALTHY.value
+            if status.health
+            not in (DatacenterHealth.UNHEALTHY.value, DatacenterHealth.INITIALIZING.value)
         )
 
     def _handle_partition_healed(
@@ -657,11 +707,17 @@ class GateHealthCoordinator:
         slo_routing_factor = self._state.get_dc_slo_routing_factor(datacenter_id)
         if (view := self.datacenter_resource_view(datacenter_id)) is None:
             return slo_routing_factor
+        # Uncertainties on the pressures' own scale: a share of capacity.
+        # Without a capacity to measure against, nothing is known.
         return self._resource_predictor.predict_slo_risk(
             cpu_pressure=view.cpu_pressure,
-            cpu_uncertainty=view.workload_cpu_uncertainty,
+            cpu_uncertainty_pressure=view.workload_cpu_uncertainty / view.cpu_capacity_percent
+            if view.cpu_capacity_percent > 0
+            else float("inf"),
             memory_pressure=view.memory_pressure,
-            memory_uncertainty=view.workload_memory_uncertainty,
+            memory_uncertainty_pressure=view.workload_memory_uncertainty / view.memory_capacity_bytes
+            if view.memory_capacity_bytes > 0
+            else float("inf"),
             current_slo_score=slo_routing_factor,
         )
 
@@ -670,19 +726,13 @@ class GateHealthCoordinator:
         datacenter_ids: list[str],
     ) -> list[DatacenterCandidate]:
         """
-        Build datacenter candidates for job routing.
+        Build the router's view of each datacenter.
 
-        Creates DatacenterCandidate objects with health and capacity info
-        for the job router to use in datacenter selection.
-
-        Integrates DatacenterCapacityAggregator (AD-43) to enrich candidates
-        with aggregated capacity metrics from manager heartbeats.
-
-        Args:
-            datacenter_ids: List of datacenter IDs to build candidates for
-
-        Returns:
-            List of DatacenterCandidate objects with health/capacity metrics
+        Health is the merged classification (TCP heartbeats and federated
+        probes), held at DEGRADED while a correlated failure or a partition
+        makes an UNHEALTHY verdict suspect. Capacity is the datacenter's
+        AD-43 aggregate. Managers are those the gate dispatches to; the
+        ones whose circuit is open are the circuit-breaker pressure.
         """
         candidates: list[DatacenterCandidate] = []
         for datacenter_id in datacenter_ids:
@@ -698,42 +748,57 @@ class GateHealthCoordinator:
             if datacenter_id in self._partitioned_datacenters:
                 health_bucket = DatacenterHealth.DEGRADED.value.upper()
 
-            available_cores = status.available_capacity
-            total_cores = status.available_capacity + status.queue_depth
-            queue_depth = status.queue_depth
-
-            if self._capacity_aggregator is not None:
-                capacity = self._capacity_aggregator.get_capacity(
-                    datacenter_id, health_bucket.lower()
-                )
-                if capacity.total_cores > 0:
-                    available_cores = capacity.available_cores
-                    total_cores = capacity.total_cores
-                    queue_depth = capacity.pending_workflow_count
-
-            slo_routing_factor = self._datacenter_routing_factor(datacenter_id)
+            capacity = self._capacity_aggregator.get_capacity(datacenter_id)
+            managers = self._datacenter_managers.get(datacenter_id, [])
+            open_circuit_count = self._circuit_breaker_manager.count_open_circuits(
+                managers
+            )
             candidates.append(
                 DatacenterCandidate(
                     datacenter_id=datacenter_id,
                     health_bucket=health_bucket,
-                    available_cores=available_cores,
-                    total_cores=total_cores,
-                    queue_depth=queue_depth,
-                    lhm_multiplier=1.0,
-                    circuit_breaker_pressure=0.0,
-                    total_managers=status.manager_count,
-                    healthy_managers=status.manager_count,
-                    health_severity_weight=getattr(
-                        status, "health_severity_weight", 1.0
+                    available_cores=capacity.available_cores,
+                    total_cores=capacity.total_cores,
+                    queue_depth=capacity.pending_workflow_count,
+                    total_managers=len(managers),
+                    healthy_managers=len(managers) - open_circuit_count,
+                    circuit_breaker_pressure=(
+                        open_circuit_count / len(managers) if managers else 0.0
                     ),
-                    worker_overload_ratio=getattr(status, "worker_overload_ratio", 0.0),
-                    overloaded_worker_count=getattr(
-                        status, "overloaded_worker_count", 0
-                    ),
-                    slo_routing_factor=slo_routing_factor,
+                    health_severity_weight=status.health_severity_weight,
+                    slo_routing_factor=self._datacenter_routing_factor(datacenter_id),
                 )
             )
         return candidates
+
+    def sample_datacenter_correlation(self) -> None:
+        """Give the cross-datacenter correlation detector one sample of
+        every datacenter's merged health -- an UNHEALTHY datacenter is a
+        failure, a reachable one a recovery, one never heard from yet no
+        evidence -- then check whether a partition it detected has healed.
+
+        The detector confirms a failure, and a recovery, only over time
+        (AD-33 Part 6): it must hear each datacenter's health as often as
+        that can change, not only its transitions. Unfed, it never saw a
+        correlated failure, so a suspect datacenter was never held at
+        DEGRADED during one (AD-36 then took a network-wide blip for lost
+        datacenters); and a partition it detected never healed -- its
+        datacenters stayed held at DEGRADED for good.
+        """
+        for datacenter_id, managers in self._datacenter_managers.items():
+            match self.classify_datacenter_health(datacenter_id).health:
+                case DatacenterHealth.UNHEALTHY.value:
+                    self._cross_dc_correlation.record_failure(
+                        datacenter_id, "unhealthy", len(managers)
+                    )
+                case (
+                    DatacenterHealth.HEALTHY.value
+                    | DatacenterHealth.BUSY.value
+                    | DatacenterHealth.DEGRADED.value
+                ):
+                    self._cross_dc_correlation.record_recovery(datacenter_id)
+        if self._cross_dc_correlation.is_in_partition():
+            self._cross_dc_correlation.check_partition_healed()
 
     def check_and_notify_partition_healed(self) -> bool:
         return self._cross_dc_correlation.check_partition_healed()
@@ -744,67 +809,3 @@ class GateHealthCoordinator:
     def get_time_since_partition_healed(self) -> float | None:
         return self._cross_dc_correlation.get_time_since_partition_healed()
 
-    def legacy_select_datacenters(
-        self,
-        count: int,
-        dc_health: dict[str, DatacenterStatus],
-        datacenter_manager_count: int,
-        preferred: list[str] | None = None,
-    ) -> tuple[list[str], list[str], str]:
-        if not dc_health:
-            if datacenter_manager_count > 0:
-                return ([], [], "initializing")
-            return ([], [], "unhealthy")
-
-        # An explicit ``datacenters=[...]`` list on the submission is a
-        # placement CONSTRAINT (mirroring the AD-36 router): selection
-        # only considers the listed datacenters. This selector
-        # previously accepted ``preferred`` and never read it, so a
-        # dc-pinned job could silently run anywhere.
-        preferred_set = set(preferred) if preferred else None
-
-        def _in_scope(datacenter_id: str) -> bool:
-            return preferred_set is None or datacenter_id in preferred_set
-
-        healthy = [
-            dc
-            for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.HEALTHY.value and _in_scope(dc)
-        ]
-        busy = [
-            dc
-            for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.BUSY.value and _in_scope(dc)
-        ]
-        degraded = [
-            dc
-            for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.DEGRADED.value and _in_scope(dc)
-        ]
-
-        if healthy:
-            worst_health = "healthy"
-        elif busy:
-            worst_health = "busy"
-        elif degraded:
-            worst_health = "degraded"
-        else:
-            # Nothing usable. Distinguish "still coming up" from "down":
-            # any in-scope datacenter in its pre-first-heartbeat window
-            # makes the aggregate INITIALIZING (submissions rejected as
-            # transient, clients retry) rather than UNHEALTHY (jobs
-            # failed). Scoped to the constraint so a pinned job's
-            # rejection reflects the PINNED datacenters' state, not an
-            # unrelated datacenter that happens to be booting.
-            initializing = any(
-                status.health == DatacenterHealth.INITIALIZING.value
-                for dc, status in dc_health.items()
-                if _in_scope(dc)
-            )
-            return ([], [], "initializing" if initializing else "unhealthy")
-
-        all_usable = healthy + busy + degraded
-        primary = all_usable[:count]
-        fallback = all_usable[count:]
-
-        return (primary, fallback, worst_health)

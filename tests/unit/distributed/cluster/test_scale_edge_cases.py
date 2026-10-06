@@ -34,16 +34,9 @@ from hyperscale.distributed.reliability.load_shedding import (
     RequestPriority,
 )
 from hyperscale.distributed.reliability.rate_limiting import (
-    TokenBucket,
     RateLimitConfig,
     ServerRateLimiter,
     CooperativeRateLimiter,
-)
-from hyperscale.distributed.health.probes import (
-    HealthProbe,
-    ProbeConfig,
-    ProbeResult,
-    CompositeProbe,
 )
 from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
@@ -145,7 +138,7 @@ class TestMemoryLeakPrevention:
 
         # Simulate high request volume
         for _ in range(100000):
-            shedder.should_shed("Ping")
+            shedder.should_shed_handler("ping")
 
         metrics = shedder.get_metrics()
         assert metrics["total_requests"] == 100000
@@ -192,37 +185,6 @@ class TestMemoryLeakPrevention:
 
 class TestResourceExhaustion:
     """Tests for resource exhaustion scenarios."""
-
-    def test_token_bucket_complete_depletion(self):
-        """Test token bucket behavior when completely depleted."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)
-
-        # Deplete all tokens
-        for _ in range(10):
-            assert bucket.acquire() is True
-
-        # Bucket is empty - can't acquire more
-        assert bucket.acquire() is False
-        # Note: available_tokens calls _refill() which may add tiny amounts
-        # due to elapsed time, so check it's less than 1 (can't acquire)
-        assert bucket.available_tokens < 1
-
-    def test_token_bucket_recovery_after_depletion(self):
-        """Test token bucket recovery after complete depletion."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=100.0)  # Fast refill
-
-        # Deplete
-        for _ in range(10):
-            bucket.acquire()
-
-        # Immediately after depletion, should have very few tokens
-        # (available_tokens calls _refill so may have tiny amount)
-        assert bucket.available_tokens < 1
-
-        # Wait for refill
-        time.sleep(0.1)  # Should refill 10 tokens
-
-        assert bucket.available_tokens >= 9  # Allow for timing variance
 
     @pytest.mark.asyncio
     async def test_rate_limiter_sustained_overload(self):
@@ -301,7 +263,7 @@ class TestResourceExhaustion:
         accepted_count = 0
 
         for _ in range(10000):
-            if shedder.should_shed("SubmitJob"):  # HIGH priority
+            if shedder.should_shed_handler("job_submission"):  # HIGH priority
                 shed_count += 1
             else:
                 accepted_count += 1
@@ -338,7 +300,7 @@ class TestCascadeFailures:
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
         detector.record_latency(50.0)  # Below 100.0 threshold
-        assert not shedder.should_shed("DetailedStatsRequest")  # LOW - accepted
+        assert not shedder.should_shed_handler("cluster_status")  # LOW - accepted
 
         # Test STRESSED state (300ms > 200ms, < 500ms threshold)
         detector = HybridOverloadDetector(config)
@@ -346,9 +308,9 @@ class TestCascadeFailures:
         detector.record_latency(300.0)
 
         # LOW and NORMAL should now be shed
-        assert shedder.should_shed("DetailedStatsRequest")  # LOW
-        assert shedder.should_shed("StatsUpdate")  # NORMAL
-        assert not shedder.should_shed("SubmitJob")  # HIGH
+        assert shedder.should_shed_handler("cluster_status")  # LOW
+        assert shedder.should_shed_handler("workflow_progress")  # NORMAL
+        assert not shedder.should_shed_handler("job_submission")  # HIGH
 
         # Test OVERLOADED state (1000ms > 500ms threshold)
         detector = HybridOverloadDetector(config)
@@ -356,8 +318,8 @@ class TestCascadeFailures:
         detector.record_latency(1000.0)
 
         # Only CRITICAL accepted
-        assert shedder.should_shed("SubmitJob")  # HIGH - now shed
-        assert not shedder.should_shed("Ping")  # CRITICAL
+        assert shedder.should_shed_handler("job_submission")  # HIGH - now shed
+        assert not shedder.should_shed_handler("ping")  # CRITICAL
 
     def test_multiple_detection_methods_cascade(self):
         """Test cascade when multiple detection methods trigger."""
@@ -385,41 +347,6 @@ class TestCascadeFailures:
         # Should be OVERLOADED from absolute bounds
         state = detector.get_state(cpu_percent=50.0, memory_percent=50.0)
         assert state == OverloadState.OVERLOADED
-
-    @pytest.mark.asyncio
-    async def test_probe_failure_cascade(self):
-        """Test probe failures cascading to composite unhealthy."""
-        failure_count = 0
-
-        async def failing_check():
-            nonlocal failure_count
-            failure_count += 1
-            if failure_count <= 3:
-                return False, "Component unavailable"
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="dependency",
-            check=failing_check,
-            config=ProbeConfig(
-                failure_threshold=3,
-                timeout_seconds=1.0,
-            ),
-        )
-
-        composite = CompositeProbe("service")
-        composite.add_probe(probe)
-
-        # Initially healthy
-        assert composite.is_healthy() is True
-
-        # Fail 3 times to trigger threshold
-        for _ in range(3):
-            await probe.check()
-
-        assert composite.is_healthy() is False
-        assert "dependency" in composite.get_unhealthy_probes()
-
 
 # =============================================================================
 # State Corruption and Recovery Tests
@@ -572,7 +499,7 @@ class TestStateCorruptionRecovery:
         # Generate metrics
         detector.record_latency(300.0)  # OVERLOADED
         for _ in range(100):
-            shedder.should_shed("SubmitJob")
+            shedder.should_shed_handler("job_submission")
 
         metrics = shedder.get_metrics()
         assert metrics["total_requests"] == 100
@@ -668,7 +595,7 @@ class TestThunderingHerdBurst:
         assert state == OverloadState.HEALTHY
 
         # All traffic should be accepted
-        assert not shedder.should_shed("DetailedStatsRequest")
+        assert not shedder.should_shed_handler("cluster_status")
 
     @pytest.mark.asyncio
     async def test_concurrent_rate_limit_checks(self):
@@ -708,7 +635,7 @@ class TestThunderingHerdBurst:
         shed_decisions = []
         for _ in range(1000):
             # Mix of priorities
-            shed_decisions.append(shedder.should_shed("SubmitJob"))  # HIGH
+            shed_decisions.append(shedder.should_shed_handler("job_submission"))  # HIGH
 
         # In healthy state, all should be accepted
         assert sum(shed_decisions) == 0  # None shed
@@ -738,9 +665,9 @@ class TestStarvationFairness:
 
         # Verify CRITICAL is never shed even under sustained load
         for _ in range(10000):
-            assert shedder.should_shed("Ping") is False
-            assert shedder.should_shed("Heartbeat") is False
-            assert shedder.should_shed("JobCancelRequest") is False
+            assert shedder.should_shed_handler("ping") is False
+            assert shedder.should_shed_handler("raft_append_entries") is False
+            assert shedder.should_shed_handler("cancel_job") is False
 
     def test_high_priority_starves_low_under_stress(self):
         """Test LOW priority is shed while HIGH continues under stress."""
@@ -760,9 +687,9 @@ class TestStarvationFairness:
         low_shed = 0
 
         for _ in range(1000):
-            if shedder.should_shed("SubmitJob"):  # HIGH
+            if shedder.should_shed_handler("job_submission"):  # HIGH
                 high_shed += 1
-            if shedder.should_shed("DetailedStatsRequest"):  # LOW
+            if shedder.should_shed_handler("cluster_status"):  # LOW
                 low_shed += 1
 
         # HIGH should not be shed, LOW should be completely shed
@@ -857,22 +784,10 @@ class TestNumericOverflowBoundary:
 
         # Simulate many operations
         for _ in range(1_000_000):
-            shedder.should_shed("Ping")
+            shedder.should_shed_handler("ping")
 
         metrics = shedder.get_metrics()
         assert metrics["total_requests"] == 1_000_000
-
-    def test_token_bucket_refill_precision(self):
-        """Test token bucket maintains precision over many refills."""
-        bucket = TokenBucket(bucket_size=1000, refill_rate=0.001)
-
-        # Many small refills
-        for _ in range(10000):
-            bucket._refill()
-            time.sleep(0.0001)
-
-        # Tokens should not exceed bucket size
-        assert bucket.available_tokens <= bucket.bucket_size
 
     def test_extension_grant_logarithmic_decay(self):
         """Test extension grants follow logarithmic decay correctly."""
@@ -1005,36 +920,6 @@ class TestRapidStateTransitions:
         # Should see multiple states
         assert len(states_seen) >= 2
 
-    @pytest.mark.asyncio
-    async def test_probe_flapping_detection(self):
-        """Test probe handles flapping (rapid success/failure)."""
-        call_count = 0
-
-        async def flapping_check():
-            nonlocal call_count
-            call_count += 1
-            # Alternate success/failure
-            return call_count % 2 == 0, "Flapping"
-
-        probe = HealthProbe(
-            name="flapper",
-            check=flapping_check,
-            config=ProbeConfig(
-                failure_threshold=3,
-                success_threshold=2,
-            ),
-        )
-
-        # Run many checks
-        for _ in range(20):
-            await probe.check()
-
-        # Due to alternating pattern and thresholds,
-        # state should be deterministic
-        state = probe.get_state()
-        assert state is not None
-
-
 # =============================================================================
 # Long-Running Stability Tests
 # =============================================================================
@@ -1083,7 +968,7 @@ class TestLongRunningStability:
             else:
                 detector.record_latency(300.0)  # OVERLOADED
 
-            should_shed = shedder.should_shed("SubmitJob")
+            should_shed = shedder.should_shed_handler("job_submission")
             expected_total += 1
             if should_shed:
                 expected_shed += 1
@@ -1152,38 +1037,6 @@ class TestRecoveryPatterns:
         # Should see progression through states
         # OVERLOADED -> STRESSED -> BUSY -> HEALTHY (not necessarily all)
         assert recovery_states[-1] == OverloadState.HEALTHY
-
-    @pytest.mark.asyncio
-    async def test_probe_recovery_after_failures(self):
-        """Test probe recovers after consecutive failures."""
-        failure_phase = True
-
-        async def controllable_check():
-            if failure_phase:
-                return False, "Service unavailable"
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="service",
-            check=controllable_check,
-            config=ProbeConfig(
-                failure_threshold=3,
-                success_threshold=2,
-            ),
-        )
-
-        # Fail until unhealthy
-        for _ in range(5):
-            await probe.check()
-        assert probe.is_healthy() is False
-
-        # Enable recovery
-        failure_phase = False
-
-        # Should recover after success_threshold successes
-        for _ in range(3):
-            await probe.check()
-        assert probe.is_healthy() is True
 
     def test_extension_tracker_recovery_cycle(self):
         """Test extension tracker through full exhaustion-recovery cycle."""
@@ -1301,30 +1154,6 @@ class TestConcurrentAccessSafety:
         for results in all_results:
             assert all(isinstance(r, bool) for r in results)
 
-    @pytest.mark.asyncio
-    async def test_concurrent_probe_checks(self):
-        """Test concurrent probe checks don't cause issues."""
-        check_count = 0
-
-        async def counting_check():
-            nonlocal check_count
-            check_count += 1
-            await asyncio.sleep(0.001)
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="concurrent",
-            check=counting_check,
-            config=ProbeConfig(timeout_seconds=1.0),
-        )
-
-        # Run many concurrent checks
-        await asyncio.gather(*[probe.check() for _ in range(100)])
-
-        # All checks should have completed
-        assert check_count == 100
-
-
 # =============================================================================
 # Clock Skew and Time-Based Edge Cases
 # =============================================================================
@@ -1332,24 +1161,6 @@ class TestConcurrentAccessSafety:
 
 class TestClockSkewTimeBased:
     """Tests for clock skew and time-based edge cases."""
-
-    def test_token_bucket_handles_time_going_backwards(self):
-        """Test token bucket handles time.monotonic() anomalies gracefully."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=10.0)
-
-        # Consume some tokens
-        for _ in range(50):
-            bucket.acquire()
-
-        # Force a refill
-        initial_tokens = bucket.available_tokens
-
-        # Even with weird timing, should not exceed bucket size
-        bucket._refill()
-        bucket._refill()
-        bucket._refill()
-
-        assert bucket.available_tokens <= bucket.bucket_size
 
     def test_extension_tracker_handles_old_deadlines(self):
         """Test extension tracker with deadlines in the past."""
@@ -1372,29 +1183,6 @@ class TestClockSkewTimeBased:
         # Should still calculate correctly (even if result is in past)
         assert new_deadline == past_deadline + extension_seconds
 
-    @pytest.mark.asyncio
-    async def test_probe_handles_very_short_periods(self):
-        """Test probe with extremely short period doesn't cause issues."""
-        check_count = 0
-
-        async def quick_check():
-            nonlocal check_count
-            check_count += 1
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="quick",
-            check=quick_check,
-            config=ProbeConfig(
-                period_seconds=0.001,  # 1ms period
-                timeout_seconds=0.1,
-            ),
-        )
-
-        # Single check should work
-        await probe.check()
-        assert check_count == 1
-
     def test_cooperative_limiter_retry_after_zero(self):
         """Test cooperative limiter with zero retry_after."""
         limiter = CooperativeRateLimiter()
@@ -1413,33 +1201,6 @@ class TestClockSkewTimeBased:
 
         assert limiter.is_blocked("operation") is True
         assert limiter.get_retry_after("operation") > 3599.0
-
-    def test_token_bucket_very_slow_refill(self):
-        """Test token bucket with extremely slow refill rate."""
-        bucket = TokenBucket(
-            bucket_size=100, refill_rate=0.0001
-        )  # 1 token per 10000 sec
-
-        # Deplete
-        for _ in range(100):
-            bucket.acquire()
-
-        # After short wait, should have minimal tokens
-        time.sleep(0.01)
-        assert bucket.available_tokens < 1
-
-    def test_token_bucket_very_fast_refill(self):
-        """Test token bucket with extremely fast refill rate."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=1000000.0)  # 1M tokens/sec
-
-        # Deplete
-        for _ in range(100):
-            bucket.acquire()
-
-        # Should refill almost instantly
-        time.sleep(0.001)
-        assert bucket.available_tokens >= 99
-
 
 # =============================================================================
 # Data Structure Invariant Tests
@@ -1509,13 +1270,13 @@ class TestDataStructureInvariants:
 
         # Make requests of different priorities
         for _ in range(100):
-            shedder.should_shed("DetailedStatsRequest")  # LOW
+            shedder.should_shed_handler("cluster_status")  # LOW
         for _ in range(100):
-            shedder.should_shed("StatsUpdate")  # NORMAL
+            shedder.should_shed_handler("workflow_progress")  # NORMAL
         for _ in range(100):
-            shedder.should_shed("SubmitJob")  # HIGH
+            shedder.should_shed_handler("job_submission")  # HIGH
         for _ in range(100):
-            shedder.should_shed("Ping")  # CRITICAL
+            shedder.should_shed_handler("ping")  # CRITICAL
 
         metrics = shedder.get_metrics()
         shed_sum = sum(metrics["shed_by_priority"].values())
@@ -1538,32 +1299,6 @@ class TestDataStructureInvariants:
         assert metrics["total_requests"] == 100
         assert metrics["rate_limited_requests"] <= metrics["total_requests"]
 
-    @pytest.mark.asyncio
-    async def test_probe_state_consistency(self):
-        """Test probe state remains internally consistent."""
-
-        async def variable_check():
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="test",
-            check=variable_check,
-            config=ProbeConfig(failure_threshold=3, success_threshold=2),
-        )
-
-        for _ in range(100):
-            await probe.check()
-
-            state = probe.get_state()
-            # Invariants
-            assert state.consecutive_successes >= 0
-            assert state.consecutive_failures >= 0
-            # Can't have both consecutive successes and failures
-            assert not (
-                state.consecutive_successes > 0 and state.consecutive_failures > 0
-            )
-
-
 # =============================================================================
 # Partial Failure and Split-Brain Tests
 # =============================================================================
@@ -1571,44 +1306,6 @@ class TestDataStructureInvariants:
 
 class TestPartialFailureSplitBrain:
     """Tests for partial failure and split-brain scenarios."""
-
-    @pytest.mark.asyncio
-    async def test_composite_probe_partial_failure(self):
-        """Test composite probe with some probes failing."""
-        healthy_probe_calls = 0
-        unhealthy_probe_calls = 0
-
-        async def healthy_check():
-            nonlocal healthy_probe_calls
-            healthy_probe_calls += 1
-            return True, "OK"
-
-        async def unhealthy_check():
-            nonlocal unhealthy_probe_calls
-            unhealthy_probe_calls += 1
-            return False, "Failed"
-
-        healthy_probe = HealthProbe(
-            name="healthy",
-            check=healthy_check,
-            config=ProbeConfig(failure_threshold=1),
-        )
-        unhealthy_probe = HealthProbe(
-            name="unhealthy",
-            check=unhealthy_check,
-            config=ProbeConfig(failure_threshold=1),
-        )
-
-        composite = CompositeProbe("mixed")
-        composite.add_probe(healthy_probe)
-        composite.add_probe(unhealthy_probe)
-
-        await composite.check_all()
-
-        # Composite should be unhealthy if any probe is unhealthy
-        assert composite.is_healthy() is False
-        assert "unhealthy" in composite.get_unhealthy_probes()
-        assert "healthy" not in composite.get_unhealthy_probes()
 
     @pytest.mark.asyncio
     async def test_rate_limiter_client_isolation(self):
@@ -1659,7 +1356,7 @@ class TestPartialFailureSplitBrain:
             await rate_limiter.check_rate_limit("client-1", "operation")
 
         # Shedder should still accept (it doesn't know about rate limiter)
-        assert shedder.should_shed("SubmitJob") is False
+        assert shedder.should_shed_handler("job_submission") is False
 
         # Rate limiter should still reject (it doesn't know about shedder)
         result = await rate_limiter.check_rate_limit("client-1", "operation")
@@ -1734,13 +1431,13 @@ class TestBackpressurePropagation:
         shedder = LoadShedder(detector)
 
         # Before overload
-        assert shedder.should_shed("SubmitJob") is False
+        assert shedder.should_shed_handler("job_submission") is False
 
         # Single high latency should immediately affect shedding
         detector.record_latency(600.0)  # OVERLOADED
 
         # Immediately after recording, shedding should take effect
-        assert shedder.should_shed("SubmitJob") is True
+        assert shedder.should_shed_handler("job_submission") is True
 
     def test_recovery_propagation_timing(self):
         """Test timing of recovery from overload to acceptance."""
@@ -1758,14 +1455,14 @@ class TestBackpressurePropagation:
         for _ in range(3):
             detector.record_latency(600.0)
 
-        assert shedder.should_shed("SubmitJob") is True
+        assert shedder.should_shed_handler("job_submission") is True
 
         # Recovery samples
         for _ in range(3):
             detector.record_latency(50.0)
 
         # Should immediately recover
-        assert shedder.should_shed("SubmitJob") is False
+        assert shedder.should_shed_handler("job_submission") is False
 
     @pytest.mark.asyncio
     async def test_rate_limit_backpressure_signal(self):
@@ -1834,23 +1531,6 @@ class TestMetricCardinalityExplosion:
         client_counters = limiter._adaptive._operation_counters.get("client-1", {})
         assert len(client_counters) == 1000
 
-    def test_load_shedder_custom_message_types(self):
-        """Test load shedder with many custom message types."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        # Register many custom message types
-        for i in range(1000):
-            shedder.register_message_priority(
-                f"CustomMessage{i}",
-                RequestPriority(i % 4),  # Cycle through priorities
-            )
-
-        # All should work correctly
-        for i in range(1000):
-            priority = shedder.classify_request(f"CustomMessage{i}")
-            assert priority == RequestPriority(i % 4)
-
     def test_extension_tracker_many_workers(self):
         """Test extension tracker with many workers."""
         manager = WorkerHealthManager(WorkerHealthManagerConfig())
@@ -1873,63 +1553,6 @@ class TestMetricCardinalityExplosion:
 
 class TestDeadlineTimeoutInteractions:
     """Tests for deadline and timeout interactions."""
-
-    @pytest.mark.asyncio
-    async def test_probe_timeout_shorter_than_check(self):
-        """Test probe timeout shorter than actual check duration."""
-
-        async def slow_check():
-            await asyncio.sleep(0.5)
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="slow",
-            check=slow_check,
-            config=ProbeConfig(timeout_seconds=0.1),
-        )
-
-        response = await probe.check()
-
-        assert response.result == ProbeResult.TIMEOUT
-        assert "timed out" in response.message.lower()
-
-    @pytest.mark.asyncio
-    async def test_probe_timeout_equal_to_check(self):
-        """Test probe timeout approximately equal to check duration."""
-
-        async def borderline_check():
-            await asyncio.sleep(0.09)  # Just under timeout
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="borderline",
-            check=borderline_check,
-            config=ProbeConfig(timeout_seconds=0.1),
-        )
-
-        response = await probe.check()
-
-        # Should succeed (timing might vary)
-        assert response.result in (ProbeResult.SUCCESS, ProbeResult.TIMEOUT)
-
-    @pytest.mark.asyncio
-    async def test_token_bucket_acquire_async_timeout(self):
-        """Test token bucket async acquire with timeout."""
-        bucket = TokenBucket(bucket_size=5, refill_rate=0.1)
-
-        # Exhaust bucket
-        for _ in range(5):
-            bucket.acquire()
-
-        # Try to acquire with short timeout
-        start = time.monotonic()
-        result = await bucket.acquire_async(tokens=1, max_wait=0.1)
-        elapsed = time.monotonic() - start
-
-        # Should timeout relatively quickly
-        assert elapsed < 0.2
-        # May or may not succeed depending on exact timing
-        assert isinstance(result, bool)
 
     def test_extension_deadline_calculation(self):
         """Test extension deadline calculation is additive."""
@@ -1987,23 +1610,6 @@ class TestErrorMessageQuality:
 
         assert reason is not None
         assert "30" in reason or "50" in reason  # Should mention the values
-
-    @pytest.mark.asyncio
-    async def test_probe_timeout_message_includes_duration(self):
-        """Test probe timeout message includes timeout duration."""
-
-        async def slow_check():
-            await asyncio.sleep(1.0)
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="slow",
-            check=slow_check,
-            config=ProbeConfig(timeout_seconds=0.1),
-        )
-
-        response = await probe.check()
-        assert "0.1" in response.message  # Should mention timeout value
 
     def test_worker_eviction_reason_descriptive(self):
         """Test worker eviction reason is descriptive."""
@@ -2072,7 +1678,7 @@ class TestIdempotency:
         shedder = LoadShedder(detector)
 
         for _ in range(100):
-            shedder.should_shed("Ping")
+            shedder.should_shed_handler("ping")
 
         # Multiple resets should be safe
         shedder.reset_metrics()
@@ -2123,28 +1729,6 @@ class TestIdempotency:
 
         assert limiter.is_blocked("op1") is False
 
-    @pytest.mark.asyncio
-    async def test_probe_stop_periodic_idempotent(self):
-        """Test probe stop_periodic is idempotent."""
-
-        async def quick_check():
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="test",
-            check=quick_check,
-            config=ProbeConfig(period_seconds=0.1),
-        )
-
-        await probe.start_periodic()
-        await asyncio.sleep(0.05)
-
-        # Multiple stops should be safe
-        await probe.stop_periodic()
-        await probe.stop_periodic()
-        await probe.stop_periodic()
-
-
 # =============================================================================
 # Edge Cases in Priority and State Transitions
 # =============================================================================
@@ -2169,14 +1753,14 @@ class TestPriorityStateTransitionEdges:
 
         # HEALTHY - all accepted
         detector.record_latency(30.0)
-        for msg, priority in [
-            ("Ping", RequestPriority.CRITICAL),
-            ("SubmitJob", RequestPriority.HIGH),
-            ("StatsUpdate", RequestPriority.NORMAL),
-            ("DetailedStatsRequest", RequestPriority.LOW),
+        for handler_name, priority in [
+            ("ping", RequestPriority.CRITICAL),
+            ("job_submission", RequestPriority.HIGH),
+            ("workflow_progress", RequestPriority.NORMAL),
+            ("cluster_status", RequestPriority.LOW),
         ]:
-            result = shedder.should_shed(msg)
-            assert result is False, f"{msg} should be accepted when HEALTHY"
+            result = shedder.should_shed_handler(handler_name)
+            assert result is False, f"{handler_name} should be accepted when HEALTHY"
             priorities_tested[priority] = True
 
         assert all(priorities_tested.values())
@@ -2216,10 +1800,10 @@ class TestPriorityStateTransitionEdges:
             state = detector.get_state()
             assert state == expected_state, f"Wrong state for latency {latency}"
 
-            assert shedder.should_shed("Ping") == crit_shed
-            assert shedder.should_shed("SubmitJob") == high_shed
-            assert shedder.should_shed("StatsUpdate") == norm_shed
-            assert shedder.should_shed("DetailedStatsRequest") == low_shed
+            assert shedder.should_shed_handler("ping") == crit_shed
+            assert shedder.should_shed_handler("job_submission") == high_shed
+            assert shedder.should_shed_handler("workflow_progress") == norm_shed
+            assert shedder.should_shed_handler("cluster_status") == low_shed
 
     def test_extension_progress_boundary_values(self):
         """Test extension with boundary progress values."""
@@ -2277,7 +1861,7 @@ class TestDiagnosticsObservability:
         shedder = LoadShedder(detector)
 
         for _ in range(100):
-            shedder.should_shed("Ping")
+            shedder.should_shed_handler("ping")
 
         metrics = shedder.get_metrics()
 
@@ -2311,48 +1895,6 @@ class TestDiagnosticsObservability:
 
         for field in required_fields:
             assert field in metrics, f"Missing field: {field}"
-
-    @pytest.mark.asyncio
-    async def test_probe_state_complete(self):
-        """Test probe state includes all expected fields."""
-
-        async def check():
-            return True, "OK"
-
-        probe = HealthProbe(name="test", check=check)
-
-        await probe.check()
-        state = probe.get_state()
-
-        assert hasattr(state, "healthy")
-        assert hasattr(state, "consecutive_successes")
-        assert hasattr(state, "consecutive_failures")
-        assert hasattr(state, "last_check")
-        assert hasattr(state, "last_result")
-        assert hasattr(state, "last_message")
-        assert hasattr(state, "total_checks")
-        assert hasattr(state, "total_failures")
-
-    def test_composite_probe_status_complete(self):
-        """Test composite probe status includes all probes."""
-
-        async def check():
-            return True, "OK"
-
-        probe1 = HealthProbe(name="probe1", check=check)
-        probe2 = HealthProbe(name="probe2", check=check)
-
-        composite = CompositeProbe("composite")
-        composite.add_probe(probe1)
-        composite.add_probe(probe2)
-
-        status = composite.get_status()
-
-        assert "name" in status
-        assert "healthy" in status
-        assert "probes" in status
-        assert "probe1" in status["probes"]
-        assert "probe2" in status["probes"]
 
     def test_extension_tracker_state_complete(self):
         """Test extension tracker state includes all expected fields."""
@@ -2412,7 +1954,7 @@ class TestGracefulDegradation:
         # Even under extreme load, CRITICAL must pass
         critical_accepted = 0
         for _ in range(10000):
-            if not shedder.should_shed("Ping"):
+            if not shedder.should_shed_handler("ping"):
                 critical_accepted += 1
 
         assert critical_accepted == 10000
@@ -2464,36 +2006,6 @@ class TestGracefulDegradation:
 
         # Grants should follow logarithmic decay
         assert grants[0] > grants[1] > grants[2]
-
-    @pytest.mark.asyncio
-    async def test_probe_graceful_timeout_handling(self):
-        """Test probe handles timeouts gracefully."""
-        timeout_count = 0
-
-        async def slow_sometimes():
-            nonlocal timeout_count
-            timeout_count += 1
-            if timeout_count % 2 == 0:
-                await asyncio.sleep(1.0)  # Will timeout
-            return True, "OK"
-
-        probe = HealthProbe(
-            name="flaky",
-            check=slow_sometimes,
-            config=ProbeConfig(
-                timeout_seconds=0.1,
-                failure_threshold=5,  # Tolerant
-            ),
-        )
-
-        # Run several checks
-        for _ in range(10):
-            response = await probe.check()
-            # Should not crash, should return valid response
-            assert response.result in (
-                ProbeResult.SUCCESS,
-                ProbeResult.TIMEOUT,
-            )
 
     def test_detector_handles_extreme_values_gracefully(self):
         """Test detector handles extreme input values gracefully."""

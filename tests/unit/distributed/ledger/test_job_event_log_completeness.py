@@ -1,6 +1,9 @@
 """
-AD-38's job event log is complete: all eight event types are written,
-survive power loss, and replay to exactly the live state.
+AD-38's job event log is complete: every event type is written, survives
+power loss, and replays to exactly the live state -- JobRelinquished too,
+which closes a manager's record of a job another manager now leads, at
+the record's own tallies; and JobDatacenterReassigned, which moves a job
+off a datacenter it lost mid-run (AD-36).
 
 Four of the eight (JobProgressReported, JobCancellationAcked, JobFailed,
 JobTimedOut) were declared and never written or replayed: failures and
@@ -25,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from hyperscale.distributed.ledger.datacenter_reassignment import DatacenterReassignment
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
 from hyperscale.distributed.ledger.events.event_type import JobEventType
 from hyperscale.distributed.ledger.job_ledger import JobLedger
@@ -83,17 +87,43 @@ async def _record_every_event_type(ledger: JobLedger) -> dict[str, str]:
     completed = await _create(ledger, "job-completed")
     await ledger.complete_job(completed, "completed", 2, 0, 500, durability=LOCAL)
 
+    relinquished = await _create(ledger, "job-relinquished")
+    await ledger.accept_job(relinquished, "dc-east", 2, durability=LOCAL)
+    await ledger.report_progress(relinquished, "dc-east", 2, 1, durability=LOCAL)
+    await ledger.relinquish_job(relinquished, held_by="10.0.0.2:9000")
+
+    reassigned = await _create(ledger, "job-reassigned", timeout_seconds=90.0)
+    await ledger.accept_job(reassigned, "dc-east", 2, durability=LOCAL)
+    await ledger.reassign_datacenter(reassigned, REASSIGNMENT, durability=LOCAL)
+
+    taken_over = await _create(ledger, "job-taken-over")
+    await ledger.accept_job(taken_over, "dc-east", 2, durability=LOCAL)
+    await ledger.record_leadership_acquired(taken_over, "10.0.0.3:9000", "10.0.0.2:9000", lease_fence_token=3)
+
     return {
         "running": running,
         "cancelling": cancelling,
         "failed": failed,
         "timed_out": timed_out,
         "completed": completed,
+        "relinquished": relinquished,
+        "reassigned": reassigned,
+        "taken_over": taken_over,
     }
 
 
+# dc-west lost mid-run, its unfinished share moved to dc-north.
+REASSIGNMENT = DatacenterReassignment(
+    lost_datacenter="dc-west",
+    replacement_datacenter="dc-north",
+    completed_workflow_ids=("wf-login",),
+    total_completed=3,
+    total_failed=1,
+)
+
+
 @pytest.mark.asyncio
-async def test_all_eight_event_types_are_written() -> None:
+async def test_every_event_type_is_written() -> None:
     filesystem = SimFilesystem()
     ledger = await _open_ledger(filesystem)
 
@@ -120,6 +150,14 @@ async def test_power_loss_replays_every_event_to_the_live_state() -> None:
     assert recovered_jobs["timed_out"].status == "timeout"
     assert recovered_jobs["cancelling"].cancellation_acked_datacenters == frozenset({"dc-east"})
     assert recovered_jobs["running"].completed_count == 1
+    assert (
+        recovered_jobs["relinquished"].status,
+        recovered_jobs["relinquished"].completed_count,
+        recovered_jobs["relinquished"].failed_count,
+    ) == ("relinquished", 2, 1)
+    assert recovered_jobs["reassigned"].assigned_datacenters == ("dc-east", "dc-north")
+    assert recovered_jobs["reassigned"].datacenter_reassignments == (REASSIGNMENT,)
+    assert recovered_jobs["taken_over"].leader_id == "10.0.0.3:9000"
     await recovered.close()
 
 
@@ -146,7 +184,7 @@ async def test_checkpoint_and_power_loss_keep_every_active_field() -> None:
     ledger = await _open_ledger(filesystem)
     jobs = await _record_every_event_type(ledger)
     before = {
-        name: ledger.get_job(jobs[name]) for name in ("running", "cancelling")
+        name: ledger.get_job(jobs[name]) for name in ("running", "cancelling", "reassigned")
     }
     await ledger.checkpoint()
     await ledger.close()

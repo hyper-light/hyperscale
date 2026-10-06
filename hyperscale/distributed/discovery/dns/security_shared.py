@@ -1,0 +1,6 @@
+"""Definitions shared by the classes of
+``hyperscale.distributed.discovery.dns.security`` (see that module)."""
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+_DEFAULT_CLOCK: Clock = RealClock()

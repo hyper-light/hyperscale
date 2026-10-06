@@ -5,6 +5,10 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
 from tests.end_to_end.workflows.base_scenario_workflow import BaseScenarioWorkflow
+from tests.end_to_end.workflow_lifecycle_checks import (
+    assert_retry_budgets_released,
+    assert_workflow_lifecycle_sound,
+)
 from tests.framework.results.scenario_outcome import ScenarioOutcome
 from tests.framework.results.scenario_result import ScenarioResult
 from tests.framework.runner.scenario_runner import ScenarioRunner
@@ -178,10 +182,8 @@ async def validate_58_5_manager_retry_queue_overflow() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Retry queue overflow expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Retry queue overflow expected workflow retries")
+        assert_retry_budgets_released(manager, "Retry queue overflow expected workflow retries")
     finally:
         await runtime.stop_cluster()
 

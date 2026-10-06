@@ -2,7 +2,7 @@
 Type definitions for SWIM + Lifeguard protocol.
 """
 
-from typing import Any, Literal
+from typing import Literal
 
 Message = Literal[
     b"ack",
@@ -31,4 +31,11 @@ LeaderRole = Literal["follower", "candidate", "leader"]
 
 NodeAddr = tuple[str, int]
 
-Ctx = dict[str, Any]
+SwimContextKey = str | NodeAddr
+"""Context keys: setting names from ``Env.get_swim_init_context`` plus the
+per-peer addresses the join handler writes its acceptance marker under."""
+
+SwimContextValue = int | float | bytes
+"""Context values: the numeric SWIM settings plus the join marker ``b"OK"``."""
+
+Ctx = dict[SwimContextKey, SwimContextValue]

@@ -75,7 +75,7 @@ async def test_commits_flow_through_injected_filesystem(tmp_path):
     recording = RecordingFilesystem()
     writer = WALWriter(
         path=tmp_path / "seam.wal",
-        config=WALWriterConfig(batch_timeout_microseconds=100),
+        config=WALWriterConfig(),
         filesystem=recording,
     )
     await writer.start()
@@ -102,7 +102,7 @@ async def test_group_commit_is_one_durable_unit(tmp_path):
     writer = WALWriter(
         path=tmp_path / "batch.wal",
         # A long batch window so both submissions land in one batch.
-        config=WALWriterConfig(batch_timeout_microseconds=50_000),
+        config=WALWriterConfig(),
         filesystem=recording,
     )
     await writer.start()
@@ -131,7 +131,7 @@ async def test_a_storage_fault_fails_its_batch_rolls_back_and_the_writer_recover
     filesystem = RecordingFilesystem()
     writer = WALWriter(
         path=tmp_path / "full.wal",
-        config=WALWriterConfig(batch_timeout_microseconds=100),
+        config=WALWriterConfig(),
         filesystem=filesystem,
     )
     await writer.start()
@@ -167,7 +167,7 @@ async def test_a_failed_rollback_latches_the_writer(tmp_path):
     )
     writer = WALWriter(
         path=tmp_path / "broken.wal",
-        config=WALWriterConfig(batch_timeout_microseconds=100),
+        config=WALWriterConfig(),
         filesystem=filesystem,
     )
     await writer.start()

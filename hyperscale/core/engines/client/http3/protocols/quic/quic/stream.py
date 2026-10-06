@@ -32,6 +32,8 @@ class QuicStreamReceiver:
     def __init__(self, stream_id: Optional[int], readable: bool) -> None:
         self.highest_offset = 0  # the highest offset ever seen
         self.is_finished = False
+        # Whether an event has ended the stream: it is ended once.
+        self._end_delivered = False
         self.stop_pending = False
 
         self._buffer = bytearray()
@@ -64,6 +66,11 @@ class QuicStreamReceiver:
                 raise FinalSizeError("Data received beyond final size")
             elif frame.fin and frame_end != self._final_size:
                 raise FinalSizeError("Cannot change final size")
+            elif self._end_delivered:
+                # The stream has ended: the frame brings nothing new -- a
+                # retransmission the peer sent before our ACK reached it --
+                # and must not end it a second time.
+                return None
         if frame.fin:
             self._final_size = frame_end
         if frame_end > self.highest_offset:
@@ -75,6 +82,7 @@ class QuicStreamReceiver:
             if frame.fin:
                 # all data up to the FIN has been received, we're done receiving
                 self.is_finished = True
+                self._end_delivered = True
             return events.StreamDataReceived(
                 data=frame.data, end_stream=frame.fin, stream_id=self._stream_id
             )
@@ -102,6 +110,7 @@ class QuicStreamReceiver:
         if end_stream:
             # all data up to the FIN has been received, we're done receiving
             self.is_finished = True
+            self._end_delivered = True
         if data or end_stream:
             return events.StreamDataReceived(
                 data=data, end_stream=end_stream, stream_id=self._stream_id

@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from hyperscale.distributed.env import Env
-
 from .latency_observation import LatencyObservation
 from .latency_slo import LatencySLO
 from .slo_compliance_score import SLOComplianceScore
+from .slo_config import SLOConfig
 
 
 # Field count for ``SLOSummary.to_bytes`` / ``from_bytes``. The
@@ -58,8 +57,8 @@ class SLOSummary:
         cls,
         *,
         observation: LatencyObservation,
-        slo: LatencySLO | None = None,
-        env: Env | None = None,
+        slo: LatencySLO,
+        config: SLOConfig,
     ) -> "SLOSummary":
         """Build a summary from a ``LatencyObservation``.
 
@@ -67,12 +66,11 @@ class SLOSummary:
         doesn't need access to the sender's SLO config — the
         summary self-describes its compliance.
         """
-        latency_slo = slo if slo is not None else LatencySLO.from_env(env)
         score = SLOComplianceScore.calculate(
             target_id=observation.target_id,
             observation=observation,
-            slo=latency_slo,
-            env=env,
+            slo=slo,
+            config=config,
         )
         return cls(
             p50_ms=observation.p50_ms,

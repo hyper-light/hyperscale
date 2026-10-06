@@ -1,11 +1,11 @@
 import asyncio
 import binascii
+import math
 import time
 import uuid
 from typing import (
     Dict,
     Generic,
-    List,
     Literal,
     Optional,
     Tuple,
@@ -14,9 +14,11 @@ from typing import (
 from urllib.parse import ParseResult, urlparse
 
 from hyperscale.core.engines.client.http2 import MercurySyncHTTP2Connection
+from hyperscale.core.engines.client.http2.fast_hpack import ConnectionEncoder
 from hyperscale.core.engines.client.http2.pipe import HTTP2Pipe
 from hyperscale.core.engines.client.http2.protocols import HTTP2Connection
 from hyperscale.core.engines.client.shared.models import URL as GRPCUrl
+from hyperscale.core.engines.client.shared.models.url import DEFAULT_PORTS
 from hyperscale.core.engines.client.shared.models import URLMetadata
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.testing.models import (
@@ -25,6 +27,7 @@ from hyperscale.core.testing.models import (
 )
 
 from .models.grpc import GRPCResponse
+from .models.grpc.constants import GRPC_TIMEOUT_MAX_VALUE
 from .models.grpc import Protobuf as GRPCProtobuf
 
 T = TypeVar("T")
@@ -96,14 +99,12 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
         url: URL,
     ):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
                     pipe,
-                    url,
-                    upgrade_ssl,
+                    optimized_url,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
                     timeout=self.timeouts.request_timeout,
@@ -113,27 +114,12 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                 self._connections.append(connection)
                 self._pipes.append(pipe)
 
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
+            # Plain-string requests for the same address reuse this lookup:
+            # the resolved URL, under the key the connect path reads. One
+            # that never resolved is left for the connect path to look up.
+            if optimized_url.ip_addresses:
+                self._url_cache[optimized_url.target] = optimized_url
 
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    pipe,
-                    url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-                connection.reset()
-                self._connections.append(connection)
-                self._pipes.append(pipe)
-
-            self._url_cache[url.optimized.hostname] = url
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -186,7 +172,6 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
         request_url: str | URL,
         protobuf: GRPCProtobuf[T] | Protobuf[T],
         timeout: Optional[int | float] = None,
-        upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
             Literal[
@@ -212,34 +197,13 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
-            (error, connection, pipe, url, upgrade_ssl) = await asyncio.wait_for(
+            (error, connection, pipe, url) = await asyncio.wait_for(
                 self._connect_to_url_location(
                     connection,
                     request_url,
-                    ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
                 timeout=self.timeouts.request_timeout,
             )
-
-            if upgrade_ssl:
-                ssl_redirect_url = request_url.replace("http://", "https://")
-
-                (
-                    error,
-                    connection,
-                    pipe,
-                    url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(
-                        connection,
-                        request_url,
-                        ssl_redirect_url=ssl_redirect_url,
-                    ),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-                request_url = ssl_redirect_url
 
             if error or connection is None or connection.stream.reader is None:
                 timings["connect_end"] = time.monotonic()
@@ -272,6 +236,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
             encoded_headers = self._encode_headers(
                 url,
+                pipe._encoder,
                 timeout=timeout,
             )
 
@@ -302,6 +267,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                 headers,
                 body,
                 error,
+                trailers,
             ) = await asyncio.wait_for(
                 pipe.receive_response(connection),
                 timeout=self.timeouts.request_timeout,
@@ -310,7 +276,28 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
             connection.consecutive_read_timeouts = 0
 
             if error:
-                raise error
+                # A failed read fails the request and leaves the connection in
+                # an unknown state: reset, with a new pipe.
+                connection.reset()
+                self._connections.append(connection)
+                self._pipes.append(HTTP2Pipe(self._concurrency))
+
+                timings["read_end"] = time.monotonic()
+
+                return (
+                    GRPCResponse(
+                        url=URLMetadata(
+                            host=url.hostname,
+                            path=url.path,
+                        ),
+                        method="POST",
+                        status=400,
+                        status_message=str(error),
+                        timings=timings,
+                    ),
+                    False,
+                    timings,
+                )
 
             self._connections.append(connection)
             self._pipes.append(pipe)
@@ -326,6 +313,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     method="POST",
                     status=status,
                     headers=headers,
+                    trailers=trailers,
                     content=body,
                     timings=timings,
                 ),
@@ -386,57 +374,52 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
         self,
         connection: HTTP2Connection | None,
         request_url: str | URL,
-        ssl_redirect_url: Optional[str] = None,
     ) -> Tuple[
         Exception,
         HTTP2Connection,
         HTTP2Pipe,
         GRPCUrl,
-        bool,
     ]:
-        has_optimized_url = isinstance(request_url, URL)
-
-        if has_optimized_url:
-            parsed_url = request_url.optimized
-
-        elif ssl_redirect_url:
-            parsed_url = GRPCUrl(ssl_redirect_url)
+        if isinstance(request_url, URL):
+            # Resolved when the workflow prepared it: never looked up here,
+            # and never read from or added to the lookup cache.
+            url = parsed_url = request_url.optimized
 
         else:
             parsed_url = GRPCUrl(request_url)
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+            # A lookup serves only the address it resolved: its target (scheme
+            # and authority), not the hostname every port on a host shares.
+            cache_key = parsed_url.target
+            url = self._url_cache.get(cache_key)
 
-        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
+            if url is None:
+                dns_lock = self._dns_lock[cache_key]
+                dns_waiter = self._dns_waiters[cache_key]
 
-        if do_dns_lookup and dns_lock.locked() is False:
-            try:
-                async with dns_lock:
-                    url = parsed_url
-                    await url.lookup()
+                if dns_lock.locked() is False:
+                    try:
+                        async with dns_lock:
+                            url = parsed_url
+                            await url.lookup()
 
-                    self._url_cache[parsed_url.hostname] = url
+                            self._url_cache[cache_key] = url
 
-            finally:
-                # However the lookup ended, release its waiters; after a
-                # failed or cancelled lookup the next request looks up
-                # again with a fresh waiter.
-                if dns_waiter.done() is False:
-                    dns_waiter.set_result(None)
+                    finally:
+                        # However the lookup ended, release its waiters; after
+                        # a failed or cancelled lookup the next request looks
+                        # up again with a fresh waiter.
+                        if dns_waiter.done() is False:
+                            dns_waiter.set_result(None)
 
-                if parsed_url.hostname not in self._url_cache:
-                    del self._dns_waiters[parsed_url.hostname]
+                        if cache_key not in self._url_cache:
+                            del self._dns_waiters[cache_key]
 
-        elif do_dns_lookup:
-            # Shielded: a waiter's cancellation must not cancel the
-            # lookup future every other waiter shares.
-            await asyncio.shield(dns_waiter)
-            url = self._url_cache.get(parsed_url.hostname)
-
-        elif has_optimized_url:
-            url = request_url.optimized
+                else:
+                    # Shielded: a waiter's cancellation must not cancel the
+                    # lookup future every other waiter shares.
+                    await asyncio.shield(dns_waiter)
+                    url = self._url_cache.get(cache_key)
 
         connection = self._connections.pop()
         pipe = self._pipes.pop()
@@ -449,14 +432,12 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
             # Reuses the connection's transport when it reaches one of the
             # host's addresses; otherwise races a new one across them.
             address, socket_config, new_transport = await connection.connect_to_any(
+                parsed_url.target,
                 url.hostname,
                 url.ip_addresses,
                 url.port,
                 url.address_rotation,
-                ssl=self._client_ssl_context
-                if url.is_ssl or ssl_redirect_url
-                else None,
-                ssl_upgrade=ssl_redirect_url is not None,
+                ssl=self._client_ssl_context if url.is_ssl else None,
             )
 
             if new_transport:
@@ -474,19 +455,9 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                 connection,
                 pipe,
                 parsed_url,
-                False,
             )
 
         except Exception as err:
-            if "server_hostname is only meaningful with ssl" in str(err):
-                return (
-                    err,
-                    connection,
-                    pipe,
-                    parsed_url,
-                    True,
-                )
-
             connection_error = err
 
         try:
@@ -495,7 +466,6 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                 connection,
                 pipe,
                 parsed_url,
-                False,
             )
 
         finally:
@@ -524,28 +494,48 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
     def _encode_headers(
         self,
         url: GRPCUrl | URL,
+        header_encoder: ConnectionEncoder,
         timeout: int | float = 60,
     ):
         if isinstance(url, URL):
             url = url.optimized
 
+        # :authority names the target as RFC 9113 8.3.1 does: the host, an
+        # IPv6 address in brackets, and the port unless it is the scheme's
+        # default.
+        hostname = url.hostname
+        scheme = url.scheme
+        authority = f"[{hostname}]" if ":" in hostname else hostname
+        if url.port != DEFAULT_PORTS.get(scheme):
+            authority = f"{authority}:{url.port}"
+
+        # HTTP/2 field names are lowercase (RFC 9113, 8.2.1): a gRPC server
+        # rejects a request carrying any other as malformed.
         encoded_headers = [
             (b":method", b"POST"),
-            (b":authority", url.hostname.encode()),
-            (b":scheme", url.scheme.encode()),
+            (b":authority", authority.encode()),
+            (b":scheme", scheme.encode()),
             (b":path", url.path.encode()),
-            (b"Content-Type", b"application/grpc"),
-            (b"Grpc-Timeout", f"{timeout}".encode()),
-            (b"TE", b"trailers"),
+            (b"content-type", b"application/grpc"),
+            (b"te", b"trailers"),
         ]
 
-        encoded_headers: bytes = self._encoder.encode(encoded_headers)
-        encoded_headers: List[bytes] = [
-            encoded_headers[i : i + self._settings.max_frame_size]
-            for i in range(0, len(encoded_headers), self._settings.max_frame_size)
-        ]
+        if timeout is not None:
+            # A deadline is at most eight digits and a unit: milliseconds
+            # while they fit, else whole seconds.
+            milliseconds = max(1, math.ceil(timeout * 1000))
+            encoded_headers.append(
+                (
+                    b"grpc-timeout",
+                    f"{milliseconds}m".encode()
+                    if milliseconds <= GRPC_TIMEOUT_MAX_VALUE
+                    else f"{math.ceil(timeout)}S".encode(),
+                )
+            )
 
-        return encoded_headers[0]
+        # The whole header block: the pipe frames it, in CONTINUATION frames
+        # past the peer's largest frame.
+        return header_encoder.encode(encoded_headers)
 
     def close(self):
         for connection in self._connections:

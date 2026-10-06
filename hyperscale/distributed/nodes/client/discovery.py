@@ -227,6 +227,7 @@ class ClientDiscovery:
         )
 
         results: dict[str, list[WorkflowStatusInfo]] = {}
+        query_errors: list[Exception] = []
 
         async def query_one(addr: tuple[str, int]) -> None:
             try:
@@ -237,8 +238,10 @@ class ClientDiscovery:
                     timeout=timeout,
                 )
 
-                if isinstance(response_data, Exception) or response_data == b'error':
-                    return
+                if isinstance(response_data, Exception):
+                    raise response_data
+                if response_data == b'error':
+                    raise RuntimeError(f"manager {addr[0]}:{addr[1]} answered the workflow query with an error")
 
                 response = WorkflowQueryResponse.load(response_data)
                 dc_id = response.datacenter
@@ -247,8 +250,9 @@ class ClientDiscovery:
                     results[dc_id] = []
                 results[dc_id].extend(response.workflows)
 
-            except Exception:
-                pass  # Manager query failed - skip
+            except Exception as query_error:
+                # Another manager may answer; if none does, these raise.
+                query_errors.append(query_error)
 
         # If we know which manager accepted this job, query it first
         # This ensures we get results from the job leader
@@ -261,11 +265,15 @@ class ClientDiscovery:
                     return results
 
         # Query all managers (either no job_id, or job target query failed)
+        query_errors.clear()
         await asyncio.gather(
             *[query_one(addr) for addr in self._config.managers],
             return_exceptions=False,
         )
 
+        # Every manager failing is not "no workflows".
+        if len(query_errors) == len(self._config.managers):
+            raise ExceptionGroup("every manager failed the workflow query", list(query_errors))
         return results
 
     async def query_workflows_via_gate(

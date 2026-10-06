@@ -13,8 +13,12 @@ manager's storage probe succeeds.
 Driven through the real DatacenterHealthManager.
 """
 
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.health.phi_accrual_config import PhiAccrualConfig
 from hyperscale.distributed.datacenters import DatacenterHealthManager
 from hyperscale.distributed.models import DatacenterHealth, ManagerHeartbeat
+
+MANAGER_HEARTBEAT_PHI = PhiAccrualConfig.for_manager_heartbeats(Env())
 
 DATACENTER = "dc-1"
 MANAGER_ADDR = ("10.0.0.1", 8080)
@@ -38,7 +42,7 @@ def leader_heartbeat(storage_writable: bool, version: int) -> ManagerHeartbeat:
 
 
 def test_a_datacenter_whose_leader_cannot_write_is_unhealthy_until_it_can() -> None:
-    health_manager = DatacenterHealthManager()
+    health_manager = DatacenterHealthManager(MANAGER_HEARTBEAT_PHI)
 
     health_manager.update_manager(DATACENTER, MANAGER_ADDR, leader_heartbeat(True, 1))
     assert health_manager.get_datacenter_health(DATACENTER).health == DatacenterHealth.HEALTHY.value

@@ -11,12 +11,14 @@ Tests manager registration, status updates, and discovery broadcasts including:
 import asyncio
 import pytest
 import inspect
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 from enum import Enum
 
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.nodes.gate.handlers.tcp_manager import GateManagerHandler
+from hyperscale.distributed.nodes.gate.server import GateServer
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 from hyperscale.distributed.models import (
     ManagerHeartbeat,
@@ -117,7 +119,7 @@ def create_mock_handler(
 ) -> GateManagerHandler:
     """Create a mock handler with configurable behavior."""
     if state is None:
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
     validator = MockRoleValidator()
     validator._validate_result = validate_role
@@ -154,7 +156,7 @@ class TestHandleStatusUpdateHappyPath:
     @pytest.mark.asyncio
     async def test_accepts_valid_heartbeat(self):
         """Accepts valid manager heartbeat."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         handler = create_mock_handler(state=state)
 
         heartbeat = ManagerHeartbeat(
@@ -187,7 +189,7 @@ class TestHandleStatusUpdateHappyPath:
     @pytest.mark.asyncio
     async def test_records_heartbeat(self):
         """Records heartbeat in state."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         recorded_heartbeats = []
 
         def record_heartbeat(dc, addr, manager_id, version, term, is_leader):
@@ -265,7 +267,7 @@ class TestHandleStatusUpdateBackpressure:
         """Updates DC backpressure level when manager was previously tracked with backpressure."""
         from hyperscale.distributed.reliability.backpressure import BackpressureLevel
 
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         # Pre-register manager with backpressure so that the heartbeat clears it
         manager_addr = ("10.0.0.1", 8000)
         state._manager_backpressure[manager_addr] = BackpressureLevel.THROTTLE
@@ -366,7 +368,7 @@ class TestHandleRegisterHappyPath:
     @pytest.mark.asyncio
     async def test_accepts_valid_registration(self):
         """Accepts valid manager registration."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         handler = create_mock_handler(state=state)
 
         heartbeat = ManagerHeartbeat(
@@ -402,7 +404,7 @@ class TestHandleRegisterHappyPath:
     @pytest.mark.asyncio
     async def test_returns_healthy_gates(self):
         """Returns healthy gates in registration response."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         healthy_gates = [MockGateInfo("gate-001", ("127.0.0.1", 9000))]
 
         handler = GateManagerHandler(
@@ -498,7 +500,7 @@ class TestHandleDiscoveryHappyPath:
     @pytest.mark.asyncio
     async def test_accepts_valid_discovery(self):
         """Accepts valid discovery broadcast."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         handler = create_mock_handler(state=state)
 
         broadcast = ManagerDiscoveryBroadcast(
@@ -529,7 +531,7 @@ class TestHandleDiscoveryHappyPath:
     @pytest.mark.asyncio
     async def test_updates_datacenter_managers(self):
         """Updates datacenter manager tracking."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         handler = create_mock_handler(state=state)
 
         broadcast = ManagerDiscoveryBroadcast(
@@ -601,7 +603,7 @@ class TestConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_status_updates(self):
         """Concurrent status updates don't interfere."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         handler = create_mock_handler(state=state)
 
         heartbeats = []
@@ -644,7 +646,7 @@ class TestConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_registrations(self):
         """Concurrent registrations don't interfere."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         handler = create_mock_handler(state=state)
 
         heartbeats = []
@@ -884,7 +886,7 @@ class TestFailureModes:
 
         handler = GateManagerHandler(
             clock=RealClock(),
-            state=GateRuntimeState(),
+            state=GateRuntimeState(forward_throughput_interval_start=0.0),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             env=MockEnv(),
@@ -939,7 +941,7 @@ class TestFailureModes:
 
         handler = GateManagerHandler(
             clock=RealClock(),
-            state=GateRuntimeState(),
+            state=GateRuntimeState(forward_throughput_interval_start=0.0),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             env=MockEnv(),
@@ -989,6 +991,56 @@ class TestFailureModes:
         assert isinstance(result, bytes)
 
 
+# =============================================================================
+# manager_discovery endpoint (the GateServer wrapper around the handler)
+# =============================================================================
+
+
+class TestManagerDiscoveryEndpoint:
+    """The gate's TCP endpoint hands the handler its own UDP address map.
+
+    The handler tests above call ``handle_discovery`` with keyword
+    arguments, so they never exercised the endpoint's positional call --
+    which omitted ``datacenter_manager_udp`` and raised TypeError on
+    every discovery broadcast between peered gates.
+    """
+
+    @pytest.mark.asyncio
+    async def test_broadcast_reaches_the_gates_manager_maps(self):
+        datacenter_managers: dict[str, list[tuple[str, int]]] = {}
+        datacenter_manager_udp: dict[str, list[tuple[str, int]]] = {}
+        handler = create_mock_handler()
+        handler._datacenter_managers = datacenter_managers
+
+        async def handle_exception(error, context):
+            raise error
+
+        gate = SimpleNamespace(
+            _accepting_requests=True,
+            _manager_handler=handler,
+            _datacenter_manager_udp=datacenter_manager_udp,
+            handle_exception=handle_exception,
+        )
+        broadcast = ManagerDiscoveryBroadcast(
+            datacenter="dc-east",
+            manager_tcp_addr=("10.0.0.1", 8000),
+            manager_udp_addr=("10.0.0.1", 8001),
+            source_gate_id="gate-002",
+            worker_count=5,
+            healthy_worker_count=5,
+            available_cores=40,
+            total_cores=60,
+        )
+
+        result = await GateServer.manager_discovery(
+            gate, ("10.0.0.2", 9000), broadcast.dump(), 0
+        )
+
+        assert result == b"ok"
+        assert datacenter_manager_udp == {"dc-east": [("10.0.0.1", 8001)]}
+        assert datacenter_managers == {"dc-east": [("10.0.0.1", 8000)]}
+
+
 __all__ = [
     "TestHandleStatusUpdateHappyPath",
     "TestHandleStatusUpdateBackpressure",
@@ -1000,4 +1052,5 @@ __all__ = [
     "TestConcurrency",
     "TestEdgeCases",
     "TestFailureModes",
+    "TestManagerDiscoveryEndpoint",
 ]

@@ -26,27 +26,31 @@ _DEFAULT_CLOCK: Clock = RealClock()
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
 from .cache.bounded_lru_cache import BoundedLRUCache
-from .consistency_level import ConsistencyLevel
 from .durability_level import DurabilityLevel
 from .events.event_type import JobEventType
+from .events.job_leadership_acquired import JobLeadershipAcquired
 from .events.job_event import (
     JobCreated,
+    JobDatacenterReassigned,
     JobAccepted,
     JobCancellationAcked,
     JobCancellationRequested,
     JobCompleted,
     JobFailed,
     JobProgressReported,
+    JobRelinquished,
     JobTimedOut,
 )
 from .job_event_applier import (
     JOB_FAILED_STATUS,
+    JOB_RELINQUISHED_STATUS,
     JOB_TIMED_OUT_STATUS,
     JobEventApplier,
 )
 from .job_commit_sequencer import JobCommitSequencer
 from .job_id import JobIdGenerator
 from .unsatisfiable_durability_error import UnsatisfiableDurabilityError
+from .datacenter_reassignment import DatacenterReassignment
 from .job_state import JobState
 from .storage_health import StorageHealth
 from .wal.node_wal import NodeWAL, WALAppendResult
@@ -314,12 +318,18 @@ class JobLedger:
                 regional_lsn=checkpoint.regional_lsn,
                 global_lsn=checkpoint.global_lsn,
             )
+            # The log may hold nothing past the checkpoint (it dropped what
+            # the checkpoint covers): numbering resumes after it.
+            self._wal.restore_checkpointed_lsn(checkpoint.local_lsn)
             start_lsn = checkpoint.local_lsn + 1
         else:
             start_lsn = 0
 
         async for entry in self._wal.iter_from(start_lsn):
             self._apply_entry(entry)
+        # Everything recovered is now applied -- replayed, or held by the
+        # checkpoint -- so the next checkpoint can compact it.
+        await self._wal.mark_applied_through(self._wal.last_synced_lsn)
 
         await self._archive_terminal_jobs()
         self._publish_snapshot()
@@ -545,6 +555,46 @@ class JobLedger:
 
         return await self._commit_in_turn(job_id, append_result, durability, commit_turn)
 
+    async def reassign_datacenter(
+        self,
+        job_id: str,
+        reassignment: DatacenterReassignment,
+        durability: DurabilityLevel = DurabilityLevel.LOCAL,
+    ) -> CommitResult | None:
+        """Record that the job moved off a datacenter it lost while it ran
+        there (AD-36 ``JobDatacenterReassigned``): a node recovering the
+        job from this ledger awaits its results where it runs now."""
+        self._require_satisfiable_durability(durability)
+
+        async with self._lock:
+            job = self._jobs_internal.get(job_id)
+            if job is None:
+                return None
+
+            hlc = self._clock.now()
+            append_result = await self._append(
+                JobEventType.JOB_DATACENTER_REASSIGNED,
+                JobDatacenterReassigned(
+                    job_id=job_id,
+                    hlc=hlc,
+                    fence_token=job.fence_token,
+                    lost_datacenter=reassignment.lost_datacenter,
+                    replacement_datacenter=reassignment.replacement_datacenter,
+                    completed_workflow_ids=reassignment.completed_workflow_ids,
+                    total_completed=reassignment.total_completed,
+                    total_failed=reassignment.total_failed,
+                ),
+            )
+
+            # Applied unconditionally -- see the class docstring's apply
+            # contract.
+            commit_turn = self._apply_live(
+                job_id,
+                job.with_datacenter_reassigned(reassignment=reassignment, hlc=hlc),
+            )
+
+        return await self._commit_in_turn(job_id, append_result, durability, commit_turn)
+
     async def request_cancellation(
         self,
         job_id: str,
@@ -755,20 +805,50 @@ class JobLedger:
             ),
         )
 
+    async def relinquish_job(
+        self,
+        job_id: str,
+        held_by: str,
+    ) -> CommitResult | None:
+        """Close this ledger's record of a job another manager of its
+        datacenter leads, or led and ended (AD-38 ``JobRelinquished``).
+
+        The record stops claiming the job: a restart neither resumes nor
+        fails it, and reads of it here defer to its leader. LOCAL only --
+        replicated, it would read as the job's end to every member.
+        """
+        return await self._record_terminal(
+            job_id,
+            JobEventType.JOB_RELINQUISHED,
+            JOB_RELINQUISHED_STATUS,
+            None,
+            None,
+            DurabilityLevel.LOCAL,
+            lambda job, hlc: JobRelinquished(
+                job_id=job_id,
+                hlc=hlc,
+                fence_token=job.fence_token,
+                held_by=held_by,
+            ),
+        )
+
     async def _record_terminal(
         self,
         job_id: str,
         event_type: JobEventType,
         final_status: str,
-        total_completed: int,
-        total_failed: int,
+        total_completed: int | None,
+        total_failed: int | None,
         durability: DurabilityLevel,
         build_event: Callable[[JobState, HLCTimestamp], msgspec.Struct],
     ) -> CommitResult | None:
-        """Shared terminal transition for complete / fail / time out.
+        """Shared terminal transition for complete / fail / time out /
+        relinquish.
 
         A job reaches exactly one terminal: the first terminal event wins
-        and later ones (from any of the three paths) append nothing.
+        and later ones (from any of the paths) append nothing. Totals of
+        None keep the record's own tallies as they stand under the lock --
+        what replay reads at the same point of the log.
         """
         self._require_satisfiable_durability(durability)
 
@@ -786,8 +866,8 @@ class JobLedger:
             # from recovered state.
             terminal_job = job.with_completion(
                 final_status=final_status,
-                total_completed=total_completed,
-                total_failed=total_failed,
+                total_completed=job.completed_count if total_completed is None else total_completed,
+                total_failed=job.failed_count if total_failed is None else total_failed,
                 hlc=hlc,
             )
 
@@ -856,6 +936,42 @@ class JobLedger:
         finally:
             await self._wal.mark_applied(append_result.entry.lsn)
 
+    async def record_leadership_acquired(
+        self,
+        job_id: str,
+        leader_id: str,
+        previous_leader_id: str | None,
+        lease_fence_token: int,
+    ) -> CommitResult | None:
+        """Record that this node took ``job_id`` over (AD-38
+        ``JobLeadershipAcquired``): who leads it from here, from whom, under
+        which lease fence. LOCAL, like ``relinquish_job`` on the side that
+        gave a job up. Records nothing for a job this ledger does not hold
+        or that has ended."""
+        async with self._lock:
+            job = self._jobs_internal.get(job_id)
+            if job is None or job.is_terminal:
+                return None
+
+            hlc = self._clock.now()
+            append_result = await self._append(
+                JobEventType.JOB_LEADERSHIP_ACQUIRED,
+                JobLeadershipAcquired(
+                    job_id=job_id,
+                    hlc=hlc,
+                    fence_token=job.fence_token,
+                    leader_id=leader_id,
+                    previous_leader_id=previous_leader_id or "",
+                    lease_fence_token=lease_fence_token,
+                ),
+            )
+            commit_turn = self._apply_live(
+                job_id,
+                job.with_leadership_acquired(leader_id=leader_id, hlc=hlc),
+            )
+
+        return await self._commit_in_turn(job_id, append_result, DurabilityLevel.LOCAL, commit_turn)
+
     async def adopt_replicated_history(
         self,
         job_id: str,
@@ -891,11 +1007,11 @@ class JobLedger:
             self._publish_snapshot()
             return len(history)
 
-    def get_job(
-        self,
-        job_id: str,
-        consistency: ConsistencyLevel = ConsistencyLevel.SESSION,
-    ) -> JobState | None:
+    def get_job(self, job_id: str) -> JobState | None:
+        """``job_id``'s state as this node's own ledger holds it: active,
+        or terminal while it stays cached. Reads are not leveled -- a job
+        led elsewhere is not here, and a linearizable read would need a
+        ReadIndex through the job's group (AD-52), which is not built."""
         active_job = self._jobs_snapshot.get(job_id)
         if active_job is not None:
             return active_job
@@ -931,6 +1047,13 @@ class JobLedger:
                 for job_id, job in self._jobs_internal.items()
                 if not job.is_terminal
             }
+            # A terminal job whose archive record is still owed rides the
+            # checkpoint: its WAL entries fall at or below this checkpoint,
+            # so replay no longer reaches them, and recovery's terminal
+            # sweep re-attempts the archive from here instead.
+            job_states.update(
+                (job_id, job.to_dict()) for job_id, job in self._pending_archive_jobs.items()
+            )
 
             # Each watermark reports the tier it actually reached.
             # Stamping all three from the local fsync watermark made
@@ -957,6 +1080,10 @@ class JobLedger:
             await self._checkpoint_manager.cleanup(
                 keep_count=self._checkpoint_retention_count
             )
+            # Every retained checkpoint replays from its own LSN on; the
+            # log keeps exactly what the oldest of them still needs.
+            if (covered_through_lsn := await self._checkpoint_manager.lowest_retained_local_lsn()) >= 0:
+                await self._wal.discard_through(covered_through_lsn)
             self._last_checkpoint_at = _DEFAULT_CLOCK.time()
 
             return path

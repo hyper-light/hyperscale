@@ -5,17 +5,16 @@ from .latency_observation import LatencyObservation
 from .slo_config import SLOConfig
 from .tdigest import TDigest
 
-from hyperscale.distributed.runtime import Clock, RealClock
-
-
-_DEFAULT_CLOCK: Clock = RealClock()
-
 
 class TimeWindowedTDigest:
-    """Maintains multiple T-Digest buckets by time window."""
+    """Maintains multiple T-Digest buckets by time window.
 
-    def __init__(self, config: SLOConfig | None = None) -> None:
-        self._config = config or SLOConfig.from_env()
+    Times are the owning node's monotonic clock readings, passed in by
+    the caller.
+    """
+
+    def __init__(self, config: SLOConfig) -> None:
+        self._config = config
         self._window_duration_seconds = self._config.window_duration_seconds
         self._max_windows = self._config.max_windows
         self._windows: dict[float, TDigest] = {}
@@ -48,29 +47,25 @@ class TimeWindowedTDigest:
             oldest_start = self._window_order.pop(0)
             self._windows.pop(oldest_start, None)
 
-    def add(
-        self, value: float, weight: float = 1.0, timestamp: float | None = None
-    ) -> None:
-        """Add a value to the current time window."""
-        event_time = timestamp if timestamp is not None else _DEFAULT_CLOCK.monotonic()
-        window_start = self._window_start_for_timestamp(event_time)
+    def add(self, value: float, timestamp: float, weight: float = 1.0) -> None:
+        """Add a value to the time window ``timestamp`` falls in."""
+        window_start = self._window_start_for_timestamp(timestamp)
         self._register_window(window_start)
         self._windows[window_start].add(value, weight)
-        self._prune_windows(event_time)
+        self._prune_windows(timestamp)
 
-    def add_batch(self, values: list[float], timestamp: float | None = None) -> None:
+    def add_batch(self, values: list[float], timestamp: float) -> None:
         """Add multiple values into the same time window."""
         for value in values:
-            self.add(value, timestamp=timestamp)
+            self.add(value, timestamp)
 
     def get_recent_observation(
         self,
         target_id: str,
-        now: float | None = None,
+        now: float,
     ) -> LatencyObservation | None:
-        """Aggregate recent windows into a latency observation."""
-        reference_time = now if now is not None else _DEFAULT_CLOCK.monotonic()
-        self._prune_windows(reference_time)
+        """Aggregate the windows recent at ``now`` into a latency observation."""
+        self._prune_windows(now)
         if not self._window_order:
             return None
 

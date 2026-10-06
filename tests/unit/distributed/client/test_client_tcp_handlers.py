@@ -24,6 +24,7 @@ from hyperscale.distributed.nodes.client.handlers import (
     JobStatusPushHandler,
     JobBatchPushHandler,
     JobFinalResultHandler,
+    WorkflowResultPushHandler,
     WindowedStatsPushHandler,
     CancellationCompleteHandler,
     GateLeaderTransferHandler,
@@ -220,7 +221,7 @@ class TestJobFinalResultHandler:
         initial_result = ClientJobResult(job_id=job_id, status="submitted")
         state.initialize_job_tracking(job_id, initial_result)
 
-        handler = JobFinalResultHandler(state, logger)
+        handler = JobFinalResultHandler(state, logger, WorkflowResultPushHandler(state, logger))
 
         final_result = JobFinalResult(
             job_id=job_id,
@@ -244,7 +245,7 @@ class TestJobFinalResultHandler:
         logger = Mock(spec=Logger)
         logger.log = AsyncMock()
 
-        handler = JobFinalResultHandler(state, logger)
+        handler = JobFinalResultHandler(state, logger, WorkflowResultPushHandler(state, logger))
 
         # Invalid data
         result = await handler.handle(("server", 8000), b'invalid', 100)
@@ -307,6 +308,34 @@ class TestCancellationCompleteHandler:
         assert state._cancellation_success[job_id] is False
         assert state._cancellation_errors[job_id] == errors
 
+    @pytest.mark.asyncio
+    async def test_a_cancellation_the_client_did_not_make_leaves_nothing_behind(self):
+        """A gate tells a datacenter it moved the job off (AD-36), or one
+        it completed without (AD-44), to stop -- and that datacenter's
+        manager reports the cancellation to the job's client. Recorded,
+        the report stayed for the client's lifetime: only a cancellation
+        the client made clears its entries."""
+        state = ClientState()
+        logger = Mock(spec=Logger)
+        logger.log = AsyncMock()
+        handler = CancellationCompleteHandler(state, logger)
+
+        result = await handler.handle(
+            ("server", 8000),
+            JobCancellationComplete(
+                job_id="job-moved-off-a-datacenter",
+                success=True,
+                cancelled_workflow_count=2,
+                errors=[],
+            ).dump(),
+            100,
+        )
+
+        assert result == b'OK'
+        assert state._cancellation_success == {}
+        assert state._cancellation_errors == {}
+        assert state._cancellation_events == {}
+
 
 class TestGateLeaderTransferHandler:
     """Test GateLeaderTransferHandler class."""
@@ -320,7 +349,7 @@ class TestGateLeaderTransferHandler:
 
         job_id = "transfer-job-123"
 
-        leadership = ClientLeadershipTracker(state, logger)
+        leadership = ClientLeadershipTracker(state)
         handler = GateLeaderTransferHandler(state, logger, leadership)
 
         transfer = GateJobLeaderTransfer(
@@ -348,7 +377,7 @@ class TestGateLeaderTransferHandler:
         job_id = "fence-job"
 
         # Establish current leader with token 10
-        leadership = ClientLeadershipTracker(state, logger)
+        leadership = ClientLeadershipTracker(state)
         leadership.update_gate_leader(job_id, ("gate-1", 9000), fence_token=10)
 
         handler = GateLeaderTransferHandler(state, logger, leadership)
@@ -406,7 +435,7 @@ class TestManagerLeaderTransferHandler:
         job_id = "mgr-transfer-job"
         datacenter_id = "dc-east"
 
-        leadership = ClientLeadershipTracker(state, logger)
+        leadership = ClientLeadershipTracker(state)
         handler = ManagerLeaderTransferHandler(state, logger, leadership)
 
         transfer = ManagerJobLeaderTransfer(
@@ -436,7 +465,7 @@ class TestManagerLeaderTransferHandler:
         datacenter_id = "dc-west"
 
         # Establish current leader
-        leadership = ClientLeadershipTracker(state, logger)
+        leadership = ClientLeadershipTracker(state)
         leadership.update_manager_leader(
             job_id,
             datacenter_id,

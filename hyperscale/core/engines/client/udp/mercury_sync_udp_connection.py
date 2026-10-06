@@ -198,12 +198,11 @@ class MercurySyncUDPConnection:
         url: URL,
     ):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
-                    url,
+                    optimized_url,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(None, url),
                     timeout=self.timeouts.request_timeout,
@@ -212,24 +211,12 @@ class MercurySyncUDPConnection:
                 connection.reset()
                 self._connections.append(connection)
 
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
+            # Plain-string requests for the same address reuse this lookup:
+            # the resolved URL, under the key the connect path reads. One
+            # that never resolved is left for the connect path to look up.
+            if optimized_url.ip_addresses:
+                self._url_cache[optimized_url.target] = optimized_url
 
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    url,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(None, url),
-                    timeout=self.timeouts.request_timeout,
-                )
-
-                connection.reset()
-                self._connections.append(connection)
-
-            self._url_cache[url.optimized.hostname] = url
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -420,16 +407,15 @@ class MercurySyncUDPConnection:
         self,
         connection: UDPConnection | None,
         request_url: str | URL,
-        ssl_redirect_url=None,
     ) -> Tuple[
         Optional[Exception],
         UDPConnection,
         UDPUrl,
     ]:
-        has_optimized_url = isinstance(request_url, URL)
-
-        if has_optimized_url:
-            parsed_url = request_url.optimized
+        if isinstance(request_url, URL):
+            # Resolved when the workflow prepared it: never looked up here,
+            # and never read from or added to the lookup cache.
+            url = parsed_url = request_url.optimized
 
         else:
             parsed_url = UDPUrl(
@@ -438,38 +424,38 @@ class MercurySyncUDPConnection:
                 protocol=self.address_protocol,
             )
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+            # A lookup serves only the address it resolved: its target (scheme
+            # and authority), not the hostname every port on a host shares.
+            cache_key = parsed_url.target
+            url = self._url_cache.get(cache_key)
 
-        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
+            if url is None:
+                dns_lock = self._dns_lock[cache_key]
+                dns_waiter = self._dns_waiters[cache_key]
 
-        if do_dns_lookup and dns_lock.locked() is False:
-            try:
-                async with dns_lock:
-                    url = parsed_url
-                    await url.lookup()
+                if dns_lock.locked() is False:
+                    try:
+                        async with dns_lock:
+                            url = parsed_url
+                            await url.lookup()
 
-                    self._url_cache[parsed_url.hostname] = url
+                            self._url_cache[cache_key] = url
 
-            finally:
-                # However the lookup ended, release its waiters; after a
-                # failed or cancelled lookup the next request looks up
-                # again with a fresh waiter.
-                if dns_waiter.done() is False:
-                    dns_waiter.set_result(None)
+                    finally:
+                        # However the lookup ended, release its waiters; after
+                        # a failed or cancelled lookup the next request looks
+                        # up again with a fresh waiter.
+                        if dns_waiter.done() is False:
+                            dns_waiter.set_result(None)
 
-                if parsed_url.hostname not in self._url_cache:
-                    del self._dns_waiters[parsed_url.hostname]
+                        if cache_key not in self._url_cache:
+                            del self._dns_waiters[cache_key]
 
-        elif do_dns_lookup:
-            # Shielded: a waiter's cancellation must not cancel the
-            # lookup future every other waiter shares.
-            await asyncio.shield(dns_waiter)
-            url = self._url_cache.get(parsed_url.hostname)
-
-        elif has_optimized_url:
-            url = request_url.optimized
+                else:
+                    # Shielded: a waiter's cancellation must not cancel the
+                    # lookup future every other waiter shares.
+                    await asyncio.shield(dns_waiter)
+                    url = self._url_cache.get(cache_key)
 
         connection_error: Optional[Exception] = None
         connection = self._connections.pop()

@@ -76,6 +76,12 @@ class TransportFactory(Protocol):
         """
         ...
 
+    def close_stream_server(self, sockname: tuple[str, int]) -> None:
+        """Close the server's TCP listener at ``sockname``: further dials
+        are refused, as at a closed port. The connections it accepted are
+        the server's to close (it tracks them, as in REAL)."""
+        ...
+
     def connect_stream(
         self,
         self_sockname: tuple[str, int],

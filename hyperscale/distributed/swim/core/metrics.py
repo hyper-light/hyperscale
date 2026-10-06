@@ -5,11 +5,12 @@ Provides counters and gauges for monitoring key events.
 """
 
 from dataclasses import dataclass, field
-from typing import Any
 
+from .swim_metrics_snapshot import SwimMetricsSnapshot
 from .protocols import LoggerProtocol
 
 from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -39,12 +40,22 @@ class Metrics:
     probes_timeout: int = 0
     indirect_probes_sent: int = 0
     indirect_probes_success: int = 0
+    indirect_probe_stale_acks: int = 0
+    indirect_probe_unexpected_proxy_acks: int = 0
+    probe_cycle_spurious_cancel: int = 0
+    send_retries: int = 0
     
     # Membership metrics
     joins_received: int = 0
     joins_propagated: int = 0
     leaves_received: int = 0
     leaves_propagated: int = 0
+    join_retries: int = 0
+    joins_rejected_no_incarnation: int = 0
+    joins_rejected_no_version: int = 0
+    joins_rejected_version_mismatch: int = 0
+    joins_rejected_zombie: int = 0
+    node_recoveries_detected: int = 0
     
     # Suspicion metrics
     suspicions_started: int = 0
@@ -53,6 +64,10 @@ class Metrics:
     suspicions_expired: int = 0
     suspicions_expired_refuted_direct: int = 0
     dead_gossip_deferred_unwitnessed: int = 0
+    suspicions_expired_stale: int = 0
+    suspicions_skipped_stale_tracker: int = 0
+    suspicions_skipped_unconfirmed: int = 0
+    suspicions_skipped_unregistered: int = 0
     
     # Election metrics
     elections_started: int = 0
@@ -66,6 +81,7 @@ class Metrics:
     heartbeats_received: int = 0
     leadership_changes: int = 0
     split_brain_events: int = 0
+    leadership_retries: int = 0
     
     # Error metrics
     network_errors: int = 0
@@ -77,6 +93,17 @@ class Metrics:
     gossip_updates_received: int = 0
     gossip_buffer_overflows: int = 0
     gossip_alive_refutations_suppressed: int = 0
+    gossip_informed_deaths: int = 0
+    gossip_invalid_role: int = 0
+    gossip_liveness_identity_suppressed: int = 0
+    gossip_liveness_refutations_suppressed: int = 0
+    gossip_unknown_updates_suppressed: int = 0
+    non_authoritative_alive_suppressed: int = 0
+    stale_alive_refutations_suppressed: int = 0
+    superseded_self_accusations_ignored: int = 0
+    stale_unconfirmed_peer_sightings: int = 0
+    malformed_source_address: int = 0
+    malformed_embedded_state: int = 0
     
     # Rate limiting and dedup
     messages_rate_limited: int = 0
@@ -87,6 +114,8 @@ class Metrics:
     
     # Logger for structured logging (optional)
     _logger: LoggerProtocol | None = None
+    # Log records lost because the logger's write itself failed.
+    _log_write_failures: int = 0
     _node_host: str = ""
     _node_port: int = 0
     _node_id: int = 0
@@ -116,15 +145,18 @@ class Metrics:
         
         Lockless: relies on Python GIL for atomicity of individual operations.
         In the rare case of a race, we may lose an increment - acceptable for metrics.
+
+        Raises:
+            AttributeError: ``metric`` is not a counter here -- a name with
+                no field was once dropped silently, losing 23 counters.
         """
-        if hasattr(self, metric):
-            current = getattr(self, metric)
-            if current < self.MAX_COUNTER_VALUE:
-                new_value = min(current + amount, self.MAX_COUNTER_VALUE)
-                setattr(self, metric, new_value)
-                # Track saturation for monitoring (set.add is atomic under GIL)
-                if new_value >= self.MAX_COUNTER_VALUE:
-                    self._saturated_counters.add(metric)
+        current = getattr(self, metric)
+        if current < self.MAX_COUNTER_VALUE:
+            new_value = min(current + amount, self.MAX_COUNTER_VALUE)
+            setattr(self, metric, new_value)
+            # Track saturation for monitoring (set.add is atomic under GIL)
+            if new_value >= self.MAX_COUNTER_VALUE:
+                self._saturated_counters.add(metric)
     
     def get(self, metric: str) -> int:
         """Get current value of a metric."""
@@ -150,7 +182,6 @@ class Metrics:
         
         if saturated:
             try:
-                from hyperscale.logging.hyperscale_logging_models import ServerDebug
                 await self._logger.log(ServerDebug(
                     message=f"[Metrics] Counters saturated at MAX_COUNTER_VALUE: {', '.join(saturated)}",
                     node_host=self._node_host,
@@ -158,7 +189,9 @@ class Metrics:
                     node_id=self._node_id,
                 ))
             except Exception:
-                pass  # Don't let logging errors propagate
+                # The logger itself failed: nowhere left to report it but
+                # these stats.
+                self._log_write_failures += 1
         
         return len(saturated)
     
@@ -166,10 +199,11 @@ class Metrics:
         """Get uptime in seconds."""
         return _DEFAULT_CLOCK.monotonic() - self._start_time
     
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> SwimMetricsSnapshot:
         """Export all metrics as a dictionary."""
         return {
             'uptime_seconds': self.uptime(),
+            'log_write_failures': self._log_write_failures,
             'probes': {
                 'sent': self.probes_sent,
                 'received': self.probes_received,

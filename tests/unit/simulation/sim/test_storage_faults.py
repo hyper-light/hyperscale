@@ -10,7 +10,7 @@ Knob semantics (all deterministic):
   and tears the last survivor: out-of-order persistence, not a clean
   suffix.
 
-Production scenarios: NodeWAL and RaftWAL group-commit entries through
+Production scenarios: NodeWAL group-commits entries through
 the seam, survive power loss (fsynced = durable by construction), and
 recover TRUNCATION-SAFELY past crash debris; the idempotency ledger
 does the same end-to-end under SIM.
@@ -22,7 +22,6 @@ from pathlib import Path
 
 import pytest
 
-from hyperscale.distributed.hlc import HLCTimestamp
 from hyperscale.distributed.idempotency.idempotency_config import (
     IdempotencyConfig,
 )
@@ -35,8 +34,6 @@ from hyperscale.distributed.idempotency.manager_ledger import (
 )
 from hyperscale.distributed.ledger.wal.node_wal import NodeWAL
 from hyperscale.distributed.ledger.wal.wal_entry import JobEventType
-from hyperscale.distributed.raft.models import RaftLogEntry
-from hyperscale.distributed.raft.raft_wal import RaftWAL
 from tests.simulation.harness.sim import (
     SimFilesystem,
     SimulationLoop,
@@ -192,40 +189,6 @@ async def test_node_wal_survives_crash_and_tolerates_torn_tail():
         b"job-1",
     ]
     await recovered.close()
-
-
-@pytest.mark.asyncio
-async def test_raft_wal_survives_crash_and_stops_at_corruption():
-    filesystem = SimFilesystem()
-    wal_path = Path("/raft/raft.wal")
-
-    def _entry(term: int, index: int, command: bytes) -> RaftLogEntry:
-        return RaftLogEntry(
-            term=term,
-            index=index,
-            command=command,
-            command_type="stats_update",
-            job_id="job-1",
-            hlc=HLCTimestamp(wall_ms=index, logical=0, node_id=1),
-        )
-
-    wal = RaftWAL(wal_path, _RecordingLogger(), filesystem=filesystem)
-    await wal.open()
-    assert await wal.append(_entry(1, 1, b"cmd-1"))
-    assert await wal.append(_entry(1, 2, b"cmd-2"))
-    await wal.close()
-
-    filesystem.crash()
-    # Crash debris after the durable entries: garbage that fails CRC.
-    await filesystem.append_fsync(wal_path, b"\x00" * 24)
-
-    recovered_wal = RaftWAL(
-        wal_path, _RecordingLogger(), filesystem=filesystem
-    )
-    await recovered_wal.open()
-    entries = await recovered_wal.recover()
-    assert [(entry.term, entry.index) for entry in entries] == [(1, 1), (1, 2)]
-    await recovered_wal.close()
 
 
 @pytest.mark.asyncio

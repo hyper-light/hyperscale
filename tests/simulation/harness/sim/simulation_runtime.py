@@ -20,6 +20,10 @@ On construction it:
    ``connect_write_pipe`` and reads the cwd via ``run_in_executor``, both
    banned under the ``SimulationLoop``. SIM asserts on server state, not
    log output, so the kill-switch is the right trade.
+6. Snapshots the logging settings: a server sets the process's (its log
+   level, output, directory) as it is built, often in the test's own
+   context -- ``close`` restores them, so no simulation leaves the test
+   process configured as its servers were.
 
 Servers are constructed by the caller with ``**runtime.sim_kwargs()``
 spread into their ``__init__`` (``clock`` / ``random_source`` /
@@ -31,13 +35,21 @@ defaults, re-enable logging, and tear the loop down.
 import asyncio
 
 from hyperscale.logging import LoggingConfig
+from hyperscale.logging.config.logging_config import (
+    _global_disabled_loggers,
+    _global_level_map,
+    _global_log_level,
+    _global_log_output_type,
+    _global_logging_directory,
+    _global_logging_disabled,
+)
 from hyperscale.distributed.runtime import (
     restore_defaults,
     snapshot_defaults,
     swap_defaults,
 )
 
-from .in_process_transport import InProcessTransport
+from .in_process_transport import FaultCheck, InProcessTransport
 from .seeded_random import SeededRandom
 from .sim_filesystem import SimFilesystem
 from .sim_system_resources import SimSystemResources
@@ -54,12 +66,14 @@ class SimulationRuntime:
     scenario.
     """
 
-    def __init__(self, seed: int = 1) -> None:
+    def __init__(self, seed: int = 1, fault_check: FaultCheck | None = None) -> None:
+        """``fault_check`` is consulted at every delivery to drop or delay
+        it (see ``InProcessTransport``); None delivers everything."""
         self.loop = SimulationLoop()
         asyncio.set_event_loop(self.loop)
         self.clock = VirtualClock(self.loop)
         self.random = SeededRandom(seed)
-        self.transport = InProcessTransport(self.loop)
+        self.transport = InProcessTransport(self.loop, fault_check=fault_check)
         self.transport_factory = SimTransportFactory(self.transport)
         self.filesystem = SimFilesystem(clock=self.clock)
         self.system_resources = SimSystemResources()
@@ -73,6 +87,20 @@ class SimulationRuntime:
             filesystem=self.filesystem,
             system_resources=self.system_resources,
         )
+
+        # The logging settings as the test process had them, restored by
+        # ``close`` (lists copied: loggers are disabled by mutating one).
+        self._logging_settings = [
+            (setting, list(value) if isinstance(value := setting.get(), list) else value)
+            for setting in (
+                _global_log_level,
+                _global_disabled_loggers,
+                _global_level_map,
+                _global_log_output_type,
+                _global_logging_directory,
+                _global_logging_disabled,
+            )
+        ]
 
         # The SimulationLoop bans the real-I/O ops the async logger's
         # stream setup performs; SIM asserts on state, not log output.
@@ -96,7 +124,8 @@ class SimulationRuntime:
         Safe to call once; idempotent-friendly guards keep a double
         ``close`` from raising.
         """
-        LoggingConfig().enable()
+        for setting, value in self._logging_settings:
+            setting.set(value)
         restore_defaults(self._defaults)
         if not self.loop.is_closed():
             self.loop.close()

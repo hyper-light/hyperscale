@@ -1,8 +1,53 @@
+import asyncio
+import socket
 import ssl
 from asyncio.sslproto import SSLProtocol, SSLProtocolState
 
 # What asyncio's SSLProtocol treats as "no more data for now" on a read.
 _SSL_AGAIN_ERRORS = (ssl.SSLWantReadError, ssl.SSLSyscallError)
+
+
+async def open_ssl_protocol_transport(
+    loop: asyncio.AbstractEventLoop,
+    connected_socket: socket.socket,
+    family: int,
+    ssl_context: ssl.SSLContext,
+    server_hostname: str | None,
+    protocol: asyncio.BaseProtocol,
+    handshake_timeout: float | None,
+) -> asyncio.Transport:
+    """
+    What ``loop.create_connection(ssl=..., sock=...)`` does, with
+    ClientSSLProtocol in place of asyncio's SSLProtocol: TLS over the
+    connected socket, returning the TLS transport once the handshake
+    completes, with ``protocol.connection_made`` called. For loops that
+    cannot watch a socket for readiness, where TLSTransport cannot run.
+    """
+    handshake_complete = loop.create_future()
+    ssl_protocol = ClientSSLProtocol(
+        loop,
+        protocol,
+        ssl_context,
+        handshake_complete,
+        False,
+        server_hostname,
+        ssl_handshake_timeout=handshake_timeout,
+    )
+
+    await loop.create_connection(
+        lambda: ssl_protocol,
+        sock=connected_socket,
+        family=family,
+    )
+
+    try:
+        await handshake_complete
+
+    except BaseException:
+        ssl_protocol._app_transport.close()
+        raise
+
+    return ssl_protocol._app_transport
 
 
 class ClientSSLProtocol(SSLProtocol):

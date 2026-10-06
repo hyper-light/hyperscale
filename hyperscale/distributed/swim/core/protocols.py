@@ -13,9 +13,10 @@ the historical name for backward compatibility; new callers should
 import ``Runner`` from ``hyperscale.distributed.runtime`` directly.
 """
 
-from typing import Protocol, Any, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from hyperscale.distributed.runtime import Runner as TaskRunnerProtocol
+from hyperscale.logging.models import Entry
 
 
 __all__ = ["LoggerProtocol", "TaskRunnerProtocol"]
@@ -34,7 +35,7 @@ class LoggerProtocol(Protocol):
     backend (file writes, network sends, etc.).
     """
 
-    async def log(self, entry: Any) -> None:
+    async def log(self, entry: Entry) -> None:
         """
         Log a structured entry.
 

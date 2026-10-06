@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.hlc import HLCTimestamp
 from hyperscale.distributed.raft.models import (
     AppendEntries,
@@ -75,7 +76,7 @@ def make_node(
     node = RaftNode(
         job_id="job-1",
         node_id=node_id,
-        members=members,
+        initial_voters=frozenset(members),
         member_addrs=member_addrs,
         send_message=send_mock,
         apply_command=apply_mock,
@@ -84,7 +85,7 @@ def make_node(
         logger=logger_mock,
         configured_cluster_size=len(members),
         clock=new_hybrid_logical_clock(),
-        may_lead=lambda: True,
+        may_lead=lambda: True, storage=VolatileRaftStorage()
     )
     return node, send_mock, apply_mock
 
@@ -359,7 +360,8 @@ class TestPropose:
 
         success, index = await propose_and_apply(node, b"cmd", "CREATE_JOB")
         assert success is True
-        assert index == 1
+        # The term opened with its blank entry at index 1 (Raft 8).
+        assert index == 2
 
     @pytest.mark.asyncio
     async def test_propose_fails_on_follower(self) -> None:
@@ -375,8 +377,8 @@ class TestPropose:
 
         _, index1 = await propose_and_apply(node, b"a", "CREATE_JOB")
         _, index2 = await propose_and_apply(node, b"b", "CREATE_JOB")
-        assert index1 == 1
-        assert index2 == 2
+        assert index1 == 2
+        assert index2 == 3
 
 
 # =============================================================================
@@ -502,30 +504,39 @@ class TestAppendEntriesResponse:
 
     @pytest.mark.asyncio
     async def test_successful_response_advances_match(self) -> None:
-        node, _, _ = make_single_node()
-        await node.start_election()
-        # Add another member manually for this test
-        node.update_membership(
-            {"solo", "node-2"},
-            {"solo": ("127.0.0.1", 9001), "node-2": ("127.0.0.1", 9002)},
+        # Two voters: nothing commits without node-2's acknowledgment.
+        node, _, _ = make_node(
+            node_id="solo",
+            members={"solo", "node-2"},
+            member_addrs={"solo": ("127.0.0.1", 9001), "node-2": ("127.0.0.1", 9002)},
         )
+        await node.start_election()
+        await node.handle_request_vote_response(
+            RequestVoteResponse(
+                job_id="job-1", term=node.current_term, vote_granted=True, voter_id="node-2",
+            )
+        )
+        assert node.is_leader()
 
         # ``propose`` blocks until the entry is applied, so run it in the
-        # background: it appends the entry and advances commit_index
-        # synchronously before awaiting its waiter.
+        # background: it appends the entry (after the leader's term-start
+        # entry) and advances commit_index synchronously before awaiting its
+        # waiter.
         propose_task = asyncio.create_task(node.propose(b"cmd", "NO_OP"))
         await asyncio.sleep(0.01)
+        uncommitted = node.commit_index
 
         response = AppendEntriesResponse(
             job_id="job-1",
             term=node.current_term,
             success=True,
             follower_id="node-2",
-            match_index=1,
+            match_index=node.last_log_index,
         )
         await node.handle_append_entries_response(response)
-        # Commit should advance since both nodes agree
-        assert node.commit_index == 1
+        # Commit advances once both voters hold the entry.
+        assert uncommitted == 0
+        assert node.commit_index == node.last_log_index
 
         # Release the proposal waiter and clean up the background task.
         await node.apply_committed_entries()
@@ -574,8 +585,10 @@ class TestApplyCommitted:
 
         # Quorum is 1 (single node): each proposal commits and applies
         # inside propose, resolving without waiting for a tick's apply pass.
-        assert await node.propose(b"cmd1", "CREATE_JOB") == (True, 1)
-        assert await node.propose(b"cmd2", "CREATE_JOB") == (True, 2)
+        # The term's blank entry (index 1, Raft 8) commits with them and
+        # never reaches the state machine.
+        assert await node.propose(b"cmd1", "CREATE_JOB") == (True, 2)
+        assert await node.propose(b"cmd2", "CREATE_JOB") == (True, 3)
         assert apply_mock.call_count == 2
 
         # Nothing is left for the tick's apply pass.
@@ -625,38 +638,6 @@ class TestReplication:
         send_mock.reset_mock()
         await node.replicate_to_followers()
         assert send_mock.call_count == 0
-
-
-# =============================================================================
-# Test Membership Updates
-# =============================================================================
-
-
-class TestMembership:
-    """Tests for dynamic membership changes."""
-
-    def test_update_membership_adds_new_members(self) -> None:
-        node, _, _ = make_node()
-        new_members = {"node-1", "node-2", "node-3", "node-4"}
-        new_addrs = {
-            "node-1": ("127.0.0.1", 9001),
-            "node-2": ("127.0.0.1", 9002),
-            "node-3": ("127.0.0.1", 9003),
-            "node-4": ("127.0.0.1", 9004),
-        }
-        node.update_membership(new_members, new_addrs)
-        # No crash, membership updated
-
-    @pytest.mark.asyncio
-    async def test_leader_tracks_new_members(self) -> None:
-        node, _, _ = make_single_node()
-        await node.start_election()
-
-        node.update_membership(
-            {"solo", "new-node"},
-            {"solo": ("127.0.0.1", 9001), "new-node": ("127.0.0.1", 9002)},
-        )
-        # Leader should have initialized next_index for new member
 
 
 # =============================================================================

@@ -51,8 +51,6 @@ from hyperscale.distributed.reliability.rate_limiting import (
     ServerRateLimiter as ServerRateLimiter,
     RateLimitConfig as RateLimitConfig,
     RateLimitResult as RateLimitResult,
-    # Legacy (kept for backward compatibility)
-    TokenBucket as TokenBucket,
     CooperativeRateLimiter as CooperativeRateLimiter,
     # Retry-after helpers
     is_rate_limit_response as is_rate_limit_response,
@@ -65,12 +63,7 @@ from hyperscale.distributed.reliability.rate_limiting import (
 from hyperscale.distributed.reliability.message_class import (
     # AD-37: Message classification for backpressure policy
     MessageClass as MessageClass,
-    MESSAGE_CLASS_TO_PRIORITY as MESSAGE_CLASS_TO_PRIORITY,
     classify_handler as classify_handler,
-    get_priority_for_handler as get_priority_for_handler,
-    is_control_message as is_control_message,
-    is_data_message as is_data_message,
-    is_shedable as is_shedable,
     CONTROL_HANDLERS as CONTROL_HANDLERS,
     DISPATCH_HANDLERS as DISPATCH_HANDLERS,
     DATA_HANDLERS as DATA_HANDLERS,

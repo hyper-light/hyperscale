@@ -15,6 +15,7 @@ import time
 from collections import defaultdict
 from unittest.mock import AsyncMock, MagicMock
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.raft.models import (
     AppendEntries,
     AppendEntriesResponse,
@@ -144,13 +145,13 @@ def create_cluster(
             may_lead=lambda: True,
             job_id="job-1",
             node_id=node_id,
-            members=members,
+            initial_voters=frozenset(members),
             member_addrs=member_addrs,
             send_message=network.make_send_callback(node_id),
             apply_command=network.make_apply_callback(node_id),
             on_become_leader=None,
             on_lose_leadership=None,
-            logger=logger_mock,
+            logger=logger_mock, storage=VolatileRaftStorage()
         )
         addr = member_addrs[node_id]
         network.add_node(node_id, addr, node)
@@ -219,14 +220,17 @@ async def test_log_replication() -> None:
     await network.deliver_all_messages()
     await network.deliver_all_messages()
     assert nodes["node-1"].is_leader()
+    # The new leader opens its term with its own entry (Raft 5.4.2/8)
+    term_start_index = nodes["node-1"].last_log_index
+    assert term_start_index == 1
 
     # Propose a command: it replicates and commits before resolving
     success, index = await propose_with_delivery(network, nodes["node-1"], b"command-1")
     assert success is True
-    assert index == 1
+    assert index == term_start_index + 1
 
     # Leader should have advanced commit
-    assert nodes["node-1"].commit_index == 1
+    assert nodes["node-1"].commit_index == index
 
 
 async def test_follower_applies_committed_entries() -> None:
@@ -238,7 +242,7 @@ async def test_follower_applies_committed_entries() -> None:
     await network.deliver_all_messages()
     await network.deliver_all_messages()
 
-    await propose_with_delivery(network, nodes["node-1"], b"cmd-1")
+    _, index = await propose_with_delivery(network, nodes["node-1"], b"cmd-1")
 
     # Leader sends another heartbeat with updated commit index
     await nodes["node-1"].replicate_to_followers()
@@ -248,7 +252,7 @@ async def test_follower_applies_committed_entries() -> None:
     # Followers apply the entry the moment they learn it committed: no
     # separate apply pass is needed, and none finds anything left over
     for node_id in ["node-2", "node-3"]:
-        assert nodes[node_id].commit_index == 1
+        assert nodes[node_id].commit_index == index
         assert [entry.command for entry in network._applied_entries[node_id]] == [b"cmd-1"]
         assert await nodes[node_id].apply_committed_entries() == 0
 
@@ -260,6 +264,8 @@ async def test_multiple_proposals() -> None:
     await nodes["node-1"].start_election()
     await network.deliver_all_messages()
     await network.deliver_all_messages()
+    # The new leader opens its term with its own entry (Raft 5.4.2/8)
+    term_start_index = nodes["node-1"].last_log_index
 
     # Propose 5 commands
     for idx in range(5):
@@ -268,7 +274,7 @@ async def test_multiple_proposals() -> None:
         )
         assert success is True
 
-    assert nodes["node-1"].commit_index == 5
+    assert nodes["node-1"].commit_index == term_start_index + 5
 
     # The leader applied each entry in order as it committed
     assert [entry.command for entry in network._applied_entries["node-1"]] == [
@@ -347,10 +353,13 @@ async def test_single_node_consensus() -> None:
     await nodes["solo"].start_election()
     assert nodes["solo"].is_leader()
     assert nodes["solo"].current_term == 1
+    # The new leader opens its term with its own entry (Raft 5.4.2/8)
+    term_start_index = nodes["solo"].last_log_index
 
     success, index = await nodes["solo"].propose(b"cmd", "CREATE_JOB")
     assert success is True
-    assert index == 1
+    assert index == term_start_index + 1
+    assert nodes["solo"].commit_index == index
 
     # Single node commits and applies within the proposal (quorum = 1)
     assert [entry.command for entry in network._applied_entries["solo"]] == [b"cmd"]

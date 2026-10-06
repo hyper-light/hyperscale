@@ -50,7 +50,7 @@ async def ping(handler: GatePingHandler) -> GatePingResponse:
 
 @pytest.mark.asyncio
 async def test_ping_reports_active_once_startup_sync_completes() -> None:
-    state = GateRuntimeState()
+    state = GateRuntimeState(forward_throughput_interval_start=0.0)
     gate = object.__new__(GateServer)
     gate._modular_state = state
     gate.is_leader = lambda: True
@@ -63,7 +63,7 @@ async def test_ping_reports_active_once_startup_sync_completes() -> None:
 
 @pytest.mark.asyncio
 async def test_handler_and_server_version_bumps_advance_one_version() -> None:
-    state = GateRuntimeState()
+    state = GateRuntimeState(forward_throughput_interval_start=0.0)
     gate = object.__new__(GateServer)
     gate._modular_state = state
 

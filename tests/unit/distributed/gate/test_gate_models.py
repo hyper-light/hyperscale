@@ -4,7 +4,6 @@ Integration tests for Gate Models (Section 15.3.2).
 Tests gate-specific data models:
 - GatePeerState, GatePeerTracking
 - DCHealthState, ManagerTracking
-- JobForwardingState, ForwardingMetrics
 - LeaseState, LeaseTracking
 """
 
@@ -18,8 +17,6 @@ from hyperscale.distributed.nodes.gate.models import (
     GatePeerTracking,
     DCHealthState,
     ManagerTracking,
-    JobForwardingState,
-    ForwardingMetrics,
     LeaseState,
     LeaseTracking,
 )
@@ -395,117 +392,6 @@ class TestDCHealthStateEdgeCases:
 
 
 # =============================================================================
-# ForwardingMetrics Tests
-# =============================================================================
-
-
-class TestForwardingMetricsHappyPath:
-    """Tests for ForwardingMetrics happy path."""
-
-    def test_create_default(self):
-        """Create metrics with defaults."""
-        metrics = ForwardingMetrics()
-
-        assert metrics.count == 0
-        assert metrics.last_throughput == 0.0
-        assert metrics.interval_seconds == 10.0
-
-    def test_record_forward(self):
-        """Record forward increments count."""
-        metrics = ForwardingMetrics()
-
-        metrics.record_forward()
-        assert metrics.count == 1
-
-        metrics.record_forward()
-        assert metrics.count == 2
-
-    def test_calculate_throughput_within_interval(self):
-        """Calculate throughput within interval returns last value."""
-        metrics = ForwardingMetrics(interval_seconds=10.0)
-        # Just created, so within interval
-        metrics.record_forward()
-        metrics.record_forward()
-
-        # Should return 0.0 (last value) since interval hasn't elapsed
-        throughput = metrics.calculate_throughput()
-        assert throughput == 0.0
-        # Count should remain since interval not elapsed
-        assert metrics.count == 2
-
-    def test_calculate_throughput_after_interval(self):
-        """Calculate throughput after interval calculates and resets."""
-        metrics = ForwardingMetrics(interval_seconds=0.0)  # Immediate interval
-        metrics.record_forward()
-        metrics.record_forward()
-        metrics.record_forward()
-
-        # Force interval start to past
-        metrics.interval_start = time.monotonic() - 1.0
-        metrics.count = 10
-
-        throughput = metrics.calculate_throughput()
-
-        assert throughput > 0.0  # Should be ~10/elapsed
-        assert metrics.count == 0  # Reset after calculation
-
-
-class TestForwardingMetricsEdgeCases:
-    """Tests for ForwardingMetrics edge cases."""
-
-    def test_zero_interval(self):
-        """Zero interval causes immediate calculation."""
-        metrics = ForwardingMetrics(interval_seconds=0.0)
-        metrics.record_forward()
-
-        throughput = metrics.calculate_throughput()
-        # Very high throughput due to tiny elapsed time
-        assert throughput >= 0.0
-
-    def test_many_forwards(self):
-        """Handle many forward records."""
-        metrics = ForwardingMetrics()
-
-        for _ in range(10000):
-            metrics.record_forward()
-
-        assert metrics.count == 10000
-
-
-# =============================================================================
-# JobForwardingState Tests
-# =============================================================================
-
-
-class TestJobForwardingStateHappyPath:
-    """Tests for JobForwardingState happy path."""
-
-    def test_create_default(self):
-        """Create state with defaults."""
-        state = JobForwardingState()
-
-        assert state.forward_timeout == 3.0
-        assert state.max_forward_attempts == 3
-        assert state.throughput_metrics is not None
-
-    def test_record_forward_delegates(self):
-        """Record forward delegates to metrics."""
-        state = JobForwardingState()
-
-        state.record_forward()
-        state.record_forward()
-
-        assert state.throughput_metrics.count == 2
-
-    def test_get_throughput_delegates(self):
-        """Get throughput delegates to metrics."""
-        state = JobForwardingState()
-
-        throughput = state.get_throughput()
-        assert throughput >= 0.0
-
-
-# =============================================================================
 # LeaseTracking Tests
 # =============================================================================
 
@@ -688,14 +574,6 @@ class TestModelsUseSlots:
         """DCHealthState uses slots."""
         assert hasattr(DCHealthState, "__slots__")
 
-    def test_forwarding_metrics_uses_slots(self):
-        """ForwardingMetrics uses slots."""
-        assert hasattr(ForwardingMetrics, "__slots__")
-
-    def test_job_forwarding_state_uses_slots(self):
-        """JobForwardingState uses slots."""
-        assert hasattr(JobForwardingState, "__slots__")
-
     def test_lease_tracking_uses_slots(self):
         """LeaseTracking uses slots."""
         assert hasattr(LeaseTracking, "__slots__")
@@ -715,8 +593,6 @@ class TestModelsAreDataclasses:
             GatePeerState,
             ManagerTracking,
             DCHealthState,
-            ForwardingMetrics,
-            JobForwardingState,
             LeaseTracking,
             LeaseState,
         ]

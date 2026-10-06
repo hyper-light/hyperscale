@@ -62,7 +62,7 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 14**: Add immediate status replay after client reconnect/register_callback (verified - already implemented)
 - [x] **Task 16**: Add job_status_push retry/peer-forward on failure (verified - already implemented in stats_coordinator.py)
 - [x] **Task 17**: Invoke progress callbacks on batch updates (verified - already implemented in stats_coordinator.py)
-- [x] **Task 18**: Add client poll-on-reconnect or replay mechanism (verified - already implemented with last_sequence)
+- [x] **Task 18**: Add client poll-on-reconnect or replay mechanism (2026-10: the gate half existed, the client never re-registered; now it asks for a replay when a completed job's results stay missing -- architecture.md Component 4 "As built")
 - [x] **Task 36**: Implement mixed final status resolution across DCs (verified - already implemented in _resolve_global_result_status)
 - [x] **Task 40**: Integrate job lease acquisition/renewal in gate submission (verified - already implemented in tcp_job.py)
 - [x] **Task 43**: Manager validate cluster/environment on registration (verified - already implemented in handle_register)

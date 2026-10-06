@@ -1397,11 +1397,11 @@ else:
 
 ## Item 4.4 — Routing reads via `SoftStateCache`
 
-**What**: `GateJobRouter` (AD-51), `ManagerDispatcher`, etc. read from `SoftStateCache` for non-linearizable decisions.
+**What**: `GateJobRouter` (AD-51) and the gate's dispatch read from `SoftStateCache` for non-linearizable decisions. (`ManagerDispatcher` was removed 2026-10-04: write-only, never read; gate dispatch is `GateDispatchCoordinator`.)
 
 **Files**:
 - Modify `hyperscale/distributed/routing/gate_job_router.py` — replace direct membership lookups with `soft_cache.get()`.
-- Modify `hyperscale/distributed/datacenters/manager_dispatcher.py` — same.
+- Modify `hyperscale/distributed/nodes/gate/dispatch_coordinator.py` — same.
 
 **Acceptance criteria**:
 - Routing decisions don't block on Raft for typical reads.

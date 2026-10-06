@@ -16,7 +16,7 @@ class GraphQLHTTP2Response(HTTP2Response):
     cookies: Optional[Cookies] = None
     status: Optional[int] = None
     status_message: Optional[str] = None
-    headers: Optional[Dict[bytes, bytes]] = None
+    headers: Optional[Dict[str, str]] = None
     content: bytes = b""
     timings: Optional[
         Dict[

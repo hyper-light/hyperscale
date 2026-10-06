@@ -203,6 +203,14 @@ class InProcessTransport:
         udp_protocol.connection_made(udp_transport)
         return udp_transport
 
+    def close_tcp(self, sockname: tuple[str, int]) -> None:
+        """Close the TCP listener at ``sockname``: further ``connect_tcp``
+        attempts are refused, as at a closed port. Connections it
+        accepted stay open until their server closes them -- as a REAL
+        listener's close leaves them."""
+        if (registration := self._registry.get(sockname)) is not None:
+            registration.tcp_protocol_factory = None
+
     def deregister_server(self, sockname: tuple[str, int]) -> None:
         """Remove the server at ``sockname`` from the registry.
 
@@ -271,6 +279,10 @@ class InProcessTransport:
             sockname=peer_sockname,
         )
         server_transport.set_protocol(server_protocol)
+        # Each end learns when the other closes -- a REAL peer's FIN or
+        # RST -- so a connection to a crashed server dies on both ends.
+        client_transport.set_partner(server_transport)
+        server_transport.set_partner(client_transport)
 
         # Notify both sides; matches asyncio's contract that
         # ``connection_made`` is called after the transport-protocol

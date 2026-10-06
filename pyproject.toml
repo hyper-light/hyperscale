@@ -227,13 +227,14 @@ Homepage = "https://github.com/hyper-light/hyperscale"
 hyperscale = "hyperscale.commands.root:run"
 
 [tool.setuptools.packages.find]
-# Scanning implicit namespaces is active by default. Exclude any
-# ``*.testing*`` package — those hold simulation-harness fixtures
-# (e.g. hyperscale.distributed.testing.workflows.SimpleWorkflow). They
-# live under hyperscale.* in the source tree only so the
-# RestrictedUnpickler allowlist accepts them when running tests in this
-# repo; production wheels must NOT carry them.
-exclude = ["*.testing", "*.testing.*"]
+# Scanning implicit namespaces is active by default. Exclude the
+# simulation-harness fixtures in ``hyperscale.distributed.testing`` (e.g.
+# hyperscale.distributed.testing.workflows.SimpleWorkflow). They live
+# under hyperscale.* in the source tree only so the RestrictedUnpickler
+# allowlist accepts them when running tests in this repo; production
+# wheels must NOT carry them. ``hyperscale.core.testing`` is production
+# code (the engine clients' request models) and ships.
+exclude = ["hyperscale.distributed.testing", "hyperscale.distributed.testing.*"]
 
 [tool.ruff]
 target-version = "py311"

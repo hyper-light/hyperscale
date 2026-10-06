@@ -1,49 +1,26 @@
 """
 Incarnation number tracking for SWIM protocol.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
-
 from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.swim.core.types import Status
 from hyperscale.distributed.swim.core.node_state import NodeState
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
+from .message_freshness import MessageFreshness
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-class MessageFreshness(Enum):
-    """
-    Result of checking message freshness.
-
-    Indicates whether a message should be processed and why it was
-    accepted or rejected. This enables appropriate handling per case.
-    """
-
-    FRESH = "fresh"
-    """Message has new information - process it."""
-
-    DUPLICATE = "duplicate"
-    """Same incarnation and same/lower status priority - silent ignore.
-    This is completely normal in gossip protocols where the same state
-    propagates via multiple paths."""
-
-    STALE = "stale"
-    """Lower incarnation than known - indicates delayed message or state drift.
-    Worth logging as it may indicate network issues."""
-
-    INVALID = "invalid"
-    """Incarnation number failed validation (negative or exceeds max).
-    Indicates bug or corruption."""
-
-    SUSPICIOUS = "suspicious"
-    """Incarnation jump is suspiciously large - possible attack or serious bug."""
-
 
 # Maximum valid incarnation number (2^31 - 1 for wide compatibility)
 MAX_INCARNATION = 2**31 - 1
@@ -92,6 +69,8 @@ class IncarnationTracker:
     _death_incarnations: dict[tuple[str, int], int] = field(default_factory=dict)
 
     _logger: LoggerProtocol | None = None
+    # Log records lost because the logger's write itself failed.
+    _log_write_failures: int = 0
     _node_host: str = ""
     _node_port: int = 0
     _node_id: str = ""
@@ -130,7 +109,9 @@ class IncarnationTracker:
                     )
                 )
             except Exception:
-                pass  # Don't let logging errors propagate
+                # The logger itself failed: nowhere left to report it but
+                # these stats.
+                self._log_write_failures += 1
 
     def get_self_incarnation(self) -> int:
         """Get current incarnation number for this node."""
@@ -481,6 +462,7 @@ class IncarnationTracker:
             "total_cleanups": self._cleanup_count,
             "zombie_rejections": self._zombie_rejections,
             "active_death_records": len(self._death_timestamps),
+            "log_write_failures": self._log_write_failures,
         }
 
     # =========================================================================
@@ -762,3 +744,10 @@ class IncarnationTracker:
             self.clear_death_record(node)
 
         return len(to_remove)
+
+_REHOMED = (
+    MessageFreshness,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

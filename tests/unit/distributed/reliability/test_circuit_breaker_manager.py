@@ -52,7 +52,7 @@ class TestCircuitBreakerManagerHappyPath:
     def test_initialization(self) -> None:
         """Test CircuitBreakerManager initializes with correct config."""
         env = MockEnv(max_errors=10, window_seconds=120.0, half_open_after=60.0)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
 
         assert manager._config.max_errors == 10
         assert manager._config.window_seconds == 120.0
@@ -63,7 +63,7 @@ class TestCircuitBreakerManagerHappyPath:
     async def test_get_circuit_creates_new_circuit(self) -> None:
         """Test get_circuit creates a new circuit for unknown manager."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         circuit = await manager.get_circuit(addr)
@@ -76,7 +76,7 @@ class TestCircuitBreakerManagerHappyPath:
     async def test_get_circuit_returns_existing_circuit(self) -> None:
         """Test get_circuit returns the same circuit for known manager."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         circuit1 = await manager.get_circuit(addr)
@@ -88,7 +88,7 @@ class TestCircuitBreakerManagerHappyPath:
     async def test_record_success_on_existing_circuit(self) -> None:
         """Test recording success updates the circuit."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Create circuit first
@@ -102,7 +102,7 @@ class TestCircuitBreakerManagerHappyPath:
     async def test_record_failure_increments_error_count(self) -> None:
         """Test recording failure increments error count."""
         env = MockEnv(max_errors=5)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Record 3 failures (below threshold)
@@ -117,7 +117,7 @@ class TestCircuitBreakerManagerHappyPath:
     async def test_get_circuit_status(self) -> None:
         """Test get_circuit_status returns correct status dict."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         await manager.get_circuit(addr)
@@ -135,7 +135,7 @@ class TestCircuitBreakerManagerHappyPath:
     async def test_get_all_circuit_status(self) -> None:
         """Test get_all_circuit_status returns all managers."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr1 = ("192.168.1.1", 8080)
         addr2 = ("192.168.1.2", 8080)
 
@@ -153,7 +153,7 @@ class TestCircuitBreakerManagerHappyPath:
     async def test_remove_circuit(self) -> None:
         """Test remove_circuit removes the circuit for a manager."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         await manager.get_circuit(addr)
@@ -166,7 +166,7 @@ class TestCircuitBreakerManagerHappyPath:
     async def test_clear_all(self) -> None:
         """Test clear_all removes all circuits."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
 
         # Create multiple circuits
         for idx in range(5):
@@ -190,7 +190,7 @@ class TestCircuitBreakerManagerNegativePath:
     async def test_is_circuit_open_unknown_manager(self) -> None:
         """Test is_circuit_open returns False for unknown manager."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # No circuit exists, should return False
@@ -199,7 +199,7 @@ class TestCircuitBreakerManagerNegativePath:
     def test_get_circuit_status_unknown_manager(self) -> None:
         """Test get_circuit_status returns None for unknown manager."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         status = manager.get_circuit_status(addr)
@@ -208,7 +208,7 @@ class TestCircuitBreakerManagerNegativePath:
     def test_record_success_unknown_manager(self) -> None:
         """Test record_success on unknown manager is a no-op."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Should not raise, should be a no-op
@@ -221,7 +221,7 @@ class TestCircuitBreakerManagerNegativePath:
     async def test_record_failure_creates_circuit(self) -> None:
         """Test record_failure creates circuit if not exists."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # record_failure should create the circuit
@@ -235,7 +235,7 @@ class TestCircuitBreakerManagerNegativePath:
     async def test_remove_circuit_unknown_manager(self) -> None:
         """Test remove_circuit on unknown manager is a no-op."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Should not raise
@@ -255,7 +255,7 @@ class TestCircuitBreakerManagerFailureModes:
     async def test_circuit_opens_after_max_errors(self) -> None:
         """Test circuit opens after max_errors failures."""
         env = MockEnv(max_errors=5)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Record exactly max_errors failures
@@ -270,7 +270,7 @@ class TestCircuitBreakerManagerFailureModes:
     async def test_circuit_stays_closed_below_threshold(self) -> None:
         """Test circuit stays closed below max_errors threshold."""
         env = MockEnv(max_errors=5)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Record max_errors - 1 failures
@@ -283,7 +283,7 @@ class TestCircuitBreakerManagerFailureModes:
     async def test_circuit_transitions_to_half_open(self) -> None:
         """Test circuit transitions to half-open after timeout."""
         env = MockEnv(max_errors=5, half_open_after=0.1)  # 100ms
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Open the circuit
@@ -302,7 +302,7 @@ class TestCircuitBreakerManagerFailureModes:
     async def test_circuit_closes_on_success_in_half_open(self) -> None:
         """Test circuit closes when success recorded in half-open state."""
         env = MockEnv(max_errors=5, half_open_after=0.05)  # 50ms
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Open the circuit
@@ -325,7 +325,7 @@ class TestCircuitBreakerManagerFailureModes:
     async def test_circuit_reopens_on_failure_in_half_open(self) -> None:
         """Test circuit reopens when failure recorded in half-open state."""
         env = MockEnv(max_errors=1, half_open_after=0.05)  # 50ms
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Open the circuit
@@ -348,7 +348,7 @@ class TestCircuitBreakerManagerFailureModes:
     async def test_open_circuits_listed_correctly(self) -> None:
         """Test get_all_circuit_status lists open circuits correctly."""
         env = MockEnv(max_errors=2)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr1 = ("192.168.1.1", 8080)
         addr2 = ("192.168.1.2", 8080)
         addr3 = ("192.168.1.3", 8080)
@@ -382,7 +382,7 @@ class TestCircuitBreakerManagerConcurrency:
     async def test_concurrent_get_circuit_same_addr(self) -> None:
         """Test concurrent get_circuit calls for same address."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Run multiple tasks concurrently
@@ -396,7 +396,7 @@ class TestCircuitBreakerManagerConcurrency:
     async def test_concurrent_get_circuit_different_addrs(self) -> None:
         """Test concurrent get_circuit calls for different addresses."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
 
         async def get_circuit_worker(idx: int):
             addr = (f"192.168.1.{idx}", 8080)
@@ -412,7 +412,7 @@ class TestCircuitBreakerManagerConcurrency:
     async def test_concurrent_record_failures(self) -> None:
         """Test concurrent failure recording."""
         env = MockEnv(max_errors=100)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         await asyncio.gather(*[manager.record_failure(addr) for _ in range(50)])
@@ -425,7 +425,7 @@ class TestCircuitBreakerManagerConcurrency:
     async def test_concurrent_mixed_operations(self) -> None:
         """Test concurrent success/failure recording."""
         env = MockEnv(max_errors=100)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Pre-create the circuit
@@ -468,7 +468,7 @@ class TestCircuitBreakerManagerEdgeCases:
     async def test_max_errors_one(self) -> None:
         """Test circuit with max_errors=1 opens immediately."""
         env = MockEnv(max_errors=1)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         await manager.record_failure(addr)
@@ -480,7 +480,7 @@ class TestCircuitBreakerManagerEdgeCases:
         """Test behavior with max_errors=0 (edge case)."""
         # This tests the underlying ErrorStats behavior
         env = MockEnv(max_errors=0)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # With max_errors=0, first failure should not open circuit
@@ -496,7 +496,7 @@ class TestCircuitBreakerManagerEdgeCases:
     async def test_very_short_window(self) -> None:
         """Test with very short window_seconds."""
         env = MockEnv(max_errors=5, window_seconds=0.1)  # 100ms window
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         # Record failures
@@ -514,7 +514,7 @@ class TestCircuitBreakerManagerEdgeCases:
     async def test_very_short_half_open_after(self) -> None:
         """Test with very short half_open_after."""
         env = MockEnv(max_errors=1, half_open_after=0.01)  # 10ms
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         await manager.record_failure(addr)
@@ -530,7 +530,7 @@ class TestCircuitBreakerManagerEdgeCases:
     async def test_ipv6_address(self) -> None:
         """Test with IPv6 address tuple."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("::1", 8080)
 
         circuit = await manager.get_circuit(addr)
@@ -543,7 +543,7 @@ class TestCircuitBreakerManagerEdgeCases:
     async def test_large_port_number(self) -> None:
         """Test with maximum port number."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 65535)
 
         circuit = await manager.get_circuit(addr)
@@ -556,7 +556,7 @@ class TestCircuitBreakerManagerEdgeCases:
     async def test_many_managers(self) -> None:
         """Test with many manager circuits."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
 
         # Create 1000 circuits
         for idx in range(1000):
@@ -573,7 +573,7 @@ class TestCircuitBreakerManagerEdgeCases:
     async def test_circuit_config_matches_env(self) -> None:
         """Test that circuit config matches env settings."""
         env = MockEnv(max_errors=7, window_seconds=45.0, half_open_after=15.0)
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
         addr = ("192.168.1.1", 8080)
 
         circuit = await manager.get_circuit(addr)
@@ -586,7 +586,7 @@ class TestCircuitBreakerManagerEdgeCases:
     async def test_duplicate_addr_different_ports(self) -> None:
         """Test same host with different ports are separate circuits."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
 
         addr1 = ("192.168.1.1", 8080)
         addr2 = ("192.168.1.1", 8081)
@@ -601,7 +601,7 @@ class TestCircuitBreakerManagerEdgeCases:
     async def test_status_after_clear_all(self) -> None:
         """Test get_all_circuit_status after clear_all."""
         env = MockEnv()
-        manager = CircuitBreakerManager(env)
+        manager = CircuitBreakerManager(env, is_peer_suspected=lambda _peer_addr: False)
 
         await manager.get_circuit(("192.168.1.1", 8080))
         manager.clear_all()

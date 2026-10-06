@@ -26,6 +26,7 @@ from .worker_manager_demo import worker_entry
 
 _AUTH_SECRET = "sim-multiprocess-secret-00000000"
 WATCH_INTERVAL_SECONDS = 0.5
+LINK_LATENCY_SECONDS = 0.01
 PEERED_MANAGERS = [(f"sim-mgr-{name}", 9000, 9001) for name in "abc"]
 
 
@@ -58,14 +59,17 @@ def peered_manager_entry(
         host,
         tcp_port,
         udp_port,
-        _env(JOB_CLEANUP_INTERVAL=job_cleanup_interval_seconds),
+        _env(
+            JOB_CLEANUP_INTERVAL=job_cleanup_interval_seconds,
+            COMPLETED_JOB_MAX_AGE=job_retention_seconds,
+            FAILED_JOB_MAX_AGE=job_retention_seconds,
+        ),
         dc_id=datacenter_id,
         seed_managers=list(peer_tcp_addresses),
         manager_udp_peers=list(peer_udp_addresses),
         wal_data_dir=Path(f"/sim/{host}-{tcp_port}/ledger"),
         **context.sim_kwargs(),
     )
-    manager._config.job_retention_seconds = job_retention_seconds
     log: list = []
     context.set_result(log)
 
@@ -82,6 +86,18 @@ def peered_manager_entry(
                 "replica-events": sum(
                     len(manager._ledger_replica.history(job_id))
                     for job_id in manager._ledger_replica.states()
+                ),
+                # The dispatcher's per-job state: queue entries and dispatch
+                # loops (built at start, so absent before it).
+                "dispatcher-pending": (
+                    len(manager._workflow_dispatcher._pending)
+                    if manager._workflow_dispatcher is not None
+                    else 0
+                ),
+                "dispatch-loops": (
+                    len(manager._workflow_dispatcher._job_dispatch_tasks)
+                    if manager._workflow_dispatcher is not None
+                    else 0
                 ),
             }
             if (ledger := manager._job_ledger) is not None:
@@ -118,7 +134,7 @@ def run_peered_manager_job(
     optional ``(process_id, virtual_time)`` SIGKILL. Returns every
     child's log."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=max_virtual_time, seed=23
+        latency=LINK_LATENCY_SECONDS, max_virtual_time=max_virtual_time, seed=23
     )
     for host, tcp_port, udp_port in PEERED_MANAGERS:
         coordinator.add_process(

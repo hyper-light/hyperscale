@@ -21,10 +21,16 @@ from hyperscale.distributed.reliability.overload import (
     OverloadState,
 )
 from hyperscale.distributed.reliability.load_shedding import (
-    DEFAULT_MESSAGE_PRIORITIES,
     LoadShedder,
     LoadShedderConfig,
     RequestPriority,
+    classify_handler_to_priority,
+)
+from hyperscale.distributed.reliability.message_class import (
+    CONTROL_HANDLERS,
+    DATA_HANDLERS,
+    DISPATCH_HANDLERS,
+    TELEMETRY_HANDLERS,
 )
 
 
@@ -507,67 +513,34 @@ class TestBaselineAndReset:
 class TestLoadShedderPriorities:
     """Tests for LoadShedder priority classification."""
 
-    def test_critical_messages_classified_correctly(self):
-        """Critical messages get CRITICAL priority."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
+    def test_control_handlers_classified_critical(self):
+        """Every CONTROL handler gets CRITICAL priority."""
+        for handler_name in sorted(CONTROL_HANDLERS):
+            priority = classify_handler_to_priority(handler_name)
+            assert priority == RequestPriority.CRITICAL, f"{handler_name} should be CRITICAL"
 
-        critical_messages = ["Ping", "Ack", "JobCancelRequest", "Heartbeat", "HealthCheck"]
+    def test_dispatch_handlers_classified_high(self):
+        """Every DISPATCH handler gets HIGH priority."""
+        for handler_name in sorted(DISPATCH_HANDLERS):
+            priority = classify_handler_to_priority(handler_name)
+            assert priority == RequestPriority.HIGH, f"{handler_name} should be HIGH"
 
-        for message in critical_messages:
-            priority = shedder.classify_request(message)
-            assert priority == RequestPriority.CRITICAL, f"{message} should be CRITICAL"
+    def test_data_handlers_classified_normal(self):
+        """Every DATA handler gets NORMAL priority."""
+        for handler_name in sorted(DATA_HANDLERS):
+            priority = classify_handler_to_priority(handler_name)
+            assert priority == RequestPriority.NORMAL, f"{handler_name} should be NORMAL"
 
-    def test_high_messages_classified_correctly(self):
-        """High priority messages get HIGH priority."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
+    def test_telemetry_handlers_classified_low(self):
+        """Every TELEMETRY handler gets LOW priority."""
+        for handler_name in sorted(TELEMETRY_HANDLERS):
+            priority = classify_handler_to_priority(handler_name)
+            assert priority == RequestPriority.LOW, f"{handler_name} should be LOW"
 
-        high_messages = ["SubmitJob", "WorkflowDispatch", "StateSync"]
-
-        for message in high_messages:
-            priority = shedder.classify_request(message)
-            assert priority == RequestPriority.HIGH, f"{message} should be HIGH"
-
-    def test_normal_messages_classified_correctly(self):
-        """Normal priority messages get NORMAL priority."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        normal_messages = ["JobProgress", "StatsUpdate", "StatsQuery"]
-
-        for message in normal_messages:
-            priority = shedder.classify_request(message)
-            assert priority == RequestPriority.NORMAL, f"{message} should be NORMAL"
-
-    def test_low_messages_classified_correctly(self):
-        """Low priority messages get LOW priority."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        low_messages = ["DetailedStatsRequest", "DebugRequest", "DiagnosticsRequest"]
-
-        for message in low_messages:
-            priority = shedder.classify_request(message)
-            assert priority == RequestPriority.LOW, f"{message} should be LOW"
-
-    def test_unknown_message_defaults_to_normal(self):
-        """Unknown message types default to NORMAL priority."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        priority = shedder.classify_request("UnknownMessageType")
+    def test_unknown_handler_defaults_to_normal(self):
+        """Unknown handler names default to NORMAL priority."""
+        priority = classify_handler_to_priority("not_a_real_handler")
         assert priority == RequestPriority.NORMAL
-
-    def test_register_custom_priority(self):
-        """Can register custom priority for message types."""
-        detector = HybridOverloadDetector()
-        shedder = LoadShedder(detector)
-
-        shedder.register_message_priority("CustomMessage", RequestPriority.CRITICAL)
-
-        priority = shedder.classify_request("CustomMessage")
-        assert priority == RequestPriority.CRITICAL
 
 
 # =============================================================================
@@ -584,8 +557,9 @@ class TestLoadSheddingDecisions:
         shedder = LoadShedder(detector)
 
         # No latency recorded = healthy
-        for message_type in DEFAULT_MESSAGE_PRIORITIES.keys():
-            assert not shedder.should_shed(message_type)
+        all_handler_names = CONTROL_HANDLERS | DISPATCH_HANDLERS | DATA_HANDLERS | TELEMETRY_HANDLERS
+        for handler_name in sorted(all_handler_names):
+            assert not shedder.should_shed_handler(handler_name)
 
     def test_busy_sheds_only_low(self):
         """Busy state sheds only LOW priority."""
@@ -601,13 +575,13 @@ class TestLoadSheddingDecisions:
         detector.record_latency(75.0)
 
         # LOW should be shed
-        assert shedder.should_shed("DetailedStatsRequest")  # LOW
-        assert shedder.should_shed("DebugRequest")  # LOW
+        assert shedder.should_shed_handler("cluster_status")  # LOW
+        assert shedder.should_shed_handler("cluster_metrics")  # LOW
 
         # Others should not be shed
-        assert not shedder.should_shed("StatsUpdate")  # NORMAL
-        assert not shedder.should_shed("SubmitJob")  # HIGH
-        assert not shedder.should_shed("Ping")  # CRITICAL
+        assert not shedder.should_shed_handler("workflow_progress")  # NORMAL
+        assert not shedder.should_shed_handler("job_submission")  # HIGH
+        assert not shedder.should_shed_handler("ping")  # CRITICAL
 
     def test_stressed_sheds_normal_and_low(self):
         """Stressed state sheds NORMAL and LOW priority."""
@@ -623,12 +597,12 @@ class TestLoadSheddingDecisions:
         detector.record_latency(150.0)
 
         # LOW and NORMAL should be shed
-        assert shedder.should_shed("DetailedStatsRequest")  # LOW
-        assert shedder.should_shed("StatsUpdate")  # NORMAL
+        assert shedder.should_shed_handler("cluster_status")  # LOW
+        assert shedder.should_shed_handler("workflow_progress")  # NORMAL
 
         # HIGH and CRITICAL should not be shed
-        assert not shedder.should_shed("SubmitJob")  # HIGH
-        assert not shedder.should_shed("Ping")  # CRITICAL
+        assert not shedder.should_shed_handler("job_submission")  # HIGH
+        assert not shedder.should_shed_handler("ping")  # CRITICAL
 
     def test_overloaded_sheds_all_except_critical(self):
         """Overloaded state sheds all except CRITICAL."""
@@ -644,14 +618,14 @@ class TestLoadSheddingDecisions:
         detector.record_latency(300.0)
 
         # LOW, NORMAL, HIGH should be shed
-        assert shedder.should_shed("DetailedStatsRequest")  # LOW
-        assert shedder.should_shed("StatsUpdate")  # NORMAL
-        assert shedder.should_shed("SubmitJob")  # HIGH
+        assert shedder.should_shed_handler("cluster_status")  # LOW
+        assert shedder.should_shed_handler("workflow_progress")  # NORMAL
+        assert shedder.should_shed_handler("job_submission")  # HIGH
 
         # CRITICAL should not be shed
-        assert not shedder.should_shed("Ping")  # CRITICAL
-        assert not shedder.should_shed("JobCancelRequest")  # CRITICAL
-        assert not shedder.should_shed("Heartbeat")  # CRITICAL
+        assert not shedder.should_shed_handler("ping")  # CRITICAL
+        assert not shedder.should_shed_handler("cancel_job")  # CRITICAL
+        assert not shedder.should_shed_handler("raft_append_entries")  # CRITICAL
 
     def test_should_shed_by_priority_directly(self):
         """should_shed_priority() works correctly."""
@@ -687,7 +661,7 @@ class TestLoadShedderMetrics:
         shedder = LoadShedder(detector)
 
         for _ in range(10):
-            shedder.should_shed("Ping")
+            shedder.should_shed_handler("ping")
 
         metrics = shedder.get_metrics()
         assert metrics["total_requests"] == 10
@@ -707,11 +681,11 @@ class TestLoadShedderMetrics:
 
         # 5 HIGH requests (will be shed)
         for _ in range(5):
-            shedder.should_shed("SubmitJob")
+            shedder.should_shed_handler("job_submission")
 
         # 3 CRITICAL requests (won't be shed)
         for _ in range(3):
-            shedder.should_shed("Ping")
+            shedder.should_shed_handler("ping")
 
         metrics = shedder.get_metrics()
         assert metrics["total_requests"] == 8
@@ -733,11 +707,11 @@ class TestLoadShedderMetrics:
 
         # Shed some of each (except CRITICAL)
         for _ in range(3):
-            shedder.should_shed("DetailedStatsRequest")  # LOW
+            shedder.should_shed_handler("cluster_status")  # LOW
         for _ in range(2):
-            shedder.should_shed("StatsUpdate")  # NORMAL
+            shedder.should_shed_handler("workflow_progress")  # NORMAL
         for _ in range(4):
-            shedder.should_shed("SubmitJob")  # HIGH
+            shedder.should_shed_handler("job_submission")  # HIGH
 
         metrics = shedder.get_metrics()
         assert metrics["shed_by_priority"]["LOW"] == 3
@@ -758,7 +732,7 @@ class TestLoadShedderMetrics:
         detector.record_latency(300.0)
 
         for _ in range(10):
-            shedder.should_shed("SubmitJob")
+            shedder.should_shed_handler("job_submission")
 
         shedder.reset_metrics()
 
@@ -925,7 +899,7 @@ class TestCustomConfiguration:
         detector.record_latency(75.0)
 
         # HIGH should be shed even in BUSY
-        assert shedder.should_shed("SubmitJob")  # HIGH
+        assert shedder.should_shed_handler("job_submission")  # HIGH
 
 
 class TestStateOrdering:

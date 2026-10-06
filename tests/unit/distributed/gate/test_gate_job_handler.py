@@ -12,16 +12,29 @@ Tests job submission, status queries, and progress updates including:
 import asyncio
 import pytest
 import inspect
+import subprocess
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from enum import Enum
 
+import cloudpickle
+
+from hyperscale.core.graph.workflow import Workflow
+from hyperscale.core.hooks import step
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.gate.handlers.tcp_job import GateJobHandler
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
+from hyperscale.distributed.protocol.transient_errors import is_transient_rejection
+from hyperscale.distributed.idempotency.gate_cache import GateIdempotencyCache
+from hyperscale.distributed.idempotency.idempotency_config import IdempotencyConfig
+from hyperscale.distributed.idempotency.idempotency_key import IdempotencyKey
+from hyperscale.distributed.models import JobStatusQuery
 from hyperscale.distributed.models import (
+    JobAck,
     JobStatus,
     JobSubmission,
     JobProgress,
@@ -30,6 +43,76 @@ from hyperscale.distributed.models import (
 
 # The gate's configured TCP timeouts, as a default Env gives them.
 GATE_SETTINGS = Env()
+
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+
+
+class Checkout(Workflow):
+    vus = 1
+
+    @step()
+    async def check_out(self) -> dict:
+        return {}
+
+
+class LargeCheckout(Workflow):
+    vus = 1
+    # About a megabyte of workflow state travels with the submission.
+    catalog = "x" * 1_000_000
+
+    @step()
+    async def check_out(self) -> dict:
+        return {}
+
+
+# A job's workflows as a client submits them: (id, dependencies, workflow).
+WORKFLOWS = cloudpickle.dumps([("wf-1", [], Checkout())])
+
+
+class LoginStep(Workflow):
+    vus = 1
+    duration = "20s"
+
+    @step()
+    async def log_in(self) -> dict:
+        return {}
+
+
+class BrowseStep(Workflow):
+    vus = 1
+    duration = "20s"
+
+    @step()
+    async def browse(self) -> dict:
+        return {}
+
+
+class SearchStep(Workflow):
+    vus = 1
+    duration = "30s"
+
+    @step()
+    async def search(self) -> dict:
+        return {}
+
+
+# BrowseStep runs after LoginStep; SearchStep alongside both. Each
+# workflow's workers observe its duration times the default multiplier.
+CHAIN_WORKFLOWS = cloudpickle.dumps(
+    [
+        ("wf-login", [], LoginStep()),
+        ("wf-browse", ["LoginStep"], BrowseStep()),
+        ("wf-search", [], SearchStep()),
+    ]
+)
+CHAIN_BUDGET_SECONDS = 40.0 * GATE_SETTINGS.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER
+
+
+class BlockedModulePayload:
+    """Unpickled by a plain unpickler, it runs ``subprocess.getoutput``."""
+
+    def __reduce__(self):
+        return (subprocess.getoutput, ("true",))
 
 
 # =============================================================================
@@ -224,6 +307,17 @@ def make_recording_dispatch(job_manager):
     return dispatch
 
 
+def answering(gather_status):
+    """A gate's status answering over a gather stub: the gathered status,
+    or no answer when the gate holds no such job."""
+
+    async def answer_status_query(query: JobStatusQuery) -> bytes:
+        status = await gather_status(query.job_id)
+        return status.dump() if status is not None else b""
+
+    return answer_status_query
+
+
 def create_mock_handler(
     state: GateRuntimeState = None,
     rate_limit_allowed: bool = True,
@@ -232,10 +326,15 @@ def create_mock_handler(
     has_quorum: bool = True,
     circuit_state: MockCircuitState = MockCircuitState.CLOSED,
     select_dcs: list[str] = None,
+    cluster_formed: Callable[[], bool] = lambda: True,
+    cluster_read_only: Callable[[], bool] = lambda: False,
+    job_manager: "MockGateJobManager | None" = None,
+    job_lease_manager: MagicMock | None = None,
+    idempotency_cache: GateIdempotencyCache[bytes] | None = None,
 ) -> GateJobHandler:
     """Create a mock handler with configurable behavior."""
     if state is None:
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
     if select_dcs is None:
         select_dcs = ["dc-east", "dc-west"]
 
@@ -248,12 +347,14 @@ def create_mock_handler(
         state=state,
         logger=MockLogger(),
         task_runner=MockTaskRunner(),
-        job_manager=MockGateJobManager(),
+        job_manager=job_manager if job_manager is not None else MockGateJobManager(),
         job_leadership_tracker=MockJobLeadershipTracker(),
         quorum_circuit=MockQuorumCircuit(circuit_state=circuit_state),
         load_shedder=MockLoadShedder(),
-        job_lease_manager=make_lease_manager(),
-        idempotency_cache=None,
+        job_lease_manager=(
+            job_lease_manager if job_lease_manager is not None else make_lease_manager()
+        ),
+        idempotency_cache=idempotency_cache,
         send_tcp=AsyncMock(),
         replication_coordinator=make_replication_coordinator(),
         get_active_peer_addrs=lambda: [],
@@ -265,11 +366,11 @@ def create_mock_handler(
         should_shed_request=lambda req_type: should_shed,
         has_quorum_available=lambda: has_quorum,
         quorum_size=lambda: 3,
-        select_datacenters_with_fallback=lambda count, dcs, job_id: (
+        select_datacenters_with_fallback=AsyncMock(return_value=(
             select_dcs,
             [],
             "healthy",
-        ),
+        )),
         get_healthy_gates=lambda: [MockGateInfo()],
         broadcast_job_leadership=AsyncMock(),
         dispatch_job_to_datacenters=AsyncMock(),
@@ -277,7 +378,157 @@ def create_mock_handler(
         record_request_latency=lambda latency: None,
         record_dc_job_stats=AsyncMock(),
         handle_update_by_tier=lambda *args: None,
+        default_timeout_multiplier=GATE_SETTINGS.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+        current_raft_members=lambda: frozenset({"gate-001"}),
+        cluster_formed=cluster_formed,
+        cluster_read_only=cluster_read_only,
+        overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+        replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
     )
+
+
+# =============================================================================
+# handle_submission before the gate tier's membership forms (AD-52)
+# =============================================================================
+
+
+class TestDuplicateSubmissions:
+    """AD-40: a submission whose idempotency key was already decided gets
+    the original decision, for the original job, marked as a duplicate's
+    -- even when the retry carried a fresh job id."""
+
+    @pytest.mark.asyncio
+    async def test_a_retry_with_a_decided_key_is_answered_for_the_original_job(self):
+        handler = create_mock_handler(
+            idempotency_cache=GateIdempotencyCache(IdempotencyConfig(), task_runner=None, logger=None),
+        )
+        idempotency_key = str(IdempotencyKey(client_id="client-1", sequence=1, nonce="nonce-1"))
+
+        first = JobAck.load(
+            await handler.handle_submission(
+                addr=("10.0.0.1", 8000),
+                data=JobSubmission(
+                    job_id="job-original",
+                    workflows=WORKFLOWS,
+                    vus=10,
+                    timeout_seconds=60.0,
+                    datacenter_count=2,
+                    idempotency_key=idempotency_key,
+                ).dump(),
+                active_gate_peer_count=2,
+            )
+        )
+        retry = JobAck.load(
+            await handler.handle_submission(
+                addr=("10.0.0.1", 8000),
+                data=JobSubmission(
+                    job_id="job-retried-under-a-fresh-id",
+                    workflows=WORKFLOWS,
+                    vus=10,
+                    timeout_seconds=60.0,
+                    datacenter_count=2,
+                    idempotency_key=idempotency_key,
+                ).dump(),
+                active_gate_peer_count=2,
+            )
+        )
+
+        assert first.accepted and not first.was_duplicate
+        assert retry.was_duplicate and retry.accepted == first.accepted
+        assert retry.job_id == retry.original_job_id == "job-original"
+
+
+class TestHandleSubmissionBeforeMembershipForms:
+    """A job's Raft group is founded with the gate tier's committed
+    members: before the membership group forms there are none, so the job
+    is refused -- retryably, holding nothing -- and accepted once it has."""
+
+    @pytest.mark.asyncio
+    async def test_a_job_waits_for_the_gate_tiers_membership(self):
+        membership = {"formed": False}
+        job_manager = MockGateJobManager()
+        job_lease_manager = make_lease_manager()
+        handler = create_mock_handler(
+            cluster_formed=lambda: membership["formed"],
+            job_manager=job_manager,
+            job_lease_manager=job_lease_manager,
+        )
+        submission = JobSubmission(
+            job_id="job-123",
+            workflows=WORKFLOWS,
+            vus=10,
+            timeout_seconds=60.0,
+            datacenter_count=2,
+        )
+
+        refused = JobAck.load(
+            await handler.handle_submission(
+                addr=("10.0.0.1", 8000), data=submission.dump(), active_gate_peer_count=2
+            )
+        )
+        held_before_formation = (job_lease_manager.acquire.await_count, job_manager.has_job("job-123"))
+
+        membership["formed"] = True
+        accepted = JobAck.load(
+            await handler.handle_submission(
+                addr=("10.0.0.1", 8000), data=submission.dump(), active_gate_peer_count=2
+            )
+        )
+
+        assert (refused.accepted, refused.error) == (
+            False,
+            "Gate cluster membership not formed yet; retry",
+        )
+        # Retryable: the client backs off and submits again.
+        assert is_transient_rejection(refused.error)
+        assert held_before_formation == (0, False)
+        assert accepted.accepted, accepted.error
+
+
+class TestHandleSubmissionWhileReadOnly:
+    """AD-52 section 13: an operator's read-only mode refuses job
+    submissions -- not retryably: the client hears it at once -- and holds
+    nothing; open again, the same job is accepted."""
+
+    @pytest.mark.asyncio
+    async def test_a_read_only_cluster_refuses_jobs(self):
+        mode = {"read_only": True}
+        job_manager = MockGateJobManager()
+        job_lease_manager = make_lease_manager()
+        handler = create_mock_handler(
+            cluster_read_only=lambda: mode["read_only"],
+            job_manager=job_manager,
+            job_lease_manager=job_lease_manager,
+        )
+        submission = JobSubmission(
+            job_id="job-123",
+            workflows=WORKFLOWS,
+            vus=10,
+            timeout_seconds=60.0,
+            datacenter_count=2,
+        )
+
+        refused = JobAck.load(
+            await handler.handle_submission(
+                addr=("10.0.0.1", 8000), data=submission.dump(), active_gate_peer_count=2
+            )
+        )
+        held_while_read_only = (job_lease_manager.acquire.await_count, job_manager.has_job("job-123"))
+
+        mode["read_only"] = False
+        accepted = JobAck.load(
+            await handler.handle_submission(
+                addr=("10.0.0.1", 8000), data=submission.dump(), active_gate_peer_count=2
+            )
+        )
+
+        assert (refused.accepted, refused.error) == (
+            False,
+            "Gate cluster is read-only: job submissions are refused",
+        )
+        assert not is_transient_rejection(refused.error)
+        assert held_while_read_only == (0, False)
+        assert accepted.accepted, accepted.error
 
 
 # =============================================================================
@@ -295,7 +546,7 @@ class TestHandleSubmissionHappyPath:
 
         submission = JobSubmission(
             job_id="job-123",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=2,
@@ -317,7 +568,7 @@ class TestHandleSubmissionHappyPath:
         handler = GateJobHandler(
             clock=RealClock(),
             client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
-            state=GateRuntimeState(),
+            state=GateRuntimeState(forward_throughput_interval_start=0.0),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
@@ -337,11 +588,11 @@ class TestHandleSubmissionHappyPath:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+            select_datacenters_with_fallback=AsyncMock(return_value=(
                 ["dc-1"],
                 [],
                 "healthy",
-            ),
+            )),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=make_recording_dispatch(job_manager),
@@ -349,11 +600,17 @@ class TestHandleSubmissionHappyPath:
             record_request_latency=lambda latency: None,
             record_dc_job_stats=AsyncMock(),
             handle_update_by_tier=lambda *args: None,
+            default_timeout_multiplier=GATE_SETTINGS.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            current_raft_members=lambda: frozenset({"gate-001"}),
+            cluster_formed=lambda: True,
+            cluster_read_only=lambda: False,
+            overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+            replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
 
         submission = JobSubmission(
             job_id="job-456",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=1,
@@ -379,7 +636,7 @@ class TestHandleSubmissionHappyPath:
         handler = GateJobHandler(
             clock=RealClock(),
             client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
-            state=GateRuntimeState(),
+            state=GateRuntimeState(forward_throughput_interval_start=0.0),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
@@ -399,11 +656,11 @@ class TestHandleSubmissionHappyPath:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+            select_datacenters_with_fallback=AsyncMock(return_value=(
                 ["dc-east", "dc-west"],
                 [],
                 "healthy",
-            ),
+            )),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=make_recording_dispatch(job_manager),
@@ -411,11 +668,17 @@ class TestHandleSubmissionHappyPath:
             record_request_latency=lambda latency: None,
             record_dc_job_stats=AsyncMock(),
             handle_update_by_tier=lambda *args: None,
+            default_timeout_multiplier=GATE_SETTINGS.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            current_raft_members=lambda: frozenset({"gate-001"}),
+            cluster_formed=lambda: True,
+            cluster_read_only=lambda: False,
+            overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+            replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
 
         submission = JobSubmission(
             job_id="job-789",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=2,
@@ -433,6 +696,92 @@ class TestHandleSubmissionHappyPath:
         assert job_manager.target_dcs["job-789"] == {"dc-east", "dc-west"}
 
 
+class TestHandleSubmissionReadsWorkflows:
+    """A gate reads a job's workflows as its managers do, before admitting
+    it: through the restricted unpickler (a plain one ran whatever a
+    payload named, and a payload it could not read was admitted anyway),
+    in dependency order, and -- submitted without a timeout of its own --
+    for the budget of its longest workflow chain, which every gate times
+    it by and its managers are given (taken as zero, it timed out at the
+    first check)."""
+
+    @pytest.mark.asyncio
+    async def test_a_job_without_a_timeout_is_given_its_workflow_chain_budget(self):
+        handler = create_mock_handler()
+        dispatched: list[JobSubmission] = []
+
+        async def record_dispatch(submission, target_dcs):
+            dispatched.append(submission)
+
+        handler._dispatch_job_to_datacenters = record_dispatch
+
+        ack = JobAck.load(
+            await handler.handle_submission(
+                addr=("10.0.0.1", 8000),
+                data=JobSubmission(
+                    job_id="job-chain",
+                    workflows=CHAIN_WORKFLOWS,
+                    vus=1,
+                    timeout_seconds=0.0,
+                ).dump(),
+                active_gate_peer_count=0,
+            )
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        [replicated] = [
+            JobSubmission.load(call.kwargs["replica"].submission_payload)
+            for call in handler._replication_coordinator.replicate_with_quorum.await_args_list
+        ]
+        assert ack.accepted
+        assert [submission.timeout_seconds for submission in dispatched] == [CHAIN_BUDGET_SECONDS]
+        assert replicated.timeout_seconds == CHAIN_BUDGET_SECONDS
+        # The workers' own deadlines still come from each workflow.
+        assert not replicated.timeout_seconds_explicit
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("workflows", "reason"),
+        [
+            (b"not a pickle", "Invalid workflows: "),
+            (
+                cloudpickle.dumps([("wf-1", [], BlockedModulePayload())]),
+                "Invalid workflows: SecurityError",
+            ),
+            (
+                cloudpickle.dumps(
+                    [
+                        ("wf-login", ["BrowseStep"], LoginStep()),
+                        ("wf-browse", ["LoginStep"], BrowseStep()),
+                    ]
+                ),
+                "Invalid workflows: ValueError: workflow dependencies form a cycle",
+            ),
+        ],
+        ids=["unreadable", "blocked-module", "dependency-cycle"],
+    )
+    async def test_workflows_no_manager_could_run_are_refused(self, workflows, reason):
+        handler = create_mock_handler()
+
+        ack = JobAck.load(
+            await handler.handle_submission(
+                addr=("10.0.0.1", 8000),
+                data=JobSubmission(
+                    job_id="job-unrunnable",
+                    workflows=workflows,
+                    vus=1,
+                    timeout_seconds=60.0,
+                ).dump(),
+                active_gate_peer_count=0,
+            )
+        )
+
+        assert not ack.accepted
+        assert ack.error.startswith(reason)
+        handler._replication_coordinator.replicate_with_quorum.assert_not_awaited()
+
+
 # =============================================================================
 # handle_submission Negative Path Tests (AD-24 Rate Limiting)
 # =============================================================================
@@ -448,7 +797,7 @@ class TestHandleSubmissionRateLimiting:
 
         submission = JobSubmission(
             job_id="job-123",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=2,
@@ -476,7 +825,7 @@ class TestHandleSubmissionRateLimiting:
         handler = GateJobHandler(
             clock=RealClock(),
             client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
-            state=GateRuntimeState(),
+            state=GateRuntimeState(forward_throughput_interval_start=0.0),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=MockGateJobManager(),
@@ -496,11 +845,11 @@ class TestHandleSubmissionRateLimiting:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+            select_datacenters_with_fallback=AsyncMock(return_value=(
                 ["dc-1"],
                 [],
                 "healthy",
-            ),
+            )),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -508,11 +857,17 @@ class TestHandleSubmissionRateLimiting:
             record_request_latency=lambda latency: None,
             record_dc_job_stats=AsyncMock(),
             handle_update_by_tier=lambda *args: None,
+            default_timeout_multiplier=GATE_SETTINGS.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            current_raft_members=lambda: frozenset({"gate-001"}),
+            cluster_formed=lambda: True,
+            cluster_read_only=lambda: False,
+            overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+            replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
 
         submission = JobSubmission(
             job_id="job-123",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=1,
@@ -552,7 +907,7 @@ class TestHandleSubmissionLoadShedding:
 
         submission = JobSubmission(
             job_id="job-123",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=2,
@@ -564,8 +919,11 @@ class TestHandleSubmissionLoadShedding:
             active_gate_peer_count=2,
         )
 
-        assert isinstance(result, bytes)
-        # Should return rejection JobAck
+        # Refused, with when to retry: the gate's overload verdict cannot
+        # change before its next sample.
+        ack = JobAck.load(result)
+        assert not ack.accepted
+        assert ack.retry_after_seconds == GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS
 
 
 # =============================================================================
@@ -583,7 +941,7 @@ class TestHandleSubmissionCircuitBreaker:
 
         submission = JobSubmission(
             job_id="job-123",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=2,
@@ -613,7 +971,7 @@ class TestHandleSubmissionQuorum:
 
         submission = JobSubmission(
             job_id="job-123",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=2,
@@ -634,7 +992,7 @@ class TestHandleSubmissionQuorum:
 
         submission = JobSubmission(
             job_id="job-123",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=2,
@@ -658,13 +1016,56 @@ class TestHandleSubmissionDatacenterSelection:
     """Tests for handle_submission datacenter selection."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("datacenter_count", "datacenters"),
+        [(0, []), (-1, []), (3, ["dc-east", "dc-west"]), (2, ["dc-east", "dc-east"])],
+    )
+    async def test_rejects_a_job_that_cannot_be_placed_as_asked(
+        self,
+        datacenter_count: int,
+        datacenters: list[str],
+    ):
+        """A job runs in at least one datacenter and in no more than it
+        lists; anything else is refused before any datacenter is chosen
+        (a non-positive count sliced the routing order from its end)."""
+        selections: list[tuple[int, list[str] | None, str]] = []
+        handler = create_mock_handler()
+
+        async def select_datacenters_with_fallback(count, listed, job_id):
+            selections.append((count, listed, job_id))
+            return (["dc-east"], [], "healthy")
+
+        handler._select_datacenters_with_fallback = select_datacenters_with_fallback
+
+        submission = JobSubmission(
+            job_id="job-123",
+            workflows=WORKFLOWS,
+            vus=10,
+            timeout_seconds=60.0,
+            datacenter_count=datacenter_count,
+            datacenters=datacenters,
+        )
+
+        ack = JobAck.load(
+            await handler.handle_submission(
+                addr=("10.0.0.1", 8000),
+                data=submission.dump(),
+                active_gate_peer_count=0,
+            )
+        )
+
+        assert ack.accepted is False
+        assert ack.error.startswith("Unplaceable job")
+        assert selections == []
+
+    @pytest.mark.asyncio
     async def test_rejects_when_no_dcs_available(self):
         """Rejects submission when no datacenters available."""
         handler = create_mock_handler(select_dcs=[])
 
         submission = JobSubmission(
             job_id="job-123",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=2,
@@ -700,13 +1101,21 @@ class TestHandleStatusRequestHappyPath:
                 timestamp=1234567890.0,
             )
 
+        queries: list[JobStatusQuery] = []
+
+        async def answer_status_query(query: JobStatusQuery) -> bytes:
+            queries.append(query)
+            return await answering(mock_gather_status)(query)
+
         result = await handler.handle_status_request(
             addr=("10.0.0.1", 8000),
             data=b"job-123",
-            gather_job_status=mock_gather_status,
+            answer_status_query=answer_status_query,
         )
 
-        assert isinstance(result, bytes)
+        # A bare job id (an older client) is an EVENTUAL read.
+        assert [(query.job_id, query.consistency) for query in queries] == [("job-123", "eventual")]
+        assert GlobalJobStatus.load(result).job_id == "job-123"
 
 
 class TestHandleStatusRequestNegativePath:
@@ -728,7 +1137,7 @@ class TestHandleStatusRequestNegativePath:
         result = await handler.handle_status_request(
             addr=("10.0.0.1", 8000),
             data=b"job-123",
-            gather_job_status=mock_gather_status,
+            answer_status_query=answering(mock_gather_status),
         )
 
         assert isinstance(result, bytes)
@@ -749,7 +1158,7 @@ class TestHandleStatusRequestNegativePath:
         result = await handler.handle_status_request(
             addr=("10.0.0.1", 8000),
             data=b"job-123",
-            gather_job_status=mock_gather_status,
+            answer_status_query=answering(mock_gather_status),
         )
 
         # Should return empty bytes when shedding
@@ -767,7 +1176,7 @@ class TestHandleProgressHappyPath:
     @pytest.mark.asyncio
     async def test_accepts_valid_progress(self):
         """Accepts valid progress update."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         job_manager = MockGateJobManager()
         job_manager.set_job(
             "job-123",
@@ -802,11 +1211,11 @@ class TestHandleProgressHappyPath:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+            select_datacenters_with_fallback=AsyncMock(return_value=(
                 ["dc-1"],
                 [],
                 "healthy",
-            ),
+            )),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -814,6 +1223,12 @@ class TestHandleProgressHappyPath:
             record_request_latency=lambda latency: None,
             record_dc_job_stats=AsyncMock(),
             handle_update_by_tier=lambda *args: None,
+            default_timeout_multiplier=GATE_SETTINGS.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            current_raft_members=lambda: frozenset({"gate-001"}),
+            cluster_formed=lambda: True,
+            cluster_read_only=lambda: False,
+            overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+            replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
 
         progress = JobProgress(
@@ -840,7 +1255,7 @@ class TestHandleProgressFencingTokens:
     @pytest.mark.asyncio
     async def test_rejects_stale_fence_token(self):
         """Rejects progress with stale fence token."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         job_manager = MockGateJobManager()
         job_manager.set_job(
             "job-123",
@@ -876,11 +1291,11 @@ class TestHandleProgressFencingTokens:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+            select_datacenters_with_fallback=AsyncMock(return_value=(
                 ["dc-1"],
                 [],
                 "healthy",
-            ),
+            )),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -888,6 +1303,12 @@ class TestHandleProgressFencingTokens:
             record_request_latency=lambda latency: None,
             record_dc_job_stats=AsyncMock(),
             handle_update_by_tier=lambda *args: None,
+            default_timeout_multiplier=GATE_SETTINGS.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            current_raft_members=lambda: frozenset({"gate-001"}),
+            cluster_formed=lambda: True,
+            cluster_read_only=lambda: False,
+            overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+            replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
 
         progress = JobProgress(
@@ -910,7 +1331,7 @@ class TestHandleProgressFencingTokens:
     @pytest.mark.asyncio
     async def test_updates_fence_token_on_newer(self):
         """Updates fence token when receiving newer value."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         job_manager = MockGateJobManager()
         job_manager.set_job(
             "job-123",
@@ -946,11 +1367,11 @@ class TestHandleProgressFencingTokens:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+            select_datacenters_with_fallback=AsyncMock(return_value=(
                 ["dc-1"],
                 [],
                 "healthy",
-            ),
+            )),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -958,6 +1379,12 @@ class TestHandleProgressFencingTokens:
             record_request_latency=lambda latency: None,
             record_dc_job_stats=AsyncMock(),
             handle_update_by_tier=lambda *args: None,
+            default_timeout_multiplier=GATE_SETTINGS.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            current_raft_members=lambda: frozenset({"gate-001"}),
+            cluster_formed=lambda: True,
+            cluster_read_only=lambda: False,
+            overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+            replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
 
         progress = JobProgress(
@@ -996,7 +1423,7 @@ class TestConcurrency:
             submissions.append(
                 JobSubmission(
                     job_id=f"job-{i}",
-                    workflows=b"test_workflows",
+                    workflows=WORKFLOWS,
                     vus=10,
                     timeout_seconds=60.0,
                     datacenter_count=1,
@@ -1036,7 +1463,7 @@ class TestConcurrency:
                 handler.handle_status_request(
                     addr=("10.0.0.1", 8000),
                     data=f"job-{i}".encode(),
-                    gather_job_status=mock_gather_status,
+                    answer_status_query=answering(mock_gather_status),
                 )
                 for i in range(100)
             ]
@@ -1070,7 +1497,7 @@ class TestEdgeCases:
         result = await handler.handle_status_request(
             addr=("10.0.0.1", 8000),
             data=b"",
-            gather_job_status=mock_gather_status,
+            answer_status_query=answering(mock_gather_status),
         )
 
         assert isinstance(result, bytes)
@@ -1099,7 +1526,7 @@ class TestEdgeCases:
             result = await handler.handle_status_request(
                 addr=("10.0.0.1", 8000),
                 data=job_id.encode(),
-                gather_job_status=mock_gather_status,
+                answer_status_query=answering(mock_gather_status),
             )
             assert isinstance(result, bytes)
 
@@ -1110,7 +1537,7 @@ class TestEdgeCases:
 
         submission = JobSubmission(
             job_id="job-large",
-            workflows=b"x" * 1_000_000,  # 1MB of data
+            workflows=cloudpickle.dumps([("wf-1", [], LargeCheckout())]),
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=1,
@@ -1131,7 +1558,7 @@ class TestEdgeCases:
 
         submission = JobSubmission(
             job_id="job-zero-vus",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=0,
             timeout_seconds=60.0,
             datacenter_count=1,
@@ -1152,7 +1579,7 @@ class TestEdgeCases:
 
         submission = JobSubmission(
             job_id="job-negative-timeout",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=-1.0,
             datacenter_count=1,
@@ -1208,7 +1635,7 @@ class TestFailureModes:
         handler = GateJobHandler(
             clock=RealClock(),
             client_push_timeout_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
-            state=GateRuntimeState(),
+            state=GateRuntimeState(forward_throughput_interval_start=0.0),
             logger=MockLogger(),
             task_runner=MockTaskRunner(),
             job_manager=MockGateJobManager(),
@@ -1228,11 +1655,11 @@ class TestFailureModes:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+            select_datacenters_with_fallback=AsyncMock(return_value=(
                 ["dc-1"],
                 [],
                 "healthy",
-            ),
+            )),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=broadcast_mock,
             dispatch_job_to_datacenters=AsyncMock(),
@@ -1240,11 +1667,17 @@ class TestFailureModes:
             record_request_latency=lambda latency: None,
             record_dc_job_stats=AsyncMock(),
             handle_update_by_tier=lambda *args: None,
+            default_timeout_multiplier=GATE_SETTINGS.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+            current_raft_members=lambda: frozenset({"gate-001"}),
+            cluster_formed=lambda: True,
+            cluster_read_only=lambda: False,
+            overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+            replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
 
         submission = JobSubmission(
             job_id="job-broadcast-fail",
-            workflows=b"test_workflows",
+            workflows=WORKFLOWS,
             vus=10,
             timeout_seconds=60.0,
             datacenter_count=1,

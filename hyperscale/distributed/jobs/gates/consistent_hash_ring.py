@@ -12,6 +12,12 @@ Key properties:
   where K is total jobs and N is number of gates
 
 Uses virtual nodes (replicas) to improve distribution uniformity.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
@@ -19,15 +25,7 @@ import bisect
 import hashlib
 from dataclasses import dataclass
 
-
-@dataclass(slots=True)
-class HashRingNode:
-    """A node in the consistent hash ring."""
-
-    node_id: str
-    tcp_host: str
-    tcp_port: int
-    weight: int = 1
+from .hash_ring_node import HashRingNode
 
 
 class ConsistentHashRing:
@@ -246,3 +244,10 @@ class ConsistentHashRing:
     def _hash(self, key: str) -> int:
         digest = hashlib.md5(key.encode("utf-8"), usedforsecurity=False).digest()
         return int.from_bytes(digest[:4], byteorder="big")
+
+_REHOMED = (
+    HashRingNode,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

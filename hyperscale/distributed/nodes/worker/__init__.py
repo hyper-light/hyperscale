@@ -14,26 +14,16 @@ root refactoring in Phase 15.2.7.
 # Also export the new modular components
 from .config import WorkerConfig, create_worker_config_from_env
 from .state import WorkerState
-from .models import (
-    ManagerPeerState,
-    WorkflowRuntimeState,
-    CancelState,
-    ExecutionMetrics,
-    CompletionTimeTracker,
-    TransferMetrics,
-    PendingTransferState,
-)
+from .models import WorkflowRuntimeState
 from .handlers import (
     WorkflowDispatchHandler,
     WorkflowCancelHandler,
     StateSyncHandler,
     JobLeaderTransferHandler,
     WorkflowStatusQueryHandler,
-    WorkflowProgressHandler,
 )
 
 # Core modules (Phase 15.2.6)
-from .execution import WorkerExecutor
 from .registry import WorkerRegistry
 from .sync import WorkerStateSync
 from .cancellation import WorkerCancellationHandler
@@ -60,22 +50,14 @@ __all__ = [
     # State
     "WorkerState",
     # Models
-    "ManagerPeerState",
     "WorkflowRuntimeState",
-    "CancelState",
-    "ExecutionMetrics",
-    "CompletionTimeTracker",
-    "TransferMetrics",
-    "PendingTransferState",
     # Handlers
     "WorkflowDispatchHandler",
     "WorkflowCancelHandler",
     "StateSyncHandler",
     "JobLeaderTransferHandler",
     "WorkflowStatusQueryHandler",
-    "WorkflowProgressHandler",
     # Core modules
-    "WorkerExecutor",
     "WorkerRegistry",
     "WorkerStateSync",
     "WorkerCancellationHandler",

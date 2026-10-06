@@ -56,7 +56,7 @@ async def broadcast_from_leader() -> bytes:
 
     task_runner = RunNow()
     coordinator = GateLeadershipCoordinator(
-        state=GateRuntimeState(),
+        state=GateRuntimeState(forward_throughput_interval_start=0.0),
         logger=SimpleNamespace(log=AsyncMock()),
         task_runner=task_runner,
         leadership_tracker=leader_tracker,
@@ -79,7 +79,7 @@ def make_peer_gate(tracker: JobLeadershipTracker) -> GateServer:
     gate._job_leadership_tracker = tracker
     gate._orphan_job_coordinator = SimpleNamespace(clear_orphaned_job=lambda job_id: None)
     gate._task_runner = SimpleNamespace(run=lambda *args, **kwargs: None)
-    gate._udp_logger = SimpleNamespace(log=None)
+    gate._udp_logger = SimpleNamespace(log=AsyncMock())
     gate._host, gate._tcp_port = PEER_ADDR
     gate._node_id = SimpleNamespace(full="gate-b-node-id", short="gate-b")
     return gate

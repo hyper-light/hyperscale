@@ -50,6 +50,7 @@ class URL(OptimizedArg, Generic[T]):
             case (
                 RequestType.GRAPHQL
                 | RequestType.GRAPHQL_HTTP2
+                | RequestType.GRPC
                 | RequestType.HTTP
                 | RequestType.HTTP2
                 | RequestType.HTTP3

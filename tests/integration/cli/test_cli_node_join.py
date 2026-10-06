@@ -49,13 +49,12 @@ from tests.integration.cli.node_processes import (
 ENV = Env()
 JOIN_REPLY_BOUND_SECONDS = default_join_timeout_seconds(ENV)
 _MANAGER_CONFIG = create_manager_config_from_env(LOCALHOST, 1, 2, ENV)
-# The gate heartbeat loop sleeps one interval then sends with a fixed
-# 2.0s timeout (manager/server.py _gate_heartbeat_loop), so the first
+# The gate heartbeat loop sleeps one interval then sends with the short
+# TCP timeout (manager/server.py _gate_heartbeat_loop), so the first
 # heartbeat after a join lands within one interval plus that send.
-GATE_HEARTBEAT_SEND_TIMEOUT_SECONDS = 2.0
 HEARTBEAT_BOUND_SECONDS = (
-    _MANAGER_CONFIG.gate_heartbeat_interval_seconds
-    + GATE_HEARTBEAT_SEND_TIMEOUT_SECONDS
+    _MANAGER_CONFIG.heartbeat_interval_seconds
+    + _MANAGER_CONFIG.tcp_timeout_short_seconds
 )
 
 

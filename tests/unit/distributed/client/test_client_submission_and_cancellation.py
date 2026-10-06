@@ -58,10 +58,10 @@ class TestClientJobSubmitter:
 
     def setup_method(self):
         """Set up test fixtures."""
-        self.config = ClientConfig(
+        self.config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[("m1", 7000), ("m2", 7001)],
             gates=[("g1", 9000)],
         )
@@ -69,7 +69,11 @@ class TestClientJobSubmitter:
         self.logger = Mock(spec=Logger)
         self.logger.log = AsyncMock()
         self.targets = ClientTargetSelector(self.config, self.state, make_client_discovery())
-        self.tracker = ClientJobTracker(self.state, self.logger)
+        self.tracker = ClientJobTracker(
+            self.state,
+            self.logger,
+            result_drain_timeout_seconds=Env().CLIENT_RESULT_DRAIN_TIMEOUT,
+        )
         self.protocol = ClientProtocol(self.state, self.logger)
 
     @pytest.mark.asyncio
@@ -340,10 +344,10 @@ class TestClientJobSubmitter:
     @pytest.mark.asyncio
     async def test_no_targets_configured(self):
         """Test failure when no targets available."""
-        config = ClientConfig(
+        config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[],
             gates=[],
         )
@@ -439,10 +443,10 @@ class TestClientCancellationManager:
 
     def setup_method(self):
         """Set up test fixtures."""
-        self.config = ClientConfig(
+        self.config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[("m1", 7000)],
             gates=[("g1", 9000)],
         )
@@ -450,7 +454,11 @@ class TestClientCancellationManager:
         self.logger = Mock(spec=Logger)
         self.logger.log = AsyncMock()
         self.targets = ClientTargetSelector(self.config, self.state, make_client_discovery())
-        self.tracker = ClientJobTracker(self.state, self.logger)
+        self.tracker = ClientJobTracker(
+            self.state,
+            self.logger,
+            result_drain_timeout_seconds=Env().CLIENT_RESULT_DRAIN_TIMEOUT,
+        )
 
     @pytest.mark.asyncio
     async def test_happy_path_successful_cancellation(self):
@@ -475,7 +483,7 @@ class TestClientCancellationManager:
         )
 
         job_id = "cancel-job-123"
-        self.tracker.initialize_job_tracking(job_id)
+        self.tracker.initialize_job_tracking(job_id, expected_workflow_ids=frozenset())
 
         result = await manager.cancel_job(job_id, reason="User requested")
 
@@ -517,7 +525,7 @@ class TestClientCancellationManager:
         )
 
         job_id = "retry-cancel"
-        self.tracker.initialize_job_tracking(job_id)
+        self.tracker.initialize_job_tracking(job_id, expected_workflow_ids=frozenset())
 
         result = await manager.cancel_job(job_id)
 
@@ -546,7 +554,7 @@ class TestClientCancellationManager:
         )
 
         job_id = "already-cancelled"
-        self.tracker.initialize_job_tracking(job_id)
+        self.tracker.initialize_job_tracking(job_id, expected_workflow_ids=frozenset())
 
         result = await manager.cancel_job(job_id)
 
@@ -576,7 +584,7 @@ class TestClientCancellationManager:
         )
 
         job_id = "already-done"
-        self.tracker.initialize_job_tracking(job_id)
+        self.tracker.initialize_job_tracking(job_id, expected_workflow_ids=frozenset())
 
         result = await manager.cancel_job(job_id)
 
@@ -615,7 +623,7 @@ class TestClientCancellationManager:
         )
 
         job_id = "rate-cancel"
-        self.tracker.initialize_job_tracking(job_id)
+        self.tracker.initialize_job_tracking(job_id, expected_workflow_ids=frozenset())
 
         result = await manager.cancel_job(job_id)
 
@@ -644,7 +652,7 @@ class TestClientCancellationManager:
         )
 
         job_id = "fail-cancel"
-        self.tracker.initialize_job_tracking(job_id)
+        self.tracker.initialize_job_tracking(job_id, expected_workflow_ids=frozenset())
 
         with pytest.raises(RuntimeError, match="Job cancellation failed"):
             await manager.cancel_job(job_id)
@@ -666,7 +674,7 @@ class TestClientCancellationManager:
         )
 
         job_id = "wait-cancel"
-        self.tracker.initialize_job_tracking(job_id)
+        self.tracker.initialize_job_tracking(job_id, expected_workflow_ids=frozenset())
         self.state.initialize_cancellation_tracking(job_id)
 
         async def complete_cancellation():
@@ -711,10 +719,10 @@ class TestClientCancellationManager:
     @pytest.mark.asyncio
     async def test_no_targets_configured(self):
         """Test cancellation with no targets."""
-        config = ClientConfig(
+        config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[],
             gates=[],
         )
@@ -757,7 +765,7 @@ class TestClientCancellationManager:
 
         # Initialize jobs
         for i in range(10):
-            self.tracker.initialize_job_tracking(f"job-{i}")
+            self.tracker.initialize_job_tracking(f"job-{i}", expected_workflow_ids=frozenset())
 
         async def cancel_job(job_id):
             return await manager.cancel_job(job_id)

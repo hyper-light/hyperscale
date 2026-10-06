@@ -12,10 +12,10 @@ from .ftp.protocols import FTPConnection
 from .graphql import MercurySyncGraphQLConnection
 from .graphql_http2 import MercurySyncGraphQLHTTP2Connection
 from .grpc import MercurySyncGRPCConnection
+from .grpc.protocols import GRPCConnection
 from .http import MercurySyncHTTPConnection
 from .http.protocols import HTTPConnection
 from .http2 import MercurySyncHTTP2Connection
-from .http2.fast_hpack import Encoder
 from .http2.pipe import HTTP2Pipe
 from .http2.protocols import HTTP2Connection
 from .http2.settings import Settings
@@ -26,6 +26,7 @@ from .scp import MercurySyncSCPConnection
 from .scp.protocols import SCPConnection
 from .sftp import MercurySyncSFTPConnction
 from .sftp.protocols import SFTPConnection
+from .shared.concurrency_limit import ConcurrencyLimit
 from .ssh.models import ConnectionOptions
 from .smtp import MercurySyncSMTPConnection
 from .smtp.protocols import SMTPConnection
@@ -118,6 +119,46 @@ def setup_client(
         client._client_ssl_context = ctx
         client._semaphore = asyncio.Semaphore(vus)
 
+    # Before the HTTP/2 branch: gRPC subclasses the HTTP/2 client, so that
+    # branch would otherwise take every gRPC client.
+    elif isinstance(client, MercurySyncGRPCConnection):
+        client._concurrency = vus
+        client._reset_connections = reset_connections
+
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        ctx.options |= ssl.OP_NO_COMPRESSION
+
+        ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+
+        try:
+            if hasattr(ctx, "_set_npn_protocols"):
+                ctx.set_npn_protocols(["h2", "http/1.1"])
+        except NotImplementedError:
+            pass
+
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        client._client_ssl_context = ctx
+
+        client._settings = Settings(client=False)
+
+        # gRPC's connections also open cleartext HTTP/2 (insecure channels).
+        client._connections = [
+            GRPCConnection(
+                stream_id=randrange(1, 2**20 + 2, 2),
+                reset_connections=reset_connections,
+            )
+            for _ in range(vus)
+        ]
+
+        client._pipes = [HTTP2Pipe(vus) for _ in range(vus)]
+
+        client._semaphore = asyncio.Semaphore(vus)
+
     elif isinstance(
         client,
         (
@@ -130,9 +171,7 @@ def setup_client(
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
 
-        ctx.options |= (
-            ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
-        )
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
         ctx.options |= ssl.OP_NO_COMPRESSION
 
@@ -150,7 +189,6 @@ def setup_client(
 
         client._client_ssl_context = ctx
 
-        client._encoder = Encoder()
         client._settings = Settings(client=False)
         client._connections = [
             HTTP2Connection(
@@ -162,47 +200,7 @@ def setup_client(
 
         client._pipes = [HTTP2Pipe(vus) for _ in range(vus)]
 
-        client._semaphore = asyncio.Semaphore(vus)
-
-    elif isinstance(client, MercurySyncGRPCConnection):
-        client._concurrency = vus
-        client._reset_connections = reset_connections
-
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.options |= (
-            ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
-        )
-
-        ctx.options |= ssl.OP_NO_COMPRESSION
-
-        ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
-        ctx.set_alpn_protocols(["h2", "http/1.1"])
-
-        try:
-            if hasattr(ctx, "_set_npn_protocols"):
-                ctx.set_npn_protocols(["h2", "http/1.1"])
-        except NotImplementedError:
-            pass
-
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        client._client_ssl_context = ctx
-
-        client._encoder = Encoder()
-        client._settings = Settings(client=False)
-
-        client._connections = [
-            HTTP2Connection(
-                stream_id=randrange(1, 2**20 + 2, 2),
-                reset_connections=reset_connections,
-            )
-            for _ in range(vus)
-        ]
-
-        client._pipes = [HTTP2Pipe(vus) for _ in range(vus)]
-
-        client._semaphore = asyncio.Semaphore(vus)
+        client._semaphore = ConcurrencyLimit(vus)
 
     elif isinstance(client, MercurySyncHTTP3Connection):
         client._concurrency = vus

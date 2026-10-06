@@ -16,9 +16,24 @@ State on a gate is partitioned in two registries:
   registry bounded. Prepared entries are **not** eligible for
   orphan-takeover (the user invariant: only committed replicas count).
 * ``_committed_sequence`` — last committed sequence per ``job_id``.
-  Used to make re-prepare and re-commit idempotent (peer returns
-  ``ALREADY_COMMITTED`` for replays at or below the committed
-  sequence).
+  Used to make re-prepare and re-commit idempotent.
+
+A replica's version is ``(fence_token, sequence)``: the fence is the
+leadership epoch (a takeover raises it), the sequence orders one
+leader's revisions within its epoch. A replica from an older epoch than
+the one committed is ``REJECTED`` -- a deposed leader's revision must not
+overwrite its successor's -- and one at or below the committed version
+within the epoch is ``ALREADY_COMMITTED`` (a replay). Ordered by sequence
+alone, a takeover whose sequence did not exceed a revision the old leader
+committed was taken for a replay and never applied, and the old leader's
+later revisions overwrote the new leader's.
+
+A leader revises a job's replica one revision at a time
+(``revise_committed_replica``), each built on the replica the one before
+it committed, under a sequence no earlier attempt of its own used. A
+takeover first adopts the freshest replica a quorum of gates committed
+(``take_over_committed_replica``): built from a gate that missed the old
+leader's last revision, it would have committed the older state over it.
 * ``_committed_by_leader_addr`` — reverse index from leader TCP
   address to committed job ids. This lets the SWIM leader repair every
   committed job led by a dead gate without scanning unrelated jobs.
@@ -44,6 +59,7 @@ overlapping submissions cannot race the prepared/committed registries.
 """
 
 import asyncio
+import dataclasses
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
@@ -94,6 +110,8 @@ class GateJobReplicationCoordinator:
         "_prepared_ttl_seconds",
         "_quorum_timeout_seconds",
         "_peer_rpc_timeout_seconds",
+        "_attempted_sequences",
+        "_revision_locks",
     )
 
     def __init__(
@@ -125,15 +143,22 @@ class GateJobReplicationCoordinator:
         self._committed_sequence: dict[str, int] = {}
         self._committed_replicas: dict[str, GateJobReplica] = {}
         self._committed_by_leader_addr: dict[tuple[str, int], set[str]] = {}
+        # (job_id, fence_token, sequence) of a commit -> the replica it
+        # replaced, restored if the commit is aborted.
         self._commit_rollback_replicas: dict[
-            tuple[str, int],
+            tuple[str, int, int],
             GateJobReplica | None,
         ] = {}
-        self._commit_rollback_expires_at: dict[tuple[str, int], float] = {}
+        self._commit_rollback_expires_at: dict[tuple[str, int, int], float] = {}
         self._prepared_expires_at: dict[str, float] = {}
         self._prepared_ttl_seconds = prepared_ttl_seconds
         self._quorum_timeout_seconds = quorum_timeout_seconds
         self._peer_rpc_timeout_seconds = peer_rpc_timeout_seconds
+        # The highest sequence this gate sent out for each job, committed
+        # or not: a revision never reuses one.
+        self._attempted_sequences: dict[str, int] = {}
+        # One revision (or takeover) of a job's replica at a time.
+        self._revision_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Leader-side entry point
@@ -164,12 +189,28 @@ class GateJobReplicationCoordinator:
         performed.
         """
         peer_acks_needed = max(0, quorum_size - 1)
+        self._attempted_sequences[replica.job_id] = max(
+            replica.sequence,
+            self._attempted_sequences.get(replica.job_id, 0),
+        )
+
+        # The leader's own vote is a prepare like any peer's: a replica its
+        # registry refuses (an older epoch, or another job holding the
+        # idempotency key) is not counted -- it was, unchecked, so two
+        # gates admitting one key at once each counted itself and
+        # committed.
+        if await self._record_prepare(replica) is GateJobReplicaStatus.REJECTED:
+            return False
 
         if peer_acks_needed == 0:
             await self._apply_committed_with_tracking(replica)
             return True
 
         if len(peer_addrs) < peer_acks_needed:
+            async with self._lock:
+                if self._prepared.get(replica.job_id) is replica:
+                    self._prepared.pop(replica.job_id, None)
+                    self._prepared_expires_at.pop(replica.job_id, None)
             await self._logger.log(
                 ServerWarning(
                     message=(
@@ -200,9 +241,11 @@ class GateJobReplicationCoordinator:
                 acked_peers.append(peer_addr)
 
         if len(acked_peers) < peer_acks_needed:
-            await self._abort_prepared_peers(
-                acked_peers, replica.job_id, replica.sequence
-            )
+            async with self._lock:
+                if self._prepared.get(replica.job_id) is replica:
+                    self._prepared.pop(replica.job_id, None)
+                    self._prepared_expires_at.pop(replica.job_id, None)
+            await self._abort_prepared_peers(acked_peers, replica)
             await self._logger.log(
                 ServerWarning(
                     message=(
@@ -232,11 +275,11 @@ class GateJobReplicationCoordinator:
             if self._is_commit_ack_positive(commit_result)
         ]
         if len(committed_peers) < peer_acks_needed:
-            await self._abort_prepared_peers(
-                acked_peers,
-                replica.job_id,
-                replica.sequence,
-            )
+            async with self._lock:
+                if self._prepared.get(replica.job_id) is replica:
+                    self._prepared.pop(replica.job_id, None)
+                    self._prepared_expires_at.pop(replica.job_id, None)
+            await self._abort_prepared_peers(acked_peers, replica)
             await self._logger.log(
                 ServerWarning(
                     message=(
@@ -254,11 +297,7 @@ class GateJobReplicationCoordinator:
         try:
             await self._apply_committed_with_tracking(replica)
         except Exception as apply_error:
-            await self._abort_prepared_peers(
-                acked_peers,
-                replica.job_id,
-                replica.sequence,
-            )
+            await self._abort_prepared_peers(acked_peers, replica)
             await self._logger.log(
                 ServerWarning(
                     message=(
@@ -273,6 +312,133 @@ class GateJobReplicationCoordinator:
             return False
 
         return True
+
+    async def revise_committed_replica(
+        self,
+        job_id: str,
+        revise: Callable[[GateJobReplica], GateJobReplica | None],
+        peer_addrs: list[tuple[str, int]],
+        quorum_size: int,
+    ) -> bool:
+        """Commit a revision of ``job_id``'s replica -- its leader's own
+        change, in its own epoch -- to a quorum of gates.
+
+        ``revise`` turns the committed replica into its successor, or
+        returns None when there is nothing to change (True: nothing to
+        commit). Revisions of a job run one at a time, each built on the
+        replica the one before it committed, under a sequence no earlier
+        attempt of this gate used: two built on the same replica at once,
+        and the later commit dropped the earlier one's change; a sequence
+        that a failed attempt left committed at a peer was answered
+        "already committed" there for a different replica.
+
+        False when this gate holds no committed replica of the job, or no
+        quorum committed the revision.
+        """
+        async with self._revision_locks.setdefault(job_id, asyncio.Lock()):
+            committed = self._committed_replicas.get(job_id)
+            if committed is None:
+                return False
+            if (revised := revise(committed)) is None:
+                return True
+            return await self.replicate_with_quorum(
+                dataclasses.replace(
+                    revised,
+                    fence_token=committed.fence_token,
+                    sequence=max(
+                        committed.sequence,
+                        self._attempted_sequences.get(job_id, 0),
+                    )
+                    + 1,
+                ),
+                peer_addrs,
+                quorum_size,
+            )
+
+    async def take_over_committed_replica(
+        self,
+        job_id: str,
+        build_takeover: Callable[[], GateJobReplica | None],
+        peer_addrs: list[tuple[str, int]],
+        quorum_size: int,
+    ) -> GateJobReplica | None:
+        """Commit this gate's takeover of ``job_id`` to a quorum of gates.
+
+        The freshest replica a quorum committed is adopted first -- every
+        revision of the old leader reached a quorum, so one of them holds
+        its last -- and applied here, where ``build_takeover`` reads the
+        job's state to build the takeover replica (a raised fence; None
+        to give up). Built from a gate that missed the old leader's last
+        revision, the takeover committed the older state over it.
+
+        None when a quorum did not answer for the job, ``build_takeover``
+        gave up, or no quorum committed the takeover.
+        """
+        async with self._revision_locks.setdefault(job_id, asyncio.Lock()):
+            request_payload = GateJobReplicaFetchRequest(job_id=job_id).dump()
+            responses = await asyncio.gather(
+                *[
+                    self._send_fetch(
+                        peer_addr,
+                        request_payload,
+                        expected_job_id=job_id,
+                        expected_leader_addr=None,
+                    )
+                    for peer_addr in peer_addrs
+                ],
+                return_exceptions=True,
+            )
+            answers = [
+                response
+                for response in responses
+                if isinstance(response, GateJobReplicaFetchResponse)
+            ]
+            if len(answers) + 1 < quorum_size:
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Gate takeover of job {job_id[:10]}: {len(answers)} of "
+                            f"{len(peer_addrs)} peers answered for its replica, short "
+                            f"of a quorum of {quorum_size} with this gate"
+                        ),
+                        node_host=self._get_node_addr()[0],
+                        node_port=self._get_node_addr()[1],
+                        node_id=self._get_node_id().short,
+                    )
+                )
+                return None
+
+            freshest = max(
+                (
+                    answer.replica
+                    for answer in answers
+                    if answer.found and answer.replica is not None
+                ),
+                key=lambda replica: (replica.fence_token, replica.sequence),
+                default=None,
+            )
+            local = self._committed_replicas.get(job_id)
+            if freshest is not None and (
+                local is None
+                or (freshest.fence_token, freshest.sequence)
+                > (local.fence_token, local.sequence)
+            ):
+                await self._apply_repair_replica(freshest)
+
+            if (takeover := build_takeover()) is None:
+                return None
+            committed = self._committed_replicas.get(job_id)
+            takeover = dataclasses.replace(
+                takeover,
+                sequence=max(
+                    committed.sequence if committed is not None else 0,
+                    self._attempted_sequences.get(job_id, 0),
+                )
+                + 1,
+            )
+            if not await self.replicate_with_quorum(takeover, peer_addrs, quorum_size):
+                return None
+            return takeover
 
     # ------------------------------------------------------------------
     # Peer-side handlers (entry points for the TCP wire handlers)
@@ -307,6 +473,7 @@ class GateJobReplicationCoordinator:
         abort = GateJobReplicaAbort.load(data)
         status = await self._drop_prepared_or_committed(
             abort.job_id,
+            abort.fence_token,
             abort.sequence,
         )
         return GateJobReplicaAck(
@@ -353,12 +520,11 @@ class GateJobReplicationCoordinator:
     ) -> GateJobReplica | None:
         """Query peers for a cached committed replica for ``job_id``.
 
-        Returns the first replica returned by any peer (replicas are
-        identical across the quorum that committed them, so picking
-        the first response is correct). Returns ``None`` when no peer
-        has a committed copy — typically meaning the job's quorum
-        commit was lost with the original leader or never reached
-        any survivor.
+        Returns the freshest replica any peer holds -- its leader revises
+        a job's replica, and each peer holds the latest revision it
+        committed. Returns ``None`` when no peer has a committed copy —
+        typically meaning the job's quorum commit was lost with the
+        original leader or never reached any survivor.
         """
         if not peer_addrs:
             return None
@@ -377,12 +543,19 @@ class GateJobReplicationCoordinator:
             return_exceptions=True,
         )
 
-        for response in responses:
-            if isinstance(response, Exception) or response is None:
-                continue
-            if response.found and response.replica is not None:
-                return response.replica
-        return None
+        # Each peer holds the latest revision it committed: the freshest
+        # answer is the job's state.
+        return max(
+            (
+                response.replica
+                for response in responses
+                if isinstance(response, GateJobReplicaFetchResponse)
+                and response.found
+                and response.replica is not None
+            ),
+            key=lambda replica: (replica.fence_token, replica.sequence),
+            default=None,
+        )
 
     async def fetch_committed_replicas_for_leader_from_peers(
         self,
@@ -415,7 +588,10 @@ class GateJobReplicationCoordinator:
                 continue
             for replica in response.replicas:
                 current = replicas_by_job_id.get(replica.job_id)
-                if current is None or replica.sequence > current.sequence:
+                if current is None or (replica.fence_token, replica.sequence) > (
+                    current.fence_token,
+                    current.sequence,
+                ):
                     replicas_by_job_id[replica.job_id] = replica
 
         return list(replicas_by_job_id.values())
@@ -460,7 +636,10 @@ class GateJobReplicationCoordinator:
         }
         for replica in replicas:
             current = replicas_by_job_id.get(replica.job_id)
-            if current is None or replica.sequence > current.sequence:
+            if current is None or (replica.fence_token, replica.sequence) > (
+                current.fence_token,
+                current.sequence,
+            ):
                 replicas_by_job_id[replica.job_id] = replica
 
         repaired_job_ids: list[str] = []
@@ -480,23 +659,39 @@ class GateJobReplicationCoordinator:
         """Apply a prepare to the in-memory registry.
 
         Returns:
-            ``ALREADY_COMMITTED`` when the committed sequence is at or
-            above ``replica.sequence`` (idempotent replay).
-            ``REJECTED`` when a strictly newer prepare is already
-            in-flight for the same job.
-            ``PREPARED`` when ``replica.sequence`` is newer than the
-            committed sequence or no commit exists yet.
+            ``REJECTED`` when the replica is from an older epoch than
+            the one committed, or a strictly newer prepare is already
+            in flight for the same job.
+            ``ALREADY_COMMITTED`` when the committed version is at or
+            above the replica's (idempotent replay).
+            ``PREPARED`` when the replica's version is newer than the
+            committed one or no commit exists yet.
         """
         async with self._lock:
-            committed_sequence = self._committed_sequence.get(replica.job_id)
-            if (
-                committed_sequence is not None
-                and committed_sequence >= replica.sequence
-            ):
-                return GateJobReplicaStatus.ALREADY_COMMITTED
+            if (committed := self._committed_replicas.get(replica.job_id)) is not None:
+                if replica.fence_token < committed.fence_token:
+                    return GateJobReplicaStatus.REJECTED
+                if (committed.fence_token, committed.sequence) >= (
+                    replica.fence_token,
+                    replica.sequence,
+                ):
+                    return GateJobReplicaStatus.ALREADY_COMMITTED
 
             existing = self._prepared.get(replica.job_id)
-            if existing is not None and existing.sequence > replica.sequence:
+            if existing is not None and (existing.fence_token, existing.sequence) > (
+                replica.fence_token,
+                replica.sequence,
+            ):
+                return GateJobReplicaStatus.REJECTED
+
+            # AD-40: an idempotency key decides one job. A key another job's
+            # replica holds here -- prepared or committed -- refuses this
+            # one: quorums intersect, so of two gates admitting the same
+            # key at once, at most one commits.
+            if replica.idempotency_key and any(
+                held.idempotency_key == replica.idempotency_key and held.job_id != replica.job_id
+                for held in (*self._committed_replicas.values(), *self._prepared.values())
+            ):
                 return GateJobReplicaStatus.REJECTED
 
             self._prepared[replica.job_id] = replica
@@ -517,12 +712,14 @@ class GateJobReplicationCoordinator:
         immediately by ``commit``.
         """
         async with self._lock:
-            committed_sequence = self._committed_sequence.get(replica.job_id)
-            if (
-                committed_sequence is not None
-                and committed_sequence >= replica.sequence
-            ):
-                return GateJobReplicaStatus.ALREADY_COMMITTED
+            if (committed := self._committed_replicas.get(replica.job_id)) is not None:
+                if replica.fence_token < committed.fence_token:
+                    return GateJobReplicaStatus.REJECTED
+                if (committed.fence_token, committed.sequence) >= (
+                    replica.fence_token,
+                    replica.sequence,
+                ):
+                    return GateJobReplicaStatus.ALREADY_COMMITTED
 
             self._prepared.pop(replica.job_id, None)
             self._prepared_expires_at.pop(replica.job_id, None)
@@ -532,19 +729,28 @@ class GateJobReplicationCoordinator:
         return GateJobReplicaStatus.COMMITTED
 
     async def _drop_prepared_or_committed(
-        self, job_id: str, sequence: int
+        self, job_id: str, fence_token: int, sequence: int
     ) -> GateJobReplicaStatus:
+        """Drop the prepared or committed replica of exactly this version:
+        an abort of one epoch's revision must not take down another
+        epoch's at the same sequence."""
         drop_committed = False
         restore_replica: GateJobReplica | None = None
         async with self._lock:
             existing = self._prepared.get(job_id)
-            if existing is not None and existing.sequence == sequence:
+            if existing is not None and (existing.fence_token, existing.sequence) == (
+                fence_token,
+                sequence,
+            ):
                 self._prepared.pop(job_id, None)
                 self._prepared_expires_at.pop(job_id, None)
 
-            committed_sequence = self._committed_sequence.get(job_id)
-            if committed_sequence == sequence:
-                rollback_key = (job_id, sequence)
+            committed = self._committed_replicas.get(job_id)
+            if committed is not None and (committed.fence_token, committed.sequence) == (
+                fence_token,
+                sequence,
+            ):
+                rollback_key = (job_id, fence_token, sequence)
                 has_rollback_record = rollback_key in self._commit_rollback_replicas
                 previous_replica = self._commit_rollback_replicas.pop(
                     rollback_key,
@@ -572,13 +778,14 @@ class GateJobReplicationCoordinator:
     async def _apply_repair_replica(self, replica: GateJobReplica) -> bool:
         """Apply a committed replica from the repair path."""
         async with self._lock:
-            committed_sequence = self._committed_sequence.get(replica.job_id)
-            if (
-                committed_sequence is not None
-                and committed_sequence > replica.sequence
-            ):
+            committed = self._committed_replicas.get(replica.job_id)
+            committed_version = (
+                (committed.fence_token, committed.sequence) if committed is not None else None
+            )
+            replica_version = (replica.fence_token, replica.sequence)
+            if committed_version is not None and committed_version > replica_version:
                 return False
-            if committed_sequence != replica.sequence:
+            if committed_version != replica_version:
                 self._record_committed_locked(replica, track_rollback=False)
 
         await self._apply_committed(replica)
@@ -592,7 +799,7 @@ class GateJobReplicationCoordinator:
         """Record a committed replica and update the leader-address index."""
         previous = self._committed_replicas.get(replica.job_id)
         if track_rollback:
-            rollback_key = (replica.job_id, replica.sequence)
+            rollback_key = (replica.job_id, replica.fence_token, replica.sequence)
             self._commit_rollback_replicas.setdefault(rollback_key, previous)
             self._commit_rollback_expires_at[rollback_key] = (
                 self._clock.monotonic() + self._prepared_ttl_seconds
@@ -675,9 +882,11 @@ class GateJobReplicationCoordinator:
                 ),
                 timeout=self._quorum_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response := self._extract_response_bytes(response_tuple), Exception):
+                raise response
         except (asyncio.TimeoutError, Exception) as error:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=(
                         f"Gate replication: prepare to {peer_addr} failed for "
@@ -690,8 +899,7 @@ class GateJobReplicationCoordinator:
             )
             return None
 
-        response = self._extract_response_bytes(response_tuple)
-        if not response or isinstance(response, Exception):
+        if not response:
             return None
         try:
             return GateJobReplicaAck.load(response)
@@ -714,9 +922,11 @@ class GateJobReplicationCoordinator:
                 ),
                 timeout=self._peer_rpc_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response := self._extract_response_bytes(response_tuple), Exception):
+                raise response
         except Exception as error:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=(
                         f"Gate replication: commit to {peer_addr} failed for "
@@ -729,8 +939,7 @@ class GateJobReplicationCoordinator:
             )
             return None
 
-        response = self._extract_response_bytes(response_tuple)
-        if not response or isinstance(response, Exception):
+        if not response:
             return None
         try:
             return GateJobReplicaAck.load(response)
@@ -740,13 +949,16 @@ class GateJobReplicationCoordinator:
     async def _abort_prepared_peers(
         self,
         peer_addrs: list[tuple[str, int]],
-        job_id: str,
-        sequence: int,
+        replica: GateJobReplica,
     ) -> None:
-        payload = GateJobReplicaAbort(job_id=job_id, sequence=sequence).dump()
+        payload = GateJobReplicaAbort(
+            job_id=replica.job_id,
+            fence_token=replica.fence_token,
+            sequence=replica.sequence,
+        ).dump()
         await asyncio.gather(
             *[
-                self._send_abort(peer_addr, payload, job_id)
+                self._send_abort(peer_addr, payload, replica.job_id)
                 for peer_addr in peer_addrs
             ],
             return_exceptions=True,
@@ -759,7 +971,7 @@ class GateJobReplicationCoordinator:
         job_id: str,
     ) -> None:
         try:
-            await self._clock.wait_for(
+            response_tuple = await self._clock.wait_for(
                 self._send_tcp(
                     peer_addr,
                     "gate_job_replica_abort",
@@ -768,9 +980,11 @@ class GateJobReplicationCoordinator:
                 ),
                 timeout=self._peer_rpc_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response := self._extract_response_bytes(response_tuple), Exception):
+                raise response
         except Exception as abort_error:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=(
                         f"Gate replication: abort to {peer_addr} failed for "
@@ -895,6 +1109,8 @@ class GateJobReplicationCoordinator:
         """Drop all replication state for ``job_id`` (terminal cleanup)."""
         self._prepared.pop(job_id, None)
         self._prepared_expires_at.pop(job_id, None)
+        self._attempted_sequences.pop(job_id, None)
+        self._revision_locks.pop(job_id, None)
         rollback_keys = [
             rollback_key
             for rollback_key in self._commit_rollback_replicas

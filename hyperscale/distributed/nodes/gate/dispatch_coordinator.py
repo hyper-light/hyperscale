@@ -13,6 +13,7 @@ from hyperscale.distributed.models import (
     JobAck,
     JobStatus,
     JobStatusPush,
+    restricted_loads,
 )
 from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
@@ -31,6 +32,7 @@ from hyperscale.distributed.reliability import (
     JitterStrategy,
 )
 from hyperscale.logging.hyperscale_logging_models import (
+    ObservedLatencyRecorded,
     ServerWarning,
     ServerInfo,
     ServerError,
@@ -43,10 +45,7 @@ from hyperscale.distributed.runtime import Clock
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.jobs.gates import GateJobManager, GateJobTimeoutTracker
-    from hyperscale.distributed.routing import (
-        DispatchTimeTracker,
-        ObservedLatencyTracker,
-    )
+    from hyperscale.distributed.routing import ObservedLatencyTracker
     from hyperscale.distributed.health import CircuitBreakerManager
     from hyperscale.distributed.swim.core import ErrorStats
     from hyperscale.logging import Logger
@@ -71,11 +70,10 @@ class GateDispatchCoordinator:
         task_runner: "TaskRunner",
         job_manager: "GateJobManager",
         job_timeout_tracker: "GateJobTimeoutTracker",
-        dispatch_time_tracker: "DispatchTimeTracker",
         circuit_breaker_manager: "CircuitBreakerManager",
         datacenter_managers: dict[str, list[tuple[str, int]]],
         quorum_circuit: "ErrorStats",
-        select_datacenters: Callable,
+        select_datacenters: Callable[..., Awaitable[tuple[list[str], list[str], str]]],
         broadcast_leadership: Callable[
             [str, int, tuple[str, int] | None], Awaitable[None]
         ],
@@ -84,6 +82,7 @@ class GateDispatchCoordinator:
         confirm_manager_for_dc: Callable,
         suspect_manager_for_dc: Callable,
         record_forward_throughput_event: Callable,
+        record_forward_attempt_event: Callable,
         get_node_host: Callable[[], str],
         get_node_port: Callable[[], int],
         get_node_id_short: Callable[[], str],
@@ -92,13 +91,17 @@ class GateDispatchCoordinator:
         clock: Clock,
         capacity_aggregator: DatacenterCapacityAggregator | None = None,
         spillover_evaluator: SpilloverEvaluator | None = None,
-        observed_latency_tracker: "ObservedLatencyTracker | None" = None,
         record_dispatch_failure: Callable[[str, str], None] | None = None,
-        persist_accepted_job=None,
+        persist_accepted_job: Callable[[JobSubmission, list[str], int], Awaitable[None]] | None = None,
         *,
+        observed_latency_tracker: "ObservedLatencyTracker",
+        estimate_datacenter_latencies_ms: Callable[[], dict[str, float]],
         manager_selector: DatacenterManagerSelector,
         finalize_failed_job: Callable[[str, tuple[str, ...], str], Awaitable[None]],
         on_job_dispatched: Callable[[JobSubmission, list[str]], Awaitable[None]],
+        datacenter_leader_failover_seconds: float,
+        leader_heartbeat_interval_seconds: float,
+        record_fallback_used: Callable[[str, str], None],
     ) -> None:
         # Told which datacenters actually accepted a job (AD-44 best-effort
         # tracking starts from exactly those).
@@ -111,6 +114,30 @@ class GateDispatchCoordinator:
         self._manager_dispatch_timeout_seconds: float = (
             manager_dispatch_timeout_seconds
         )
+        # A datacenter answering "retry" is replacing its leader: its
+        # dispatch keeps retrying for as long as that can take, at the pace
+        # its managers learn a new leader -- one leader heartbeat (full
+        # jitter): waiting longer only delays the job past the election,
+        # asking sooner mostly re-asks a question whose answer has not
+        # changed.
+        self._dispatch_retry_config = RetryConfig(
+            max_attempts=None,
+            base_delay=leader_heartbeat_interval_seconds,
+            max_delay=leader_heartbeat_interval_seconds,
+            jitter=JitterStrategy.FULL,
+            # Transient JobAck rejections (mid-election, warmup, load
+            # shedding) must retry alongside the transport errors the
+            # default whitelist covers.
+            retryable_exceptions=(
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                TransientDispatchError,
+            ),
+        )
+        self._datacenter_leader_failover_seconds = datacenter_leader_failover_seconds
+        # AD-36: counts each fallback a dispatch lands on, from -> to.
+        self._record_fallback_used = record_fallback_used
         # AD-28: orders a datacenter's managers for dispatch (known leader
         # first, then rendezvous + EWMA) and learns from dispatch outcomes.
         self._manager_selector: DatacenterManagerSelector = manager_selector
@@ -123,14 +150,15 @@ class GateDispatchCoordinator:
         # successful_dcs, fence_token) at the acceptance point so a
         # restarted gate recovers its accepted jobs. None = volatile
         # gate (the pre-Phase-8 behavior).
-        self._persist_accepted_job = persist_accepted_job
-        self._dispatch_time_tracker: "DispatchTimeTracker" = dispatch_time_tracker
+        self._persist_accepted_job: Callable[[JobSubmission, list[str], int], Awaitable[None]] | None = (
+            persist_accepted_job
+        )
         self._circuit_breaker_manager: "CircuitBreakerManager" = circuit_breaker_manager
         self._datacenter_managers: dict[str, list[tuple[str, int]]] = (
             datacenter_managers
         )
         self._quorum_circuit: "ErrorStats" = quorum_circuit
-        self._select_datacenters: Callable = select_datacenters
+        self._select_datacenters: Callable[..., Awaitable[tuple[list[str], list[str], str]]] = select_datacenters
         self._broadcast_leadership: Callable[
             [str, int, tuple[str, int] | None], Awaitable[None]
         ] = broadcast_leadership
@@ -142,6 +170,7 @@ class GateDispatchCoordinator:
         self._record_forward_throughput_event: Callable = (
             record_forward_throughput_event
         )
+        self._record_forward_attempt_event: Callable = record_forward_attempt_event
         self._get_node_host: Callable[[], str] = get_node_host
         self._get_node_port: Callable[[], int] = get_node_port
         self._get_node_id_short: Callable[[], str] = get_node_id_short
@@ -149,29 +178,14 @@ class GateDispatchCoordinator:
             capacity_aggregator
         )
         self._spillover_evaluator: SpilloverEvaluator | None = spillover_evaluator
-        self._observed_latency_tracker: "ObservedLatencyTracker | None" = (
-            observed_latency_tracker
-        )
+        # AD-45: learns each datacenter's time to accept a dispatched job.
+        self._observed_latency_tracker: "ObservedLatencyTracker" = observed_latency_tracker
+        # Every known datacenter's latency estimate, as routing ranks
+        # them: spillover weighs the same numbers.
+        self._estimate_datacenter_latencies_ms = estimate_datacenter_latencies_ms
         self._record_dispatch_failure: Callable[[str, str], None] | None = (
             record_dispatch_failure
         )
-
-    def _get_observed_rtt_ms(
-        self,
-        datacenter_id: str,
-        default_rtt_ms: float,
-        min_confidence: float = 0.3,
-    ) -> float:
-        if self._observed_latency_tracker is None:
-            return default_rtt_ms
-
-        observed_ms, confidence = self._observed_latency_tracker.get_observed_latency(
-            datacenter_id
-        )
-        if confidence < min_confidence or observed_ms <= 0.0:
-            return default_rtt_ms
-
-        return observed_ms
 
     async def _push_job_status_to_client(
         self,
@@ -254,11 +268,6 @@ class GateDispatchCoordinator:
         Sets origin_gate_addr so managers send results directly to this gate.
         Handles health-based routing: UNHEALTHY -> fail, DEGRADED/BUSY -> warn, HEALTHY -> proceed.
         """
-        for datacenter_id in target_dcs:
-            await self._dispatch_time_tracker.record_dispatch(
-                submission.job_id, datacenter_id
-            )
-
         job = self._job_manager.get_job(submission.job_id)
         if not job:
             return
@@ -273,7 +282,7 @@ class GateDispatchCoordinator:
             "Job dispatching",
         )
 
-        primary_dcs, fallback_dcs, worst_health = self._select_datacenters(
+        primary_dcs, fallback_dcs, worst_health = await self._select_datacenters(
             len(target_dcs),
             target_dcs if target_dcs else None,
             job_id=submission.job_id,
@@ -282,8 +291,7 @@ class GateDispatchCoordinator:
         if worst_health == "initializing":
             job.status = JobStatus.PENDING.value
             self._job_manager.set_job(submission.job_id, job)
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerWarning(
                     message=f"Job {submission.job_id}: DCs became initializing after acceptance - waiting",
                     node_host=self._get_node_host(),
@@ -314,8 +322,7 @@ class GateDispatchCoordinator:
                 for datacenter_id in target_dcs:
                     self._record_dispatch_failure(submission.job_id, datacenter_id)
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerError(
                     message=f"Job {submission.job_id}: All datacenters are UNHEALTHY - job failed",
                     node_host=self._get_node_host(),
@@ -333,8 +340,7 @@ class GateDispatchCoordinator:
             return
 
         if worst_health == "degraded":
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerWarning(
                     message=f"Job {submission.job_id}: No HEALTHY or BUSY DCs available, routing to DEGRADED: {primary_dcs}",
                     node_host=self._get_node_host(),
@@ -343,8 +349,7 @@ class GateDispatchCoordinator:
                 ),
             )
         elif worst_health == "busy":
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=f"Job {submission.job_id}: No HEALTHY DCs available, routing to BUSY: {primary_dcs}",
                     node_host=self._get_node_host(),
@@ -353,6 +358,10 @@ class GateDispatchCoordinator:
                 ),
             )
 
+        # The datacenters the job runs in are the ones it is sent to: each
+        # result slot starts with a primary and moves -- before the job is
+        # sent on -- to any datacenter that takes the primary's place.
+        self._job_manager.set_target_dcs(submission.job_id, set(primary_dcs))
         successful_dcs, failed_dcs = await self._dispatch_job_with_fallback(
             submission,
             primary_dcs,
@@ -368,8 +377,7 @@ class GateDispatchCoordinator:
             # timeouts may still have reached a manager, which runs the
             # job and supersedes this status. Only a certain failure
             # (nothing was ever sent) takes the terminal path.
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerError(
                     message=f"Job {submission.job_id}: Failed to dispatch to any datacenter",
                     node_host=self._get_node_host(),
@@ -385,8 +393,7 @@ class GateDispatchCoordinator:
             self._job_manager.set_job(submission.job_id, job)
 
             if failed_dcs:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerInfo(
                         message=f"Job {submission.job_id}: Dispatched to {len(successful_dcs)} DCs, {len(failed_dcs)} failed",
                         node_host=self._get_node_host(),
@@ -430,7 +437,7 @@ class GateDispatchCoordinator:
                 is_final=True,
             )
 
-    def _evaluate_spillover(
+    async def _evaluate_spillover(
         self,
         job_id: str,
         primary_dc: str,
@@ -462,23 +469,22 @@ class GateDispatchCoordinator:
         if primary_capacity.can_serve_immediately(job_cores_required):
             return None
 
-        fallback_capacities: list[tuple] = []
-        for fallback_dc in fallback_dcs:
-            fallback_capacity = self._capacity_aggregator.get_capacity(fallback_dc)
-            rtt_ms = self._get_observed_rtt_ms(fallback_dc, default_rtt_ms=50.0)
-            fallback_capacities.append((fallback_capacity, rtt_ms))
-
-        primary_rtt_ms = self._get_observed_rtt_ms(primary_dc, default_rtt_ms=10.0)
+        latencies_ms = self._estimate_datacenter_latencies_ms()
         decision = self._spillover_evaluator.evaluate(
             job_cores_required=job_cores_required,
             primary_capacity=primary_capacity,
-            fallback_capacities=fallback_capacities,
-            primary_rtt_ms=primary_rtt_ms,
+            fallback_capacities=[
+                (
+                    self._capacity_aggregator.get_capacity(fallback_dc),
+                    latencies_ms[fallback_dc],
+                )
+                for fallback_dc in fallback_dcs
+            ],
+            primary_rtt_ms=latencies_ms[primary_dc],
         )
 
         if decision.should_spillover and decision.spillover_dc:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=f"Job {job_id}: Spillover from {primary_dc} to {decision.spillover_dc} "
                     f"(primary_wait={decision.primary_wait_seconds:.1f}s, "
@@ -505,10 +511,19 @@ class GateDispatchCoordinator:
         fallback_queue = list(fallback_dcs)
         job_id = submission.job_id
 
-        job_cores = getattr(submission, "cores_required", 1)
+        # The cores the job's first workflows -- those depending on none --
+        # would use, as a manager's dispatcher allocates them: one per VU
+        # (the workflow's own, else the job's), at least one each. A job
+        # submission names no core requirement; reading one that is not
+        # there left every job asking for one core.
+        job_cores = sum(
+            max(1, workflow.vus if workflow.vus and workflow.vus > 0 else submission.vus)
+            for _workflow_id, dependencies, workflow in restricted_loads(submission.workflows)
+            if not dependencies
+        )
 
         for datacenter in primary_dcs:
-            spillover_dc = self._evaluate_spillover(
+            spillover_dc = await self._evaluate_spillover(
                 job_id=job_id,
                 primary_dc=datacenter,
                 fallback_dcs=fallback_queue,
@@ -518,6 +533,7 @@ class GateDispatchCoordinator:
             target_dc = spillover_dc if spillover_dc else datacenter
             if spillover_dc and spillover_dc in fallback_queue:
                 fallback_queue.remove(spillover_dc)
+                self._job_manager.move_target_dc(job_id, datacenter, spillover_dc)
 
             success, _, accepting_manager = await self._try_dispatch_to_dc(
                 job_id, target_dc, submission
@@ -530,6 +546,9 @@ class GateDispatchCoordinator:
 
             if self._record_dispatch_failure:
                 self._record_dispatch_failure(job_id, target_dc)
+            # A dispatch that ran out of retries may have reached a manager
+            # that runs the job anyway: released, it is told to stop.
+            self._job_manager.release_datacenter(job_id, target_dc)
 
             fallback_dc, fallback_manager = await self._try_fallback_dispatch(
                 job_id, target_dc, submission, fallback_queue
@@ -542,6 +561,25 @@ class GateDispatchCoordinator:
                 failed.append(target_dc)
 
         return (successful, failed)
+
+    async def dispatch_to_datacenter(
+        self,
+        job_id: str,
+        datacenter: str,
+        submission: JobSubmission,
+    ) -> bool:
+        """Dispatch a job's submission to one datacenter -- a share of a
+        job already placed, re-run where a lost datacenter's went (AD-36)
+        -- recording the manager that took it. False when no manager of
+        the datacenter took it within the dispatch retry budget."""
+        success, _, accepting_manager = await self._try_dispatch_to_dc(
+            job_id, datacenter, submission
+        )
+        if success:
+            self._record_dc_manager_for_job(job_id, datacenter, accepting_manager)
+        elif self._record_dispatch_failure:
+            self._record_dispatch_failure(job_id, datacenter)
+        return success
 
     async def _try_dispatch_to_dc(
         self,
@@ -556,24 +594,51 @@ class GateDispatchCoordinator:
             self._datacenter_managers.get(datacenter, []),
         )
 
+        datacenter_dispatch_started = self._clock.monotonic()
+        # One retry budget for the datacenter, not one per manager.
+        retry_deadline_at = datacenter_dispatch_started + self._datacenter_leader_failover_seconds
+        self._record_forward_attempt_event()
         for manager_addr in managers:
             dispatch_started = self._clock.monotonic()
-            success, error = await self._try_dispatch_to_manager(
-                manager_addr, submission
+            accepting_manager, error = await self._try_dispatch_to_manager(
+                datacenter, manager_addr, submission, retry_deadline_at
             )
-            if success:
+            if accepting_manager is not None:
+                accepted_at = self._clock.monotonic()
                 # Time to an accepted dispatch (transient retries included):
-                # the responsiveness the gate actually gets from this manager.
+                # the responsiveness the gate actually gets from the manager
+                # that took it.
                 self._manager_selector.record_success(
                     datacenter,
-                    manager_addr,
-                    (self._clock.monotonic() - dispatch_started) * 1000.0,
+                    accepting_manager,
+                    (accepted_at - dispatch_started) * 1000.0,
+                )
+                # AD-45: the datacenter's time to start the job -- network,
+                # leader availability, admission, durable acceptance and
+                # first placement. A job's run time is set by its
+                # workflows, not by the datacenter, so it is not sampled.
+                latency_ms = (accepted_at - datacenter_dispatch_started) * 1000.0
+                observed_latency_ms, sample_count = await self._observed_latency_tracker.record_job_latency(
+                    datacenter,
+                    latency_ms,
+                )
+                await self._logger.log(
+                    ObservedLatencyRecorded(
+                        message=(
+                            f"{datacenter} accepted job {job_id} in {latency_ms:.1f}ms: observed "
+                            f"latency {observed_latency_ms:.1f}ms over {sample_count} samples"
+                        ),
+                        datacenter_id=datacenter,
+                        latency_ms=latency_ms,
+                        observed_latency_ms=observed_latency_ms,
+                        sample_count=sample_count,
+                    )
                 )
                 self._task_runner.run(
-                    self._confirm_manager_for_dc, datacenter, manager_addr
+                    self._confirm_manager_for_dc, datacenter, accepting_manager
                 )
                 self._record_forward_throughput_event()
-                return (True, None, manager_addr)
+                return (True, None, accepting_manager)
             else:
                 self._manager_selector.record_failure(datacenter, manager_addr)
                 self._task_runner.run(
@@ -589,15 +654,20 @@ class GateDispatchCoordinator:
         submission: JobSubmission,
         fallback_queue: list[str],
     ) -> tuple[str | None, tuple[str, int] | None]:
-        """Try fallback DCs when primary fails."""
+        """Try fallback DCs when primary fails. The failed datacenter's
+        result slot moves to each fallback before the job is sent there,
+        and is dropped when none takes the job."""
+        slot_holder = failed_dc
         while fallback_queue:
             fallback_dc = fallback_queue.pop(0)
+            self._job_manager.move_target_dc(job_id, slot_holder, fallback_dc)
+            slot_holder = fallback_dc
             success, _, accepting_manager = await self._try_dispatch_to_dc(
                 job_id, fallback_dc, submission
             )
             if success:
-                self._task_runner.run(
-                    self._logger.log,
+                self._record_fallback_used(failed_dc, fallback_dc)
+                await self._logger.log(
                     ServerInfo(
                         message=f"Job {job_id}: Fallback from {failed_dc} to {fallback_dc}",
                         node_host=self._get_node_host(),
@@ -609,81 +679,85 @@ class GateDispatchCoordinator:
 
             if self._record_dispatch_failure:
                 self._record_dispatch_failure(job_id, fallback_dc)
+            self._job_manager.release_datacenter(job_id, fallback_dc)
 
+        self._job_manager.discard_target_dc(job_id, slot_holder)
         return (None, None)
 
     async def _try_dispatch_to_manager(
         self,
+        datacenter: str,
         manager_addr: tuple[str, int],
         submission: JobSubmission,
-        max_retries: int = 9,
-        base_delay: float = 1.0,
-    ) -> tuple[bool, str | None]:
-        """Try to dispatch job to a single manager with retries and circuit breaker.
+        retry_deadline_at: float,
+    ) -> tuple[tuple[str, int] | None, str | None]:
+        """Dispatch a job to a datacenter starting at one of its managers,
+        retrying transient answers until ``retry_deadline_at``, behind each
+        manager's circuit breaker. Returns the manager that accepted it --
+        the leader a follower redirected to, when one did -- or the error.
 
-        The retry budget must span a full datacenter leader election
-        (pre-vote ~2s + 5-7s jittered timeout, so ~9-10s worst case):
-        a gate front-running a warming or mid-failover manager gets
-        transient rejections ("Not DC leader", "no quorum", "not
-        accepting jobs") that resolve within that window — with the
-        old 3-attempt/~1s budget the gate gave up while the election
-        it was waiting on was still running, terminally failing the
-        job. Ten attempts at base 1.0s (full jitter, 5s cap) spans the
-        window with margin while staying bounded.
+        A transient rejection ("Not DC leader", "no quorum", "not accepting
+        jobs") means the datacenter is replacing its leader or warming up;
+        it resolves within the datacenter's leader failover, so retrying
+        stops there and no sooner. A follower that names a leader this gate
+        knows is taken at its word at once: retrying the follower would
+        only hear the same redirect until the budget ran out.
         """
         if await self._circuit_breaker_manager.is_circuit_open(manager_addr):
-            return (False, "Circuit breaker is OPEN")
+            return (None, "Circuit breaker is OPEN")
 
-        circuit = await self._circuit_breaker_manager.get_circuit(manager_addr)
-        retry_config = RetryConfig(
-            max_attempts=max_retries + 1,
-            base_delay=base_delay,
-            max_delay=5.0,
-            jitter=JitterStrategy.FULL,
-            # Transient JobAck rejections (mid-election, warmup, load
-            # shedding) must retry alongside the transport errors the
-            # default whitelist covers.
-            retryable_exceptions=(
-                ConnectionError,
-                TimeoutError,
-                OSError,
-                TransientDispatchError,
-            ),
-        )
-        executor = RetryExecutor(retry_config)
+        known_managers = self._datacenter_managers.get(datacenter, [])
+        target = manager_addr
+        circuit = await self._circuit_breaker_manager.get_circuit(target)
 
-        async def dispatch_operation() -> tuple[bool, str | None]:
-            # ``_send_tcp`` returns ``(response_bytes | None, clock_time)`` —
-            # unpack the tuple rather than testing isinstance(response, bytes)
-            # against the raw tuple, which would always fail and force the
-            # retry path to ``raise ConnectionError("No valid response from
-            # manager")`` even when the manager handler responded correctly.
-            response, _clock = await self._send_tcp(
-                manager_addr,
-                "job_submission",
-                submission.dump(),
-                timeout=self._manager_dispatch_timeout_seconds,
-            )
-
-            if isinstance(response, bytes):
+        async def dispatch_operation() -> tuple[tuple[str, int] | None, str | None]:
+            nonlocal target, circuit
+            # Redirects are followed within an attempt until one points
+            # back; the next attempt starts over, as leadership may have
+            # moved since.
+            redirected_from: set[tuple[str, int]] = set()
+            while True:
+                # ``_send_tcp`` returns ``(response_bytes | None, clock_time)``.
+                response, _clock = await self._send_tcp(
+                    target,
+                    "job_submission",
+                    submission.dump(),
+                    timeout=self._manager_dispatch_timeout_seconds,
+                )
+                if not isinstance(response, bytes):
+                    raise ConnectionError(f"No valid response from manager {target}")
                 ack = JobAck.load(response)
-                return self._process_dispatch_ack(ack, manager_addr, circuit)
-
-            raise ConnectionError("No valid response from manager")
+                # Follow a redirect to a leader this gate knows of.
+                if (
+                    not ack.accepted
+                    and ack.leader_addr is not None
+                    and (leader := (ack.leader_addr[0], ack.leader_addr[1])) != target
+                    and leader in known_managers
+                    and leader not in redirected_from
+                    and not await self._circuit_breaker_manager.is_circuit_open(leader)
+                ):
+                    # An answer proves the follower reachable.
+                    circuit.record_success()
+                    redirected_from.add(target)
+                    target = leader
+                    circuit = await self._circuit_breaker_manager.get_circuit(target)
+                    continue
+                accepted, error = self._process_dispatch_ack(ack, target, circuit)
+                return (target if accepted else None, error)
 
         try:
-            result = await executor.execute(
+            return await RetryExecutor(self._dispatch_retry_config, clock=self._clock).execute(
                 dispatch_operation,
                 operation_name=f"dispatch_to_manager_{manager_addr}",
+                deadline_at=retry_deadline_at,
             )
-            return result
         except TransientDispatchError as exception:
-            # The manager kept answering "retry" for the whole budget: it
-            # is reachable, so this is not a circuit failure.
-            return (False, str(exception))
+            # The datacenter kept answering "retry" for its whole failover:
+            # it is reachable, so this is not a circuit failure.
+            return (None, str(exception))
         except Exception as exception:
             circuit.record_failure()
-            return (False, str(exception))
+            return (None, str(exception))
 
     def _process_dispatch_ack(
         self,
@@ -724,9 +798,7 @@ class GateDispatchCoordinator:
     ) -> None:
         """Record the accepting manager as job leader for a DC."""
         if manager_addr:
-            if job_id not in self._state._job_dc_managers:
-                self._state._job_dc_managers[job_id] = {}
-            self._state._job_dc_managers[job_id][datacenter] = manager_addr
+            self._state.set_job_dc_manager(job_id, datacenter, manager_addr)
 
 
 __all__ = ["GateDispatchCoordinator"]

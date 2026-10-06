@@ -29,9 +29,12 @@ un-fsynced volatile segments survived (torn, out of order). The
 durable job records were group-committed (fsynced) so recovery reads
 them unaffected — the reorder debris must simply never break replay.
 
-Timing pinned by probe (seed 101): submit 9.21, dispatch 9.25, restart
-9.4 (mid-run), gen-2 up 54.4, worker re-registered 60.4, completion
-observed 60.71.
+Timing pinned by probe (seed 101, 2026-10-04): submit 1.80, worker
+running [2.0, 2.5] with the client's completion at 2.38 when unfaulted,
+restart 2.0 (mid-run, 0.16 after dispatch as before). Submission was
+9.21 while the lone manager waited out a full pre-vote and vote wait for
+a majority its own vote already made (Raft section 5.2: a candidate
+leads once it holds one).
 """
 
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
@@ -43,7 +46,7 @@ from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
     worker_entry,
 )
 
-_RESTART_AT = 9.4
+_RESTART_AT = 2.0
 _DOWN_SECONDS = 45.0
 _CEILING = 220.0
 
@@ -87,10 +90,13 @@ def _assert_job_completed_across_restart(results: dict) -> None:
         f"the restart instant: {client_log}"
     )
 
+    # The client's own terminal -- what ``wait_for_job`` returned. (The
+    # sampled ``status-seen`` rows can miss a completion that lands between
+    # two samples: the sampler stops the moment the wait returns.)
     completions = [
         entry
         for entry in client_log
-        if entry[0] == "status-seen" and entry[1] == "completed"
+        if entry[0] == "job-finished" and entry[1] == "completed"
     ]
     assert completions, (
         f"client never observed completion across the restart: {client_log}"

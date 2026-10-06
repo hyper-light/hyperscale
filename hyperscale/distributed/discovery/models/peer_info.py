@@ -1,52 +1,21 @@
 """
 Peer information models for the discovery system.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import total_ordering
-
 from hyperscale.distributed.runtime import Clock, RealClock
 
+from .peer_health import PeerHealth
 
 _DEFAULT_CLOCK: Clock = RealClock()
-
-
-@total_ordering
-class PeerHealth(Enum):
-    """
-    Health status of a peer.
-
-    Ordering: HEALTHY > UNKNOWN > DEGRADED > UNHEALTHY > EVICTED
-    Higher values indicate better health.
-    """
-    EVICTED = ("evicted", 0)       # Removed from pool
-    UNHEALTHY = ("unhealthy", 1)   # Failed consecutive probes
-    DEGRADED = ("degraded", 2)     # High error rate or latency
-    UNKNOWN = ("unknown", 3)       # Not yet probed
-    HEALTHY = ("healthy", 4)       # Responding normally
-
-    def __init__(self, label: str, order: int) -> None:
-        self._label = label
-        self._order = order
-
-    @property
-    def value(self) -> str:
-        """Return the string value for serialization."""
-        return self._label
-
-    def __lt__(self, other: object) -> bool:
-        if not isinstance(other, PeerHealth):
-            return NotImplemented
-        return self._order < other._order
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, PeerHealth):
-            return NotImplemented
-        return self._order == other._order
-
-    def __hash__(self) -> int:
-        return hash(self._label)
 
 
 @dataclass(slots=True)
@@ -187,31 +156,6 @@ class PeerInfo:
             self.health = PeerHealth.HEALTHY
             self.health_weight = 1.0
 
-    def should_evict(
-        self,
-        error_rate_threshold: float,
-        consecutive_failure_limit: int,
-        latency_threshold_ms: float,
-    ) -> bool:
-        """
-        Check if this peer should be evicted from the connection pool.
-
-        Args:
-            error_rate_threshold: Max acceptable error rate
-            consecutive_failure_limit: Max consecutive failures
-            latency_threshold_ms: Max acceptable latency
-
-        Returns:
-            True if peer should be evicted
-        """
-        if self.consecutive_failures >= consecutive_failure_limit:
-            return True
-        if self.error_rate > error_rate_threshold:
-            return True
-        if self.ewma_latency_ms > latency_threshold_ms:
-            return True
-        return False
-
     def matches_locality(self, datacenter_id: str, region_id: str) -> tuple[bool, bool]:
         """
         Check locality match with given datacenter and region.
@@ -234,3 +178,10 @@ class PeerInfo:
             self.host == other.host and
             self.port == other.port
         )
+
+_REHOMED = (
+    PeerHealth,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -55,12 +55,12 @@ def _pending_workflow_in_backoff(remaining_seconds: float) -> PendingWorkflow:
     left at ``_NOW``.
 
     Built bare: the two helpers under test read exactly
-    ``dispatch_attempts`` / ``last_dispatch_attempt`` /
+    ``failed_dispatch_attempts`` / ``last_dispatch_attempt`` /
     ``next_retry_delay`` and nothing else (same bare-construction
     precedent as ``test_manager_restart_truth``).
     """
     pending_workflow = object.__new__(PendingWorkflow)
-    pending_workflow.dispatch_attempts = 1
+    pending_workflow.failed_dispatch_attempts = 1
     pending_workflow.next_retry_delay = _BACKOFF_DELAY_SECONDS
     pending_workflow.last_dispatch_attempt = (
         _NOW - (_BACKOFF_DELAY_SECONDS - remaining_seconds)
@@ -79,7 +79,7 @@ def test_epsilon_sits_between_float_artifacts_and_real_delays() -> None:
 
 def test_first_attempt_has_no_backoff() -> None:
     pending_workflow = object.__new__(PendingWorkflow)
-    pending_workflow.dispatch_attempts = 0
+    pending_workflow.failed_dispatch_attempts = 0
     pending_workflow.next_retry_delay = _BACKOFF_DELAY_SECONDS
     pending_workflow.last_dispatch_attempt = 0.0
     assert pending_workflow.is_retry_backoff_expired(_NOW) is True

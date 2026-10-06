@@ -9,19 +9,18 @@ Key responsibilities:
 - Handle extension requests with proper validation
 - Reset trackers when workers become healthy
 - Coordinate with the three-signal health model (AD-19)
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
 from hyperscale.distributed.runtime import Clock, RealClock
-
-
-_DEFAULT_CLOCK: Clock = RealClock()
 from typing import TYPE_CHECKING
-
-from hyperscale.distributed.health.alpha_posterior import (
-    HierarchicalAlphaTuner,
-    HierarchicalAlphaTunerConfig,
-)
+from hyperscale.distributed.health.alpha_posterior import HierarchicalAlphaTuner, HierarchicalAlphaTunerConfig
 from hyperscale.distributed.health.extension_decision import (
     ExtensionDecision,
     ExtensionDecisionConfig,
@@ -33,47 +32,20 @@ from hyperscale.distributed.health.extension_ledger import (
     ExtensionLedger,
     ExtensionLedgerConfig,
 )
-from hyperscale.distributed.health.extension_outcome import (
-    ExtensionOutcomeEvent,
-    ExtensionOutcomeKind,
-)
+from hyperscale.distributed.health.extension_outcome import ExtensionOutcomeEvent, ExtensionOutcomeKind
+from hyperscale.distributed.health.extension_tracker import ExtensionTracker, ExtensionTrackerConfig
+from hyperscale.distributed.health.progress_witness import ThroughputWitness
+from hyperscale.distributed.health.workflow_progress_snapshot import WorkflowProgressSnapshot
+from hyperscale.distributed.models import HealthcheckExtensionRequest, HealthcheckExtensionResponse
+from hyperscale.distributed.health.progress_witness import WitnessVerdictKind
+from hyperscale.distributed.health.extension_decision import ExtensionWitnessEvidence
+
+from .worker_health_manager_config import WorkerHealthManagerConfig
 
 if TYPE_CHECKING:
     from hyperscale.distributed.models.jobs import TimeoutTrackingState
-from hyperscale.distributed.health.extension_tracker import (
-    ExtensionTracker,
-    ExtensionTrackerConfig,
-)
-from hyperscale.distributed.health.progress_witness import ThroughputWitness
-from hyperscale.distributed.health.workflow_progress_snapshot import (
-    WorkflowProgressSnapshot,
-)
-from hyperscale.distributed.models import (
-    HealthcheckExtensionRequest,
-    HealthcheckExtensionResponse,
-)
 
-
-@dataclass(slots=True)
-class WorkerHealthManagerConfig:
-    """
-    Configuration for WorkerHealthManager.
-
-    Attributes:
-        base_deadline: Base deadline in seconds for extensions.
-        min_grant: Minimum extension grant in seconds.
-        max_extensions: Maximum extensions per worker per cycle.
-        eviction_threshold: Number of failed extensions before eviction.
-        warning_threshold: Remaining extensions to trigger warning notification.
-        grace_period: Seconds of grace after exhaustion before kill.
-    """
-
-    base_deadline: float = 30.0
-    min_grant: float = 1.0
-    max_extensions: int = 5
-    eviction_threshold: int = 3
-    warning_threshold: int = 1
-    grace_period: float = 10.0
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class WorkerHealthManager:
@@ -147,8 +119,8 @@ class WorkerHealthManager:
 
         # Phase H5 — multi-witness decision orchestrator. Lazy: a manager
         # without a witness wired in (e.g. unit tests) gets the legacy
-        # path; the production HealthAwareServer construction passes a
-        # witness so the full multi-witness logic activates.
+        # path; ManagerServer passes one, so the full multi-witness
+        # logic decides in production.
         self._throughput_witness: ThroughputWitness | None = throughput_witness
         self._decision_evaluator: ExtensionDecisionEvaluator | None = (
             ExtensionDecisionEvaluator(
@@ -294,12 +266,6 @@ class WorkerHealthManager:
             # legacy outcome so the caller's H7/H8 hooks see a
             # consistent shape.
             tracker = self._get_tracker(request.worker_id)
-            from hyperscale.distributed.health.extension_decision import (
-                ExtensionWitnessEvidence,
-            )
-            from hyperscale.distributed.health.progress_witness import (
-                WitnessVerdictKind,
-            )
             evidence = ExtensionWitnessEvidence(
                 progress_meaningful=response.granted,
                 progress_all_non_regressed=response.granted,
@@ -608,8 +574,11 @@ class WorkerHealthManager:
         }
 
     def forget_workflow(self, workflow_id: str) -> None:
-        """Drop H7 ledger state for a terminated workflow."""
+        """Drop H7 ledger state and H6 throughput streams for a
+        terminated workflow."""
         self._ledger.forget_workflow(workflow_id)
+        if self._throughput_witness is not None:
+            self._throughput_witness.forget_workflow(workflow_id)
 
     def forget_job(self, job_id: str) -> None:
         """Cascade-drop H7 ledger state for a terminated job."""
@@ -657,6 +626,8 @@ class WorkerHealthManager:
         # closes the H8 outcome-feedback loop: every workflow owned
         # by the worker is implicitly resolved as "worker_lost".
         self._ledger.forget_worker(worker_id)
+        if self._throughput_witness is not None:
+            self._throughput_witness.forget_worker(worker_id)
 
     def should_evict_worker(self, worker_id: str) -> tuple[bool, str | None]:
         """
@@ -760,3 +731,10 @@ class WorkerHealthManager:
         return sum(
             1 for tracker in self._trackers.values() if tracker.extension_count > 0
         )
+
+_REHOMED = (
+    WorkerHealthManagerConfig,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

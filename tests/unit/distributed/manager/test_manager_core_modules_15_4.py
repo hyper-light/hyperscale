@@ -25,6 +25,8 @@ from unittest.mock import MagicMock, AsyncMock
 
 from hyperscale.distributed.jobs import WindowedStatsCollector
 from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.slo import SLOConfig
 from hyperscale.distributed.nodes.manager.config import ManagerConfig
 from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
 from hyperscale.distributed.reliability import StatsBuffer, StatsBufferConfig
@@ -49,7 +51,7 @@ from hyperscale.distributed.nodes.manager.stats import (
 @pytest.fixture
 def manager_state():
     """Create a fresh ManagerState for testing."""
-    state = ManagerState()
+    state = ManagerState(slo_config=SLOConfig.from_env(Env()))
     state.initialize_locks()
     return state
 
@@ -124,7 +126,7 @@ def mock_worker_registration():
 class TestManagerRegistryHappyPath:
     """Happy path tests for ManagerRegistry."""
 
-    def test_register_worker(
+    async def test_register_worker(
         self,
         manager_state,
         manager_config,
@@ -139,15 +141,16 @@ class TestManagerRegistryHappyPath:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
-        registry.register_worker(mock_worker_registration)
+        await registry.register_worker(mock_worker_registration)
 
         assert "worker-test-123" in manager_state._workers
         assert ("10.0.0.100", 6000) in manager_state._worker_addr_to_id
         assert "worker-test-123" in manager_state._worker_circuits
 
-    def test_unregister_worker(
+    async def test_unregister_worker(
         self,
         manager_state,
         manager_config,
@@ -162,15 +165,16 @@ class TestManagerRegistryHappyPath:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
-        registry.register_worker(mock_worker_registration)
+        await registry.register_worker(mock_worker_registration)
         registry.unregister_worker("worker-test-123")
 
         assert "worker-test-123" not in manager_state._workers
         assert ("10.0.0.100", 6000) not in manager_state._worker_addr_to_id
 
-    def test_get_worker(
+    async def test_get_worker(
         self,
         manager_state,
         manager_config,
@@ -185,9 +189,10 @@ class TestManagerRegistryHappyPath:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
-        registry.register_worker(mock_worker_registration)
+        await registry.register_worker(mock_worker_registration)
 
         result = registry.get_worker("worker-test-123")
         assert result is mock_worker_registration
@@ -195,7 +200,7 @@ class TestManagerRegistryHappyPath:
         result_none = registry.get_worker("nonexistent")
         assert result_none is None
 
-    def test_get_worker_by_addr(
+    async def test_get_worker_by_addr(
         self,
         manager_state,
         manager_config,
@@ -210,14 +215,15 @@ class TestManagerRegistryHappyPath:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
-        registry.register_worker(mock_worker_registration)
+        await registry.register_worker(mock_worker_registration)
 
         result = registry.get_worker_by_addr(("10.0.0.100", 6000))
         assert result is mock_worker_registration
 
-    def test_get_healthy_worker_ids(
+    async def test_get_healthy_worker_ids(
         self,
         manager_state,
         manager_config,
@@ -232,9 +238,10 @@ class TestManagerRegistryHappyPath:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
-        registry.register_worker(mock_worker_registration)
+        await registry.register_worker(mock_worker_registration)
 
         healthy = registry.get_healthy_worker_ids()
         assert "worker-test-123" in healthy
@@ -249,7 +256,7 @@ class TestManagerRegistryHappyPath:
 class TestManagerRegistryGateManagement:
     """Tests for gate management in ManagerRegistry."""
 
-    def test_register_gate(
+    async def test_register_gate(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can register a gate."""
@@ -259,17 +266,18 @@ class TestManagerRegistryGateManagement:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         gate_info = MagicMock()
         gate_info.node_id = "gate-123"
 
-        registry.register_gate(gate_info)
+        await registry.register_gate(gate_info)
 
         assert "gate-123" in manager_state._known_gates
         assert "gate-123" in manager_state._healthy_gate_ids
 
-    def test_unregister_gate(
+    async def test_unregister_gate(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can unregister a gate."""
@@ -279,18 +287,19 @@ class TestManagerRegistryGateManagement:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         gate_info = MagicMock()
         gate_info.node_id = "gate-123"
 
-        registry.register_gate(gate_info)
+        await registry.register_gate(gate_info)
         registry.unregister_gate("gate-123")
 
         assert "gate-123" not in manager_state._known_gates
         assert "gate-123" not in manager_state._healthy_gate_ids
 
-    def test_mark_gate_unhealthy(
+    async def test_mark_gate_unhealthy(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can mark gate as unhealthy."""
@@ -300,18 +309,19 @@ class TestManagerRegistryGateManagement:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         gate_info = MagicMock()
         gate_info.node_id = "gate-123"
 
-        registry.register_gate(gate_info)
+        await registry.register_gate(gate_info)
         registry.mark_gate_unhealthy("gate-123")
 
         assert "gate-123" not in manager_state._healthy_gate_ids
         assert "gate-123" in manager_state._gate_unhealthy_since
 
-    def test_mark_gate_healthy(
+    async def test_mark_gate_healthy(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can mark gate as healthy."""
@@ -321,12 +331,13 @@ class TestManagerRegistryGateManagement:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         gate_info = MagicMock()
         gate_info.node_id = "gate-123"
 
-        registry.register_gate(gate_info)
+        await registry.register_gate(gate_info)
         registry.mark_gate_unhealthy("gate-123")
         registry.mark_gate_healthy("gate-123")
 
@@ -337,7 +348,7 @@ class TestManagerRegistryGateManagement:
 class TestManagerRegistryHealthBuckets:
     """Tests for AD-17 health bucket selection."""
 
-    def test_get_workers_by_health_bucket(
+    async def test_get_workers_by_health_bucket(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Workers are bucketed by health state."""
@@ -347,6 +358,7 @@ class TestManagerRegistryHealthBuckets:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         health_states: dict[str, str] = {}
@@ -369,7 +381,7 @@ class TestManagerRegistryHealthBuckets:
             reg.node = node
             reg.total_cores = 4
 
-            registry.register_worker(reg)
+            await registry.register_worker(reg)
             health_states[worker_id] = health_state
 
         original_get_health = registry.get_worker_health_state
@@ -394,7 +406,7 @@ class TestManagerRegistryHealthBuckets:
 class TestManagerLeaseCoordinatorHappyPath:
     """Happy path tests for ManagerLeaseCoordinator."""
 
-    def test_claim_job_leadership(
+    async def test_claim_job_leadership(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can claim job leadership."""
@@ -406,14 +418,14 @@ class TestManagerLeaseCoordinatorHappyPath:
             task_runner=mock_task_runner,
         )
 
-        result = leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
+        result = await leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
 
         assert result is True
         assert leases.is_job_leader("job-123") is True
         assert leases.get_job_leader("job-123") == "manager-1"
         assert leases.get_job_leader_addr("job-123") == ("127.0.0.1", 8000)
 
-    def test_cannot_claim_if_other_leader(
+    async def test_cannot_claim_if_other_leader(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Cannot claim leadership if another manager is leader."""
@@ -428,7 +440,7 @@ class TestManagerLeaseCoordinatorHappyPath:
         # Set another manager as leader
         manager_state._job_leaders["job-123"] = "manager-2"
 
-        result = leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
+        result = await leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
 
         assert result is False
         assert leases.get_job_leader("job-123") == "manager-2"
@@ -449,7 +461,7 @@ class TestManagerLeaseCoordinatorFencing:
             task_runner=mock_task_runner,
         )
 
-        leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
+        await leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
 
         token1 = leases.get_fence_token("job-123")
         assert token1 == 1
@@ -473,38 +485,18 @@ class TestManagerLeaseCoordinatorFencing:
             task_runner=mock_task_runner,
         )
 
-        leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
+        await leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
         await leases.increment_fence_token("job-123")
 
         assert leases.validate_fence_token("job-123", 2) is True
         assert leases.validate_fence_token("job-123", 3) is True
         assert leases.validate_fence_token("job-123", 1) is False
 
-    def test_layer_version_increments(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
-    ):
-        """Layer version increments correctly."""
-        leases = ManagerLeaseCoordinator(
-            state=manager_state,
-            config=manager_config,
-            logger=mock_logger,
-            node_id="manager-1",
-            task_runner=mock_task_runner,
-        )
-
-        leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
-
-        version1 = leases.get_layer_version("job-123")
-        assert version1 == 0
-
-        version2 = leases.increment_layer_version("job-123")
-        assert version2 == 1
-
 
 class TestManagerLeaseCoordinatorEdgeCases:
     """Edge case tests for ManagerLeaseCoordinator."""
 
-    def test_get_led_job_ids(
+    async def test_get_led_job_ids(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can get list of jobs we lead."""
@@ -516,8 +508,8 @@ class TestManagerLeaseCoordinatorEdgeCases:
             task_runner=mock_task_runner,
         )
 
-        leases.claim_job_leadership("job-1", ("127.0.0.1", 8000))
-        leases.claim_job_leadership("job-2", ("127.0.0.1", 8000))
+        await leases.claim_job_leadership("job-1", ("127.0.0.1", 8000))
+        await leases.claim_job_leadership("job-2", ("127.0.0.1", 8000))
         manager_state._job_leaders["job-3"] = "manager-2"  # Different leader
 
         led_jobs = leases.get_led_job_ids()
@@ -539,15 +531,13 @@ class TestManagerLeaseCoordinatorEdgeCases:
             task_runner=mock_task_runner,
         )
 
-        leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
+        await leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
         await leases.increment_fence_token("job-123")
-        leases.increment_layer_version("job-123")
 
         leases.clear_job_leases("job-123")
 
         assert leases.get_job_leader("job-123") is None
         assert leases.get_fence_token("job-123") == 0
-        assert leases.get_layer_version("job-123") == 0
 
 
 # =============================================================================
@@ -569,6 +559,7 @@ class TestManagerHealthMonitorHappyPath:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         monitor = ManagerHealthMonitor(
@@ -595,6 +586,7 @@ class TestManagerHealthMonitorHappyPath:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         monitor = ManagerHealthMonitor(
@@ -621,6 +613,7 @@ class TestManagerHealthMonitorHappyPath:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         monitor = ManagerHealthMonitor(
@@ -658,6 +651,7 @@ class TestManagerHealthMonitorJobSuspicion:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         monitor = ManagerHealthMonitor(
@@ -684,6 +678,7 @@ class TestManagerHealthMonitorJobSuspicion:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            on_worker_unregistered=lambda worker_id: None,
         )
 
         monitor = ManagerHealthMonitor(
@@ -786,33 +781,6 @@ class TestManagerStatsCoordinatorHappyPath:
 
 class TestManagerStatsCoordinatorProgressState:
     """Tests for AD-19 progress state tracking."""
-
-    def test_get_progress_state_normal(
-        self,
-        manager_state,
-        manager_config,
-        mock_logger,
-        mock_task_runner,
-        stats_buffer,
-        windowed_stats,
-    ):
-        """Progress state is NORMAL when no workers."""
-        stats = ManagerStatsCoordinator(
-            state=manager_state,
-            config=manager_config,
-            logger=mock_logger,
-            node_id="manager-1",
-            task_runner=mock_task_runner,
-            stats_buffer=stats_buffer,
-            windowed_stats=windowed_stats,
-            clock=RealClock(),
-            get_healthy_worker_count=lambda: len(manager_state._workers),
-        )
-
-        # With no workers and no dispatches, should be NORMAL
-        state = stats.get_progress_state()
-        assert state == ProgressState.NORMAL
-
 
 class TestManagerStatsCoordinatorBackpressure:
     """Tests for AD-23 backpressure."""
@@ -955,8 +923,8 @@ class TestCoreModulesConcurrency:
         )
 
         # Simulate race condition
-        result1 = leases1.claim_job_leadership("job-race", ("10.0.0.1", 8000))
-        result2 = leases2.claim_job_leadership("job-race", ("10.0.0.2", 8000))
+        result1 = await leases1.claim_job_leadership("job-race", ("10.0.0.1", 8000))
+        result2 = await leases2.claim_job_leadership("job-race", ("10.0.0.2", 8000))
 
         # Only one should succeed
         assert result1 is True
@@ -975,7 +943,7 @@ class TestCoreModulesConcurrency:
             task_runner=mock_task_runner,
         )
 
-        leases.claim_job_leadership("job-fence", ("127.0.0.1", 8000))
+        await leases.claim_job_leadership("job-fence", ("127.0.0.1", 8000))
 
         async def increment_many():
             for _ in range(100):
