@@ -9,7 +9,7 @@ Gates coordinate job execution across datacenters:
 - Accept jobs from clients
 - Dispatch jobs to datacenter managers
 - Aggregate global job status
-- Handle cross-DC retry with leases
+- Handle cross-DC retry under per-job leadership and fencing tokens
 - Provide the global job view to clients
 
 Protocols:
@@ -21,7 +21,7 @@ Protocols:
   - Job submission from clients
   - Job dispatch to managers
   - Status aggregation from managers
-  - Lease coordination between gates
+  - Job leadership replication between gates
 
 Module Structure:
 - Coordinators: Business logic (leadership, dispatch, stats, cancellation, peer, health)
@@ -186,7 +186,6 @@ from hyperscale.distributed.idempotency import (
 from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
     DatacenterOverloadConfig,
-    LeaseManager as DatacenterLeaseManager,
     CrossDCCorrelationDetector,
 )
 from hyperscale.distributed.protocol.version import (
@@ -304,7 +303,7 @@ class GateServer(HealthAwareServer):
     - Accept job submissions from clients (TCP)
     - Dispatch jobs to managers in target datacenters (TCP)
     - Aggregate global job status across DCs (TCP)
-    - Manage leases for at-most-once semantics
+    - Fence each job's dispatches (per-job leadership, AD-40 idempotency) for at-most-once semantics
     """
 
     def __init__(
@@ -318,7 +317,6 @@ class GateServer(HealthAwareServer):
         datacenter_manager_udp: dict[str, list[tuple[str, int]]] | None = None,
         gate_peers: list[tuple[str, int]] | None = None,
         gate_udp_peers: list[tuple[str, int]] | None = None,
-        lease_timeout: float = 30.0,
         incarnation_storage_dir: str | None = None,
         wal_data_dir: Path | None = None,
         *,
@@ -340,7 +338,6 @@ class GateServer(HealthAwareServer):
             datacenter_manager_udp: DC -> manager UDP addresses mapping
             gate_peers: Peer gate TCP addresses
             gate_udp_peers: Peer gate UDP addresses
-            lease_timeout: Lease timeout in seconds
         """
         super().__init__(
             host=host,
@@ -513,7 +510,6 @@ class GateServer(HealthAwareServer):
             cleanup_interval=env.JOB_LEASE_CLEANUP_INTERVAL,
             # As long as the gate keeps the job itself.
             released_retention_seconds=env.FAILED_JOB_MAX_AGE,
-            logger=self._udp_logger,
         )
 
         # Windowed stats
@@ -603,12 +599,6 @@ class GateServer(HealthAwareServer):
             get_observed_latency=self._blended_scorer.get_observed_latency,
         )
 
-        # Datacenter lease manager
-        self._dc_lease_manager = DatacenterLeaseManager(
-            node_id="",
-            lease_timeout=lease_timeout,
-        )
-
         # Orphan job tracking
         self._orphan_grace_period: float = derive_gate_orphan_grace_seconds(env)
         self._orphan_check_interval: float = env.GATE_ORPHAN_CHECK_INTERVAL
@@ -656,7 +646,6 @@ class GateServer(HealthAwareServer):
         self._recovery_semaphore = asyncio.Semaphore(env.RECOVERY_MAX_CONCURRENT)
 
         # Configuration
-        self._lease_timeout = lease_timeout
         # Terminal-job retention (was a literal 3600.0, the same value
         # as this setting's default; now configurable like the manager's).
         self._job_max_age: float = env.FAILED_JOB_MAX_AGE
@@ -1339,7 +1328,6 @@ class GateServer(HealthAwareServer):
         self._job_leadership_tracker.node_id = self._node_id.full
         self._job_leadership_tracker.node_addr = (self._host, self._tcp_port)
         self._job_lease_manager.node_id = self._node_id.full
-        self._dc_lease_manager.set_node_id(self._node_id.full)
 
         await self._job_hash_ring.add_node(
             node_id=self._node_id.full,
@@ -1390,12 +1378,7 @@ class GateServer(HealthAwareServer):
 
         await self._dc_health_monitor.start()
 
-        # Start job lease manager cleanup
-
         # Start background tasks
-        # An expired lease is an orphan candidate from the cleanup's first
-        # pass on (the cleanup starts with the background loops).
-        self._job_lease_manager.set_on_lease_expired(self._orphan_job_coordinator.on_lease_expired)
         self._start_background_loops()
 
         # Start timeout tracker (AD-34)
@@ -1560,7 +1543,6 @@ class GateServer(HealthAwareServer):
 
     def _start_background_loops(self) -> None:
         loops = [
-            self._lease_cleanup_loop,
             self._job_cleanup_loop,
             self._rate_limit_cleanup_loop,
             self._batch_stats_loop,
@@ -1571,7 +1553,7 @@ class GateServer(HealthAwareServer):
             self._resource_sampling_loop,
             # AD-28 discovery maintenance.
             self._discovery_maintenance_loop,
-            # Job lease expiry (AD-31 orphan detection).
+            # Job lease expiry, and forgetting ended leases.
             self._job_lease_manager.run_cleanup,
         ]
         if self._gate_udp_peers:
@@ -1866,20 +1848,6 @@ class GateServer(HealthAwareServer):
         """Handle state sync request from peer gate."""
         if self._accepting_requests:
             return await self._state_sync_handler.handle_state_sync_request(
-                addr, data, self.handle_exception
-            )
-        return b"error"
-
-    @tcp.receive()
-    async def lease_transfer(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ):
-        """Handle lease transfer during gate scaling."""
-        if self._accepting_requests:
-            return await self._state_sync_handler.handle_lease_transfer(
                 addr, data, self.handle_exception
             )
         return b"error"
@@ -9224,15 +9192,6 @@ class GateServer(HealthAwareServer):
     # Background Tasks
     # =========================================================================
 
-    async def _lease_cleanup_loop(self) -> None:
-        """Periodically clean up expired leases."""
-        while self._running:
-            if not await self._run_background_loop_pass(
-                self._lease_cleanup_pass,
-                lambda error: self.handle_exception(error, "lease_cleanup_loop"),
-            ):
-                break
-
     async def _run_background_loop_pass(
         self,
         run_pass: Callable[[], Awaitable[bool]],
@@ -9247,12 +9206,6 @@ class GateServer(HealthAwareServer):
             return False
         except Exception as error:
             await on_error(error)
-        return True
-
-    async def _lease_cleanup_pass(self) -> bool:
-        """One lease cleanup pass: wait half a lease timeout, then drop expired leases."""
-        await self._clock.sleep(self._lease_timeout / 2)
-        self._dc_lease_manager.cleanup_expired()
         return True
 
     def _get_expired_terminal_jobs(self, now: float) -> list[str]:

@@ -96,7 +96,6 @@ async def run_gate_1():
         gate_udp_peers=gate_peers_udp,
         datacenter_managers=datacenter_managers_tcp,
         datacenter_manager_udp=datacenter_managers_udp,
-        lease_timeout=30.0,
     )
     
     await server.start()
@@ -141,7 +140,6 @@ async def run_gate_1():
             # Job status
             print(f"\n  Jobs:")
             print(f"    Active: {len(server._jobs)}")
-            print(f"    Leases: {len(server._leases)}")
             
     except asyncio.CancelledError:
         print("\n[Gate 1] Shutting down...")

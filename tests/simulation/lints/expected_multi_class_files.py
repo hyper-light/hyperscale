@@ -68,7 +68,7 @@ EXPECTED_MULTI_CLASS_FILES: dict[str, int] = {
     'hyperscale/core/runtime/filesystem.py': 2,
     'hyperscale/core/runtime/real_filesystem.py': 2,
     'hyperscale/logging/exceptions.py': 7,
-    'hyperscale/logging/hyperscale_logging_models.py': 69,
+    'hyperscale/logging/hyperscale_logging_models.py': 68,
     'hyperscale/reporting/cloudwatch/cloudwatch_config.py': 2,
     'hyperscale/reporting/time_aligned_results.py': 3,
     'hyperscale/tools/filesystem/base.py': 2,

@@ -43,7 +43,6 @@ if TYPE_CHECKING:
     )
     from hyperscale.distributed.jobs import JobLeadershipTracker
     from hyperscale.distributed.jobs.gates import GateJobManager
-    from hyperscale.distributed.leases import JobLease
     from hyperscale.distributed.taskex import TaskRunner
 
 
@@ -342,45 +341,6 @@ class GateOrphanJobCoordinator:
         self._orphan_due_at.pop(job_id, None)
         self._orphan_due_heartbeats.pop(job_id, None)
         self._takeover_extensions.pop(job_id, None)
-
-    async def on_lease_expired(self, lease: "JobLease") -> None:
-        """
-        Handle expired job lease callback from LeaseManager.
-
-        When a job lease expires without renewal, it indicates the owning
-        gate may have failed. This marks the job as potentially orphaned
-        for evaluation during the next check cycle.
-
-        Args:
-            lease: The expired job lease
-        """
-        job_id = lease.job_id
-        owner_node = lease.owner_node
-
-        if owner_node == self._get_node_id().full:
-            return
-
-        now = self._clock.monotonic()
-        if not self._state.is_job_orphaned(job_id):
-            self._state.mark_job_orphaned(
-                job_id,
-                now,
-                self._known_gate_addr(owner_node),
-            )
-
-            await self._logger.log(
-                ServerDebug(
-                    message=f"Job {job_id[:8]}... lease expired (owner={owner_node[:8]}...), marked for orphan check",
-                    node_host=self._get_node_addr()[0],
-                    node_port=self._get_node_addr()[1],
-                    node_id=self._get_node_id().short,
-                ),
-            )
-
-    def _known_gate_addr(self, node_id: str) -> tuple[str, int] | None:
-        """The TCP address of a gate this gate knows, else None."""
-        owner_gate = self._state.get_known_gate(node_id)
-        return (owner_gate.tcp_host, owner_gate.tcp_port) if owner_gate is not None else None
 
     async def _send_job_status_push_with_retry(
         self,

@@ -14,18 +14,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Awaitable, Callable
 from hyperscale.distributed.runtime import Clock, RealClock
-from hyperscale.logging.hyperscale_logging_models import JobLeaseExpiryCallbackFailed
 
 from .job_lease_shared import _DEFAULT_CLOCK
 from .job_lease_model import JobLease
 from .job_lease_manager import JobLeaseManager
-from .lease_acquisition_result import LeaseAcquisitionResult
 from .lease_state import LeaseState
 
 _REHOMED = (
     LeaseState,
     JobLease,
-    LeaseAcquisitionResult,
     JobLeaseManager,
 )
 

@@ -612,13 +612,3 @@ class StaleObservationsDecayed(Entry, kw_only=True):
 
     datacenter_ids: list[str]
     level: LogLevel = LogLevel.INFO
-
-
-class JobLeaseExpiryCallbackFailed(Entry, kw_only=True):
-    """A job lease's expiry handling raised: the lease expired, but what was
-    to follow it (an orphan check, say) did not run for this job."""
-
-    node_id: str
-    job_id: str
-    error_type: str
-    level: LogLevel = LogLevel.ERROR

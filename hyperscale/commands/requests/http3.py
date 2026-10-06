@@ -38,6 +38,7 @@ async def make_http3_request(
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
+    verify_tls: bool = True,
 ):
     
     timeouts = Timeouts(request_timeout=timeout)
@@ -45,7 +46,7 @@ async def make_http3_request(
         timeouts=timeouts,
     )
 
-    http3 = setup_client(http3, 1)
+    http3 = setup_client(http3, 1, verify_tls=verify_tls)
     terminal = create_ping_ui(
         url,
         method,

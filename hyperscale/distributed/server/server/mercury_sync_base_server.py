@@ -12,7 +12,7 @@ try:
 except ImportError:
     # Windows reports no per-process descriptor limit: no cap.
     resource = None
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import (
@@ -79,12 +79,8 @@ from hyperscale.distributed.reliability.load_shedding import (
     classify_handler_to_priority,
 )
 from hyperscale.distributed.server.events import LamportClock
-from hyperscale.distributed.server.hooks.task import (
-    TaskCall,
-)
 
 from hyperscale.distributed.taskex import TaskRunner
-from hyperscale.distributed.taskex.run import Run
 from hyperscale.core.jobs.protocols.constants import (
     MAX_DECOMPRESSED_SIZE,
     MAX_MESSAGE_SIZE,
@@ -374,13 +370,6 @@ class MercurySyncBaseServer(Generic[T]):
             Handler,
         ] = {}
 
-        self.task_handlers: dict[str, TaskCall] = {}
-
-        self._tasks: dict[
-            str,
-            TaskCall,
-        ] = {}
-
         # Initialize TaskRunner eagerly so subclasses' `__init__` (and any
         # submodule they construct that captures `self._task_runner` by
         # reference) see a usable value. The previous pattern of leaving
@@ -390,7 +379,6 @@ class MercurySyncBaseServer(Generic[T]):
         # attribute 'run'`. ``TaskRunner.__init__`` does not require a
         # running event loop.
         self._task_runner: TaskRunner = TaskRunner(0, env)
-        self._task_runs: dict[str, list[Run]] = defaultdict(list)
 
     @staticmethod
     def _build_host_address_resolver(
@@ -544,7 +532,6 @@ class MercurySyncBaseServer(Generic[T]):
 
         self._get_tcp_hooks()
         self._get_udp_hooks()
-        self._get_task_hooks()
 
         # Mark server as running before starting network listeners
         self._running = True
@@ -565,7 +552,6 @@ class MercurySyncBaseServer(Generic[T]):
             raise
 
         self._start_server_maintenance_loops()
-        self._run_on_start_tasks()
 
     def _ensure_loggers(self) -> None:
         """Create the TCP and UDP loggers a subclass left unset."""
@@ -642,27 +628,6 @@ class MercurySyncBaseServer(Generic[T]):
             self._udp_server_cleanup_task = self._loop.create_task(
                 self._cleanup_udp_server_tasks()
             )
-
-    def _run_on_start_tasks(self) -> None:
-        """Run every task hook triggered on start, keeping its run."""
-        for task_name, task in self._tasks.items():
-            if task.trigger == "ON_START":
-                run = self._task_runner.run(
-                    task.call,
-                    *task.args,
-                    alias=task.alias,
-                    run_id=task.run_id,
-                    timeout=task.timeout,
-                    schedule=task.schedule,
-                    trigger=task.trigger,
-                    repeat=task.repeat,
-                    keep=task.keep,
-                    max_age=task.max_age,
-                    keep_policy=task.keep_policy,
-                    **task.kwargs,
-                )
-
-                self._task_runs[task_name].append(run)
 
     async def _start_udp_server(
         self,
@@ -1060,16 +1025,6 @@ class MercurySyncBaseServer(Generic[T]):
             self._udp_handler_admission_groups[encoded_hook_name] = (
                 hook_admission_group
             )
-
-    def _get_task_hooks(self):
-        hooks: Dict[str, Handler] = self._hooks_of_type("task")
-
-        for hook in hooks.values():
-            hook = hook.__get__(self, self.__class__)
-            setattr(self, hook.__name__, hook)
-
-            if isinstance(hook, TaskCall):
-                self.task_handlers[hook.__name__] = hook
 
     async def _connect_tcp_client(
         self,

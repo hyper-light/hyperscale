@@ -38,6 +38,7 @@ async def make_tcp_request(
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
+    verify_tls: bool = True,
 ):
     
     if method is None or method not in ["send", "receive", "bidirectional"]:
@@ -49,7 +50,7 @@ async def make_tcp_request(
         timeouts=timeouts,
     )
 
-    tcp = setup_client(tcp, 1)
+    tcp = setup_client(tcp, 1, verify_tls=verify_tls)
     terminal = create_ping_ui(
         url,
         method,

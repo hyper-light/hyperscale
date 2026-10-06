@@ -22,13 +22,14 @@ async def make_smtp_request(
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
+    verify_tls: bool = True,
 
 ):
 
     timeouts = Timeouts(request_timeout=timeout)
 
     smtp = MercurySyncSMTPConnection(timeouts=timeouts)
-    smtp = setup_client(smtp, 1)
+    smtp = setup_client(smtp, 1, verify_tls=verify_tls)
 
     terminal = create_ping_ui(
         url,

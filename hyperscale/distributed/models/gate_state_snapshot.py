@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from .message import Message
 
 if TYPE_CHECKING:
-    from .datacenter_lease import DatacenterLease
     from .datacenter_status import DatacenterStatus
     from .global_job_status import GlobalJobStatus
     from .job_submission import JobSubmission
@@ -28,7 +27,6 @@ class GateStateSnapshot(Message):
     version: int  # State version
     jobs: dict[str, "GlobalJobStatus"] = field(default_factory=dict)
     datacenter_status: dict[str, "DatacenterStatus"] = field(default_factory=dict)
-    leases: dict[str, "DatacenterLease"] = field(default_factory=dict)
     # Manager discovery - shared between gates
     datacenter_managers: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     datacenter_manager_udp: dict[str, list[tuple[str, int]]] = field(

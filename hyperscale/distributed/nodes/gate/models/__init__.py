@@ -7,7 +7,6 @@ Shared protocol message models remain in distributed_rewrite/models/.
 
 from .gate_peer_state import GatePeerState, GatePeerTracking
 from .dc_health_state import DCHealthState, ManagerTracking
-from .lease_state import LeaseState, LeaseTracking
 from .transient_dispatch_error import TransientDispatchError
 
 __all__ = [
@@ -15,7 +14,5 @@ __all__ = [
     "GatePeerTracking",
     "DCHealthState",
     "ManagerTracking",
-    "LeaseState",
-    "LeaseTracking",
     "TransientDispatchError",
 ]

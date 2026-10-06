@@ -174,6 +174,7 @@ async def ftp(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off GraphQL request
@@ -187,6 +188,7 @@ async def ftp(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
     
     if lookup:
@@ -210,6 +212,7 @@ async def ftp(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
 
     )
 
@@ -235,6 +238,7 @@ async def graphql(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off GraphQL request
@@ -249,6 +253,7 @@ async def graphql(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -274,6 +279,7 @@ async def graphql(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
 
     )
 
@@ -299,6 +305,7 @@ async def graphqlh2(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off GraphQL HTTP2 request
@@ -313,6 +320,7 @@ async def graphqlh2(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -338,6 +346,7 @@ async def graphqlh2(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
 
     )
 
@@ -370,6 +379,7 @@ async def http(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off HTTP request
@@ -386,6 +396,7 @@ async def http(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -419,6 +430,7 @@ async def http(
             output_file=filepath,
             wait=wait,
             quiet=quiet,
+            verify_tls=not insecure,
 
         )
     
@@ -455,6 +467,7 @@ async def http2(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off HTTP2 request
@@ -473,6 +486,7 @@ async def http2(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -504,6 +518,7 @@ async def http2(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
     )
 
 
@@ -535,6 +550,7 @@ async def http3(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off HTTP3 request
@@ -551,6 +567,7 @@ async def http3(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -582,6 +599,7 @@ async def http3(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
     )
 
 @ping.command()
@@ -708,6 +726,7 @@ async def smtp(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off SMTP request
@@ -722,6 +741,7 @@ async def smtp(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_smtp_prefix(url):
@@ -748,6 +768,7 @@ async def smtp(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
 
     )
         
@@ -769,6 +790,7 @@ async def tcp(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off TCP request
@@ -782,6 +804,7 @@ async def tcp(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if lookup:
@@ -803,6 +826,7 @@ async def tcp(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
     )
         
 
@@ -893,6 +917,7 @@ async def websocket(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off request using one of the supported client types
@@ -909,6 +934,7 @@ async def websocket(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_websocket_prefix(url):
@@ -941,5 +967,6 @@ async def websocket(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
     )
             

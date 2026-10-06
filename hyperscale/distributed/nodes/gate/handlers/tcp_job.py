@@ -33,7 +33,6 @@ from hyperscale.distributed.jobs.workflow_dependencies import (
     validate_workflow_dependencies,
 )
 from hyperscale.distributed.leases import JobLeaseManager
-from hyperscale.distributed.leases.lease_acquisition_result import LeaseAcquisitionResult
 from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
     ProtocolVersion,
@@ -801,14 +800,8 @@ class GateJobHandler:
     ) -> bytes:
         """Acquire the job's lease, refuse while the gate quorum is unhealthy,
         and place the job."""
-        lease_result = await self._job_lease_manager.acquire(submission.job_id)
-        if (refusal := self._lease_refusal(submission, negotiated_caps_str, lease_result)) is not None:
-            return refusal
-
-        lease = lease_result.lease
+        lease = await self._job_lease_manager.acquire(submission.job_id)
         held_lease_job_ids.append(submission.job_id)
-        lease_duration = lease.lease_duration
-        fence_token = lease.fence_token
 
         await self._raise_if_quorum_circuit_open(submission)
         await self._raise_if_quorum_unavailable(submission, active_gate_peer_count)
@@ -817,47 +810,11 @@ class GateJobHandler:
             submission,
             negotiated_caps_str,
             workflow_ids,
-            lease_duration,
-            fence_token,
+            lease.lease_duration,
+            lease.fence_token,
             claimed_idempotency_keys,
             owned_idempotency_keys,
         )
-
-    @staticmethod
-    def _lease_refusal(
-        submission: JobSubmission,
-        negotiated_caps_str: str,
-        lease_result: LeaseAcquisitionResult,
-    ) -> bytes | None:
-        """Refuse when another gate holds the job's lease, or acquisition
-        returned none."""
-        if not lease_result.success:
-            error_message = (
-                f"Job lease held by {lease_result.current_owner} "
-                f"(expires in {lease_result.expires_in:.1f}s)"
-            )
-            error_ack = JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error=error_message,
-                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                capabilities=negotiated_caps_str,
-            ).dump()
-            return error_ack
-
-        if lease_result.lease is None:
-            error_ack = JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error="Lease acquisition did not return a lease",
-                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                capabilities=negotiated_caps_str,
-            ).dump()
-            return error_ack
-
-        return None
 
     async def _raise_if_quorum_circuit_open(self, submission: JobSubmission) -> None:
         """Release the lease and raise while the quorum circuit is open."""

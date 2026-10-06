@@ -23,8 +23,8 @@ _CONTROL_HANDLERS: frozenset[str] = frozenset(
         # A gate's decision to time a job out (AD-34): a lifecycle command,
         # as cancellation is
         "job_global_timeout",
-        # Leadership and its transfer: who owns a job, a datacenter or a
-        # lease -- losing one strands the work it names
+        # Leadership and its transfer: who owns a job or a datacenter --
+        # losing one strands the work it names
         "job_leader_gate_transfer",
         "job_leader_manager_transfer",
         "job_leader_worker_transfer",
@@ -33,7 +33,6 @@ _CONTROL_HANDLERS: frozenset[str] = frozenset(
         "receive_manager_job_leader_transfer",
         "job_leadership_announcement",
         "dc_leader_announcement",
-        "lease_transfer",
         "workflow_reassignment",
         # Membership: operator joins, evictions, and the liveness check a
         # recovered peer must pass before it is re-admitted

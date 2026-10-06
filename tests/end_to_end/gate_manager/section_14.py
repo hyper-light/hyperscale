@@ -1,6 +1,7 @@
 import asyncio
 import re
 
+from hyperscale.distributed.leases import JobLeaseManager
 from hyperscale.distributed.nodes.gate import GateServer
 
 from tests.end_to_end.workflows.base_scenario_workflow import BaseScenarioWorkflow
@@ -97,8 +98,7 @@ async def validate_14_1_lease_acquisition() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        state = gate._modular_state
-        assert isinstance(state._leases, dict), "Lease acquisition expected leases"
+        assert isinstance(gate._job_lease_manager, JobLeaseManager), "Lease acquisition expected leases"
     finally:
         await runtime.stop_cluster()
 
@@ -115,8 +115,7 @@ async def validate_14_1_lease_renewal() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        state = gate._modular_state
-        assert isinstance(state._leases, dict), "Lease renewal expected leases"
+        assert isinstance(gate._job_lease_manager, JobLeaseManager), "Lease renewal expected leases"
     finally:
         await runtime.stop_cluster()
 
@@ -133,8 +132,7 @@ async def validate_14_1_lease_expiry() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        state = gate._modular_state
-        assert isinstance(state._leases, dict), "Lease expiry expected leases"
+        assert isinstance(gate._job_lease_manager, JobLeaseManager), "Lease expiry expected leases"
     finally:
         await runtime.stop_cluster()
 
@@ -151,82 +149,7 @@ async def validate_14_1_lease_cleanup() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        state = gate._modular_state
-        assert isinstance(state._leases, dict), "Lease cleanup expected leases"
-    finally:
-        await runtime.stop_cluster()
-
-
-async def validate_14_2_dc_lease_acquisition() -> None:
-    spec = _build_spec(
-        "gate_manager_14_2_dc_lease_acquisition",
-        "14.2 Datacenter Leases - DC lease acquisition",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        gate = _get_gate(runtime)
-        state = gate._modular_state
-        assert isinstance(state._leases, dict), "DC lease acquisition expected leases"
-    finally:
-        await runtime.stop_cluster()
-
-
-async def validate_14_2_lease_transfer() -> None:
-    spec = _build_spec(
-        "gate_manager_14_2_lease_transfer",
-        "14.2 Datacenter Leases - Lease transfer",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        gate = _get_gate(runtime)
-        state = gate._modular_state
-        assert isinstance(state._leases, dict), "Lease transfer expected leases"
-    finally:
-        await runtime.stop_cluster()
-
-
-async def validate_14_2_lease_transfer_ack() -> None:
-    spec = _build_spec(
-        "gate_manager_14_2_lease_transfer_ack",
-        "14.2 Datacenter Leases - Lease transfer ack",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        gate = _get_gate(runtime)
-        state = gate._modular_state
-        assert isinstance(state._leases, dict), "Lease transfer ack expected leases"
-    finally:
-        await runtime.stop_cluster()
-
-
-async def validate_14_2_fence_token_increment() -> None:
-    spec = _build_spec(
-        "gate_manager_14_2_fence_token_increment",
-        "14.2 Datacenter Leases - Fence token increment",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        gate = _get_gate(runtime)
-        state = gate._modular_state
-        assert state._fence_token is not None, (
-            "Fence token increment expected fence token"
-        )
+        assert isinstance(gate._job_lease_manager, JobLeaseManager), "Lease cleanup expected leases"
     finally:
         await runtime.stop_cluster()
 
@@ -236,10 +159,6 @@ async def run() -> None:
     await validate_14_1_lease_renewal()
     await validate_14_1_lease_expiry()
     await validate_14_1_lease_cleanup()
-    await validate_14_2_dc_lease_acquisition()
-    await validate_14_2_lease_transfer()
-    await validate_14_2_lease_transfer_ack()
-    await validate_14_2_fence_token_increment()
 
 
 if __name__ == "__main__":

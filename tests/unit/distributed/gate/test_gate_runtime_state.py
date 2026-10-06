@@ -49,11 +49,6 @@ class TestGateRuntimeStateInitialization:
         state = GateRuntimeState(forward_throughput_interval_start=0.0)
         assert state._gate_state == GateStateEnum.SYNCING
 
-    def test_initial_fence_token_is_zero(self):
-        """Initial fence token is 0."""
-        state = GateRuntimeState(forward_throughput_interval_start=0.0)
-        assert state._fence_token == 0
-
     def test_initial_state_version_is_zero(self):
         """Initial state version is 0."""
         state = GateRuntimeState(forward_throughput_interval_start=0.0)
@@ -314,70 +309,6 @@ class TestBackpressureMethods:
         state._dc_backpressure["dc-4"] = BackpressureLevel.REJECT
 
         assert state.get_max_backpressure_level() == BackpressureLevel.REJECT
-
-
-# =============================================================================
-# Lease Methods Tests
-# =============================================================================
-
-
-class TestLeaseMethods:
-    """Tests for lease management methods."""
-
-    def test_get_lease_key(self):
-        """Get lease key formats correctly."""
-        state = GateRuntimeState(forward_throughput_interval_start=0.0)
-        key = state.get_lease_key("job-123", "dc-east")
-        assert key == "job-123:dc-east"
-
-    def test_set_and_get_lease(self):
-        """Set and get lease operations."""
-        state = GateRuntimeState(forward_throughput_interval_start=0.0)
-
-        class MockLease:
-            pass
-
-        lease = MockLease()
-        state.set_lease("job-123", "dc-east", lease)
-
-        result = state.get_lease("job-123", "dc-east")
-        assert result is lease
-
-    def test_get_lease_not_found(self):
-        """Get nonexistent lease returns None."""
-        state = GateRuntimeState(forward_throughput_interval_start=0.0)
-        assert state.get_lease("unknown", "unknown") is None
-
-    def test_remove_lease(self):
-        """Remove lease removes it."""
-        state = GateRuntimeState(forward_throughput_interval_start=0.0)
-
-        class MockLease:
-            pass
-
-        state.set_lease("job-123", "dc-east", MockLease())
-        state.remove_lease("job-123", "dc-east")
-
-        assert state.get_lease("job-123", "dc-east") is None
-
-    def test_remove_nonexistent_lease_is_safe(self):
-        """Remove nonexistent lease doesn't raise."""
-        state = GateRuntimeState(forward_throughput_interval_start=0.0)
-        state.remove_lease("unknown", "unknown")  # Should not raise
-
-    @pytest.mark.asyncio
-    async def test_next_fence_token(self):
-        """Next fence token increments monotonically."""
-        state = GateRuntimeState(forward_throughput_interval_start=0.0)
-
-        token1 = await state.next_fence_token()
-        token2 = await state.next_fence_token()
-        token3 = await state.next_fence_token()
-
-        assert token1 == 1
-        assert token2 == 2
-        assert token3 == 3
-        assert state._fence_token == 3
 
 
 # =============================================================================
@@ -655,24 +586,6 @@ class TestConcurrency:
         # Operations should be serialized
         assert len(execution_order) == 4
 
-    @pytest.mark.asyncio
-    async def test_concurrent_fence_token_increments(self):
-        """Concurrent fence token increments produce unique values."""
-        state = GateRuntimeState(forward_throughput_interval_start=0.0)
-        tokens = []
-
-        async def increment():
-            for _ in range(50):
-                token = await state.next_fence_token()
-                tokens.append(token)
-
-        await asyncio.gather(increment(), increment())
-
-        # Should have 100 tokens total
-        assert len(tokens) == 100
-        # Note: Without locking, uniqueness is not guaranteed
-        # This tests the actual behavior
-
 
 # =============================================================================
 # Edge Cases Tests
@@ -709,15 +622,6 @@ class TestEdgeCases:
             state.mark_leader_dead((f"10.0.{i // 256}.{i % 256}", 9000))
 
         assert len(state._dead_job_leaders) == 1000
-
-    @pytest.mark.asyncio
-    async def test_large_fence_token(self):
-        """Handle large fence token values."""
-        state = GateRuntimeState(forward_throughput_interval_start=0.0)
-        state._fence_token = 2**62
-
-        token = await state.next_fence_token()
-        assert token == 2**62 + 1
 
     def test_special_characters_in_job_ids(self):
         """Handle special characters in job IDs."""

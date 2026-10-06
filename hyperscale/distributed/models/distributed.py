@@ -118,9 +118,6 @@ from .cancel_job import CancelJob
 from .cancel_ack import CancelAck
 from .workflow_cancellation_query import WorkflowCancellationQuery
 from .workflow_cancellation_response import WorkflowCancellationResponse
-from .datacenter_lease import DatacenterLease
-from .lease_transfer import LeaseTransfer
-from .lease_transfer_ack import LeaseTransferAck
 from .datacenter_status import DatacenterStatus
 from .ping_request import PingRequest
 from .worker_status import WorkerStatus
@@ -247,9 +244,6 @@ _WIRE_MODELS = (
     CancelAck,
     WorkflowCancellationQuery,
     WorkflowCancellationResponse,
-    DatacenterLease,
-    LeaseTransfer,
-    LeaseTransferAck,
     DatacenterStatus,
     PingRequest,
     WorkerStatus,

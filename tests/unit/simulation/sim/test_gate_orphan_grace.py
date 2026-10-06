@@ -1,5 +1,5 @@
 """
-A gate waits on a job whose leader gate's lease lapsed for as long as the
+A gate waits on a job whose leader gate failed for as long as the
 gate tier needs to reach its verdict on that gate -- derived, learned from
 rescues, and extended while the leader is still heard from -- never for a
 fixed guess (AD-52 section 10 for gates, as the worker's orphan grace).
@@ -25,7 +25,6 @@ from hyperscale.distributed.env import Env
 from hyperscale.distributed.jobs import JobLeadershipTracker
 from hyperscale.distributed.jobs.gates import GateJobManager
 from hyperscale.distributed.jobs.gates.consistent_hash_ring import ConsistentHashRing
-from hyperscale.distributed.leases.job_lease import JobLease
 from hyperscale.distributed.models import GateInfo, GlobalJobStatus, JobStatus
 from hyperscale.distributed.nodes.gate.config import derive_gate_orphan_grace_seconds
 from hyperscale.distributed.nodes.gate.orphan_job_coordinator import GateOrphanJobCoordinator
@@ -44,7 +43,7 @@ CHECK_INTERVAL_SECONDS = SETTINGS.GATE_ORPHAN_CHECK_INTERVAL
 THIS_GATE_ADDRESS = ("10.0.0.1", 9000)
 LEADER_GATE_ID = "gate-leader"
 LEADER_GATE_ADDRESS = ("10.0.0.2", 9000)
-# When the leader's lease lapses, well after boot.
+# When the leader gate fails, well after boot.
 ORPHANED_AT = 10.0
 # How often a leader still alive is heard from: one gate heartbeat per
 # check interval is ample evidence; the extension needs only one since the
@@ -92,7 +91,7 @@ async def run_orphans(
     await_failure: bool = False,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Orphan each of ``orphan_job_ids`` in turn -- the next once the one
-    before is settled -- by its leader's lapsed lease; the leader (and so
+    before is settled -- by its leader gate's failure (SWIM); the leader (and so
     the tier) is heard from while a job of ``heard_from_during`` waits.
     Rescue a job (its leadership announced by a peer) ``rescues[job_id]``
     seconds after it came due. No gate ever takes a job over: each is
@@ -131,12 +130,13 @@ async def run_orphans(
         assert await_failure, f"the coordinator failed {job_id}: {reason}"
         failed_after[job_id] = clock.monotonic() - orphaned_at[job_id]
 
+    job_leadership_tracker = JobLeadershipTracker(node_id=node_id.full, node_addr=THIS_GATE_ADDRESS)
     coordinator = GateOrphanJobCoordinator(
         state=state,
         logger=Logger(),
         task_runner=task_runner,
         job_hash_ring=ConsistentHashRing(),
-        job_leadership_tracker=JobLeadershipTracker(node_id=node_id.full, node_addr=THIS_GATE_ADDRESS),
+        job_leadership_tracker=job_leadership_tracker,
         job_manager=job_manager,
         get_node_id=lambda: node_id,
         get_node_addr=lambda: THIS_GATE_ADDRESS,
@@ -165,25 +165,20 @@ async def run_orphans(
             job_manager.set_job(job_id, GlobalJobStatus(job_id=job_id, status=JobStatus.RUNNING.value))
             current_job[:] = [job_id]
             orphaned_at[job_id] = clock.monotonic()
-            await coordinator.on_lease_expired(
-                JobLease(
-                    job_id=job_id,
-                    owner_node=LEADER_GATE_ID,
-                    fence_token=1,
-                    created_at=0.0,
-                    expires_at=orphaned_at[job_id],
-                )
-            )
+            job_leadership_tracker.process_leadership_claim(job_id, LEADER_GATE_ID, LEADER_GATE_ADDRESS, 1)
+            assert coordinator.mark_jobs_orphaned_by_gate(LEADER_GATE_ADDRESS) == [job_id]
             if (rescued_after := rescues.get(job_id)) is not None:
                 while job_id not in due_after:
                     await clock.sleep(CHECK_INTERVAL_SECONDS)
                 await clock.sleep(orphaned_at[job_id] + due_after[job_id] + rescued_after - clock.monotonic())
                 coordinator.clear_orphaned_job(job_id)
+                job_leadership_tracker.release_leadership(job_id)
                 continue
             settled = failed_after if await_failure else due_after
             while job_id not in settled and clock.monotonic() - orphaned_at[job_id] < observe_seconds:
                 await clock.sleep(CHECK_INTERVAL_SECONDS)
             job_manager.delete_job(job_id)
+            job_leadership_tracker.release_leadership(job_id)
             if not await_failure:
                 coordinator.clear_orphaned_job(job_id)
         return due_after, failed_after

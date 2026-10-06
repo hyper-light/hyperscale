@@ -145,7 +145,7 @@ The distributed system implements a three-tier architecture optimized for execut
 1. **Workers are the source of truth** - Workers maintain authoritative state for their own workflows
 2. **Passive state discovery** - Serf-style heartbeat embedding in SWIM messages
 3. **Quorum-based provisioning** - Manager decisions require quorum confirmation
-4. **Lease-based execution** - Gates use leases for at-most-once DC semantics
+4. **Fenced execution** - Gates get at-most-once DC semantics from per-job gate leadership and fencing tokens (every takeover commits a `GateJobReplica` through Raft with a strictly higher fence), AD-40 idempotency keys, and manager-side fencing that refuses a stale gate fence. (2026-10-06: the never-acquired datacenter lease subsystem -- `DatacenterLeaseManager`, `DatacenterLease`, `LeaseTransfer`/`LeaseTransferAck` and the gate's `lease_transfer` handler -- was removed; it provided none of this.)
 5. **Graceful degradation** - Load shedding under pressure, LHM-aware timeouts
 6. **Composition over inheritance** - All extensibility via callbacks, not method overriding
 7. **TaskRunner for lifecycle management** - All background tasks managed via TaskRunner
@@ -1802,7 +1802,8 @@ hyperscale/distributed_rewrite/
 │   ├── datacenter_health.py      # DatacenterHealthManager
 │   ├── (manager_dispatcher.py)   # removed 2026-10-04: never read; gate
 │   │                             #   dispatch is GateDispatchCoordinator
-│   └── lease_manager.py          # DC lease management
+│   └── (lease_manager.py)        # removed 2026-10-06: DC leases never acquired;
+│                                 #   at-most-once is leadership + fencing + AD-40
 │
 ├── reliability/                  # Cross-cutting reliability
 │   ├── __init__.py
@@ -4452,14 +4453,14 @@ Cross-datacenter coordinators that manage global job state and DC-level retries.
 │  │ • Probe/Ack      │    │ • Job Submission │                   │
 │  │ • Suspicion      │    │ • Status Relay   │                   │
 │  │ • Leadership     │    │ • State Sync     │                   │
-│  │ • State Embed    │    │ • Lease Transfer │                   │
+│  │ • State Embed    │    │ • Job Leadership │                   │
 │  └──────────────────┘    └──────────────────┘                   │
 │           │                      │                               │
 │           ▼                      ▼                               │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                    Gate State                            │    │
 │  │  • _jobs: GlobalJobStatus per job                       │    │
-│  │  • _leases: DatacenterLease per job:dc                  │    │
+│  │  • job leaders + fencing tokens per job                 │    │
 │  │  • _datacenter_status: ManagerHeartbeat per DC          │    │
 │  │  • _versioned_clock: Per-entity Lamport timestamps      │    │
 │  └─────────────────────────────────────────────────────────┘    │
@@ -4467,9 +4468,9 @@ Cross-datacenter coordinators that manage global job state and DC-level retries.
 │  Responsibilities:                                               │
 │  • Accept job submissions from clients                          │
 │  • Select target datacenters for job execution                  │
-│  • Create leases for at-most-once semantics                     │
+│  • Fence dispatches for at-most-once (AD-40)                    │
 │  • Aggregate status from managers across DCs                    │
-│  • Handle DC-level failure and retry (lease-based)              │
+│  • Handle DC-level failure and retry (fenced)                   │
 │  • Leader election among gates                                   │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -5029,14 +5030,14 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │           │            FOR EACH TARGET DATACENTER:            │             │
 │           ▼                                                    │             │
 │  ┌─────────────────────────────────────────────────────────┐  │             │
-│  │  LEASE CREATION (at-most-once semantics)                │  │             │
+│  │  JOB FENCING (at-most-once semantics)                   │  │             │
 │  │  ───────────────────────────────────────────────────────│  │             │
-│  │  1. Generate fence_token (monotonic, derived from term) │  │             │
-│  │  2. Create DatacenterLease {                            │  │             │
-│  │       job_id, datacenter, lease_holder: self.node_id,  │  │             │
-│  │       fence_token, expires_at: now + timeout           │  │             │
-│  │     }                                                   │  │             │
-│  │  3. Store in _leases[(job_id, datacenter)]             │  │             │
+│  │  1. fence_token from the job's gate leadership; every   │  │             │
+│  │     takeover commits a strictly higher one (Raft        │  │             │
+│  │     GateJobReplica); managers refuse stale fences      │  │             │
+│  │  2. AD-40 idempotency key dedupes resubmission         │  │             │
+│  │                                                         │  │             │
+│  │  (DC leases removed 2026-10-06)                        │  │             │
 │  └─────────────────────────────────────────────────────────┘  │             │
 │                         │                                      │             │
 │                         ▼                                      │             │
@@ -5557,9 +5558,9 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │    ▼                                                             │
 │  Gate (Leader)                                                   │
 │    │                                                             │
-│    ├──► Create DatacenterLease (fence_token)                    │
+│    ├──► Stamp the job's fence_token (leadership)                │
 │    │                                                             │
-│    │ TCP: JobSubmission (with lease)                            │
+│    │ TCP: JobSubmission (with fence_token)                      │
 │    ▼                                                             │
 │  Manager (Leader)                                                │
 │    │                                                             │
@@ -6133,10 +6134,10 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │                            ▼                                     │
 │  Gate Handling:                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ Lease-based at-most-once:                                 │  │
+│  │ Fenced at-most-once (leadership + AD-40):                 │  │
 │  │                                                            │  │
-│  │ • If lease expired → Job marked FAILED for that DC        │  │
-│  │ • If lease valid → Wait for recovery or timeout           │  │
+│  │ • DC lost → job marked FAILED for that DC                 │  │
+│  │ • DC recovering → wait for recovery or timeout            │  │
 │  │                                                            │  │
 │  │ User-facing: Gate returns job failure to client           │  │
 │  │ (No automatic cross-DC retry - explicit decision)         │  │
@@ -7378,7 +7379,7 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  │      │──────────────────────►│ (to leader)                               ││
 │  │      │                       │                                           ││
 │  │      │ ③ TCP: GlobalJobStatus[]│                                         ││
-│  │      │◄──────────────────────│ + DatacenterLease[]                       ││
+│  │      │◄──────────────────────│ + job leaders/fences                      ││
 │  │      │                       │                                           ││
 │  │      │ Apply state           │                                           ││
 │  │      │                       │                                           ││
@@ -7393,11 +7394,11 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  │                                                                          ││
 │  │   Leaving Gate (★)          Other Gates                                  ││
 │  │      │                          │                                        ││
-│  │      │ ① Transfer leases        │                                        ││
-│  │      │    to new leader         │                                        ││
+│  │      │ ① Drain membership       │                                        ││
+│  │      │    (AD-52)               │                                        ││
 │  │      │──────────────────────────►│                                        ││
 │  │      │                          │                                        ││
-│  │      │ ② LeaseTransfer ack      │                                        ││
+│  │      │ ② Peers take its jobs    │                                        ││
 │  │      │◄──────────────────────────│                                        ││
 │  │      │                          │                                        ││
 │  │      │ ③ Update registry        │                                        ││
@@ -7871,28 +7872,6 @@ gate = GateServer(
 │  │  ├─ version: int                   # State version                      │ │
 │  │  ├─ workers: list[WorkerStateSnapshot]  # Registered workers            │ │
 │  │  └─ jobs: dict[str, JobProgress]   # Active jobs                        │ │
-│  │                                                                         │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ LEASE MESSAGES (Gates only)                                            │ │
-│  ├────────────────────────────────────────────────────────────────────────┤ │
-│  │                                                                         │ │
-│  │  DatacenterLease                                                         │ │
-│  │  ├─ job_id: str                    # Job identifier                     │ │
-│  │  ├─ datacenter: str                # Datacenter holding lease           │ │
-│  │  ├─ lease_holder: str              # Gate node_id                       │ │
-│  │  ├─ fence_token: int               # Fencing token                      │ │
-│  │  ├─ expires_at: float              # Monotonic expiration               │ │
-│  │  └─ version: int                   # Lease version                      │ │
-│  │                                                                         │ │
-│  │  LeaseTransfer                                                           │ │
-│  │  ├─ job_id: str                    # Job identifier                     │ │
-│  │  ├─ datacenter: str                # Datacenter                         │ │
-│  │  ├─ from_gate: str                 # Current holder                     │ │
-│  │  ├─ to_gate: str                   # New holder                         │ │
-│  │  ├─ new_fence_token: int           # New fencing token                  │ │
-│  │  └─ version: int                   # Transfer version                   │ │
 │  │                                                                         │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │

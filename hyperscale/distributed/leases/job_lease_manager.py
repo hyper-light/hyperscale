@@ -3,18 +3,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 import asyncio
-from typing import Awaitable, Callable
-from hyperscale.logging.hyperscale_logging_models import JobLeaseExpiryCallbackFailed
 
 from .job_lease_shared import _DEFAULT_CLOCK
 from .job_lease_model import JobLease
-from .lease_acquisition_result import LeaseAcquisitionResult
 from .lease_state import LeaseState
-
-if TYPE_CHECKING:
-    from hyperscale.logging import Logger
 
 
 class JobLeaseManager:
@@ -26,8 +19,6 @@ class JobLeaseManager:
         "_default_duration",
         "_cleanup_interval",
         "_released_retention_seconds",
-        "_on_lease_expired",
-        "_logger",
     )
 
     def __init__(
@@ -35,10 +26,8 @@ class JobLeaseManager:
         node_id: str,
         default_duration: float = 30.0,
         cleanup_interval: float = 10.0,
-        on_lease_expired: Callable[[JobLease], Awaitable[None]] | None = None,
         *,
         released_retention_seconds: float,
-        logger: Logger,
     ) -> None:
         """``released_retention_seconds``: how long a job's lease and fence
         token are kept once the lease ended -- released or expired -- before
@@ -51,8 +40,6 @@ class JobLeaseManager:
         self._default_duration = default_duration
         self._cleanup_interval = cleanup_interval
         self._released_retention_seconds = released_retention_seconds
-        self._on_lease_expired = on_lease_expired
-        self._logger = logger
 
     @property
     def node_id(self) -> str:
@@ -68,56 +55,31 @@ class JobLeaseManager:
         self._fence_tokens[job_id] = next_token
         return next_token
 
-    async def acquire(
-        self,
-        job_id: str,
-        duration: float | None = None,
-        force: bool = False,
-    ) -> LeaseAcquisitionResult:
+    async def acquire(self, job_id: str, duration: float | None = None) -> JobLease:
+        """This gate's lease on the job: its active lease extended, else a
+        new one under the job's next fence token. Every lease here is this
+        gate's own -- none is imported from another gate -- so acquisition
+        never meets another holder."""
         if duration is None:
             duration = self._default_duration
 
         async with self._lock:
-            existing = self._leases.get(job_id)
-
-            if existing and existing.owner_node == self._node_id:
-                if existing.is_active():
-                    existing.extend(duration)
-                    return LeaseAcquisitionResult(
-                        success=True,
-                        lease=existing,
-                    )
-
-            if (
-                existing
-                and existing.is_active()
-                and existing.owner_node != self._node_id
-            ):
-                if not force:
-                    return LeaseAcquisitionResult(
-                        success=False,
-                        current_owner=existing.owner_node,
-                        expires_in=existing.remaining_seconds(),
-                    )
+            if (existing := self._leases.get(job_id)) is not None and existing.is_active():
+                existing.extend(duration)
+                return existing
 
             now = _DEFAULT_CLOCK.monotonic()
-            fence_token = self._get_next_fence_token(job_id)
-
             lease = JobLease(
                 job_id=job_id,
                 owner_node=self._node_id,
-                fence_token=fence_token,
+                fence_token=self._get_next_fence_token(job_id),
                 created_at=now,
                 expires_at=now + duration,
                 lease_duration=duration,
                 state=LeaseState.ACTIVE,
             )
             self._leases[job_id] = lease
-
-            return LeaseAcquisitionResult(
-                success=True,
-                lease=lease,
-            )
+            return lease
 
     async def renew(self, job_id: str, duration: float | None = None) -> bool:
         if duration is None:
@@ -209,79 +171,13 @@ class JobLeaseManager:
         lease.state = LeaseState.EXPIRED
         return True
 
-    async def import_lease(
-        self,
-        job_id: str,
-        owner_node: str,
-        fence_token: int,
-        expires_at: float,
-        lease_duration: float = 30.0,
-    ) -> None:
-        async with self._lock:
-            current_token = self._fence_tokens.get(job_id, 0)
-
-            if fence_token <= current_token:
-                return
-
-            now = _DEFAULT_CLOCK.monotonic()
-            remaining = max(0.0, expires_at - now)
-
-            lease = JobLease(
-                job_id=job_id,
-                owner_node=owner_node,
-                fence_token=fence_token,
-                created_at=now,
-                expires_at=now + remaining,
-                lease_duration=lease_duration,
-                state=LeaseState.ACTIVE if remaining > 0 else LeaseState.EXPIRED,
-            )
-            self._leases[job_id] = lease
-            self._fence_tokens[job_id] = fence_token
-
-    async def export_leases(self) -> list[dict]:
-        async with self._lock:
-            result = []
-            for job_id, lease in self._leases.items():
-                if lease.is_active():
-                    result.append(
-                        {
-                            "job_id": job_id,
-                            "owner_node": lease.owner_node,
-                            "fence_token": lease.fence_token,
-                            "expires_in": lease.remaining_seconds(),
-                            "lease_duration": lease.lease_duration,
-                        }
-                    )
-            return result
-
     async def run_cleanup(self) -> None:
-        """Expire leases every cleanup interval, telling the expiry hook of
-        each -- for as long as the owner runs it (under its task runner,
-        cancelled with its other background loops). A hook that raises is
-        reported and the rest of the pass goes on."""
+        """Expire leases, and forget those ended past the retention, every
+        cleanup interval -- for as long as the owner runs it (under its task
+        runner, cancelled with its other background loops)."""
         while True:
             await _DEFAULT_CLOCK.sleep(self._cleanup_interval)
-            for lease in await self.cleanup_expired():
-                if self._on_lease_expired is None:
-                    continue
-                try:
-                    await self._on_lease_expired(lease)
-                except Exception as callback_error:
-                    await self._logger.log(
-                        JobLeaseExpiryCallbackFailed(
-                            message=(
-                                f"Lease expiry handling for job {lease.job_id} raised "
-                                f"{type(callback_error).__name__}: {callback_error}"
-                            ),
-                            node_id=self._node_id,
-                            job_id=lease.job_id,
-                            error_type=type(callback_error).__name__,
-                        )
-                    )
-
-    def set_on_lease_expired(self, on_lease_expired: Callable[[JobLease], Awaitable[None]]) -> None:
-        """Hear each lease the cleanup expires."""
-        self._on_lease_expired = on_lease_expired
+            await self.cleanup_expired()
 
     async def lease_count(self) -> int:
         async with self._lock:

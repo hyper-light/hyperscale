@@ -147,10 +147,6 @@ from .distributed import (
     CancelJobWorkflowsResponse as CancelJobWorkflowsResponse,
     WorkflowCancellationQuery as WorkflowCancellationQuery,
     WorkflowCancellationResponse as WorkflowCancellationResponse,
-    # Lease
-    DatacenterLease as DatacenterLease,
-    LeaseTransfer as LeaseTransfer,
-    LeaseTransferAck as LeaseTransferAck,
     # Datacenter health
     DatacenterStatus as DatacenterStatus,
     # Ping/health check

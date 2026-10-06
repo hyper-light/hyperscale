@@ -32,6 +32,7 @@ async def make_websocket_request(
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
+    verify_tls: bool = True,
 ):
     
     if method is None or method not in ["send", "receive"]:
@@ -42,7 +43,7 @@ async def make_websocket_request(
         timeouts=timeouts,
     )
 
-    websocket = setup_client(websocket, 1)
+    websocket = setup_client(websocket, 1, verify_tls=verify_tls)
     terminal = create_ping_ui(
         url,
         method,

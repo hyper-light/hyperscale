@@ -20,12 +20,13 @@ async def make_ftp_request(
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
+    verify_tls: bool = True,
 ):
     
     timeouts = Timeouts(request_timeout=timeout)
 
     ftp = MercurySyncFTPConnection(timeouts=timeouts)
-    ftp = setup_client(ftp, 1)
+    ftp = setup_client(ftp, 1, verify_tls=verify_tls)
 
     terminal = create_ping_ui(
         url,

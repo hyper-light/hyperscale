@@ -17,8 +17,6 @@ from hyperscale.distributed.models import (
     GateStateSyncRequest,
     GateStateSyncResponse,
     JobFinalResult,
-    LeaseTransfer,
-    LeaseTransferAck,
 )
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -174,84 +172,6 @@ class GateStateSyncHandler:
                 state_version=0,
                 snapshot=None,
                 error=str(error),
-            ).dump()
-
-    async def handle_lease_transfer(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        handle_exception: Callable,
-    ) -> bytes:
-        """
-        Handle lease transfer during gate scaling.
-
-        When a gate is scaling down, it transfers job leases to peer gates.
-
-        Args:
-            addr: Source gate address
-            data: Serialized LeaseTransfer
-            handle_exception: Callback for exception handling
-
-        Returns:
-            Serialized LeaseTransferAck
-        """
-        try:
-            transfer = LeaseTransfer.load(data)
-
-            await self._logger.log(
-                ServerInfo(
-                    message=f"Receiving lease transfer from {transfer.source_gate_id[:8]}... "
-                    f"for job {transfer.job_id[:8]}...",
-                    node_host=self._get_host(),
-                    node_port=self._get_tcp_port(),
-                    node_id=self._get_node_id().short,
-                ),
-            )
-
-            if self._job_manager.has_job(transfer.job_id):
-                return LeaseTransferAck(
-                    job_id=transfer.job_id,
-                    accepted=False,
-                    error="Job already exists on this gate",
-                    new_fence_token=0,
-                ).dump()
-
-            new_fence_token = transfer.fence_token + 1
-
-            self._job_leadership_tracker.assume_leadership(
-                job_id=transfer.job_id,
-                metadata=transfer.metadata,
-                fence_token=new_fence_token,
-            )
-
-            if transfer.job_status:
-                self._job_manager.set_job(transfer.job_id, transfer.job_status)
-
-            await self._state.increment_state_version()
-
-            await self._logger.log(
-                ServerInfo(
-                    message=f"Accepted lease transfer for job {transfer.job_id[:8]}... "
-                    f"(new fence token: {new_fence_token})",
-                    node_host=self._get_host(),
-                    node_port=self._get_tcp_port(),
-                    node_id=self._get_node_id().short,
-                ),
-            )
-
-            return LeaseTransferAck(
-                job_id=transfer.job_id,
-                accepted=True,
-                new_fence_token=new_fence_token,
-            ).dump()
-
-        except Exception as error:
-            await handle_exception(error, "handle_lease_transfer")
-            return LeaseTransferAck(
-                job_id="unknown",
-                accepted=False,
-                error=str(error),
-                new_fence_token=0,
             ).dump()
 
     async def _forward_job_final_result_to_leader(

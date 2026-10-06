@@ -994,12 +994,22 @@ class WorkflowRunner:
                 )
             }
 
+            # Every setting a Workflow may declare, with its default. A
+            # Workflow attribute of one of these names overrides it -- only
+            # these, so a Workflow's other members never leak in.
             config = {
                 "vus": 1000,
                 "duration": "1m",
                 "threads": self._threads,
                 "connect_retries": 3,
                 "interval": workflow.interval,
+                "cert_path": None,
+                "key_path": None,
+                "reset_connections": False,
+                # Clients check the server's certificate and name (RFC 9110
+                # section 4.3.4); a Workflow targeting a self-signed server
+                # sets ``verify_tls = False``.
+                "verify_tls": True,
             }
 
             engines_count = len(
@@ -1020,7 +1030,11 @@ class WorkflowRunner:
                 {
                     name: value
                     for name, value in inspect.getmembers(workflow)
-                    if config.get(name)
+                    # Membership, not truthiness, so False overrides
+                    # (verify_tls, reset_connections). The Workflow base
+                    # declares only vus, duration and interval among these,
+                    # each equal to its default here.
+                    if name in config
                 }
             )
 
@@ -1045,6 +1059,7 @@ class WorkflowRunner:
                     cert_path=config.get("cert_path"),
                     key_path=config.get("key_path"),
                     reset_connections=config.get("reset_connections"),
+                    verify_tls=config["verify_tls"],
                 )
 
             self._workflow_hooks[run_id][workflow.name] = list(hooks.keys())

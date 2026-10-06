@@ -268,14 +268,8 @@ def make_lease_manager(fence_token: int = 1, lease_duration: float = 30.0):
         fence_token=fence_token,
         lease_duration=lease_duration,
     )
-    acquire_result = SimpleNamespace(
-        success=True,
-        lease=lease,
-        current_owner=None,
-        expires_in=0.0,
-    )
     manager = MagicMock()
-    manager.acquire = AsyncMock(return_value=acquire_result)
+    manager.acquire = AsyncMock(return_value=lease)
     manager.release = AsyncMock(return_value=None)
     manager.renew = AsyncMock(return_value=True)
     return manager

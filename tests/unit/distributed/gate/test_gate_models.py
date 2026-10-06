@@ -4,7 +4,6 @@ Integration tests for Gate Models (Section 15.3.2).
 Tests gate-specific data models:
 - GatePeerState, GatePeerTracking
 - DCHealthState, ManagerTracking
-- LeaseState, LeaseTracking
 """
 
 import asyncio
@@ -17,8 +16,6 @@ from hyperscale.distributed.nodes.gate.models import (
     GatePeerTracking,
     DCHealthState,
     ManagerTracking,
-    LeaseState,
-    LeaseTracking,
 )
 from hyperscale.distributed.reliability import BackpressureLevel
 
@@ -392,165 +389,6 @@ class TestDCHealthStateEdgeCases:
 
 
 # =============================================================================
-# LeaseTracking Tests
-# =============================================================================
-
-
-class TestLeaseTrackingHappyPath:
-    """Tests for LeaseTracking happy path."""
-
-    def test_create(self):
-        """Create lease tracking."""
-
-        # Mock lease
-        class MockLease:
-            pass
-
-        lease = MockLease()
-        tracking = LeaseTracking(
-            job_id="job-123",
-            datacenter_id="dc-east",
-            lease=lease,
-            fence_token=42,
-        )
-
-        assert tracking.job_id == "job-123"
-        assert tracking.datacenter_id == "dc-east"
-        assert tracking.lease is lease
-        assert tracking.fence_token == 42
-
-
-# =============================================================================
-# LeaseState Tests
-# =============================================================================
-
-
-class TestLeaseStateHappyPath:
-    """Tests for LeaseState happy path."""
-
-    def test_create_default(self):
-        """Create lease state with defaults."""
-        state = LeaseState()
-
-        assert state.leases == {}
-        assert state.fence_token == 0
-        assert state.lease_timeout == 30.0
-
-    def test_get_lease_key(self):
-        """Get lease key formats correctly."""
-        state = LeaseState()
-
-        key = state.get_lease_key("job-123", "dc-east")
-        assert key == "job-123:dc-east"
-
-    def test_set_and_get_lease(self):
-        """Set and get lease operations work."""
-        state = LeaseState()
-
-        class MockLease:
-            pass
-
-        lease = MockLease()
-        state.set_lease("job-123", "dc-east", lease)
-
-        result = state.get_lease("job-123", "dc-east")
-        assert result is lease
-
-    def test_get_nonexistent_lease(self):
-        """Get nonexistent lease returns None."""
-        state = LeaseState()
-
-        result = state.get_lease("unknown", "unknown")
-        assert result is None
-
-    def test_remove_lease(self):
-        """Remove lease removes it."""
-        state = LeaseState()
-
-        class MockLease:
-            pass
-
-        state.set_lease("job-123", "dc-east", MockLease())
-        state.remove_lease("job-123", "dc-east")
-
-        result = state.get_lease("job-123", "dc-east")
-        assert result is None
-
-    def test_remove_nonexistent_lease_is_safe(self):
-        """Remove nonexistent lease doesn't raise."""
-        state = LeaseState()
-        state.remove_lease("unknown", "unknown")  # Should not raise
-
-    def test_next_fence_token(self):
-        """Next fence token increments and returns."""
-        state = LeaseState()
-
-        token1 = state.next_fence_token()
-        token2 = state.next_fence_token()
-        token3 = state.next_fence_token()
-
-        assert token1 == 1
-        assert token2 == 2
-        assert token3 == 3
-        assert state.fence_token == 3
-
-
-class TestLeaseStateEdgeCases:
-    """Tests for LeaseState edge cases."""
-
-    def test_many_leases(self):
-        """Handle many leases."""
-        state = LeaseState()
-
-        class MockLease:
-            pass
-
-        for i in range(1000):
-            state.set_lease(f"job-{i}", f"dc-{i % 5}", MockLease())
-
-        assert len(state.leases) == 1000
-
-    def test_overwrite_lease(self):
-        """Overwriting lease replaces previous."""
-        state = LeaseState()
-
-        class Lease1:
-            pass
-
-        class Lease2:
-            pass
-
-        state.set_lease("job-1", "dc-1", Lease1())
-        state.set_lease("job-1", "dc-1", Lease2())
-
-        result = state.get_lease("job-1", "dc-1")
-        assert isinstance(result, Lease2)
-
-    def test_fence_token_overflow(self):
-        """Fence token handles large values."""
-        state = LeaseState()
-        state.fence_token = 2**62
-
-        token = state.next_fence_token()
-        assert token == 2**62 + 1
-
-    def test_special_characters_in_ids(self):
-        """Handle special characters in IDs."""
-        state = LeaseState()
-
-        class MockLease:
-            pass
-
-        # IDs with special chars
-        state.set_lease("job:colon", "dc-dash", MockLease())
-        key = state.get_lease_key("job:colon", "dc-dash")
-        assert key == "job:colon:dc-dash"
-
-        result = state.get_lease("job:colon", "dc-dash")
-        assert result is not None
-
-
-# =============================================================================
 # Slots and Memory Tests
 # =============================================================================
 
@@ -574,13 +412,6 @@ class TestModelsUseSlots:
         """DCHealthState uses slots."""
         assert hasattr(DCHealthState, "__slots__")
 
-    def test_lease_tracking_uses_slots(self):
-        """LeaseTracking uses slots."""
-        assert hasattr(LeaseTracking, "__slots__")
-
-    def test_lease_state_uses_slots(self):
-        """LeaseState uses slots."""
-        assert hasattr(LeaseState, "__slots__")
 
 
 class TestModelsAreDataclasses:
@@ -593,8 +424,6 @@ class TestModelsAreDataclasses:
             GatePeerState,
             ManagerTracking,
             DCHealthState,
-            LeaseTracking,
-            LeaseState,
         ]
         for cls in classes:
             assert is_dataclass(cls), f"{cls.__name__} is not a dataclass"

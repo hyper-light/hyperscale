@@ -55,6 +55,7 @@ async def make_graphqlh2_request(
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
+    verify_tls: bool = True,
 ):
     
     graphql_data = GraphQLQuery(**data)
@@ -64,7 +65,7 @@ async def make_graphqlh2_request(
         timeouts=timeouts,
     )
 
-    graphqlh2 = setup_client(graphqlh2, 1)
+    graphqlh2 = setup_client(graphqlh2, 1, verify_tls=verify_tls)
     terminal = create_ping_ui(
         url,
         method,

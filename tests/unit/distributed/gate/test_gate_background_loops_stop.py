@@ -21,7 +21,6 @@ from hyperscale.distributed.nodes.gate.server import GateServer
 from hyperscale.distributed.taskex import TaskRunner
 
 LOOP_NAMES = (
-    "_lease_cleanup_loop",
     "_job_cleanup_loop",
     "_rate_limit_cleanup_loop",
     "_batch_stats_loop",

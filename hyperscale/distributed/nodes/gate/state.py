@@ -2,7 +2,7 @@
 Gate runtime state for GateServer.
 
 Manages all mutable state including peer tracking, job management,
-datacenter health, leases, and metrics.
+datacenter health, and metrics.
 """
 
 import asyncio
@@ -16,7 +16,6 @@ from hyperscale.distributed.models import (
     GateState as GateStateEnum,
     ManagerHeartbeat,
     DatacenterRegistrationState,
-    DatacenterLease,
     JobSubmission,
     WorkflowResultPush,
     NegotiatedCapabilities,
@@ -132,10 +131,6 @@ class GateRuntimeState:
         self._job_client_updates_delivered_ahead: dict[
             str, dict[tuple[str, int], set[int]]
         ] = {}
-
-        # Lease state (legacy)
-        self._leases: dict[str, DatacenterLease] = {}
-        self._fence_token: int = 0
 
         # Leadership/orphan tracking
         self._dead_job_leaders: set[tuple[str, int]] = set()
@@ -532,33 +527,6 @@ class GateRuntimeState:
         for key in keys_to_remove:
             self._job_progress_sequences.pop(key, None)
             self._job_progress_seen.pop(key, None)
-
-    # Lease methods
-    def get_lease_key(self, job_id: str, datacenter_id: str) -> str:
-        """Get the lease key for a job-DC pair."""
-        return f"{job_id}:{datacenter_id}"
-
-    def get_lease(self, job_id: str, datacenter_id: str) -> DatacenterLease | None:
-        """Get the lease for a job-DC pair."""
-        key = self.get_lease_key(job_id, datacenter_id)
-        return self._leases.get(key)
-
-    def set_lease(
-        self, job_id: str, datacenter_id: str, lease: DatacenterLease
-    ) -> None:
-        """Set the lease for a job-DC pair."""
-        key = self.get_lease_key(job_id, datacenter_id)
-        self._leases[key] = lease
-
-    def remove_lease(self, job_id: str, datacenter_id: str) -> None:
-        """Remove the lease for a job-DC pair."""
-        key = self.get_lease_key(job_id, datacenter_id)
-        self._leases.pop(key, None)
-
-    async def next_fence_token(self) -> int:
-        async with self._get_counter_lock():
-            self._fence_token += 1
-            return self._fence_token
 
     # Orphan/leadership methods
     def mark_leader_dead(self, leader_addr: tuple[str, int]) -> None:

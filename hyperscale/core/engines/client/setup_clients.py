@@ -40,6 +40,13 @@ from .websocket.protocols import WebsocketConnection
 
 T = TypeVar('T')
 
+# Whether to verify the server -> (check_hostname, verify_mode). Assigned in
+# this order: a context refuses CERT_NONE while check_hostname is on.
+SERVER_VERIFICATION_BY_SETTING: dict[bool, tuple[bool, ssl.VerifyMode]] = {
+    True: (True, ssl.CERT_REQUIRED),
+    False: (False, ssl.CERT_NONE),
+}
+
 
 def setup_client(
     client: T,
@@ -48,7 +55,12 @@ def setup_client(
     cert_path: Optional[str] = None,
     key_path: Optional[str] = None,
     reset_connections: bool = False,
+    verify_tls: bool = True,
 ) -> T:
+    # (check_hostname, verify_mode) for every client TLS context: the
+    # server's certificate and name are checked (RFC 9110 section 4.3.4)
+    # unless the workflow opts out for a self-signed target.
+    server_verification = SERVER_VERIFICATION_BY_SETTING[verify_tls]
     
     if isinstance(
         client,
@@ -73,8 +85,7 @@ def setup_client(
 
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname, ctx.verify_mode = server_verification
 
         client._ssl_context = ctx
         client._semaphore = asyncio.Semaphore(vus)
@@ -106,8 +117,7 @@ def setup_client(
         ]
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname, ctx.verify_mode = server_verification
 
 
         client.trace = HTTPTrace(
@@ -139,8 +149,7 @@ def setup_client(
         except NotImplementedError:
             pass
 
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname, ctx.verify_mode = server_verification
 
         client._client_ssl_context = ctx
 
@@ -184,8 +193,7 @@ def setup_client(
         except NotImplementedError:
             pass
 
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname, ctx.verify_mode = server_verification
 
         client._client_ssl_context = ctx
 
@@ -207,8 +215,7 @@ def setup_client(
         client.reset_connections = reset_connections
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname, ctx.verify_mode = server_verification
 
         client._client_ssl_context = ctx
 
@@ -251,8 +258,7 @@ def setup_client(
 
     elif isinstance(client, MercurySyncSMTPConnection):
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname, ctx.verify_mode = server_verification
 
         client._ssl_context = ctx
         client._loop = asyncio.get_event_loop()
@@ -277,8 +283,7 @@ def setup_client(
         ]
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname, ctx.verify_mode = server_verification
 
         client._tcp_ssl_context = ctx
         client._semaphore = asyncio.Semaphore(vus)
@@ -317,8 +322,7 @@ def setup_client(
     elif isinstance(client, MercurySyncWebsocketConnection):
         client._concurrency = vus
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname, ctx.verify_mode = server_verification
 
         client._client_ssl_context = ctx
 
