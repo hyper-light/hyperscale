@@ -1,4 +1,6 @@
 import asyncio
+import functools
+import os
 import pathlib
 import sys
 from collections.abc import Awaitable, Callable
@@ -10,34 +12,42 @@ from hyperscale.distributed.taskex import TaskRunner
 from hyperscale.distributed.taskex.run import Run
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerError, ServerWarning
+from hyperscale.ui.components.scatter_plot import SeriesUpdate
+from hyperscale.ui.components.stat_tile import StatTileReading
+from hyperscale.ui.components.stat_tile.stat_tile_separators import STAT_TILE_SEPARATORS
+from hyperscale.ui.components.status_badge import BADGE_GAP, StatusBadgeReading, badge_line_count
 from hyperscale.ui.components.table import TableConfig
+from hyperscale.ui.components.table.tabulate import TableCell
 from hyperscale.ui.components.terminal import Terminal
 from hyperscale.ui.ci_safe.summary_line_output import format_duration
 from hyperscale.ui.config.mode import TerminalDisplayMode
+from hyperscale.ui.config.mode import TerminalMode as DisplayMode
 
-from .dashboard_formatting import format_reading
-from .models import NodeDashboardFrame, NodeDashboardLayout, TableRow
+from .dashboard_formatting import format_rate, format_reading
+from .models import NodeDashboardFrame, NodeDashboardLayout
 from .node_dashboard_actions import (
+    tile_channel,
+    update_node_dashboard_badges,
     update_node_dashboard_chart,
-    update_node_dashboard_cluster,
-    update_node_dashboard_detail,
     update_node_dashboard_identity,
-    update_node_dashboard_readings,
     update_node_dashboard_status,
-    update_node_dashboard_summary,
     update_node_dashboard_table,
+    update_node_dashboard_tile,
 )
 from .node_dashboard_chart_series import NodeDashboardChartSeries
 from .node_dashboard_config import NodeDashboardConfig
 from .node_dashboard_reader import NodeDashboardReader
+from .node_dashboard_rows import NodeDashboardRows
 from .node_dashboard_sampling_stopped import NodeDashboardSamplingStopped
-from .node_dashboard_summary_lines import NodeDashboardSummaryLines
 from .node_dashboard_sections import (
+    content_width,
     generate_node_dashboard_sections,
     node_dashboard_table_config,
 )
+from .node_dashboard_summary_lines import NodeDashboardSummaryLines
+from .node_dashboard_table_cells import cell_meter_width, table_cells
 
-PanelContent = list[str] | list[TableRow] | str
+PanelContent = list[str] | list[dict[str, TableCell]] | list[StatusBadgeReading] | StatTileReading | str
 PanelPublisher = Callable[[PanelContent], Awaitable[object]]
 
 # The terminal framework's display mode for each rendering terminal mode:
@@ -46,22 +56,35 @@ DISPLAY_MODES: dict[TerminalMode, TerminalDisplayMode] = {
     "full": "extended",
     "ci": "compatability",
 }
-# The padding HyperscaleInterface renders `run workflow`'s terminal with.
-HORIZONTAL_PADDING = 4
+# The dashboard spans the terminal's width, as btop and k9s do, less one
+# column of padding on each side (the canvas never reaches the terminal's
+# last column, Terminal's canvas_size), and every row but one blank row
+# above and below.
+WIDTH_SHARE = 1.0
+HORIZONTAL_PADDING = 1
 VERTICAL_PADDING = 1
+# What the status line says before where the node's logs go.
+STOP_HINT = "ctrl-c stops the node"
+# What stands in for a log path's directories where the whole path does
+# not fit the status line, by mode.
+ELLIPSES: dict[DisplayMode, str] = {DisplayMode.EXTENDED: "\u2026", DisplayMode.COMPATIBILITY: "..."}
 
 
 def dashboard_terminal(
     layout: NodeDashboardLayout,
     terminal_mode: TerminalMode,
     table_config: TableConfig,
+    rows: NodeDashboardRows,
 ) -> Terminal | None:
     """The terminal a dashboard renders its frames through, in a mode
     that renders frames; None in any other."""
     if terminal_mode not in DISPLAY_MODES:
         return None
 
-    return Terminal(generate_node_dashboard_sections(layout, table_config, DISPLAY_MODES[terminal_mode]))
+    return Terminal(
+        generate_node_dashboard_sections(layout, table_config, DISPLAY_MODES[terminal_mode], rows),
+        width_share=WIDTH_SHARE,
+    )
 
 
 def dashboard_summary_lines(
@@ -75,6 +98,17 @@ def dashboard_summary_lines(
         return None
 
     return NodeDashboardSummaryLines(sys.stdout.buffer, change_interval_seconds, heartbeat_interval_seconds)
+
+
+def status_text(log_path: pathlib.Path, width: int, separator: str, ellipsis: str) -> str:
+    """The status line in ``width`` columns: how to stop the node and its
+    log file's whole path, or -- where that does not fit -- the file's
+    name after an ellipsis for its directories (the name is never cut)."""
+    whole_text = f"{STOP_HINT}{separator}logs {log_path}"
+    if len(whole_text) < width:
+        return whole_text
+
+    return f"{STOP_HINT}{separator}logs {ellipsis}{os.sep}{log_path.name}"
 
 
 class NodeDashboard:
@@ -104,8 +138,12 @@ class NodeDashboard:
     ``SLO_EVALUATION_WINDOW_SECONDS`` of samples -- the horizon the cluster
     judges a node's latency over (AD-42) -- one point per series per
     sample, so it holds at most that window over the sampling interval;
-    each series' newest value, and the role's values in other units, are
-    listed beside it.
+    each series' newest value is in the chart's legend.
+
+    The sections take the rows a sample needs (``NodeDashboardRows``): when
+    the lines the badges flow onto or the table's row count change, the
+    sections are laid out again within the frame being published, and
+    every section is published afresh into the new layout.
     """
 
     def __init__(
@@ -125,12 +163,14 @@ class NodeDashboard:
         self._env = env
         self._config = config
         self._logger = logger
-        self._status_line = f"ctrl-c stops the node | logs {log_path}"
+        self._log_path = log_path
         window_seconds = env.SLO_EVALUATION_WINDOW_SECONDS
-        table_config = node_dashboard_table_config(
-            reader.layout, DISPLAY_MODES.get(terminal_mode, DISPLAY_MODES["ci"])
-        )
-        self._terminal = dashboard_terminal(reader.layout, terminal_mode, table_config)
+        display_mode = DISPLAY_MODES.get(terminal_mode, DISPLAY_MODES["ci"])
+        self._display_mode = DisplayMode.to_mode(display_mode)
+        self._separator = STAT_TILE_SEPARATORS[self._display_mode]
+        self._rows = NodeDashboardRows()
+        table_config = node_dashboard_table_config(reader.layout, display_mode)
+        self._terminal = dashboard_terminal(reader.layout, terminal_mode, table_config, self._rows)
         self._summary_lines = dashboard_summary_lines(
             terminal_mode, table_config.pagination_refresh_rate, window_seconds
         )
@@ -198,38 +238,63 @@ class NodeDashboard:
 
     async def _publish(self, frame: NodeDashboardFrame) -> None:
         self._chart_series.record(frame.sampled_at, frame.chart_values)
-        readings = self._readings(frame)
         if self._summary_lines is not None:
-            await self._write_summary_line(frame, readings)
+            await self._write_summary_line(frame, self._readings(frame))
             return
 
-        # The identity column holds no more lines than the header is tall
-        # (IDENTITY_LINE_COUNT): it never pages, so no line moves between
-        # frames unless its value changes.
-        identity_lines = [
-            *frame.identity_lines,
-            f"up {format_duration(frame.uptime_seconds)} {frame.lifecycle_state}",
-        ]
-        panels: tuple[tuple[str, PanelPublisher, PanelContent], ...] = (
-            ("identity", update_node_dashboard_identity, identity_lines),
-            ("cluster", update_node_dashboard_cluster, frame.cluster_lines),
-            ("summary", update_node_dashboard_summary, frame.summary_lines),
-            ("detail", update_node_dashboard_detail, frame.detail_lines),
-            ("table", update_node_dashboard_table, frame.table_rows),
-            ("status", update_node_dashboard_status, self._status_line),
-            ("readings", update_node_dashboard_readings, readings),
-        )
-        # One sample is one frame: no frame shows some panels of a sample
+        # One sample is one frame: no frame shows some sections of a sample
         # beside the table of the sample before.
         async with self._terminal.updating():
-            for panel_name, publish, content in panels:
+            await self._lay_out_for(frame)
+            for panel_name, publish, content in self._panels(frame):
                 await self._publish_changed(panel_name, publish, content)
 
-            await self._publish_charts(frame)
+            await self._publish_chart(frame)
+
+    async def _lay_out_for(self, frame: NodeDashboardFrame) -> None:
+        """Lay the sections out again where ``frame``'s badges or table need
+        other rows than the last frame's; every section is then published
+        afresh (laying out refits each component)."""
+        canvas = self._terminal.canvas
+        badge_lines = badge_line_count(frame.badges, content_width(canvas.width), len(BADGE_GAP), self._display_mode)
+        if self._rows.need(badge_lines, len(frame.table_rows)):
+            await self._terminal.resize(width=canvas.width, height=canvas.height)
+            self._published.clear()
+
+    def _panels(self, frame: NodeDashboardFrame) -> list[tuple[str, PanelPublisher, PanelContent]]:
+        """Each section's name, publisher and content for ``frame``."""
+        canvas_width = self._terminal.canvas.width
+        table_width = content_width(canvas_width)
+        meter_width = cell_meter_width(table_width, len(self._reader.layout.table_headers))
+        return [
+            ("identity", update_node_dashboard_identity, self._identity_lines(frame)),
+            ("badges", update_node_dashboard_badges, frame.badges),
+            *self._tile_panels(frame),
+            ("table", update_node_dashboard_table, table_cells(frame.table_rows, self._display_mode, meter_width)),
+            ("status", update_node_dashboard_status, self._status_line(table_width)),
+        ]
+
+    def _tile_panels(self, frame: NodeDashboardFrame) -> list[tuple[str, PanelPublisher, PanelContent]]:
+        return [
+            (f"tile {tile_index}", functools.partial(update_node_dashboard_tile, tile_channel(tile_index)), tile)
+            for tile_index, tile in enumerate(frame.tiles)
+        ]
+
+    def _identity_lines(self, frame: NodeDashboardFrame) -> list[str]:
+        """The identity column: who the node is, its lifecycle state and
+        uptime, and where it listens. It holds no more lines than the header
+        is tall (IDENTITY_LINE_COUNT): it never pages, so no line moves
+        between frames unless its value changes."""
+        role_line, *address_lines = frame.identity_lines
+        uptime = f"up {format_duration(frame.uptime_seconds)}"
+        return [role_line, f"{frame.lifecycle_state}{self._separator}{uptime}", *address_lines]
+
+    def _status_line(self, width: int) -> str:
+        return status_text(self._log_path, width, self._separator, ELLIPSES[self._display_mode])
 
     def _readings(self, frame: NodeDashboardFrame) -> list[str]:
         """Each series' newest value in the window, then the role's values
-        in other units."""
+        in other units: the CI-safe summary line's readings."""
         return [
             *(
                 f"{chart.title} {format_reading(self._chart_series.newest_value(chart_index))}"
@@ -246,15 +311,23 @@ class NodeDashboard:
                 f"the dashboard stopped writing summary lines: {type(write_error).__name__}: {write_error}"
             )
 
-    async def _publish_charts(self, frame: NodeDashboardFrame) -> None:
+    async def _publish_chart(self, frame: NodeDashboardFrame) -> None:
         # Every sample moves each series' points along the window, so the
         # chart is published every sample -- a series with no point in the
         # window plots none, never a gap as a zero nor stale points.
+        layout = self._reader.layout
         await update_node_dashboard_chart(
-            {
-                chart.title: self._chart_series.points(chart_index)
-                for chart_index, chart in enumerate(self._reader.layout.charts)
-            }
+            SeriesUpdate(
+                points={
+                    chart.title: self._chart_series.points(chart_index, chart.plots_zero)
+                    for chart_index, chart in enumerate(layout.charts)
+                },
+                readings={
+                    chart.title: format_rate(self._chart_series.newest_value(chart_index), layout.chart_reading_unit)
+                    for chart_index, chart in enumerate(layout.charts)
+                },
+                extra_reading=frame.chart_extra_reading,
+            )
         )
 
     async def _publish_changed(self, panel_name: str, publish: PanelPublisher, content: PanelContent) -> None:

@@ -3,12 +3,18 @@ from collections import Counter
 
 from hyperscale.distributed.models import WorkflowProgress
 from hyperscale.distributed.nodes import WorkerServer
+from hyperscale.ui.components.stat_tile import StatTileReading, StatTileSecondary
+from hyperscale.ui.components.status_badge import StatusBadgeReading
 from hyperscale.ui.components.table.table_config import HeaderOptions
 
 from .counter_rates import CounterRates
-from .dashboard_formatting import format_reading, in_use_percent
+from .dashboard_formatting import cores_meter, format_reading, in_use_percent
 from .models import NodeDashboardChart, NodeDashboardFrame, NodeDashboardLayout, TableRow
 from .node_identity_reader import NodeIdentityReader
+from .status_tones import joined_label, known_ratio_badges, state_badge, state_tone
+
+# The state of a worker's connection to its managers that needs no word.
+CONNECTED_STATE = "connected"
 
 WORKER_DASHBOARD_LAYOUT = NodeDashboardLayout(
     role="worker",
@@ -20,17 +26,21 @@ WORKER_DASHBOARD_LAYOUT = NodeDashboardLayout(
         "rate": HeaderOptions(default=0, precision_format=".1f"),
         "cores": HeaderOptions(default=0),
     },
+    table_empty_message="no workflows running",
+    tile_labels=("CORES", "ACTIVE", "THROUGHPUT", "ERRORS"),
     # The workflows it completed and failed are workflows a second: one
     # axis, as on its manager's chart. Its active workflows (a count) and
-    # the share of its cores busy (percent) are not, and are listed beside
-    # it; the throughput it reports and its backpressure are in its panel.
+    # the share of its cores busy (a meter) are in its tiles, as are the
+    # throughput it reports and its errors; its backpressure is a badge.
     chart_unit="wf /s",
+    chart_reading_unit="/s",
     # Declared failures first: where series share a cell the later one is
-    # drawn (ScatterPlot), so a run of zero failures never hides the small
-    # rates above it, while any nonzero failure rate lands on cells of its
-    # own; every series' value is also listed beside the chart.
+    # drawn (ScatterPlot), so a failure never hides the small rates above
+    # it; failures plot no zeros, so any failure rate shows on cells of its
+    # own and a quiet node draws none. Every series' reading is in the
+    # chart's legend.
     charts=(
-        NodeDashboardChart("failed", "failed", "hot_pink_3", "x"),
+        NodeDashboardChart("failed", "failed", "indian_red_3", "x", plots_zero=False),
         NodeDashboardChart("completed", "completed", "royal_blue", "circle_toggle"),
     ),
 )
@@ -40,7 +50,7 @@ def workflow_row(progress: WorkflowProgress) -> TableRow:
     """One running workflow's row in the worker's workflow table."""
     return {
         "workflow": progress.workflow_name,
-        "status": progress.status,
+        "status": state_badge(progress.status),
         "done": progress.completed_count,
         "failed": progress.failed_count,
         "rate": progress.rate_per_second,
@@ -128,6 +138,81 @@ class WorkerDashboardReader:
                 f"{format_reading(in_use_percent(core_allocator.total_cores, core_allocator.available_cores))}",
             ],
             sampled_at=sampled_at,
+            badges=self._badges(),
+            tiles=[
+                self._core_tile(),
+                self._active_tile(running),
+                self._throughput_tile(running),
+                self._error_tile(running),
+            ],
+            chart_extra_reading=None,
+        )
+
+    def _badges(self) -> list[StatusBadgeReading]:
+        """The worker's status at a glance: its primary manager and its
+        connection to it, its managers healthy of those it knows, the
+        backpressure its managers ask of it, its SWIM view and its local
+        health."""
+        worker = self._worker
+        registry = worker._registry
+        backpressure = worker._backpressure_manager.get_max_backpressure_level().name.lower()
+        healthy_count = len(registry._healthy_manager_ids)
+        known_count = len(registry._known_managers)
+        return [
+            self._manager_badge(),
+            *known_ratio_badges("managers", healthy_count, known_count),
+            StatusBadgeReading(f"backpressure {backpressure}", state_tone(backpressure)),
+            self._identity.swim_badge(),
+            self._identity.load_badge(worker._backpressure_manager._overload_detector.current_state.name.lower()),
+        ]
+
+    def _manager_badge(self) -> StatusBadgeReading:
+        """The primary manager, with the connection's state where it is not
+        connected."""
+        worker = self._worker
+        connection_state = worker._cluster_connection.state.name.lower()
+        primary = f"manager {describe_address(worker._registry.get_primary_manager_tcp_addr())}"
+        state_words = [] if connection_state == CONNECTED_STATE else [connection_state]
+        return StatusBadgeReading(joined_label([primary, *state_words]), state_tone(connection_state))
+
+    def _core_tile(self) -> StatTileReading:
+        core_allocator = self._worker._core_allocator
+        queued_count = len(self._worker._pending_workflows)
+        return StatTileReading(
+            value="",
+            meter=cores_meter(core_allocator.total_cores - core_allocator.available_cores, core_allocator.total_cores),
+            secondaries=(StatTileSecondary(f"{queued_count} queued", queued_count),),
+        )
+
+    def _active_tile(self, running: list[WorkflowProgress]) -> StatTileReading:
+        ended_statuses = self._ended_statuses
+        return StatTileReading(
+            value=f"{len(running)} running",
+            secondaries=(
+                StatTileSecondary(f"{ended_statuses['completed']} done", ended_statuses["completed"]),
+                StatTileSecondary(f"{ended_statuses['cancelled']} cancelled", ended_statuses["cancelled"]),
+            ),
+        )
+
+    def _throughput_tile(self, running: list[WorkflowProgress]) -> StatTileReading:
+        actions_completed, _, rate_per_second = total_progress(running)
+        return StatTileReading(
+            value=f"{self._worker._worker_state._throughput_last_value:.2f} wf/s",
+            secondaries=(
+                StatTileSecondary(f"{rate_per_second:.1f} actions/s", rate_per_second),
+                StatTileSecondary(f"{actions_completed} actions", actions_completed),
+            ),
+        )
+
+    def _error_tile(self, running: list[WorkflowProgress]) -> StatTileReading:
+        """Workflows failed -- drawn as failing only once any has -- and
+        the running workflows' failed actions while nonzero."""
+        _, actions_failed, _ = total_progress(running)
+        failed_count = self._ended_statuses["failed"]
+        return StatTileReading(
+            value=f"{failed_count} failed",
+            value_tone="failing" if failed_count > 0 else None,
+            secondaries=(StatTileSecondary(f"{actions_failed} action errors", actions_failed, "failing"),),
         )
 
     def _ended_counts(self) -> dict[str, int]:

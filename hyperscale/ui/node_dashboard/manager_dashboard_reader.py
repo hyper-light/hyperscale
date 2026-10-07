@@ -4,34 +4,50 @@ from hyperscale.distributed.jobs.dispatch_outcome import DispatchOutcome
 from hyperscale.distributed.models import JobInfo, WorkerStatus
 from hyperscale.distributed.nodes import ManagerServer
 from hyperscale.distributed.slo import LatencyObservation
+from hyperscale.ui.components.stat_tile import StatTileReading, StatTileSecondary
+from hyperscale.ui.components.status_badge import StatusBadgeReading
 from hyperscale.ui.components.table.table_config import HeaderOptions
 
 from .counter_rates import CounterRates
-from .dashboard_formatting import cluster_lines, count_statuses, format_reading, in_use_percent
+from .dashboard_formatting import (
+    cluster_lines,
+    cohort_badge,
+    cores_meter,
+    count_statuses,
+    format_milliseconds,
+    format_reading,
+    in_use_percent,
+    leader_badge,
+)
 from .job_workflow_tally import JobWorkflowTally
 from .models import NodeDashboardChart, NodeDashboardFrame, NodeDashboardLayout, TableRow
 from .node_identity_reader import NodeIdentityReader
+from .status_tones import known_ratio_badges, state_badge
 
 MANAGER_DASHBOARD_LAYOUT = NodeDashboardLayout(
     role="manager",
     table_headers={
         "worker": HeaderOptions(default="none", fixed=True),
         "state": HeaderOptions(default="-"),
-        "cores": HeaderOptions(default=0),
-        "free": HeaderOptions(default=0),
+        "cores": HeaderOptions(default="-"),
         "load": HeaderOptions(default="-"),
         "p95 ms": HeaderOptions(default="-", precision_format=".1f"),
     },
+    table_empty_message="waiting for workers to register",
+    tile_labels=("WORKERS", "CORES", "JOBS", "WORKFLOWS"),
     # Workflows dispatched, completed and failed are all workflows a
-    # second: one axis. The share of cores in use (percent) and the
-    # dispatch round trip (milliseconds) are not, and are listed beside it.
+    # second: one axis. The share of cores in use is the CORES tile's
+    # meter, and the dispatch round trip (milliseconds) the chart's extra
+    # reading.
     chart_unit="wf /s",
+    chart_reading_unit="/s",
     # Declared failures first: where series share a cell the later one is
-    # drawn (ScatterPlot), so a run of zero failures never hides the small
-    # rates above it, while any nonzero failure rate lands on cells of its
-    # own; every series' value is also listed beside the chart.
+    # drawn (ScatterPlot), so a failure never hides the small rates above
+    # it; failures plot no zeros, so any failure rate shows on cells of its
+    # own and a quiet node draws none. Every series' reading is in the
+    # chart's legend.
     charts=(
-        NodeDashboardChart("failures", "failed", "hot_pink_3", "x"),
+        NodeDashboardChart("failures", "failed", "indian_red_3", "x", plots_zero=False),
         NodeDashboardChart("completions", "completed", "royal_blue", "circle_toggle"),
         NodeDashboardChart("dispatches", "dispatched", "aquamarine_2", "dot"),
     ),
@@ -51,15 +67,21 @@ def describe_worker(worker: WorkerStatus) -> str:
     return f"{registration.node.host}:{registration.node.port}"
 
 
+def free_cores(worker: WorkerStatus) -> int:
+    """A worker's cores neither in use nor reserved."""
+    return worker.available_cores - worker.reserved_cores
+
+
 def worker_row(worker: WorkerStatus, dispatch_latencies: dict[str, LatencyObservation]) -> TableRow:
-    """One worker's row in the manager's worker table: its dispatch round
-    trip p95 (D-5) is left at the column's default until one is observed."""
+    """One worker's row in the manager's worker table: its state and load
+    as badges, its cores in use of its cores as a meter, and its dispatch
+    round trip p95 (D-5) -- left at the column's default until one is
+    observed."""
     row: TableRow = {
         "worker": describe_worker(worker),
-        "state": worker.state,
-        "cores": worker.total_cores,
-        "free": worker.available_cores - worker.reserved_cores,
-        "load": worker.overload_state,
+        "state": state_badge(worker.state),
+        "cores": cores_meter(worker.total_cores - free_cores(worker), worker.total_cores),
+        "load": state_badge(worker.overload_state),
     }
     if (observation := dispatch_latencies.get(worker.worker_id)) is not None:
         row["p95 ms"] = observation.p95_ms
@@ -69,12 +91,12 @@ def worker_row(worker: WorkerStatus, dispatch_latencies: dict[str, LatencyObserv
 
 def core_counts(workers: list[WorkerStatus]) -> tuple[int, int]:
     """The workers' cores: (total, free -- neither in use nor reserved)."""
-    total_cores, free_cores = 0, 0
+    total_cores, total_free_cores = 0, 0
     for worker in workers:
         total_cores += worker.total_cores
-        free_cores += worker.available_cores - worker.reserved_cores
+        total_free_cores += free_cores(worker)
 
-    return total_cores, free_cores
+    return total_cores, total_free_cores
 
 
 def dispatch_counts(manager: ManagerServer, workflow_tally: JobWorkflowTally) -> dict[str, int]:
@@ -128,9 +150,10 @@ class ManagerDashboardReader:
         manager = self._manager
         sampled_at = manager._clock.monotonic()
         workers = list(manager._worker_pool._workers.values())
-        total_cores, free_cores = core_counts(workers)
+        total_cores, free_core_count = core_counts(workers)
         jobs = manager._job_manager.iter_jobs()
         dispatch_latencies = manager._manager_state.get_worker_dispatch_latency_observations(sampled_at)
+        datacenter_p95_ms = self._datacenter_p95_ms(sampled_at)
         return NodeDashboardFrame(
             identity_lines=self._identity.identity_lines(),
             lifecycle_state=manager._manager_state.manager_state_enum.name.lower(),
@@ -142,15 +165,85 @@ class ManagerDashboardReader:
                     *self._identity.health_lines(manager._overload_detector.current_state.name.lower()),
                 ],
             ),
-            summary_lines=self._worker_lines(total_cores, free_cores),
+            summary_lines=self._worker_lines(total_cores, free_core_count),
             detail_lines=self._job_lines(jobs),
             table_rows=[worker_row(worker, dispatch_latencies) for worker in workers],
             chart_values=self._chart_values(jobs, sampled_at),
             value_lines=[
-                f"cores in use % {format_reading(in_use_percent(total_cores, free_cores))}",
-                f"dispatch p95 ms {format_reading(self._datacenter_p95_ms(sampled_at))}",
+                f"cores in use % {format_reading(in_use_percent(total_cores, free_core_count))}",
+                f"dispatch p95 ms {format_reading(datacenter_p95_ms)}",
             ],
             sampled_at=sampled_at,
+            badges=self._badges(),
+            tiles=[
+                self._worker_tile(),
+                StatTileReading(value="", meter=cores_meter(total_cores - free_core_count, total_cores)),
+                self._job_tile(jobs),
+                self._workflow_tile(jobs),
+            ],
+            chart_extra_reading=f"dispatch p95 {format_milliseconds(datacenter_p95_ms)}",
+        )
+
+    def _badges(self) -> list[StatusBadgeReading]:
+        """The manager's status at a glance: the cluster's leader and its
+        own membership, its peer managers and gates (where it knows any),
+        its SWIM view and its local health."""
+        manager = self._manager
+        manager_state = manager._manager_state
+        peer_metrics = manager_state.get_quorum_metrics()
+        gate_metrics = manager_state.get_gate_metrics()
+        return [
+            leader_badge(manager._cluster_membership),
+            cohort_badge(manager._cluster_membership),
+            *known_ratio_badges("managers", peer_metrics["active_peer_count"], peer_metrics["known_peer_count"]),
+            *known_ratio_badges("gates", gate_metrics["healthy_gate_count"], gate_metrics["known_gate_count"]),
+            self._identity.swim_badge(),
+            self._identity.load_badge(manager._overload_detector.current_state.name.lower()),
+        ]
+
+    def _worker_tile(self) -> StatTileReading:
+        worker_metrics = self._manager._manager_state.get_worker_metrics()
+        unhealthy_count = worker_metrics["unhealthy_worker_count"]
+        return StatTileReading(
+            value=f"{worker_metrics['worker_count'] - unhealthy_count} healthy",
+            secondaries=(StatTileSecondary(f"{unhealthy_count} unhealthy", unhealthy_count, "failing"),),
+        )
+
+    def _job_tile(self, jobs: list[JobInfo]) -> StatTileReading:
+        """Jobs running, then -- while nonzero -- failed, queued, done and
+        cancelled, and the jobs this manager leads of those it knows."""
+        status_counts = Counter(job.status for job in jobs)
+        failed_count = count_statuses(status_counts, FAILED_JOB_STATUSES)
+        pending_count = count_statuses(status_counts, PENDING_JOB_STATUSES)
+        led_job_count = len(self._manager._leases.get_led_job_ids())
+        known_leader_count = self._manager._manager_state.get_job_metrics()["job_leader_count"]
+        return StatTileReading(
+            value=f"{count_statuses(status_counts, RUNNING_JOB_STATUSES)} running",
+            secondaries=(
+                StatTileSecondary(f"{failed_count} failed", failed_count, "failing"),
+                StatTileSecondary(f"{pending_count} queued", pending_count),
+                StatTileSecondary(f"{status_counts['completed']} done", status_counts["completed"]),
+                StatTileSecondary(f"{status_counts['cancelled']} cancelled", status_counts["cancelled"]),
+                StatTileSecondary(f"leading {led_job_count}/{known_leader_count}", led_job_count),
+            ),
+        )
+
+    def _workflow_tile(self, jobs: list[JobInfo]) -> StatTileReading:
+        """Workflows done, then -- while nonzero -- failed, still active,
+        failed dispatches and the dispatch rate."""
+        manager_state = self._manager._manager_state
+        workflows_total, workflows_completed, workflows_failed = count_workflows(jobs)
+        active_count = workflows_total - workflows_completed - workflows_failed
+        dispatch_failures = manager_state._dispatch_failure_count
+        dispatch_rate = manager_state._dispatch_throughput_last_value
+        return StatTileReading(
+            value=f"{workflows_completed} done",
+            secondaries=(
+                StatTileSecondary(f"{workflows_failed} failed", workflows_failed, "failing"),
+                StatTileSecondary(f"{active_count} active", active_count),
+                StatTileSecondary(f"{dispatch_failures} dispatch failed", dispatch_failures, "failing"),
+                StatTileSecondary(f"{dispatch_rate:.1f}/s dispatch", dispatch_rate),
+            ),
         )
 
     def _chart_values(self, jobs: list[JobInfo], sampled_at: float) -> list[float | None]:
@@ -162,14 +255,14 @@ class ManagerDashboardReader:
         datacenter_latency = self._manager._manager_state.get_dispatch_latency_observation(sampled_at)
         return None if datacenter_latency is None else datacenter_latency.p95_ms
 
-    def _worker_lines(self, total_cores: int, free_cores: int) -> list[str]:
+    def _worker_lines(self, total_cores: int, free_core_count: int) -> list[str]:
         manager_state = self._manager._manager_state
         worker_metrics = manager_state.get_worker_metrics()
         gate_metrics = manager_state.get_gate_metrics()
         peer_metrics = manager_state.get_quorum_metrics()
         return [
             f"WORKERS {worker_metrics['worker_count']} unhealthy {worker_metrics['unhealthy_worker_count']}",
-            f"cores {total_cores} free {free_cores}",
+            f"cores {total_cores} free {free_core_count}",
             f"gates {gate_metrics['known_gate_count']} healthy {gate_metrics['healthy_gate_count']}",
             f"managers {peer_metrics['active_peer_count']} of {peer_metrics['known_peer_count']} up",
         ]

@@ -4,6 +4,8 @@ import time
 
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
+from hyperscale.ui.styling import stylize
+from hyperscale.ui.styling.tones import TONE_PALETTES
 
 from .column_layout import content_column_layout
 from .table_config import TableConfig
@@ -206,6 +208,25 @@ class Table:
         return self._last_rendered_frames, rerender
 
     async def _rerender(self, data: list[dict[str, TableCell]]):
+        if self._shows_empty_state(data):
+            return await self._empty_state_lines()
+
+        return await self._rerender_rows(data)
+
+    def _shows_empty_state(self, data: list[dict[str, TableCell]]) -> bool:
+        """Whether the table shows its empty state: it has no rows and an
+        empty message to show in their place."""
+        return not data and self._config.empty_message is not None
+
+    async def _empty_state_lines(self) -> list[str]:
+        """The empty message, cut to the table's width, centered in it and
+        drawn in the palette's dim label color."""
+        message = self._config.empty_message[: self._max_width]
+        left_padding = (self._max_width - len(message)) // 2
+        styled_message = await stylize(message, color=TONE_PALETTES[self._mode].label_color, mode=self._mode)
+        return [" " * left_padding + styled_message + " " * (self._max_width - len(message) - left_padding)]
+
+    async def _rerender_rows(self, data: list[dict[str, TableCell]]):
         if self._config.size_columns_to_content:
             return await self._rerender_sized_to_content(data)
 

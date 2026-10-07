@@ -69,8 +69,8 @@ SHOW_CURSOR = b"\x1b[?25h"
 
 
 def chart_titles(layout: NodeDashboardLayout) -> list[str]:
-    """How the role's chart names its series in a frame: its legend, and
-    each series' reading beside the chart."""
+    """How the role's chart names its series in a frame: its legend, each
+    series beside its reading."""
     return [chart.title for chart in layout.charts]
 
 
@@ -141,15 +141,15 @@ async def test_ci_dashboards_show_the_cluster_and_keep_logs_out_of_the_frames(
     nodes = [manager, worker]
     try:
         await manager.start()
-        assert await manager.wait_for_output("CLUSTER standalone", within=BOOT_TIMEOUT_SECONDS), "".join(manager.lines[-30:])
-        assert await manager.wait_for_output("WORKERS 0", within=BOOT_TIMEOUT_SECONDS)
+        assert await manager.wait_for_output("standalone", within=BOOT_TIMEOUT_SECONDS), "".join(manager.lines[-30:])
+        assert await manager.wait_for_output("0 healthy", within=BOOT_TIMEOUT_SECONDS)
 
         await worker.start()
-        assert await manager.wait_for_output("WORKERS 1", within=BOOT_TIMEOUT_SECONDS), (
+        assert await manager.wait_for_output("1 healthy", within=BOOT_TIMEOUT_SECONDS), (
             f"the manager's dashboard never showed the worker:\n{''.join(manager.lines[-30:])}"
         )
         assert await manager.wait_for_output(f"{LOCALHOST}:{worker_start}", within=BOOT_TIMEOUT_SECONDS)
-        assert await worker.wait_for_output(f"primary {manager.address}", within=BOOT_TIMEOUT_SECONDS), (
+        assert await worker.wait_for_output(f"manager {manager.address}", within=BOOT_TIMEOUT_SECONDS), (
             f"the worker's dashboard never showed its manager:\n{''.join(worker.lines[-30:])}"
         )
         for node, layout in ((manager, ManagerDashboardReader.layout), (worker, WorkerDashboardReader.layout)):
@@ -230,7 +230,7 @@ async def test_full_dashboard_on_a_terminal_restores_the_cursor_on_ctrl_c(
     await read_terminal(master_descriptor, collected, closed)
     try:
         assert await wait_for_bytes(collected, HIDE_CURSOR, within=BOOT_TIMEOUT_SECONDS)
-        assert await wait_for_bytes(collected, b"CLUSTER standalone", within=BOOT_TIMEOUT_SECONDS), bytes(collected[-3000:])
+        assert await wait_for_bytes(collected, b"standalone", within=BOOT_TIMEOUT_SECONDS), bytes(collected[-3000:])
         assert await wait_for_bytes(collected, b"(wf /s)", within=BOOT_TIMEOUT_SECONDS), bytes(collected[-3000:])
         assert await wait_for_bytes(collected, HEADER_ART_LINE.encode(), within=BOOT_TIMEOUT_SECONDS)
         # The dashboard draws before the node finishes booting: interrupt
@@ -386,20 +386,20 @@ async def test_the_gate_dashboard_shows_the_datacenter_its_manager_reports(
     nodes = [manager, gate]
     try:
         await gate.start()
-        assert await gate.wait_for_output("CLUSTER standalone", within=BOOT_TIMEOUT_SECONDS), "".join(gate.lines[-30:])
+        assert await gate.wait_for_output("+ quorum 1/1", within=BOOT_TIMEOUT_SECONDS), "".join(gate.lines[-30:])
         assert await gate.wait_for_output("GATE", within=BOOT_TIMEOUT_SECONDS)
 
         await manager.start()
-        assert await gate.wait_for_output("DATACENTERS 1", within=BOOT_TIMEOUT_SECONDS), (
+        assert await gate.wait_for_output("DCs accepting 1/1", within=BOOT_TIMEOUT_SECONDS), (
             f"the gate's dashboard never showed the manager's datacenter:\n{''.join(gate.lines[-30:])}"
         )
-        assert await gate.wait_for_output("managers alive 1", within=BOOT_TIMEOUT_SECONDS)
+        assert await gate.wait_for_output(NODE_DATACENTER, within=BOOT_TIMEOUT_SECONDS)
         assert await gate.wait_for_output(HEADER_ART_LINE, within=BOOT_TIMEOUT_SECONDS)
         for title in chart_titles(GateDashboardReader.layout):
             assert await gate.wait_for_output(title, within=BOOT_TIMEOUT_SECONDS), (
                 f"the gate's dashboard has no {title!r} chart:\n{''.join(gate.lines[-30:])}"
             )
-        assert await manager.wait_for_output("gates 1 healthy 1", within=BOOT_TIMEOUT_SECONDS), (
+        assert await manager.wait_for_output("gates 1/1", within=BOOT_TIMEOUT_SECONDS), (
             f"the manager's dashboard never showed its gate:\n{''.join(manager.lines[-30:])}"
         )
         assert await wait_for_log(node_log(logs_directory, "gate", gate_start, GATE_DATACENTER), BOOT_MARKERS["gate"])

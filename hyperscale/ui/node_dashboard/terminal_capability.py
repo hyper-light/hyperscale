@@ -10,7 +10,6 @@ import functools
 from hyperscale.core.jobs.models import TerminalMode
 from hyperscale.ui.ci_safe import TerminalSelection
 from hyperscale.ui.ci_safe.terminal_capability import (
-    LAYOUT_CHECK_DISPLAY_MODE,
     PLOT_POINT_GLYPH,
     Fallback,
     empty_frame_lines,
@@ -18,13 +17,15 @@ from hyperscale.ui.ci_safe.terminal_capability import (
     first_fallback,
     select_terminal_mode,
 )
+from hyperscale.ui.components.meter.meter_glyph_sets import EXTENDED_METER_GLYPHS
+from hyperscale.ui.components.status_badge.status_badge_glyph_sets import EXTENDED_BADGE_GLYPHS
 from hyperscale.ui.components.terminal.canvas import Canvas
 from hyperscale.ui.components.terminal.terminal import canvas_size
 from hyperscale.ui.hyperscale_header import create_hyperscale_header
 
 from .models import NodeDashboardLayout
-from .node_dashboard import HORIZONTAL_PADDING, VERTICAL_PADDING
-from .node_dashboard_rows import IDENTITY_LINE_COUNT, TABLE_MIN_ROWS
+from .node_dashboard import HORIZONTAL_PADDING, VERTICAL_PADDING, WIDTH_SHARE
+from .node_dashboard_rows import IDENTITY_LINE_COUNT, NodeDashboardRows
 from .node_dashboard_sections import (
     IDENTITY_COMPONENT_NAME,
     generate_node_dashboard_sections,
@@ -33,6 +34,21 @@ from .node_dashboard_sections import (
 
 # What a degraded node's reason calls the UI it could not show.
 FULL_UI_NAME = "the full dashboard"
+# The glyphs an empty dashboard frame (which the encoding check renders)
+# does not draw: the plot's point character, the badges' and the meters'.
+UNDRAWN_GLYPHS = "".join(
+    [
+        PLOT_POINT_GLYPH,
+        *EXTENDED_BADGE_GLYPHS.values(),
+        *EXTENDED_METER_GLYPHS.cell_steps,
+        EXTENDED_METER_GLYPHS.full,
+        EXTENDED_METER_GLYPHS.empty,
+    ]
+)
+# The display mode the layout check renders the dashboard in: the full
+# dashboard's own, so the frame it encodes carries the full dashboard's
+# glyphs (its rules among them).
+NODE_LAYOUT_CHECK_DISPLAY_MODE = "extended"
 
 
 async def layout_fallback(layout: NodeDashboardLayout, columns: int, lines: int, encoding: str | None) -> Fallback | None:
@@ -42,28 +58,31 @@ async def layout_fallback(layout: NodeDashboardLayout, columns: int, lines: int,
     it: an empty frame must fit the canvas, the header row must hold the
     Hyperscale header's art unclipped and the identity column without
     paging, the table must have room for a row (an empty frame draws
-    none), and the frame and the plot's point must encode."""
+    none), and the frame and the glyphs it draws once sampled must
+    encode."""
     if columns < 1 or lines <= 2 * VERTICAL_PADDING:
         return ("ci-safe", f"the terminal's size is unknown or too small ({columns}x{lines})")
 
-    canvas_width, canvas_height = canvas_size(columns, lines, HORIZONTAL_PADDING, VERTICAL_PADDING)
+    canvas_width, canvas_height = canvas_size(columns, lines, HORIZONTAL_PADDING, VERTICAL_PADDING, WIDTH_SHARE)
+    rows = NodeDashboardRows()
     canvas = Canvas(
         generate_node_dashboard_sections(
             layout,
-            node_dashboard_table_config(layout, LAYOUT_CHECK_DISPLAY_MODE),
-            LAYOUT_CHECK_DISPLAY_MODE,
+            node_dashboard_table_config(layout, NODE_LAYOUT_CHECK_DISPLAY_MODE),
+            NODE_LAYOUT_CHECK_DISPLAY_MODE,
+            rows,
         )
     )
     frame_lines = await empty_frame_lines(canvas, canvas_width, canvas_height)
     # The header's art at its own size: a narrower header section clips it.
-    header = create_hyperscale_header(LAYOUT_CHECK_DISPLAY_MODE)
+    header = create_hyperscale_header(NODE_LAYOUT_CHECK_DISPLAY_MODE)
     await header.fit()
     layout_overflows = any(
         (
             len(frame_lines) > canvas_height,
             max(map(len, frame_lines)) > canvas_width,
             canvas.get_section(IDENTITY_COMPONENT_NAME).height < IDENTITY_LINE_COUNT,
-            canvas.get_section(f"node_dashboard_{layout.role}_table").height < TABLE_MIN_ROWS,
+            not rows.fits(canvas_height),
             canvas.get_section(header.name).width < header.raw_size,
         )
     )
@@ -71,7 +90,7 @@ async def layout_fallback(layout: NodeDashboardLayout, columns: int, lines: int,
         (
             (layout_overflows, f"the terminal ({columns}x{lines}) is smaller than the dashboard's layout needs"),
             (
-                not encodes("".join(frame_lines) + PLOT_POINT_GLYPH, encoding),
+                not encodes("".join(frame_lines) + UNDRAWN_GLYPHS, encoding),
                 f"stdout's encoding ({encoding}) cannot write the dashboard's glyphs",
             ),
         )

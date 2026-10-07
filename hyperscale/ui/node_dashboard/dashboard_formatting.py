@@ -2,8 +2,12 @@
 
 from collections import Counter
 
-from hyperscale.distributed.cluster.cluster_membership import ClusterMembership
+from hyperscale.distributed.cluster.cluster_membership import FORMATION_FORMED, ClusterMembership
 from hyperscale.distributed.cluster.models import ClusterMemberId
+from hyperscale.ui.components.meter import MeterReading
+from hyperscale.ui.components.status_badge import StatusBadgeReading
+
+from .status_tones import joined_label
 
 # A formed cluster member that is not the leader follows it; before the
 # cluster forms, the formation stage itself is the member's role.
@@ -69,3 +73,43 @@ def in_use_percent(total_cores: int, free_cores: int) -> float:
 def count_statuses(status_counts: Counter[str], statuses: tuple[str, ...]) -> int:
     """How many of the counted items are in any of ``statuses``."""
     return sum(map(status_counts.__getitem__, statuses))
+
+
+def format_rate(value: float | None, unit: str) -> str:
+    """A rate as a chart's legend reads it: ``59.9/s``, or ``NO_READING``."""
+    if value is None:
+        return NO_READING
+
+    return f"{value:.1f}{unit}"
+
+
+def format_milliseconds(value: float | None) -> str:
+    """A latency in milliseconds: ``50.0 ms``, or ``NO_READING``."""
+    if value is None:
+        return NO_READING
+
+    return f"{value:.1f} ms"
+
+
+def leader_badge(membership: ClusterMembership) -> StatusBadgeReading:
+    """The cluster leader as a badge -- in trouble while none is known --
+    with the formation stage while the cluster has not formed."""
+    stage = [] if membership.formation == FORMATION_FORMED else [membership.formation]
+    return StatusBadgeReading(
+        joined_label([f"leader {describe_leader(membership)}", *stage]),
+        "ok" if membership.leader_member_id is not None else "failing",
+    )
+
+
+def cohort_badge(membership: ClusterMembership) -> StatusBadgeReading:
+    """The node's membership as a badge: its role, the voters among the
+    cohort and the formation stage -- worth a look until formed."""
+    return StatusBadgeReading(
+        f"{describe_cluster_role(membership)} {len(membership.voters)}/{len(membership.cohort)} voters",
+        "ok" if membership.formation == FORMATION_FORMED else "degraded",
+    )
+
+
+def cores_meter(used_cores: int, total_cores: int) -> MeterReading:
+    """Cores in use of all cores, as a meter labelled ``used/total``."""
+    return MeterReading(used=used_cores, total=total_cores, label=f"{used_cores}/{total_cores}")

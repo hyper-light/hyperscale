@@ -2,13 +2,25 @@ from collections import Counter
 
 from hyperscale.distributed.models import DatacenterStatus
 from hyperscale.distributed.nodes import GateServer
+from hyperscale.ui.components.meter import MeterReading
+from hyperscale.ui.components.stat_tile import StatTileReading, StatTileSecondary
+from hyperscale.ui.components.status_badge import StatusBadgeReading
 from hyperscale.ui.components.table.table_config import HeaderOptions
+from hyperscale.ui.styling.tones import StatusTone
 
 from .counter_rates import CounterRates
-from .dashboard_formatting import cluster_lines, count_statuses, format_reading
+from .dashboard_formatting import (
+    cluster_lines,
+    cores_meter,
+    count_statuses,
+    format_milliseconds,
+    format_reading,
+    leader_badge,
+)
 from .job_outcome_tally import JobOutcomeTally
 from .models import NodeDashboardChart, NodeDashboardFrame, NodeDashboardLayout, TableRow
 from .node_identity_reader import NodeIdentityReader
+from .status_tones import joined_label, nonzero_counts, state_badge
 
 GATE_DASHBOARD_LAYOUT = NodeDashboardLayout(
     role="gate",
@@ -17,19 +29,24 @@ GATE_DASHBOARD_LAYOUT = NodeDashboardLayout(
         "health": HeaderOptions(default="-"),
         "managers": HeaderOptions(default=0),
         "workers": HeaderOptions(default=0),
-        "capacity": HeaderOptions(default=0),
+        "cores": HeaderOptions(default="-"),
         "p95 ms": HeaderOptions(default="-", precision_format=".1f"),
     },
+    table_empty_message="waiting for datacenters to report",
+    tile_labels=("JOBS", "DATACENTERS", "FORWARDING", "ORPHANS"),
     # Jobs admitted, completed and failed are all jobs a second: one axis.
-    # The datacenters accepting jobs (a count) and the worst datacenter's
-    # dispatch round trip (milliseconds) are not, and are listed beside it.
+    # The datacenters accepting jobs (a count) are a badge and the worst
+    # datacenter's dispatch round trip (milliseconds) the chart's extra
+    # reading.
     chart_unit="jobs /s",
+    chart_reading_unit="/s",
     # Declared failures first: where series share a cell the later one is
-    # drawn (ScatterPlot), so a run of zero failures never hides the small
-    # rates above it, while any nonzero failure rate lands on cells of its
-    # own; every series' value is also listed beside the chart.
+    # drawn (ScatterPlot), so a failure never hides the small rates above
+    # it; failures plot no zeros, so any failure rate shows on cells of its
+    # own and a quiet node draws none. Every series' reading is in the
+    # chart's legend.
     charts=(
-        NodeDashboardChart("failed", "failed", "hot_pink_3", "x"),
+        NodeDashboardChart("failed", "failed", "indian_red_3", "x", plots_zero=False),
         NodeDashboardChart("completed", "completed", "royal_blue", "circle_toggle"),
         NodeDashboardChart("admitted", "admitted", "aquamarine_2", "dot"),
     ),
@@ -44,16 +61,26 @@ COMPLETED_JOB_STATUSES = ("completed",)
 FAILED_JOB_STATUSES = ("failed", "timeout")
 
 
-def datacenter_row(status: DatacenterStatus, dispatch_p95_by_datacenter: dict[str, float]) -> TableRow:
-    """One datacenter's row in the gate's datacenter table: its dispatch
-    round trip p95 (D-5) is left at the column's default until one of its
-    managers reports one."""
+# DatacenterHealth values a gate routes no job to while it has another.
+HEALTHY_DATACENTER_HEALTH = ("healthy",)
+
+
+def datacenter_row(
+    status: DatacenterStatus,
+    total_cores: int,
+    dispatch_p95_by_datacenter: dict[str, float],
+) -> TableRow:
+    """One datacenter's row in the gate's datacenter table: its health as a
+    badge, its cores in use of ``total_cores`` (its freshest manager
+    heartbeat's) as a meter -- a datacenter's available capacity is its
+    free cores -- and its dispatch round trip p95 (D-5), left at the
+    column's default until one of its managers reports one."""
     row: TableRow = {
         "datacenter": status.dc_id,
-        "health": status.health,
+        "health": state_badge(status.health),
         "managers": status.manager_count,
         "workers": status.worker_count,
-        "capacity": status.available_capacity,
+        "cores": cores_meter(max(total_cores - status.available_capacity, 0), total_cores),
     }
     if (dispatch_p95_ms := dispatch_p95_by_datacenter.get(status.dc_id)) is not None:
         row["p95 ms"] = dispatch_p95_ms
@@ -72,6 +99,27 @@ def dispatch_p95_by_datacenter(gate: GateServer, datacenter_ids: list[str]) -> d
         for datacenter_id in datacenter_ids
         if (heartbeat := runtime_state.get_dc_slo_heartbeat(datacenter_id)) is not None
     }
+
+
+def datacenter_total_cores(gate: GateServer, datacenter_id: str) -> int:
+    """A datacenter's cores, from its freshest manager heartbeat (the one
+    its health is classified from); 0 before any manager reports."""
+    heartbeat, _, _ = gate._dc_health_manager.get_best_manager_heartbeat(datacenter_id)
+    return 0 if heartbeat is None else heartbeat.total_cores
+
+
+def quorum_tone(up_count: int, cluster_size: int) -> StatusTone:
+    """A majority of the gates up holds a quorum; fewer do not."""
+    return "ok" if 2 * up_count > cluster_size else "failing"
+
+
+def accepting_tone(accepting_count: int, datacenter_count: int) -> StatusTone:
+    """Every datacenter accepting jobs is as expected, some worth a look,
+    none in trouble."""
+    if accepting_count < 1:
+        return "failing"
+
+    return "ok" if accepting_count >= datacenter_count else "degraded"
 
 
 def outcome_counts(outcome_tally: JobOutcomeTally) -> dict[str, int]:
@@ -136,11 +184,106 @@ class GateDashboardReader:
             ),
             summary_lines=self._datacenter_lines(datacenter_statuses),
             detail_lines=self._job_lines(),
-            table_rows=[datacenter_row(status, dispatch_p95s) for status in datacenter_statuses],
+            table_rows=[
+                datacenter_row(status, datacenter_total_cores(gate, status.dc_id), dispatch_p95s)
+                for status in datacenter_statuses
+            ],
             chart_values=self._chart_values(sampled_at),
             value_lines=self._value_lines(datacenter_statuses, dispatch_p95s),
             sampled_at=sampled_at,
+            badges=self._badges(datacenter_statuses),
+            tiles=[
+                self._job_tile(),
+                self._datacenter_tile(datacenter_statuses),
+                self._forwarding_tile(),
+                self._orphan_tile(),
+            ],
+            chart_extra_reading=f"worst DC p95 {format_milliseconds(max(dispatch_p95s.values(), default=None))}",
         )
+
+    def _badges(self, datacenter_statuses: list[DatacenterStatus]) -> list[StatusBadgeReading]:
+        """The gate's status at a glance: the cluster's leader, the gates'
+        quorum (the gate cluster's membership), the datacenters accepting
+        jobs, its SWIM view and its local health."""
+        gate = self._gate
+        health_counts = Counter(status.health for status in datacenter_statuses)
+        accepting_count = count_statuses(health_counts, ACCEPTING_DATACENTER_HEALTH)
+        return [
+            leader_badge(gate._cluster_membership),
+            self._quorum_badge(),
+            StatusBadgeReading(
+                f"DCs accepting {accepting_count}/{len(datacenter_statuses)}",
+                accepting_tone(accepting_count, len(datacenter_statuses)),
+            ),
+            self._identity.swim_badge(),
+            self._identity.load_badge(gate._overload_detector.current_state.name.lower()),
+        ]
+
+    def _quorum_badge(self) -> StatusBadgeReading:
+        """The gates up (this one among them) of the gate cluster, and the
+        peers it holds dead while any are."""
+        gate = self._gate
+        runtime_state = gate._modular_state
+        cluster_size = len(gate._gate_peers) + 1
+        up_count = runtime_state.get_active_peer_count() + 1
+        dead_gates = nonzero_counts(((len(runtime_state._dead_gate_peers), "dead"),))
+        return StatusBadgeReading(
+            joined_label([f"quorum {up_count}/{cluster_size}", *dead_gates]), quorum_tone(up_count, cluster_size)
+        )
+
+    def _job_tile(self) -> StatTileReading:
+        """Jobs running, then -- while nonzero -- failed, queued, done and
+        cancelled, and the jobs this gate leads of those it tracks."""
+        gate = self._gate
+        status_counts = Counter(job.status for _, job in gate._job_manager.items())
+        failed_count = count_statuses(status_counts, FAILED_JOB_STATUSES)
+        pending_count = count_statuses(status_counts, PENDING_JOB_STATUSES)
+        leadership_tracker = gate._job_leadership_tracker
+        led_job_count = len(leadership_tracker.get_jobs_led_by(gate.node_id.full))
+        return StatTileReading(
+            value=f"{count_statuses(status_counts, RUNNING_JOB_STATUSES)} running",
+            secondaries=(
+                StatTileSecondary(f"{failed_count} failed", failed_count, "failing"),
+                StatTileSecondary(f"{pending_count} queued", pending_count),
+                StatTileSecondary(f"{status_counts['completed']} done", status_counts["completed"]),
+                StatTileSecondary(f"{status_counts['cancelled']} cancelled", status_counts["cancelled"]),
+                StatTileSecondary(f"leading {led_job_count}/{len(leadership_tracker)}", led_job_count),
+            ),
+        )
+
+    def _datacenter_tile(self, datacenter_statuses: list[DatacenterStatus]) -> StatTileReading:
+        """The datacenters healthy of all, as a meter (each one's managers
+        alive are in its table row)."""
+        health_counts = Counter(status.health for status in datacenter_statuses)
+        healthy_count = count_statuses(health_counts, HEALTHY_DATACENTER_HEALTH)
+        return StatTileReading(
+            value="",
+            meter=MeterReading(
+                used=healthy_count,
+                total=len(datacenter_statuses),
+                label=f"{healthy_count}/{len(datacenter_statuses)} healthy",
+            ),
+        )
+
+    def _forwarding_tile(self) -> StatTileReading:
+        """The jobs forwarded each second, then -- while nonzero -- the
+        routing decisions made and the fallbacks among them."""
+        gate = self._gate
+        routing_metrics = gate._job_router.get_metrics()
+        routed_count = sum_metrics_with_prefix(routing_metrics, "decision:")
+        fallback_count = sum_metrics_with_prefix(routing_metrics, "fallback:")
+        return StatTileReading(
+            value=f"{gate._modular_state._forward_throughput_last_value:.1f}/s",
+            secondaries=(
+                StatTileSecondary(f"{fallback_count} fallback", fallback_count, "degraded"),
+                StatTileSecondary(f"{routed_count} routed", routed_count),
+            ),
+        )
+
+    def _orphan_tile(self) -> StatTileReading:
+        """The jobs orphaned by a lost peer: in trouble while any are."""
+        orphan_count = len(self._gate._modular_state._orphaned_jobs)
+        return StatTileReading(value=f"{orphan_count}", value_tone="failing" if orphan_count > 0 else None)
 
     def _chart_values(self, sampled_at: float) -> list[float | None]:
         self._outcome_tally.advance(job_statuses(self._gate))

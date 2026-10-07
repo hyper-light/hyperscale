@@ -1,19 +1,20 @@
 """
 The node dashboards render as `run workflow`'s UI does: the Hyperscale
-header with the node's identity, the role's panels, the role's one chart
-of its series in a shared unit (a legend naming each) beside each series'
-newest value and the role's values in other units, and the role's table --
-every section sized from the canvas so the whole fits the terminal.
+header with the node's identity, a line of status badges, a row of stat
+tiles, the role's one chart of its series in a shared unit (a legend
+naming each with its current reading, and the role's extra reading at its
+right), and the role's table -- every section sized from the canvas so the
+whole fits the terminal.
 
 Each test builds a real node (constructed, never started) on a clock the
 test moves by hand, puts known state into it -- a registered worker,
 dispatches and their round trips, jobs, datacenter heartbeats -- and reads
 it twice through the role's reader: once directly, asserting each series'
-exact value and the other values' lines, and once through a "ci" dashboard
-rendering into a pipe that stands in for the terminal, asserting the
-header, the legend, every reading, the top of the chart's value axis (the
-scatter plot scales it to 1.1 times the largest value of any series,
-rounded up) and the table rows.
+exact value and the other values' lines (the CI-safe summary's), and once
+through a "ci" dashboard rendering into a pipe that stands in for the
+terminal, asserting the header, the legend and its readings, the tiles,
+the top of the chart's value axis (the scatter plot scales it to 1.1 times
+the largest value of any series, rounded up) and the table rows.
 
 The clock stands still while the dashboard renders: the rates the first
 sample computes (over the interval the test advanced) are the only rate
@@ -59,12 +60,14 @@ from hyperscale.ui.node_dashboard import (
 )
 from hyperscale.ui.node_dashboard.models import NodeDashboardLayout
 from hyperscale.ui.node_dashboard.node_dashboard_chart_series import NodeDashboardChartSeries
-from hyperscale.ui.node_dashboard.node_dashboard_rows import IDENTITY_LINE_COUNT, table_rows
+from hyperscale.ui.node_dashboard.node_dashboard import HORIZONTAL_PADDING, VERTICAL_PADDING, WIDTH_SHARE
+from hyperscale.ui.node_dashboard.node_dashboard_rows import IDENTITY_LINE_COUNT, NodeDashboardRows
 from hyperscale.ui.node_dashboard.node_dashboard_sections import (
     CHART_COMPONENT_NAME,
     IDENTITY_COMPONENT_NAME,
     generate_node_dashboard_sections,
     node_dashboard_table_config,
+    table_component_name,
 )
 from hyperscale.ui.components.terminal.terminal import canvas_size as terminal_canvas_size
 from tests.integration.cli.node_processes import reserve_port_blocks, worker_port_span
@@ -88,11 +91,8 @@ SAMPLED_INTERVAL_SECONDS = 2.0
 # value it plots (ScatterPlot._generate_x_and_y_vals), as the run UI's chart.
 VALUE_AXIS_HEADROOM = 1.1
 # The terminal sizes the layout must fit without clipping: the smallest it
-# is built for, a shorter one, and a roomy one.
-TERMINAL_SIZES = ((120, 38), (120, 30), (120, 22), (160, 48))
-# The padding the dashboard renders with (NodeDashboard).
-HORIZONTAL_PADDING = 4
-VERTICAL_PADDING = 1
+# is built for, shorter and narrower ones, and a roomy one.
+TERMINAL_SIZES = ((120, 38), (120, 30), (100, 30), (120, 22), (160, 48))
 LAYOUTS = (ManagerDashboardReader.layout, WorkerDashboardReader.layout, GateDashboardReader.layout)
 
 
@@ -192,26 +192,31 @@ async def render_dashboard(
     return frame
 
 
-def legend(reader: NodeDashboardReader) -> str:
-    """The chart's legend: each series' point character and title."""
-    return "  ".join(f"{PointChar.by_name(chart.point_char)} {chart.title}" for chart in reader.layout.charts)
+def legend(reader: NodeDashboardReader, readings: dict[str, str]) -> str:
+    """The chart's legend: each series' point character, title and
+    reading, the series drawn last (on top) first."""
+    return "   ".join(
+        f"{PointChar.by_name(chart.point_char)} {chart.title} {readings[chart.title]}"
+        for chart in reversed(reader.layout.charts)
+    )
 
 
 async def assert_header_chart_and_readings(
     frame: str,
     reader: NodeDashboardReader,
+    legend_readings: dict[str, str],
     readings: list[str],
     largest_value: float | None,
 ) -> None:
-    """The frame shows the Hyperscale header, the chart's legend (and the
-    nice value axis above ``largest_value``, where it plots any value), and
-    every reading; where it plots any value, a nice value axis above
+    """The frame shows the Hyperscale header, the chart's legend with each
+    series' reading, and every other reading (the tiles' and the chart's
+    extra reading); where it plots any value, a nice value axis above
     ``largest_value``."""
     plain_frame = "\n".join(plain_lines(frame))
     for header_line in await header_lines():
         assert header_line in plain_frame, f"the Hyperscale header is missing {header_line!r}:\n{plain_frame}"
 
-    assert legend(reader) in plain_frame, f"the legend is missing:\n{plain_frame}"
+    assert legend(reader, legend_readings) in plain_frame, f"the legend is missing:\n{plain_frame}"
     for reading in readings:
         assert reading in plain_frame, f"the reading {reading!r} is missing:\n{plain_frame}"
 
@@ -275,16 +280,18 @@ async def test_the_manager_dashboard_charts_its_dispatches_and_lists_cores_and_l
     assert frame_read.value_lines == ["cores in use % 75.0", "dispatch p95 ms 40.0"]
 
     frame = await render_dashboard(
-        rendered_reader, manager, tmp_path, "(wf /s)", "dispatched 50.0", f"127.0.0.1:{worker_port}"
+        rendered_reader, manager, tmp_path, "(wf /s)", "dispatched 50.0/s", f"127.0.0.1:{worker_port}"
     )
     await assert_header_chart_and_readings(
         frame,
         reader,
-        ["dispatched 50.0", "completed 10.0", "failed 4.0", "cores in use % 75.0", "dispatch p95 ms 40.0"],
+        {"dispatched": "50.0/s", "completed": "10.0/s", "failed": "4.0/s"},
+        ["dispatch p95 40.0 ms", "WORKERS", "1 healthy", "CORES", " 6/8", "WORKFLOWS", "20 done, 8 failed"],
         50.0,
     )
     worker_row = next(line for line in plain_lines(frame) if f"127.0.0.1:{worker_port}" in line)
-    assert worker_row.split() == ["|", f"127.0.0.1:{worker_port}", "healthy", "8", "2", "healthy", "40.0", "|"]
+    assert worker_row.split()[:3] == [f"127.0.0.1:{worker_port}", "+", "healthy"]
+    assert worker_row.split()[-4:] == ["6/8", "+", "healthy", "40.0"]
     assert f"MANAGER {manager.node_id.short}" in frame
 
 
@@ -307,12 +314,11 @@ async def test_a_chart_with_no_value_is_not_plotted_as_zero(tmp_path: pathlib.Pa
         manager,
         tmp_path,
         "(wf /s)",
-        "cores in use % 75.0",
-        "dispatch p95 ms -",
+        "dispatch p95 -",
         f"127.0.0.1:{worker_port}",
     )
     worker_row = next(line for line in plain_lines(frame) if f"127.0.0.1:{worker_port}" in line)
-    assert worker_row.split()[-2] == "-"
+    assert worker_row.split()[-1] == "-"
 
 
 async def test_the_worker_dashboard_charts_its_ended_workflows_and_lists_its_load(
@@ -350,12 +356,17 @@ async def test_the_worker_dashboard_charts_its_ended_workflows_and_lists_its_loa
     assert frame_read.chart_values == [None, None]
     assert frame_read.value_lines == ["active workflows 1", "cores busy % 75.0"]
 
-    frame = await render_dashboard(reader, worker, tmp_path, "(wf /s)", "cores busy % 75.0", "DashWorkflow")
+    frame = await render_dashboard(reader, worker, tmp_path, "(wf /s)", " 3/4", "DashWorkflow")
     await assert_header_chart_and_readings(
-        frame, reader, ["completed -", "failed -", "active workflows 1", "cores busy % 75.0"], None
+        frame,
+        reader,
+        {"completed": "-", "failed": "-"},
+        ["ACTIVE", "1 running", "THROUGHPUT", "2.50 wf/s", "7.5 actions/s", "ERRORS", "0 failed, 1 action errors"],
+        None,
     )
+    assert "~ backpressure batch" in frame
     workflow_row = next(line for line in plain_lines(frame) if "DashWorkflow" in line)
-    assert workflow_row.split() == ["|", "DashWorkflow", "running", "42", "1", "7.5", "0", "|"]
+    assert workflow_row.split() == ["DashWorkflow", "+", "running", "42", "1", "7.5", "0"]
     assert f"WORKER {worker.node_id.short}" in frame
 
 
@@ -427,19 +438,23 @@ async def test_the_gate_dashboard_charts_its_jobs_and_lists_its_datacenters(tmp_
     assert frame_read.value_lines == ["DCs accepting 2", "worst DC p95 ms 90.0"]
 
     frame = await render_dashboard(
-        rendered_reader, gate, tmp_path, "(jobs /s)", "worst DC p95 ms 90.0", "DC-EAST", "DC-WEST"
+        rendered_reader, gate, tmp_path, "(jobs /s)", "worst DC p95 90.0 ms", "DC-EAST", "DC-WEST"
     )
     await assert_header_chart_and_readings(
         frame,
         reader,
-        ["admitted 2.0", "completed 0.5", "failed 0.5", "DCs accepting 2", "worst DC p95 ms 90.0"],
+        {"admitted": "2.0/s", "completed": "0.5/s", "failed": "0.5/s"},
+        ["+ DCs accepting 2/2", "worst DC p95 90.0 ms", "JOBS", "4 running, 1 failed", " 2/2 healthy", "ORPHANS"],
         2.0,
     )
     datacenter_rows = {
-        cells[1]: cells for line in plain_lines(frame) if len(cells := line.split()) > 2 and cells[1].startswith("DC-")
+        cells[0]: cells for line in plain_lines(frame) if len(cells := line.split()) > 2 and cells[0].startswith("DC-")
     }
-    assert datacenter_rows["DC-EAST"][2] == "healthy" and datacenter_rows["DC-EAST"][-2] == "30.0"
-    assert datacenter_rows["DC-WEST"][2] == "healthy" and datacenter_rows["DC-WEST"][-2] == "90.0"
+    # Each datacenter: healthy, one manager and two workers, 8 of its 16
+    # cores in use, and its own p95.
+    for datacenter_id, p95 in (("DC-EAST", "30.0"), ("DC-WEST", "90.0")):
+        assert datacenter_rows[datacenter_id][1:5] == ["+", "healthy", "1", "2"], datacenter_rows
+        assert datacenter_rows[datacenter_id][-2:] == ["8/16", p95], datacenter_rows
     assert f"GATE {gate.node_id.short}" in frame
 
 
@@ -518,15 +533,23 @@ async def test_a_largest_value_under_five_is_drawn() -> None:
 def canvas_size(columns: int, lines: int) -> tuple[int, int]:
     """The canvas a terminal of ``columns`` x ``lines`` gives the
     dashboard, as Terminal sizes it."""
-    return terminal_canvas_size(columns, lines, HORIZONTAL_PADDING, VERTICAL_PADDING)
+    return terminal_canvas_size(columns, lines, HORIZONTAL_PADDING, VERTICAL_PADDING, WIDTH_SHARE)
 
 
-async def dashboard_canvas(layout: NodeDashboardLayout, columns: int, lines: int) -> Canvas:
+async def dashboard_canvas(
+    layout: NodeDashboardLayout,
+    columns: int,
+    lines: int,
+    rows: NodeDashboardRows | None = None,
+) -> Canvas:
     """``layout``'s dashboard laid out for a ``columns`` x ``lines``
-    terminal, before any sample."""
+    terminal by ``rows`` (before any sample, by default)."""
     canvas = Canvas(
         generate_node_dashboard_sections(
-            layout, node_dashboard_table_config(layout, "compatability"), "compatability"
+            layout,
+            node_dashboard_table_config(layout, "compatability"),
+            "compatability",
+            rows if rows is not None else NodeDashboardRows(),
         )
     )
     canvas_width, canvas_height = canvas_size(columns, lines)
@@ -537,16 +560,18 @@ async def dashboard_canvas(layout: NodeDashboardLayout, columns: int, lines: int
 async def test_the_layout_fills_the_terminal_exactly_and_gives_the_table_what_is_left() -> None:
     # Every section takes its rows of the canvas: together they fill it
     # (nothing passes its bottom), the header row holds the identity column
-    # unpaged, and the table takes every row the others leave.
+    # unpaged, and the table takes the rows it needs.
     for layout in LAYOUTS:
         for columns, lines in TERMINAL_SIZES:
-            canvas = await dashboard_canvas(layout, columns, lines)
+            rows = NodeDashboardRows()
+            canvas = await dashboard_canvas(layout, columns, lines, rows)
             canvas_width, canvas_height = canvas_size(columns, lines)
             frame_lines = plain_lines((await canvas.render()).replace("\r", ""))
             assert len(frame_lines) == canvas_height, (layout.role, columns, lines, "\n".join(frame_lines))
             assert max(map(len, frame_lines)) == canvas_width
+            assert canvas_width + 2 * HORIZONTAL_PADDING < columns, "a line reaches the terminal's last column"
             assert canvas.get_section(IDENTITY_COMPONENT_NAME).height >= IDENTITY_LINE_COUNT
-            assert canvas.get_section(f"node_dashboard_{layout.role}_table").height == table_rows(canvas_height)
+            assert canvas.get_section(table_component_name(layout)).height == rows.table_rows(canvas_height)
 
 
 async def test_a_resize_lays_the_sections_out_again_for_the_new_size() -> None:
@@ -566,8 +591,10 @@ async def test_the_chart_holds_every_series_of_the_role_with_a_legend() -> None:
         assert chart_section.component_names == [CHART_COMPONENT_NAME]
         plot_lines, _ = await chart_section.component.get_next_frame()
         plain_plot = [ANSI_SEQUENCE.sub("", line) for line in plot_lines]
-        assert plain_plot[0].strip() == "  ".join(
-            f"{PointChar.by_name(chart.point_char)} {chart.title}" for chart in layout.charts
+        # Before any sample the legend names each series, the series drawn
+        # last (on top) first.
+        assert plain_plot[0].strip() == "   ".join(
+            f"{PointChar.by_name(chart.point_char)} {chart.title}" for chart in reversed(layout.charts)
         )
         assert any(f"({layout.chart_unit})" in line and line.rstrip().endswith("^") for line in plain_plot)
         assert any(line.strip().startswith("Time (sec) |") for line in plain_plot)
@@ -597,7 +624,7 @@ async def test_a_multi_series_plot_scales_to_every_series_and_the_later_series_w
     plain_plot = [ANSI_SEQUENCE.sub("", line) for line in lines]
 
     assert rendered
-    assert plain_plot[0].strip() == f"{PointChar.by_name('dot')} low  {PointChar.by_name('x')} high"
+    assert plain_plot[0].strip() == f"{PointChar.by_name('dot')} low   {PointChar.by_name('x')} high"
     # The value axis covers the higher series: a nice top above 1.1 x 40.
     assert_nice_value_axis(value_axis_labels("\n".join(plain_plot), "per second"), 40.0)
     plotted = "".join(plain_plot[3:])

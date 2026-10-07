@@ -30,6 +30,12 @@ CANVAS_COLUMN = VALUE_LABEL_WIDTH + len(VALUE_GUTTER)
 TIME_ARROW = ">"
 # Time-axis labels sit no closer than plotille spaced its own.
 TIME_TICK_SPACING = 10
+# A terminal cell is about twice as tall as it is wide: value-axis labels
+# this many rows apart are spaced as far as the time axis' labels are, so
+# a plot whose config asks for it (``PlotConfig.value_tick_rows``) labels
+# both axes at one visual density rather than every row.
+CELL_HEIGHT_TO_WIDTH = 2
+TIME_MATCHED_VALUE_TICK_ROWS = TIME_TICK_SPACING // CELL_HEIGHT_TO_WIDTH
 # Braille cells are two dots wide and four tall.
 DOTS_PER_COLUMN = 2
 DOTS_PER_ROW = 4
@@ -70,15 +76,21 @@ def tick_label(value: float, decimals: int) -> str:
     return label if len(label) <= VALUE_LABEL_WIDTH else f"{value:.3g}"
 
 
-def value_axis_ticks(values: list[float], low: float, explicit_high: float | None, rows: int) -> NiceTicks:
+def value_axis_ticks(
+    values: list[float],
+    low: float,
+    explicit_high: float | None,
+    rows: int,
+    rows_per_tick: int = 1,
+) -> NiceTicks:
     """The value axis' ticks, from ``low`` to the first nice tick above the
-    largest value (or the configured end): no more than one a row (the
-    step the nice number at or above the range over the rows), so no two
-    share a row and the axis ends as close above the values as a nice
-    step allows."""
+    largest value (or the configured end): no more than one every
+    ``rows_per_tick`` rows (the step the nice number at or above the range
+    over that many ticks), so no two share a row and the axis ends as
+    close above the values as a nice step allows."""
     largest = max(values, default=low) * VALUE_HEADROOM
     high = explicit_high if explicit_high is not None else largest
-    return nice_ticks(low, high if high > low else low + 1, rows + 1, False)
+    return nice_ticks(low, high if high > low else low + 1, rows // max(rows_per_tick, 1) + 1, False)
 
 
 def time_axis_end(times: list[float], low: float, explicit_high: float | None, columns: int) -> float:

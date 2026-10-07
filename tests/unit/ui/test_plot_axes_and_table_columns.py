@@ -23,11 +23,18 @@ from hyperscale.ui.components.scatter_plot.plot_axes import (
 from hyperscale.ui.components.table import Table
 from hyperscale.ui.components.terminal.canvas import Canvas
 from hyperscale.ui.components.terminal.terminal import canvas_size
+from hyperscale.ui.components.meter import MeterReading
+from hyperscale.ui.components.status_badge import StatusBadgeReading
+from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.node_dashboard import ManagerDashboardReader
+from hyperscale.ui.node_dashboard.node_dashboard import HORIZONTAL_PADDING, VERTICAL_PADDING, WIDTH_SHARE
+from hyperscale.ui.node_dashboard.node_dashboard_rows import NodeDashboardRows
 from hyperscale.ui.node_dashboard.node_dashboard_sections import (
     generate_node_dashboard_sections,
     node_dashboard_table_config,
+    table_component_name,
 )
+from hyperscale.ui.node_dashboard.node_dashboard_table_cells import table_cells
 
 ANSI_SEQUENCE = re.compile(r"\x1b\[[0-9;:?]*[A-Za-z]")
 POINT = "●"
@@ -36,10 +43,22 @@ PLOT_HEIGHT = 14
 # A label with more decimals than any nice step needs.
 LONG_DECIMALS = re.compile(r"\d\.\d{3,}")
 WORKER_ADDRESS = "127.0.0.1:15138"
-WORKER_ROW = {"worker": WORKER_ADDRESS, "state": "healthy", "cores": 8, "free": 2, "load": "healthy", "p95 ms": 50.0}
-# The dashboard's padding (NodeDashboard).
-HORIZONTAL_PADDING = 4
-VERTICAL_PADDING = 1
+# A manager's worker row as the dashboard draws it: its statuses as badges
+# and its cores in use as a meter ten columns wide, in ASCII.
+METER_WIDTH = 10
+(WORKER_ROW,) = table_cells(
+    [
+        {
+            "worker": WORKER_ADDRESS,
+            "state": StatusBadgeReading("healthy", "ok"),
+            "cores": MeterReading(used=6, total=8, label="6/8"),
+            "load": StatusBadgeReading("healthy", "ok"),
+            "p95 ms": 50.0,
+        }
+    ],
+    TerminalMode.COMPATIBILITY,
+    METER_WIDTH,
+)
 
 
 def plain(lines: list[str]) -> list[str]:
@@ -135,28 +154,40 @@ async def test_a_worker_address_is_never_cut_and_columns_drop_from_the_right() -
         lines = await rendered_table(width)
         assert all(len(line) == width for line in lines), (width, lines)
         assert WORKER_ADDRESS in lines[-1], (width, lines)
-        shown = lines[-1].split()
+        shown_headers = [header for header in headers if header in lines[0]]
         # The columns shown are the first ones, in order: any dropped are
         # the last.
-        assert shown[0] == WORKER_ADDRESS and len(shown) <= len(headers), (width, lines)
+        assert lines[-1].split()[0] == WORKER_ADDRESS, (width, lines)
+        assert shown_headers == headers[: len(shown_headers)], (width, lines)
 
     # Wide enough for every value: every column shows.
-    assert (await rendered_table(65))[-1].split() == [WORKER_ADDRESS, "healthy", "8", "2", "healthy", "50.0"]
+    assert (await rendered_table(65))[-1].split() == [
+        WORKER_ADDRESS,
+        "+",
+        "healthy",
+        "#####-",
+        "6/8",
+        "+",
+        "healthy",
+        "50.0",
+    ]
     # Too narrow for them all: the rightmost go first.
-    assert (await rendered_table(24))[-1].split() == [WORKER_ADDRESS, "healthy"]
+    assert (await rendered_table(30))[-1].split() == [WORKER_ADDRESS, "+", "healthy"]
 
 
 async def test_the_dashboard_shows_a_worker_address_whole_at_120_and_100_columns() -> None:
     layout = ManagerDashboardReader.layout
     for columns in (120, 100):
+        rows = NodeDashboardRows()
+        rows.need(badge_line_count=1, table_row_count=1)
         canvas = Canvas(
             generate_node_dashboard_sections(
-                layout, node_dashboard_table_config(layout, "compatability"), "compatability"
+                layout, node_dashboard_table_config(layout, "compatability"), "compatability", rows
             )
         )
-        canvas_width, canvas_height = canvas_size(columns, 38, HORIZONTAL_PADDING, VERTICAL_PADDING)
+        canvas_width, canvas_height = canvas_size(columns, 38, HORIZONTAL_PADDING, VERTICAL_PADDING, WIDTH_SHARE)
         await canvas.initialize(width=canvas_width, height=canvas_height)
-        await canvas.get_component(f"node_dashboard_{layout.role}_table").update([WORKER_ROW])
+        await canvas.get_component(table_component_name(layout)).update([WORKER_ROW])
         frame = ANSI_SEQUENCE.sub("", await canvas.render())
         worker_line = next(line for line in frame.split("\n") if "127.0.0.1:" in line)
         assert WORKER_ADDRESS in worker_line, f"{columns} columns:\n{frame}"

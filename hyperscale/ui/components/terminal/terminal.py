@@ -52,6 +52,8 @@ T = TypeVar("T", bound=ActionData)
 # wide plus the horizontal padding on each side, so no line reaches the
 # terminal's last column).
 TERMINAL_WIDTH_SHARE = 0.75
+# The terminal's last column, which no line of a frame reaches.
+LAST_COLUMN = 1
 
 
 def canvas_size(
@@ -59,13 +61,19 @@ def canvas_size(
     lines: int,
     horizontal_padding: int,
     vertical_padding: int,
+    width_share: float = TERMINAL_WIDTH_SHARE,
 ) -> tuple[int, int]:
-    """The canvas a terminal of ``columns`` x ``lines`` holds: its share of
-    the columns less the horizontal padding, rounded down to a multiple of
-    three (the sections' thirds), and every line but the vertical padding
-    above and below it -- so a frame fills the terminal's rows exactly and
-    never passes its bottom."""
-    width = math.floor(columns * TERMINAL_WIDTH_SHARE) - horizontal_padding
+    """The canvas a terminal of ``columns`` x ``lines`` holds: its
+    ``width_share`` of the columns less the horizontal padding -- never so
+    wide that a line (the canvas and the padding on each side) reaches the
+    terminal's last column, where a terminal wraps the cursor -- rounded
+    down to a multiple of three (the sections' thirds), and every line but
+    the vertical padding above and below it -- so a frame fills the
+    terminal's rows exactly and never passes its bottom."""
+    width = min(
+        math.floor(columns * width_share) - horizontal_padding,
+        columns - 2 * horizontal_padding - LAST_COLUMN,
+    )
     return max(width - width % 3, 1), max(lines - 2 * vertical_padding, 1)
 
 
@@ -83,6 +91,7 @@ async def handle_resize(engine: Terminal):
             terminal_size.lines,
             engine._horizontal_padding,
             engine._vertical_padding,
+            engine.width_share,
         )
         if (width, height) != (engine.canvas.width, engine.canvas.height):
             await engine.resize(width=width, height=height)
@@ -113,8 +122,11 @@ class Terminal:
         sections: List[Section],
         config: EngineConfig | None = None,
         sigmap: Dict[signal.Signals, Coroutine[None, None, None]] | None = None,
+        width_share: float = TERMINAL_WIDTH_SHARE,
     ) -> None:
         self.config = config
+        # The share of the terminal's columns the canvas spans (canvas_size).
+        self.width_share = width_share
         self.canvas = Canvas(sections)
 
         refresh_rate = RefreshRate.MEDIUM.value
@@ -391,6 +403,7 @@ class Terminal:
             terminal_size.lines,
             self._horizontal_padding,
             self._vertical_padding,
+            self.width_share,
         )
         if width is None:
             width = terminal_width

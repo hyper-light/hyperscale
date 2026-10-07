@@ -46,15 +46,17 @@ async def test_a_registering_worker_shows_on_the_manager_dashboard(tmp_path: pat
             dashboard = ci_dashboard(ManagerDashboardReader(manager), manager, env, tmp_path / "manager.log")
             await dashboard.start()
             try:
-                frame = await wait_for_frame(collected, "WORKERS 0", "CLUSTER standalone")
+                frame = await wait_for_frame(collected, "0 healthy", "standalone")
                 assert f"tcp 127.0.0.1:{manager_port}" in frame
                 # The node id begins with its datacenter.
                 assert f"MANAGER {manager.node_id.short}" in frame and manager.node_id.short.startswith("DC-DASH")
-                # The status line names the log file (clipped to the screen's width).
-                assert f"ctrl-c stops the node | logs {str(tmp_path)[:40]}" in frame
+                # The status line names the log file (its directories elided
+                # where the whole path does not fit).
+                assert "ctrl-c stops the node, logs " in frame and "manager.log" in frame
 
                 await asyncio.wait_for(worker.start(), timeout=WORKER_REGISTRATION_SECONDS)
-                frame = await wait_for_frame(collected, "WORKERS 1", f"cores {WORKER_CORES} free {WORKER_CORES}")
+                # One healthy worker, none of its cores in use.
+                frame = await wait_for_frame(collected, "1 healthy", f" 0/{WORKER_CORES}")
                 assert f"127.0.0.1:{worker_port}" in frame, "the worker's row is missing from the table"
             finally:
                 await dashboard.stop()
@@ -78,9 +80,10 @@ async def test_the_worker_dashboard_shows_its_manager_and_counts_ended_workflows
             try:
                 await wait_for_frame(
                     collected,
-                    f"primary 127.0.0.1:{manager_port}",
-                    "MANAGERS connected",
-                    f"CORES {WORKER_CORES} free {WORKER_CORES}",
+                    # Connected to its primary manager (a connected
+                    # manager's badge names no state), no core in use.
+                    f"+ manager 127.0.0.1:{manager_port}",
+                    f" 0/{WORKER_CORES}",
                 )
 
                 # A workflow runs, then ends failed: the worker's own
@@ -97,11 +100,11 @@ async def test_the_worker_dashboard_shows_its_manager_and_counts_ended_workflows
                     elapsed_seconds=1.0,
                 )
                 worker._worker_state.add_active_workflow("workflow-dash", progress, ("127.0.0.1", manager_port))
-                await wait_for_frame(collected, "WORKFLOWS running 1", "DashWorkflow", "actions 42")
+                await wait_for_frame(collected, "1 running", "DashWorkflow", "42 actions")
 
                 progress.status = "failed"
                 worker._worker_state.remove_active_workflow("workflow-dash")
-                frame = await wait_for_frame(collected, "WORKFLOWS running 0", "failed 1 cancelled 0")
+                frame = await wait_for_frame(collected, "0 running", "1 failed")
                 assert "DashWorkflow" not in frame, "the ended workflow is still in the table"
             finally:
                 await dashboard.stop()

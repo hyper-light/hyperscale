@@ -137,7 +137,7 @@ async def test_ctrl_c_stops_the_node_and_leaves_nothing_of_the_dashboard(tmp_pat
                 shutdown_timeout_seconds=SHUTDOWN_SECONDS,
             )
         )
-        await wait_for_frame(collected, "CLUSTER standalone", "up 0h00m0", within=MANAGER_BOOT_SECONDS)
+        await wait_for_frame(collected, "+ standalone 1/1 voters", "up 0h00m0", within=MANAGER_BOOT_SECONDS)
         assert len(Terminal._updates.updates[IDENTITY_CHANNEL]) == subscribers_before + 1
 
         os.kill(os.getpid(), signal.SIGINT)

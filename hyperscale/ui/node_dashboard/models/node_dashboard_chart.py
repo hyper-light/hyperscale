@@ -11,9 +11,15 @@ class NodeDashboardChart:
     character its points are drawn in. The chart's value axis scales to
     every series' values, as the run UI's chart does to its one: a fixed
     top would sit on the largest possible value, which the plot never
-    draws (no point lands on an axis' maximum)."""
+    draws (no point lands on an axis' maximum).
+
+    A series that does not ``plots_zero`` -- failures -- draws no point
+    for a zero: its points show only when it happens (its legend reading
+    still shows its zero), so a quiet node's chart is not lined with
+    alarm-colored marks along its axis."""
 
     name: str
     title: str
     color: Colorizer
     point_char: PointCharName
+    plots_zero: bool = True

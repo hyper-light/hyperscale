@@ -57,6 +57,9 @@ def summary_frame(sampled_at: float, workers: int) -> NodeDashboardFrame:
         chart_values=[],
         value_lines=["cores in use % 75.0"],
         sampled_at=sampled_at,
+        badges=[],
+        tiles=[],
+        chart_extra_reading=None,
     )
 
 
@@ -87,9 +90,11 @@ def test_each_unfit_environment_selects_ci_safe_and_a_capable_terminal_keeps_ful
 
 
 async def test_a_terminal_too_small_or_unable_to_encode_the_glyphs_selects_ci_safe() -> None:
-    assert await layout_fallback(LAYOUT, 120, 38, "utf-8") is None
-    assert await layout_fallback(LAYOUT, 160, 48, "utf-8") is None
-    for columns, lines in ((40, 10), (0, 0), (120, 14), (100, 38)):
+    for columns, lines in ((120, 38), (120, 30), (100, 30), (160, 48)):
+        assert await layout_fallback(LAYOUT, columns, lines, "utf-8") is None, (columns, lines)
+    # Too narrow for the Hyperscale header's art, or too short for the
+    # header, the badges, the tiles, a table row and the status line.
+    for columns, lines in ((40, 10), (0, 0), (120, 14), (80, 38)):
         assert (await layout_fallback(LAYOUT, columns, lines, "utf-8"))[0] == "ci-safe", (columns, lines)
     assert (await layout_fallback(LAYOUT, 120, 38, "ascii"))[0] == "ci-safe"
 

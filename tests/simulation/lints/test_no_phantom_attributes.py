@@ -123,7 +123,10 @@ DECLARED_FIELD_BINDERS: frozenset[str] = frozenset({"Message"})
 # (the stdlib's `Exception`) and `DatacentersWithoutRoomError` below it.
 # Raised from 621 to 622 for `RunSummaryStopped` (the stdlib's
 # `Exception`): a run's CI-safe summary ending on an error of its own.
-MAX_UNPROVABLE_CLASSES = 622
+# Raised from 622 to 625 for the status components' configs, `MeterConfig`,
+# `StatTileConfig` and `StatusBadgeConfig`: each a pydantic `BaseModel`, as
+# every terminal component's config is.
+MAX_UNPROVABLE_CLASSES = 625
 
 
 class ClassFacts:

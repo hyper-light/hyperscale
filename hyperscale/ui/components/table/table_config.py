@@ -35,3 +35,7 @@ class TableConfig(BaseModel):
     # any fixed one are never truncated; columns are dropped from the right
     # when the values do not fit. Off: every column is the same width.
     size_columns_to_content: StrictBool = False
+    # What a table with no rows shows in place of its header: one dim line,
+    # centered (``waiting for workers to register``). None draws the header
+    # over no rows.
+    empty_message: StrictStr | None = None
