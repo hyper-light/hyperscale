@@ -31,10 +31,13 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
+    ServerDebug,
     ServerError,
     ServerInfo,
+    ServerWarning,
 )
 
+from hyperscale.distributed.nodes.gate.models.pending_job_cancellation import PendingJobCancellation
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 
 # Prefix stamped on a cancel response when no DC confirmed the cancel,
@@ -44,6 +47,26 @@ from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 # two must stay in sync — changing this marker requires updating that
 # set.
 _CANCEL_RETRYABLE_MARKER = "cancellation pending leader transition"
+
+# Fail-fast forward: try each manager once (no per-manager connection
+# retry) so a full DC sweep -- even against a partly-dead DC mid-failover --
+# returns to the client well inside the client's per-send timeout.
+# Robustness against the failover convergence window comes from the
+# *client* re-issuing a cancel no datacenter confirmed (see
+# ``ClientCancellationManager.cancel_job``), and from the gate re-driving a
+# cancel some datacenters confirmed to the rest
+# (``redrive_pending_cancellations``) -- not from the gate blocking on
+# internal retries. Retrying here instead would stack per-manager backoff
+# into a multi-tens-of-seconds round-trip that the client would time out
+# on, which is exactly what stranded gate-routed cancels during a
+# manager-leader failover.
+_FAIL_FAST_FORWARD_RETRY_CONFIG = RetryConfig(
+    max_attempts=1,
+    base_delay=0.5,
+    max_delay=5.0,
+    jitter=JitterStrategy.FULL,
+    retryable_exceptions=(ConnectionError, TimeoutError, OSError),
+)
 
 # How far each datacenter's answer to a single-workflow cancel carries the
 # gate's aggregate: a workflow still being stopped in any datacenter is not
@@ -133,6 +156,10 @@ class GateCancellationHandler:
         self._send_tcp: Callable = send_tcp
         self._client_push_timeout_seconds: float = client_push_timeout_seconds
         self._manager_request_timeout_seconds: float = manager_request_timeout_seconds
+        # Cancels some target datacenters have not confirmed, by job: each
+        # is re-driven until every target confirms or the gate retires the
+        # job (``redrive_pending_cancellations``).
+        self._pending_cancellations: dict[str, PendingJobCancellation] = {}
 
     def _build_cancel_response(
         self,
@@ -322,27 +349,15 @@ class GateCancellationHandler:
         use_ad20: bool,
     ) -> bytes:
         """Forward the cancel to every target datacenter, mark the job
-        CANCELLED once one confirmed, and answer the client."""
-        # Fail-fast forward: try each manager once (no per-manager
-        # connection retry) so a full DC sweep — even against a
-        # partly-dead DC mid-failover — returns to the client well
-        # inside the client's per-send timeout. Robustness against
-        # the failover convergence window comes from the *client*
-        # re-issuing the cancel across its total time budget (see
-        # ``ClientCancellationManager.cancel_job``), not from the
-        # gate blocking on internal retries. Retrying here instead
-        # would stack per-manager backoff into a multi-tens-of-
-        # seconds round-trip that the client would time out on,
-        # which is exactly what stranded gate-routed cancels during
-        # a manager-leader failover.
-        retry_config = RetryConfig(
-            max_attempts=1,
-            base_delay=0.5,
-            max_delay=5.0,
-            jitter=JitterStrategy.FULL,
-            retryable_exceptions=(ConnectionError, TimeoutError, OSError),
-        )
+        CANCELLED once one confirmed, and answer the client.
 
+        The datacenters that did not confirm are re-driven until they do
+        (``redrive_pending_cancellations``). Once the job is CANCELLED here,
+        a repeat cancel is answered at the gate and those datacenters'
+        progress is dropped as a terminal job's: unconfirmed, they ran the
+        job on uncancelled for the rest of its budget (base 657e460b
+        ``tcp_cancellation.py:363-376``).
+        """
         errors: list[str] = []
         confirmed_datacenters: list[tuple[str, int]] = []
         cancelled_workflows = 0
@@ -355,7 +370,7 @@ class GateCancellationHandler:
                 fence_token=fence_token,
                 reason=reason,
                 timestamp=timestamp,
-                retry_config=retry_config,
+                retry_config=_FAIL_FAST_FORWARD_RETRY_CONFIG,
                 errors=errors,
                 confirmed_datacenters=confirmed_datacenters,
             )
@@ -374,6 +389,17 @@ class GateCancellationHandler:
             )
             job.status = JobStatus.CANCELLED.value
             await self._state.increment_state_version()
+            self._track_unconfirmed_cancellation(
+                job_id,
+                PendingJobCancellation(
+                    use_ad20=use_ad20,
+                    requester_id=requester_id,
+                    fence_token=fence_token,
+                    reason=reason,
+                    timestamp=timestamp,
+                ),
+                confirmed_datacenters,
+            )
 
         return self._build_cancel_response(
             use_ad20,
@@ -381,6 +407,115 @@ class GateCancellationHandler:
             success=any_dc_confirmed,
             cancelled_count=cancelled_workflows,
             error=self._cancel_error_string(any_dc_confirmed, errors),
+        )
+
+    def _track_unconfirmed_cancellation(
+        self,
+        job_id: str,
+        pending: PendingJobCancellation,
+        confirmed_datacenters: list[tuple[str, int]],
+    ) -> None:
+        """Keep the cancel for re-driving while a target datacenter has not
+        confirmed it; a concurrent cancel's confirmations join the one kept."""
+        kept = self._pending_cancellations.setdefault(job_id, pending)
+        kept.confirmed_datacenters.update(datacenter for datacenter, _ in confirmed_datacenters)
+        self._forget_cancellation_once_confirmed(job_id, kept)
+
+    def _unconfirmed_datacenters(self, job_id: str, pending: PendingJobCancellation) -> list[str]:
+        """The job's target datacenters that have not confirmed its cancel."""
+        return [
+            datacenter
+            for datacenter in self._cancellation_target_datacenters(job_id)
+            if datacenter not in pending.confirmed_datacenters
+        ]
+
+    async def redrive_pending_cancellations(self) -> None:
+        """
+        Forward each pending cancel again to its datacenters that have not
+        confirmed it (AD-20).
+
+        A cancel one datacenter confirmed marks its job CANCELLED; the
+        others -- their job leader mid-failover, or out of reach -- are
+        driven here until each confirms, or until the gate retires the job
+        (it then holds nothing more to cancel for). Run by the gate's
+        cancellation re-drive loop.
+        """
+        for job_id, pending in list(self._pending_cancellations.items()):
+            await self._redrive_pending_cancellation(job_id, pending)
+
+    async def _redrive_pending_cancellation(self, job_id: str, pending: PendingJobCancellation) -> None:
+        """Forward the cancel to each datacenter that has not confirmed it;
+        forget it once every target has, or once the gate retired the job."""
+        if self._job_manager.get_job(job_id) is None:
+            await self._abandon_pending_cancellation(job_id, pending)
+            return
+
+        for datacenter in self._unconfirmed_datacenters(job_id, pending):
+            await self._redrive_datacenter_cancellation(job_id, datacenter, pending)
+
+        self._forget_cancellation_once_confirmed(job_id, pending)
+
+    async def _redrive_datacenter_cancellation(
+        self,
+        job_id: str,
+        datacenter: str,
+        pending: PendingJobCancellation,
+    ) -> None:
+        """Forward the cancel to one datacenter; durably record its
+        confirmation (AD-38 ``JobCancellationAcked``)."""
+        cancelled_count, confirmed, datacenter_error = await self._cancel_job_in_dc_with_redirects(
+            dc=datacenter,
+            managers=self._datacenter_managers.get(datacenter, []),
+            use_ad20=pending.use_ad20,
+            job_id=job_id,
+            requester_id=pending.requester_id,
+            fence_token=pending.fence_token,
+            reason=pending.reason,
+            timestamp=pending.timestamp,
+            retry_config=_FAIL_FAST_FORWARD_RETRY_CONFIG,
+        )
+        if not confirmed:
+            await self._log_cancellation_event(
+                ServerDebug,
+                f"Cancellation of job {job_id[:8]}... not yet confirmed in DC {datacenter}: {datacenter_error}",
+            )
+            return
+
+        pending.confirmed_datacenters.add(datacenter)
+        await self._record_cancellation(job_id, pending.reason, pending.requester_id, [(datacenter, cancelled_count)])
+        await self._log_cancellation_event(
+            ServerInfo,
+            f"DC {datacenter} confirmed the cancellation of job {job_id[:8]}... on a re-drive",
+        )
+
+    def _forget_cancellation_once_confirmed(self, job_id: str, pending: PendingJobCancellation) -> None:
+        """Stop re-driving the cancel once every target datacenter confirmed it."""
+        if not self._unconfirmed_datacenters(job_id, pending):
+            self._pending_cancellations.pop(job_id, None)
+
+    async def _abandon_pending_cancellation(self, job_id: str, pending: PendingJobCancellation) -> None:
+        """Stop re-driving the cancel of a job the gate retired, warning
+        that some target datacenter never confirmed it."""
+        self._pending_cancellations.pop(job_id, None)
+        await self._log_cancellation_event(
+            ServerWarning,
+            f"Job {job_id[:8]}... retired before every datacenter confirmed its cancellation "
+            f"(confirmed: {sorted(pending.confirmed_datacenters)})",
+        )
+
+    async def _log_cancellation_event(
+        self,
+        log_model: type[ServerDebug] | type[ServerInfo] | type[ServerWarning],
+        message: str,
+    ) -> None:
+        """Log a cancel re-drive event as this gate."""
+        await self._logger.log(
+            log_model(
+                message=message,
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().short,
+            )
         )
 
     async def _cancel_job_in_datacenter(

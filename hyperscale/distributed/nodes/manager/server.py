@@ -2119,16 +2119,27 @@ class ManagerServer(HealthAwareServer):
             )
 
     def _on_manager_become_leader(self) -> None:
-        """Handle becoming SWIM cluster leader."""
+        """Handle becoming SWIM cluster leader.
+
+        A job's AD-34 timeout follows the job's own leadership, not the
+        cluster's: becoming cluster leader moves no job here (a takeover
+        tracks the job it takes, ``_track_taken_over_job_timeout``).
+        """
         self._task_runner.run(self._state_sync.sync_state_from_workers)
         self._task_runner.run(self._state_sync.sync_full_state_from_manager_peers)
         self._task_runner.run(self._scan_for_orphaned_jobs)
-        self._task_runner.run(self._resume_timeout_tracking_for_all_jobs)
 
     def _on_manager_lose_leadership(self) -> None:
         self._task_runner.run(self._handle_leadership_loss)
 
     async def _handle_leadership_loss(self) -> None:
+        """Log the loss of cluster leadership.
+
+        The jobs this manager leads stay its own (each is led under its own
+        lease), and so does their AD-34 timeout. Stopping their tracking
+        here left a demoted manager's jobs with no timeout at all, and told
+        each job's gate it had FAILED (base 657e460b ``server.py:2131-2158``).
+        """
         await self._udp_logger.log(
             ServerInfo(
                 message="Lost SWIM cluster leadership - pausing leader-only tasks",
@@ -2137,25 +2148,6 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-
-        for job_id in self._leases.get_led_job_ids():
-            await self._stop_timeout_tracking_on_leadership_loss(job_id)
-
-    async def _stop_timeout_tracking_on_leadership_loss(self, job_id: str) -> None:
-        """Stop the led job's timeout tracking, logging a failure to stop it."""
-        strategy = self._manager_state.get_job_timeout_strategy(job_id)
-        if strategy:
-            try:
-                await strategy.stop_tracking(job_id, "leadership_lost")
-            except Exception as error:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=f"Failed to stop timeout tracking for job {job_id[:8]}...: {error}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
 
     # =========================================================================
     # Per-Job Raft Leader Callbacks
@@ -3517,7 +3509,65 @@ class ManagerServer(HealthAwareServer):
             next_fencing_token,
         )
         await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
+        await self._track_taken_over_job_timeout(job_id, next_fencing_token)
         self._replay_extension_state_for_job(job_id)
+
+    async def _track_taken_over_job_timeout(self, job_id: str, fencing_token: int) -> None:
+        """
+        Track a taken-over job's AD-34 timeout as its new leader.
+
+        The strategy its gate presence selects tracks what is left of the
+        job's budget, and resumes at the job's leadership fence -- above
+        every earlier leader's -- telling a coordinating gate where the job's
+        reports and decisions now go. A takeover installed no strategy, and
+        a taken-over job never timed out (base 657e460b
+        ``server.py:3489-3520``).
+        """
+        if self._job_manager.get_job_by_id(job_id) is None:
+            return
+
+        gate_addr = self._manager_state.get_job_origin_gate(job_id)
+        timeout_strategy = GateCoordinatedTimeout(self) if gate_addr else LocalAuthorityTimeout(self)
+        await timeout_strategy.start_tracking(
+            job_id=job_id,
+            timeout_seconds=self._taken_over_job_remaining_budget_seconds(job_id),
+            gate_addr=gate_addr,
+        )
+        self._manager_state.set_job_timeout_strategy(job_id, timeout_strategy)
+        await timeout_strategy.resume_tracking(job_id, fencing_token)
+
+    def _taken_over_job_remaining_budget_seconds(self, job_id: str) -> float:
+        """
+        What is left of a taken-over job's budget, from its replicated
+        ``JobCreated``.
+
+        Unbounded when the job has no replicated record -- a leader that
+        kept no ledger -- so stuck detection alone applies.
+        """
+        replicated_state = self._ledger_replica.job_state(job_id)
+        if replicated_state is None:
+            return float("inf")
+        return self._remaining_job_budget_seconds(replicated_state)
+
+    def _remaining_job_budget_seconds(self, job_state: JobState) -> float:
+        """
+        The job's recorded budget less the time since its record's creation,
+        on the hybrid logical clock -- a recovered job's rule. Its leader's
+        monotonic readings have no origin in common with this host's.
+
+        Unbounded when no budget is recorded: a zero budget timed the job out
+        at its first check. One timeout check of grace when nothing is left,
+        so a completion already on its way wins.
+        """
+        budget_seconds = job_state.timeout_seconds if job_state.timeout_seconds > 0.0 else float("inf")
+        remaining_seconds = budget_seconds - max(
+            (self._hlc.now().wall_ms - job_state.created_hlc.wall_ms) / 1000.0, 0.0
+        )
+        return (
+            remaining_seconds
+            if remaining_seconds > 0.0
+            else self._config.job_timeout_check_interval_seconds
+        )
 
     def _stamp_taken_over_job_leadership(self, job_id: str, next_fencing_token: int) -> list[str]:
         """Record this manager as the job's leader at the new fencing token; returns the job's workflow names."""
@@ -5152,18 +5202,21 @@ class ManagerServer(HealthAwareServer):
         )
 
     async def _unified_timeout_iteration(self, check_interval: float) -> bool:
-        """One AD-34 timeout round: check every job's strategy, then expire
-        cancellations their workers never confirmed (AD-54)."""
+        """One AD-34 timeout round: check the timeout of every job this
+        manager leads, then expire cancellations their workers never
+        confirmed (AD-54).
+
+        Jobs are led per job, each under its own lease, not by the cluster
+        leader. Gated on cluster leadership, a demoted manager's jobs -- led
+        by it still -- were checked by no manager (base 657e460b
+        ``server.py:5159``); a job taken from this manager is checked by its
+        new leader alone.
+        """
         await self._clock.sleep(check_interval)
 
-        # Only leader checks timeouts
-        if not self.is_leader():
-            return True
-
-        for job_id, strategy in list(
-            self._manager_state.iter_job_timeout_strategies()
-        ):
-            await self._check_job_timeout_strategy(job_id, strategy)
+        for job_id, strategy in self._manager_state.iter_job_timeout_strategies():
+            if self._leases.is_job_leader(job_id):
+                await self._check_job_timeout_strategy(job_id, strategy)
 
         # A cancellation its workers never confirmed within the
         # window they have to confirm one is over anyway (AD-54): the
@@ -5942,13 +5995,6 @@ class ManagerServer(HealthAwareServer):
         return (job := self._job_manager.get_job_by_id(job_id)) is not None and (
             status_order.is_terminal(job.status)
         )
-
-    async def _resume_timeout_tracking_for_all_jobs(self) -> None:
-        """Resume timeout tracking for all jobs as new leader."""
-        for job_id in self._leases.get_led_job_ids():
-            strategy = self._manager_state.get_job_timeout_strategy(job_id)
-            if strategy:
-                await strategy.resume_tracking(job_id)
 
     # =========================================================================
     # Helper Methods
@@ -11893,6 +11939,9 @@ class ManagerServer(HealthAwareServer):
                 requestor_id=requestor_contact,
                 durability=DurabilityLevel.REGIONAL,
                 job_id=submission.job_id,
+                # Replicated with the record: a peer taking the job over
+                # tracks what is left of it (``_track_taken_over_job_timeout``).
+                timeout_seconds=submission.timeout_seconds,
             )
         )
         await self._log_ledger_shortfall(
@@ -12448,7 +12497,15 @@ class ManagerServer(HealthAwareServer):
         strategy: TimeoutStrategy,
         timeout_msg: JobGlobalTimeout,
     ) -> None:
-        """Hand the gate's timeout to the job's strategy; drop the strategy once it accepts (AD-34)."""
+        """Hand the gate's timeout to the job's strategy; drop the strategy once it accepts (AD-34).
+
+        Only the job's leader acts on it: a manager the job was taken from
+        holds the strategy of a job it no longer runs, and its stale fence
+        would let it time the job out under its new leader.
+        """
+        if not self._leases.is_job_leader(timeout_msg.job_id):
+            return
+
         accepted = await strategy.handle_global_timeout(
             timeout_msg.job_id,
             timeout_msg.reason,

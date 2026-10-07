@@ -30,6 +30,9 @@ LOOP_NAMES = (
     "_resource_sampling_loop",
     "_discovery_maintenance_loop",
     "_gate_peer_readmission_loop",
+    # Re-drives cancels a datacenter has not confirmed; it records their
+    # confirmations in the ledger.
+    "_cancellation_redrive_loop",
 )
 
 

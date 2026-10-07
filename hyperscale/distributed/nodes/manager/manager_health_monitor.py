@@ -281,12 +281,19 @@ class ManagerHealthMonitor:
         """
         Record job progress from worker (AD-30).
 
+        The report refutes a suspicion of the pair: the worker is talking
+        about the job, so the job layer has no grounds to declare it dead
+        for it. Unrefuted, every suspicion expired into job-death, and a
+        worker that resumed reporting had its workflows reassigned and run
+        twice (base 657e460b ``manager_health_monitor.py:280-289``).
+
         Args:
             job_id: Job ID
             worker_id: Worker ID
         """
         key = (job_id, worker_id)
         self._state._worker_job_last_progress[key] = _DEFAULT_CLOCK.monotonic()
+        self._job_suspicions.pop(key, None)
 
     def cleanup_job_progress(self, job_id: str) -> None:
         """
@@ -325,8 +332,8 @@ class ManagerHealthMonitor:
         """
         key = (job_id, worker_id)
         async with self._health_state_lock:
-            if key in self._job_suspicions:
-                return  # Already suspected
+            if not self._may_suspect(key):
+                return
 
             timeout = timeout_seconds or self._config.job_responsiveness_threshold_seconds
             self._job_suspicions[key] = JobSuspicion(
@@ -356,6 +363,21 @@ class ManagerHealthMonitor:
         async with self._health_state_lock:
             if suspicion := self._job_suspicions.get(key):
                 suspicion.add_confirmation()
+
+    def _may_suspect(self, key: tuple[str, str]) -> bool:
+        """Whether the pair is unsuspected and still silent past the
+        responsiveness threshold (a pair with no report counts as silent).
+
+        The responsiveness loop finds the silent pairs, then suspects them one
+        at a time, logging each: a report landing in between refutes the
+        silence before its suspicion starts.
+        """
+        return self._is_silent_worker_job(
+            key,
+            self._state._worker_job_last_progress.get(key, float("-inf")),
+            _DEFAULT_CLOCK.monotonic(),
+            self._config.job_responsiveness_threshold_seconds,
+        )
 
     async def refute_job_suspicion(self, job_id: str, worker_id: str) -> None:
         """
@@ -389,30 +411,41 @@ class ManagerHealthMonitor:
         Returns:
             List of (job_id, worker_id) pairs declared dead
         """
-        cluster_size = len(self._state._workers)
-        expired: list[tuple[str, str]] = []
+        expired = self._take_expired_job_suspicions()
 
-        for key, suspicion in list(self._job_suspicions.items()):
-            if suspicion.is_expired(cluster_size):
-                job_id, worker_id = key
-                expired.append((job_id, worker_id))
-
-                # Remove suspicion, and the pair's progress: the worker's
-                # workflows for the job are reassigned, so it no longer
-                # owes the job progress (a report re-creates the entry).
-                del self._job_suspicions[key]
-                self._state._worker_job_last_progress.pop(key, None)
-
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"Worker {worker_id[:8]}... declared dead for job {job_id[:8]}... (suspicion expired)",
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
-                )
+        for job_id, worker_id in expired:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Worker {worker_id[:8]}... declared dead for job {job_id[:8]}... (suspicion expired)",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
 
         return expired
+
+    def _take_expired_job_suspicions(self) -> list[tuple[str, str]]:
+        """Remove and return the expired suspicions in one pass with no
+        await: a report arriving while the expiries are logged finds no
+        suspicion left to refute, and none taken from a snapshot is acted on
+        after a report refuted it."""
+        cluster_size = len(self._state._workers)
+        expired = [
+            key
+            for key, suspicion in self._job_suspicions.items()
+            if suspicion.is_expired(cluster_size)
+        ]
+        self._forget_expired_job_pairs(expired)
+        return expired
+
+    def _forget_expired_job_pairs(self, expired: list[tuple[str, str]]) -> None:
+        """Drop each expired pair's suspicion and its progress: the worker's
+        workflows for the job are reassigned, so it no longer owes the job
+        progress (a report re-creates the entry)."""
+        for key in expired:
+            del self._job_suspicions[key]
+            self._state._worker_job_last_progress.pop(key, None)
 
     def find_silent_worker_jobs(
         self,

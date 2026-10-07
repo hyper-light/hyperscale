@@ -597,7 +597,9 @@ class GateJobTimeoutTracker:
             if info.dc_status.get(dc) in {"completed", "failed", "cancelled"}:
                 continue  # Skip terminal DCs
 
-            await self._send_global_timeout(job_id, dc, manager_addr, timeout_msg)
+            await self._send_global_timeout(
+                job_id, dc, manager_addr, timeout_msg, info.dc_fence_tokens.get(dc, 0)
+            )
 
     async def _send_global_timeout(
         self,
@@ -605,14 +607,28 @@ class GateJobTimeoutTracker:
         dc: str,
         manager_addr: tuple[str, int],
         timeout_msg: JobGlobalTimeout,
+        datacenter_fence_token: int,
     ) -> None:
-        """Deliver the global timeout to one DC manager, warning when it is not acknowledged."""
+        """Deliver the global timeout to one DC manager, warning when it is not acknowledged.
+
+        The decision carries the fence of the DC's leader this gate last
+        heard from (AD-34 Part 7, Scenario 3): a manager fences decisions by
+        its own job-leadership fence, so the gate's decision counter -- 1
+        for every decision -- was stale at every leader that had taken the
+        job over (base 657e460b ``gate_job_timeout_tracker.py:563``).
+        """
+        datacenter_message = JobGlobalTimeout(
+            job_id=timeout_msg.job_id,
+            reason=timeout_msg.reason,
+            timed_out_at=timeout_msg.timed_out_at,
+            fence_token=datacenter_fence_token,
+        )
         # send_tcp returns a failure rather than raising; anything but
         # the manager's b"ok" means the decision was not processed.
         response, _ = await self._gate.send_tcp(
             manager_addr,
             "job_global_timeout",
-            timeout_msg.dump(),
+            datacenter_message.dump(),
             timeout=5.0,
         )
         if response != b"ok":

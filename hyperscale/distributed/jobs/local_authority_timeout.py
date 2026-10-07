@@ -56,11 +56,11 @@ class LocalAuthorityTimeout(TimeoutStrategy):
                 timeout_fence_token=0,
             )
 
-    async def resume_tracking(self, job_id: str) -> None:
+    async def resume_tracking(self, job_id: str, fence_token: int) -> None:
         """
         Resume after leader transfer.
 
-        State already in JobInfo - just increment fence token.
+        State already in JobInfo - just advance the fence token.
         """
         job = self._manager._job_manager.get_job_by_id(job_id)
         if not job or not job.timeout_tracking:
@@ -74,9 +74,11 @@ class LocalAuthorityTimeout(TimeoutStrategy):
             )
             return
 
-        # Increment fence token (prevents stale operations)
+        # Advance the fence token (prevents stale operations)
         async with job.lock:
-            job.timeout_tracking.timeout_fence_token += 1
+            job.timeout_tracking.timeout_fence_token = max(
+                job.timeout_tracking.timeout_fence_token + 1, fence_token
+            )
 
         await self._manager._udp_logger.log(
             ServerDebug(

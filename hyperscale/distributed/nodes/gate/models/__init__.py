@@ -12,6 +12,7 @@ from .datacenter_refused_dispatch_error import DatacenterRefusedDispatchError
 from .datacenters_without_room_error import DatacentersWithoutRoomError
 from .gate_job_replica_durable_state import GateJobReplicaDurableState
 from .gate_job_replica_rollback import GateJobReplicaRollback
+from .pending_job_cancellation import PendingJobCancellation
 
 __all__ = [
     "GatePeerState",
@@ -23,4 +24,5 @@ __all__ = [
     "DatacentersWithoutRoomError",
     "GateJobReplicaDurableState",
     "GateJobReplicaRollback",
+    "PendingJobCancellation",
 ]

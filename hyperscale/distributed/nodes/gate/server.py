@@ -611,6 +611,11 @@ class GateServer(HealthAwareServer):
         # Orphan job tracking
         self._orphan_grace_period: float = derive_gate_orphan_grace_seconds(env)
         self._orphan_check_interval: float = env.GATE_ORPHAN_CHECK_INTERVAL
+        # A cancel a datacenter has not confirmed is re-driven once per SWIM
+        # probe period: the datacenter's membership, and so its job leader,
+        # changes one probe period at a time (AD-29) -- the soonest a retry
+        # can meet a different answer.
+        self._cancellation_redrive_interval: float = float(env.SWIM_UDP_POLL_INTERVAL)
         # Every background loop's run token: stopping the gate cancels each
         # before the ledger and caches they write to are closed.
         self._background_loop_tokens: list[str] = []
@@ -1590,6 +1595,7 @@ class GateServer(HealthAwareServer):
             self._discovery_maintenance_loop,
             # Job lease expiry, and forgetting ended leases.
             self._job_lease_manager.run_cleanup,
+            self._cancellation_redrive_loop,
         ]
         if self._gate_udp_peers:
             loops.append(self._gate_peer_readmission_loop)
@@ -9709,6 +9715,21 @@ class GateServer(HealthAwareServer):
         # commit or abort will come) and expired commit-rollback
         # records: retained at most TTL + one cleanup interval.
         await self._replication_coordinator.reap_expired_prepared()
+        return True
+
+    async def _cancellation_redrive_loop(self) -> None:
+        """Re-drive each cancel a target datacenter has not confirmed (AD-20)."""
+        while self._running:
+            if not await self._run_background_loop_pass(
+                self._cancellation_redrive_pass,
+                lambda error: self.handle_exception(error, "cancellation_redrive_loop"),
+            ):
+                break
+
+    async def _cancellation_redrive_pass(self) -> bool:
+        """One re-drive pass, a probe period after the last."""
+        await self._clock.sleep(self._cancellation_redrive_interval)
+        await self._cancellation_handler.redrive_pending_cancellations()
         return True
 
     async def _rate_limit_cleanup_loop(self) -> None:

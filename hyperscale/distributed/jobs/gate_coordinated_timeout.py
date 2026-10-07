@@ -68,22 +68,24 @@ class GateCoordinatedTimeout(TimeoutStrategy):
                 timeout_fence_token=0,
             )
 
-    async def resume_tracking(self, job_id: str) -> None:
-        """Resume after leader transfer - notify gate."""
+    async def resume_tracking(self, job_id: str, fence_token: int) -> None:
+        """Resume after leader transfer - advance the fence, notify gate."""
         job = self._manager._job_manager.get_job_by_id(job_id)
         if not job or not job.timeout_tracking:
             return
 
         async with job.lock:
-            job.timeout_tracking.timeout_fence_token += 1
-            fence_token = job.timeout_tracking.timeout_fence_token
+            job.timeout_tracking.timeout_fence_token = max(
+                job.timeout_tracking.timeout_fence_token + 1, fence_token
+            )
+            resumed_fence_token = job.timeout_tracking.timeout_fence_token
 
         # Send leadership transfer notification to gate
-        await self._send_leader_transfer_report(job_id, fence_token)
+        await self._send_leader_transfer_report(job_id, resumed_fence_token)
 
         await self._manager._udp_logger.log(
             ServerDebug(
-                message=f"Resumed gate-coordinated timeout tracking for {job_id} (fence={fence_token})",
+                message=f"Resumed gate-coordinated timeout tracking for {job_id} (fence={resumed_fence_token})",
                 node_host=self._manager._host,
                 node_port=self._manager._tcp_port,
                 node_id=self._manager._node_id.short,

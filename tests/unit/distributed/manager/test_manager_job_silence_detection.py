@@ -12,6 +12,17 @@ worker's entries were never pruned.
   reassigned, so it owes the job no progress) until it reports again;
 * unregistering a worker, or removing its state, prunes exactly its
   progress entries.
+
+A job suspicion was never refuted: ``record_job_progress`` left it in
+place, so every suspicion expired into job-death and a worker that resumed
+reporting had its workflows reassigned and run twice.
+
+* a suspected pair whose worker reports again is not declared dead when
+  its suspicion window passes;
+* a report landing between the loop finding a pair silent and suspecting
+  it refutes the silence: no suspicion starts;
+* a report landing while an expiry pass logs its deaths does not break
+  the pass: every pair it found expired is returned for reassignment.
 """
 
 from types import SimpleNamespace
@@ -147,3 +158,80 @@ def test_removing_a_workers_state_prunes_exactly_its_progress_entries() -> None:
     state.remove_worker_state(SILENT_WORKER)
 
     assert state._worker_job_last_progress == {(JOB_ID, TALKING_WORKER): 1.0}
+
+
+@pytest.mark.asyncio
+async def test_a_report_refutes_the_suspicion_of_its_pair(stepped_clock: SteppedClock) -> None:
+    state = ManagerState(slo_config=SLOConfig.from_env(Env()))
+    monitor = make_monitor(state)
+    monitor.record_job_progress(JOB_ID, SILENT_WORKER)
+    stepped_clock.now += RESPONSIVENESS_THRESHOLD_SECONDS
+    await monitor.suspect_job(JOB_ID, SILENT_WORKER, timeout_seconds=SUSPICION_TIMEOUT_SECONDS)
+
+    stepped_clock.now += SUSPICION_TIMEOUT_SECONDS / 2
+    monitor.record_job_progress(JOB_ID, SILENT_WORKER)
+    stepped_clock.now += SUSPICION_TIMEOUT_SECONDS
+
+    assert await monitor.check_job_suspicion_expiry() == []
+    # The pair is tracked again from its report, not forgotten.
+    assert (JOB_ID, SILENT_WORKER) in state._worker_job_last_progress
+
+
+@pytest.mark.asyncio
+async def test_a_report_after_the_silence_was_found_starts_no_suspicion(stepped_clock: SteppedClock) -> None:
+    state = ManagerState(slo_config=SLOConfig.from_env(Env()))
+    monitor = make_monitor(state)
+    monitor.record_job_progress(JOB_ID, SILENT_WORKER)
+    stepped_clock.now += RESPONSIVENESS_THRESHOLD_SECONDS
+    [silent_pair] = monitor.find_silent_worker_jobs(RESPONSIVENESS_THRESHOLD_SECONDS)
+
+    monitor.record_job_progress(*silent_pair)
+    await monitor.suspect_job(*silent_pair, timeout_seconds=SUSPICION_TIMEOUT_SECONDS)
+    stepped_clock.now += SUSPICION_TIMEOUT_SECONDS
+
+    assert monitor._job_suspicions == {}
+    assert await monitor.check_job_suspicion_expiry() == []
+
+
+class ReportingDuringLogLogger(RecordingLogger):
+    """Delivers a worker's progress report while the first expiry is
+    logged -- the await an expiry pass makes between its deaths."""
+
+    def __init__(self, monitor_reports: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self.monitor: ManagerHealthMonitor | None = None
+        self.monitor_reports = monitor_reports
+
+    async def log(self, entry: object) -> None:
+        await super().log(entry)
+        while self.monitor is not None and self.monitor_reports:
+            self.monitor.record_job_progress(*self.monitor_reports.pop())
+
+
+@pytest.mark.asyncio
+async def test_a_report_during_an_expiry_pass_does_not_break_it(stepped_clock: SteppedClock) -> None:
+    state = ManagerState(slo_config=SLOConfig.from_env(Env()))
+    logger = ReportingDuringLogLogger([(JOB_ID, TALKING_WORKER)])
+    monitor = ManagerHealthMonitor(
+        state=state,
+        config=make_config(),
+        registry=SimpleNamespace(),
+        logger=logger,
+        node_id="manager-1",
+        task_runner=SimpleNamespace(run=lambda *args, **kwargs: None),
+    )
+    for worker_id in (SILENT_WORKER, TALKING_WORKER):
+        monitor.record_job_progress(JOB_ID, worker_id)
+    stepped_clock.now += RESPONSIVENESS_THRESHOLD_SECONDS
+    for worker_id in (SILENT_WORKER, TALKING_WORKER):
+        await monitor.suspect_job(JOB_ID, worker_id, timeout_seconds=SUSPICION_TIMEOUT_SECONDS)
+    stepped_clock.now += SUSPICION_TIMEOUT_SECONDS
+    logger.entries.clear()
+    logger.monitor = monitor
+
+    expired = await monitor.check_job_suspicion_expiry()
+
+    # Both were expired when the pass looked; both are reassigned.
+    assert sorted(expired) == [(JOB_ID, SILENT_WORKER), (JOB_ID, TALKING_WORKER)]
+    assert len(logger.entries) == 2
+    assert monitor._job_suspicions == {}

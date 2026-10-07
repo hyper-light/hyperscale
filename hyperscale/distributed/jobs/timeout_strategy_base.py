@@ -32,17 +32,21 @@ class TimeoutStrategy(ABC):
         pass
 
     @abstractmethod
-    async def resume_tracking(self, job_id: str) -> None:
+    async def resume_tracking(self, job_id: str, fence_token: int) -> None:
         """
         Resume tracking after leader transfer.
 
-        CRITICAL: New leader calls this to continue timeout tracking.
-        Reconstructs strategy state from JobInfo.timeout_tracking.
+        CRITICAL: the new leader calls this, once it tracks the job, to
+        continue its timeout tracking.
 
-        Increments fence token to prevent stale timeout decisions.
+        The timeout fence advances to ``fence_token`` -- the job's
+        leadership fence, above every earlier leader's -- or by one when
+        that is not ahead of it, so an earlier leader's reports and the
+        decisions made on them are stale.
 
         Args:
             job_id: Job to resume tracking
+            fence_token: The job's leadership fencing token
         """
         pass
 
