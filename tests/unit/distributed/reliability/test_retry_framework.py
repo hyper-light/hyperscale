@@ -13,6 +13,8 @@ These tests verify that:
 import asyncio
 import pytest
 
+from hyperscale.distributed.reliability.retry_after_error import RetryAfterError
+
 from hyperscale.distributed.reliability import (
     JitterStrategy,
     RetryConfig,
@@ -493,3 +495,99 @@ class TestRetryScenarios:
         # Check that delays span the range
         assert min(delays) < 0.5  # Some near 0
         assert max(delays) > 0.5  # Some near 1.0
+
+
+class TestRetryAfterHint:
+    """A failure carrying the server's retry hint is retried after the hint
+    plus up to one more of jitter, instead of after the back-off."""
+
+    class HintedFailure(RetryAfterError):
+        def __init__(self, retry_after_seconds: float) -> None:
+            super().__init__("refused", retry_after_seconds)
+
+    class SteppedClock:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.sleeps: list[float] = []
+
+        def monotonic(self) -> float:
+            return self.now
+
+        async def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    class FixedRandom:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+        def random(self) -> float:
+            return self.value
+
+        def uniform(self, lower: float, upper: float) -> float:
+            return lower + (upper - lower) * self.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("random_value", [0.0, 0.5, 0.999])
+    async def test_a_hinted_failure_waits_the_hint_and_at_most_one_more(self, random_value: float) -> None:
+        hint_seconds = 7.0
+        clock = self.SteppedClock()
+        failures = [self.HintedFailure(hint_seconds)]
+
+        async def operation() -> str:
+            if failures:
+                raise failures.pop()
+            return "ok"
+
+        config = RetryConfig(
+            max_attempts=None,
+            base_delay=0.5,
+            max_delay=0.5,
+            retryable_exceptions=(self.HintedFailure,),
+        )
+        executor = RetryExecutor(config, clock=clock, random_source=self.FixedRandom(random_value))
+
+        assert await executor.execute(operation, deadline_at=60.0) == "ok"
+        (waited,) = clock.sleeps
+        assert waited == pytest.approx(hint_seconds * (1.0 + random_value))
+        assert hint_seconds <= waited < 2 * hint_seconds
+
+    @pytest.mark.asyncio
+    async def test_an_unhinted_failure_waits_the_back_off(self) -> None:
+        clock = self.SteppedClock()
+        failures = [ConnectionError("refused")]
+
+        async def operation() -> str:
+            if failures:
+                raise failures.pop()
+            return "ok"
+
+        config = RetryConfig(
+            max_attempts=None,
+            base_delay=0.5,
+            max_delay=0.5,
+            jitter=JitterStrategy.NONE,
+        )
+        executor = RetryExecutor(config, clock=clock, random_source=self.FixedRandom(0.5))
+
+        assert await executor.execute(operation, deadline_at=60.0) == "ok"
+        assert clock.sleeps == [0.5]
+
+    @pytest.mark.asyncio
+    async def test_a_hint_past_the_deadline_is_cut_to_it(self) -> None:
+        clock = self.SteppedClock()
+        failures = [self.HintedFailure(30.0)]
+
+        async def operation() -> str:
+            if failures:
+                raise failures.pop()
+            return "ok"
+
+        config = RetryConfig(
+            max_attempts=None,
+            retryable_exceptions=(self.HintedFailure,),
+        )
+        executor = RetryExecutor(config, clock=clock, random_source=self.FixedRandom(0.5))
+
+        assert await executor.execute(operation, deadline_at=10.0) == "ok"
+        assert clock.sleeps == [10.0]

@@ -4,11 +4,14 @@ Client retry pacing (AD-21, AD-24, AD-32).
 A node that refuses a submission with ``retry_after_seconds`` (a shed
 submission carries one OVERLOAD_SAMPLE_INTERVAL_SECONDS, a gate-replication
 quorum refusal one standard gate TCP timeout, a rate limit its token
-refill time) must not see the client's next attempt before the hint has
-passed. A refusal with no hint backs off from the configured base, which
-is one overload sample interval. Time runs on a stepped clock: each sleep
-advances it by its length, so the gap between two sends is exactly the
-back-off the client chose.
+refill time, a manager without a known leader the time until its election
+next decides) must not see the client's next attempt before the hint has
+passed. A refusal with no hint, and a failed exchange, back off from the
+RFC 6298 retransmission timeout of the round trips measured so far --
+never below CLIENT_RETRANSMISSION_TIMEOUT_MIN_SECONDS -- doubling per
+un-hinted back-off. Time runs on a stepped clock: each sleep advances it by
+its length, so the gap between two sends is exactly the back-off the
+client chose.
 """
 
 import asyncio
@@ -62,11 +65,13 @@ class FixedRandom:
 
 
 class RecordingTransport:
-    """Answers each send with the next scripted reply and records when it was sent."""
+    """Answers each send with the next scripted reply, ``round_trip_seconds``
+    after it, and records when it was sent."""
 
-    def __init__(self, clock: SteppedClock, replies: list[bytes]) -> None:
+    def __init__(self, clock: SteppedClock, replies: list[bytes], round_trip_seconds: float = 0.0) -> None:
         self._clock = clock
         self._replies = replies
+        self._round_trip_seconds = round_trip_seconds
         self.send_times: list[float] = []
 
     async def send_tcp(
@@ -77,6 +82,7 @@ class RecordingTransport:
         timeout: float,
     ) -> tuple[bytes, None]:
         self.send_times.append(self._clock.now)
+        self._clock.now += self._round_trip_seconds
         return (self._replies[len(self.send_times) - 1], None)
 
     def gap_between_sends(self) -> float:
@@ -206,7 +212,10 @@ async def test_a_rate_limited_submission_is_not_retried_before_its_hint(monkeypa
 
 @pytest.mark.asyncio
 async def test_an_unhinted_refusal_backs_off_from_the_derived_base(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no hint the first back-off is the configured base (one overload sample interval), equal-jittered."""
+    """
+    With no hint, over a path whose round trips are far below it, the first back-off is RFC 6298's minimum
+    retransmission timeout, equal-jittered.
+    """
     env = Env()
     clock = install_time(monkeypatch, submission_module, 0.5)
     unhinted_refusal = JobAck(job_id="job-retry-hint", accepted=False, error="syncing").dump()
@@ -214,8 +223,59 @@ async def test_an_unhinted_refusal_backs_off_from_the_derived_base(monkeypatch: 
 
     await submit_one_job(make_submitter(env, transport))
 
-    assert make_config(env).retry_base_delay_seconds == env.OVERLOAD_SAMPLE_INTERVAL_SECONDS
-    assert transport.gap_between_sends() == pytest.approx(env.OVERLOAD_SAMPLE_INTERVAL_SECONDS)
+    assert make_config(env).retry_base_delay_seconds == env.CLIENT_RETRANSMISSION_TIMEOUT_MIN_SECONDS
+    assert transport.gap_between_sends() == pytest.approx(env.CLIENT_RETRANSMISSION_TIMEOUT_MIN_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_slow_round_trips_raise_the_unhinted_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A round trip R above the minimum sets the retransmission timeout to R + 4 * R/2 = 3R (RFC 6298 sections 2.2,
+    2.3): the client waits that, not the minimum, before asking again -- sooner would duplicate an exchange the
+    path takes that long to complete.
+    """
+    env = Env()
+    round_trip_seconds = 2 * env.CLIENT_RETRANSMISSION_TIMEOUT_MIN_SECONDS
+    clock = install_time(monkeypatch, submission_module, 0.5)
+    unhinted_refusal = JobAck(job_id="job-retry-hint", accepted=False, error="syncing").dump()
+    transport = RecordingTransport(clock, [unhinted_refusal, accepted_ack()], round_trip_seconds)
+
+    await submit_one_job(make_submitter(env, transport))
+
+    assert transport.gap_between_sends() == pytest.approx(round_trip_seconds + 3 * round_trip_seconds)
+
+
+@pytest.mark.asyncio
+async def test_a_hinted_wait_does_not_double_the_next_unhinted_back_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A manager without a known leader says when its election next decides; when the client comes back to a
+    refusal no server can time (no worker registered yet), it backs off from the base -- the hinted wait was the
+    server's schedule, not a failed attempt to back off from.
+    """
+    env = Env()
+    election_hint_seconds = env.LEADER_ELECTION_TIMEOUT_JITTER
+    clock = install_time(monkeypatch, submission_module, 0.5)
+    leader_unknown = JobAck(
+        job_id="job-retry-hint",
+        accepted=False,
+        error="Not DC leader, retry at leader: unknown",
+        retry_after_seconds=election_hint_seconds,
+    ).dump()
+    no_capacity = JobAck(
+        job_id="job-retry-hint",
+        accepted=False,
+        error="No workers registered in this datacenter; rejecting job submission",
+    ).dump()
+    transport = RecordingTransport(clock, [leader_unknown, no_capacity, accepted_ack()])
+
+    await submit_one_job(make_submitter(env, transport))
+
+    first_gap, second_gap = (
+        later_send - earlier_send
+        for earlier_send, later_send in zip(transport.send_times, transport.send_times[1:])
+    )
+    assert first_gap == pytest.approx(election_hint_seconds * 1.5)
+    assert second_gap == pytest.approx(env.CLIENT_RETRANSMISSION_TIMEOUT_MIN_SECONDS)
 
 
 @pytest.mark.asyncio

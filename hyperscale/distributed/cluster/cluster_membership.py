@@ -214,6 +214,7 @@ class ClusterMembership:
         "_may_lead",
         "_cluster_uuids",
         "_formation_interval_seconds",
+        "_next_formation_round_at",
         "_tombstone_retention_seconds",
         "_request_timeout_seconds",
         "_watch_wait_ceiling_seconds",
@@ -343,6 +344,9 @@ class ClusterMembership:
         self._may_lead = may_lead
         self._cluster_uuids = cluster_uuids
         self._formation_interval_seconds = formation_interval_seconds
+        # When the formation loop's next round begins (0.0 until its first
+        # round has run): see ``seconds_until_next_formation_round``.
+        self._next_formation_round_at = 0.0
         self._tombstone_retention_seconds = tombstone_retention_seconds
         self._request_timeout_seconds = request_timeout_seconds
         self._watch_wait_ceiling_seconds = watch_wait_ceiling_seconds
@@ -525,7 +529,20 @@ class ClusterMembership:
         heard from for the tombstone retention."""
         while self._running:
             await self._formation_tick()
+            self._next_formation_round_at = self._clock.monotonic() + self._formation_interval_seconds
             await self._clock.sleep(self._formation_interval_seconds)
+
+    def seconds_until_next_formation_round(self) -> float:
+        """
+        Seconds until this node's next formation round begins: the soonest
+        an unformed cluster can form, short of a founder's claim committing
+        meanwhile. While a round runs (or before the first), one formation
+        interval -- the round under way may form the cluster, and if it
+        does not, the next follows an interval after it. Control plane:
+        read when a submission is refused for an unformed cluster, to tell
+        the submitter when to come back.
+        """
+        return max(self._next_formation_round_at - self._clock.monotonic(), 0.0) or self._formation_interval_seconds
 
     async def _formation_tick(self) -> None:
         """One pass of the formation loop: a formation round unless the

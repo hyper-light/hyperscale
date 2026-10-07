@@ -102,6 +102,11 @@ class LocalLeaderElection:
     # leaderless spell (see ``_election_loop``), cleared on following or
     # leading.
     _stand_for_election_at: float | None = field(default=None, repr=False)
+    # When the election loop's current wait ends at the latest -- the
+    # candidacy wait, a pre-vote or vote round's timeout, a flapping delay,
+    # a follower's lease check: the instant it next decides. Read by
+    # ``seconds_until_next_decision``; 0.0 before the loop first waits.
+    _next_decision_at: float = field(default=0.0, repr=False)
     _running: bool = False
     
     # Track fallback tasks created when TaskRunner not available
@@ -380,6 +385,7 @@ class LocalLeaderElection:
         if timeout <= 0:
             return
         timeout = max(timeout, 0.001)
+        self._next_decision_at = self._clock.monotonic() + timeout
 
         if self._election_wake_event is None:
             await self._clock.sleep(timeout)
@@ -1119,6 +1125,21 @@ class LocalLeaderElection:
         """
         return self.state.is_fencing_token_valid(token)
     
+    def seconds_until_next_decision(self) -> float:
+        """
+        Seconds until this node's election loop next decides, at the latest.
+
+        The loop decides when its current wait ends: a leaderless node's
+        randomized candidacy wait (Raft section 5.2), the pre-vote or vote
+        round it has in flight, a flapping delay, or a follower's lease
+        check. A peer's vote or heartbeat can end the wait sooner, never
+        later. 0.0 while the loop is acting rather than waiting -- its
+        decision is being made now -- and before it first waits.
+        Control plane: read when a submission is refused for want of a
+        known leader, to tell the submitter when to come back.
+        """
+        return max(self._next_decision_at - self._clock.monotonic(), 0.0)
+
     def get_current_leader(self) -> tuple[str, int] | None:
         """Get the current leader, if any."""
         if self.state.is_leader() and self.self_addr:

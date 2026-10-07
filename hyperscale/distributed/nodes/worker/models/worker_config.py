@@ -100,6 +100,11 @@ class WorkerConfig:
             "WORKER_INITIAL_REGISTRATION_JITTER_MAX"
         )
     )
+    manager_rejoin_watch_interval_seconds: float = field(
+        default_factory=lambda: _default_env_value(
+            "WORKER_MANAGER_REJOIN_WATCH_INTERVAL_SECONDS"
+        )
+    )
 
     # Event log configuration (AD-47)
     event_log_dir: Path | None = None
@@ -183,4 +188,5 @@ class WorkerConfig:
             registration_max_retries=env.WORKER_REGISTRATION_MAX_RETRIES,
             registration_base_delay_seconds=env.WORKER_REGISTRATION_BASE_DELAY,
             initial_registration_jitter_max_seconds=env.WORKER_INITIAL_REGISTRATION_JITTER_MAX,
+            manager_rejoin_watch_interval_seconds=env.WORKER_MANAGER_REJOIN_WATCH_INTERVAL_SECONDS,
         )

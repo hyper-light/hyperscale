@@ -124,6 +124,7 @@ class GateJobHandler:
         current_raft_members: Callable[[], frozenset[str]],
         cluster_formed: Callable[[], bool],
         cluster_read_only: Callable[[], bool],
+        cluster_formation_retry_after_seconds: Callable[[], float],
         overload_retry_after_seconds: float,
         replication_retry_after_seconds: float,
     ) -> None:
@@ -166,6 +167,9 @@ class GateJobHandler:
                 formed -- a job's Raft group has no voters before it
             cluster_read_only: Whether an operator put the gate cluster in
                 read-only mode (AD-52 section 13)
+            cluster_formation_retry_after_seconds: When a submission refused
+                for an unformed gate cluster may retry: the gate's next
+                formation round, the soonest the cluster can form
             overload_retry_after_seconds: When a submission shed for load
                 may retry: the gate's overload sampling interval, the
                 soonest its verdict can change
@@ -178,6 +182,7 @@ class GateJobHandler:
         self._current_raft_members = current_raft_members
         self._cluster_formed = cluster_formed
         self._cluster_read_only = cluster_read_only
+        self._cluster_formation_retry_after_seconds = cluster_formation_retry_after_seconds
         self._overload_retry_after_seconds = overload_retry_after_seconds
         self._replication_retry_after_seconds = replication_retry_after_seconds
         self._state: GateRuntimeState = state
@@ -771,6 +776,7 @@ class GateJobHandler:
                 job_id=submission.job_id,
                 accepted=False,
                 error="Gate cluster membership not formed yet; retry",
+                retry_after_seconds=self._cluster_formation_retry_after_seconds(),
                 protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                 protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 capabilities=negotiated_caps_str,

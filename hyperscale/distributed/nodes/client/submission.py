@@ -30,6 +30,7 @@ from hyperscale.distributed.protocol.version import CURRENT_PROTOCOL_VERSION
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.nodes.client.config import TRANSIENT_ERRORS
 from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
+from hyperscale.distributed.nodes.client.retransmission_timeout import RetransmissionTimeout
 from hyperscale.logging import Logger
 
 from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
@@ -107,6 +108,9 @@ class ClientJobSubmitter:
         self._send_tcp = send_tcp_func
         self._idempotency_key_generator = idempotency_key_generator
         self._logical_id_generator = logical_id_generator
+        # The un-hinted retry ladder's base, from the round trips this
+        # client's submissions measure (RFC 6298).
+        self._retransmission_timeout = RetransmissionTimeout(config.retry_base_delay_seconds)
 
     async def submit_job(
         self,
@@ -399,6 +403,8 @@ class ClientJobSubmitter:
         last_error = None
         max_retries = self._config.submission_max_retries
         max_redirects = self._config.submission_max_redirects_per_attempt
+        # Un-hinted back-offs waited so far: the ladder's exponent.
+        unhinted_backoffs = 0
 
         for retry in range(max_retries + 1):
             # Try each target in ranked order, cycling through on retries
@@ -417,7 +423,9 @@ class ClientJobSubmitter:
             # Transient error - retry
             last_error = redirect_result
 
-            await self._backoff_before_retry(retry, max_retries, retry_after_seconds)
+            unhinted_backoffs = await self._backoff_before_retry(
+                retry, max_retries, retry_after_seconds, unhinted_backoffs
+            )
 
         # All retries exhausted
         raise RuntimeError(f"Job submission failed after {max_retries} retries: {last_error}")
@@ -434,9 +442,11 @@ class ClientJobSubmitter:
         retry: int,
         max_retries: int,
         retry_after_seconds: float,
-    ) -> None:
+        unhinted_backoffs: int,
+    ) -> int:
         """
-        Sleep before the next retry (AD-21, AD-24).
+        Sleep before the next retry (AD-21, AD-24); returns the un-hinted
+        back-offs waited so far, this one included.
 
         A refusal that carried the server's ``retry_after_seconds`` hint
         waits the hint plus up to one more hint of jitter -- never less,
@@ -446,19 +456,29 @@ class ClientJobSubmitter:
         a caller that resubmits on that failure (a submit loop) otherwise
         reaches the server well inside the hint it was just given.
 
-        An un-hinted transient refusal waits an exponential, equal-jittered
-        back-off from the configured base. Every transient failure backs
-        off, including one whose error text is empty (a bare timeout);
-        after the last un-hinted one no attempt follows, so the failure is
-        raised at once.
+        Every transient refusal a server can time carries its hint: an
+        election's next decision, a formation round, a probe interval, a
+        load sample, a token refill. What has none -- a transport failure
+        (a timeout, a refused or reset connection), an exhausted redirect
+        chain, a condition that clears at an instant no server times (a
+        worker's registration arriving), a refusal from a server whose
+        deciding mechanism is acting at that instant -- waits an exponential,
+        equal-jittered back-off whose base is the RFC 6298 retransmission
+        timeout of the round trips measured so far, doubling per un-hinted
+        back-off already waited (section 5.5) -- a hinted wait was the
+        server's schedule, not a failure to back off from. Every such
+        failure backs off, including one whose error text is empty (a bare
+        timeout); after the last un-hinted one no attempt follows, so the
+        failure is raised at once.
         """
         if retry_after_seconds > 0.0:
             await _DEFAULT_CLOCK.sleep(retry_after_seconds * (1.0 + _DEFAULT_RANDOM.random()))
-            return
+            return unhinted_backoffs
         if retry >= max_retries:
-            return
-        base_delay = self._config.retry_base_delay_seconds * (2**retry)
+            return unhinted_backoffs
+        base_delay = self._retransmission_timeout.seconds * (2**unhinted_backoffs)
         await _DEFAULT_CLOCK.sleep(base_delay * (0.5 + _DEFAULT_RANDOM.random()))
+        return unhinted_backoffs + 1
 
     async def _submit_with_redirects(
         self,
@@ -537,6 +557,9 @@ class ClientJobSubmitter:
         if isinstance(response, Exception):
             self._targets.record_target_failure(target)
             return (_prepend_redirect_history(redirect_history, str(response)), None, 0.0)
+
+        # Any answer, refusal or acceptance, measures one round trip.
+        self._retransmission_timeout.record_round_trip(_DEFAULT_CLOCK.monotonic() - sent_at)
 
         # A rate-limited (AD-32) or shed/quorum-refused (AD-24) submission
         # carries the server's retry hint; the retry loop waits it out.

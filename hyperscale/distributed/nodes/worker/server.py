@@ -1188,10 +1188,10 @@ class WorkerServer(HealthAwareServer):
                 break
 
     async def _manager_rejoin_watch_iteration(self) -> bool:
-        """One manager-restart check and its two-second wait; False once cancelled."""
+        """One manager-restart check and its rejoin-watch wait; False once cancelled."""
         try:
             await self._check_manager_rejoins()
-            await self._clock.sleep(2.0)
+            await self._clock.sleep(self._config.manager_rejoin_watch_interval_seconds)
             return True
         except asyncio.CancelledError:
             return False

@@ -376,6 +376,7 @@ def create_mock_handler(
         current_raft_members=lambda: frozenset({"gate-001"}),
         cluster_formed=cluster_formed,
         cluster_read_only=cluster_read_only,
+        cluster_formation_retry_after_seconds=lambda: GATE_SETTINGS.CLUSTER_FORMATION_INTERVAL_SECONDS,
         overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
         replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
     )
@@ -598,6 +599,7 @@ class TestHandleSubmissionHappyPath:
             current_raft_members=lambda: frozenset({"gate-001"}),
             cluster_formed=lambda: True,
             cluster_read_only=lambda: False,
+            cluster_formation_retry_after_seconds=lambda: GATE_SETTINGS.CLUSTER_FORMATION_INTERVAL_SECONDS,
             overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
             replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
@@ -666,6 +668,7 @@ class TestHandleSubmissionHappyPath:
             current_raft_members=lambda: frozenset({"gate-001"}),
             cluster_formed=lambda: True,
             cluster_read_only=lambda: False,
+            cluster_formation_retry_after_seconds=lambda: GATE_SETTINGS.CLUSTER_FORMATION_INTERVAL_SECONDS,
             overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
             replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
@@ -855,6 +858,7 @@ class TestHandleSubmissionRateLimiting:
             current_raft_members=lambda: frozenset({"gate-001"}),
             cluster_formed=lambda: True,
             cluster_read_only=lambda: False,
+            cluster_formation_retry_after_seconds=lambda: GATE_SETTINGS.CLUSTER_FORMATION_INTERVAL_SECONDS,
             overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
             replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
@@ -1221,6 +1225,7 @@ class TestHandleProgressHappyPath:
             current_raft_members=lambda: frozenset({"gate-001"}),
             cluster_formed=lambda: True,
             cluster_read_only=lambda: False,
+            cluster_formation_retry_after_seconds=lambda: GATE_SETTINGS.CLUSTER_FORMATION_INTERVAL_SECONDS,
             overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
             replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
@@ -1301,6 +1306,7 @@ class TestHandleProgressFencingTokens:
             current_raft_members=lambda: frozenset({"gate-001"}),
             cluster_formed=lambda: True,
             cluster_read_only=lambda: False,
+            cluster_formation_retry_after_seconds=lambda: GATE_SETTINGS.CLUSTER_FORMATION_INTERVAL_SECONDS,
             overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
             replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
@@ -1377,6 +1383,7 @@ class TestHandleProgressFencingTokens:
             current_raft_members=lambda: frozenset({"gate-001"}),
             cluster_formed=lambda: True,
             cluster_read_only=lambda: False,
+            cluster_formation_retry_after_seconds=lambda: GATE_SETTINGS.CLUSTER_FORMATION_INTERVAL_SECONDS,
             overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
             replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )
@@ -1665,6 +1672,7 @@ class TestFailureModes:
             current_raft_members=lambda: frozenset({"gate-001"}),
             cluster_formed=lambda: True,
             cluster_read_only=lambda: False,
+            cluster_formation_retry_after_seconds=lambda: GATE_SETTINGS.CLUSTER_FORMATION_INTERVAL_SECONDS,
             overload_retry_after_seconds=GATE_SETTINGS.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
             replication_retry_after_seconds=GATE_SETTINGS.GATE_TCP_TIMEOUT_STANDARD,
         )

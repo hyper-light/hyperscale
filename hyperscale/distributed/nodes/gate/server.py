@@ -1249,6 +1249,7 @@ class GateServer(HealthAwareServer):
             current_raft_members=lambda: self._raft.consensus.current_members(),
             cluster_formed=lambda: self._cluster_membership.formed,
             cluster_read_only=lambda: self._cluster_membership.read_only,
+            cluster_formation_retry_after_seconds=self._cluster_membership.seconds_until_next_formation_round,
             overload_retry_after_seconds=self.env.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
             replication_retry_after_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
         )
@@ -1728,10 +1729,13 @@ class GateServer(HealthAwareServer):
     ):
         """Handle job submission from client."""
         if self._is_clock_fenced():
+            # The fence is re-judged only as clock offsets are re-measured
+            # (AD-39): one probe interval is the soonest it can lift.
             return JobAck(
                 job_id=JobSubmission.load(data).job_id,
                 accepted=False,
                 error="Gate clock fenced (offset beyond bound), not accepting jobs",
+                retry_after_seconds=self.env.HLC_OFFSET_PROBE_INTERVAL_SECONDS,
                 protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                 protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
             ).dump()

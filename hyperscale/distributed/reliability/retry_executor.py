@@ -77,13 +77,17 @@ class RetryExecutor:
             # Pure exponential backoff, no jitter
             return min(cap, base * (2**attempt))
 
-    def _retry_delay(self, attempt: int, exc: Exception) -> float:
-        """The wait before retrying after ``exc``: the backoff for this
-        attempt, and never less than a ``RetryAfterError``'s own hint."""
-        delay = self.calculate_delay(attempt)
-        if isinstance(exc, RetryAfterError):
-            return max(delay, exc.retry_after_seconds)
-        return delay
+    def _delay_before_retry(self, exception: Exception, attempt: int) -> float:
+        """
+        The wait before retrying a failed attempt: a ``RetryAfterError``'s
+        hint plus up to one more hint of jitter -- never less than the hint,
+        since its sender refuses until then, while the jitter keeps callers
+        refused together from returning together -- else the configured
+        back-off.
+        """
+        if isinstance(exception, RetryAfterError) and exception.retry_after_seconds > 0.0:
+            return exception.retry_after_seconds * (1.0 + self._random.random())
+        return self.calculate_delay(attempt)
 
     def reset(self) -> None:
         """Reset state for decorrelated jitter."""
@@ -138,7 +142,7 @@ class RetryExecutor:
                     raise
 
                 # Calculate and apply delay, never past the deadline
-                delay = self._retry_delay(attempt, exc)
+                delay = self._delay_before_retry(exc, attempt)
                 if deadline_at is not None:
                     if (remaining := deadline_at - self._clock.monotonic()) <= 0:
                         raise

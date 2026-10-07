@@ -405,6 +405,45 @@ async def test_a_datacenter_without_room_is_left_for_a_fallback_at_its_first_ref
     assert not await breakers.is_circuit_open(LEADER)
 
 
+async def test_a_datacenter_that_says_when_its_election_decides_is_asked_then_and_not_before() -> None:
+    """A manager without a known leader says when its election next decides
+    (``retry_after_seconds``): the gate does not ask again before that --
+    even when it is longer than the leader-heartbeat pace -- and asks within
+    one hint of jitter after it, landing the job on the leader it became."""
+    clock = SleepAdvancedClock()
+    election_hint_seconds = GATE_SETTINGS.LEADER_ELECTION_TIMEOUT_BASE + GATE_SETTINGS.LEADER_ELECTION_TIMEOUT_JITTER
+    assert election_hint_seconds > GATE_SETTINGS.LEADER_HEARTBEAT_INTERVAL
+    started_at = clock.now
+    elected_at = started_at + election_hint_seconds
+    sends: list[float] = []
+
+    async def send_tcp(manager_addr, action, payload, timeout):
+        sends.append(clock.now)
+        if clock.now >= elected_at:
+            return (ACCEPTED, 0)
+        electing = JobAck(
+            job_id="job-1",
+            accepted=False,
+            error="Not DC leader, retry at leader: unknown",
+            retry_after_seconds=elected_at - clock.now,
+        ).dump()
+        return (electing, 0)
+
+    coordinator = make_coordinator(
+        AsyncMock(side_effect=send_tcp),
+        CircuitBreakerManager(Env(), is_peer_suspected=lambda _peer_addr: False),
+        clock=clock,
+    )
+
+    accepting_manager, error = await coordinator._try_dispatch_to_manager(
+        "dc-west", MANAGER, submission(), started_at + DATACENTER_LEADER_FAILOVER_SECONDS
+    )
+
+    assert (accepting_manager, error) == (MANAGER, None)
+    assert len(sends) == 2, sends
+    assert elected_at <= sends[1] < elected_at + election_hint_seconds, sends
+
+
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 
 

@@ -11454,10 +11454,13 @@ class ManagerServer(HealthAwareServer):
             ).dump()
 
         if self._is_clock_fenced():
+            # The fence is re-judged only as clock offsets are re-measured
+            # (AD-39): one probe interval is the soonest it can lift.
             return JobAck(
                 job_id=job_id,
                 accepted=False,
                 error="Manager clock fenced (offset beyond bound), not accepting jobs",
+                retry_after_seconds=self._env.HLC_OFFSET_PROBE_INTERVAL_SECONDS,
             ).dump()
         return None
 
@@ -11476,11 +11479,14 @@ class ManagerServer(HealthAwareServer):
             return self._not_leader_submission_ack(job_id)
 
         if not self._leadership.has_quorum():
+            # Quorum returns as SWIM confirms peers alive again, one probe
+            # period at a time (AD-29): the soonest it can be regained.
             return JobAck(
                 job_id=job_id,
                 accepted=False,
                 error="No quorum available; rejecting job submission",
                 leader_addr=None,
+                retry_after_seconds=float(self._env.SWIM_UDP_POLL_INTERVAL),
                 protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                 protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
             ).dump()
@@ -11493,7 +11499,9 @@ class ManagerServer(HealthAwareServer):
         Multi-source leader resolution -- election state, peer heartbeats and
         a last-known-leader scan -- yields None only when no peer has ever
         reported a leader, in which case the client treats the response as
-        transient and round-robins.
+        transient and comes back when this node's election next decides:
+        the refusal carries that wait as its retry hint. A named leader
+        needs no hint; the submitter redirects to it at once.
         """
         leader_addr = self._resolve_dc_leader_addr()
         leader_hint = (
@@ -11504,6 +11512,7 @@ class ManagerServer(HealthAwareServer):
             accepted=False,
             error=f"Not DC leader, retry at leader: {leader_hint}",
             leader_addr=leader_addr,
+            retry_after_seconds=0.0 if leader_addr else self._leader_election.seconds_until_next_decision(),
             protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
             protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
         ).dump()
@@ -11522,6 +11531,7 @@ class ManagerServer(HealthAwareServer):
                 accepted=False,
                 error="Cluster membership not formed yet; retry",
                 leader_addr=None,
+                retry_after_seconds=self._cluster_membership.seconds_until_next_formation_round(),
                 protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                 protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
             ).dump()
@@ -11549,6 +11559,12 @@ class ManagerServer(HealthAwareServer):
         NOT a rejection: queueing behind busy capacity is legitimate.
         """
         if self._manager_state.get_worker_count() < 1:
+            # No retry hint: capacity returns when a worker's registration
+            # arrives -- after a booting worker's randomized first-attempt
+            # delay, its registration retries, or a rejoin -- at an instant
+            # nothing here times. The submitter's growing back-off polls
+            # for it (measured: a fixed rejoin-interval hint made boot-time
+            # clients wait past registrations that had already landed).
             return JobAck(
                 job_id=job_id,
                 accepted=False,

@@ -332,6 +332,11 @@ class Env(BaseModel):
     # cold-start latency is acceptable because workers retry with their
     # own backoff after the initial attempt.
     WORKER_INITIAL_REGISTRATION_JITTER_MAX: StrictFloat = 5.0
+    # How often a worker checks whether a manager it is registered with has
+    # restarted (its incarnation jumped) and, if so, registers again: the
+    # cadence at which a restarted manager's empty worker registry refills
+    # from live workers.
+    WORKER_MANAGER_REJOIN_WATCH_INTERVAL_SECONDS: StrictFloat = 2.0
 
     # Time budget for the worker's local subprocess pool to spawn and
     # acknowledge readiness. *Distinct* from
@@ -498,6 +503,12 @@ class Env(BaseModel):
     # it follows within one attempt.
     CLIENT_SUBMISSION_MAX_RETRIES: StrictInt = 5
     CLIENT_SUBMISSION_MAX_REDIRECTS: StrictInt = 3
+    # The least a client waits before sending again a request whose exchange
+    # failed (a timeout, a refused connection) or was refused without the
+    # server's retry hint, and the wait before any round trip is measured:
+    # RFC 6298's minimum and initial retransmission timeout (sections 2.4
+    # and 2.1). Measured round trips raise it on slow paths.
+    CLIENT_RETRANSMISSION_TIMEOUT_MIN_SECONDS: StrictFloat = 1.0
     # Seconds a completed job waits for workflow results still in flight
     # (they travel apart from the terminal status, unordered with it):
     # one standard manager/gate push timeout, the longest a send already
@@ -1261,6 +1272,7 @@ class Env(BaseModel):
             "CLIENT_SUBMISSION_TIMEOUT": float,
             "CLIENT_SUBMISSION_MAX_RETRIES": int,
             "CLIENT_SUBMISSION_MAX_REDIRECTS": int,
+            "CLIENT_RETRANSMISSION_TIMEOUT_MIN_SECONDS": float,
             "CLIENT_RESULT_DRAIN_TIMEOUT": float,
             "CLIENT_JOB_RETENTION_SECONDS": float,
             # Manager dead node cleanup settings
@@ -1471,6 +1483,7 @@ class Env(BaseModel):
             "WORKER_REGISTRATION_MAX_RETRIES": int,
             "WORKER_REGISTRATION_BASE_DELAY": float,
             "WORKER_INITIAL_REGISTRATION_JITTER_MAX": float,
+            "WORKER_MANAGER_REJOIN_WATCH_INTERVAL_SECONDS": float,
             # Job responsiveness / timeout settings
             "JOB_RESPONSIVENESS_THRESHOLD": float,
             "JOB_RESPONSIVENESS_CHECK_INTERVAL": float,

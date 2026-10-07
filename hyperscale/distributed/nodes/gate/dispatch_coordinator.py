@@ -1259,7 +1259,7 @@ class GateDispatchCoordinator:
         now (DatacenterRefusedDispatchError) -- the dispatch moves on to a
         fallback datacenter."""
         if is_transient_rejection(ack.error):
-            raise TransientDispatchError(ack.error)
+            raise TransientDispatchError(ack.error, ack.retry_after_seconds)
         if ack.retry_after_seconds > 0.0:
             raise DatacenterRefusedDispatchError(ack.error, ack.retry_after_seconds)
 
