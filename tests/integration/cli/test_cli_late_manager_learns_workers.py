@@ -14,9 +14,14 @@ update the restarted managers sat at "WORKERS 0" for good: a datacenter
 that would have had no capacity the moment the one manager its workers
 still knew failed.
 
+It then registers with each worker it learned (`manager_register`) so the
+worker takes it back -- an endpoint the worker had wired as a reply hook
+for a request it never sends, so no request ever reached it.
+
 Three managers form, a worker registers. The third manager is stopped,
 the worker's log declares it dead, and it is restarted on its directory:
-its dashboard must show the worker healthy within the boot bound.
+within the boot bound its dashboard must show the worker healthy, and the
+worker must count all three managers healthy again.
 
 Run from the repo root (the commands are invoked from `.venv/bin`).
 """
@@ -103,6 +108,9 @@ async def test_a_manager_restarted_after_its_workers_wrote_it_off_learns_them_ag
         "--workers", str(WORKER_CORES),
         "--managers", managers[0].address,
         "--config", str(config_path),
+        # Its CI-safe line reads how many of the managers it knows it
+        # counts healthy.
+        "--output-mode", "ci-safe",
         environment=WIDE_TERMINAL,
         quiet=False,
     )
@@ -129,6 +137,12 @@ async def test_a_manager_restarted_after_its_workers_wrote_it_off_learns_them_ag
         assert await restarted.wait_for_output("1 healthy", within=BOOT_TIMEOUT_SECONDS), (
             f"the restarted manager never learned the worker:\n{''.join(restarted.lines[-30:])}"
         )
+        # And the worker takes the restarted manager back: it registers with
+        # the worker (manager_register).
+        worker.lines.clear()
+        assert await worker.wait_for_output(
+            f"known {COHORT_SIZE} healthy {COHORT_SIZE}", within=BOOT_TIMEOUT_SECONDS
+        ), f"the worker never took the restarted manager back:\n{''.join(worker.lines[-10:])}"
 
         await stop_all([*managers[:-1], worker, restarted], signal.SIGINT, whole_group=False)
     finally:

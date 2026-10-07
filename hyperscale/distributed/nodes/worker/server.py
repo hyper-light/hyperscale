@@ -2907,8 +2907,8 @@ class WorkerServer(HealthAwareServer):
                 )
             )
 
-    @tcp.handle("manager_register")
-    async def handle_manager_register(
+    @tcp.receive()
+    async def manager_register(
         self, addr: tuple[str, int], data: bytes, clock_time: int
     ) -> bytes:
         """
@@ -2916,7 +2916,10 @@ class WorkerServer(HealthAwareServer):
 
         This enables bidirectional registration: managers can proactively
         register with workers they discover via state sync from peer managers.
-        This speeds up cluster formation.
+        A manager restarted after this worker declared it dead registers
+        here, and this worker takes it back. (Registered as a reply hook,
+        ``tcp.handle``, for a request this worker never sends, it was
+        never called: the manager's request found no handler.)
         """
         return await self._registration_handler.process_manager_registration(
             data=data,
