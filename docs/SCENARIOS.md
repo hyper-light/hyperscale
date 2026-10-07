@@ -254,14 +254,41 @@ These run every `invariant_poll_interval` (default 100 ms) for the entire
 lifetime of any scenario above. Any violation fails the scenario
 immediately, regardless of which fault path is being exercised.
 
-*Status:* the checker exists (`tests/simulation/harness/invariants.py`,
-poll interval `HarnessTimeouts.invariant_poll_interval = 0.1`), but only two
-continuous invariants are implemented: `at_most_one_job_leader_per_job`
-(`:246`) and the liveness check `cluster_membership_progress` (`:282`).
-Leader exclusivity, terminal reach and execution counts are checked
-post-hoc by the VOPR oracles (`tests/simulation/oracle/cluster_trace_oracle.py`),
-and core accounting post-hoc by `test_worker_core_accounting.py`. The rest
-of this list is not checked continuously.
+*Status (2026-10-07):* every `ClusterHarness` scenario runs the catalog
+(`continuous_catalog()` in `tests/simulation/harness/invariants.py`; checks in
+`tests/simulation/harness/invariant_checks/`) every
+`HarnessTimeouts.invariant_poll_interval` (0.1 s). Each item below names its
+check; where the item as written is wrong for a correct cluster, the check's
+module records why and what it checks instead. Mutation checks:
+`tests/unit/simulation/harness/test_continuous_invariants.py`; live
+evaluation: `tests/simulation/scenarios/l2_single_dc/test_continuous_invariant_catalog.py`.
+"At most one leader per DC" is not continuous (the VOPR oracles judge leader
+exclusivity post-hoc, `tests/simulation/oracle/cluster_trace_oracle.py`).
+
+- Job leaders: `AtMostOneJobLeaderPerJob`.
+- Fence tokens: `MonotonicFenceTokens` -- manager lease and dispatch tokens,
+  worker accepted tokens, gate tokens, against a per-instance high-water mark.
+- Sub-workflow tokens: `UniqueSubWorkflowTokens` -- no token runs on two
+  workers, the worker running it is the one it names, no job lists it twice.
+- Terminal reach: `JobMakesProgress` -- a job with work in flight progresses
+  within AD-34's stuck bound (`stuck_threshold` + AD-26 extension seconds +
+  `JOB_TIMEOUT_CHECK_INTERVAL`), past which its leader must time it out.
+- Cancelled cores: `CancelledJobsFreeCores` -- within the worker's own
+  cancellation bound (poll interval + query timeout + cancel wait + one
+  execution-update wait, from `WorkerConfig`), counted only while no network
+  fault or pause is in force and the job's leader is live.
+- Resource counters: `ResourceCounterConsistency` -- on the worker the bound
+  is an identity (free + assigned cores = total; `available_cores` caches
+  the free count); on a manager, reserved cores are still inside the
+  reported available count, so `available + reserved` may exceed the total
+  there and the check is that each stays within `[0, total]`.
+- Member counts: `MemberCountConvergence` -- per datacenter's managers and
+  across gates, once stabilized and with no view-splitting fault in force,
+  within one gossip dissemination: `(max(1, int(lambda * ln(n + 1))) + 1)`
+  protocol periods plus one probe timeout.
+- Cluster isolation: `ClusterIdIsolation` -- one `CLUSTER_ID` across the
+  nodes, and every SWIM member any node holds is a node of the cluster.
+
 
 - **At most one leader per DC** at any moment.
 - **At most one job-leader per job** at any moment.

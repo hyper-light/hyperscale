@@ -435,13 +435,24 @@ properties):
   corpora once they exist. Every failure is already a permanent reproducer
   (`--sim-replay=<seed>`); the missing piece is purely the standing job and
   a place to record failing seeds. Cheapest rigor purchase on this list.
-- *Status 2026-10-06: partial.* The standing job exists: the nightly
-  `vopr` job in `.github/workflows/ci.yml` (cron `0 7 * * *`, 180-minute
-  cap) runs `uv run pytest tests/simulation --ignore=tests/simulation/lints`
-  and uploads `tests/simulation/_artifacts/` for 14 days. It passes neither
-  `--sim-vopr-count` nor `HYPERSCALE_SIM_SOAK=1`, so it runs the default
-  4-seed sweep and skips the soak; failing seeds are kept only as those
-  14-day artifacts.
+- *Status 2026-10-07: built.* `.github/workflows/ci.yml` runs the swarm
+  through `tests/simulation/soak/run_swarm.py`, one `--sim-replay`
+  invocation per seed so a failing seed never hides the seeds after it.
+  Measured cost per seed (judge + replay twin): vopr ~6 s, vopr_gates
+  ~16 s, vopr_mdc ~13 s, vopr_chaos ~21 s, soak ~34 s -- 500 seeds of every
+  suite is ~7.5 h serially, past a hosted runner's 6 h job limit, so:
+  `vopr-swarm-nightly` runs one job per suite (soak included) on a
+  time budget (the 180-minute job cap less 10 minutes of setup; the runner
+  starts a seed only while the time left covers its slowest seed, so the
+  count is measured on the runner) over a fresh window starting at the run
+  id; `vopr-swarm-weekly` (Sundays) runs the fixed corpus, seeds 1-500 per
+  suite, in five shards of 100, failing loudly if a shard cannot finish.
+  The nightly `vopr` job also sets `HYPERSCALE_SIM_SOAK=1`. Failing seeds
+  go to a ledger (`swarm_failing_seeds.json`: seed, first/last failing
+  commit and time) and a seed log with each seed's replay command; the job
+  summary lists them, the artifact keeps them 90 days, and the nightly
+  ledger is carried between runs in the Actions cache and replayed first
+  until each seed passes.
 
 **F3. Seed-randomized topology/workload parameters — (b) COVERABLE — P1**
 - Today: the VOPR topology is FIXED (manager + 2-core worker + client) and

@@ -468,14 +468,31 @@ Initial L2/L3 catalog:
 The catalog is extensible per scenario: a scenario can register
 scenario-specific invariants in its `setup`.
 
-*As built (2026-10-06): `InvariantChecker` (`tests/simulation/harness/invariants.py`)
-polls every `invariant_poll_interval` (0.1 s). Of this catalog only
-`at_most_one_job_leader_per_job` (`invariants.py:246`) exists.
-`MonotonicFenceTokens`, `WorkerSubprocessAttribution`, `NoOrphanWorkflows`
-and `LeakedLocksBounded` are not implemented as continuous checks. Leader
-exclusivity, terminal agreement, execution counts, single-DC placement and
-DC-health convergence are checked post-hoc by the VOPR oracle
-(`tests/simulation/oracle/cluster_trace_oracle.py:191-695`).*
+*As built (2026-10-07): `InvariantChecker` (`tests/simulation/harness/invariants.py`)
+polls every `invariant_poll_interval` (0.1 s) and every `ClusterHarness`
+registers the whole catalog (`continuous_catalog()`); each check lives in
+`tests/simulation/harness/invariant_checks/`. Built: `AtMostOneJobLeaderPerJob`,
+`MonotonicFenceTokens` (manager lease + dispatch tokens, worker accepted
+tokens, gate tokens; a high-water mark per node instance, so a token
+forgotten and re-learned older is caught), `WorkerSubprocessAttribution`,
+`NoOrphanWorkflows`, `LeakedLocksBounded`. Three entries above are wrong
+for a correct cluster and were replaced:
+`WorkerSubprocessAttribution` as written compares the pool with the
+supervisor's 1 s copy of the same pool, so it can only fire on a spawn
+between snapshots -- the check is that no executor PID sits in two
+workers' pools; `NoOrphanWorkflows` is checked on the worker, which sets a
+workflow's leader in the same step that makes it active
+(`WorkerState.add_active_workflow`), and requires that leader to be a
+cluster manager; `LeakedLocksBounded`'s `<= active peers + 1` fails on a
+correct manager, which keeps a dead peer's lock until the reaper drops it
+(`_cleanup_stale_dead_manager_tracking`), so the bound is set membership:
+every lock's peer is active, dead-not-yet-reaped, known or awaiting
+recovery verification, and every gate lock's gate is known. Mutation
+checks: `tests/unit/simulation/harness/test_continuous_invariants.py`;
+live evaluation: `tests/simulation/scenarios/l2_single_dc/test_continuous_invariant_catalog.py`.
+Leader exclusivity, terminal agreement, execution counts, single-DC
+placement and DC-health convergence are also checked post-hoc by the VOPR
+oracle (`tests/simulation/oracle/cluster_trace_oracle.py:191-695`).*
 
 ## 13. Liveness invariants
 
@@ -499,9 +516,18 @@ Catches "deadlock that pretends to be slowness." Initial catalog:
 - `BackpressureEventuallyClears` — once load drops, backpressure level
   returns to NONE within bounded time.
 
-*As built (2026-10-06): the one liveness invariant is
-`cluster_membership_progress` (`invariants.py:282`, 30 s staleness budget).
-None of the three above is implemented.*
+*As built (2026-10-07): `cluster_membership_progress` (`invariants.py`,
+staleness budget `stabilization_default`) and `JobMakesProgress`
+(`invariant_checks/job_progress.py`). `JobMakesProgress` as written --
+the completion count rises every N seconds -- fails on a correct cluster
+running one long workflow; it is built as the bound the protocol enforces
+(AD-34): a job with a workflow DISPATCHED or RUNNING shows progress (job
+status/counts, a workflow's status or lifecycle state, a dispatch's
+completed/failed actions or finished cores) within `stuck_threshold` +
+the AD-26 extension seconds since its last progress + one
+`JOB_TIMEOUT_CHECK_INTERVAL`, read from the job's `TimeoutTrackingState`
+and the leader's Env. `LeaderHeartbeatsContinue` and
+`BackpressureEventuallyClears` are not built.*
 
 ## 14. Diagnostics
 

@@ -43,8 +43,8 @@ from tests.simulation.harness.invariants import (
     InvariantChecker,
     LivenessInvariant,
     SafetyInvariant,
-    at_most_one_job_leader_per_job,
     cluster_membership_progress,
+    continuous_catalog,
 )
 from tests.simulation.harness.port_allocator import PortAllocator
 from tests.simulation.harness.server_handle import ServerHandle, ServerKind
@@ -124,13 +124,12 @@ class ClusterHarness:
             poll_interval=self.spec.timeouts.invariant_poll_interval,
             on_violation=self._on_invariant_violation,
         )
-        self._invariants.add_safety(at_most_one_job_leader_per_job())
         self._invariants.add_liveness(
             cluster_membership_progress(
                 staleness_budget=self.spec.timeouts.stabilization_default,
             )
         )
-        for safety in self.extra_safety_invariants:
+        for safety in [*continuous_catalog(), *self.extra_safety_invariants]:
             self._invariants.add_safety(safety)
         for liveness in self.extra_liveness_invariants:
             self._invariants.add_liveness(liveness)
@@ -199,6 +198,11 @@ class ClusterHarness:
 
     async def _on_invariant_violation(self, reason: str) -> None:
         await self._diagnostics.dump(reason=f"invariant: {reason}")
+
+    @property
+    def stabilized(self) -> bool:
+        """True once ``__aenter__`` has brought the cluster to steady state."""
+        return self._entered
 
     @property
     def supervisor(self) -> Supervisor:

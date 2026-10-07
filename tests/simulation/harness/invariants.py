@@ -25,6 +25,17 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from tests.simulation.harness.errors import HarnessError
+from tests.simulation.harness.invariant_checks.cancelled_core_release import CancelledCoreRelease
+from tests.simulation.harness.invariant_checks.cluster_isolation import cluster_isolation_violation
+from tests.simulation.harness.invariant_checks.job_progress import JobProgressWatch
+from tests.simulation.harness.invariant_checks.leaked_locks import leaked_lock_violation
+from tests.simulation.harness.invariant_checks.member_count_convergence import MemberCountConvergence
+from tests.simulation.harness.invariant_checks.monotonic_fence_tokens import MonotonicFenceTokens
+from tests.simulation.harness.invariant_checks.orphan_workflows import orphan_workflow_violation
+from tests.simulation.harness.invariant_checks.resource_counters import resource_counter_violation
+from tests.simulation.harness.invariant_checks.sub_workflow_tokens import unique_sub_workflow_token_violation
+from tests.simulation.harness.invariant_checks.subprocess_attribution import subprocess_attribution_violation
+from tests.simulation.harness.invariant_result import InvariantResult
 from tests.simulation.harness.server_handle import ServerHandle, ServerKind
 
 if TYPE_CHECKING:
@@ -38,14 +49,6 @@ class Severity(StrEnum):
 
 class InvariantViolation(HarnessError):
     """A registered invariant evaluated to False (safety) or stalled (liveness)."""
-
-
-@dataclass(slots=True, frozen=True)
-class InvariantResult:
-    """Outcome of one invariant evaluation."""
-
-    holds: bool
-    detail: str = ""
 
 
 @dataclass(slots=True)
@@ -310,3 +313,99 @@ def cluster_membership_progress(staleness_budget: float = 30.0) -> LivenessInvar
         progress_counter=_counter,
         staleness_budget_seconds=staleness_budget,
     )
+
+
+# =========================================================================
+# Continuous catalog (simulation_framework.md §12-13, SCENARIOS.md §11).
+# Each check lives in ``invariant_checks/``; where a doc's stated form is
+# wrong for a correct cluster, the check's module records why and what
+# replaces it.
+# =========================================================================
+
+
+def _from_violation_detail(
+    detail_of: Callable[["ClusterHarness"], str],
+) -> Callable[["ClusterHarness"], InvariantResult]:
+    """Adapt a check returning its first violation's detail ("" = holds)."""
+
+    def _evaluate(harness: "ClusterHarness") -> InvariantResult:
+        detail = detail_of(harness)
+        return InvariantResult(holds=not detail, detail=detail)
+
+    return _evaluate
+
+
+def monotonic_fence_tokens() -> SafetyInvariant:
+    """No node's fence token for a job ever goes backwards."""
+    return SafetyInvariant(name="MonotonicFenceTokens", evaluate=MonotonicFenceTokens().evaluate)
+
+
+def unique_sub_workflow_tokens() -> SafetyInvariant:
+    """A sub-workflow token runs on one worker -- the one it names -- and is listed once."""
+    return SafetyInvariant(
+        name="UniqueSubWorkflowTokens",
+        evaluate=_from_violation_detail(unique_sub_workflow_token_violation),
+    )
+
+
+def worker_subprocess_attribution() -> SafetyInvariant:
+    """No executor PID belongs to two workers' pools."""
+    return SafetyInvariant(
+        name="WorkerSubprocessAttribution",
+        evaluate=_from_violation_detail(subprocess_attribution_violation),
+    )
+
+
+def no_orphan_workflows() -> SafetyInvariant:
+    """Every running workflow has a known job leader that is a cluster manager."""
+    return SafetyInvariant(name="NoOrphanWorkflows", evaluate=_from_violation_detail(orphan_workflow_violation))
+
+
+def leaked_locks_bounded() -> SafetyInvariant:
+    """A manager holds state locks only for peers and gates it still tracks."""
+    return SafetyInvariant(name="LeakedLocksBounded", evaluate=_from_violation_detail(leaked_lock_violation))
+
+
+def job_makes_progress() -> SafetyInvariant:
+    """A job with work in flight progresses within its AD-34 stuck bound."""
+    return SafetyInvariant(name="JobMakesProgress", evaluate=JobProgressWatch(clock=time.monotonic).evaluate)
+
+
+def cancelled_jobs_free_cores() -> SafetyInvariant:
+    """A cancelled job's dispatches free their cores within the worker's cancellation bound."""
+    return SafetyInvariant(name="CancelledJobsFreeCores", evaluate=CancelledCoreRelease(clock=time.monotonic).evaluate)
+
+
+def resource_counter_consistency() -> SafetyInvariant:
+    """Worker core counters add up; manager-side counters stay within [0, total]."""
+    return SafetyInvariant(
+        name="ResourceCounterConsistency",
+        evaluate=_from_violation_detail(resource_counter_violation),
+    )
+
+
+def member_count_convergence() -> SafetyInvariant:
+    """Each observer tier agrees on member count within one gossip dissemination."""
+    return SafetyInvariant(name="MemberCountConvergence", evaluate=MemberCountConvergence(clock=time.monotonic).evaluate)
+
+
+def cluster_id_isolation() -> SafetyInvariant:
+    """No node holds membership from another cluster."""
+    return SafetyInvariant(name="ClusterIdIsolation", evaluate=_from_violation_detail(cluster_isolation_violation))
+
+
+def continuous_catalog() -> list[SafetyInvariant]:
+    """The full continuous catalog, fresh state per call (one per harness)."""
+    return [
+        at_most_one_job_leader_per_job(),
+        monotonic_fence_tokens(),
+        unique_sub_workflow_tokens(),
+        worker_subprocess_attribution(),
+        no_orphan_workflows(),
+        leaked_locks_bounded(),
+        job_makes_progress(),
+        cancelled_jobs_free_cores(),
+        resource_counter_consistency(),
+        member_count_convergence(),
+        cluster_id_isolation(),
+    ]

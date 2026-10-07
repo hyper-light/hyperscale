@@ -138,6 +138,7 @@ _WORKER_TAGS = frozenset(
         "manager-healthy",
         "workflows-active",
         "workflow-started",
+        "workflow-deadline-armed",
         "workflow-executed",
         _AUDIT_TAG,
     }

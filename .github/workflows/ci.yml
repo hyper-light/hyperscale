@@ -24,11 +24,20 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      swarm:
+        description: "VOPR swarm depth: nightly (time-budgeted fresh window) or weekly (fixed 500-seed corpus)"
+        type: choice
+        options: [nightly, weekly]
+        default: nightly
   # Lets release.yml gate publication on this workflow.
   workflow_call:
   # The long simulation campaigns are too slow for every push.
   schedule:
+    # Nightly: VOPR default corpora + soak, and the time-budgeted swarm.
     - cron: "0 7 * * *"
+    # Weekly: the fixed 500-seed swarm corpus per suite, sharded.
+    - cron: "0 12 * * 0"
 
 # A newer push to the same branch makes the older run irrelevant.
 concurrency:
@@ -113,9 +122,14 @@ jobs:
     name: VOPR campaigns
     # Wall-clock heavy: chaos schedules, gate tiers and soak horizons.
     # Nightly and on demand, not on every push.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule == '0 7 * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    env:
+      # The soak's default corpus (one 1800-virtual-second horizon, judge
+      # + replay twin, plus the kill-horizon pin) measured 57 s locally on
+      # 2026-10-07; it fits inside this job's 180-minute cap.
+      HYPERSCALE_SIM_SOAK: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -139,3 +153,140 @@ jobs:
           path: tests/simulation/_artifacts/
           if-no-files-found: ignore
           retention-days: 14
+
+  # D-42 / F2: the standing seed swarm. Every seed runs as its own
+  # ``--sim-replay`` invocation (tests/simulation/soak/run_swarm.py), so a
+  # failing seed never hides the rest, and every failure lands in a
+  # ledger -- seed + commit + exact replay command -- that the job
+  # summary shows, the artifact keeps for 90 days, and the next nightly
+  # run restores from the cache and replays first until the seed passes.
+  #
+  # Cost per seed (judge + byte-identical replay twin), measured
+  # 2026-10-07: vopr ~6 s, vopr_gates ~16 s, vopr_mdc ~13 s,
+  # vopr_chaos ~21 s, soak ~34 s. 500 seeds of every suite is ~7.5 h
+  # serially even at that speed, past a hosted runner's 6 h job limit,
+  # so the swarm splits into:
+  #
+  # * nightly, one job per suite, time-budgeted: the runner starts a seed
+  #   only while the budget left covers the slowest seed so far, so the
+  #   seed count is measured on the runner itself. Budget = the job cap
+  #   (180 min, the vopr job's) minus 10 min of setup (the lints job's
+  #   whole cap covers checkout + uv sync). The window starts at the run
+  #   id, so every night draws seeds no earlier night drew. The window
+  #   length is the budget in seconds: no seed finishes under a second,
+  #   so the budget, never the window, ends the run.
+  # * weekly, the fixed corpus of 500 seeds per suite (seeds 1-500) in
+  #   five shards of 100: the slowest suite's shard (chaos) measured
+  #   ~35 min, a fifth of the same 170-minute budget. A shard that still
+  #   cannot finish fails loudly (--require-all) and lists its unrun
+  #   seeds rather than passing short.
+  vopr-swarm-nightly:
+    name: VOPR swarm (nightly, ${{ matrix.suite.name }})
+    if: >-
+      github.event.schedule == '0 7 * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.swarm != 'weekly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - { name: vopr, path: tests/simulation/vopr }
+          - { name: vopr_gates, path: tests/simulation/vopr_gates }
+          - { name: vopr_mdc, path: tests/simulation/vopr_mdc }
+          - { name: vopr_chaos, path: tests/simulation/vopr_chaos }
+          - { name: soak, path: tests/simulation/soak }
+    env:
+      SWARM_BUDGET_SECONDS: "10200"
+      SWARM_LEDGER: tests/simulation/_artifacts/swarm_failing_seeds.json
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+      - name: Restore failing-seed ledger
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.SWARM_LEDGER }}
+          key: swarm-ledger-${{ matrix.suite.name }}-${{ github.run_id }}
+          restore-keys: swarm-ledger-${{ matrix.suite.name }}-
+      - name: Run the swarm
+        run: >-
+          uv run python tests/simulation/soak/run_swarm.py
+          --suites ${{ matrix.suite.path }}
+          --first-seed ${{ github.run_id }}
+          --count "$SWARM_BUDGET_SECONDS"
+          --budget-seconds "$SWARM_BUDGET_SECONDS"
+          --ledger "$SWARM_LEDGER"
+          --summary-markdown "$GITHUB_STEP_SUMMARY"
+      - name: Save failing-seed ledger
+        if: '!cancelled()'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.SWARM_LEDGER }}
+          key: swarm-ledger-${{ matrix.suite.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload swarm record
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v4
+        with:
+          name: swarm-nightly-${{ matrix.suite.name }}
+          path: |
+            tests/simulation/_artifacts/swarm_failing_seeds.json
+            tests/simulation/_artifacts/swarm_seed_log.jsonl
+            tests/simulation/_artifacts/swarm/
+          if-no-files-found: ignore
+          retention-days: 90
+
+  vopr-swarm-weekly:
+    name: VOPR swarm (weekly, ${{ matrix.suite.name }} shard ${{ matrix.shard }})
+    if: >-
+      github.event.schedule == '0 12 * * 0' ||
+      (github.event_name == 'workflow_dispatch' && inputs.swarm == 'weekly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - { name: vopr, path: tests/simulation/vopr }
+          - { name: vopr_gates, path: tests/simulation/vopr_gates }
+          - { name: vopr_mdc, path: tests/simulation/vopr_mdc }
+          - { name: vopr_chaos, path: tests/simulation/vopr_chaos }
+          - { name: soak, path: tests/simulation/soak }
+        shard: [0, 1, 2, 3, 4]
+    env:
+      SWARM_BUDGET_SECONDS: "10200"
+      SWARM_SHARD_SEEDS: "100"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+      - name: Run the shard
+        run: >-
+          uv run python tests/simulation/soak/run_swarm.py
+          --suites ${{ matrix.suite.path }}
+          --first-seed "$(( 1 + ${{ matrix.shard }} * SWARM_SHARD_SEEDS ))"
+          --count "$SWARM_SHARD_SEEDS"
+          --budget-seconds "$SWARM_BUDGET_SECONDS"
+          --require-all
+          --summary-markdown "$GITHUB_STEP_SUMMARY"
+      - name: Upload swarm record
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v4
+        with:
+          name: swarm-weekly-${{ matrix.suite.name }}-${{ matrix.shard }}
+          path: |
+            tests/simulation/_artifacts/swarm_failing_seeds.json
+            tests/simulation/_artifacts/swarm_seed_log.jsonl
+            tests/simulation/_artifacts/swarm/
+          if-no-files-found: ignore
+          retention-days: 90

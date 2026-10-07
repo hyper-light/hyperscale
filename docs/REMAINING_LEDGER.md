@@ -50,8 +50,8 @@ D-83/84), and AD-44 late results / `RETRY_BUDGET_DEFAULT` (P-AD44-1, A3-G-50).
    `AdaptiveRateLimitConfig.from_env` derives every limit from the node's Env (`reliability/rate_limit_derivation.py`); the hand-set `RateLimitConfig` and the unused client-side `CooperativeRateLimiter` are deleted (925b345c).
 9. **Unmeasured performance claims (P-AD52-3, A2-G-264/258/247, R-G3/35/39).**
    There is no `tests/benchmarks/` and no throughput/RSS, ingest, spike, AD-38 latency, AD-52 §16 or 5000× probe. AD-36's "< 10 s reroute" has no test (the DC-loss bound is 30 s). Size M.
-10. **D-42 / D-13: nightly CI and continuous invariants.**
-    The nightly `vopr` job runs the default 4-seed sweep and never the soak (`.github/workflows/ci.yml:129`). Only 2 of SCENARIOS §11's continuous invariants exist. Size M.
+10. ~~**D-42 / D-13: nightly CI and continuous invariants.**~~ BUILT (2026-10-07).
+    `vopr-swarm-nightly` (time-budgeted, one job per suite, soak included) and `vopr-swarm-weekly` (seeds 1-500 per suite, five shards) run `run_swarm.py`, which keeps a failing-seed ledger the next night replays first; the nightly `vopr` job runs the soak. Every `ClusterHarness` scenario runs the full continuous catalog. See D-42, D-13 and D-13b below.
 
 Also notable, small (closed 2026-10-07): the unfed `ManagerDiscoveryCoordinator` was deleted (AD-28-1); `DiscoveryService` logs failed DNS lookups (R-G67); the raw-task lint covers all of `hyperscale/` (R-G66). Doc banners are stale: architecture.md:21085 still says read consistency is "Not built" and AD_52.md contradicts its own Status (FIX.md's §1.1/§1.2 status was corrected, R-G51).
 
@@ -483,15 +483,15 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - Exists: nothing (`retry_on|retries=` zero hits in `tests/simulation/harness`, `tests/simulation/scenarios`).
 - Missing: the decorator. Candidate for Doc-obsolete (SIM determinism makes retries a flake-mask), but no decision recorded.
 
-#### D-13 — Continuous safety/liveness invariant catalog — STILL PARTIAL — size M
+#### D-13 — Continuous safety/liveness invariant catalog — CLOSED 2026-10-07 — size M
 - Doc: simulation_framework.md P-13/P-14 catalog: AtMostOneJobLeaderPerJob, MonotonicFenceTokens, WorkerSubprocessAttribution, NoOrphanWorkflows, LeakedLocksBounded, JobMakesProgress.
-- Exists: `tests/simulation/harness/invariants.py:246 at_most_one_job_leader_per_job`, `:282 cluster_membership_progress`; post-hoc VOPR oracles `tests/simulation/oracle/cluster_trace_oracle.py:191-695` (leader exclusivity, terminal agreement, execution counts, placement, DC health).
-- Missing: MonotonicFenceTokens, WorkerSubprocessAttribution, NoOrphanWorkflows, LeakedLocksBounded, JobMakesProgress as continuous checks (zero hits under any name in `tests/`).
+- Closed: all six run in every `ClusterHarness` scenario (`continuous_catalog()`, `tests/simulation/harness/invariants.py`; checks in `tests/simulation/harness/invariant_checks/`). Three as written are wrong for a correct cluster and were replaced, recorded in simulation_framework.md §12-13 and each check's module: WorkerSubprocessAttribution (pool vs its own 1 s snapshot) became PID disjointness across workers; LeakedLocksBounded (`<= active + 1`; a dead peer keeps its lock until reaped) became set membership; JobMakesProgress (completion count every N s; one long workflow completes nothing) became AD-34's stuck bound.
+- Proof: mutation checks `tests/unit/simulation/harness/test_continuous_invariants.py` (each invariant holds on real state objects, then fails on the injected violation; the checker loop catches one injected mid-run); live evaluation `tests/simulation/scenarios/l2_single_dc/test_continuous_invariant_catalog.py`.
 
-#### D-42 — F2 standing 500-seed swarm — STILL PARTIAL — size S
+#### D-42 — F2 standing 500-seed swarm — CLOSED 2026-10-07 — size S
 - Doc: simulation_rigor_checklist.md:424-433 "nightly/weekly soak invocation (`--sim-vopr-count=500`) ... the missing piece is purely the standing job and a place to record failing seeds."
-- Exists: nightly `vopr` job `.github/workflows/ci.yml:112-139` (cron :31) running `pytest tests/simulation` at the default sweep, artifacts uploaded; F1 soak `tests/simulation/soak/`; F3 Built (below).
-- Missing: the job passes neither `--sim-vopr-count` nor `HYPERSCALE_SIM_SOAK=1` (ci.yml:129), so it runs the 4-seed default and skips soak; no failing-seed record beyond 14-day artifacts. Plan Phase 3 "Remaining" lists exactly this.
+- Closed: `.github/workflows/ci.yml` `vopr-swarm-nightly` and `vopr-swarm-weekly` run `tests/simulation/soak/run_swarm.py` (one `--sim-replay` per seed, so one failure no longer ends a sweep). Measured cost per seed: vopr ~6 s, gates ~16 s, mdc ~13 s, chaos ~21 s, soak ~34 s; 500 of each (~7.5 h) exceeds a hosted job, so nightly is time-budgeted per suite (180-min cap less 10 min setup; count measured on the runner) over a fresh window from the run id, and weekly runs seeds 1-500 per suite in five shards of 100 (`--require-all`). The nightly `vopr` job sets `HYPERSCALE_SIM_SOAK=1`. Failing seeds: ledger (seed, first/last commit) + seed log with replay commands, in the job summary, a 90-day artifact, and (nightly) the Actions cache, replayed first the next night until they pass.
+- Proof: `tests/unit/simulation/harness/test_swarm_ledger.py`.
 
 #### D-62 — Policy-driven placement — STILL PARTIAL — size M
 - Doc: improvements.md:8 "explicit constraints (region affinity, min capacity, cost, latency budget) with pluggable policy."
@@ -565,14 +565,13 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - Exists: Raft store applies a torn-last-frame-only rule and sets aside an untrustworthy disk (Plan D1 stage A); restart/idempotency/incarnation/snapshot-install covered (`tests/unit/distributed/raft/test_raft_snapshot_install.py`, `test_wal_reclamation.py`).
 - Closed: `NodeWAL` accepts only a torn tail. It cuts the tail after a stable second read, and refuses any other damage with `WALUntrustworthyError` and a CRITICAL `WALUntrustworthy` log, leaving the file as found. Refusal was chosen over set-aside because nothing rebuilds a node's ledger from peers and LOCAL entries are never replicated (AD-38 Part 3.2). Tested in `tests/unit/distributed/ledger/wal/test_node_wal_damage_vopr.py`.
 
-#### D-13b (G-96) — SCENARIOS §11 continuous 9-invariant checker — STILL PARTIAL — size M
+#### D-13b (G-96) — SCENARIOS §11 continuous 9-invariant checker — CLOSED 2026-10-07 — size M
 - Doc: SCENARIOS.md §11, nine invariants every 100 ms.
-- Exists: `InvariantChecker` with 2 invariants (see D-13); post-hoc oracles cover leader exclusivity, terminal reach, execution counts.
-- Missing: monotone fence tokens, unique sub-workflow tokens, cores freed within budget, `available + reserved <= total`, member-count convergence, cluster-ID isolation as continuous checks (`worker_core_accounting` VOPR checks cores, post-hoc only).
+- Closed: monotone fence tokens, unique sub-workflow tokens, terminal reach (JobMakesProgress), cancelled cores freed within the worker's cancellation bound, resource counters, member-count convergence (within one gossip dissemination) and cluster-ID isolation run continuously beside job-leader exclusivity; SCENARIOS §11 names each check and every bound's derivation. `available + reserved <= total` is an identity on the worker and `[0, total]` per counter on a manager (reserved cores are still inside the reported available count there). "At most one leader per DC" stays post-hoc (VOPR oracle).
 
 ### Now Built / Doc-obsolete
 - D-6 One harness REAL/SIM — Doc-obsolete: the doc's own amendment (simulation_framework.md:885-906) moved SIM to SIM-native multiprocess suites; `tests/simulation/harness/execution_mode.py`.
-- D-42-F1/F3 Soak + seed-drawn topology — Built: `tests/simulation/soak/`; chaos draws topology per seed `tests/simulation/vopr_chaos/chaos_plan.py:380-386` (F2 remains, above).
+- D-42-F1/F3 Soak + seed-drawn topology — Built: `tests/simulation/soak/`; chaos draws topology per seed `tests/simulation/vopr_chaos/chaos_plan.py:380-386` (F2 closed 2026-10-07, above).
 - D-48 L-section client/edge faults — Built: chaos `client_partition` links `chaos_plan.py:588,639`; L5 `tests/unit/simulation/sim/test_multiprocess_rejection_storm.py`; L2/L4 as before. (Base VOPR `vopr/fault_plan.py:31` still manager↔worker only; the doc's recipe targets chaos.)
 - D-49 Four queued production gaps — Built: completion obligation (`jobs/completion_notice_obligation.py`); mid-flight AD-36 failover `nodes/gate/job_failover_coordinator.py`, run at `gate/server.py:1552`, test `tests/unit/distributed/gate/test_gate_mid_flight_failover.py`; storage-aware placement `datacenters/datacenter_health_manager.py:234` (`storage_writable` in heartbeat), test `tests/unit/distributed/jobs/test_storage_aware_datacenter_health.py`; SIM duration workflows (Plan SIM17).
 - D-59 Global ledger quorum replication — Built: manager REGIONAL replicator `nodes/manager/server.py:1144`, gate regional+global `gate/server.py:1423-1424`, GLOBAL when spanning regions `gate/server.py:3512`; tests `tests/integration/raft/test_ledger_replication.py`, `test_ledger_region_span.py`.
@@ -589,5 +588,5 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - (Closed) Client honors `JobAck.retry_after_seconds`; see D-70.
 - (Closed) Job `NodeWAL` mid-file corruption now refuses to start; see D-95.
 - Harness drops cleanup errors and a pending invariant violation when the test body already raised (`tests/simulation/harness/cluster_harness.py:166-170`) — see D-9.
-- Nightly CI `vopr` job runs only the default 4-seed sweep and never the soak (`.github/workflows/ci.yml:129`) — see D-42.
+- (Closed) Nightly CI ran only the default 4-seed sweep and never the soak; see D-42.
 - God files grew ~35–46% since 2026-08 despite the complexity program — see D-84.
