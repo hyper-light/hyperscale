@@ -6,6 +6,7 @@ import cloudpickle
 from typing import Self
 
 from hyperscale.distributed.models.restricted_unpickler import RestrictedUnpickler
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.taskex.snowflake import SnowflakeGenerator
 
 
@@ -25,7 +26,8 @@ def _generate_instance_id() -> int:
     return pid_component | random_component
 
 
-# Module-level Snowflake generator for message IDs — LAZY.
+# Module-level Snowflake generator for message IDs — LAZY, and bound
+# to the module's CURRENT clock.
 #
 # Construction is deferred to first use for two determinism reasons
 # (both measured as chaos-VOPR twin forks):
@@ -37,23 +39,51 @@ def _generate_instance_id() -> int:
 # * the instance bits combine PID + secrets — random per run. Under
 #   SIM the swapped ``_DEFAULT_RANDOM`` supplies them
 #   deterministically; REAL mode keeps the PID+secrets nonce.
+#
+# The generator in use is the one built for ``_DEFAULT_CLOCK`` (which
+# ``swap_defaults`` / ``restore_defaults`` rebind): a generator built
+# while a virtual clock was swapped in must not outlive the swap, or
+# every later id embeds that dead clock's frozen time and receivers'
+# replay guards reject the frames as stale. The REAL clock's generator
+# is kept for the process's life, so ids minted on the REAL axis stay
+# strictly monotone across any number of swaps.
+_REAL_CLOCK: Clock = RealClock()
+_DEFAULT_CLOCK: Clock = _REAL_CLOCK
 _DEFAULT_RANDOM = None
+_real_clock_message_id_generator: SnowflakeGenerator | None = None
 _message_id_generator: SnowflakeGenerator | None = None
+_message_id_generator_clock: Clock | None = None
 
 
-def _get_message_id_generator() -> SnowflakeGenerator:
-    global _message_id_generator
-    if _message_id_generator is None:
-        if _DEFAULT_RANDOM is not None:
-            instance = int(_DEFAULT_RANDOM.uniform(0.0, 1023.0))
-        else:
-            instance = _generate_instance_id()
-        _message_id_generator = SnowflakeGenerator(instance=instance)
-    return _message_id_generator
+def _message_id_generator_instance() -> int:
+    """The generator's 10 instance bits: from the swapped ``_DEFAULT_RANDOM``
+    under SIM, else the PID + secrets nonce."""
+    if _DEFAULT_RANDOM is not None:
+        return int(_DEFAULT_RANDOM.uniform(0.0, 1023.0))
+    return _generate_instance_id()
 
-# Incarnation nonce - random value generated at module load time
-# Used to detect messages from previous incarnations of this process
-MESSAGE_INCARNATION = secrets.token_bytes(8)
+
+def _real_clock_generator() -> SnowflakeGenerator:
+    """The process-lifetime generator on the REAL clock, built on first use."""
+    global _real_clock_message_id_generator
+    if _real_clock_message_id_generator is None:
+        _real_clock_message_id_generator = SnowflakeGenerator(
+            instance=_message_id_generator_instance(), clock=_REAL_CLOCK
+        )
+    return _real_clock_message_id_generator
+
+
+def _bind_message_id_generator() -> None:
+    """Bind the generator for the module's current ``_DEFAULT_CLOCK``: the
+    REAL clock's lifetime generator, or a fresh one on a swapped clock."""
+    global _message_id_generator, _message_id_generator_clock
+    if _DEFAULT_CLOCK is _REAL_CLOCK:
+        _message_id_generator = _real_clock_generator()
+    else:
+        _message_id_generator = SnowflakeGenerator(
+            instance=_message_id_generator_instance(), clock=_DEFAULT_CLOCK
+        )
+    _message_id_generator_clock = _DEFAULT_CLOCK
 
 
 def generate_message_id() -> int:
@@ -65,7 +95,14 @@ def generate_message_id() -> int:
     here spun a blocking ``time.sleep`` on the event-loop thread, which
     under a frozen virtual clock could never terminate.
     """
-    return _get_message_id_generator().generate_sync()
+    if _message_id_generator_clock is not _DEFAULT_CLOCK:
+        _bind_message_id_generator()
+    return _message_id_generator.generate_sync()
+
+
+# Incarnation nonce - random value generated at module load time
+# Used to detect messages from previous incarnations of this process
+MESSAGE_INCARNATION = secrets.token_bytes(8)
 
 
 class Message:

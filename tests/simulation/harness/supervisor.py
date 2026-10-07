@@ -34,6 +34,10 @@ from tests.simulation.harness.timeouts import HarnessTimeouts
 
 
 _HARNESS_RUN_ID_ENV = "HYPERSCALE_HARNESS_RUN_ID"
+# The pid of the harness process that owns a run: a tagged process whose
+# owner still lives belongs to a concurrent run (another session on the
+# same machine), not to a dead one, and is never reaped.
+_HARNESS_OWNER_PID_ENV = "HYPERSCALE_HARNESS_OWNER_PID"
 
 
 @dataclass(slots=True)
@@ -75,6 +79,7 @@ class Supervisor:
     async def __aenter__(self) -> "Supervisor":
         self._run_id = uuid.uuid4().hex
         os.environ[_HARNESS_RUN_ID_ENV] = self._run_id
+        os.environ[_HARNESS_OWNER_PID_ENV] = str(os.getpid())
 
         await self._preflight_zombie_reap()
 
@@ -160,6 +165,7 @@ class Supervisor:
         self._report_async_leaks(truly_leaked)
 
         os.environ.pop(_HARNESS_RUN_ID_ENV, None)
+        os.environ.pop(_HARNESS_OWNER_PID_ENV, None)
 
     async def _signal_servers_stop(self) -> None:
         """Phase 1: fire ``server.stop()`` for every started node in parallel.
@@ -549,6 +555,8 @@ class Supervisor:
                 continue
             if foreign_id == self._run_id:
                 continue
+            if _owner_is_alive(proc, env.get(_HARNESS_OWNER_PID_ENV)):
+                continue
             zombies.append(proc)
         return zombies
 
@@ -565,6 +573,18 @@ class Supervisor:
     @staticmethod
     def _now() -> float:
         return time.monotonic()
+
+
+def _owner_is_alive(proc: psutil.Process, owner_pid_text: str | None) -> bool:
+    """Whether ``proc``'s owning harness process still runs: its tagged
+    owner pid exists and was created no later than ``proc`` (a pid the
+    OS reused after the owner died belongs to a younger process)."""
+    if not owner_pid_text:
+        return False
+    try:
+        return psutil.Process(int(owner_pid_text)).create_time() <= proc.create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        return False
 
 
 def _describe_leaked_task(task: asyncio.Task) -> str:

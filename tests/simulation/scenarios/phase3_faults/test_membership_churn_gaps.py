@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.models import (
     NodeInfo,
     NodeRole,
@@ -40,10 +41,30 @@ from tests.simulation.harness import (
 
 _LARGE_WORKER_COUNT = 50
 _COMPACT_WORKER_BLOCK = 32
-_SLOW_CHURN_CYCLES = 30
+# docs/SCENARIOS.md section 6: "1 worker every 10 s for 5 min". The stream
+# runs for the scenario's five minutes; each churn event is placed by the
+# previous one's observed outcome (removal, then restoration), so events
+# are never closer than the interval -- the count is whatever the
+# cluster's real detection latency fits in the stream, not a fixed 30
+# (which assumed a 10 s cycle and ran ~27 s cycles past 13 minutes).
+_SLOW_CHURN_STREAM_SECONDS = 300.0
 _SLOW_CHURN_INTERVAL_SECONDS = 10.0
 _SCALE_DOWN_WINDOW_SECONDS = 10.0
 _LARGE_CLUSTER_RUNNING_TIMEOUT_SECONDS = 120.0
+_REQUEST_TIMEOUT_SECONDS = 5.0
+
+# Mass crash: a datacenter with no workers left is a capacity wait, not a
+# failure (AD-54 "Failed dispatch"): the workflow returns to PENDING and
+# the job fails with its cause at its AD-34 deadline. The leader checks
+# deadlines once per ``JOB_TIMEOUT_CHECK_INTERVAL``, so the failure is
+# surfaced up to one interval after the deadline and reaches the client
+# with one push (one request timeout).
+_MASS_CRASH_JOB_TIMEOUT_SECONDS = 120.0
+_MASS_CRASH_COMPLETION_BUDGET_SECONDS = (
+    _MASS_CRASH_JOB_TIMEOUT_SECONDS
+    + Env().JOB_TIMEOUT_CHECK_INTERVAL
+    + _REQUEST_TIMEOUT_SECONDS
+)
 
 # ---------------------------------------------------------------------------
 # Derived budgets for the graceful_scale_down scenarios.
@@ -115,7 +136,7 @@ def _single_manager_spec(
             ),
         },
         env=EnvOverrides(
-            request_timeout="5s",
+            request_timeout=f"{_REQUEST_TIMEOUT_SECONDS:g}s",
             log_level="error",
             max_workers_per_manager=max_workers_per_manager,
         ),
@@ -126,9 +147,16 @@ def _single_manager_spec(
 def _long_workload(
     timeout_seconds: float,
     allowed_terminal_statuses: set[str] | None = None,
+    completion_budget_seconds: float | None = None,
 ) -> WorkloadSpec:
     expectations: list[Expectation] = [
-        ExpectCompletionWithin(seconds=timeout_seconds),
+        ExpectCompletionWithin(
+            seconds=(
+                timeout_seconds
+                if completion_budget_seconds is None
+                else completion_budget_seconds
+            )
+        ),
     ]
     if allowed_terminal_statuses is None:
         expectations.insert(
@@ -371,7 +399,11 @@ async def test_mass_crash_50_workers() -> None:
         workers = cluster.workers("local")
 
         async with cluster.workload(
-            _long_workload(120.0, {"failed", "cancelled", "timeout"})
+            _long_workload(
+                _MASS_CRASH_JOB_TIMEOUT_SECONDS,
+                {"failed", "cancelled", "timeout"},
+                completion_budget_seconds=_MASS_CRASH_COMPLETION_BUDGET_SECONDS,
+            )
         ) as driver:
             await driver.submit()
             await driver.wait_until_running(
@@ -435,7 +467,9 @@ async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
                 flush=True,
             )
 
-        for churn_index in range(_SLOW_CHURN_CYCLES):
+        stream_started_at = time.monotonic()
+        churn_index = 0
+        while time.monotonic() - stream_started_at < _SLOW_CHURN_STREAM_SECONDS:
             await cluster.faults.kill(victim)
             await wait_until(
                 lambda: manager.instance._manager_state.get_worker_count() <= 1,
@@ -457,6 +491,7 @@ async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
                     f"iter_{i}_restore_timeout"
                 ),
             )
+            churn_index += 1
 
 
 @pytest.mark.asyncio

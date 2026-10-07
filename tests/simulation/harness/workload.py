@@ -27,6 +27,7 @@ from tests.simulation.harness.conditions import dc_has_leader, wait_until
 from tests.simulation.harness.errors import HarnessError
 from tests.simulation.harness.harness_auth_secret import HARNESS_AUTH_SECRET
 from tests.simulation.harness.expectations import (
+    ExpectCompletionWithin,
     Expectation,
     ExpectationResult,
     WorkloadObservations,
@@ -64,8 +65,9 @@ class WorkloadDriver:
        happen between this and ``wait_for_completion`` to land
        mid-workload.
     3. ``wait_for_completion()`` — block until every expected
-       workflow has reported a result, bounded by the spec's
-       ``timeout_seconds``.
+       workflow has reported a result, bounded by the larger of the
+       spec's ``timeout_seconds`` and its ``ExpectCompletionWithin``
+       budgets.
 
     ``submit_and_wait()`` is a convenience that does ``submit`` +
     ``wait_for_completion`` back-to-back (no ``wait_until_running``)
@@ -231,7 +233,8 @@ class WorkloadDriver:
 
     async def wait_for_completion(self) -> None:
         """Block until every expected workflow reports a result, bounded
-        by the largest ``Submission.timeout_seconds`` in the spec.
+        by the largest ``Submission.timeout_seconds`` or
+        ``ExpectCompletionWithin.seconds`` in the spec.
 
         On timeout, ``observations.completion_seconds`` is left
         ``None`` so ``ExpectCompletionWithin`` fails with a clear
@@ -425,7 +428,20 @@ class WorkloadDriver:
         return "L3 routing candidates: " + "; ".join(snapshots)
 
     async def _wait_for_completion(self) -> None:
-        budget = max(s.timeout_seconds for s in self.spec.submissions)
+        # A job that cannot finish surfaces through the AD-34 timeout
+        # path -- its failure result arrives one timeout-check interval
+        # (plus a push) AFTER ``timeout_seconds``. Waiting only
+        # ``timeout_seconds`` would make that completion unobservable,
+        # so the wait covers every completion budget the spec's own
+        # ``ExpectCompletionWithin`` expectations will judge.
+        budget = max(
+            [submission.timeout_seconds for submission in self.spec.submissions]
+            + [
+                expectation.seconds
+                for expectation in self.spec.expectations
+                if isinstance(expectation, ExpectCompletionWithin)
+            ]
+        )
         try:
             await asyncio.wait_for(self._all_complete_event.wait(), timeout=budget)
         except asyncio.TimeoutError:

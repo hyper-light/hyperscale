@@ -14,6 +14,8 @@ until the production-side Clock/Random/Transport refactor lands.
 
 import asyncio
 import pathlib
+import shutil
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -47,6 +49,7 @@ from tests.simulation.harness.invariants import (
     continuous_catalog,
 )
 from tests.simulation.harness.port_allocator import PortAllocator
+from tests.simulation.harness.scenario_signal_router import ScenarioSignalRouter
 from tests.simulation.harness.server_handle import ServerHandle, ServerKind
 from tests.simulation.harness.submission import WorkloadSpec
 from tests.simulation.harness.supervisor import Supervisor
@@ -96,6 +99,10 @@ class ClusterHarness:
     _next_worker_index_by_dc: dict[str, int] = field(init=False, default_factory=dict)
     _expected_worker_count_by_dc: dict[str, int] = field(init=False, default_factory=dict)
     _entered: bool = field(init=False, default=False)
+    _signal_router: ScenarioSignalRouter = field(init=False)
+    # Per-run directory holding every node's WAL and logs (``<node_id>/``):
+    # nodes otherwise fall back to the working directory. Removed on exit.
+    _node_data_root: pathlib.Path = field(init=False)
 
     async def __aenter__(self) -> "ClusterHarness":
         if self.mode is ExecutionMode.SIM:
@@ -103,6 +110,12 @@ class ClusterHarness:
                 "SIM mode requires the Clock/Random/Transport refactor (Phases 5–6); "
                 "use ExecutionMode.REAL until then."
             )
+
+        # In-process nodes register abort handlers for SIGINT/SIGTERM as
+        # they start; the scenario claims them back so a signal stops it.
+        self._signal_router = ScenarioSignalRouter(asyncio.current_task())
+        self._signal_router.claim()
+        self._node_data_root = pathlib.Path(tempfile.mkdtemp(prefix="hyperscale-harness-"))
 
         self._ports = PortAllocator(host=self.spec.host)
         self._expected_worker_count_by_dc = {
@@ -136,9 +149,8 @@ class ClusterHarness:
 
         self._faults = FaultMatrix(harness=self)
 
-        await self._supervisor.__aenter__()
-
         try:
+            await self._supervisor.__aenter__()
             self._build_servers()
             await self._start_servers()
             # Phase 4: install FaultInjectingTransport on every started
@@ -146,17 +158,29 @@ class ClusterHarness:
             # subsequent send. Servers without the wrapper would still
             # be reachable from rule-blocked peers.
             fault_transport.install(self)
+            self._signal_router.claim()
             await self._invariants.start()
             await self._stabilize()
         except BaseException:
-            await self._invariants.stop()
-            await self._supervisor.shutdown()
+            try:
+                await self._invariants.stop()
+                await self._supervisor.shutdown()
+            finally:
+                await self._remove_node_data_root()
+                self._release_signal_routing()
             raise
 
         self._entered = True
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        try:
+            await self._teardown(exc_val)
+        finally:
+            await self._remove_node_data_root()
+            self._release_signal_routing()
+
+    async def _teardown(self, exc_val: BaseException | None) -> None:
         await self._invariants.stop()
         invariant_violation = self._invariants.violation
         try:
@@ -172,6 +196,27 @@ class ClusterHarness:
                 cleanup_report.attach_to(exc_val)
             elif (teardown_failure := cleanup_report.failure()) is not None:
                 raise teardown_failure
+
+    def node_data_directory(self, node_id: str) -> pathlib.Path:
+        """The node's WAL directory under this run's data root (its logs
+        live in ``logs/`` beneath it); stable across the node's restarts."""
+        return self._node_data_root / node_id
+
+    async def _remove_node_data_root(self) -> None:
+        """Delete the run's node data directory once every node stopped."""
+        await asyncio.get_running_loop().run_in_executor(None, shutil.rmtree, self._node_data_root)
+
+    def reclaim_signals(self) -> None:
+        """Claim SIGINT/SIGTERM back for the scenario after a node starts
+        (its components register their own handlers as it boots)."""
+        self._signal_router.claim()
+
+    def _release_signal_routing(self) -> None:
+        """With the cluster torn down: drop every signal handler the
+        scenario or its nodes registered, then let a signal that stopped
+        the scenario take its default effect."""
+        self._signal_router.release()
+        self._signal_router.redeliver()
 
     async def dump_diagnostics(self, reason: str = "manual") -> None:
         """Write a complete diagnostic snapshot. Safe to call any time after __aenter__."""
@@ -275,6 +320,7 @@ class ClusterHarness:
         handle.started = True
         self._supervisor.start_worker_pid_tracking(handle)
         fault_transport.reinstall_for(handle, self)
+        self._signal_router.claim()
         return handle
 
     def address_to_node_id(
@@ -367,7 +413,11 @@ class ClusterHarness:
                 _peer_udp=peer_udp,
             ) -> GateServer:
                 env = self._build_env(node_id=_node_id, dc_id="global", dc_spec=None)
-                return GateServer(
+                return fault_transport.construct(
+                    self,
+                    _node_id,
+                    GateServer,
+                    wal_data_dir=self.node_data_directory(_node_id),
                     host=self.spec.host,
                     tcp_port=_tcp,
                     udp_port=_udp,
@@ -419,7 +469,11 @@ class ClusterHarness:
                     env = self._build_env(
                         node_id=_node_id, dc_id=_dc_id, dc_spec=_dc_spec,
                     )
-                    return ManagerServer(
+                    return fault_transport.construct(
+                        self,
+                        _node_id,
+                        ManagerServer,
+                        wal_data_dir=self.node_data_directory(_node_id),
                         host=self.spec.host,
                         tcp_port=_tcp,
                         udp_port=_udp,
@@ -496,7 +550,10 @@ class ClusterHarness:
                 dc_spec=_dc_spec,
                 worker_cores=_dc_spec.cores_per_worker,
             )
-            return WorkerServer(
+            return fault_transport.construct(
+                self,
+                _node_id,
+                WorkerServer,
                 host=self.spec.host,
                 tcp_port=_tcp,
                 udp_port=_udp,
@@ -672,7 +729,10 @@ class ClusterHarness:
     ) -> Env:
         """Compose Env from cluster + DC + per-node overrides + worker cores."""
         layered = self._layered_overrides(dc_spec=dc_spec, node_id=node_id)
-        kwargs: dict[str, object] = {"MERCURY_SYNC_AUTH_SECRET": HARNESS_AUTH_SECRET}
+        kwargs: dict[str, object] = {
+            "MERCURY_SYNC_AUTH_SECRET": HARNESS_AUTH_SECRET,
+            "MERCURY_SYNC_LOGS_DIRECTORY": str(self.node_data_directory(node_id) / "logs"),
+        }
         if layered.request_timeout is not None:
             kwargs["MERCURY_SYNC_REQUEST_TIMEOUT"] = layered.request_timeout
         if layered.log_level is not None:

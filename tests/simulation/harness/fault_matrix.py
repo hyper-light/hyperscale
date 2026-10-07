@@ -271,6 +271,7 @@ class FaultMatrix:
         from tests.simulation.harness import fault_transport
 
         fault_transport.reinstall_for(handle, self.harness)
+        self.harness.reclaim_signals()
 
     async def kill_many(self, handles: list[ServerHandle]) -> None:
         """Abruptly kill every handle concurrently."""

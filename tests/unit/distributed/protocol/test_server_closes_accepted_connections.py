@@ -28,6 +28,7 @@ import pytest
 
 from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.server import tcp, udp
+from hyperscale.distributed.server.protocol.mercury_sync_tcp_protocol import MercurySyncTCPProtocol
 from hyperscale.distributed.server.server.mercury_sync_base_server import (
     MercurySyncBaseServer,
 )
@@ -172,3 +173,45 @@ async def test_a_request_fails_when_its_connection_closes_not_at_its_timeout() -
     finally:
         await requester.shutdown()
         await responder.shutdown()
+
+
+class LateArrivingTransport(asyncio.Transport):
+    """A transport the listener accepted before it closed, whose
+    ``connection_made`` the loop runs only after the node aborted the
+    connections it tracked."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    def is_closing(self) -> bool:
+        return self.aborted
+
+    def get_extra_info(self, name: str, default: object = None) -> object:
+        return default
+
+
+@pytest.mark.asyncio
+async def test_a_connection_arriving_after_the_node_began_closing_is_aborted() -> None:
+    """``asyncio.Server.wait_closed`` waits for every connection the
+    listener accepted. One accepted in the loop iteration before shutdown
+    -- its ``connection_made`` still pending when the node aborted its
+    tracked connections -- was never aborted: a node's stop then waited on
+    it forever (the L3 gate-fault scenarios' teardown hang)."""
+    responder = make_node()
+    await responder.start_server()
+    assert responder._tcp_server_state.accepting
+    await responder.shutdown()
+
+    late_transport = LateArrivingTransport()
+    late_connection = MercurySyncTCPProtocol(
+        responder, mode="server", server_state=responder._tcp_server_state
+    )
+    late_connection.connection_made(late_transport)
+
+    assert late_transport.aborted
+    assert late_connection not in responder._tcp_server_state.connections
+

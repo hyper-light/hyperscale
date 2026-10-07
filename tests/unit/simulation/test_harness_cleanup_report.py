@@ -8,6 +8,8 @@ findings land for a failed and for a passing test body.
 """
 
 import asyncio
+import pathlib
+import tempfile
 
 import pytest
 
@@ -20,6 +22,7 @@ from tests.simulation.harness.invariants import (
     SafetyInvariant,
 )
 from tests.simulation.harness.port_allocator import PortAllocator
+from tests.simulation.harness.scenario_signal_router import ScenarioSignalRouter
 from tests.simulation.harness.supervisor import Supervisor
 
 
@@ -45,6 +48,9 @@ async def _harness_with_findings(
     )
     harness._supervisor = supervisor
     harness._invariants = checker
+    # The rest of the state ``__aenter__`` gives a harness its teardown uses.
+    harness._signal_router = ScenarioSignalRouter(asyncio.current_task())
+    harness._node_data_root = pathlib.Path(tempfile.mkdtemp(prefix="hyperscale-harness-"))
     await checker.start()
     await _wait_for_first_tick(checker, violated)
     return harness

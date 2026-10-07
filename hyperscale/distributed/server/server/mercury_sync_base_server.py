@@ -758,6 +758,7 @@ class MercurySyncBaseServer(Generic[T]):
         worker_socket: socket.socket | None = None,
         worker_server: asyncio.Server | None = None,
     ):
+        self._tcp_server_state.accepting = True
         if self._transport_factory is not None:
             # SIM mode: register the server-side TCP protocol factory
             # with the in-process transport registry instead of binding
@@ -2593,7 +2594,9 @@ class MercurySyncBaseServer(Generic[T]):
 
     def _abort_accepted_connections(self) -> None:
         """Abort every connection this node's TCP server accepted, the SIM
-        listener closed first."""
+        listener closed first; a connection whose ``connection_made`` is
+        still pending aborts itself on arrival."""
+        self._tcp_server_state.accepting = False
         if self._transport_factory is not None:
             self._transport_factory.close_stream_server((self._host, self._tcp_port))
         for accepted_connection in list(self._tcp_server_state.connections):

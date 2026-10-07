@@ -17,6 +17,27 @@ from .retention_policy import RetentionPolicyConfig
 T = TypeVar("T", bound=Entry)
 
 
+def _named_directory(directory: pathlib.Path) -> str | None:
+    """``directory`` made absolute, or None when the path named none."""
+    if not directory.parts:
+        return None
+    return str(directory.absolute())
+
+
+def _split_log_path(path: str | None) -> tuple[str | None, str | None]:
+    """A context's log file name and directory from its ``path``: a path
+    with a suffix names a file, any other a directory. A bare filename
+    names no directory, so the stream places it in the configured logs
+    directory (``LoggingConfig``), else the working directory -- resolving
+    it against the working directory here bypassed a configured one."""
+    if not path:
+        return None, None
+    logfile_path = pathlib.Path(path)
+    if not logfile_path.suffix:
+        return None, str(logfile_path.absolute())
+    return logfile_path.name, _named_directory(logfile_path.parent)
+
+
 class Logger:
     def __init__(self) -> None:
         self._contexts: Dict[str, LoggerContext] = {}
@@ -50,19 +71,8 @@ class Logger:
         if name is None:
             name = "default"
 
-        filename: str | None = None
-        directory: str | None = None
 
-        if path:
-            logfile_path = pathlib.Path(path)
-            is_logfile = len(logfile_path.suffix) > 0
-
-            filename = logfile_path.name if is_logfile else None
-            directory = (
-                str(logfile_path.parent.absolute())
-                if is_logfile
-                else str(logfile_path.absolute())
-            )
+        filename, directory = _split_log_path(path)
 
         self._contexts[name] = LoggerContext(
             name=name,
@@ -101,19 +111,8 @@ class Logger:
         if name is None:
             name = "default"
 
-        filename: str | None = None
-        directory: str | None = None
 
-        if path:
-            logfile_path = pathlib.Path(path)
-            is_logfile = len(logfile_path.suffix) > 0
-
-            filename = logfile_path.name if is_logfile else None
-            directory = (
-                str(logfile_path.parent.absolute())
-                if is_logfile
-                else str(logfile_path.absolute())
-            )
+        filename, directory = _split_log_path(path)
 
         self._contexts[name] = LoggerContext(
             name=name,
@@ -151,19 +150,8 @@ class Logger:
         if name is None:
             name = "default"
 
-        filename: str | None = None
-        directory: str | None = None
 
-        if path:
-            logfile_path = pathlib.Path(path)
-            is_logfile = len(logfile_path.suffix) > 0
-
-            filename = logfile_path.name if is_logfile else None
-            directory = (
-                str(logfile_path.parent.absolute())
-                if is_logfile
-                else str(logfile_path.absolute())
-            )
+        filename, directory = _split_log_path(path)
 
         if self._contexts.get(name) is None:
             self._contexts[name] = LoggerContext(
@@ -220,22 +208,11 @@ class Logger:
         enable_lsn: bool = False,
         instance_id: int = 0,
     ):
-        filename: str | None = None
-        directory: str | None = None
 
         if name is None:
             name = "default"
 
-        if path:
-            logfile_path = pathlib.Path(path)
-            is_logfile = len(logfile_path.suffix) > 0
-
-            filename = logfile_path.name if is_logfile else None
-            directory = (
-                str(logfile_path.parent.absolute())
-                if is_logfile
-                else str(logfile_path.absolute())
-            )
+        filename, directory = _split_log_path(path)
 
         if self._contexts.get(name) is None:
             self._contexts[name] = LoggerContext(
