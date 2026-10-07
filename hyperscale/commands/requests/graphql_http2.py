@@ -1,9 +1,10 @@
 import asyncio
 from pydantic import BaseModel, StrictStr
-from typing import Dict, Any
+from typing import Dict
+from .json_value import JSONValue
 
 
-from typing import Literal, Any
+from typing import Literal
 from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.engines.client.graphql_http2 import MercurySyncGraphQLHTTP2Connection
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
@@ -26,14 +27,14 @@ from .ping_result_serializer import PingResultSerializer
 class GraphQLQuery(BaseModel):
     query: StrictStr
     operation_name: StrictStr | None = None
-    variables: Dict[StrictStr, Any] | None = None
+    variables: Dict[StrictStr, JSONValue] | None = None
 
 
 
 async def make_graphqlh2_request(
     url: str,
     cookies: list[HTTPCookie],
-    headers: dict[str, Any],
+    headers: dict[str, JSONValue],
     method: Literal[
         "query",
         "mutation",
@@ -49,7 +50,7 @@ async def make_graphqlh2_request(
         ]
         | Dict[
             Literal["query", "operation_name", "variables"], 
-            str | dict[str, Any],
+            str | dict[str, JSONValue],
         ]
     ),
     redirects: int, 

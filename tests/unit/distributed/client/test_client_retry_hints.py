@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.idempotency.idempotency_key import IdempotencyKeyGenerator
 from hyperscale.distributed.jobs.logical_id_generator import LogicalIdGenerator
@@ -107,7 +107,7 @@ def make_logger() -> Logger:
 
 def make_targets(env: Env, config: ClientConfig, state: ClientState) -> ClientTargetSelector:
     discovery = DiscoveryService(
-        env.get_discovery_config(node_role="client", static_seeds=[], allow_dynamic_registration=True),
+        DiscoveryConfig.from_env(env, node_role="client", static_seeds=[], allow_dynamic_registration=True),
         Logger(),
     )
     return ClientTargetSelector(config, state, discovery)

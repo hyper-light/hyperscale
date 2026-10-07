@@ -1,5 +1,4 @@
 from typing import (
-    Any,
     Dict,
     Generator,
     Generic,
@@ -21,6 +20,7 @@ from hyperscale.core.testing.models.base.base_types import (
 from .mutation_validator import MutationValidator
 
 T = TypeVar("T")
+DefaultT = TypeVar("DefaultT")
 
 
 class Mutation(OptimizedArg, Generic[T]):
@@ -101,7 +101,7 @@ class Mutation(OptimizedArg, Generic[T]):
             "operation_name",
             "variables",
         ],
-        Any,
+        None,
         None,
     ]:
         for key in self.data:
@@ -142,6 +142,6 @@ class Mutation(OptimizedArg, Generic[T]):
             "operation_name",
             "variables",
         ],
-        default: Optional[Any] = None,
-    ) -> Optional[str | Dict[str, HTTPEncodableValue] | Any]:
+        default: DefaultT | None = None,
+    ) -> str | Dict[str, HTTPEncodableValue] | DefaultT | None:
         return self.data.get(key, default)

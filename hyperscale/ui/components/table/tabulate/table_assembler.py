@@ -2,7 +2,6 @@ import asyncio
 import itertools
 import math
 from typing import (
-    Any,
     Dict,
     Literal,
 )
@@ -18,6 +17,7 @@ from hyperscale.ui.styling.colors import (
 from .cell_alignment import CellAlignment, CellAlignmentMap, CellAlignmentType
 from .charset_position_type import CharsetPositionType
 from .table_border_lines import TableBorderCharset, TableBorderLines
+from .table_cell import TableCell
 
 
 HeaderColorMap = Dict[str, Colorizer]
@@ -63,7 +63,7 @@ class TableAssembler:
         header_alignment: CellAlignment = "LEFT",
         cell_alignment: CellAlignment = "LEFT",
         field_format_map: Dict[str, str] | None = None,
-        field_default_map: Dict[str, Any] | None = None,
+        field_default_map: Dict[str, TableCell] | None = None,
         header_color_map: HeaderColorMap | None = None,
         data_color_map: DataColorMap | None = None,
         border_color: ColorName | ExtendedColorName | None = None,
@@ -903,7 +903,7 @@ class TableAssembler:
 
         self._height_offset = 0
 
-    def calculate_height_offset(self, data: list[list[Any]]):
+    def calculate_height_offset(self, data: list[list[TableCell]]):
         spacer_lines_count = len(data) - 1
 
         height_offset = self._calculate_height_offset_for_line(
@@ -930,7 +930,7 @@ class TableAssembler:
     async def create_table_lines(
         self,
         headers: list[str],
-        data: list[list[Any]],
+        data: list[list[TableCell]],
     ) -> list[str]:
         headers_count = len(headers)
         if headers_count < self.columns_count:
@@ -975,7 +975,7 @@ class TableAssembler:
     async def _create_data_and_spacer_lines(
         self,
         headers: list[str],
-        data: list[list[Any]],
+        data: list[list[TableCell]],
     ):
         data_and_spacer_lines: list[str] = []
 
@@ -1109,7 +1109,7 @@ class TableAssembler:
     async def _create_data_line(
         self,
         headers: list[str],
-        row: list[Any],
+        row: list[TableCell],
     ) -> str | None:
         data_cells = await asyncio.gather(
             *[
@@ -1174,7 +1174,7 @@ class TableAssembler:
 
     async def _create_cell(
         self,
-        data: Any,
+        data: TableCell,
         charset: TableBorderCharset,
         position_type: CharsetPositionType,
         header_key: str | None = None,
@@ -1246,7 +1246,7 @@ class TableAssembler:
 
     def _convert_cell_to_string(
         self,
-        data: Any,
+        data: TableCell,
         header_key: str,
     ) -> str:
         if data is None:
@@ -1391,7 +1391,7 @@ class TableAssembler:
 
     async def _format_cell(
         self,
-        raw_value: Any,
+        raw_value: TableCell,
         converted_data: str,
         left_border_char: str | None = None,
         right_border_char: str | None = None,
@@ -1436,7 +1436,7 @@ class TableAssembler:
 
     async def _colorize_data(
         self,
-        raw_value: Any,
+        raw_value: TableCell,
         data: str,
         color_map: HeaderColorMap | DataColorMap,
         color_key: str,
@@ -1495,7 +1495,7 @@ class TableAssembler:
     def _get_value_or_default(
         self,
         header: str,
-        row: list[Any],
+        row: list[TableCell],
         idx: int,
     ):
         row_length = len(row)

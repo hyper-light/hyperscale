@@ -3,6 +3,8 @@
 
 from dataclasses import dataclass
 
+from hyperscale.distributed.env.env import Env
+
 
 @dataclass(slots=True)
 class OverloadConfig:
@@ -66,3 +68,38 @@ class OverloadConfig:
                 f"{name} must be in ascending order: "
                 f"got ({values[0]}, {values[1]}, {values[2]})"
             )
+
+    @classmethod
+    def from_env(cls, env: Env) -> "OverloadConfig":
+        """
+        Overload detection configuration (AD-18) from ``env``.
+
+        Hybrid detection combines delta-based, absolute bounds, and
+        resource-based (CPU/memory) signals.
+        """
+        return cls(
+            ema_alpha=env.OVERLOAD_EMA_ALPHA,
+            current_window=env.OVERLOAD_CURRENT_WINDOW,
+            trend_window=env.OVERLOAD_TREND_WINDOW,
+            min_samples=env.OVERLOAD_MIN_SAMPLES,
+            delta_thresholds=(
+                env.OVERLOAD_DELTA_BUSY,
+                env.OVERLOAD_DELTA_STRESSED,
+                env.OVERLOAD_DELTA_OVERLOADED,
+            ),
+            absolute_bounds=(
+                env.OVERLOAD_ABSOLUTE_BUSY_MS,
+                env.OVERLOAD_ABSOLUTE_STRESSED_MS,
+                env.OVERLOAD_ABSOLUTE_OVERLOADED_MS,
+            ),
+            cpu_thresholds=(
+                env.OVERLOAD_CPU_BUSY,
+                env.OVERLOAD_CPU_STRESSED,
+                env.OVERLOAD_CPU_OVERLOADED,
+            ),
+            memory_thresholds=(
+                env.OVERLOAD_MEMORY_BUSY,
+                env.OVERLOAD_MEMORY_STRESSED,
+                env.OVERLOAD_MEMORY_OVERLOADED,
+            ),
+        )

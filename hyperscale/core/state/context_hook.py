@@ -1,7 +1,6 @@
 import asyncio
 from inspect import isawaitable, signature
 from typing import (
-    Any,
     Awaitable,
     Callable,
     Dict,
@@ -25,7 +24,7 @@ class ContextHook(Generic[T, K]):
     def __init__(
         self,
         workflows: List[str],
-        call: Callable[..., Awaitable[Any]],
+        call: Callable[..., Awaitable[object]],
         timeouts: Optional[Timeouts] = None,
         tags: Optional[List[str]] = None,
     ) -> None:
@@ -62,7 +61,7 @@ class ContextHook(Generic[T, K]):
         )
 
         self.result: T | Exception = None
-        self.context_args: Dict[str, Any] = {}
+        self.context_args: Dict[str, object] = {}
         # Every parameter the hook declares can be filled from the context;
         # the documented hooks take them positional-or-keyword.
         self._hook_args = [arg.name for arg in signature(call).parameters.values()]

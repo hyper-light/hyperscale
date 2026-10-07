@@ -3,7 +3,6 @@ import os
 import uuid
 from inspect import signature
 from typing import (
-    Any,
     Awaitable,
     Callable,
     Dict,
@@ -35,7 +34,7 @@ from .wrap_metric import wrap_metric
 class Hook:
     def __init__(
         self,
-        call: Callable[..., Awaitable[Any] | Awaitable[CallResult]],
+        call: Callable[..., Awaitable[object]],
         dependencies: List[str],
         timeouts: Optional[Timeouts] = None,
         tags: Optional[List[str]] = None,

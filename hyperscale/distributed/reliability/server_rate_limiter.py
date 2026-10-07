@@ -78,7 +78,6 @@ class ServerRateLimiter:
     async def check(
         self,
         addr: tuple[str, int],
-        raise_on_limit: bool = False,
     ) -> bool:
         """
         Compatibility method matching the simple RateLimiter.check() API.
@@ -88,23 +87,14 @@ class ServerRateLimiter:
 
         Args:
             addr: Source address tuple (host, port)
-            raise_on_limit: If True, raise RateLimitExceeded instead of returning False
 
         Returns:
             True if request is allowed, False if rate limited
-
-        Raises:
-            RateLimitExceeded: If raise_on_limit is True and rate is exceeded
         """
         client_id = f"{addr[0]}:{addr[1]}"
         result = await self._adaptive.check(
             client_id, "default", RequestPriority.NORMAL
         )
-
-        if not result.allowed and raise_on_limit:
-            from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
-
-            raise RateLimitExceeded(f"Rate limit exceeded for {addr[0]}:{addr[1]}")
 
         return result.allowed
 

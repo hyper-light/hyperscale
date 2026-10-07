@@ -86,7 +86,7 @@ from hyperscale.distributed.jobs.logical_id_generator import (
 )
 from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.nodes.client.protocol import ClientProtocol
 from hyperscale.distributed.nodes.client.leadership import ClientLeadershipTracker
@@ -204,7 +204,8 @@ class HyperscaleClient(MercurySyncBaseServer):
             config=self._config,
             state=self._state,
             discovery=DiscoveryService(
-                env.get_discovery_config(
+                DiscoveryConfig.from_env(
+                    env,
                     node_role="client",
                     static_seeds=[],
                     allow_dynamic_registration=True,

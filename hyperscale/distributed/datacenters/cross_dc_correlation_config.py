@@ -3,6 +3,8 @@
 
 from dataclasses import dataclass
 
+from hyperscale.distributed.env.env import Env
+
 
 @dataclass(slots=True)
 class CrossDCCorrelationConfig:
@@ -110,3 +112,59 @@ class CrossDCCorrelationConfig:
 
     # If this fraction of DCs have high LHM, treat as systemic issue
     lhm_correlation_fraction: float = 0.5
+
+    @classmethod
+    def from_env(cls, env: Env) -> "CrossDCCorrelationConfig":
+        """
+        Cross-DC correlation configuration (Phase 7) from ``env``.
+
+        Controls cascade eviction prevention when multiple DCs fail
+        simultaneously (likely network partition, not actual DC failures).
+
+        HIGH correlation requires BOTH:
+        - Fraction of DCs >= high_threshold_fraction (e.g., 50%)
+        - Count of DCs >= high_count_threshold (e.g., 4)
+
+        This prevents false positives when few DCs exist.
+
+        Anti-flapping mechanisms:
+        - Failure confirmation: failures must persist before counting
+        - Recovery confirmation: recovery must be sustained before healthy
+        - Flap detection: too many state changes marks DC as flapping
+
+        Secondary correlation signals:
+        - Latency correlation: elevated latency across DCs = network issue
+        - Extension correlation: many extensions across DCs = load spike
+        - LHM correlation: high LHM scores across DCs = systemic stress
+        """
+        return cls(
+            # Primary thresholds
+            correlation_window_seconds=env.CROSS_DC_CORRELATION_WINDOW,
+            low_threshold=env.CROSS_DC_CORRELATION_LOW_THRESHOLD,
+            medium_threshold=env.CROSS_DC_CORRELATION_MEDIUM_THRESHOLD,
+            high_count_threshold=env.CROSS_DC_CORRELATION_HIGH_COUNT_THRESHOLD,
+            high_threshold_fraction=env.CROSS_DC_CORRELATION_HIGH_FRACTION,
+            correlation_backoff_seconds=env.CROSS_DC_CORRELATION_BACKOFF,
+            # Anti-flapping
+            failure_confirmation_seconds=env.CROSS_DC_FAILURE_CONFIRMATION,
+            recovery_confirmation_seconds=env.CROSS_DC_RECOVERY_CONFIRMATION,
+            flap_threshold=env.CROSS_DC_FLAP_THRESHOLD,
+            flap_detection_window_seconds=env.CROSS_DC_FLAP_DETECTION_WINDOW,
+            flap_cooldown_seconds=env.CROSS_DC_FLAP_COOLDOWN,
+            # Latency-based correlation
+            enable_latency_correlation=env.CROSS_DC_ENABLE_LATENCY_CORRELATION,
+            latency_elevated_threshold_ms=env.CROSS_DC_LATENCY_ELEVATED_THRESHOLD_MS,
+            latency_critical_threshold_ms=env.CROSS_DC_LATENCY_CRITICAL_THRESHOLD_MS,
+            min_latency_samples=env.CROSS_DC_MIN_LATENCY_SAMPLES,
+            latency_sample_window_seconds=env.CROSS_DC_LATENCY_SAMPLE_WINDOW,
+            latency_correlation_fraction=env.CROSS_DC_LATENCY_CORRELATION_FRACTION,
+            # Extension-based correlation
+            enable_extension_correlation=env.CROSS_DC_ENABLE_EXTENSION_CORRELATION,
+            extension_count_threshold=env.CROSS_DC_EXTENSION_COUNT_THRESHOLD,
+            extension_correlation_fraction=env.CROSS_DC_EXTENSION_CORRELATION_FRACTION,
+            extension_window_seconds=env.CROSS_DC_EXTENSION_WINDOW,
+            # LHM-based correlation
+            enable_lhm_correlation=env.CROSS_DC_ENABLE_LHM_CORRELATION,
+            lhm_stressed_threshold=env.CROSS_DC_LHM_STRESSED_THRESHOLD,
+            lhm_correlation_fraction=env.CROSS_DC_LHM_CORRELATION_FRACTION,
+        )

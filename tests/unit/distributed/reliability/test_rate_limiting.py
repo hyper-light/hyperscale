@@ -535,25 +535,6 @@ class TestServerRateLimiterCheckCompatibility:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_check_raises_on_limit(self) -> None:
-        """Test check() raises RateLimitExceeded when raise_on_limit=True."""
-        from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
-
-        config = AdaptiveRateLimitConfig(default_max_requests=2, default_window_size=2.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (2, 2.0)})
-        limiter = ServerRateLimiter(adaptive_config=config)
-        addr = ("10.0.0.1", 9000)
-
-        # Exhaust the counter
-        await limiter.check(addr)
-        await limiter.check(addr)
-
-        # Should raise
-        with pytest.raises(RateLimitExceeded) as exc_info:
-            await limiter.check(addr, raise_on_limit=True)
-
-        assert "10.0.0.1:9000" in str(exc_info.value)
-
-    @pytest.mark.asyncio
     async def test_check_different_addresses_isolated(self) -> None:
         """Test that different addresses have separate counters."""
         config = AdaptiveRateLimitConfig(default_max_requests=2, default_window_size=2.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (2, 2.0)})

@@ -373,15 +373,14 @@ Items: root-docs.md G-rows (R-G*) plus delta-partials/delta-changed-code finding
 - Exists: phantom attributes/member calls and unreceived actions at zero (tests/simulation/lints/expected_phantom_*.py, expected_unreceived_action_violations.py all empty).
 - Missing: aggregate of R-G56/58/59/60/63/69 below.
 
-#### R-G56 — No inline imports — STILL PARTIAL — size S
+#### R-G56 — No inline imports — CLOSED outside engines/jobs (2026-10-07) — size S
 - Doc: SCAN.md "**BLOCKING**: Do not proceed ... if ANY inline imports exist (except TYPE_CHECKING)".
 - Exists: lint tests/simulation/lints/test_no_inline_imports.py; snapshot 56 functions / 61 imports; node servers clean.
-- Missing (non-engine, non-optional-dependency): hyperscale/distributed/env/env.py 8 config getters (`get_*_config`) and reliability/rate_limiting.py::execute_with_rate_limit_retry, server_rate_limiter.py::ServerRateLimiter.check — cycle-breakers (plan :221); break the cycle by moving the config types off the modules that import Env. core/engines 15 and core/jobs local_server_pool.py::run_thread 4 need owner OK. Reporting backends' lazy imports are optional deps (justified).
+- Closed: Env no longer imports its consumers -- the config getters became `from_env` constructors on the configs (`OverloadConfig`, `WorkerHealthManagerConfig`, `CrossDCCorrelationConfig`, `DiscoveryConfig`), the pattern `AdaptiveRateLimitConfig.from_env` already set; `get_extension_tracker_config` had no caller and is gone. `ServerRateLimiter.check` lost `raise_on_limit` (no production caller), its only edge into core/jobs. The lint exempts, documented in its docstring and self-tested, optional-dependency probes (an import under an `ImportError` handler) and reporting backends' PEP 562 lazy loaders. Snapshot: 10 functions / 14 imports, all core/engines (dtls, needs owner OK) and core/jobs `local_server_pool.py::run_thread` (peer-owned).
 
-#### R-G58 — No `Any` — STILL PARTIAL — size M
+#### R-G58 — No `Any` — CLOSED outside engines/jobs/cli and the user's monitoring/tools/versioning WIP (2026-10-07) — size M
 - Doc: SCAN.md "PROBLEM 4: Any/object escape hatches".
-- Exists: distributed/ down to 2 justified (ledger/checkpoint/checkpoint_model.py:16 and restricted_loads; plan :226-227).
-- Missing: `Any` annotations remain in logging/ (12), ui/ (30), reporting/ (13), commands/ outside cli/ (17), core/jobs (32, peer-owned), core/engines (115, needs OK). No lint holds `Any` at its count.
+- Closed: ratchet lint tests/simulation/lints/test_no_any.py (per-file snapshot, all of hyperscale/). logging, ui, reporting, commands outside cli/, core/graph, core/hooks, core/state and core/testing are at 0 (generics -- `DefaultT` getters; aliases -- `JSONValue` (PEP 695, commands/requests/json_value.py), `TableCell`, `StepResult`; `Never` for the heterogeneous action list; `object` for pass-through values). Snapshot keeps distributed/'s 2 justified (checkpoint_model.py `job_states`, `restricted_loads`, reasons in the lint docstring), core/engines 145 (needs OK), core/jobs 43 (peer-owned), commands/cli 62 (off-limits). monitoring/, tools/ and versioning/ are the user's work in progress (REMAINING_WORK_PLAN) and are held at their counts, not rewritten.
 
 #### R-G59 — Thin servers — STILL PARTIAL (was ABSENT) — size L
 - Doc: SCAN.md "Verify Server is 'Thin'"; duplicates consolidated; dead code removed.

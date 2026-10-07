@@ -166,6 +166,7 @@ from hyperscale.distributed.monitoring import ProcessResourceMonitor, ResourceMe
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     LoadShedder,
+    OverloadConfig,
     AdaptiveRateLimitConfig,
     ServerRateLimiter,
     BackpressureSignal,
@@ -188,13 +189,14 @@ from hyperscale.distributed.idempotency import (
 from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
     DatacenterOverloadConfig,
+    CrossDCCorrelationConfig,
     CrossDCCorrelationDetector,
 )
 from hyperscale.distributed.protocol.version import (
     NodeCapabilities,
     CURRENT_PROTOCOL_VERSION,
 )
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.discovery.security.role_validator import (
     RoleValidator,
 )
@@ -433,7 +435,7 @@ class GateServer(HealthAwareServer):
 
         # Load shedding (AD-22), at this node's OVERLOAD_* settings (the
         # AD-24 rate-limit window is derived from them)
-        self._overload_detector = HybridOverloadDetector(env.get_overload_config())
+        self._overload_detector = HybridOverloadDetector(OverloadConfig.from_env(env))
         self._resource_monitor = ProcessResourceMonitor()
         self._last_resource_metrics: ResourceMetrics | None = None
         self._gate_health_state: str = "healthy"
@@ -733,7 +735,7 @@ class GateServer(HealthAwareServer):
 
         # Cross-DC correlation detector
         self._cross_dc_correlation = CrossDCCorrelationDetector(
-            config=env.get_cross_dc_correlation_config(),
+            config=CrossDCCorrelationConfig.from_env(env),
             on_callback_error=self._on_cross_dc_callback_error,
         )
         self._add_configured_datacenters_to_correlation()
@@ -744,7 +746,8 @@ class GateServer(HealthAwareServer):
         # join at runtime are covered; peers keyed by "host:port".
         self._manager_selector = DatacenterManagerSelector(
             create_discovery=lambda: DiscoveryService(
-                env.get_discovery_config(
+                DiscoveryConfig.from_env(
+                    env,
                     node_role="gate",
                     static_seeds=[],
                     allow_dynamic_registration=True,
@@ -849,7 +852,8 @@ class GateServer(HealthAwareServer):
         # registration is allowed, so fall back to it in that case
         # (the same solo-node pattern the worker uses).
         peer_static_seeds = [f"{host}:{port}" for host, port in self._gate_peers]
-        peer_discovery_config = env.get_discovery_config(
+        peer_discovery_config = DiscoveryConfig.from_env(
+            env,
             node_role="gate",
             static_seeds=peer_static_seeds,
             allow_dynamic_registration=not peer_static_seeds,

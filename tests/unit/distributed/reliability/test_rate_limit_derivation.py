@@ -100,7 +100,7 @@ def healthy_limiter(env: Env) -> AdaptiveRateLimiter:
 
 
 def stressed_limiter(env: Env) -> AdaptiveRateLimiter:
-    detector = HybridOverloadDetector(env.get_overload_config())
+    detector = HybridOverloadDetector(OverloadConfig.from_env(env))
     stressed_cpu_percent = (env.OVERLOAD_CPU_STRESSED + env.OVERLOAD_CPU_OVERLOADED) / 2 * 100
     detector.get_state(stressed_cpu_percent, 0.0)
     assert detector.current_state is OverloadState.STRESSED
@@ -339,7 +339,7 @@ def test_tracked_clients_are_two_per_held_connection() -> None:
 def test_env_overload_settings_are_the_detector_defaults() -> None:
     """The window derives from the OVERLOAD_* settings the nodes' detectors
     run on; their defaults are the detector's own."""
-    assert Env().get_overload_config() == OverloadConfig()
+    assert OverloadConfig.from_env(Env()) == OverloadConfig()
 
 
 def test_a_bare_config_takes_the_derivations_of_the_env_defaults() -> None:

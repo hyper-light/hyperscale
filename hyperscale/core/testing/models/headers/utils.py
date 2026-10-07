@@ -1,7 +1,8 @@
+import asyncio
 import os
 import struct
 from base64 import encodebytes as base64encode
-from typing import Any, Tuple
+from typing import Tuple
 
 from .constants import HEADER_LENGTH_INDEX
 
@@ -35,7 +36,7 @@ def get_header_bits(raw_headers: bytes):
     return header_bits
 
 
-async def get_message_buffer_size(header_bits: Tuple[int], connection: Any):
+async def get_message_buffer_size(header_bits: Tuple[int, ...], connection: asyncio.StreamReader):
     bits = header_bits[HEADER_LENGTH_INDEX]
     length_bits = bits & 0x7F
     length = 0

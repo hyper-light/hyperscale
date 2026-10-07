@@ -5,7 +5,7 @@ import datetime
 import os
 import pathlib
 import sys
-from typing import Any, Callable, Dict, Literal, TypeVar
+from typing import Callable, Dict, Literal, TypeVar
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
 from hyperscale.logging.config.logging_config import LoggingConfig
@@ -59,7 +59,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -99,7 +99,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -138,7 +138,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -199,7 +199,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -254,7 +254,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -306,7 +306,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -346,7 +346,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -381,7 +381,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -412,7 +412,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,

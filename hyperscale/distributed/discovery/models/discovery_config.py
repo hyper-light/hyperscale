@@ -4,6 +4,8 @@ Discovery configuration for the enhanced DNS discovery system (AD-28).
 
 from dataclasses import dataclass, field
 
+from hyperscale.distributed.env.env import Env
+
 @dataclass(slots=True)
 class DiscoveryConfig:
     """
@@ -208,3 +210,63 @@ class DiscoveryConfig:
             raise ValueError("candidate_set_size must be at least 1")
         if not 0.0 < self.ewma_alpha <= 1.0:
             raise ValueError("ewma_alpha must be in (0, 1]")
+
+    @classmethod
+    def from_env(
+        cls,
+        env: Env,
+        node_role: str = "worker",
+        static_seeds: list[str] | None = None,
+        allow_dynamic_registration: bool = False,
+    ) -> "DiscoveryConfig":
+        """
+        Discovery service configuration (AD-28) from ``env``.
+
+        Configures peer discovery, locality-aware selection, and adaptive
+        load balancing, filtering peers by this node's CLUSTER_ID and
+        ENVIRONMENT_ID.
+
+        Args:
+            env: The node's environment settings.
+            node_role: Role of the local node ('worker', 'manager', etc.)
+            static_seeds: Static seed addresses in "host:port" format
+            allow_dynamic_registration: Allow empty seeds (peers register dynamically)
+        """
+        # Parse DNS names from comma-separated string (StrictStr: "" splits
+        # to [""], which the blank filter drops, so no emptiness guard).
+        dns_names: list[str] = list(filter(None, map(str.strip, env.DISCOVERY_DNS_NAMES.split(","))))
+
+        # Parse allowed CIDRs from comma-separated string
+        dns_allowed_cidrs: list[str] = list(
+            filter(None, map(str.strip, env.DISCOVERY_DNS_ALLOWED_CIDRS.split(",")))
+        )
+
+        return cls(
+            cluster_id=env.CLUSTER_ID,
+            environment_id=env.ENVIRONMENT_ID,
+            node_role=node_role,
+            dns_names=dns_names,
+            static_seeds=static_seeds or [],
+            default_port=env.DISCOVERY_DEFAULT_PORT,
+            dns_cache_ttl=env.DISCOVERY_DNS_CACHE_TTL,
+            dns_timeout=env.DISCOVERY_DNS_TIMEOUT,
+            # DNS Security settings
+            dns_allowed_cidrs=dns_allowed_cidrs,
+            dns_block_private_for_public=env.DISCOVERY_DNS_BLOCK_PRIVATE_FOR_PUBLIC,
+            dns_detect_ip_changes=env.DISCOVERY_DNS_DETECT_IP_CHANGES,
+            dns_max_ip_changes_per_window=env.DISCOVERY_DNS_MAX_IP_CHANGES,
+            dns_ip_change_window_seconds=env.DISCOVERY_DNS_IP_CHANGE_WINDOW,
+            dns_reject_on_security_violation=env.DISCOVERY_DNS_REJECT_ON_VIOLATION,
+            # Locality settings
+            datacenter_id=env.DISCOVERY_DATACENTER_ID,
+            region_id=env.DISCOVERY_REGION_ID,
+            prefer_same_dc=env.DISCOVERY_PREFER_SAME_DC,
+            candidate_set_size=env.DISCOVERY_CANDIDATE_SET_SIZE,
+            ewma_alpha=env.DISCOVERY_EWMA_ALPHA,
+            baseline_latency_ms=env.DISCOVERY_BASELINE_LATENCY_MS,
+            latency_multiplier_threshold=env.DISCOVERY_LATENCY_MULTIPLIER_THRESHOLD,
+            min_peers_per_tier=env.DISCOVERY_MIN_PEERS_PER_TIER,
+            max_concurrent_dns_resolutions=env.DISCOVERY_MAX_CONCURRENT_DNS_RESOLUTIONS,
+            # Dynamic registration mode
+            allow_dynamic_registration=allow_dynamic_registration,
+        )

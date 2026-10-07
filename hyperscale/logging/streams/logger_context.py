@@ -1,6 +1,6 @@
 import asyncio
 import os
-from typing import Any, Literal, TypeVar
+from typing import Literal, TypeVar
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
 from hyperscale.logging.config.logging_config import LoggingConfig
@@ -28,7 +28,7 @@ class LoggerContext:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,

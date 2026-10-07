@@ -26,7 +26,7 @@ Usage:
 import statistics
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -184,9 +184,9 @@ class TimeAlignedResults(Results):
 
     def aggregate_progress_stats(
         self,
-        progress_updates: List[Dict[str, Any]],
+        progress_updates: List[Dict[str, float]],
         reference_time: Optional[float] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, float]:
         """
         Aggregate progress statistics with time alignment.
 
@@ -250,7 +250,7 @@ class TimeAlignedResults(Results):
 
     def _calculate_time_weighted_rate(
         self,
-        progress_updates: List[Dict[str, Any]],
+        progress_updates: List[Dict[str, float]],
         reference_time: float,
     ) -> float:
         """
@@ -298,9 +298,9 @@ class TimeAlignedResults(Results):
 
     def interpolate_to_reference_time(
         self,
-        progress_updates: List[Dict[str, Any]],
+        progress_updates: List[Dict[str, float]],
         reference_time: float,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, float]:
         """
         Interpolate progress values to a common reference time.
 

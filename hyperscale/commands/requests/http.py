@@ -1,5 +1,6 @@
 import asyncio
-from typing import Literal, Any
+from typing import Literal
+from .json_value import JSONValue
 from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.engines.client.http import MercurySyncHTTPConnection
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
@@ -24,7 +25,7 @@ async def make_http_request(
     url: str,
     params: dict[str, str],
     cookies: list[HTTPCookie],
-    headers: dict[str, Any],
+    headers: dict[str, JSONValue],
     method: Literal[
         "get",
         "post",
@@ -34,7 +35,7 @@ async def make_http_request(
         "head",
         "options"
     ],
-    data: Any | None,
+    data: JSONValue,
     redirects: int, 
     timeout: int | float,
     output_file: str | None = None,

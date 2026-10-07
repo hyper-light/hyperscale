@@ -1,13 +1,12 @@
 import inspect
-from typing import Tuple, Dict, Any
 from .attributes import Attributizer
 from .colors import Colorizer, HighlightColorizer
 
 
 def get_style(
     stylizer: Colorizer | HighlightColorizer | Attributizer,
-    *args: Tuple[Any, ...],
-    **kwargs: Dict[str, Any],
+    *args: object,
+    **kwargs: object,
 ):
     if isinstance(stylizer, str):
         return stylizer

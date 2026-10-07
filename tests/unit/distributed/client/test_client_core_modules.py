@@ -20,7 +20,7 @@ from unittest.mock import Mock, AsyncMock
 import pytest
 
 from hyperscale.logging import Logger
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.nodes.client.protocol import ClientProtocol
@@ -33,7 +33,8 @@ from hyperscale.distributed.models import ClientJobResult
 def make_client_discovery() -> DiscoveryService:
     """AD-28 discovery service as HyperscaleClient builds it."""
     return DiscoveryService(
-        Env().get_discovery_config(
+        DiscoveryConfig.from_env(
+            Env(),
             node_role="client",
             static_seeds=[],
             allow_dynamic_registration=True,

@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from hyperscale.logging import Logger
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.gate.datacenter_manager_selector import (
     DatacenterManagerSelector,
@@ -35,7 +35,8 @@ MANAGERS = [MANAGER_A, MANAGER_B, MANAGER_C]
 def _selector(heartbeats: dict) -> DatacenterManagerSelector:
     return DatacenterManagerSelector(
         create_discovery=lambda: DiscoveryService(
-            Env().get_discovery_config(
+            DiscoveryConfig.from_env(
+                Env(),
                 node_role="gate",
                 static_seeds=[],
                 allow_dynamic_registration=True,

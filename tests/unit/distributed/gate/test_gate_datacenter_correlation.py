@@ -25,7 +25,7 @@ from hyperscale.distributed.slo.latency_slo import LatencySLO
 from hyperscale.distributed.slo.slo_health_classifier import SLOHealthClassifier
 from hyperscale.distributed.capacity import DatacenterCapacityAggregator
 from hyperscale.distributed.datacenters import cross_dc_correlation_detector, dc_state_info
-from hyperscale.distributed.datacenters.cross_dc_correlation import CrossDCCorrelationDetector
+from hyperscale.distributed.datacenters.cross_dc_correlation import CrossDCCorrelationConfig, CrossDCCorrelationDetector
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.health.circuit_breaker_manager import CircuitBreakerManager
 from hyperscale.distributed.models import DatacenterStatus
@@ -37,7 +37,7 @@ from hyperscale.distributed.resources.datacenter_resource_aggregator import (
 from hyperscale.distributed.slo.resource_aware_predictor import ResourceAwareSLOPredictor
 
 SETTINGS = Env()
-CORRELATION = SETTINGS.get_cross_dc_correlation_config()
+CORRELATION = CrossDCCorrelationConfig.from_env(SETTINGS)
 DATACENTERS = ["dc-a", "dc-b", "dc-c"]
 # The gate samples each heartbeat interval.
 SAMPLE_INTERVAL_SECONDS = SETTINGS.MANAGER_HEARTBEAT_INTERVAL

@@ -29,7 +29,7 @@ import pytest
 
 from hyperscale.logging import Logger
 from hyperscale.distributed.runtime import RealClock
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.gate.datacenter_manager_selector import DatacenterManagerSelector
 from hyperscale.distributed.swim.core import CircuitState
@@ -54,7 +54,8 @@ def make_manager_selector(state: GateRuntimeState) -> DatacenterManagerSelector:
     """A real AD-28 selector reading the test's runtime state."""
     return DatacenterManagerSelector(
         create_discovery=lambda: DiscoveryService(
-            Env().get_discovery_config(
+            DiscoveryConfig.from_env(
+                Env(),
                 node_role="gate",
                 static_seeds=[],
                 allow_dynamic_registration=True,

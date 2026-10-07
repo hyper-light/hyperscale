@@ -1,5 +1,5 @@
 import asyncio
-from typing import Literal, Any
+from typing import Literal
 from pydantic import BaseModel, StrictStr, StrictInt
 
 from hyperscale.core.engines.client.setup_clients import setup_client
@@ -27,7 +27,7 @@ async def make_udp_request(
         "receive",
         "bidirectional"
     ],
-    data: Any | None,
+    data: str | bytes | None,
     options: dict[
         Literal[
             "delimiter",

@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import List
 
 try:
     from prometheus_client import Info, Summary, Counter, Gauge, Histogram, Enum
@@ -28,7 +28,7 @@ class PrometheusMetric:
         metric_name: str,
         metric_type: str,
         metric_description: str = None,
-        metric_states: List[Any] = None,
+        metric_states: List[str] | None = None,
         metric_labels: List[str] = [],
         metric_namespace: str = None,
         registry=None,

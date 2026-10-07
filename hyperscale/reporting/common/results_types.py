@@ -1,5 +1,4 @@
 from typing import (
-    Any,
     Dict,
     List,
     Literal,
@@ -83,7 +82,8 @@ WorkflowStats = Dict[
 ]
 
 
-WorkflowContextResult = Dict[str, Any | Exception]
+# A workflow context: user-set values, opaque here (an Exception when it failed).
+WorkflowContextResult = Dict[str, object]
 
 
 WorkflowResultsSet = WorkflowStats | WorkflowContextResult

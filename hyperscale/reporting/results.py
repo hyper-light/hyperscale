@@ -1,7 +1,6 @@
 import statistics
 from collections import Counter, defaultdict
 from typing import (
-    Any,
     Callable,
     Dict,
     Iterable,
@@ -77,6 +76,9 @@ TestResult = (
     | Exception
 )
 
+# Any step's result: a TEST step's, a METRIC step's metric, or none.
+StepResult = TestResult | Metric | None
+
 # Clients whose responses carry a status code (HTTP, gRPC, the WebSocket
 # handshake, SMTP replies). Other clients do not produce one.
 STATUS_REQUEST_TYPES = frozenset(
@@ -150,7 +152,7 @@ class Results:
         workflow: str,
         results: Dict[
             str,
-            List[Any],
+            List[StepResult],
         ],
         elapsed: float,
         run_id: Optional[int] = None,
@@ -171,7 +173,7 @@ class Results:
     def create_aggregates(
         self,
         steps: Iterable[str],
-    ) -> Dict[str, TimingsAggregate | List[Any]]:
+    ) -> Dict[str, TimingsAggregate | List[StepResult]]:
         """
         One aggregate per step: a TEST step's results are reduced as they are
         added (``aggregate_result``); any other step keeps its results.
@@ -185,9 +187,9 @@ class Results:
 
     def aggregate_result(
         self,
-        aggregates: Dict[str, TimingsAggregate | List[Any]],
+        aggregates: Dict[str, TimingsAggregate | List[StepResult]],
         step: str,
-        result: TestResult | Metric | Exception | None,
+        result: StepResult,
     ) -> None:
         """Add one of a step's results to that step's aggregate."""
         hook = self._hooks[step]
@@ -205,7 +207,7 @@ class Results:
     def process_aggregates(
         self,
         workflow: str,
-        aggregates: Dict[str, TimingsAggregate | List[Any]],
+        aggregates: Dict[str, TimingsAggregate | List[StepResult]],
         elapsed: float,
         run_id: Optional[int] = None,
     ) -> WorkflowStats:

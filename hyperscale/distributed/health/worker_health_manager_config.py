@@ -3,6 +3,8 @@
 
 from dataclasses import dataclass
 
+from hyperscale.distributed.env.env import Env
+
 
 @dataclass(slots=True)
 class WorkerHealthManagerConfig:
@@ -24,3 +26,20 @@ class WorkerHealthManagerConfig:
     eviction_threshold: int = 3
     warning_threshold: int = 1
     grace_period: float = 10.0
+
+    @classmethod
+    def from_env(cls, env: Env) -> "WorkerHealthManagerConfig":
+        """
+        Worker health manager configuration (AD-26) from ``env``.
+
+        Controls deadline extension tracking for workers; extensions use
+        logarithmic decay to prevent indefinite extensions.
+        """
+        return cls(
+            base_deadline=env.EXTENSION_BASE_DEADLINE,
+            min_grant=env.EXTENSION_MIN_GRANT,
+            max_extensions=env.EXTENSION_MAX_EXTENSIONS,
+            eviction_threshold=env.EXTENSION_EVICTION_THRESHOLD,
+            warning_threshold=env.EXTENSION_EXHAUSTION_WARNING_THRESHOLD,
+            grace_period=env.EXTENSION_EXHAUSTION_GRACE_PERIOD,
+        )

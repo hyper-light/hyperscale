@@ -16,7 +16,7 @@ import pytest
 
 from hyperscale.logging.hyperscale_logging_models import DiscoveryDnsLookupFailed
 from hyperscale.logging.models import Entry
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.discovery.dns.resolver import DNSError, DNSResult
 from hyperscale.distributed.env import Env
 
@@ -49,7 +49,8 @@ class RecordingLogger:
 
 
 def make_service(dns_names: list[str]) -> tuple[DiscoveryService, ScriptedResolver]:
-    config = Env(DISCOVERY_DNS_NAMES=",".join(dns_names), DISCOVERY_DEFAULT_PORT=PORT).get_discovery_config(
+    config = DiscoveryConfig.from_env(
+        Env(DISCOVERY_DNS_NAMES=",".join(dns_names), DISCOVERY_DEFAULT_PORT=PORT),
         node_role="worker",
         allow_dynamic_registration=True,
     )

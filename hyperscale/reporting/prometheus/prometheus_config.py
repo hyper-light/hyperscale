@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Dict
 
 from pydantic import BaseModel, ConfigDict, StrictStr, StrictInt
 
@@ -12,7 +12,7 @@ class PrometheusConfig(BaseModel):
     pushgateway_port: StrictInt = 9091
     auth_request_method: StrictStr = "GET"
     auth_request_timeout: StrictInt = 60000
-    auth_request_data: Dict[StrictStr, Any] = {}
+    auth_request_data: Dict[StrictStr, object] = {}
     username: StrictStr | None = None
     password: StrictStr | None = None
     namespace: StrictStr = "hyperscale"

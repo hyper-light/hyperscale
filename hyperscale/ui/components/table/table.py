@@ -1,13 +1,12 @@
 import asyncio
 import math
 import time
-from typing import Any
 
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 
 from .table_config import TableConfig
-from .tabulate import TableAssembler
+from .tabulate import TableAssembler, TableCell
 
 
 class Table:
@@ -54,7 +53,7 @@ class Table:
         self._use_header_rotation = False
         self._width_adjust = 0
 
-        self._last_state: list[dict[str, Any]] = []
+        self._last_state: list[dict[str, TableCell]] = []
         self._last_rendered_frames: list[str] = []
 
         self._updates: asyncio.Queue | None = None
@@ -157,7 +156,7 @@ class Table:
 
     async def update(
         self,
-        data: list[dict[str, Any]],
+        data: list[dict[str, TableCell]],
     ):
         await self._update_lock.acquire()
 
@@ -205,7 +204,7 @@ class Table:
 
         return self._last_rendered_frames, rerender
 
-    async def _rerender(self, data: list[dict[str, Any]]):
+    async def _rerender(self, data: list[dict[str, TableCell]]):
         current_headers = list(self._header_keys[: self._columns_count])
 
         if self._use_header_rotation:
@@ -228,7 +227,7 @@ class Table:
 
     def _cycle_data_rows(
         self,
-        data: list[list[Any]],
+        data: list[list[TableCell]],
         height_adjustment: int,
     ):
         data_length = len(data)
@@ -307,10 +306,10 @@ class Table:
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
-        data: list[dict[str, Any]] | None = None
+        data: list[dict[str, TableCell]] | None = None
 
         if self._updates.empty() is False:
-            data: list[dict[str, Any]] = await self._updates.get()
+            data: list[dict[str, TableCell]] = await self._updates.get()
 
         if self._update_lock.locked():
             self._update_lock.release()

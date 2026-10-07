@@ -28,7 +28,7 @@ from hyperscale.distributed.nodes.client.submission import ClientJobSubmitter
 from hyperscale.distributed.nodes.client.cancellation import ClientCancellationManager
 from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.nodes.client.protocol import ClientProtocol
@@ -44,7 +44,8 @@ from hyperscale.logging import Logger
 def make_client_discovery() -> DiscoveryService:
     """AD-28 discovery service as HyperscaleClient builds it."""
     return DiscoveryService(
-        Env().get_discovery_config(
+        DiscoveryConfig.from_env(
+            Env(),
             node_role="client",
             static_seeds=[],
             allow_dynamic_registration=True,

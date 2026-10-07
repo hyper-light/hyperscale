@@ -112,6 +112,7 @@ from hyperscale.distributed.models.worker_state import (
 )
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
+    OverloadConfig,
     RetryBudgetManager,
     AdaptiveRateLimitConfig,
     ServerRateLimiter,
@@ -120,7 +121,7 @@ from hyperscale.distributed.reliability import (
     create_reliability_config_from_env,
 )
 from hyperscale.distributed.resources import ProcessResourceMonitor, ResourceMetrics
-from hyperscale.distributed.health import WorkerHealthManager
+from hyperscale.distributed.health import WorkerHealthManager, WorkerHealthManagerConfig
 from hyperscale.distributed.health.progress_witness import ThroughputWitness
 from hyperscale.distributed.health.progress_witness.witness_feed_derivation import throughput_witness_config
 from hyperscale.distributed.taskex.util.time_parser import TimeParser
@@ -591,7 +592,7 @@ class ManagerServer(HealthAwareServer):
 
         # Load shedding (AD-22), at this node's OVERLOAD_* settings (the
         # AD-24 rate-limit window is derived from them)
-        self._overload_detector = HybridOverloadDetector(self._env.get_overload_config())
+        self._overload_detector = HybridOverloadDetector(OverloadConfig.from_env(self._env))
         self._resource_monitor = ProcessResourceMonitor()
         self._last_resource_metrics: "ResourceMetrics | None" = None
         self._manager_health_state: str = "healthy"
@@ -849,7 +850,7 @@ class ManagerServer(HealthAwareServer):
         # 20 progress reports/s at the old 1000 cap cost 18.5 ms. The
         # arithmetic is in progress_witness/witness_feed_derivation.py.
         self._worker_health_manager = WorkerHealthManager(
-            self.env.get_worker_health_manager_config(),
+            WorkerHealthManagerConfig.from_env(self.env),
             throughput_witness=ThroughputWitness(
                 throughput_witness_config(
                     self.env.HYPERSCALE_EXTENSION_FPR_BUDGET,

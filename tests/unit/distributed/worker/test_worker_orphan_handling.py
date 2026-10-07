@@ -15,7 +15,6 @@ import time
 import inspect
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -48,11 +47,6 @@ class MockEnv:
     MERCURY_SYNC_MAX_PENDING_WORKFLOWS: int = 100
     DISCOVERY_PROBE_INTERVAL: float = 30.0
     DISCOVERY_FAILURE_DECAY_INTERVAL: float = 60.0
-    
-    def get_discovery_config(self, **kwargs) -> MagicMock:
-        mock_config = MagicMock()
-        mock_config.dns_names = []
-        return mock_config
 
 
 class MockTaskRunner:

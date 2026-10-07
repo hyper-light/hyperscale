@@ -1,5 +1,4 @@
 from typing import (
-    Any,
     Awaitable,
     Callable,
     List,
@@ -16,7 +15,7 @@ def step(
     timeouts: Optional[Timeouts] = None,
     tags: Optional[List[str]] = None,
 ):
-    def wrapper(func: Callable[..., Awaitable[Any]]):
+    def wrapper(func: Callable[..., Awaitable[object]]):
         return Hook(
             func,
             args,

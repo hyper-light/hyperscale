@@ -523,24 +523,6 @@ class TestServerRateLimiterCheckEdgeCases:
         assert await limiter.check(addr) is True
 
     @pytest.mark.asyncio
-    async def test_check_exception_message_format(self) -> None:
-        """Test that RateLimitExceeded exception has correct message format."""
-        from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
-
-        config = AdaptiveRateLimitConfig(default_max_requests=1, default_window_size=1.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (1, 1.0)})
-        limiter = ServerRateLimiter(adaptive_config=config)
-        addr = ("10.20.30.40", 12345)
-
-        await limiter.check(addr)
-
-        try:
-            await limiter.check(addr, raise_on_limit=True)
-            assert False, "Should have raised"
-        except RateLimitExceeded as exc:
-            assert "10.20.30.40" in str(exc)
-            assert "12345" in str(exc)
-
-    @pytest.mark.asyncio
     async def test_check_multiple_concurrent_addresses(self) -> None:
         """Test check() with many different addresses concurrently."""
         config = AdaptiveRateLimitConfig(default_max_requests=5, default_window_size=5.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (5, 5.0)})

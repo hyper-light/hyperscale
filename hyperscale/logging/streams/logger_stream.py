@@ -9,7 +9,6 @@ import struct
 import sys
 import zlib
 from typing import (
-    Any,
     AsyncIterator,
     Callable,
     Dict,
@@ -109,7 +108,7 @@ class LoggerStream:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -160,7 +159,7 @@ class LoggerStream:
         self._stdout: io.TextIOBase | None = None
         self._transports: List[asyncio.Transport] = []
 
-        self._models: Dict[str, Callable[..., Entry]] = {}
+        self._models: dict[str, tuple[type[Entry], dict[str, object]]] = {}
         self._queue: asyncio.Queue[asyncio.Future[None]] = asyncio.Queue(
             maxsize=queue_max_size
         )

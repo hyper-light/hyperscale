@@ -14,7 +14,7 @@ from hyperscale.distributed.cluster.models import ClusterMetricsReply
 from hyperscale.distributed.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed.swim.health.graceful_degradation import DegradationLevel
 from hyperscale.distributed.env import Env
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.models import (
     HealthcheckExtensionResponse,
     NodeInfo,
@@ -395,7 +395,8 @@ class WorkerServer(HealthAwareServer):
         static_seeds: list[str] = [
             f"{host}:{port}" for host, port in self._seed_managers
         ]
-        discovery_config = env.get_discovery_config(
+        discovery_config = DiscoveryConfig.from_env(
+            env,
             node_role="worker",
             static_seeds=static_seeds,
             allow_dynamic_registration=not static_seeds,

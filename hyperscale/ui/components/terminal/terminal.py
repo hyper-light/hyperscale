@@ -9,12 +9,14 @@ import shutil
 import signal
 import sys
 import time
+from types import FrameType
 from typing import (
-    Any,
     Awaitable,
     Callable,
+    Coroutine,
     Dict,
     List,
+    Never,
     TypeVar,
 )
 
@@ -35,7 +37,9 @@ from .section import Section
 from .terminal_protocol import TerminalProtocol, patch_transport_close
 from .writer import Writer
 
-SignalHandlers = Callable[[int], Any] | int | None
+# What ``signal.getsignal`` returns: a handler (its result is ignored),
+# SIG_DFL/SIG_IGN, or None for a handler not installed from Python.
+SignalHandlers = Callable[[int, FrameType | None], object] | int | None
 Notification = Callable[[], Awaitable[None]]
 
 
@@ -95,7 +99,9 @@ async def handle_resize(engine: Terminal):
 
 
 class Terminal:
-    _actions: List[tuple[Action[Any, ActionData], str | None]] = []
+    # Every wrapped action, whatever its argument (``Never``: a one-argument
+    # callable of any parameter type is an ``Action[Never, ...]``).
+    _actions: List[tuple[Action[Never, ActionData], str | None]] = []
     _updates = SubscriptionSet()
     _render_event: asyncio.Event | None = None
 
@@ -103,7 +109,7 @@ class Terminal:
         self,
         sections: List[Section],
         config: EngineConfig | None = None,
-        sigmap: Dict[signal.Signals, asyncio.Coroutine] = None,
+        sigmap: Dict[signal.Signals, Coroutine[None, None, None]] | None = None,
     ) -> None:
         self.config = config
         self.canvas = Canvas(sections)

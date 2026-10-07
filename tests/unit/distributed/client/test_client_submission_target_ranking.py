@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.idempotency.idempotency_key import (
     IdempotencyKeyGenerator,
@@ -41,7 +41,8 @@ JOB_IDS = [f"job-{index}" for index in range(200)]
 
 def _discovery() -> DiscoveryService:
     return DiscoveryService(
-        Env().get_discovery_config(
+        DiscoveryConfig.from_env(
+            Env(),
             node_role="client",
             static_seeds=[],
             allow_dynamic_registration=True,
