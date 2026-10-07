@@ -16,11 +16,20 @@ chromium); skipped without them.
 """
 
 import asyncio
+import os
 import subprocess
 
 import pytest
 
-pytest.importorskip("playwright.async_api")
+sync_api = pytest.importorskip("playwright.sync_api")
+
+with sync_api.sync_playwright() as playwright:
+    CHROMIUM_INSTALLED = os.path.exists(playwright.chromium.executable_path)
+
+pytestmark = pytest.mark.skipif(
+    not CHROMIUM_INSTALLED,
+    reason="Playwright's Chromium is not installed (uv run playwright install chromium)",
+)
 
 import hyperscale.testing  # noqa: F401  (the engines' import order)
 from hyperscale.core.engines.client.playwright import MercurySyncPlaywrightConnection

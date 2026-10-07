@@ -317,17 +317,20 @@ class HTTP2Pipe:
 
         # The frames are parsed in place, in the buffer the reader owns for
         # its transport's lifetime, from its _start up to its _end. Where the
-        # last parse ended: until bytes arrive past it there is nothing new
-        # to parse.
+        # last parse left the buffer: while _start and _end are both as it
+        # left them there is nothing new to parse. _end alone cannot tell:
+        # making room moves the unparsed bytes to the front, and a read that
+        # then fills the room ends the buffer where the last parse did -- but
+        # moving them always takes _start from past 0 to 0.
         buffer = reader._buffer
         view = reader._view
-        parsed_end = -1
+        parsed_start = parsed_end = -1
         max_inbound_frame_size = stream.max_inbound_frame_size
         frames = None
 
         done = False
         while done is False:
-            if (buffer_length := reader._end) == parsed_end:
+            if (buffer_length := reader._end) == parsed_end and reader._start == parsed_start:
                 # Nothing new: the transport's error or the end of the
                 # stream ends the read, else it waits -- on the reader's
                 # future itself.
@@ -983,10 +986,10 @@ class HTTP2Pipe:
                 # The frames handled, or failed on, are consumed; once all of
                 # them are, the transport writes from the buffer's start.
                 if offset == buffer_length:
-                    reader._start = reader._end = parsed_end = 0
+                    reader._start = reader._end = parsed_start = parsed_end = 0
 
                 else:
-                    reader._start = offset
+                    reader._start = parsed_start = offset
                     parsed_end = buffer_length
 
             if reader._reading_paused:
