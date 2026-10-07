@@ -1,19 +1,46 @@
 import asyncio
-import math
-import sys
+import re
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Tuple, Union
 
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
-from hyperscale.ui.styling import get_style
+from hyperscale.ui.styling import get_style, stylize
 from hyperscale.ui.styling.colors import Color
 
+from .models import NiceTicks
+from .plot_axes import (
+    CANVAS_COLUMN,
+    TIME_ARROW,
+    TIME_AXIS_LINES,
+    label_rows,
+    relabel_value_axis,
+    time_axis_end,
+    time_axis_lines,
+    value_axis_ticks,
+)
 from .plot_config import PlotConfig
-from .plotille import scatter
-from .point_char import PointChar
+from .plotille import Figure
+from .point_char import PointChar, PointCharName
 
 CompletionRateSet = Tuple[str, List[Union[int, float]]]
+PlotPoints = list[tuple[int | float, int | float]]
+# A multi-series plot's update: each series' points by its name.
+SeriesPoints = dict[str, PlotPoints]
+# Color sequences take no column: a line's width is its length without them.
+COLOR_SEQUENCE = re.compile(r"\x1b\[[0-9;:]*m")
+# The space between two series' entries in the legend.
+LEGEND_SEPARATOR = "  "
+# The lines a plot draws besides its canvas rows: the value axis' title
+# and top line, the time axis and its labels.
+PLOT_FRAME_LINES = 4
+# One series to draw: its points, its color and its point character.
+PlottedSeries = tuple[PlotPoints, int, PointCharName | None]
+
+
+def all_points(plotted: list[PlottedSeries]) -> PlotPoints:
+    """Every series' points together: the axes cover them all."""
+    return [point for points, _, _ in plotted for point in points]
 
 
 class ScatterPlot:
@@ -64,7 +91,8 @@ class ScatterPlot:
         self._update_lock: asyncio.Lock | None = None
         self._updates: asyncio.Queue | None = None
         self._line_color = config.line_color
-        self._is_atty = True
+        # A multi-series plot draws its legend on the line above the plot.
+        self._legend_lines = int(config.series is not None)
 
     @property
     def raw_size(self):
@@ -87,56 +115,19 @@ class ScatterPlot:
 
         self._max_width = max_width
         self._max_height = max_height
-
-        (
-            x_max,
-            y_max,
-            x_vals,
-            y_vals,
-        ) = self._generate_x_and_y_vals([])
-
-        plot: str = scatter(
-            x_vals,
-            y_vals,
-            width=max(self._max_width, 1),
-            height=max(self._max_height, 1),
-            y_min=self._config.y_min,
-            y_max=y_max,
-            x_min=self._config.x_min,
-            x_max=x_max,
-            linesep="\n",
-            X_label=self._config.x_axis_name,
-            Y_label=self._config.y_axis_name,
-            color_mode="byte",
-            origin=self._config.use_origin,
-            marker=PointChar.by_name(self._config.point_char),
-        )
-
-        plot_lines = plot.split("\n")
-
-        max_line_length = max([len(line) for line in plot_lines])
-        width_difference = max_line_length - self._max_width
-        self._corrected_width = self._max_width - width_difference
-
-        plot_height = len(plot_lines)
-        height_difference = plot_height - self._max_height
-        self._corrected_height = self._max_height - height_difference
-
-        if self._corrected_height <= 0:
-            self._corrected_height = 1
-
-        if self._corrected_width <= 0:
-            self._corrected_width = 1
+        # The canvas spans the plot but for the value axis' labels before it
+        # and the time axis' arrow after it, and its rows all but the plot's
+        # frame lines and a multi-series legend.
+        self._corrected_width = max(max_width - CANVAS_COLUMN - len(TIME_ARROW), 1)
+        self._corrected_height = max(max_height - PLOT_FRAME_LINES - self._legend_lines, 1)
 
         self._last_rendered_frames.clear()
 
-        loop = asyncio.get_event_loop()
-        self._is_atty = loop.run_in_executor(None, sys.stdout.isatty)
+        self._updates.put_nowait(self._no_points())
 
-        if self._is_atty is False:
-            self._line_color = None
-
-        self._updates.put_nowait([])
+    def _no_points(self) -> SeriesPoints | PlotPoints:
+        """An update with no point: no series' points, or none at all."""
+        return {} if self._config.series is not None else []
 
     async def update(
         self,
@@ -158,148 +149,119 @@ class ScatterPlot:
     async def get_next_frame(self):
         data = await self._check_if_should_rerender()
 
-        if data:
+        # An update with no point redraws the bare axes (as before the
+        # first point): never the last points again, as if still current.
+        if data is None:
+            return self._last_rendered_frames, False
+
+        self._last_rendered_frames = await self._render(data)
+        return self._last_rendered_frames, True
+
+    async def _render(self, data: SeriesPoints | PlotPoints) -> list[str]:
+        if self._config.series is not None:
+            return await self._render_series(data)
+
+        return self._render_single(data)
+
+    def _render_single(self, data: PlotPoints) -> list[str]:
+        """The plot of its one series."""
+        line_color = Color.by_name(get_style(self._line_color, self._data), mode=self._mode)
+        return self._padded(self._draw([(data, line_color, self._config.point_char)]))
+
+    async def _render_series(self, series_points: SeriesPoints) -> list[str]:
+        """Draw every series of a multi-series plot (an update is each
+        series' points by name; a series missing from it has none) over
+        shared axes: time across, and up the union of every series'
+        values. The series are drawn in their declared order, so where
+        points of several series land on one cell the series declared
+        later wins: the cell shows its point character in its color. A
+        legend line above the plot names each series in its color, after
+        its point character."""
+        plotted: list[PlottedSeries] = [
             (
-                x_max,
-                y_max,
-                x_vals,
-                y_vals,
-            ) = self._generate_x_and_y_vals(data)
-
-            length_adjustments = self._get_plot_length_adjustments(
-                x_max,
-                y_max,
-                x_vals,
-                y_vals,
+                series_points.get(series.name, []),
+                Color.by_name(get_style(series.color, series_points.get(series.name, [])), mode=self._mode),
+                series.point_char,
             )
+            for series in self._config.series
+        ]
+        return self._padded([await self._legend_line(series_points), *self._draw(plotted)])
 
-            plot: str = scatter(
-                x_vals,
-                y_vals,
-                width=self._corrected_width,
-                height=self._corrected_height,
-                y_min=self._config.y_min,
-                y_max=y_max,
-                x_min=self._config.x_min,
-                x_max=x_max,
-                linesep="\n",
-                X_label=self._config.x_axis_name,
-                Y_label=self._config.y_axis_name,
-                lc=Color.by_name(
-                    get_style(
-                        self._line_color,
-                        self._data,
-                    ),
+    def _draw(self, plotted: list[PlottedSeries]) -> list[str]:
+        """The canvas of every series, its value axis relabelled at nice
+        ticks and its time axis drawn below it: the points span the
+        canvas' width (the newest in its last column) and its height (the
+        value axis ends at the nice tick above the largest value)."""
+        time_end, value_ticks = self._axis_bounds(all_points(plotted))
+        figure = Figure()
+        figure.width = self._corrected_width
+        figure.height = self._corrected_height
+        figure.x_label = ""
+        figure.y_label = self._config.y_axis_name
+        figure.origin = self._config.use_origin
+        figure.set_x_limits(min_=self._config.x_min, max_=time_end)
+        figure.set_y_limits(min_=self._config.y_min, max_=value_ticks.values[-1])
+        figure.color_mode = "byte"
+        for points, color, point_char in plotted:
+            self._scatter_series(figure, points, color, point_char)
+
+        plot_lines = figure.show().split("\n")
+        return [
+            *relabel_value_axis(
+                plot_lines[:-TIME_AXIS_LINES],
+                label_rows(value_ticks, self._config.y_min, value_ticks.values[-1], self._corrected_height),
+                self._corrected_height,
+            ),
+            *time_axis_lines(self._config.x_axis_name, self._config.x_min, time_end, self._corrected_width),
+        ]
+
+    def _axis_bounds(self, points: PlotPoints) -> tuple[float, NiceTicks]:
+        """The time axis' end and the value axis' ticks for ``points``."""
+        return (
+            time_axis_end([x_value for x_value, _ in points], self._config.x_min, self._config.x_max, self._corrected_width),
+            value_axis_ticks([y_value for _, y_value in points], self._config.y_min, self._config.y_max, self._corrected_height),
+        )
+
+    def _padded(self, plot_lines: list[str]) -> list[str]:
+        """Each line padded to the plot's width (color sequences take no
+        column), so a shorter frame leaves nothing of a longer one."""
+        return [
+            plot_line + " " * max(self._max_width - len(COLOR_SEQUENCE.sub("", plot_line)), 0)
+            for plot_line in plot_lines
+        ]
+
+    def _scatter_series(self, figure: Figure, points: PlotPoints, color: int, point_char: PointCharName | None) -> None:
+        """Draw one series' points onto ``figure``."""
+        figure.scatter(
+            [x_value for x_value, _ in points],
+            [y_value for _, y_value in points],
+            lc=color,
+            marker=PointChar.by_name(point_char),
+        )
+
+    async def _legend_line(self, series_points: SeriesPoints) -> str:
+        """Each series' point character and name, in its color."""
+        return LEGEND_SEPARATOR.join(
+            [
+                await stylize(
+                    f"{PointChar.by_name(series.point_char)} {series.name}",
+                    color=get_style(series.color, series_points.get(series.name, [])),
                     mode=self._mode,
-                ),
-                color_mode="byte",
-                origin=self._config.use_origin,
-                marker=PointChar.by_name(self._config.point_char),
-            )
-
-            plot_lines = plot.split("\n")
-
-            for idx, plot_line in enumerate(plot_lines):
-                plot_lines[idx] = plot_line + (" " * length_adjustments[idx])
-
-            self._last_rendered_frames = plot_lines
-            self._last_state = self._data
-
-            return plot_lines, True
-
-        return self._last_rendered_frames, False
+                )
+                for series in self._config.series
+            ]
+        )
 
     async def _check_if_should_rerender(self):
-        if self._updates.empty() is False:
-            return await self._updates.get()
+        # Each update is the plot's whole data set, so only the newest one
+        # queued is drawn: a plot that waited unshown, or was refit (which
+        # queues its empty axes), never replays the updates it missed one
+        # frame at a time.
+        data = None
+        while self._updates.empty() is False:
+            data = self._updates.get_nowait()
 
-    def _get_plot_length_adjustments(
-        self,
-        x_max: int,
-        y_max: int,
-        x_vals: list[int],
-        y_vals: list[int],
-    ):
-        plot: str = scatter(
-            x_vals,
-            y_vals,
-            width=self._corrected_width,
-            height=self._corrected_height,
-            y_min=self._config.y_min,
-            y_max=y_max,
-            x_min=self._config.x_min,
-            x_max=x_max,
-            linesep="\n",
-            X_label=self._config.x_axis_name,
-            Y_label=self._config.y_axis_name,
-            origin=self._config.use_origin,
-            marker=PointChar.by_name(self._config.point_char),
-        )
-
-        plot_lines = plot.split("\n")
-        length_adjustments: list[int] = []
-
-        for plot_line in plot_lines:
-            if len(plot_line) <= self._max_width:
-                difference = self._max_width - len(plot_line)
-                length_adjustments.append(difference)
-
-            else:
-                length_adjustments.append(0)
-
-        return length_adjustments
-
-    def _generate_x_and_y_vals(
-        self,
-        data: list[
-            tuple[
-                int | float,
-                int | float,
-            ]
-        ],
-    ):
-        x_range = self._config.x_range
-        if x_range and self._config.x_range_inclusive:
-            x_vals = [idx for idx in range(self._config.x_range_start, x_range + 1)]
-
-        elif x_range:
-            x_vals = [idx for idx in range(self._config.x_range_start, x_range + 1)]
-
-        else:
-            x_vals = [x_val for x_val, _ in data]
-
-        y_vals = [y_val for _, y_val in data]
-
-        x_max = self._config.x_max
-        if x_max is None and len(x_vals) < 1:
-            x_max = self._max_width * 0.8
-
-        elif x_max is None:
-            x_max = max(x_vals) * 1.1
-
-        y_max = self._config.y_max
-        if y_max is None and len(y_vals) < 1:
-            y_max = self._max_height
-
-        elif y_max is None:
-            y_max = max(y_vals) * 1.1
-
-        if x_max <= self._config.x_min:
-            x_max = self._config.x_min + 1
-
-        if y_max <= self._config.y_min:
-            y_max = self._config.y_min + 1
-
-        # The axes end at whole numbers, rounded up: plotille draws no point
-        # on or past an axis' maximum, and rounding to the nearest whole
-        # number could take the 1.1x headroom away for a largest value under
-        # 5 (1.1 x 4 rounds to 4), leaving every point at that value undrawn.
-        return (
-            math.ceil(x_max),
-            math.ceil(y_max),
-            x_vals,
-            y_vals,
-        )
+        return data
 
     async def pause(self):
         pass

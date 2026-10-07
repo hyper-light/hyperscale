@@ -27,7 +27,7 @@ from hyperscale.ui.node_dashboard import (
 )
 
 STDOUT_DESCRIPTOR = 1
-FRAME_PREFIX = "\x1b[3J\x1b[H"
+FRAME_PREFIX = "\x1b[?2026h\x1b[H"
 WORKER_CORES = 1
 # Bounds on what the nodes do on their own: a manager boots and elects
 # itself in a few seconds, a worker registers within its registration

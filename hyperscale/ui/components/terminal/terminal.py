@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import io
 import math
@@ -9,6 +10,7 @@ import shutil
 import signal
 import sys
 import time
+from collections.abc import AsyncIterator
 from types import FrameType
 from typing import (
     Awaitable,
@@ -46,6 +48,26 @@ Notification = Callable[[], Awaitable[None]]
 K = TypeVar("K")
 T = TypeVar("T", bound=ActionData)
 
+# The share of the terminal's columns a canvas spans (its lines are that
+# wide plus the horizontal padding on each side, so no line reaches the
+# terminal's last column).
+TERMINAL_WIDTH_SHARE = 0.75
+
+
+def canvas_size(
+    columns: int,
+    lines: int,
+    horizontal_padding: int,
+    vertical_padding: int,
+) -> tuple[int, int]:
+    """The canvas a terminal of ``columns`` x ``lines`` holds: its share of
+    the columns less the horizontal padding, rounded down to a multiple of
+    three (the sections' thirds), and every line but the vertical padding
+    above and below it -- so a frame fills the terminal's rows exactly and
+    never passes its bottom."""
+    width = math.floor(columns * TERMINAL_WIDTH_SHARE) - horizontal_padding
+    return max(width - width % 3, 1), max(lines - 2 * vertical_padding, 1)
+
 
 async def handle_resize(engine: Terminal):
     try:
@@ -54,35 +76,16 @@ async def handle_resize(engine: Terminal):
 
         terminal_size = await loop.run_in_executor(None, shutil.get_terminal_size)
 
-        width = int(math.floor(terminal_size.columns * 0.75))
-
-        height = terminal_size.lines - 5
-
-        width_threshold = 0
-        height_threshold = 0
-
-        width_difference = abs(width - engine.canvas.total_width)
-        height_difference = abs(height - engine.canvas.total_height)
-
-        width = max(width - (width % 3), 1)
-
-        if width_difference > width_threshold and height_difference > height_threshold:
-            await engine.resize(
-                width=width,
-                height=height,
-            )
-
-        elif width_difference > width_threshold:
-            await engine.resize(
-                width=width,
-                height=engine.canvas.height,
-            )
-
-        elif height_difference > height_threshold:
-            await engine.resize(
-                width=engine.canvas.width,
-                height=height,
-            )
+        # Every section is laid out again for the terminal's new size; the
+        # render loop's restart clears the screen and redraws.
+        width, height = canvas_size(
+            terminal_size.columns,
+            terminal_size.lines,
+            engine._horizontal_padding,
+            engine._vertical_padding,
+        )
+        if (width, height) != (engine.canvas.width, engine.canvas.height):
+            await engine.resize(width=width, height=height)
 
         if len(engine._updates.triggers) > 0:
             await asyncio.gather(
@@ -148,9 +151,27 @@ class Terminal:
         self._resize_tasks: set[asyncio.Task[None]] = set()
         self._keyboard_interrupt_task: asyncio.Task[None] | None = None
 
-        # Pre-encoded ANSI sequences for efficiency
-        self._frame_prefix = b"\033[3J\033[H"
-        self._frame_suffix = b"\n"
+        # Each frame reaches the terminal in one write, drawn over the last
+        # one in place: the cursor goes home and every line (padded to the
+        # frame's width by its sections) overwrites the line under it --
+        # never cleared first, which shows a blank screen between frames,
+        # and never cleared of scrollback (a full repaint on some
+        # terminals): the screen is cleared once, when the render loop
+        # starts, and again after a resize. A frame fills the terminal's
+        # rows (canvas_size) and ends on its last row with a carriage
+        # return, never a newline: a newline there scrolls the screen up a
+        # line, and every frame would step the header down. The frame is
+        # wrapped in a synchronized update (DEC private mode 2026:
+        # "Synchronized Output", contour-terminal's specification adopted
+        # from the terminal-wg proposal,
+        # https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e399004036):
+        # a terminal that supports it shows the frame only once all of it
+        # has arrived; one that does not ignores the unknown mode.
+        self._frame_prefix = b"\033[?2026h\033[H"
+        self._frame_suffix = b"\033[?2026l"
+        # The last frame, drawn as the terminal stops, leaves the cursor on
+        # the line below it for whatever the shell writes next.
+        self._final_frame_suffix = b"\033[?2026l\n"
 
         components: dict[str, tuple[list[str], Action[ActionData, ActionData]]] = {}
 
@@ -204,6 +225,18 @@ class Terminal:
             default_channel=default_channel,
             on_update=cls.trigger_render,
         )
+
+    @contextlib.asynccontextmanager
+    async def updating(self) -> AsyncIterator[None]:
+        """Hold the next frame while a batch of updates is published, so
+        no frame shows part of the batch: the render loop draws once the
+        batch is whole."""
+        await self._stdout_lock.acquire()
+        try:
+            yield
+
+        finally:
+            self._stdout_lock.release()
 
     async def set_component_active(self, component_name: str):
         if self._stdout_lock is None:
@@ -340,15 +373,19 @@ class Terminal:
             width = self.config.width - self._horizontal_padding
             height = self.config.height - self._vertical_padding
 
+        terminal_width, terminal_height = canvas_size(
+            terminal_size.columns,
+            terminal_size.lines,
+            self._horizontal_padding,
+            self._vertical_padding,
+        )
         if width is None:
-            width = (
-                int(math.floor(terminal_size.columns * 0.75)) - self._horizontal_padding
-            )
+            width = terminal_width
 
         width = max(width - (width % 3), 1)
 
         if height is None:
-            height = terminal_size.lines - 5 - self._vertical_padding
+            height = terminal_height
 
         self._stop_run = asyncio.Event()
         self._hide_run = asyncio.Event()
@@ -391,9 +428,7 @@ class Terminal:
 
             frame = await self.canvas.render()
 
-            self._writer.write(self._frame_prefix)
-            self._writer.write(frame.encode())
-            self._writer.write(self._frame_suffix)
+            self._writer.write(self._frame_prefix + frame.encode() + self._frame_suffix)
             await self._writer.drain()
 
         except Exception:
@@ -420,9 +455,7 @@ class Terminal:
 
                 frame = await self.canvas.render()
 
-                self._writer.write(self._frame_prefix)
-                self._writer.write(frame.encode())
-                self._writer.write(self._frame_suffix)
+                self._writer.write(self._frame_prefix + frame.encode() + self._frame_suffix)
                 await self._writer.drain()
 
             except Exception:
@@ -457,7 +490,7 @@ class Terminal:
         force: bool = False,
     ):
         if force:
-            self._writer.write(b"\033[2J\033H")
+            self._writer.write(b"\033[2J\033[H")
 
         else:
             self._writer.write(b"\033[3J\033[H")
@@ -532,9 +565,7 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        self._writer.write(self._frame_prefix)
-        self._writer.write(frame.encode())
-        self._writer.write(self._frame_suffix)
+        self._writer.write(self._frame_prefix + frame.encode() + self._final_frame_suffix)
         await self._writer.drain()
 
         try:
@@ -580,9 +611,7 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        self._writer.write(self._frame_prefix)
-        self._writer.write(frame.encode())
-        self._writer.write(self._frame_suffix)
+        self._writer.write(self._frame_prefix + frame.encode() + self._final_frame_suffix)
         await self._writer.drain()
 
         try:
@@ -616,8 +645,10 @@ class Terminal:
             [component.update for section in self.canvas.sections for component in section.components.values()]
         )
 
+        # Closed only once the transport has flushed what the terminal
+        # wrote: its process may exit right after.
         self._writer.close()
-        await asyncio.sleep(0)
+        await self._writer.wait_closed()
 
     def _register_signal_handlers(self):
         self._loop.add_signal_handler(signal.SIGWINCH, self._on_resize_signal)

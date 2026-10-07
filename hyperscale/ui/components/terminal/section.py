@@ -125,8 +125,7 @@ class Section(Generic[T]):
         width_scale = self._scale[self.config.width]
         self._actual_width = math.floor(width_scale * canvas_width)
 
-        height_scale = self._scale[self.config.height]
-        self._actual_height = math.floor(height_scale * canvans_height)
+        self._actual_height = self._rows_of(canvans_height)
 
         if self.config.max_width and self._actual_width > self.config.max_width:
             self._actual_width = self.config.max_width
@@ -156,6 +155,14 @@ class Section(Generic[T]):
             vertical_padding += border_size
 
         self._inner_height = self._actual_height - vertical_padding
+
+    def _rows_of(self, canvas_height: int) -> int:
+        """The rows the section takes of a canvas ``canvas_height`` rows
+        tall: its ``height_rows``, or its ``height``'s share."""
+        if self.config.height_rows is not None:
+            return self.config.height_rows(canvas_height)
+
+        return math.floor(self._scale[self.config.height] * canvas_height)
 
     async def create_blocks(self):
         if len(self._blocks) > 0:
@@ -201,17 +208,21 @@ class Section(Generic[T]):
         self._right_pad = " " * (self.config.right_padding + self._right_remainder_pad)
 
     async def render(self):
+        # A section given no rows (a layout dropped it to fit a short
+        # canvas) draws nothing at all.
+        if self._actual_height < 1:
+            return []
+
         if self._empty is False:
             return await self._render_with_component()
 
-        elif self._last_render is None:
-            render = await self._render_without_component()
-            self._last_render = render
+        return await self._render_empty()
 
-            return render
+    async def _render_empty(self):
+        if self._last_render is None:
+            self._last_render = await self._render_without_component()
 
-        else:
-            return self._last_render
+        return self._last_render
 
     async def _fit_components(self, component_name: str | None = None):
         if component_name and (component := self.components.get(component_name)):

@@ -9,6 +9,7 @@ from pydantic import (
 from hyperscale.ui.config.mode import TerminalDisplayMode
 from hyperscale.ui.styling.colors import Colorizer
 
+from .models import PlotSeries
 from .point_char import PointCharName
 
 
@@ -27,3 +28,6 @@ class PlotConfig(BaseModel):
     line_color: Colorizer | None = None
     terminal_mode: TerminalDisplayMode = "compatability"
     point_char: PointCharName | None = None
+    # Several series in one plot (see ScatterPlot); None plots one series
+    # in ``line_color`` and ``point_char``.
+    series: list[PlotSeries] | None = None

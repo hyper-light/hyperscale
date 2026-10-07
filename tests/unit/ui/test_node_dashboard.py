@@ -8,8 +8,9 @@ terminal.
 - Ctrl-C (a real SIGINT through ShutdownSignals) stops the node, stops the
   dashboard and leaves none of its tasks, its subscriptions or its signal
   handlers behind.
-- "disabled" renders and redirects nothing; --quiet and a non-terminal
-  stdout select the modes `run workflow` would.
+- "disabled" renders and redirects nothing; --quiet disables the
+  dashboard as `run workflow`'s, and a non-terminal stdout selects the
+  CI-safe summary lines.
 
 The dashboards' live values against a registering worker are covered by
 tests/integration/ui/test_node_dashboard_live_cluster.py and, through real
@@ -155,12 +156,16 @@ async def test_ctrl_c_stops_the_node_and_leaves_nothing_of_the_dashboard(tmp_pat
 
 
 async def test_node_terminal_modes() -> None:
-    # pytest's stdout is not a terminal: "full" renders nothing there, an
-    # explicit "ci" still renders, and --quiet disables either.
-    assert await node_terminal_mode("full", quiet=False) == "disabled"
-    assert await node_terminal_mode("ci", quiet=False) == "ci"
-    assert await node_terminal_mode("ci", quiet=True) == "disabled"
-    assert await node_terminal_mode("disabled", quiet=False) == "disabled"
+    # pytest's stdout is not a terminal: "full" falls back to the CI-safe
+    # summary lines there (saying why), an explicit "ci" still renders, and
+    # --quiet disables either.
+    layout = ManagerDashboardReader.layout
+    full_selection = await node_terminal_mode("full", False, layout)
+    assert full_selection.mode == "ci-safe"
+    assert "stdout is not a terminal" in full_selection.degraded_reason
+    assert (await node_terminal_mode("ci", False, layout)).mode == "ci"
+    assert (await node_terminal_mode("ci", True, layout)).mode == "disabled"
+    assert (await node_terminal_mode("disabled", False, layout)).mode == "disabled"
 
 
 async def test_a_disabled_dashboard_renders_nothing_and_redirects_nothing(tmp_path: pathlib.Path) -> None:

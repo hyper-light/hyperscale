@@ -5,7 +5,7 @@ from hyperscale.distributed.nodes import GateServer
 from hyperscale.ui.components.table.table_config import HeaderOptions
 
 from .counter_rates import CounterRates
-from .dashboard_formatting import cluster_lines, count_statuses
+from .dashboard_formatting import cluster_lines, count_statuses, format_reading
 from .job_outcome_tally import JobOutcomeTally
 from .models import NodeDashboardChart, NodeDashboardFrame, NodeDashboardLayout, TableRow
 from .node_identity_reader import NodeIdentityReader
@@ -20,12 +20,18 @@ GATE_DASHBOARD_LAYOUT = NodeDashboardLayout(
         "capacity": HeaderOptions(default=0),
         "p95 ms": HeaderOptions(default="-", precision_format=".1f"),
     },
+    # Jobs admitted, completed and failed are all jobs a second: one axis.
+    # The datacenters accepting jobs (a count) and the worst datacenter's
+    # dispatch round trip (milliseconds) are not, and are listed beside it.
+    chart_unit="jobs /s",
+    # Declared failures first: where series share a cell the later one is
+    # drawn (ScatterPlot), so a run of zero failures never hides the small
+    # rates above it, while any nonzero failure rate lands on cells of its
+    # own; every series' value is also listed beside the chart.
     charts=(
-        NodeDashboardChart("admitted", "jobs admitted /s", "aquamarine_2"),
-        NodeDashboardChart("completed", "jobs completed /s", "aquamarine_2"),
-        NodeDashboardChart("failed", "jobs failed /s", "hot_pink_3"),
-        NodeDashboardChart("accepting", "DCs accepting", "royal_blue"),
-        NodeDashboardChart("dispatch_latency", "worst DC p95 ms", "hot_pink_3"),
+        NodeDashboardChart("failed", "failed", "hot_pink_3", "x"),
+        NodeDashboardChart("completed", "completed", "royal_blue", "circle_toggle"),
+        NodeDashboardChart("admitted", "admitted", "aquamarine_2", "dot"),
     ),
 )
 
@@ -118,33 +124,34 @@ class GateDashboardReader:
         datacenter_statuses = self._datacenter_statuses()
         dispatch_p95s = dispatch_p95_by_datacenter(gate, [status.dc_id for status in datacenter_statuses])
         return NodeDashboardFrame(
-            identity_lines=self._identity.identity_lines(
-                gate._modular_state.get_gate_state().name.lower(),
-                gate._overload_detector.current_state.name.lower(),
+            identity_lines=self._identity.identity_lines(),
+            lifecycle_state=gate._modular_state.get_gate_state().name.lower(),
+            uptime_seconds=self._identity.uptime_seconds(),
+            cluster_lines=cluster_lines(
+                gate._cluster_membership,
+                [
+                    *self._identity.swim_lines(),
+                    *self._identity.health_lines(gate._overload_detector.current_state.name.lower()),
+                ],
             ),
-            cluster_lines=cluster_lines(gate._cluster_membership, self._identity.swim_lines()),
             summary_lines=self._datacenter_lines(datacenter_statuses),
             detail_lines=self._job_lines(),
             table_rows=[datacenter_row(status, dispatch_p95s) for status in datacenter_statuses],
-            chart_values=self._chart_values(datacenter_statuses, dispatch_p95s, sampled_at),
+            chart_values=self._chart_values(sampled_at),
+            value_lines=self._value_lines(datacenter_statuses, dispatch_p95s),
             sampled_at=sampled_at,
         )
 
-    def _chart_values(
-        self,
-        datacenter_statuses: list[DatacenterStatus],
-        dispatch_p95s: dict[str, float],
-        sampled_at: float,
-    ) -> list[float | None]:
+    def _chart_values(self, sampled_at: float) -> list[float | None]:
         self._outcome_tally.advance(job_statuses(self._gate))
         rates = self._rates.advance(outcome_counts(self._outcome_tally), sampled_at)
+        return [rates["failed"], rates["completed"], rates["admitted"]]
+
+    def _value_lines(self, datacenter_statuses: list[DatacenterStatus], dispatch_p95s: dict[str, float]) -> list[str]:
         health_counts = Counter(status.health for status in datacenter_statuses)
         return [
-            rates["admitted"],
-            rates["completed"],
-            rates["failed"],
-            float(count_statuses(health_counts, ACCEPTING_DATACENTER_HEALTH)),
-            max(dispatch_p95s.values(), default=None),
+            f"DCs accepting {count_statuses(health_counts, ACCEPTING_DATACENTER_HEALTH)}",
+            f"worst DC p95 ms {format_reading(max(dispatch_p95s.values(), default=None))}",
         ]
 
     def _datacenter_statuses(self) -> list[DatacenterStatus]:

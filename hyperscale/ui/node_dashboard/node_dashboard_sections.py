@@ -1,33 +1,28 @@
 from hyperscale.ui.components.multiline_text import MultilineText, MultilineTextConfig
-from hyperscale.ui.components.scatter_plot import PlotConfig, ScatterPlot
+from hyperscale.ui.components.scatter_plot import PlotConfig, PlotSeries, ScatterPlot
 from hyperscale.ui.components.table import Table, TableConfig
 from hyperscale.ui.components.terminal import Section, SectionConfig
 from hyperscale.ui.components.text import Text, TextConfig
 from hyperscale.ui.config.mode import TerminalDisplayMode
 from hyperscale.ui.hyperscale_header import create_hyperscale_header
 
-from .models import NodeDashboardChart, NodeDashboardLayout
+from .models import NodeDashboardLayout
 from .node_dashboard_actions import (
+    CHART_CHANNEL,
     CLUSTER_CHANNEL,
     DETAIL_CHANNEL,
     IDENTITY_CHANNEL,
+    READINGS_CHANNEL,
     STATUS_CHANNEL,
     SUMMARY_CHANNEL,
     TABLE_CHANNEL,
-    chart_channel,
-    chart_waiting_channel,
 )
+from .node_dashboard_rows import chart_rows, header_rows, panel_rows, status_rows, table_rows
 
 WAITING_TEXT = "waiting for the first sample"
-WAITING_FOR_VALUE_TEXT = "no value yet"
-# A panel holds its title and up to six lines between its top and bottom
-# borders; a shorter terminal pages the lines (MultilineText cycles them).
-PANEL_MAX_HEIGHT = 9
-# The status line: one line between its borders.
-STATUS_MAX_HEIGHT = 3
-# Panels and charts are "small" sections, a third of the canvas wide: three
-# to a row (the last section of a row widens to fill what is left of it).
-SECTIONS_PER_ROW = 3
+IDENTITY_COMPONENT_NAME = "node_dashboard_identity"
+CHART_COMPONENT_NAME = "node_dashboard_chart"
+READINGS_COMPONENT_NAME = "node_dashboard_readings"
 
 
 def header_sections(display_mode: TerminalDisplayMode) -> list[Section]:
@@ -35,14 +30,19 @@ def header_sections(display_mode: TerminalDisplayMode) -> list[Section]:
     `run workflow` names its workflow, the node's role and identity."""
     return [
         Section(
-            SectionConfig(height="xx-small", width="large"),
+            SectionConfig(height="xx-small", height_rows=header_rows, width="large"),
             components=[create_hyperscale_header(display_mode)],
         ),
         Section(
-            SectionConfig(height="xx-small", width="small", vertical_alignment="center"),
+            SectionConfig(
+                height="xx-small",
+                height_rows=header_rows,
+                width="small",
+                vertical_alignment="center",
+            ),
             components=[
                 MultilineText(
-                    "node_dashboard_identity",
+                    IDENTITY_COMPONENT_NAME,
                     MultilineTextConfig(
                         text=[WAITING_TEXT],
                         horizontal_alignment="right",
@@ -66,8 +66,8 @@ def panel_section(
     return Section(
         SectionConfig(
             width="small",
-            height="x-small",
-            max_height=PANEL_MAX_HEIGHT,
+            height="xx-small",
+            height_rows=panel_rows,
             left_border="|",
             right_border=right_border,
             top_border="-",
@@ -91,113 +91,103 @@ def panel_section(
     )
 
 
-def chart_plot_name(chart_name: str) -> str:
-    """The component name of the chart named ``chart_name``'s plot."""
-    return f"node_dashboard_chart_{chart_name}"
-
-
-def chart_waiting_name(chart_name: str) -> str:
-    """The component name of the line a chart shows while its window holds
-    no value to plot."""
-    return f"node_dashboard_chart_{chart_name}_waiting"
-
-
-def chart_waiting_text(chart: NodeDashboardChart) -> str:
-    """The line a chart shows while its window holds no value to plot."""
-    return f"{chart.title}: {WAITING_FOR_VALUE_TEXT}"
-
-
-def chart_section(
-    chart: NodeDashboardChart,
-    window_seconds: float,
-    display_mode: TerminalDisplayMode,
-    right_border: str | None,
-) -> Section:
-    """One third-width chart of the last ``window_seconds`` of samples, as
-    the run UI plots its completions: seconds into the window across (the
-    newest sample at ``window_seconds``), the chart's values up. The time
-    axis is named by the window alone: the scatter plot narrows its plot by
-    the width of its axis labels.
-
-    The section opens on a line naming the chart and saying it waits for a
-    value -- a plot with no point draws nothing at all, not even its axes --
-    and the dashboard switches to the plot while its window holds values."""
+def chart_section(layout: NodeDashboardLayout, display_mode: TerminalDisplayMode) -> Section:
+    """The role's one chart, padded and centered as the run UI's chart:
+    every series of the layout in one plot, seconds across and the series'
+    shared unit up, with a legend naming each series in its color."""
     return Section(
         SectionConfig(
-            width="small",
-            height="x-small",
+            width="large",
+            height="medium",
+            height_rows=chart_rows,
             left_border="|",
-            right_border=right_border,
-            top_border="-",
             bottom_border="-",
-            left_padding=1,
-            right_padding=1,
+            left_padding=4,
+            right_padding=4,
             horizontal_alignment="center",
             mode=display_mode,
         ),
         components=[
-            Text(
-                chart_waiting_name(chart.name),
-                TextConfig(
-                    text=chart_waiting_text(chart),
-                    color=chart.color,
-                    horizontal_alignment="center",
-                    terminal_mode=display_mode,
-                ),
-                subscriptions=[chart_waiting_channel(chart.name)],
-            ),
             ScatterPlot(
-                chart_plot_name(chart.name),
+                CHART_COMPONENT_NAME,
                 PlotConfig(
-                    plot_name=chart.title,
-                    x_axis_name=f"{window_seconds:g}s",
-                    y_axis_name=chart.title,
-                    line_color=chart.color,
+                    plot_name=layout.chart_unit,
+                    x_axis_name="Time (sec)",
+                    y_axis_name=layout.chart_unit,
                     point_char="dot",
                     terminal_mode=display_mode,
+                    series=[
+                        PlotSeries(name=chart.title, color=chart.color, point_char=chart.point_char)
+                        for chart in layout.charts
+                    ],
                 ),
-                subscriptions=[chart_channel(chart.name)],
+                subscriptions=[CHART_CHANNEL],
             )
         ],
     )
 
 
-def closes_chart_row(chart_index: int, last_chart_index: int) -> bool:
-    """Whether the chart at ``chart_index`` is the last of its row: the
-    third of it, or the last chart (which widens to fill its row)."""
-    return chart_index % SECTIONS_PER_ROW == SECTIONS_PER_ROW - 1 or chart_index == last_chart_index
+def readings_section(display_mode: TerminalDisplayMode) -> Section:
+    """Beside the chart, as the run UI's statistics table beside its own:
+    each series' newest value, and the role's values in other units."""
+    return Section(
+        SectionConfig(
+            width="small",
+            height="medium",
+            height_rows=chart_rows,
+            left_border="|",
+            right_border="|",
+            bottom_border="-",
+            left_padding=2,
+            right_padding=2,
+            mode=display_mode,
+        ),
+        components=[
+            MultilineText(
+                READINGS_COMPONENT_NAME,
+                MultilineTextConfig(
+                    text=[WAITING_TEXT],
+                    color="aquamarine_2",
+                    horizontal_alignment="left",
+                    terminal_mode=display_mode,
+                ),
+                subscriptions=[READINGS_CHANNEL],
+            )
+        ],
+    )
 
 
-def chart_sections(
+def node_dashboard_table_config(layout: NodeDashboardLayout, display_mode: TerminalDisplayMode) -> TableConfig:
+    """The role's table: its columns, each sized to its content -- the
+    first column (a worker's address, a workflow's or a datacenter's name)
+    is never cut; on a narrow terminal the columns are dropped from the
+    right, the lowest priority last -- paging its rows when there are more
+    than it has room for."""
+    return TableConfig(
+        headers=layout.table_headers,
+        size_columns_to_content=True,
+        border_color="aquamarine_2",
+        terminal_mode=display_mode,
+        table_format="simple",
+    )
+
+
+def table_section(
     layout: NodeDashboardLayout,
-    window_seconds: float,
+    table_config: TableConfig,
     display_mode: TerminalDisplayMode,
-) -> list[Section]:
-    """The role's charts, three to a row; the last of a row (and the last
-    chart, which widens to fill its row) closes it with a right border."""
-    last_chart_index = len(layout.charts) - 1
-    return [
-        chart_section(
-            chart,
-            window_seconds,
-            display_mode,
-            "|" if closes_chart_row(chart_index, last_chart_index) else None,
-        )
-        for chart_index, chart in enumerate(layout.charts)
-    ]
-
-
-def table_section(layout: NodeDashboardLayout, display_mode: TerminalDisplayMode) -> Section:
-    """The role's table across the canvas below its charts: its columns
-    need the width (a third of the canvas clips a worker's address), and
-    the table cycles its rows when there are more than its height holds."""
+) -> Section:
+    """The role's table across the canvas below its chart, given every row
+    the other sections leave: its columns need the width (a third of the
+    canvas clips a worker's address), and it pages its rows when there are
+    more than its height holds."""
     return Section(
         SectionConfig(
             width="full",
             height="xx-small",
+            height_rows=table_rows,
             left_border="|",
             right_border="|",
-            top_border="-",
             bottom_border="-",
             left_padding=1,
             right_padding=1,
@@ -207,13 +197,7 @@ def table_section(layout: NodeDashboardLayout, display_mode: TerminalDisplayMode
         components=[
             Table(
                 f"node_dashboard_{layout.role}_table",
-                TableConfig(
-                    headers=layout.table_headers,
-                    minimum_column_width=8,
-                    border_color="aquamarine_2",
-                    terminal_mode=display_mode,
-                    table_format="simple",
-                ),
+                table_config,
                 subscriptions=[TABLE_CHANNEL],
             )
         ],
@@ -226,10 +210,9 @@ def status_section(display_mode: TerminalDisplayMode) -> Section:
         SectionConfig(
             width="full",
             height="smallest",
-            max_height=STATUS_MAX_HEIGHT,
+            height_rows=status_rows,
             left_border="|",
             right_border="|",
-            top_border="-",
             bottom_border="-",
             left_padding=1,
             right_padding=1,
@@ -247,20 +230,23 @@ def status_section(display_mode: TerminalDisplayMode) -> Section:
 
 def generate_node_dashboard_sections(
     layout: NodeDashboardLayout,
-    window_seconds: float,
+    table_config: TableConfig,
     display_mode: TerminalDisplayMode,
 ) -> list[Section]:
     """The sections of a node's dashboard, laid out as `run workflow`'s:
     the Hyperscale header with the node's identity; the cluster panel and
-    the role's summary and detail panels; the role's charts over the last
-    ``window_seconds``, three to a row; the role's table; and a status line
-    naming where the node's logs go (or a sampling failure)."""
+    the role's summary and detail panels; the role's chart beside its
+    newest readings; the role's table (configured by ``table_config``);
+    and a status line naming where the node's logs go (or a sampling
+    failure). Each takes its rows of the canvas (node_dashboard_rows), so
+    together they fill it exactly."""
     return [
         *header_sections(display_mode),
         panel_section("node_dashboard_cluster", CLUSTER_CHANNEL, display_mode, None),
         panel_section("node_dashboard_summary", SUMMARY_CHANNEL, display_mode, None),
         panel_section("node_dashboard_detail", DETAIL_CHANNEL, display_mode, "|"),
-        *chart_sections(layout, window_seconds, display_mode),
-        table_section(layout, display_mode),
+        chart_section(layout, display_mode),
+        readings_section(display_mode),
+        table_section(layout, table_config, display_mode),
         status_section(display_mode),
     ]

@@ -7,7 +7,7 @@ from hyperscale.distributed.slo import LatencyObservation
 from hyperscale.ui.components.table.table_config import HeaderOptions
 
 from .counter_rates import CounterRates
-from .dashboard_formatting import cluster_lines, count_statuses, in_use_percent
+from .dashboard_formatting import cluster_lines, count_statuses, format_reading, in_use_percent
 from .job_workflow_tally import JobWorkflowTally
 from .models import NodeDashboardChart, NodeDashboardFrame, NodeDashboardLayout, TableRow
 from .node_identity_reader import NodeIdentityReader
@@ -22,12 +22,18 @@ MANAGER_DASHBOARD_LAYOUT = NodeDashboardLayout(
         "load": HeaderOptions(default="-"),
         "p95 ms": HeaderOptions(default="-", precision_format=".1f"),
     },
+    # Workflows dispatched, completed and failed are all workflows a
+    # second: one axis. The share of cores in use (percent) and the
+    # dispatch round trip (milliseconds) are not, and are listed beside it.
+    chart_unit="wf /s",
+    # Declared failures first: where series share a cell the later one is
+    # drawn (ScatterPlot), so a run of zero failures never hides the small
+    # rates above it, while any nonzero failure rate lands on cells of its
+    # own; every series' value is also listed beside the chart.
     charts=(
-        NodeDashboardChart("dispatches", "dispatches /s", "aquamarine_2"),
-        NodeDashboardChart("completions", "completed wf /s", "aquamarine_2"),
-        NodeDashboardChart("failures", "failed wf /s", "hot_pink_3"),
-        NodeDashboardChart("cores_in_use", "cores in use %", "royal_blue"),
-        NodeDashboardChart("dispatch_latency", "dispatch p95 ms", "hot_pink_3"),
+        NodeDashboardChart("failures", "failed", "hot_pink_3", "x"),
+        NodeDashboardChart("completions", "completed", "royal_blue", "circle_toggle"),
+        NodeDashboardChart("dispatches", "dispatched", "aquamarine_2", "dot"),
     ),
 )
 
@@ -126,30 +132,35 @@ class ManagerDashboardReader:
         jobs = manager._job_manager.iter_jobs()
         dispatch_latencies = manager._manager_state.get_worker_dispatch_latency_observations(sampled_at)
         return NodeDashboardFrame(
-            identity_lines=self._identity.identity_lines(
-                manager._manager_state.manager_state_enum.name.lower(),
-                manager._overload_detector.current_state.name.lower(),
+            identity_lines=self._identity.identity_lines(),
+            lifecycle_state=manager._manager_state.manager_state_enum.name.lower(),
+            uptime_seconds=self._identity.uptime_seconds(),
+            cluster_lines=cluster_lines(
+                manager._cluster_membership,
+                [
+                    *self._identity.swim_lines(),
+                    *self._identity.health_lines(manager._overload_detector.current_state.name.lower()),
+                ],
             ),
-            cluster_lines=cluster_lines(manager._cluster_membership, self._identity.swim_lines()),
             summary_lines=self._worker_lines(total_cores, free_cores),
             detail_lines=self._job_lines(jobs),
             table_rows=[worker_row(worker, dispatch_latencies) for worker in workers],
-            chart_values=self._chart_values(in_use_percent(total_cores, free_cores), jobs, sampled_at),
+            chart_values=self._chart_values(jobs, sampled_at),
+            value_lines=[
+                f"cores in use % {format_reading(in_use_percent(total_cores, free_cores))}",
+                f"dispatch p95 ms {format_reading(self._datacenter_p95_ms(sampled_at))}",
+            ],
             sampled_at=sampled_at,
         )
 
-    def _chart_values(self, cores_in_use_percent: float, jobs: list[JobInfo], sampled_at: float) -> list[float | None]:
-        manager = self._manager
+    def _chart_values(self, jobs: list[JobInfo], sampled_at: float) -> list[float | None]:
         self._workflow_tally.advance(jobs)
-        rates = self._rates.advance(dispatch_counts(manager, self._workflow_tally), sampled_at)
-        datacenter_latency = manager._manager_state.get_dispatch_latency_observation(sampled_at)
-        return [
-            rates["dispatches"],
-            rates["completions"],
-            rates["failures"],
-            cores_in_use_percent,
-            None if datacenter_latency is None else datacenter_latency.p95_ms,
-        ]
+        rates = self._rates.advance(dispatch_counts(self._manager, self._workflow_tally), sampled_at)
+        return [rates["failures"], rates["completions"], rates["dispatches"]]
+
+    def _datacenter_p95_ms(self, sampled_at: float) -> float | None:
+        datacenter_latency = self._manager._manager_state.get_dispatch_latency_observation(sampled_at)
+        return None if datacenter_latency is None else datacenter_latency.p95_ms
 
     def _worker_lines(self, total_cores: int, free_cores: int) -> list[str]:
         manager_state = self._manager._manager_state

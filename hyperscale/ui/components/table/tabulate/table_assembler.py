@@ -76,6 +76,9 @@ class TableAssembler:
         self.columns_size = column_size
         self.columns_count = columns_count
         self.max_width = max_width
+        # Each visible column's width, where a table sizes its columns to
+        # their content; None gives every column ``columns_size``.
+        self.column_sizes: list[int] | None = None
 
         if field_format_map is None:
             field_format_map = {}
@@ -1015,6 +1018,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                 )
                 for idx in range(self.columns_count)
             ]
@@ -1035,6 +1039,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                 )
                 for idx in range(self.columns_count)
             ]
@@ -1055,6 +1060,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                 )
                 for idx in range(self.columns_count)
             ]
@@ -1075,6 +1081,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                 )
                 for idx in range(self.columns_count)
             ]
@@ -1096,6 +1103,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                     header_key=header,
                     color_map=self._header_color_map,
                     is_header=True,
@@ -1123,6 +1131,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                     header_key=headers[idx],
                     color_map=self._data_color_map,
                 )
@@ -1136,6 +1145,7 @@ class TableAssembler:
         self,
         charset: TableBorderCharset | None,
         position_type: CharsetPositionType,
+        column_size: int,
     ):
         if charset is None or (charset.charset_type in self._border_charset.hide_lines):
             return None
@@ -1145,7 +1155,7 @@ class TableAssembler:
             position_type,
         )
 
-        fill_size = self.columns_size - border_length
+        fill_size = column_size - border_length
 
         match position_type:
             case CharsetPositionType.START:
@@ -1180,6 +1190,7 @@ class TableAssembler:
         header_key: str | None = None,
         color_map: HeaderColorMap | DataColorMap | None = None,
         is_header: bool = False,
+        column_size: int = 0,
     ):
         if data is None:
             data = self._field_default_map.get(header_key)
@@ -1199,6 +1210,7 @@ class TableAssembler:
         ) = self._calculate_padding(
             data_length,
             border_length,
+            column_size,
             is_header=is_header,
         )
 
@@ -1328,16 +1340,17 @@ class TableAssembler:
         self,
         header_length: int,
         border_length: int,
+        column_size: int,
         is_header: bool = False,
     ):
-        padding_total = self.columns_size - header_length - border_length
+        padding_total = column_size - header_length - border_length
         adjusted_header_length = 0
 
         if padding_total < 0:
             difference = abs(padding_total)
             adjusted_header_length = header_length - difference
 
-            padding_total = self.columns_size - adjusted_header_length - border_length
+            padding_total = column_size - adjusted_header_length - border_length
 
         padding_left = 0
         padding_right = 0
@@ -1474,8 +1487,28 @@ class TableAssembler:
 
         return len(charset.end_char)
 
+    def column_size(self, index: int) -> int:
+        """The width of the visible column at ``index``."""
+        if self.column_sizes is None:
+            return self.columns_size
+
+        return self.column_sizes[index]
+
+    def cell_text(self, data: TableCell, header_key: str) -> str:
+        """A cell's text as the table draws it: its column's default for a
+        missing value, then formatted."""
+        return self._convert_cell_to_string(self._field_default_map.get(header_key) if data is None else data, header_key)
+
+    def cell_border_length(self, index: int, count: int) -> int:
+        """The border characters a data cell at ``index`` of ``count``
+        visible columns takes besides its text."""
+        return self._calculate_border_length(self._border_charset.data_row, self._position_type_of(index, count))
+
     def _calculate_position_type(self, idx: int):
-        last_idx = self.columns_count - 1
+        return self._position_type_of(idx, self.columns_count)
+
+    def _position_type_of(self, idx: int, count: int):
+        last_idx = count - 1
 
         if idx == 0:
             return CharsetPositionType.START

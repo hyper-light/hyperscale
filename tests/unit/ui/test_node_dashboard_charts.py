@@ -1,16 +1,19 @@
 """
 The node dashboards render as `run workflow`'s UI does: the Hyperscale
-header with the node's identity, the role's panels, a chart per series the
-role's reader samples, and the role's table.
+header with the node's identity, the role's panels, the role's one chart
+of its series in a shared unit (a legend naming each) beside each series'
+newest value and the role's values in other units, and the role's table --
+every section sized from the canvas so the whole fits the terminal.
 
 Each test builds a real node (constructed, never started) on a clock the
 test moves by hand, puts known state into it -- a registered worker,
 dispatches and their round trips, jobs, datacenter heartbeats -- and reads
-it twice through the role's reader: once directly, asserting each chart's
-exact value, and once through a "ci" dashboard rendering into a pipe that
-stands in for the terminal, asserting the header, each chart (its title
-and the top of its value axis, which the scatter plot scales to 1.1 times
-the largest value it plots, rounded up) and the table rows.
+it twice through the role's reader: once directly, asserting each series'
+exact value and the other values' lines, and once through a "ci" dashboard
+rendering into a pipe that stands in for the terminal, asserting the
+header, the legend, every reading, the top of the chart's value axis (the
+scatter plot scales it to 1.1 times the largest value of any series,
+rounded up) and the table rows.
 
 The clock stands still while the dashboard renders: the rates the first
 sample computes (over the interval the test advanced) are the only rate
@@ -21,6 +24,7 @@ sample).
 """
 
 import asyncio
+import itertools
 import math
 import pathlib
 import re
@@ -41,7 +45,9 @@ from hyperscale.distributed.nodes import GateServer, ManagerServer, WorkerServer
 from hyperscale.distributed.reliability.backpressure_level import BackpressureLevel
 from hyperscale.distributed.swim.health_aware_server import HealthAwareServer
 from hyperscale.logging import Logger
-from hyperscale.ui.components.scatter_plot import PlotConfig, ScatterPlot
+from hyperscale.ui.components.scatter_plot import PlotConfig, PlotSeries, ScatterPlot
+from hyperscale.ui.components.scatter_plot.point_char import PointChar
+from hyperscale.ui.components.terminal.canvas import Canvas
 from hyperscale.ui.hyperscale_header import create_hyperscale_header
 from hyperscale.ui.node_dashboard import (
     GateDashboardReader,
@@ -51,7 +57,16 @@ from hyperscale.ui.node_dashboard import (
     NodeDashboardReader,
     WorkerDashboardReader,
 )
+from hyperscale.ui.node_dashboard.models import NodeDashboardLayout
 from hyperscale.ui.node_dashboard.node_dashboard_chart_series import NodeDashboardChartSeries
+from hyperscale.ui.node_dashboard.node_dashboard_rows import IDENTITY_LINE_COUNT, table_rows
+from hyperscale.ui.node_dashboard.node_dashboard_sections import (
+    CHART_COMPONENT_NAME,
+    IDENTITY_COMPONENT_NAME,
+    generate_node_dashboard_sections,
+    node_dashboard_table_config,
+)
+from hyperscale.ui.components.terminal.terminal import canvas_size as terminal_canvas_size
 from tests.integration.cli.node_processes import reserve_port_blocks, worker_port_span
 from tests.integration.ui.node_dashboard_harness import (
     dashboard_env,
@@ -72,6 +87,13 @@ SAMPLED_INTERVAL_SECONDS = 2.0
 # The scatter plot scales its value axis to this multiple of the largest
 # value it plots (ScatterPlot._generate_x_and_y_vals), as the run UI's chart.
 VALUE_AXIS_HEADROOM = 1.1
+# The terminal sizes the layout must fit without clipping: the smallest it
+# is built for, a shorter one, and a roomy one.
+TERMINAL_SIZES = ((120, 38), (120, 30), (120, 22), (160, 48))
+# The padding the dashboard renders with (NodeDashboard).
+HORIZONTAL_PADDING = 4
+VERTICAL_PADDING = 1
+LAYOUTS = (ManagerDashboardReader.layout, WorkerDashboardReader.layout, GateDashboardReader.layout)
 
 
 class HandClock:
@@ -102,21 +124,36 @@ def plain_lines(frame: str) -> list[str]:
     return ANSI_SEQUENCE.sub("", frame).split("\n")
 
 
-def chart_axis_top(frame: str, title: str) -> str:
-    """The top label of the value axis of the chart titled ``title``: the
-    line below its title, from the title's column."""
+def value_axis_labels(frame: str, title: str) -> list[str]:
+    """The value-axis labels of the chart titled ``title``, top down (the
+    rows without a label left out)."""
     lines = plain_lines(frame)
-    title_marker = f"({title}) ^"
-    title_line_indexes = [index for index, line in enumerate(lines) if title_marker in line]
+    # The plot centers a short title in its axis' label column.
+    title_marker = re.compile(rf"\({re.escape(title)}\)\s*\^")
+    title_line_indexes = [index for index, line in enumerate(lines) if title_marker.search(line)]
     assert len(title_line_indexes) == 1, f"no chart titled {title!r}:\n" + "\n".join(lines)
     title_line_index = title_line_indexes[0]
-    title_column = lines[title_line_index].index(title_marker)
-    axis_line = lines[title_line_index + 1][title_column:]
-    return axis_line.split("|", 1)[0].strip()
+    title_column = title_marker.search(lines[title_line_index]).start()
+    axis_lines = itertools.takewhile(
+        lambda line: not line[title_column:].split("|", 1)[0].strip().startswith("-"), lines[title_line_index + 1 :]
+    )
+    return [label for line in axis_lines if (label := line[title_column:].split("|", 1)[0].strip())]
 
 
-def expected_axis_top(largest_value: float) -> str:
-    return str(math.ceil(largest_value * VALUE_AXIS_HEADROOM))
+def assert_nice_value_axis(labels: list[str], largest_value: float) -> None:
+    """The labels step evenly at a nice step (1, 2 or 5 times a power of
+    ten) with just the decimals that tell them apart, from 0 to a top at
+    least 1.1 times the largest value (plotille draws no point on an
+    axis' maximum)."""
+    values = [float(label) for label in labels]
+    steps = {round(upper - lower, 9) for upper, lower in zip(values, values[1:])}
+    assert len(steps) == 1, labels
+    (step,) = steps
+    mantissa = step / 10 ** math.floor(math.log10(step))
+    assert round(mantissa, 9) in (1.0, 2.0, 5.0), labels
+    decimals = max(-math.floor(math.log10(step)), 0)
+    assert labels == [f"{value:.{decimals}f}" for value in values], labels
+    assert values[-1] == 0.0 and values[0] >= largest_value * VALUE_AXIS_HEADROOM, labels
 
 
 async def header_lines() -> list[str]:
@@ -155,15 +192,31 @@ async def render_dashboard(
     return frame
 
 
-async def assert_header_and_charts(frame: str, reader: NodeDashboardReader, chart_tops: dict[str, str]) -> None:
+def legend(reader: NodeDashboardReader) -> str:
+    """The chart's legend: each series' point character and title."""
+    return "  ".join(f"{PointChar.by_name(chart.point_char)} {chart.title}" for chart in reader.layout.charts)
+
+
+async def assert_header_chart_and_readings(
+    frame: str,
+    reader: NodeDashboardReader,
+    readings: list[str],
+    largest_value: float | None,
+) -> None:
+    """The frame shows the Hyperscale header, the chart's legend (and the
+    nice value axis above ``largest_value``, where it plots any value), and
+    every reading; where it plots any value, a nice value axis above
+    ``largest_value``."""
     plain_frame = "\n".join(plain_lines(frame))
     for header_line in await header_lines():
         assert header_line in plain_frame, f"the Hyperscale header is missing {header_line!r}:\n{plain_frame}"
 
-    for chart in reader.layout.charts:
-        assert chart_axis_top(frame, chart.title) == chart_tops[chart.name], (
-            f"chart {chart.title!r} plots the wrong values:\n{plain_frame}"
-        )
+    assert legend(reader) in plain_frame, f"the legend is missing:\n{plain_frame}"
+    for reading in readings:
+        assert reading in plain_frame, f"the reading {reading!r} is missing:\n{plain_frame}"
+
+    if largest_value is not None:
+        assert_nice_value_axis(value_axis_labels(frame, reader.layout.chart_unit), largest_value)
 
 
 async def registered_manager(tmp_path: pathlib.Path, clock: HandClock) -> tuple[ManagerServer, int]:
@@ -201,7 +254,7 @@ def add_job(manager: ManagerServer, job_id: str) -> JobInfo:
     return job
 
 
-async def test_the_manager_dashboard_charts_its_dispatches_completions_cores_and_latency(
+async def test_the_manager_dashboard_charts_its_dispatches_and_lists_cores_and_latency(
     tmp_path: pathlib.Path,
 ) -> None:
     clock = HandClock()
@@ -217,22 +270,18 @@ async def test_the_manager_dashboard_charts_its_dispatches_completions_cores_and
     for _ in range(manager._manager_state._slo_config.min_sample_count):
         manager._manager_state.record_dispatch_latency("worker-dash", 40.0, clock.now)
 
-    chart_values = reader.read().chart_values
-    assert chart_values == [50.0, 10.0, 4.0, 75.0, 40.0]
+    frame_read = reader.read()
+    assert frame_read.chart_values == [4.0, 10.0, 50.0]
+    assert frame_read.value_lines == ["cores in use % 75.0", "dispatch p95 ms 40.0"]
 
     frame = await render_dashboard(
-        rendered_reader, manager, tmp_path, "(dispatches /s) ^", "(dispatch p95 ms) ^", f"127.0.0.1:{worker_port}"
+        rendered_reader, manager, tmp_path, "(wf /s)", "dispatched 50.0", f"127.0.0.1:{worker_port}"
     )
-    await assert_header_and_charts(
+    await assert_header_chart_and_readings(
         frame,
         reader,
-        {
-            "dispatches": expected_axis_top(50.0),
-            "completions": expected_axis_top(10.0),
-            "failures": expected_axis_top(4.0),
-            "cores_in_use": expected_axis_top(75.0),
-            "dispatch_latency": expected_axis_top(40.0),
-        },
+        ["dispatched 50.0", "completed 10.0", "failed 4.0", "cores in use % 75.0", "dispatch p95 ms 40.0"],
+        50.0,
     )
     worker_row = next(line for line in plain_lines(frame) if f"127.0.0.1:{worker_port}" in line)
     assert worker_row.split() == ["|", f"127.0.0.1:{worker_port}", "healthy", "8", "2", "healthy", "40.0", "|"]
@@ -241,31 +290,32 @@ async def test_the_manager_dashboard_charts_its_dispatches_completions_cores_and
 
 async def test_a_chart_with_no_value_is_not_plotted_as_zero(tmp_path: pathlib.Path) -> None:
     # No dispatch has had its round trip timed: the latency chart has no
-    # point to plot (a gap, not a zero latency), and the worker's p95 cell
-    # keeps its default.
+    # point to plot (a gap, not a zero latency), its reading shows no value,
+    # and the worker's p95 cell keeps its default.
     clock = HandClock()
     manager, worker_port = await registered_manager(tmp_path, clock)
     reader = ManagerDashboardReader(manager)
     rendered_reader = ManagerDashboardReader(manager)
     clock.now += SAMPLED_INTERVAL_SECONDS
 
-    assert reader.read().chart_values == [0.0, 0.0, 0.0, 75.0, None]
+    frame_read = reader.read()
+    assert frame_read.chart_values == [0.0, 0.0, 0.0]
+    assert frame_read.value_lines == ["cores in use % 75.0", "dispatch p95 ms -"]
 
     frame = await render_dashboard(
         rendered_reader,
         manager,
         tmp_path,
-        "(dispatches /s) ^",
-        "(cores in use %) ^",
-        "dispatch p95 ms: no value yet",
+        "(wf /s)",
+        "cores in use % 75.0",
+        "dispatch p95 ms -",
         f"127.0.0.1:{worker_port}",
     )
-    assert "(dispatch p95 ms) ^" not in frame
     worker_row = next(line for line in plain_lines(frame) if f"127.0.0.1:{worker_port}" in line)
     assert worker_row.split()[-2] == "-"
 
 
-async def test_the_worker_dashboard_charts_its_workflows_cores_throughput_and_backpressure(
+async def test_the_worker_dashboard_charts_its_ended_workflows_and_lists_its_load(
     tmp_path: pathlib.Path,
 ) -> None:
     clock = HandClock()
@@ -295,18 +345,14 @@ async def test_the_worker_dashboard_charts_its_workflows_cores_throughput_and_ba
     worker._worker_state._throughput_last_value = 2.5
     worker._worker_state.set_manager_backpressure("manager-dash", BackpressureLevel.BATCH)
 
-    assert reader.read().chart_values == [1.0, 75.0, 2.5, float(BackpressureLevel.BATCH)]
+    # Its clock has not moved since the reader began: no rate yet.
+    frame_read = reader.read()
+    assert frame_read.chart_values == [None, None]
+    assert frame_read.value_lines == ["active workflows 1", "cores busy % 75.0"]
 
-    frame = await render_dashboard(reader, worker, tmp_path, "(backpressure level) ^", "DashWorkflow")
-    await assert_header_and_charts(
-        frame,
-        reader,
-        {
-            "active_workflows": expected_axis_top(1.0),
-            "cores_busy": expected_axis_top(75.0),
-            "throughput": expected_axis_top(2.5),
-            "backpressure": expected_axis_top(float(BackpressureLevel.BATCH)),
-        },
+    frame = await render_dashboard(reader, worker, tmp_path, "(wf /s)", "cores busy % 75.0", "DashWorkflow")
+    await assert_header_chart_and_readings(
+        frame, reader, ["completed -", "failed -", "active workflows 1", "cores busy % 75.0"], None
     )
     workflow_row = next(line for line in plain_lines(frame) if "DashWorkflow" in line)
     assert workflow_row.split() == ["|", "DashWorkflow", "running", "42", "1", "7.5", "0", "|"]
@@ -347,7 +393,7 @@ def hold_job(gate: GateServer, job_id: str, status: str) -> None:
     gate._job_manager.set_job(job_id, GlobalJobStatus(job_id=job_id, status=status))
 
 
-async def test_the_gate_dashboard_charts_its_jobs_datacenters_and_their_latency(tmp_path: pathlib.Path) -> None:
+async def test_the_gate_dashboard_charts_its_jobs_and_lists_its_datacenters(tmp_path: pathlib.Path) -> None:
     clock = HandClock()
     gate_port, east_manager_port, west_manager_port = reserve_port_blocks([2, 2, 2])
     gate = GateServer(
@@ -376,21 +422,18 @@ async def test_the_gate_dashboard_charts_its_jobs_datacenters_and_their_latency(
 
     # Four jobs admitted (three running, one already failed), one completed
     # and one failed over the interval; both datacenters accept jobs.
-    assert reader.read().chart_values == [2.0, 0.5, 0.5, 2.0, 90.0]
+    frame_read = reader.read()
+    assert frame_read.chart_values == [0.5, 0.5, 2.0]
+    assert frame_read.value_lines == ["DCs accepting 2", "worst DC p95 ms 90.0"]
 
     frame = await render_dashboard(
-        rendered_reader, gate, tmp_path, "(jobs admitted /s) ^", "(worst DC p95 ms) ^", "DC-EAST", "DC-WEST"
+        rendered_reader, gate, tmp_path, "(jobs /s)", "worst DC p95 ms 90.0", "DC-EAST", "DC-WEST"
     )
-    await assert_header_and_charts(
+    await assert_header_chart_and_readings(
         frame,
         reader,
-        {
-            "admitted": expected_axis_top(2.0),
-            "completed": expected_axis_top(0.5),
-            "failed": expected_axis_top(0.5),
-            "accepting": expected_axis_top(2.0),
-            "dispatch_latency": expected_axis_top(90.0),
-        },
+        ["admitted 2.0", "completed 0.5", "failed 0.5", "DCs accepting 2", "worst DC p95 ms 90.0"],
+        2.0,
     )
     datacenter_rows = {
         cells[1]: cells for line in plain_lines(frame) if len(cells := line.split()) > 2 and cells[1].startswith("DC-")
@@ -426,18 +469,29 @@ async def test_manager_rates_count_only_what_happened_since_the_last_sample(tmp_
     assert reader.read().chart_values[:3] == [None, None, None]
 
 
-def test_chart_series_hold_one_window_and_plot_the_newest_at_its_end() -> None:
+def test_chart_series_hold_one_window_and_plot_seconds_since_its_oldest_sample() -> None:
     # A window of ten seconds sampled each second holds ten samples, however
-    # long the node runs: the newest plots at the window's end, the oldest
-    # held one interval past its start, and a gap is left out.
+    # long the node runs; each plots at its seconds since the oldest sample
+    # in the window (as the run UI plots seconds since its run began), every
+    # chart from the same sample, and a gap is left out.
     series = NodeDashboardChartSeries(window_seconds=10.0, sample_interval_seconds=1.0)
     for second in range(25):
         series.record(float(second), [float(second), None if second % 2 else float(second)])
 
-    assert series.points(0) == [(float(place), float(second)) for place, second in zip(range(1, 11), range(15, 25))]
+    assert series.points(0) == [(float(place), float(second)) for place, second in zip(range(10), range(15, 25))]
     assert series.points(1) == [
-        (float(place), float(second)) for place, second in zip(range(2, 11, 2), range(16, 25, 2))
+        (float(place), float(second)) for place, second in zip(range(1, 10, 2), range(16, 25, 2))
     ]
+
+
+def test_a_dashboard_started_moments_ago_spreads_its_samples_from_zero() -> None:
+    # Three samples of a ten second window: they span 0 to 2 seconds, not
+    # the window's last two seconds (which crams them into one column).
+    series = NodeDashboardChartSeries(window_seconds=10.0, sample_interval_seconds=1.0)
+    for second in range(100, 103):
+        series.record(float(second), [float(second)])
+
+    assert series.points(0) == [(0.0, 100.0), (1.0, 101.0), (2.0, 102.0)]
 
 
 async def test_a_largest_value_under_five_is_drawn() -> None:
@@ -455,32 +509,113 @@ async def test_a_largest_value_under_five_is_drawn() -> None:
     lines, rendered = await plot.get_next_frame()
 
     assert rendered
-    value_row = next(line for line in lines if line.split("|", 1)[0].strip() == "1")
+    value_row = next(line for line in lines if line.split("|", 1)[0].strip() in ("1", "1.0"))
     assert "\u25cf" in ANSI_SEQUENCE.sub("", value_row), (
         "the points at the largest value were not drawn:\n" + "\n".join(lines)
     )
 
 
-async def test_a_chart_whose_window_empties_shows_it_waits_again(tmp_path: pathlib.Path) -> None:
-    # The latency chart plots while its window holds observations; once the
-    # last one is older than the window (the node went idle) it shows that
-    # it waits again, never its stale points.
-    clock = HandClock()
-    manager, _ = await registered_manager(tmp_path, clock)
-    for _ in range(manager._manager_state._slo_config.min_sample_count):
-        manager._manager_state.record_dispatch_latency("worker-dash", 40.0, clock.now)
-    reader = ManagerDashboardReader(manager)
-    env = dashboard_env(tmp_path)
+def canvas_size(columns: int, lines: int) -> tuple[int, int]:
+    """The canvas a terminal of ``columns`` x ``lines`` gives the
+    dashboard, as Terminal sizes it."""
+    return terminal_canvas_size(columns, lines, HORIZONTAL_PADDING, VERTICAL_PADDING)
 
-    async with terminal_pipe() as collected:
-        dashboard = NodeDashboard(reader, manager, "ci", env, tmp_path / "node.log", NodeDashboardConfig(), Logger())
-        await dashboard.start()
-        try:
-            await wait_for_frame(collected, "(dispatch p95 ms) ^")
-            clock.now += 2 * env.SLO_EVALUATION_WINDOW_SECONDS
-            frame = await wait_for_frame(collected, "dispatch p95 ms: no value yet")
-        finally:
-            await dashboard.stop()
 
-    assert "(dispatch p95 ms) ^" not in frame
-    assert dashboard_tasks() == []
+async def dashboard_canvas(layout: NodeDashboardLayout, columns: int, lines: int) -> Canvas:
+    """``layout``'s dashboard laid out for a ``columns`` x ``lines``
+    terminal, before any sample."""
+    canvas = Canvas(
+        generate_node_dashboard_sections(
+            layout, node_dashboard_table_config(layout, "compatability"), "compatability"
+        )
+    )
+    canvas_width, canvas_height = canvas_size(columns, lines)
+    await canvas.initialize(width=canvas_width, height=canvas_height)
+    return canvas
+
+
+async def test_the_layout_fills_the_terminal_exactly_and_gives_the_table_what_is_left() -> None:
+    # Every section takes its rows of the canvas: together they fill it
+    # (nothing passes its bottom), the header row holds the identity column
+    # unpaged, and the table takes every row the others leave.
+    for layout in LAYOUTS:
+        for columns, lines in TERMINAL_SIZES:
+            canvas = await dashboard_canvas(layout, columns, lines)
+            canvas_width, canvas_height = canvas_size(columns, lines)
+            frame_lines = plain_lines((await canvas.render()).replace("\r", ""))
+            assert len(frame_lines) == canvas_height, (layout.role, columns, lines, "\n".join(frame_lines))
+            assert max(map(len, frame_lines)) == canvas_width
+            assert canvas.get_section(IDENTITY_COMPONENT_NAME).height >= IDENTITY_LINE_COUNT
+            assert canvas.get_section(f"node_dashboard_{layout.role}_table").height == table_rows(canvas_height)
+
+
+async def test_a_resize_lays_the_sections_out_again_for_the_new_size() -> None:
+    layout = ManagerDashboardReader.layout
+    canvas = await dashboard_canvas(layout, 160, 48)
+    for columns, lines in TERMINAL_SIZES:
+        canvas_width, canvas_height = canvas_size(columns, lines)
+        await canvas.initialize(width=canvas_width, height=canvas_height)
+        frame_lines = plain_lines((await canvas.render()).replace("\r", ""))
+        assert len(frame_lines) == canvas_height, (columns, lines)
+
+
+async def test_the_chart_holds_every_series_of_the_role_with_a_legend() -> None:
+    for layout in LAYOUTS:
+        canvas = await dashboard_canvas(layout, 120, 38)
+        chart_section = canvas.get_section(CHART_COMPONENT_NAME)
+        assert chart_section.component_names == [CHART_COMPONENT_NAME]
+        plot_lines, _ = await chart_section.component.get_next_frame()
+        plain_plot = [ANSI_SEQUENCE.sub("", line) for line in plot_lines]
+        assert plain_plot[0].strip() == "  ".join(
+            f"{PointChar.by_name(chart.point_char)} {chart.title}" for chart in layout.charts
+        )
+        assert any(f"({layout.chart_unit})" in line and line.rstrip().endswith("^") for line in plain_plot)
+        assert any(line.strip().startswith("Time (sec) |") for line in plain_plot)
+
+
+def series_plot(series_names: tuple[str, ...]) -> ScatterPlot:
+    return ScatterPlot(
+        "series_plot",
+        PlotConfig(
+            plot_name="per second",
+            x_axis_name="Time (sec)",
+            y_axis_name="per second",
+            series=[
+                PlotSeries(name=series_name, point_char=point_char)
+                for series_name, point_char in zip(series_names, ("dot", "x", "circle_toggle"))
+            ],
+        ),
+    )
+
+
+async def test_a_multi_series_plot_scales_to_every_series_and_the_later_series_wins_a_shared_cell() -> None:
+    plot = series_plot(("low", "high"))
+    await plot.fit(max_width=40, max_height=12)
+    await plot.get_next_frame()
+    await plot.update({"low": [(1.0, 1.0), (5.0, 2.0)], "high": [(5.0, 2.0), (3.0, 40.0)]})
+    lines, rendered = await plot.get_next_frame()
+    plain_plot = [ANSI_SEQUENCE.sub("", line) for line in lines]
+
+    assert rendered
+    assert plain_plot[0].strip() == f"{PointChar.by_name('dot')} low  {PointChar.by_name('x')} high"
+    # The value axis covers the higher series: a nice top above 1.1 x 40.
+    assert_nice_value_axis(value_axis_labels("\n".join(plain_plot), "per second"), 40.0)
+    plotted = "".join(plain_plot[3:])
+    # (5, 2) is in both series: the later one ("high", X) wins its cell,
+    # so "low" shows one point and "high" two.
+    assert plotted.count(PointChar.by_name("dot")) == 1, "\n".join(plain_plot)
+    assert plotted.count(PointChar.by_name("x")) == 2, "\n".join(plain_plot)
+    assert all(len(line) == 40 for line in plain_plot), "\n".join(plain_plot)
+
+
+async def test_a_multi_series_plot_with_no_points_draws_its_axes_and_legend() -> None:
+    plot = series_plot(("dispatched", "completed", "failed"))
+    await plot.fit(max_width=40, max_height=12)
+    lines, rendered = await plot.get_next_frame()
+    plain_plot = [ANSI_SEQUENCE.sub("", line) for line in lines]
+
+    assert rendered
+    assert "dispatched" in plain_plot[0] and "failed" in plain_plot[0]
+    assert any("(per second) ^" in line for line in plain_plot), "\n".join(plain_plot)
+    assert any(line.strip().startswith("Time (sec) |") for line in plain_plot)
+    assert len(plain_plot) <= 12

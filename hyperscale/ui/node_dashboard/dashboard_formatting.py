@@ -8,6 +8,18 @@ from hyperscale.distributed.cluster.models import ClusterMemberId
 # A formed cluster member that is not the leader follows it; before the
 # cluster forms, the formation stage itself is the member's role.
 CLUSTER_ROLE_BY_FORMATION: dict[str, str] = {"formed": "follower"}
+# A reading the node has no value for this sample, as the tables show a
+# cell they have no value for.
+NO_READING = "-"
+
+
+def format_reading(value: float | None) -> str:
+    """A reading as the dashboard shows it: to the tables' precision of
+    one decimal, or ``NO_READING`` when there is none."""
+    if value is None:
+        return NO_READING
+
+    return f"{value:.1f}"
 
 
 def format_duration(total_seconds: float) -> str:
@@ -39,16 +51,17 @@ def describe_leader(membership: ClusterMembership) -> str:
     return f"{leader.host}:{leader.port}"
 
 
-def cluster_lines(membership: ClusterMembership, swim_lines: list[str]) -> list[str]:
+def cluster_lines(membership: ClusterMembership, node_lines: list[str]) -> list[str]:
     """The cluster panel of a manager or gate: its membership role, the
-    leader, the voter/learner/cohort counts, and the SWIM view."""
+    leader, the voter/learner/cohort counts, then ``node_lines`` (the
+    node's SWIM view and local health)."""
     voter_count = len(membership.voters)
     return [
         f"CLUSTER {describe_cluster_role(membership)}",
         f"leader {describe_leader(membership)}",
         f"voters {voter_count} learners {len(membership.members) - voter_count}",
         f"cohort {len(membership.cohort)} {membership.formation}",
-        *swim_lines,
+        *node_lines,
     ]
 
 

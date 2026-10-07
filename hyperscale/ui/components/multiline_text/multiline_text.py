@@ -179,9 +179,13 @@ class MultilineText:
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
+        # Each update is the whole text, so only the newest one queued is
+        # drawn: a refit (which queues the configured text) followed by
+        # the replay of the last update shows that update, not one frame
+        # of the configured text first.
         text: list[str] | None = None
-        if self._updates.empty() is False:
-            text = await self._updates.get()
+        while self._updates.empty() is False:
+            text = self._updates.get_nowait()
 
         if self._update_lock.locked():
             self._update_lock.release()

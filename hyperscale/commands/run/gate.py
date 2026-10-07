@@ -121,7 +121,8 @@ async def gate(
     start_timeout_sec = TimeParser(boot_timeout).time
     shutdown_timeout_sec = TimeParser(shutdown_timeout).time
 
-    terminal_mode = await node_terminal_mode(config.data.terminal_mode, quiet)
+    terminal_selection = await node_terminal_mode(config.data.terminal_mode, quiet, GateDashboardReader.layout)
+    terminal_mode = terminal_selection.mode
     log_path = node_log_path(config.data.logs_directory, "gate", datacenter, host, tcp_port)
 
     # While the dashboard renders, stderr (the node's logs) goes to the log
@@ -156,6 +157,7 @@ async def gate(
                     log_path,
                     NodeDashboardConfig(),
                     Logger(),
+                    degraded_reason=terminal_selection.degraded_reason,
                 ),
                 drain_before_stop=True,
                 shutdown_timeout_seconds=shutdown_timeout_sec,

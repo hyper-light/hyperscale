@@ -17,6 +17,8 @@ from hyperscale.distributed.runtime import RealClock, RealFilesystem, RealRandom
 from hyperscale.distributed.swim.core.node_id import NodeId
 from hyperscale.distributed.taskex import TaskRunner
 from hyperscale.logging import Logger
+from hyperscale.ui.node_dashboard.models import NodeDashboardLayout, NodeTerminalSelection
+from hyperscale.ui.node_dashboard.terminal_capability import select_node_terminal_mode
 
 from .cluster_cookie import ClusterCookie
 from .cluster_cookie_unavailable_error import ClusterCookieUnavailableError
@@ -110,22 +112,16 @@ def node_env(**explicit_values) -> Env:
 _UNSAFE_PATH_CHARACTERS = re.compile(r"[^A-Za-z0-9._-]")
 
 
-# A full-screen dashboard needs a terminal: with stdout a pipe (a process
-# supervisor, a log collector, a test capturing output) "full" renders
-# nothing and the node logs to stderr as it always has. "ci" -- asked for
-# explicitly -- renders plain frames to wherever stdout goes.
-NON_TERMINAL_MODES: dict[TerminalMode, TerminalMode] = {"full": "disabled"}
-
-
-async def node_terminal_mode(configured_mode: TerminalMode, quiet: bool) -> TerminalMode:
+async def node_terminal_mode(
+    configured_mode: TerminalMode,
+    quiet: bool,
+    layout: NodeDashboardLayout,
+) -> NodeTerminalSelection:
     """The terminal mode a ``hyperscale run worker|manager|gate`` node's
-    dashboard runs in: none with ``--quiet`` (as ``run workflow``), "full"
-    only when stdout is a terminal, otherwise the configured mode."""
-    if quiet:
-        return "disabled"
-
-    stdout_is_terminal = await asyncio.get_running_loop().run_in_executor(None, sys.stdout.isatty)
-    return configured_mode if stdout_is_terminal else NON_TERMINAL_MODES.get(configured_mode, configured_mode)
+    dashboard runs in, detected at runtime (``select_node_terminal_mode``):
+    "full" only where stdout can show ``layout``'s dashboard, otherwise
+    append-only summary lines; --quiet and an explicit mode win."""
+    return await select_node_terminal_mode(configured_mode, quiet, layout)
 
 
 def node_log_path(

@@ -17,18 +17,8 @@ SUMMARY_CHANNEL = "node_dashboard_summary_content"
 DETAIL_CHANNEL = "node_dashboard_detail_content"
 TABLE_CHANNEL = "node_dashboard_table_content"
 STATUS_CHANNEL = "node_dashboard_status_content"
-
-
-def chart_channel(chart_name: str) -> str:
-    """The channel the chart named ``chart_name`` (``NodeDashboardChart.
-    name``) listens on."""
-    return f"node_dashboard_chart_{chart_name}_content"
-
-
-def chart_waiting_channel(chart_name: str) -> str:
-    """The channel the line a chart shows while it waits for a value
-    listens on."""
-    return f"node_dashboard_chart_{chart_name}_waiting_content"
+READINGS_CHANNEL = "node_dashboard_readings_content"
+CHART_CHANNEL = "node_dashboard_chart_content"
 
 
 @action()
@@ -62,10 +52,10 @@ async def update_node_dashboard_status(status: str):
 
 
 @action()
-async def update_node_dashboard_chart(chart_name: str, points: list[ChartPoint]):
-    return (chart_channel(chart_name), points)
+async def update_node_dashboard_readings(lines: list[str]):
+    return (READINGS_CHANNEL, lines)
 
 
 @action()
-async def update_node_dashboard_chart_waiting(chart_name: str, waiting_text: str):
-    return (chart_waiting_channel(chart_name), waiting_text)
+async def update_node_dashboard_chart(series_points: dict[str, list[ChartPoint]]):
+    return (CHART_CHANNEL, series_points)

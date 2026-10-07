@@ -96,7 +96,8 @@ async def worker(
         else [parse_node_address(manager) for manager in managers]
     )
 
-    terminal_mode = await node_terminal_mode(config.data.terminal_mode, quiet)
+    terminal_selection = await node_terminal_mode(config.data.terminal_mode, quiet, WorkerDashboardReader.layout)
+    terminal_mode = terminal_selection.mode
     log_path = node_log_path(config.data.logs_directory, "worker", datacenter, host, tcp_port)
 
     # While the dashboard renders, stderr (the node's logs, and its executor
@@ -122,6 +123,7 @@ async def worker(
                 log_path,
                 NodeDashboardConfig(),
                 Logger(),
+                degraded_reason=terminal_selection.degraded_reason,
             ),
             drain_before_stop=False,
             shutdown_timeout_seconds=shutdown_timeout_sec,

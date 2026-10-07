@@ -136,6 +136,7 @@ class CommandNode:
         marker: str,
         *extra: str,
         environment: dict[str, str] | None = None,
+        quiet: bool = True,
     ) -> None:
         self.role = role
         # Per-node settings exported into the process (``hyperscale run``
@@ -155,11 +156,15 @@ class CommandNode:
             else None
         )
         data_directory = () if self.data_directory is None else ("--data-directory", self.data_directory)
+        # The tests read a node's logs from its output: --quiet keeps them on
+        # stderr (a node whose stdout is a pipe otherwise writes its
+        # dashboard's summary lines there, and its logs to its log file).
+        quiet_flag = ("--quiet",) if quiet else ()
         self._arguments = [
             role, "--tcp-port", str(tcp_port), "--udp-port", str(udp_port),
             "--boot-timeout", f"{int(BOOT_TIMEOUT_SECONDS)}s",
             "--shutdown-timeout", f"{int(SHUTDOWN_TIMEOUT_SECONDS)}s",
-            *log_level, *data_directory, *extra,
+            *log_level, *data_directory, *quiet_flag, *extra,
         ]
         self.lines: list[str] = []
         self.process: asyncio.subprocess.Process | None = None
@@ -304,8 +309,9 @@ def node_at(
     marker: str,
     *extra: str,
     environment: dict[str, str] | None = None,
+    quiet: bool = True,
 ) -> CommandNode:
-    return CommandNode(role, block_start, block_start + 1, marker, *extra, environment=environment)
+    return CommandNode(role, block_start, block_start + 1, marker, *extra, environment=environment, quiet=quiet)
 
 
 async def run_join(node: str, target: str, client_port: int) -> tuple[int, str]:

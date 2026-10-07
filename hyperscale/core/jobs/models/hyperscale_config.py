@@ -5,7 +5,11 @@ from typing import Literal
 
 from pydantic import BaseModel, StrictInt, model_validator
 
-TerminalMode = Literal["disabled", "ci", "full"]
+# "full": the live dashboard, on a terminal able to show it (otherwise a
+# node falls back to "ci-safe"); "ci": the same frames without color;
+# "ci-safe": a node's append-only plain ASCII summary lines; "disabled":
+# no output of the UI's own.
+TerminalMode = Literal["disabled", "ci", "ci-safe", "full"]
 
 
 class HyperscaleConfig(BaseModel):

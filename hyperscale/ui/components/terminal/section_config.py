@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Literal
 
 from pydantic import BaseModel, StrictInt, StrictStr
@@ -38,6 +39,11 @@ VerticalAlignment = Literal["top", "center", "bottom"]
 class SectionConfig(BaseModel):
     width: HorizontalSectionSize = "auto"
     height: VerticalSectionSize = "medium"
+    # The rows the section takes of a canvas this many rows tall, in place
+    # of ``height``'s share of it (``max_height`` still caps them): a layout
+    # that must fit any terminal sizes its rows from the canvas, again on
+    # every resize.
+    height_rows: Callable[[int], int] | None = None
     left_padding: StrictInt = 0
     right_padding: StrictInt = 0
     top_padding: StrictInt = 0

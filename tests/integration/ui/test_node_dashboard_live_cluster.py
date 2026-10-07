@@ -48,7 +48,8 @@ async def test_a_registering_worker_shows_on_the_manager_dashboard(tmp_path: pat
             try:
                 frame = await wait_for_frame(collected, "WORKERS 0", "CLUSTER standalone")
                 assert f"tcp 127.0.0.1:{manager_port}" in frame
-                assert "dc DC-DASH" in frame
+                # The node id begins with its datacenter.
+                assert f"MANAGER {manager.node_id.short}" in frame and manager.node_id.short.startswith("DC-DASH")
                 # The status line names the log file (clipped to the screen's width).
                 assert f"ctrl-c stops the node | logs {str(tmp_path)[:40]}" in frame
 

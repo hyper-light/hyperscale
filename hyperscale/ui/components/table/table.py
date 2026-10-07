@@ -5,6 +5,7 @@ import time
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 
+from .column_layout import content_column_layout
 from .table_config import TableConfig
 from .tabulate import TableAssembler, TableCell
 
@@ -205,12 +206,36 @@ class Table:
         return self._last_rendered_frames, rerender
 
     async def _rerender(self, data: list[dict[str, TableCell]]):
+        if self._config.size_columns_to_content:
+            return await self._rerender_sized_to_content(data)
+
+        return await self._rerender_even_columns(data)
+
+    async def _rerender_sized_to_content(self, data: list[dict[str, TableCell]]):
+        """The table with each column sized to its content: no identifying
+        value is cut, and the columns span the table's width."""
+        assembler = self._assembler
+        visible, column_sizes = content_column_layout(
+            self._header_keys,
+            self._column_texts(data),
+            {self._header_keys[0], *self._fixed_headers},
+            self._max_width,
+            assembler.cell_border_length,
+        )
+        assembler.columns_count = len(visible)
+        assembler.column_sizes = column_sizes
+        rows = self._visible_rows(data, visible)
+        return await assembler.create_table_lines(
+            visible, self._cycle_data_rows(rows, assembler.calculate_height_offset(rows))
+        )
+
+    async def _rerender_even_columns(self, data: list[dict[str, TableCell]]):
         current_headers = list(self._header_keys[: self._columns_count])
 
         if self._use_header_rotation:
             current_headers = self._cycle_headers(current_headers)
 
-        data = [[row.get(header) for header in current_headers] for row in data]
+        data = self._visible_rows(data, current_headers)
 
         height_adjustment = self._assembler.calculate_height_offset(data)
         data_rows = self._cycle_data_rows(data, height_adjustment)
@@ -220,10 +245,18 @@ class Table:
             data_rows,
         )
 
-        for idx, line in enumerate(table_lines):
-            table_lines[idx] = line + self._width_adjust * " "
+        return [line + self._width_adjust * " " for line in table_lines]
 
-        return table_lines
+    def _visible_rows(self, data: list[dict[str, TableCell]], headers: list[str]) -> list[list[TableCell]]:
+        """Each row's cells under ``headers``, in their order."""
+        return [[row.get(header) for header in headers] for row in data]
+
+    def _column_texts(self, data: list[dict[str, TableCell]]) -> dict[str, list[str]]:
+        """Each column's values as the table draws them."""
+        return {
+            header: [self._assembler.cell_text(row.get(header), header) for row in data]
+            for header in self._header_keys
+        }
 
     def _cycle_data_rows(
         self,
@@ -306,10 +339,13 @@ class Table:
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
+        # Each update is the table's whole rows, so only the newest one
+        # queued is drawn, as every other component of a frame draws its
+        # newest: a table one update behind would show rows its panels no
+        # longer count.
         data: list[dict[str, TableCell]] | None = None
-
-        if self._updates.empty() is False:
-            data: list[dict[str, TableCell]] = await self._updates.get()
+        while self._updates.empty() is False:
+            data = self._updates.get_nowait()
 
         if self._update_lock.locked():
             self._update_lock.release()
