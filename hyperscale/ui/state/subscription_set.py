@@ -4,20 +4,9 @@ import signal
 from collections import defaultdict
 from typing import Callable, TypeVar
 from typing import List, Callable, Dict, Any
+from .last_args import LastArgs as LastArgs
+from .last_kwargs import LastKwargs as LastKwargs
 from .state_types import ActionData, Action
-
-
-
-class LastArgs:
-    
-    def __init__(self):
-        self.data: dict[str, list[Any]] = defaultdict(list)
-
-class LastKwargs:
-    
-    def __init__(self):
-        self.data: dict[str, dict[str, Any]] = defaultdict(dict)
-
 
 
 K = TypeVar("K")

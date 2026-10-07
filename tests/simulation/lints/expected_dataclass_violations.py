@@ -271,6 +271,6 @@ EXPECTED_DATACLASS_VIOLATIONS: dict[str, int] = {
     'hyperscale/distributed/workflow/state_transition.py::StateTransition': 1,
     'hyperscale/distributed/workflow/workflow_lifecycle_record.py::WorkflowLifecycleRecord': 1,
     'hyperscale/logging/snowflake/snowflake.py::Snowflake': 2,
-    'hyperscale/reporting/time_aligned_results.py::TimeAlignmentMetadata': 2,
-    'hyperscale/reporting/time_aligned_results.py::TimestampedStats': 2,
+    'hyperscale/reporting/time_alignment_metadata.py::TimeAlignmentMetadata': 2,
+    'hyperscale/reporting/timestamped_stats.py::TimestampedStats': 2,
 }

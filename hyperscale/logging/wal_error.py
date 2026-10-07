@@ -1,0 +1,2 @@
+class WALError(Exception):
+    pass

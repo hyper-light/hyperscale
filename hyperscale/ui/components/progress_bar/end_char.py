@@ -1,13 +1,6 @@
-from enum import Enum
 from typing import Dict, Literal
 
-
-class EndCharType(Enum):
-    EMPTY = ""
-    BLOCK_BRACE = "]"
-    PAREN = ")"
-    DOT_BLOCK = "⢸"
-
+from .end_char_type import EndCharType as EndCharType
 
 EndCharName = Literal[
     "empty",

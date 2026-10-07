@@ -27,6 +27,8 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .real_file_handle import RealFileHandle as RealFileHandle
+
 # On macOS fsync(2) only moves data to the drive, which may keep it in its
 # volatile cache and write it later, out of order; F_FULLFSYNC asks the
 # drive to flush it to permanent storage (fsync(2), fcntl(2) man pages).
@@ -45,53 +47,6 @@ else:
 _FULL_SYNC_UNSUPPORTED_ERRNOS = frozenset(
     {errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOTTY, errno.EINVAL}
 )
-
-
-class RealFileHandle:
-    """A stdlib file object with its IO dispatched off-loop.
-
-    Only ``RealFilesystem`` constructs these; ``RealFilesystem.fsync``
-    relies on the extra ``fileno()`` accessor beyond the ``FileHandle``
-    Protocol surface, and each handle dispatches through its owning
-    filesystem's dedicated executor.
-    """
-
-    __slots__ = ("_file", "_run")
-
-    def __init__(self, file, run) -> None:
-        self._file = file
-        self._run = run
-
-    @property
-    def closed(self) -> bool:
-        return self._file.closed
-
-    def fileno(self) -> int:
-        return self._file.fileno()
-
-    def tell(self) -> int:
-        return self._file.tell()
-
-    def close_sync(self) -> None:
-        self._file.close()
-
-    async def write(self, data: bytes) -> int:
-        return await self._run(self._file.write, data)
-
-    async def read(self, size: int = -1) -> bytes:
-        return await self._run(self._file.read, size)
-
-    async def readline(self) -> bytes:
-        return await self._run(self._file.readline)
-
-    async def seek(self, offset: int, whence: int = 0) -> int:
-        return await self._run(self._file.seek, offset, whence)
-
-    async def flush(self) -> None:
-        await self._run(self._file.flush)
-
-    async def close(self) -> None:
-        await self._run(self._file.close)
 
 
 class RealFilesystem:

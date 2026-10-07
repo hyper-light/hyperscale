@@ -202,7 +202,7 @@ Each target was re-verified against the current tree before deletion (no product
 - ✅ The 9 gate re-export shims, `env/memory_parser.py`, `broadcast_tcp`/`broadcast_udp`, `WorkerState`'s duplicate manager registry. `classify_update_tier` now exists once (the gate calls the coordinator's).
 - ✅ Raft: `RaftJobManager`/`GateRaftJobManager`, `ReplicatedStatsStore`, `ReplicatedMembershipLog`. **Plus the cascade:** with the wrappers gone, only `LEDGER_APPEND` had a proposer. 43 command types, both command dataclasses and both state machines became one `LedgerAppendCommand` (msgspec; no Raft command is unpickled any more, D1 reads them from disk) and one `LedgerStateMachine`. The consensus and integration constructors lost `job_manager`/`leadership_tracker`/`manager_state`/`gate_state`.
 - Left, and why:
-  - the top-level `hyperscale/{monitoring,tools,versioning}` packages: 1,182 lines, no importers, but your recent WIP ("CPU resource limiter"), not the "empty packages" the audit assumed, so they're yours to call;
+  - ✅ decided 2026-10-06: the top-level `hyperscale/{monitoring,tools,versioning}` packages stay as they are. They're your in-progress work ("CPU resource limiter"), not dead code;
   - `OrphanedJobInfo`: used only by `test_client_leadership_transfer.py`'s self-contained fake client;
   - aligning the `"progress_update"`/`"stats_update"` labels.
 
@@ -301,7 +301,7 @@ In the order the complexity lint ranks them:
   - Verified: 354 classes pickle byte-identically, and all 1,059 modules import fresh on 3.13 and 3.14.
   - Five tests that monkeypatched a split module's seam now patch the files that read it.
   - SIM's `swap_defaults` rebinds every module holding a seam, so it needs no change.
-  - The other 89 multi-class files are outside my remit (engines, core/jobs, CLI framework, ui/logging/reporting): yours to call;
+  - The other 89 multi-class files, decided 2026-10-06: 16 are being split one class per file (pickled classes keep their wire namespace): `core/runtime/{filesystem,real_filesystem}`, `logging/exceptions`, `reporting/{cloudwatch/cloudwatch_config,time_aligned_results}`, and 11 non-vendored ui files. These stay: `logging/hyperscale_logging_models.py` (multi-class by design: CLAUDE.md puts every logger model there), the vendored plotille and tabulate modules under ui, and `commands/cli/` (the CLI framework is off-limits). The 60 in engines need your explicit OK, the 3 in core/jobs belong to the core/jobs owner, and the 3 in tools are your in-progress work;
 - move the 30 dataclasses that sit outside `models/`.
 
 Rules for every move: behavior-preserving; public messages and actions unchanged; full SIM run between moves; each move one commit.

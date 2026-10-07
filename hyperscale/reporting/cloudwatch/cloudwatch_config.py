@@ -4,10 +4,11 @@ from pydantic import BaseModel, ConfigDict, conlist, StrictStr, StrictInt
 
 from hyperscale.reporting.common.types import ReporterTypes
 
+from .cloudwatch_target import _CloudwatchTarget as _CloudwatchTarget
 
-class _CloudwatchTarget(BaseModel):
-    arn: str
-    id: str
+# Workflows carrying a CloudwatchConfig are pickled to workers: keep the
+# target's pickled class path the one it had before the split.
+_CloudwatchTarget.__module__ = __name__
 
 
 class CloudwatchConfig(BaseModel):
