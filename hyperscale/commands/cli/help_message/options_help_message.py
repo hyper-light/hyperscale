@@ -29,13 +29,15 @@ class OptionsHelpMessage(BaseModel):
 
         for line in param_lines:
             if line.startswith("@param"):
-                cleaned_line = line.strip("@param").strip()
+                # removeprefix, not strip("@param"): strip drops any of those
+                # characters from both ends ("in the same order" lost its "r").
+                cleaned_line = line.removeprefix("@param").strip()
                 name, descriptor = cleaned_line.split(" ", maxsplit=1)
 
                 param_descriptors[name] = descriptor
 
             elif line.startswith(":param"):
-                cleaned_line = line.strip(":param").strip()
+                cleaned_line = line.removeprefix(":param").strip()
                 _, name, descriptor = cleaned_line.split(" ", maxsplit=2)
 
                 param_descriptors[name] = descriptor

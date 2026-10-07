@@ -14,7 +14,6 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/commands/cli/arg_types/data_types/check_if_multiarg.py::check_if_multiarg': 4,
     'hyperscale/commands/cli/arg_types/data_types/env.py::Env._load_envar': 5,
     'hyperscale/commands/cli/arg_types/data_types/import_instance.py::ImportInstance._import_instance': 6,
-    'hyperscale/commands/cli/arg_types/data_types/import_type.py::ImportType._import_types': 7,
     'hyperscale/commands/cli/arg_types/data_types/json_data.py::JsonData._load_json': 6,
     'hyperscale/commands/cli/arg_types/data_types/json_file.py::JsonFile._load_json_file': 4,
     'hyperscale/commands/cli/arg_types/data_types/json_file.py::JsonFile._parse_type': 6,

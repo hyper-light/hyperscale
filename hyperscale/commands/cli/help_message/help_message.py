@@ -1,4 +1,6 @@
 import asyncio
+import os
+import sys
 import textwrap
 
 from pydantic import BaseModel, StrictInt
@@ -11,6 +13,24 @@ from .description_help_message import DescriptionHelpMessage
 from .metadata_help_message import MetadataHelpMessage
 from .options_help_message import OptionsHelpMessage
 from .title_help_message import TitleHelpMessage
+
+# Help clears the screen only on a terminal: written to a pipe, a log or a
+# CI job, the escape sequences would only corrupt the output.
+CLEAR_SCREEN = "\033[2J\033[H"
+
+
+async def _clear_screen_prefix() -> str:
+    """The screen clear help starts with: on a terminal only."""
+    return CLEAR_SCREEN if await _stdout_is_terminal() else ""
+
+
+async def _stdout_is_terminal() -> bool:
+    """Whether stdout is a terminal that interprets escape sequences."""
+    loop = asyncio.get_running_loop()
+    return (
+        await loop.run_in_executor(None, sys.stdout.isatty)
+        and await loop.run_in_executor(None, os.environ.get, "TERM") != "dumb"
+    )
 
 
 class HelpMessage(BaseModel):
@@ -105,7 +125,7 @@ class HelpMessage(BaseModel):
 
         message_lines = "\n".join(lines)
 
-        return f"\033[2J\033[H\n{message_lines}\n\n"
+        return f"{await _clear_screen_prefix()}\n{message_lines}\n\n"
 
     async def _create_subcommands_description(
         self,
