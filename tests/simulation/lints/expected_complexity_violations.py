@@ -1258,7 +1258,7 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/distributed/swim/gossip/extension_outcome_gossip_buffer.py::ExtensionOutcomeGossipBuffer.encode_piggyback': 7,
     'hyperscale/distributed/swim/gossip/extension_outcome_gossip_buffer.py::ExtensionOutcomeGossipBuffer.mark_broadcasts': 4,
     'hyperscale/distributed/swim/gossip/gossip_buffer.py::GossipBuffer._evict_oldest': 5,
-    'hyperscale/distributed/swim/gossip/gossip_buffer.py::GossipBuffer.add_update': 8,
+    'hyperscale/distributed/swim/gossip/gossip_buffer.py::GossipBuffer.add_update': 6,
     'hyperscale/distributed/swim/gossip/gossip_buffer.py::GossipBuffer.decode_piggyback': 7,
     'hyperscale/distributed/swim/gossip/gossip_buffer.py::GossipBuffer.encode_piggyback': 7,
     'hyperscale/distributed/swim/gossip/gossip_buffer.py::GossipBuffer.mark_broadcasts': 4,

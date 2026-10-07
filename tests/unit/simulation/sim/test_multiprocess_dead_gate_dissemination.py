@@ -19,8 +19,14 @@ manager's 5 DEAD copies went to gate-c itself, 2 to gate-b, none to
 gate-a — which then sat on its own no-confirmation suspicion leg
 (gate bracket ``[30, 120]`` stretched to 124.8s) and declared gate-c dead
 133s after the kill instead of 22s.
+
+The same topology pins Lifeguard confirmations (§IV-B): every survivor
+suspects the dead gate on its own probes and gossips the accusation with
+itself as accuser; each receiver counts each other accuser once and moves
+its suspicion's expiry to start + the Lifeguard timeout for that count.
 """
 
+import math
 from collections.abc import Callable
 
 from hyperscale.distributed.env import Env
@@ -35,12 +41,12 @@ from tests.simulation.harness.sim.multiprocess.swim_death_watch_demo import (
 
 import pytest
 
-# 220 is the long-horizon chaos composite's seed (test_multiprocess_gate_faults)
-# and the mutation check: with copies to the subject charged again, its
-# gate-a never learns the death inside the run (the manager's budget goes to
-# gate-c and gate-b), while 217 and 200 (that suite's other distinct-layout
-# seeds) disseminate in time either way and guard the bound across schedules.
-_SEEDS = (220, 217, 200)
+# 220 is the long-horizon chaos composite's seed (test_multiprocess_gate_faults).
+# 203 and 218 are the mutation check for the dissemination bound: swept over
+# seeds 200-259, they are the schedules where, with copies to the subject
+# charged again, the manager's DEAD budget never reaches gate-a and gate-a
+# falls back to its own suspicion timer (all 60 seeds pass with the fix).
+_SEEDS = (203, 218, 220)
 # Coordinator link latency, one way: the earliest instant any reaction to
 # an observed row can take effect.
 _LATENCY = 0.01
@@ -72,11 +78,16 @@ _PROBE_ROUND_BOUND = (
 )
 _ROUNDS_TO_REACH_SUSPECTING_GATE = len(_GATE_PIDS)
 _DISSEMINATION_DEADLINE_SECONDS = _PROBE_ROUND_BOUND * _ROUNDS_TO_REACH_SUSPECTING_GATE
-# The run ends before any gate's OWN no-confirmation suspicion could expire
-# (a gate suspicion's leg is at least GATE_SWIM_GLOBAL_MAX_TIMEOUT after it
-# starts, and it starts after the kill), so a death row for gate-c at
-# gate-a inside the run can only have come from dissemination.
+# A gate's own unconfirmed suspicion leg (at least GATE_SWIM_GLOBAL_MAX_TIMEOUT
+# after it starts, and it starts after the kill) ends past the run.
 _CEILING = _ENV.GATE_SWIM_GLOBAL_MAX_TIMEOUT
+# Every member that independently suspects the victim: the two surviving
+# gates and the manager. A suspicion counts at most the OTHER two as
+# confirmations (its originator's evidence is the suspicion itself).
+_SUSPECTING_PIDS = ("gate-a", "gate-b", "manager")
+_MAX_INDEPENDENT_CONFIRMATIONS = len(_SUSPECTING_PIDS) - 1
+# The suspicion sampler rounds instants to 6 decimals (start and expiry).
+_ROUNDING_TOLERANCE = 2e-6
 
 
 def _build_cluster(seed: int) -> SimulationCoordinator:
@@ -129,15 +140,21 @@ def _is_victim_death(row: tuple) -> bool:
     return row[0] == "swim-dead" and row[1] == _GATE_HOSTS[_VICTIM]
 
 
+def _schedule_victim_kill(coordinator: SimulationCoordinator, fault_instants: dict[str, float]) -> None:
+    """Kill gate-c one link latency after the manager can suspect every gate."""
+
+    def kill_victim(row: tuple) -> None:
+        fault_instants["kill_at"] = row[-1] + _LATENCY
+        coordinator.schedule_kill(_VICTIM, fault_instants["kill_at"])
+
+    coordinator.schedule_on_event("manager", _manager_can_suspect_every_gate(), kill_victim)
+
+
 def _run_kill_then_cut_suspecting_gate(seed: int) -> tuple[dict, dict[str, float]]:
     """Kill gate-c once the manager can suspect every gate; partition gate-a from
     gate-b (for good) the instant the manager commits gate-c DEAD."""
     coordinator = _build_cluster(seed)
     fault_instants: dict[str, float] = {}
-
-    def kill_victim(row: tuple) -> None:
-        fault_instants["kill_at"] = row[-1] + _LATENCY
-        coordinator.schedule_kill(_VICTIM, fault_instants["kill_at"])
 
     def cut_suspecting_gate(row: tuple) -> None:
         fault_instants["manager_commit_at"] = row[-1]
@@ -146,7 +163,7 @@ def _run_kill_then_cut_suspecting_gate(seed: int) -> tuple[dict, dict[str, float
             _SUSPECTING_GATE, _OTHER_CONFIRMER, fault_instants["cut_at"]
         )
 
-    coordinator.schedule_on_event("manager", _manager_can_suspect_every_gate(), kill_victim)
+    _schedule_victim_kill(coordinator, fault_instants)
     coordinator.schedule_on_event("manager", _is_victim_death, cut_suspecting_gate)
     return coordinator.run(), fault_instants
 
@@ -173,8 +190,18 @@ def test_cut_off_gate_learns_a_dead_peer_from_the_manager_within_one_probe_cycle
     death_at = _first_row_time(suspecting_rows, "swim-dead", victim_host)
     assert death_at is None or death_at > fault_instants["cut_at"], (fault_instants, suspecting_rows)
 
+    # The death came from the manager's gossip, not from gate-a's own
+    # suspicion timer: it lands before that suspicion's (Lifeguard-
+    # shortened) expiry, however many confirmations gate-a had gathered.
+    own_expiries = [
+        row[7] for row in suspecting_rows if row[0] == "swim-suspicion" and row[1] == victim_host
+    ]
+    assert own_expiries and death_at is not None and death_at < own_expiries[-1], (
+        fault_instants,
+        suspecting_rows,
+    )
     deadline = fault_instants["manager_commit_at"] + _DISSEMINATION_DEADLINE_SECONDS
-    assert death_at is not None and death_at <= deadline, (
+    assert death_at <= deadline, (
         "the cut-off gate must learn the death from the manager's gossip "
         f"within one probe cycle ({_DISSEMINATION_DEADLINE_SECONDS}s) of the commit",
         fault_instants,
@@ -187,3 +214,52 @@ def test_kill_then_cut_is_replay_deterministic():
     assert _run_kill_then_cut_suspecting_gate(_SEEDS[0]) == _run_kill_then_cut_suspecting_gate(
         _SEEDS[0]
     )
+
+
+def _run_kill(seed: int) -> tuple[dict, dict[str, float]]:
+    """Kill gate-c once the manager can suspect every gate; nothing else."""
+    coordinator = _build_cluster(seed)
+    fault_instants: dict[str, float] = {}
+    _schedule_victim_kill(coordinator, fault_instants)
+    return coordinator.run(), fault_instants
+
+
+def _lifeguard_timeout(confirmations: int, required: int, min_timeout: float, max_timeout: float) -> float:
+    """Lifeguard §IV-B (memberlist ``suspicion.go``): the timeout falls from
+    max toward min as log(C + 1) / log(K + 1), C capped at K; with no
+    possible confirmer (K = 0) the bracket is a single value."""
+    if required <= 0:
+        return min_timeout
+    bounded_confirmations = min(confirmations, required)
+    log_factor = math.log(bounded_confirmations + 1) / math.log(required + 1)
+    return max(min_timeout, max_timeout - (max_timeout - min_timeout) * log_factor)
+
+
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_independent_suspicions_shorten_the_suspicion_timeout(seed: int):
+    """Every member suspects the killed gate on its own probes and gossips
+    its accusation (with its address as the accuser); each receiver counts
+    each OTHER accuser once, and its suspicion's expiry moves to
+    start + Lifeguard timeout(C) as C grows. Mutation-checked: with
+    gossiped accusers ignored, no suspicion ever counts a confirmation."""
+    results, fault_instants = _run_kill(seed)
+    victim_host = _GATE_HOSTS[_VICTIM]
+    shortened = []
+    for process_id in _SUSPECTING_PIDS:
+        suspicion_rows = [
+            row for row in results[process_id] if row[0] == "swim-suspicion" and row[1] == victim_host
+        ]
+        for row in suspicion_rows:
+            _, _, confirmations, required, min_timeout, max_timeout, start, expiry, _ = row
+            assert fault_instants["kill_at"] < start, (process_id, row)
+            assert confirmations <= _MAX_INDEPENDENT_CONFIRMATIONS, (process_id, row)
+            expected_expiry = start + _lifeguard_timeout(confirmations, required, min_timeout, max_timeout)
+            assert abs(expiry - expected_expiry) <= _ROUNDING_TOLERANCE, (process_id, row, expected_expiry)
+            if confirmations >= 1 and expiry < start + max_timeout:
+                shortened.append((process_id, row))
+        # A suspicion only gains confirmations, so its expiry only advances.
+        assert [row[2] for row in suspicion_rows] == sorted(row[2] for row in suspicion_rows), suspicion_rows
+        assert [row[7] for row in suspicion_rows] == sorted(
+            (row[7] for row in suspicion_rows), reverse=True
+        ), suspicion_rows
+    assert shortened, {process_id: results[process_id] for process_id in _SUSPECTING_PIDS}

@@ -70,7 +70,7 @@ class SuspicionState:
     # Track actual confirmation count even if we don't store all confirmers
     _logical_confirmation_count: int = 0
     
-    def add_confirmation(self, from_node: tuple[str, int]) -> bool:
+    def add_confirmation(self, from_node: tuple[str, int] | None) -> bool:
         """
         Add a confirmation from another node.
         Returns True if this is a new confirmation.
@@ -79,8 +79,10 @@ class SuspicionState:
         counted for timeout calculation but the confirmer is not stored.
         """
         # The originator's vote is implicit in the suspicion itself —
-        # never a counted confirmation (see the ``originator`` field).
-        if from_node == self.originator:
+        # never a counted confirmation (see the ``originator`` field) —
+        # and an unattributed suspicion (None: gossip from a sender that
+        # predates accusers) is no independent evidence at all.
+        if from_node in (None, self.originator):
             return False
 
         # Check if already confirmed

@@ -352,7 +352,7 @@ class HierarchicalFailureDetector:
         self,
         node: NodeAddress,
         incarnation: int,
-        from_node: NodeAddress,
+        from_node: NodeAddress | None,
     ) -> bool:
         """
         Start or update a global (machine-level) suspicion.
@@ -384,7 +384,7 @@ class HierarchicalFailureDetector:
         node: NodeAddress,
         existing_state: SuspicionState,
         incarnation: int,
-        from_node: NodeAddress,
+        from_node: NodeAddress | None,
     ) -> bool:
         """Apply a suspicion of an already-suspected node: stale, a confirmation, or a higher incarnation."""
         if incarnation < existing_state.incarnation:
@@ -425,7 +425,7 @@ class HierarchicalFailureDetector:
         self,
         node: NodeAddress,
         state: SuspicionState,
-        from_node: NodeAddress,
+        from_node: NodeAddress | None,
     ) -> bool:
         """Add ``from_node``'s confirmation; when new, move the expiry to the shortened timeout."""
         if state.add_confirmation(from_node):
@@ -441,7 +441,7 @@ class HierarchicalFailureDetector:
         self,
         node: NodeAddress,
         incarnation: int,
-        from_node: NodeAddress,
+        from_node: NodeAddress | None,
     ) -> bool:
         """Open a new global suspicion of ``node`` under the AD-30 bounded bracket."""
         # AD-30 suspicion-bracket composition with bounded

@@ -14,6 +14,11 @@ as ``sim-gate-c``, never node ids, so identical-seed runs compare equal):
   ``can_suspect_peer``: the two gates ``start_suspicion`` applies), so
   from here on its death is detectable. Sampled once per SWIM protocol
   period, the cadence at which a probe round could first act on it.
+* ``("swim-suspicion", peer_host, confirmations, required, min_timeout,
+  max_timeout, start, expiry, t)`` — this node's global (AD-30) suspicion
+  of the peer, on each change of its counted Lifeguard confirmations or
+  expiry instant (``start + calculate_timeout()``), sampled once per SWIM
+  protocol period like ``swim-suspectable``.
 * ``("swim-dead", peer_host, t)`` — this node's tracker took the peer DEAD
   (own suspicion expiry, gossip, or burst confirmation alike), written
   from ``register_on_node_dead`` at the transition's exact instant.
@@ -57,7 +62,27 @@ def _watch_swim_transitions(context, server, environment: Env, watched_peers: li
                 pending_peers.remove(peer)
             await asyncio.sleep(environment.SWIM_UDP_POLL_INTERVAL)
 
+    async def watch_suspicions() -> None:
+        global_wheel = server._hierarchical_detector._global_wheel
+        last_snapshots: dict[tuple, tuple | None] = {}
+        while True:
+            for peer in [tuple(peer) for peer in watched_peers]:
+                state = global_wheel.get_state_sync(peer)
+                snapshot = None if state is None else (
+                    state.confirmation_count,
+                    state.required_confirmations,
+                    round(state.min_timeout, 6),
+                    round(state.max_timeout, 6),
+                    round(state.start_time, 6),
+                    round(state.start_time + state.calculate_timeout(), 6),
+                )
+                if snapshot is not None and snapshot != last_snapshots.get(peer):
+                    log.append(("swim-suspicion", peer[0], *snapshot, round(context.loop.time(), 6)))
+                last_snapshots[peer] = snapshot
+            await asyncio.sleep(environment.SWIM_UDP_POLL_INTERVAL)
+
     context.loop.create_task(watch_suspectable())
+    context.loop.create_task(watch_suspicions())
 
 
 def swim_death_watch_gate_entry(
