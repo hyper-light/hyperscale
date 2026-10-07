@@ -14,9 +14,7 @@ Usage:
 
 import asyncio
 import sys
-import os
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes import GateServer

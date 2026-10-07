@@ -28,13 +28,10 @@ Usage:
 
 import asyncio
 import sys
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from hyperscale.distributed.discovery import (
     DiscoveryConfig,
