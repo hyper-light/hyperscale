@@ -395,6 +395,21 @@ def test_manager_reserving_more_cores_than_a_worker_has_is_caught() -> None:
     assert "out-of-range cores" in _breach(invariant, cluster)
 
 
+def test_manager_recording_a_total_other_than_the_workers_own_is_caught() -> None:
+    cluster, manager, worker, _ = _cluster()
+    invariant = resource_counter_consistency()
+    worker_total = worker.instance._core_allocator.total_cores
+    worker_status = WorkerStatus(
+        worker_id=worker.instance._node_id.full, state="healthy", available_cores=0, total_cores=worker_total
+    )
+    manager.instance._worker_pool._workers[worker_status.worker_id] = worker_status
+    assert _holds(invariant, cluster)
+
+    # In range, yet not the worker's: a total derived from the free count.
+    worker_status.total_cores = worker_total - 1
+    assert "but the worker's allocator holds" in _breach(invariant, cluster)
+
+
 # --- MemberCountConvergence -----------------------------------------------
 
 

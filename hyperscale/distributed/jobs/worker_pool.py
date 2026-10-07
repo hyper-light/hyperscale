@@ -897,22 +897,23 @@ class WorkerPool:
         # Against what was free to allocate: the reservations this
         # heartbeat clears free cores too.
         old_unreserved_cores = worker.available_cores - worker.reserved_cores
-        worker.total_cores = heartbeat.available_cores + len(
-            heartbeat.active_workflows
-        )
+        # The worker's own core budget, as its allocator reports it beside
+        # the free count (available <= total there). Not derived from the
+        # free count and the active workflow count: a workflow holds any
+        # number of cores, and a free count older than the one applied is
+        # never applied (below) -- a total derived from it was wrong both
+        # ways. A heartbeat without the field (0) keeps the registered one.
+        if heartbeat.total_cores > 0:
+            worker.total_cores = heartbeat.total_cores
         self._apply_heartbeat_cores(node_id, worker, heartbeat)
 
         worker.overload_state = getattr(
             heartbeat, "health_overload_state", "healthy"
         )
 
-        if worker.available_cores - worker.reserved_cores > old_unreserved_cores:
-            self.capacity_generation += 1
-            self._cores_condition.notify_all()
-
         self._refresh_heartbeat_health(node_id, worker, heartbeat, drain_intended)
 
-        if self._became_selectable(node_id, was_selectable):
+        if self._capacity_grew(node_id, worker, old_unreserved_cores, was_selectable):
             self.capacity_generation += 1
             self._cores_condition.notify_all()
 

@@ -13291,14 +13291,18 @@ class ManagerServer(HealthAwareServer):
         if self._manager_state.has_worker(worker_id):
             return
 
+        # Peer managers share this manager's datacenter.
         node_info = NodeInfo(
             node_id=worker_id,
+            role=NodeRole.WORKER.value,
             host=worker_snapshot.host,
-            tcp_port=worker_snapshot.tcp_port,
+            port=worker_snapshot.tcp_port,
+            datacenter=self._node_id.datacenter,
             udp_port=worker_snapshot.udp_port,
-            role=NodeRole.WORKER,
         )
 
+        # A discovery broadcast carries the worker's free cores only: the
+        # worker's first heartbeat replaces the total with its own.
         registration = WorkerRegistration(
             node=node_info,
             total_cores=worker_snapshot.total_cores,
@@ -13307,14 +13311,7 @@ class ManagerServer(HealthAwareServer):
         )
 
         await self._registry.register_worker(registration)
-
-        self._worker_pool.register_worker(
-            worker_id=worker_id,
-            total_cores=worker_snapshot.total_cores,
-            available_cores=worker_snapshot.available_cores,
-            tcp_addr=(worker_snapshot.host, worker_snapshot.tcp_port),
-            is_remote=True,
-        )
+        await self._worker_pool.register_worker(registration)
 
     def _is_job_leader(self, job_id: str) -> bool:
         """Check if this manager is the leader for a job."""

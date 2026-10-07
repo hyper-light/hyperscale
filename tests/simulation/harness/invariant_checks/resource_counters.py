@@ -10,7 +10,11 @@ means one core counted twice.
 On a manager, a worker's ``reserved_cores`` are cores dispatched but not
 yet reflected in the worker's reported ``available_cores`` -- still
 inside it -- so ``available + reserved`` may legitimately exceed the
-total there. What holds is that each counter stays within ``[0, total]``.
+total there. What holds is that each counter stays within ``[0, total]``,
+and that the total is the worker's own: a manager's record of a live
+worker carries that worker's allocator total. Range checks alone passed a
+total derived from the reported free count (it moved with the counters it
+bounded: ``cores 1 free 0`` on a two-core worker mid-job).
 """
 
 from typing import TYPE_CHECKING
@@ -51,16 +55,30 @@ def _assigned_core_count(allocator: CoreAllocator) -> int:
 
 
 def _manager_counter_violation(harness: "ClusterHarness") -> str:
+    worker_totals = _live_worker_totals(harness)
     details = [
-        _worker_status_violation(handle.node_id, worker_status)
+        _worker_status_violation(handle.node_id, worker_status, worker_totals)
         for handle in live_handles(harness, ServerKind.MANAGER)
         for worker_status in handle.instance._worker_pool.iter_workers()
     ]
     return next(filter(None, details), "")
 
 
-def _worker_status_violation(node_id: str, worker_status: WorkerStatus) -> str:
+def _live_worker_totals(harness: "ClusterHarness") -> dict[str, int]:
+    """Each live worker's allocator total, by the id managers record it under."""
+    return {
+        handle.instance._node_id.full: handle.instance._core_allocator.total_cores
+        for handle in live_handles(harness, ServerKind.WORKER)
+    }
+
+
+def _worker_status_violation(node_id: str, worker_status: WorkerStatus, worker_totals: dict[str, int]) -> str:
     total_cores = worker_status.total_cores
+    if (worker_total := worker_totals.get(worker_status.worker_id, total_cores)) != total_cores:
+        return (
+            f"{node_id} records worker {worker_status.worker_id} with total {total_cores}, "
+            f"but the worker's allocator holds {worker_total}"
+        )
     if 0 <= worker_status.available_cores <= total_cores and 0 <= worker_status.reserved_cores <= total_cores:
         return ""
     return (
