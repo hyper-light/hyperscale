@@ -368,6 +368,43 @@ async def test_an_election_finishing_just_inside_the_failover_lands_the_job() ->
     assert elected_at <= sends[-1][1] <= elected_at + GATE_SETTINGS.LEADER_HEARTBEAT_INTERVAL
 
 
+@pytest.mark.asyncio
+async def test_a_datacenter_without_room_is_left_for_a_fallback_at_its_first_refusal() -> None:
+    """D-65/D-67: a leader refusing a job it has no room for -- a hinted
+    refusal outside the transient vocabulary -- answers for its whole
+    datacenter: the dispatch stops there, asks the leader no second time
+    through another manager, and counts no manager failure."""
+    clock = SleepAdvancedClock()
+    sends: list[tuple[tuple[str, int], float]] = []
+    no_room = JobAck(
+        job_id="job-1",
+        accepted=False,
+        error="datacenter dc-west has no room for another job: its concurrency cap of 1 unfinished jobs is reached",
+        retry_after_seconds=2.0,
+    ).dump()
+    redirect = JobAck(
+        job_id="job-1",
+        accepted=False,
+        error=f"Not DC leader, retry at leader: {LEADER[0]}:{LEADER[1]}",
+        leader_addr=LEADER,
+    ).dump()
+    breakers = CircuitBreakerManager(Env(), is_peer_suspected=lambda _peer_addr: False)
+    coordinator = make_coordinator(
+        answering(clock, {MANAGER: redirect, LEADER: no_room}, sends),
+        breakers,
+        clock=clock,
+        managers=[MANAGER, LEADER],
+    )
+
+    success, error, accepting_manager = await coordinator._try_dispatch_to_dc("job-1", "dc-west", submission())
+
+    assert (success, accepting_manager) == (False, None)
+    assert error is not None and "no room" in error
+    assert [manager_addr for manager_addr, _sent_at in sends].count(LEADER) == 1, sends
+    assert not await breakers.is_circuit_open(MANAGER)
+    assert not await breakers.is_circuit_open(LEADER)
+
+
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 
 

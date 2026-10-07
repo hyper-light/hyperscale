@@ -392,6 +392,28 @@ class Env(BaseModel):
     deployments can set this to a non-negative integer when they need a
     bounded worker fan-in per manager.
     """
+    # D-65: concurrency caps, enforced by the datacenter's leader manager at
+    # job admission -- where a gateless deployment's submissions arrive too.
+    # A capped submission is refused with ``JobAck.retry_after_seconds``.
+    #
+    # Unset (None), a datacenter admits a job while the work of its
+    # unfinished jobs plus the new job's fits its registered cores over the
+    # new job's timeout:
+    #     sum(core_seconds of unfinished jobs) + core_seconds(new) <= C * timeout(new)
+    # where C is the cores of the datacenter's registered workers and a
+    # job's core_seconds is, per workflow, min(C, max(1, vus)) cores (the
+    # per-workflow core demand the dispatcher gives an AUTO workflow) times
+    # its duration. Past that, the datacenter's cores -- fully busy -- cannot
+    # finish the job inside its own timeout: admitting it accepted a job
+    # bound to time out (AD-34) instead of telling the submitter to come back.
+    # Set, at most this many unfinished jobs at once, whatever their size.
+    JOB_CONCURRENCY_CAP_PER_DC: StrictInt | None = None
+    # D-65: per job class caps -- "<class>=<count>" entries, comma-separated;
+    # a class is its workflows' names joined by "+" ("Setup+Load=2"). A class
+    # not named here is held only by the datacenter's cap: the derived
+    # per-class cap -- the same work-over-timeout rule over the class's own
+    # jobs -- never binds before the datacenter-wide one does.
+    JOB_CLASS_CONCURRENCY_CAPS: StrictStr = ""
     MANAGER_PEER_SYNC_INTERVAL: StrictFloat = (
         10.0  # Seconds between re-registrations with peer managers that missed a rejoin
     )
@@ -1208,6 +1230,8 @@ class Env(BaseModel):
             "MANAGER_DISPATCH_CORE_WAIT_TIMEOUT": float,
             "MANAGER_HEARTBEAT_INTERVAL": float,
             "MAX_WORKERS_PER_MANAGER": int,
+            "JOB_CONCURRENCY_CAP_PER_DC": int,
+            "JOB_CLASS_CONCURRENCY_CAPS": str,
             "MANAGER_PEER_SYNC_INTERVAL": float,
             "MANAGER_PEER_JOB_SYNC_INTERVAL": float,
             # Job cleanup settings

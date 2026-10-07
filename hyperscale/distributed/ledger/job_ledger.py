@@ -752,7 +752,11 @@ class JobLedger:
         total_failed: int,
         duration_ms: int,
         durability: DurabilityLevel = DurabilityLevel.LOCAL,
+        job_class: str = "",
+        refused_retries: int = 0,
     ) -> CommitResult | None:
+        """Record a job's terminal completion (AD-38 ``JobCompleted``);
+        ``job_class`` and ``refused_retries`` are the D-67 breaker's facts."""
         return await self._record_terminal(
             job_id,
             JobEventType.JOB_COMPLETED,
@@ -768,6 +772,8 @@ class JobLedger:
                 total_completed=total_completed,
                 total_failed=total_failed,
                 duration_ms=duration_ms,
+                job_class=job_class,
+                refused_retries=refused_retries,
             ),
         )
 
@@ -780,8 +786,11 @@ class JobLedger:
         total_failed: int,
         duration_ms: int,
         durability: DurabilityLevel = DurabilityLevel.LOCAL,
+        job_class: str = "",
+        refused_retries: int = 0,
     ) -> CommitResult | None:
-        """Record a job's terminal failure (AD-38 ``JobFailed``)."""
+        """Record a job's terminal failure (AD-38 ``JobFailed``);
+        ``job_class`` and ``refused_retries`` are the D-67 breaker's facts."""
         return await self._record_terminal(
             job_id,
             JobEventType.JOB_FAILED,
@@ -798,6 +807,8 @@ class JobLedger:
                 total_completed=total_completed,
                 total_failed=total_failed,
                 duration_ms=duration_ms,
+                job_class=job_class,
+                refused_retries=refused_retries,
             ),
         )
 

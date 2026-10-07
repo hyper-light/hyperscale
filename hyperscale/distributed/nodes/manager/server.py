@@ -158,11 +158,14 @@ from hyperscale.distributed.jobs.completion_notice_obligation import (
     CompletionNoticeObligation,
 )
 from hyperscale.distributed.jobs.job_status_order import JobStatusOrder
+from hyperscale.distributed.jobs.job_admission_control import JobAdmissionControl
+from hyperscale.distributed.jobs.job_admission_refused_error import JobAdmissionRefusedError
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.distributed.ledger.job_ledger import JobLedger
 from hyperscale.distributed.ledger.job_event_applier import JOB_RELINQUISHED_STATUS
 from hyperscale.distributed.ledger.job_state import JobState
 from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
+from hyperscale.distributed.ledger.events.event_type import JobEventType
 from hyperscale.distributed.ledger.storage_health import StorageHealth
 from hyperscale.distributed.ledger.pipeline.commit_pipeline import CommitResult
 from hyperscale.distributed.raft import LedgerReplicator
@@ -626,7 +629,10 @@ class ManagerServer(HealthAwareServer):
 
         # AD-38 REGIONAL: every member's copy of the ledger events its
         # job groups commit; a takeover adopts a job's history from here.
-        self._ledger_replica = JobLedgerReplica()
+        # D-67: every terminal this member's job groups commit feeds the
+        # noisy-job breaker, so a follower that becomes the datacenter's
+        # leader holds the quarantines its predecessor opened.
+        self._ledger_replica = JobLedgerReplica(on_terminal_event=self._on_replicated_job_terminal)
         # AD-52 slice C: the datacenter's managers keep their membership in
         # one Raft group -- the configured cohort founds it, and every job
         # group takes its members from it.
@@ -869,6 +875,20 @@ class ManagerServer(HealthAwareServer):
             clock=self._clock,
         )
 
+        # D-65 concurrency caps and the D-67 noisy-job breaker, applied by
+        # this manager to each job it admits as the datacenter's leader --
+        # the one admission point gate-routed and gateless jobs share.
+        self._job_admission_control = JobAdmissionControl(
+            env=self.env,
+            job_manager=self._job_manager,
+            is_submission_in_progress=self._job_submissions_in_progress.__contains__,
+            get_registered_cores=self._get_total_cores,
+            clock=self._clock,
+            logger=self._udp_logger,
+            node_id=self._node_id.full,
+            datacenter=self._node_id.datacenter,
+        )
+
         # WorkerDisseminator (AD-48, initialized in start())
         self._worker_disseminator: "WorkerDisseminator | None" = None
 
@@ -1078,6 +1098,10 @@ class ManagerServer(HealthAwareServer):
 
     def _may_lead(self) -> bool:
         return not self._clock_offset_monitor.is_fenced
+
+    def _on_replicated_job_terminal(self, event_type: JobEventType, payload: bytes, job_state: JobState) -> None:
+        """Mirror a committed job terminal into the D-67 noisy-job breaker."""
+        self._job_admission_control.record_replicated_job_outcome(event_type, payload, job_state.created_hlc)
 
     def _is_accepting_jobs(self) -> bool:
         return (
@@ -11073,7 +11097,7 @@ class ManagerServer(HealthAwareServer):
 
             workflows = self._prepare_submission_workflows(submission)
             callback_addr = self._submission_callback_address(submission)
-            await self._clear_refused_job_record(submission.job_id)
+            await self._clear_refused_record_and_admit(submission, workflows)
 
             job_info = await self._job_manager.create_job(
                 submission=submission,
@@ -11614,6 +11638,25 @@ class ManagerServer(HealthAwareServer):
             else submission.callback_addr
         )
 
+    async def _clear_refused_record_and_admit(
+        self,
+        submission: JobSubmission,
+        workflows: list[tuple[str, list[str], Workflow]],
+    ) -> None:
+        """
+        Clear a refused submission's record for the job id, then admit the job against the caps (D-65, D-67).
+
+        The admission is recorded only after the clear: clearing cleans up
+        the job id's state, the admission's record with it.
+
+        Raises:
+            JobAdmissionRefusedError: a concurrency cap has no room for the
+                job, or its class is quarantined (``_answer_failed_job_submission``
+                answers with the refusal it carries).
+        """
+        await self._clear_refused_job_record(submission.job_id)
+        await self._job_admission_control.admit(submission, workflows)
+
     async def _clear_refused_job_record(self, job_id: str) -> None:
         """
         Remove a refused submission's record so the submission decided now takes its place.
@@ -11891,8 +11934,11 @@ class ManagerServer(HealthAwareServer):
         Log a submission that raised, take down the job it created, and refuse it.
 
         The refusal carries the error, and is recorded as the idempotency
-        key's rejection when this submission reserved the key.
+        key's rejection when this submission reserved the key. A refusal by
+        admission control (D-65, D-67) is answered as decided instead.
         """
+        if isinstance(error, JobAdmissionRefusedError):
+            return await self._answer_admission_refusal(error, idempotency_reserved, idempotency_key)
         await self._udp_logger.log(
             ServerError(
                 message=(
@@ -11909,6 +11955,24 @@ class ManagerServer(HealthAwareServer):
         error_ack = self._failed_submission_ack(error, submission)
         await self._record_failed_submission_rejection(idempotency_reserved, idempotency_key, error_ack)
         return error_ack
+
+    async def _answer_admission_refusal(
+        self,
+        refusal: JobAdmissionRefusedError,
+        idempotency_reserved: bool,
+        idempotency_key: IdempotencyKey | None,
+    ) -> bytes:
+        """
+        Answer a submission admission control refused (D-65, D-67) with its retry-hinted refusal.
+
+        The refusal is decided before the job is created, so nothing of the
+        job exists to take down. It is not the idempotency key's final
+        answer -- the submitter is told to come back -- so a key this
+        submission reserved is released, not recorded as rejected: the
+        retry is decided afresh.
+        """
+        await self._release_contested_idempotency_key(idempotency_reserved, idempotency_key)
+        return refusal.ack
 
     async def _take_down_unadmitted_job(self, unadmitted_job: JobInfo, error: Exception) -> None:
         """
@@ -13868,6 +13932,13 @@ class ManagerServer(HealthAwareServer):
             elapsed_seconds,
         ) = completion_summary
 
+        # D-67: before the retry budget goes with the job's cleanup.
+        await self._job_admission_control.record_job_outcome(
+            job_id,
+            final_status,
+            self._retry_budget_manager.refused_retries(job_id),
+        )
+
         # A client that submitted directly gets every workflow's results
         # ahead of the terminal status: result pushes still in flight (or
         # lost) cannot leave its view of the job incomplete.
@@ -14044,7 +14115,11 @@ class ManagerServer(HealthAwareServer):
         duration_ms: int,
     ) -> None:
         """Record a finished job's terminal as AD-38 ``JobFailed`` when every
-        workflow failed, ``JobCompleted`` otherwise."""
+        workflow failed, ``JobCompleted`` otherwise -- with the job's class
+        and refused retries, the D-67 breaker's facts every member of the
+        job's group mirrors (``_on_replicated_job_terminal``)."""
+        job_class = self._job_admission_control.job_class_of(job_id)
+        refused_retries = self._retry_budget_manager.refused_retries(job_id)
         if final_status == JobStatus.FAILED.value:
             await self._log_ledger_shortfall(
                 "JobFailed",
@@ -14057,6 +14132,8 @@ class ManagerServer(HealthAwareServer):
                     total_failed=total_failed,
                     duration_ms=duration_ms,
                     durability=DurabilityLevel.REGIONAL,
+                    job_class=job_class,
+                    refused_retries=refused_retries,
                 ),
             )
             return
@@ -14071,6 +14148,8 @@ class ManagerServer(HealthAwareServer):
                 total_failed=total_failed,
                 duration_ms=duration_ms,
                 durability=DurabilityLevel.REGIONAL,
+                job_class=job_class,
+                refused_retries=refused_retries,
             ),
         )
 
@@ -14389,6 +14468,7 @@ class ManagerServer(HealthAwareServer):
         if self._resource_enforcer is not None:
             self._resource_enforcer.release_job(job_id)
         self._led_workflow_resources.release_job(job_id)
+        self._job_admission_control.release(job_id)
 
     async def _announce_terminal_job_to_peers(self, job_id: str) -> None:
         """As the job's leader, sync the job to the peers before dropping it."""

@@ -25,7 +25,11 @@ from hyperscale.distributed.capacity import (
 from hyperscale.distributed.nodes.gate.datacenter_manager_selector import (
     DatacenterManagerSelector,
 )
-from hyperscale.distributed.nodes.gate.models import TransientDispatchError
+from hyperscale.distributed.nodes.gate.models import (
+    DatacenterRefusedDispatchError,
+    DatacentersWithoutRoomError,
+    TransientDispatchError,
+)
 from hyperscale.distributed.protocol.transient_errors import (
     is_transient_rejection,
 )
@@ -139,6 +143,24 @@ class GateDispatchCoordinator:
             ),
         )
         self._datacenter_leader_failover_seconds = datacenter_leader_failover_seconds
+        # D-65/D-67: a job every datacenter refused for want of room is the
+        # gate's to hold -- it acked the client -- so its placement is
+        # retried until its own timeout, no sooner than the smallest retry
+        # hint the refusals carried (``RetryExecutor`` waits a
+        # ``RetryAfterError`` out), on the same leader-heartbeat backoff as
+        # the per-datacenter dispatch: a hint shorter than it is waited no
+        # less than a fresh dispatch would wait. Nothing else retries it.
+        self._room_wait_retry_config = RetryConfig(
+            max_attempts=None,
+            base_delay=leader_heartbeat_interval_seconds,
+            max_delay=leader_heartbeat_interval_seconds,
+            jitter=JitterStrategy.FULL,
+            retryable_exceptions=(DatacentersWithoutRoomError,),
+        )
+        # The retry hints of the datacenters that refused a job for want of
+        # room during its current placement attempt, by job: present only
+        # while that attempt runs.
+        self._room_refusals: dict[str, dict[str, float]] = {}
         # AD-36: counts each fallback a dispatch lands on, from -> to.
         self._record_fallback_used = record_fallback_used
         # AD-28: orders a datacenter's managers for dispatch (known leader
@@ -304,6 +326,47 @@ class GateDispatchCoordinator:
             "Job dispatching",
         )
 
+        placement_deadline_at = self._clock.monotonic() + submission.timeout_seconds
+        try:
+            await RetryExecutor(self._room_wait_retry_config, clock=self._clock).execute(
+                lambda: self._place_job(submission, job, target_dcs, placement_deadline_at),
+                operation_name=f"place_job_{submission.job_id}",
+                deadline_at=placement_deadline_at,
+            )
+        except DatacentersWithoutRoomError as refusal:
+            await self._fail_dispatch(
+                submission,
+                job,
+                list(refusal.datacenters),
+                f"no datacenter had room for it within its {submission.timeout_seconds:.1f}s timeout: {refusal}",
+                "No datacenter had room for the job within its timeout",
+            )
+
+    async def _place_job(
+        self,
+        submission: JobSubmission,
+        job: GlobalJobStatus,
+        target_dcs: list[str],
+        placement_deadline_at: float,
+    ) -> None:
+        """Select the job's datacenters and dispatch to them -- one placement
+        attempt, made again while every datacenter refuses it for want of room.
+        The job's timeout counts from its acceptance: an attempt after a wait
+        offers the datacenters what remains of it.
+
+        Raises:
+            DatacentersWithoutRoomError: no datacenter took the job, and
+                every one that refused it had no room for it now.
+        """
+        if (remaining_timeout_seconds := placement_deadline_at - self._clock.monotonic()) <= 0.0:
+            # The retry's last wait ends at the deadline: nothing of the
+            # timeout is left to offer.
+            raise DatacentersWithoutRoomError(
+                f"job {submission.job_id}'s timeout passed while no datacenter had room for it",
+                0.0,
+                (),
+            )
+        submission.timeout_seconds = remaining_timeout_seconds
         primary_dcs, fallback_dcs, worst_health = await self._select_datacenters(
             len(target_dcs),
             self._datacenter_preference(target_dcs),
@@ -367,23 +430,42 @@ class GateDispatchCoordinator:
         target_dcs: list[str],
     ) -> None:
         """Fail a job whose every target datacenter is unhealthy."""
+        await self._fail_dispatch(
+            submission,
+            job,
+            target_dcs,
+            "every target datacenter is unhealthy",
+            "All datacenters are unhealthy",
+        )
+
+    async def _fail_dispatch(
+        self,
+        submission: JobSubmission,
+        job: GlobalJobStatus,
+        datacenters: list[str],
+        reason: str,
+        client_message: str,
+    ) -> None:
+        """Fail, terminally and loudly, a job the gate could not place in
+        ``datacenters``: its terminal record carries ``reason`` and its
+        client is told ``client_message``."""
         job.status = JobStatus.FAILED.value
-        job.failed_datacenters = len(target_dcs)
+        job.failed_datacenters = len(datacenters)
         self._job_manager.set_job(submission.job_id, job)
         self._quorum_circuit.record_error()
         await self._finalize_failed_job(
             submission.job_id,
-            tuple(sorted(target_dcs)),
-            "every target datacenter is unhealthy",
+            tuple(sorted(datacenters)),
+            reason,
         )
 
         if self._record_dispatch_failure:
-            for datacenter_id in target_dcs:
+            for datacenter_id in datacenters:
                 self._record_dispatch_failure(submission.job_id, datacenter_id)
 
         await self._logger.log(
             ServerError(
-                message=f"Job {submission.job_id}: All datacenters are UNHEALTHY - job failed",
+                message=f"Job {submission.job_id} failed: {reason}",
                 node_host=self._get_node_host(),
                 node_port=self._get_node_port(),
                 node_id=self._get_node_id_short(),
@@ -393,7 +475,7 @@ class GateDispatchCoordinator:
         await self._push_job_status_to_client(
             submission.job_id,
             JobStatus.FAILED.value,
-            "All datacenters are unhealthy",
+            client_message,
             is_final=True,
         )
 
@@ -413,7 +495,7 @@ class GateDispatchCoordinator:
         # result slot starts with a primary and moves -- before the job is
         # sent on -- to any datacenter that takes the primary's place.
         self._job_manager.set_target_dcs(submission.job_id, set(primary_dcs))
-        successful_dcs, failed_dcs = await self._dispatch_job_with_fallback(
+        successful_dcs, failed_dcs = await self._dispatch_noting_room_refusals(
             submission,
             primary_dcs,
             fallback_dcs,
@@ -426,6 +508,68 @@ class GateDispatchCoordinator:
 
         self._increment_version()
         await self._push_dispatch_outcome(submission.job_id, successful_dcs)
+
+    async def _dispatch_noting_room_refusals(
+        self,
+        submission: JobSubmission,
+        primary_dcs: list[str],
+        fallback_dcs: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Dispatch with fallback, noting the datacenters that refuse the job
+        for want of room; the successful and failed datacenters.
+
+        Raises:
+            DatacentersWithoutRoomError: none took the job and every one that
+                failed refused it for want of room.
+        """
+        self._room_refusals[submission.job_id] = {}
+        try:
+            successful_dcs, failed_dcs = await self._dispatch_job_with_fallback(
+                submission,
+                primary_dcs,
+                fallback_dcs,
+            )
+        finally:
+            room_refusals = self._room_refusals.pop(submission.job_id)
+        if self._every_failure_wanted_room(successful_dcs, failed_dcs, room_refusals):
+            await self._hold_job_without_room(submission.job_id, room_refusals)
+        return successful_dcs, failed_dcs
+
+    @staticmethod
+    def _every_failure_wanted_room(
+        successful_dcs: list[str],
+        failed_dcs: list[str],
+        room_refusals: dict[str, float],
+    ) -> bool:
+        """Whether no datacenter took the job and each that failed refused it
+        for want of room."""
+        return not successful_dcs and bool(failed_dcs) and set(failed_dcs) <= room_refusals.keys()
+
+    async def _hold_job_without_room(self, job_id: str, room_refusals: dict[str, float]) -> None:
+        """Log that the gate holds a job no datacenter had room for, and raise
+        the refusal its placement retry waits out.
+
+        Raises:
+            DatacentersWithoutRoomError: always.
+        """
+        retry_after_seconds = min(room_refusals.values())
+        refusing_datacenters = tuple(sorted(room_refusals))
+        await self._logger.log(
+            ServerWarning(
+                message=(
+                    f"Job {job_id}: no datacenter has room for it ({', '.join(refusing_datacenters)}); "
+                    f"holding it, placement retried in {retry_after_seconds:.2f}s"
+                ),
+                node_host=self._get_node_host(),
+                node_port=self._get_node_port(),
+                node_id=self._get_node_id_short(),
+            ),
+        )
+        raise DatacentersWithoutRoomError(
+            f"datacenters {', '.join(refusing_datacenters)} have no room for job {job_id}",
+            retry_after_seconds,
+            refusing_datacenters,
+        )
 
     async def _log_degraded_routing(self, job_id: str, worst_health: str, primary_dcs: list[str]) -> None:
         """Note a job routed to DEGRADED or BUSY datacenters."""
@@ -779,53 +923,105 @@ class GateDispatchCoordinator:
         retry_deadline_at = datacenter_dispatch_started + self._datacenter_leader_failover_seconds
         self._record_forward_attempt_event()
         for manager_addr in managers:
-            dispatch_started = self._clock.monotonic()
-            accepting_manager, error = await self._try_dispatch_to_manager(
-                datacenter, manager_addr, submission, retry_deadline_at
-            )
-            if accepting_manager is not None:
-                accepted_at = self._clock.monotonic()
-                # Time to an accepted dispatch (transient retries included):
-                # the responsiveness the gate actually gets from the manager
-                # that took it.
-                self._manager_selector.record_success(
-                    datacenter,
-                    accepting_manager,
-                    (accepted_at - dispatch_started) * 1000.0,
+            if (
+                outcome := await self._dispatch_via_manager(
+                    job_id, datacenter, manager_addr, submission, retry_deadline_at, datacenter_dispatch_started
                 )
-                # AD-45: the datacenter's time to start the job -- network,
-                # leader availability, admission, durable acceptance and
-                # first placement. A job's run time is set by its
-                # workflows, not by the datacenter, so it is not sampled.
-                latency_ms = (accepted_at - datacenter_dispatch_started) * 1000.0
-                observed_latency_ms, sample_count = await self._observed_latency_tracker.record_job_latency(
-                    datacenter,
-                    latency_ms,
-                )
-                await self._logger.log(
-                    ObservedLatencyRecorded(
-                        message=(
-                            f"{datacenter} accepted job {job_id} in {latency_ms:.1f}ms: observed "
-                            f"latency {observed_latency_ms:.1f}ms over {sample_count} samples"
-                        ),
-                        datacenter_id=datacenter,
-                        latency_ms=latency_ms,
-                        observed_latency_ms=observed_latency_ms,
-                        sample_count=sample_count,
-                    )
-                )
-                self._task_runner.run(
-                    self._confirm_manager_for_dc, datacenter, accepting_manager
-                )
-                self._record_forward_throughput_event()
-                return (True, None, accepting_manager)
-            else:
-                self._manager_selector.record_failure(datacenter, manager_addr)
-                self._task_runner.run(
-                    self._suspect_manager_for_dc, datacenter, manager_addr
-                )
+            ) is not None:
+                return outcome
 
         return (False, f"All managers in {datacenter} failed to accept job", None)
+
+    async def _dispatch_via_manager(
+        self,
+        job_id: str,
+        datacenter: str,
+        manager_addr: tuple[str, int],
+        submission: JobSubmission,
+        retry_deadline_at: float,
+        datacenter_dispatch_started: float,
+    ) -> tuple[bool, str | None, tuple[str, int] | None] | None:
+        """Dispatch through one of the datacenter's managers. Returns the
+        datacenter's outcome when a manager took the job, or when the
+        datacenter refused it for want of room (D-65 caps, D-67 breaker) --
+        its other managers answer for the same leader, and the manager that
+        answered is not failing. None when this manager failed: it counts
+        against the manager, and the next one is tried."""
+        dispatch_started = self._clock.monotonic()
+        try:
+            accepting_manager, _error = await self._try_dispatch_to_manager(
+                datacenter, manager_addr, submission, retry_deadline_at
+            )
+        except DatacenterRefusedDispatchError as refusal:
+            return self._room_refusal_outcome(job_id, datacenter, refusal)
+        if accepting_manager is None:
+            self._manager_selector.record_failure(datacenter, manager_addr)
+            self._task_runner.run(
+                self._suspect_manager_for_dc, datacenter, manager_addr
+            )
+            return None
+        await self._record_accepted_dispatch(
+            job_id, datacenter, accepting_manager, dispatch_started, datacenter_dispatch_started
+        )
+        return (True, None, accepting_manager)
+
+    def _room_refusal_outcome(
+        self,
+        job_id: str,
+        datacenter: str,
+        refusal: DatacenterRefusedDispatchError,
+    ) -> tuple[bool, str | None, tuple[str, int] | None]:
+        """Note a datacenter's refusal of a job for want of room on the job's
+        current placement attempt -- one dispatched outside a placement
+        attempt (an AD-36 re-run share) notes it nowhere -- and the
+        datacenter's failed outcome."""
+        self._room_refusals.get(job_id, {})[datacenter] = refusal.retry_after_seconds
+        return (False, str(refusal), None)
+
+    async def _record_accepted_dispatch(
+        self,
+        job_id: str,
+        datacenter: str,
+        accepting_manager: tuple[str, int],
+        dispatch_started: float,
+        datacenter_dispatch_started: float,
+    ) -> None:
+        """Record a manager taking the job: its responsiveness, the
+        datacenter's observed latency (AD-45), and the forward."""
+        accepted_at = self._clock.monotonic()
+        # Time to an accepted dispatch (transient retries included):
+        # the responsiveness the gate actually gets from the manager
+        # that took it.
+        self._manager_selector.record_success(
+            datacenter,
+            accepting_manager,
+            (accepted_at - dispatch_started) * 1000.0,
+        )
+        # AD-45: the datacenter's time to start the job -- network,
+        # leader availability, admission, durable acceptance and
+        # first placement. A job's run time is set by its
+        # workflows, not by the datacenter, so it is not sampled.
+        latency_ms = (accepted_at - datacenter_dispatch_started) * 1000.0
+        observed_latency_ms, sample_count = await self._observed_latency_tracker.record_job_latency(
+            datacenter,
+            latency_ms,
+        )
+        await self._logger.log(
+            ObservedLatencyRecorded(
+                message=(
+                    f"{datacenter} accepted job {job_id} in {latency_ms:.1f}ms: observed "
+                    f"latency {observed_latency_ms:.1f}ms over {sample_count} samples"
+                ),
+                datacenter_id=datacenter,
+                latency_ms=latency_ms,
+                observed_latency_ms=observed_latency_ms,
+                sample_count=sample_count,
+            )
+        )
+        self._task_runner.run(
+            self._confirm_manager_for_dc, datacenter, accepting_manager
+        )
+        self._record_forward_throughput_event()
 
     async def _try_fallback_dispatch(
         self,
@@ -865,7 +1061,11 @@ class GateDispatchCoordinator:
     def _release_failed_datacenter(self, job_id: str, datacenter: str) -> None:
         """Record a dispatch no manager of the datacenter took, and release
         it: a dispatch that ran out of retries may have reached a manager
-        that runs the job anyway, and is told to stop."""
+        that runs the job anyway, and is told to stop. A datacenter that
+        refused the job for want of room created nothing of it and stays
+        eligible: the job's placement may land there once it has room."""
+        if datacenter in self._room_refusals.get(job_id, {}):
+            return
         if self._record_dispatch_failure:
             self._record_dispatch_failure(job_id, datacenter)
         self._job_manager.release_datacenter(job_id, datacenter)
@@ -939,8 +1139,21 @@ class GateDispatchCoordinator:
             # it is reachable, so this is not a circuit failure.
             return (None, str(exception))
         except Exception as exception:
-            circuit.record_failure()
-            return (None, str(exception))
+            return self._failed_dispatch_outcome(exception, circuit)
+
+    @staticmethod
+    def _failed_dispatch_outcome(
+        exception: Exception,
+        circuit: "ErrorStats",
+    ) -> tuple[tuple[str, int] | None, str | None]:
+        """A dispatch that raised counts against the manager's circuit and
+        fails with the error -- except a datacenter's refusal for want of
+        room, which an answering manager gave: it is raised on to the
+        datacenter's dispatch."""
+        if isinstance(exception, DatacenterRefusedDispatchError):
+            raise exception
+        circuit.record_failure()
+        return (None, str(exception))
 
     async def _send_submission(self, target: tuple[str, int], submission: JobSubmission) -> JobAck:
         """Send the job to one manager; its ack, or ConnectionError when it
@@ -1035,10 +1248,20 @@ class GateDispatchCoordinator:
             circuit.record_success()
             return (True, None)
 
+        self._raise_retryable_refusal(ack)
+        return (False, ack.error)
+
+    @staticmethod
+    def _raise_retryable_refusal(ack: JobAck) -> None:
+        """Raise a refusal the dispatch acts on instead of failing: one in
+        the transient vocabulary retries the manager (TransientDispatchError);
+        one with a retry hint is the datacenter having no room for the job
+        now (DatacenterRefusedDispatchError) -- the dispatch moves on to a
+        fallback datacenter."""
         if is_transient_rejection(ack.error):
             raise TransientDispatchError(ack.error)
-
-        return (False, ack.error)
+        if ack.retry_after_seconds > 0.0:
+            raise DatacenterRefusedDispatchError(ack.error, ack.retry_after_seconds)
 
     def _record_dc_manager_for_job(
         self,

@@ -7,6 +7,7 @@ from hyperscale.distributed.runtime import Clock, Random, RealClock
 
 from .retry_shared import _DEFAULT_RANDOM
 from .jitter_strategy import JitterStrategy
+from .retry_after_error import RetryAfterError
 from .retry_config import RetryConfig
 
 T = TypeVar("T")
@@ -76,6 +77,14 @@ class RetryExecutor:
             # Pure exponential backoff, no jitter
             return min(cap, base * (2**attempt))
 
+    def _retry_delay(self, attempt: int, exc: Exception) -> float:
+        """The wait before retrying after ``exc``: the backoff for this
+        attempt, and never less than a ``RetryAfterError``'s own hint."""
+        delay = self.calculate_delay(attempt)
+        if isinstance(exc, RetryAfterError):
+            return max(delay, exc.retry_after_seconds)
+        return delay
+
     def reset(self) -> None:
         """Reset state for decorrelated jitter."""
         self._previous_delay = self._config.base_delay
@@ -129,7 +138,7 @@ class RetryExecutor:
                     raise
 
                 # Calculate and apply delay, never past the deadline
-                delay = self.calculate_delay(attempt)
+                delay = self._retry_delay(attempt, exc)
                 if deadline_at is not None:
                     if (remaining := deadline_at - self._clock.monotonic()) <= 0:
                         raise

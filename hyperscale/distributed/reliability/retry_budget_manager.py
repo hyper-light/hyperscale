@@ -100,6 +100,12 @@ class RetryBudgetManager:
         budget (AD-44 ``retry_budget_exhausted_total{job_id}``)."""
         return {job_id: budget.refused for job_id, budget in self._budgets.items()}
 
+    def refused_retries(self, job_id: str) -> int:
+        """Retries of a job refused for a spent budget so far; 0 for a job
+        with no budget held here (D-67 reads it as the job's noise)."""
+        budget = self._budgets.get(job_id)
+        return budget.refused if budget is not None else 0
+
     def _resolve_total_budget(self, total: int):
         requested = total if total > 0 else self._config.retry_budget_default
         return min(max(0, requested), self._config.retry_budget_max)

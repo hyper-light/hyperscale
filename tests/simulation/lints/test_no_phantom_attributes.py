@@ -116,7 +116,12 @@ DECLARED_FIELD_BINDERS: frozenset[str] = frozenset({"Message"})
 # (the `Transport` protocol among them), which bind nothing of theirs.
 # Raised from 616 to 617 for `DispatchOutcome` (AD-54/AD-44): an `Enum`,
 # whose base is the stdlib's and whose members are class attributes.
-MAX_UNPROVABLE_CLASSES = 617
+# Raised from 617 to 619 for the D-65/D-67 refusal exceptions,
+# `JobAdmissionRefusedError` and `DatacenterRefusedDispatchError`: each
+# subclasses the stdlib's `Exception`.
+# Raised from 619 to 621 for the gate's no-room hold: `RetryAfterError`
+# (the stdlib's `Exception`) and `DatacentersWithoutRoomError` below it.
+MAX_UNPROVABLE_CLASSES = 621
 
 
 class ClassFacts:

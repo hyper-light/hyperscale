@@ -158,6 +158,14 @@ class ErrorStats:
         return self._circuit_state
 
     @property
+    def seconds_until_half_open(self) -> float:
+        """Seconds until an OPEN circuit turns HALF_OPEN and admits a
+        probe; 0.0 when the circuit is not OPEN."""
+        if self.circuit_state != CircuitState.OPEN:
+            return 0.0
+        return max(0.0, self._circuit_opened_at + self.half_open_after - _DEFAULT_CLOCK.monotonic())
+
+    @property
     def is_circuit_open(self) -> bool:
         """Check if circuit is open (rejecting requests)."""
         return self.circuit_state == CircuitState.OPEN

@@ -682,3 +682,45 @@ class LateDatacenterResult(Entry, kw_only=True):
     job_status: str
     outcome: str
     level: LogLevel = LogLevel.WARN
+
+
+class JobAdmissionRefused(Entry, kw_only=True):
+    """D-65/D-67: a DC leader refused a job submission it could not admit
+    now -- ``control`` ``concurrency_cap`` (the datacenter's or the job
+    class's cap) or ``noisy_job_breaker`` (its job class is quarantined).
+    The submitter is told to retry after ``retry_after_seconds``."""
+
+    node_id: str
+    datacenter: str
+    job_id: str
+    job_class: str
+    control: str
+    reason: str
+    retry_after_seconds: float
+    level: LogLevel = LogLevel.WARN
+
+
+class NoisyJobClassQuarantined(Entry, kw_only=True):
+    """D-67: a job of ``job_class`` ended with ``refused_retries`` retries
+    refused for a spent AD-44 budget, so the class's breaker opened: new
+    jobs of the class are refused for ``quarantine_seconds``, then one
+    probe job is admitted."""
+
+    node_id: str
+    datacenter: str
+    job_id: str
+    job_class: str
+    refused_retries: int
+    quarantine_seconds: float
+    level: LogLevel = LogLevel.WARN
+
+
+class NoisyJobClassRecovered(Entry, kw_only=True):
+    """D-67: a job of a quarantined ``job_class`` completed without a
+    refused retry while its breaker was half-open, closing the breaker."""
+
+    node_id: str
+    datacenter: str
+    job_id: str
+    job_class: str
+    level: LogLevel = LogLevel.INFO
