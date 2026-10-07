@@ -9,7 +9,7 @@ import weakref
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing.context import SpawnContext
-from typing import Dict, List
+from typing import Callable, Dict, List
 
 from hyperscale.core.runtime import ProcessSpawner, SimulationChildContext
 
@@ -265,6 +265,7 @@ class LocalServerPool:
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         process_spawner: ProcessSpawner | None = None,
+        on_executor_exit: Callable[[tuple[str, int]], None] | None = None,
     ) -> None:
         # Phase 6 SIM seam. ``process_spawner`` is ``None`` in REAL mode —
         # the pool fans its executors out through a ``ProcessPoolExecutor``
@@ -282,6 +283,19 @@ class LocalServerPool:
         self._executor: ProcessPoolExecutor | None = None
         self._loop: asyncio.AbstractEventLoop | None = loop
         self._process_spawner = process_spawner
+        # Told the listen address of every executor whose process exit
+        # the pool reaps, at the reap — the pool leader withdraws that
+        # executor from its hand-outs before anything can dispatch to it.
+        self._on_executor_exit = on_executor_exit
+        # SIM: live executor process id -> (worker index, worker address)
+        # of the slot it fills; a reaped id leaves, its replacement joins.
+        self._executor_slots: dict[str, tuple[int, tuple[str, int]]] = {}
+        # SIM: replacements spawned per slot address, so every replacement
+        # gets a process id no earlier generation used.
+        self._executor_respawn_counts: dict[tuple[str, int], int] = {}
+        # SIM: (leader address, worker env, cert path, key path, server
+        # cleanup) every executor of this pool is spawned with.
+        self._executor_spawn_arguments: tuple | None = None
         self._pool_task: asyncio.Task | None = None
         self._run_future: asyncio.Future | None = None
         self._logger = Logger()
@@ -298,6 +312,9 @@ class LocalServerPool:
             # coordinator, not signals, drives shutdown).
             if self._loop is None:
                 self._loop = asyncio.get_event_loop()
+            self._process_spawner.set_process_exit_listener(
+                self._handle_simulation_executor_exit
+            )
             return
 
         self._context = multiprocessing.get_context("spawn")
@@ -390,26 +407,35 @@ class LocalServerPool:
                 )
 
                 try:
+                    executor_futures = [
+                        self._loop.run_in_executor(
+                            self._executor,
+                            functools.partial(
+                                run_thread,
+                                idx,
+                                leader_address,
+                                worker_ip,
+                                env.model_dump(),
+                                config.directory,
+                                log_level=config.level.name.lower(),
+                                cert_path=cert_path,
+                                key_path=key_path,
+                                enable_server_cleanup=enable_server_cleanup,
+                            ),
+                        )
+                        for idx, worker_ip in enumerate(worker_ips)
+                    ]
+
+                    # An executor's future completes when the pool reaps its
+                    # process — on return, or with ``BrokenProcessPool`` when
+                    # it died abruptly. That completion is the reap event.
+                    # No respawn here: an abrupt death breaks the
+                    # ``ProcessPoolExecutor`` (it terminates every sibling and
+                    # refuses new work), so each sibling is reaped in turn.
+                    self._watch_executor_futures(executor_futures, worker_ips)
+
                     self._pool_task = asyncio.gather(
-                        *[
-                            self._loop.run_in_executor(
-                                self._executor,
-                                functools.partial(
-                                    run_thread,
-                                    idx,
-                                    leader_address,
-                                    worker_ip,
-                                    env.model_dump(),
-                                    config.directory,
-                                    log_level=config.level.name.lower(),
-                                    cert_path=cert_path,
-                                    key_path=key_path,
-                                    enable_server_cleanup=enable_server_cleanup,
-                                
-                                ),
-                            )
-                            for idx, worker_ip in enumerate(worker_ips)
-                        ],
+                        *executor_futures,
                         return_exceptions=True,
                     )
 
@@ -440,20 +466,100 @@ class LocalServerPool:
         coordinator at the next window barrier, starting at the current
         global virtual time.
         """
-        worker_env = env.model_dump()
+        self._executor_spawn_arguments = (
+            leader_address,
+            env.model_dump(),
+            cert_path,
+            key_path,
+            enable_server_cleanup,
+        )
         for worker_index, worker_address in enumerate(worker_ips):
             worker_host, worker_port = worker_address
-            self._process_spawner.spawn_process(
+            self._spawn_simulation_executor(
                 f"executor-{worker_host}-{worker_port}",
-                run_sim_executor,
                 worker_index,
-                leader_address,
                 worker_address,
-                worker_env,
-                cert_path,
-                key_path,
-                enable_server_cleanup,
             )
+
+    def _spawn_simulation_executor(
+        self,
+        process_id: str,
+        worker_index: int,
+        worker_address: tuple[str, int],
+    ) -> None:
+        """Request one executor child for the slot at ``worker_address``.
+
+        The single SIM spawn path: the initial fan-out and every
+        replacement go through it, so a replacement runs the identical
+        ``run_sim_executor`` lifecycle — including the start
+        acknowledgement that is its ready handshake with the leader.
+        """
+        (
+            leader_address,
+            worker_env,
+            cert_path,
+            key_path,
+            enable_server_cleanup,
+        ) = self._executor_spawn_arguments
+        self._executor_slots[process_id] = (worker_index, worker_address)
+        self._process_spawner.spawn_process(
+            process_id,
+            run_sim_executor,
+            worker_index,
+            leader_address,
+            worker_address,
+            worker_env,
+            cert_path,
+            key_path,
+            enable_server_cleanup,
+        )
+
+    def _handle_simulation_executor_exit(self, process_id: str, exitcode: int) -> None:
+        """Reap listener: withdraw the dead executor, then refill its slot.
+
+        Runs at the instant the spawner reaps ``process_id``. The leader is
+        told first, so the slot is out of every hand-out before the
+        replacement is even requested; the replacement takes the slot back
+        only through its own start acknowledgement. A pool that is shutting
+        down does not respawn.
+        """
+        worker_index, worker_address = self._executor_slots.pop(process_id)
+        if self._on_executor_exit is not None:
+            self._on_executor_exit(worker_address)
+
+        if self._cleaned_up:
+            return
+
+        respawn_count = self._executor_respawn_counts.get(worker_address, 0) + 1
+        self._executor_respawn_counts[worker_address] = respawn_count
+        worker_host, worker_port = worker_address
+        self._spawn_simulation_executor(
+            f"executor-{worker_host}-{worker_port}-respawn-{respawn_count}",
+            worker_index,
+            worker_address,
+        )
+
+    def _watch_executor_futures(
+        self,
+        executor_futures: List[asyncio.Future],
+        worker_ips: List[tuple[str, int]],
+    ) -> None:
+        """REAL: report each executor's exit when the pool reaps it."""
+        if self._on_executor_exit is None:
+            return
+
+        for executor_future, worker_address in zip(executor_futures, worker_ips):
+            executor_future.add_done_callback(
+                functools.partial(self._report_executor_future_exit, worker_address)
+            )
+
+    def _report_executor_future_exit(
+        self,
+        worker_address: tuple[str, int],
+        executor_future: asyncio.Future,
+    ) -> None:
+        """REAL reap listener: the executor at ``worker_address`` exited."""
+        self._on_executor_exit(worker_address)
 
     def get_process_exitcodes(self) -> dict[int | str, int | None]:
         """Return a snapshot of worker-process id to exit code.

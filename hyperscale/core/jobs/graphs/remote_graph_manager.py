@@ -44,6 +44,7 @@ from hyperscale.core.jobs.models import (
 )
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.models.env import Env
+from hyperscale.core.jobs.protocols.node_id_derivation import derive_protocol_node_id
 from hyperscale.core.jobs.workers import Provisioner, StagePriority
 from hyperscale.core.runtime import TransportFactory
 from hyperscale.core.state import (
@@ -202,6 +203,9 @@ class RemoteGraphManager:
                 )
             )
 
+            if self._provisioner is None:
+                self._provisioner = Provisioner()
+
             if self._controller is None:
                 self._controller = RemoteGraphController(
                     None,
@@ -210,10 +214,10 @@ class RemoteGraphManager:
                     env,
                     loop=self._injected_loop,
                     transport_factory=self._transport_factory,
+                    # An executor's ready handshake returns its slot if
+                    # its predecessor at that address was retired.
+                    on_start_acknowledged=self._provisioner.readmit_node,
                 )
-
-            if self._provisioner is None:
-                self._provisioner = Provisioner()
 
             if self._status_lock is None:
                 self._status_lock = asyncio.Lock()
@@ -1732,6 +1736,21 @@ class RemoteGraphManager:
         returns immediately with the current state.
         """
         return self._latest_availability
+
+    def retire_executor(self, executor_address: Tuple[str, int]) -> None:
+        """
+        Stop handing out the executor at ``executor_address``.
+
+        Called from the server pool's reap of the executor's process. The
+        executor's node id is derived from its listen address, so a
+        replacement spawned at the same address takes the slot back —
+        through the provisioner's ``readmit_node`` — only once its own
+        start acknowledgement reaches this leader.
+        """
+        executor_host, executor_port = executor_address
+        self._provisioner.retire_node(
+            derive_protocol_node_id(executor_host, executor_port)
+        )
 
     def set_on_cores_available(self, callback: Any) -> None:
         """

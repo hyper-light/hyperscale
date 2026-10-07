@@ -4,7 +4,7 @@ import os
 import statistics
 from collections import Counter, defaultdict
 from socket import socket
-from typing import Any, Dict, List, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Set, Tuple, TypeVar
 
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph import Workflow
@@ -86,6 +86,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         *,
         loop: "asyncio.AbstractEventLoop | None" = None,
         transport_factory=None,
+        on_start_acknowledged: Callable[[int], None] | None = None,
     ) -> None:
         # Phase 6 SIM seams forwarded to the ``UDPProtocol`` base: under
         # SIM each pool executor runs in its own process (multi-process
@@ -110,6 +111,14 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
         self.acknowledged_starts: set[str] = set()
         self.acknowledged_start_node_ids: set[str] = set()
+        # Told the node id of every executor ready handshake (start
+        # acknowledgement) — how the leader's provisioner returns a
+        # respawned executor's slot only once the replacement is ready.
+        self._on_start_acknowledged: Callable[[int], None] = (
+            on_start_acknowledged
+            if on_start_acknowledged is not None
+            else self._ignore_start_acknowledgement
+        )
         self._worker_id = worker_idx
 
         self._logfile = f"hyperscale.worker.{self._worker_id}.log.json"
@@ -968,6 +977,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 node_id=node_id,
             )
 
+    @staticmethod
+    def _ignore_start_acknowledgement(node_id: int) -> None:
+        """The acknowledgement listener of a controller given none."""
+
     @receive()
     async def receive_start_acknowledgement(
         self,
@@ -991,6 +1004,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
                 self.acknowledged_starts.add(node_addr)
                 self.acknowledged_start_node_ids.add(node_id)
+                self._on_start_acknowledged(node_id)
 
                 # Signal the event if all expected workers have acknowledged
                 if (

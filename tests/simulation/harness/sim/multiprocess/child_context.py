@@ -143,6 +143,9 @@ class CrossProcessTransport:
         self._outbound: list[tuple] = []
         self._spawn_requests: list[tuple] = []
         self._spawned_process_exitcodes: dict[str, int | None] = {}
+        # The spawning owner's reap listener (``LocalServerPool``), told
+        # of each spawned child's exit at the instant it is recorded.
+        self._process_exit_listener = None
         self._announced_addresses: set[tuple] = set()
         self._new_addresses: list[tuple] = []
 
@@ -276,8 +279,21 @@ class CrossProcessTransport:
         snapshot mirrors what a real ``ProcessPoolExecutor`` owner sees:
         its own children, nobody else's.
         """
-        if process_id in self._spawned_process_exitcodes:
-            self._spawned_process_exitcodes[process_id] = exitcode
+        if process_id not in self._spawned_process_exitcodes:
+            return
+        self._spawned_process_exitcodes[process_id] = exitcode
+        if self._process_exit_listener is not None:
+            self._process_exit_listener(process_id, exitcode)
+
+    def set_process_exit_listener(self, listener) -> None:
+        """Register the owner's reap listener (``ProcessSpawner`` seam).
+
+        ``record_process_exit`` calls ``listener(process_id, exitcode)``
+        right after recording a spawned child's death — the reap event
+        the production pool hooks, at the death's exact virtual
+        instant.
+        """
+        self._process_exit_listener = listener
 
     def get_process_exitcodes(self) -> dict:
         """Exit-code snapshot of the processes this context spawned.
@@ -475,6 +491,11 @@ class ChildContext:
         """Exit-code snapshot of the children this context spawned (see
         ``CrossProcessTransport.get_process_exitcodes``)."""
         return self.transport.get_process_exitcodes()
+
+    def set_process_exit_listener(self, listener) -> None:
+        """Register the owner's reap listener (see
+        ``CrossProcessTransport.set_process_exit_listener``)."""
+        self.transport.set_process_exit_listener(listener)
 
     def set_result(self, value) -> None:
         self._result = value

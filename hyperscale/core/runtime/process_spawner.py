@@ -74,3 +74,18 @@ class ProcessSpawner(Protocol):
         worker's pool-health polling runs unchanged over it.
         """
         ...
+
+    def set_process_exit_listener(
+        self,
+        listener: Callable[[str, int], None],
+    ) -> None:
+        """Register the callable told of each spawned process's exit.
+
+        The spawner calls ``listener(process_id, exitcode)`` at the
+        instant it reaps the exit of a process it spawned — the same
+        instant the exit becomes visible in ``get_process_exitcodes`` —
+        so the owner reacts to the reap itself instead of waiting for
+        its next poll. One listener per spawner; registering again
+        replaces it.
+        """
+        ...

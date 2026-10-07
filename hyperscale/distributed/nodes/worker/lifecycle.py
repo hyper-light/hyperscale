@@ -101,6 +101,7 @@ class WorkerLifecycleManager:
             total_cores,
             loop=loop,
             process_spawner=process_spawner,
+            on_executor_exit=self._retire_executor,
         )
         self._remote_manager: RemoteGraphManager | None = None
 
@@ -239,6 +240,10 @@ class WorkerLifecycleManager:
             self._local_env,
             enable_server_cleanup=True,
         )
+
+    def _retire_executor(self, executor_address: tuple[str, int]) -> None:
+        """Pool reap listener: the pool leader stops handing out the dead executor."""
+        self._remote_manager.retire_executor(executor_address)
 
     async def connect_to_workers(
         self,
