@@ -134,6 +134,17 @@ class WorkerCancellationHandler:
         if not token:
             return (False, [f"Workflow {workflow_id} not found (no token)"])
 
+        # Read before the TaskRunner cancel below: cancelling the worker's
+        # execution task runs its final-result cleanup, which drops the
+        # workflow's name -- read after it, the executors' cancellation was
+        # skipped and they ran the cancelled workflow to its natural end,
+        # holding every later workflow behind it.
+        workflow_name = self._state._workflow_id_to_name.get(workflow_id)
+
+        # Recorded before anything is cancelled: the run's final result
+        # names this cause, not a bare "Cancelled".
+        self._state.record_workflow_cancel_reason(workflow_id, reason)
+
         # Signal cancellation via event
         self._set_cancel_event_if_present(workflow_id)
 
@@ -142,7 +153,7 @@ class WorkerCancellationHandler:
 
         self._mark_active_workflow_cancelled(workflow_id)
 
-        await self._cancel_in_remote_manager(workflow_id, errors)
+        await self._cancel_in_remote_manager(workflow_id, workflow_name, errors)
 
         await increment_version()
 
@@ -178,7 +189,12 @@ class WorkerCancellationHandler:
                 workflow_id
             ].status = WorkflowStatus.CANCELLED.value
 
-    async def _cancel_in_remote_manager(self, workflow_id: str, errors: list[str]) -> None:
+    async def _cancel_in_remote_manager(
+        self,
+        workflow_id: str,
+        workflow_name: str | None,
+        errors: list[str],
+    ) -> None:
         """Cancel a named workflow in the RemoteGraphManager when one is set."""
         # Cancel in RemoteGraphManager. TWO-step protocol by design:
         # ``cancel_workflow`` SUBMITS cancellation to every node
@@ -191,7 +207,6 @@ class WorkerCancellationHandler:
         # (measured: a timed-out 100s workflow drained 55.5 virtual
         # seconds AFTER the client observed the timeout terminal —
         # zombie execution burning cores past the job's death).
-        workflow_name = self._state._workflow_id_to_name.get(workflow_id)
         if workflow_name and self._remote_manager:
             await self._run_remote_cancellation(workflow_id, workflow_name, errors)
 

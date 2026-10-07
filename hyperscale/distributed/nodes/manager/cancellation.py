@@ -366,6 +366,7 @@ class ManagerCancellationCoordinator:
                 workflow_id=workflow_id,
                 requester_id=requester_id,
                 timestamp=timestamp,
+                reason=reason,
             ).dump()
 
             response = await self._send_to_worker(

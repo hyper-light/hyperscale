@@ -28,8 +28,8 @@
 - Partial completion: explicit “best‑effort” mode for tests when a DC is lost. *Built (AD-44 `BestEffortManager`).*
 
 ## Security & Isolation
-- Per‑tenant quotas: CPU/mem/connection budgets with enforcement. *Not built: no tenant identity or quota model.*
-- Job sandboxing: runtime isolation for load generators (cgroups/containers). *Not built: the trust boundary is the authenticated, replay-checked frame; there is no runtime isolation.*
+- Per‑tenant quotas: CPU/mem/connection budgets with enforcement. *Not planned (2026-10-07): hyperscale is job-driven and has no tenant concept; AD-41 per-job budgets, AD-24 per-client rate limits and D-65/D-67 per-job-class caps and breakers are its resource controls.*
+- Job sandboxing: runtime isolation for load generators (cgroups/containers). *Not planned (2026-10-07): isolation is the deployment's job -- nodes run in containers, which provide the cgroup limits and filesystem isolation; hyperscale's own trust boundary is the authenticated, replay-checked frame.*
 - Audit trails: immutable log of job lifecycle transitions and leadership changes. *Built: all job events plus `JobLeadershipAcquired` are journaled in the job ledger.*
 
 ## Testing & Validation

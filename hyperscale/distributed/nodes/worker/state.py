@@ -88,6 +88,9 @@ class WorkerState:
         self._workflow_start_times: dict[str, float] = {}
         self._workflow_timeout_seconds: dict[str, float] = {}
         self._suppressed_final_result_reasons: dict[str, str] = {}
+        # Why each cancelled workflow was cancelled (job timeout, AD-41
+        # kill, explicit cancel): its final result names the cause.
+        self._workflow_cancel_reasons: dict[str, str] = {}
         # Phase H4 — callbacks invoked on every workflow termination
         # path (success / failure / cancel / orphan-eviction). The
         # autonomous extension trigger registers here so its
@@ -227,6 +230,7 @@ class WorkerState:
         self._workflow_start_times.pop(workflow_id, None)
         self._workflow_timeout_seconds.pop(workflow_id, None)
         self._suppressed_final_result_reasons.pop(workflow_id, None)
+        self._workflow_cancel_reasons.pop(workflow_id, None)
         # Phase H4 — fire registered termination callbacks (e.g. the
         # autonomous extension trigger's forget_workflow). Catches the
         # workflow_executor termination path as well as the worker
@@ -270,6 +274,17 @@ class WorkerState:
         """Suppress non-success final-result pushes for all active workflows."""
         for workflow_id in list(self._active_workflows.keys()):
             self.suppress_final_result(workflow_id, reason)
+
+    def record_workflow_cancel_reason(self, workflow_id: str, reason: str) -> None:
+        """Record why an active workflow is being cancelled; the first
+        decision stands -- a later cancel of the same workflow (a retried
+        timeout, a duplicate request) does not rewrite its cause."""
+        if workflow_id in self._active_workflows:
+            self._workflow_cancel_reasons.setdefault(workflow_id, reason)
+
+    def workflow_cancel_reason(self, workflow_id: str) -> str | None:
+        """Why the workflow was cancelled, when it was."""
+        return self._workflow_cancel_reasons.get(workflow_id)
 
     def is_final_result_suppressed(self, workflow_id: str) -> bool:
         """Return whether a workflow's non-success final result is locally suppressed."""

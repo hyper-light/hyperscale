@@ -124,8 +124,10 @@ class WorkflowCancelHandler:
         """Cancel a non-terminal workflow and report whether it was running."""
         # Cancel the workflow
         was_running = progress.status == WorkflowStatus.RUNNING.value
+        # The manager's own cause (job timeout, AD-41 kill, client cancel)
+        # rides the request; the run's final result names it.
         cancelled, _ = await self._server._cancel_workflow(
-            request.workflow_id, "manager_cancel_request"
+            request.workflow_id, request.reason or "manager_cancel_request"
         )
 
         if cancelled:

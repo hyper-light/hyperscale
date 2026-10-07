@@ -181,13 +181,29 @@ fencing (`test_multiprocess_clock_fence.py`), VM pause
 - **Adversarial workflows.** Panic, infinite loop (timeout-killed),
   giant memory allocation (OOM-killed).
 
-*Status:* partial. Built: 100-job instant burst
+*Status:* built. 100-job instant burst
 (`tests/unit/simulation/sim/test_multiprocess_fanout.py`), dependency chains
 and dispatch exhaustion (`test_multiprocess_workflow_lifecycle.py`), mid-flight
 cancel (`test_multiprocess_job_cancellation.py`), submit during a blackout
 (`test_multiprocess_l2_submission_blackout.py`), long-running with AD-26
-extension (`test_multiprocess_l2_extension.py`). Not built: sustained-rate and
-staggered-start scenarios, cross-DC dependency chains, adversarial workflows.
+extension (`test_multiprocess_l2_extension.py`). Sustained 10 jobs/s for 60 s
+(`test_multiprocess_sustained_submission.py`: paced from the first acceptance,
+every sojourn within two rounds, in-flight within Little's bound, drained
+tables independent of the job count). Staggered starts through three gates
+(`test_multiprocess_staggered_submission.py`: offsets anchored on the first
+acceptance, all gates in flight at once, exactly once). Cross-DC chain
+(`test_multiprocess_cross_dc_chain.py`): a job's workflows are placed
+together, so B runs in another datacenter than its A only when A's
+datacenter is lost between them -- AD-36 moves B to the replacement and
+re-runs A there for context alone; A's counted result stays the lost
+datacenter's. Adversarial workflows (`test_multiprocess_adversarial_workflows.py`):
+a raising step fails its job; a step that swallows every cancellation is
+ended by the job's AD-34 timeout; a hog is killed by AD-41 at its memory
+budget (SIM scripts the hog's memory at the worker: executor monitors do
+not run on the SimulationLoop) -- each FAILED with its cause named, and the
+next job completes within the cancellation windows. Open (core/jobs): a
+raised step's error reaches the client only as "No results returned"
+(strict xfail in that file).
 
 ## 8. Resource pressure / pool fidelity
 

@@ -351,7 +351,7 @@ class WorkerWorkflowExecutor:
             context_updates = self._encode_context_updates(context)
 
         except asyncio.CancelledError:
-            workflow_error = "Cancelled"
+            workflow_error = self._cancelled_error_text(dispatch.workflow_id)
             progress.status = WorkflowStatus.CANCELLED.value
 
         except Exception as exc:
@@ -518,6 +518,13 @@ class WorkerWorkflowExecutor:
             return workflow_error
         progress.status = WorkflowStatus.COMPLETED.value
         return None
+
+    def _cancelled_error_text(self, workflow_id: str) -> str:
+        """A cancelled run's error: ``Cancelled``, with the worker's recorded
+        cause (job timeout, AD-41 kill, explicit cancel) when it has one."""
+        if (reason := self._state.workflow_cancel_reason(workflow_id)) is None:
+            return "Cancelled"
+        return f"Cancelled: {reason}"
 
     @staticmethod
     def _error_text(error: Exception | None) -> str:

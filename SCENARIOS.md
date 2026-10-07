@@ -1106,8 +1106,8 @@ Race Conditions Under Load
 - Workflow retry rate - Retried workflows
 
 34.4 Stats Accuracy
-- Floating point precision - Stats aggregation precision
-- Counter overflow - Stats counter exceeds int64
+- Floating point precision - Stats aggregation precision (Built: sample digests hold exact sums and merge order-independently; hyperscale/reporting/sample_digest.py)
+- Counter overflow - Stats counter exceeds int64 (Built: counts are Python ints and rates divide them exactly, rounding once; tests/unit/reporting/test_results_merge_vopr.py, test_sample_digest_vopr.py)
 - Rate calculation accuracy - Throughput calculation over time
 - Percentile accuracy - P99 with limited samples
 ---
@@ -1127,7 +1127,7 @@ Race Conditions Under Load
 
 35.3 Reporter During Failure
 - Reporter unreachable - Events buffered or dropped
-- Reporter reconnection - Buffer replayed on reconnect
+- Reporter reconnection - Buffer replayed on reconnect (Doc-obsolete: results go to reporters once, at the end of a job, each submission on a connection of its own under a deadline -- there is no long-lived connection to reconnect. The result is kept by the gate and delivered to the client whether or not a reporter accepts it, a failed submission is logged, and replaying writes into backends without idempotency keys (SQL inserts, Kafka, Datadog series) would duplicate rows. See REMAINING_LEDGER R-G38.)
 - Reporter timeout - Slow reporter times out
 - Reporter crash recovery - Reporter restarts mid-test
 ---

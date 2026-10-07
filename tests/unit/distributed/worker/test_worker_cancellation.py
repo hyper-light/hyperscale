@@ -35,6 +35,12 @@ class MockWorkerState:
         self._workflow_tokens: dict[str, str] = {}
         self._active_workflows: dict[str, MagicMock] = {}
         self._workflow_id_to_name: dict[str, str] = {}
+        self._workflow_cancel_reasons: dict[str, str] = {}
+
+    def record_workflow_cancel_reason(self, workflow_id: str, reason: str) -> None:
+        """As WorkerState: the first recorded cause of an active workflow stands."""
+        if workflow_id in self._active_workflows:
+            self._workflow_cancel_reasons.setdefault(workflow_id, reason)
 
     def add_workflow(
         self,
@@ -793,3 +799,32 @@ class TestWorkerCancellationHandlerFailureModes:
 
         # Loop should have continued despite exceptions
         assert exception_count[0] >= 1
+
+
+class TestWorkerCancellationReachesExecutors:
+    """The executors are told to stop even when cancelling the worker's
+    execution task drops the workflow's name (its final-result cleanup)."""
+
+    @pytest.mark.asyncio
+    async def test_remote_cancellation_uses_the_name_read_before_the_task_cancel(self) -> None:
+        state = MockWorkerState()
+        state.add_workflow("wf-1", token="token-1", name="SimWorkflow")
+        handler = WorkerCancellationHandler(state, **CANCELLATION_TIMEOUTS)
+        remote_manager = MagicMock()
+        remote_manager.cancel_workflow = AsyncMock()
+        remote_manager.await_workflow_cancellation = AsyncMock(return_value=(True, []))
+        handler.set_remote_manager(remote_manager)
+
+        async def cancel_task_and_clean_up(token: str) -> None:
+            # The worker's execution task, cancelled, publishes its final
+            # result and drops the workflow's local state.
+            state._workflow_id_to_name.pop("wf-1", None)
+
+        success, errors = await handler.cancel_workflow(
+            "wf-1", "execution_timeout_exceeded (20.0s)", cancel_task_and_clean_up, AsyncMock(return_value=1)
+        )
+
+        assert success and errors == []
+        remote_manager.cancel_workflow.assert_awaited_once()
+        assert remote_manager.cancel_workflow.await_args.args[1] == "SimWorkflow"
+        assert state._workflow_cancel_reasons == {"wf-1": "execution_timeout_exceeded (20.0s)"}

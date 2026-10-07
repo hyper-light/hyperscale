@@ -352,10 +352,12 @@ Items: root-docs.md G-rows (R-G*) plus delta-partials/delta-changed-code finding
 - Exists: semantics covered (tests/end_to_end/gate_manager/section_21..23.py; StatsBuffer/RobustMessageQueue unit tests; SIM fanout fixes, plan :324-330).
 - Missing: no 100K/s ingest or 10K-burst harness under tests/ (grep `storm|avalanche|flood|100_000` → none at that scale). Plan :340 "stats ingest, spike" probes not written.
 
-#### R-G38 — Reporter/results aggregation math under load untested — STILL PARTIAL — size M
+#### R-G38 — Reporter/results aggregation math — CLOSED 2026-10-07 — size M
 - Doc: SCENARIOS §34-35 "Counter overflow - Stats counter exceeds int64"; "Reporter failure isolation"; "Buffer replayed on reconnect".
-- Exists: isolation now tested (tests/unit/distributed/{gate,client}/test_*_reporter_isolation.py); t-digest (tests/unit/distributed/slo/test_tdigest_properties.py).
-- Missing: no test imports hyperscale/reporting/results.py, time_aligned_results.py or timings_aggregate.py (merge/percentile math, int64/float precision); no backend has a unit test; no replay-on-reconnect test.
+- Exists: isolation tested (tests/unit/distributed/{gate,client}/test_*_reporter_isolation.py); t-digest (tests/unit/distributed/slo/test_tdigest_properties.py).
+- Closed: merges no longer take the median of each source's mean, quantiles and spread. Each timing and metric carries a `SampleDigest` (hyperscale/reporting/sample_digest.py): exact sums in 2**-1074 units (exact_arithmetic.py: fsum expansion plus Veltkamp squares), the extremes, and a log-linear histogram with two significant digits (log_linear_buckets.py, HdrHistogram's layout, keys from exponent bits, no logarithms). Merging adds integers, so any order and grouping equals the union; mean and variance are exact until rounded once; quantiles/median/MAD are within |x|/256 plus half an ulp. Merged elapsed is the longest source's (was the median), and actions per second divide exactly. Fixed alongside: `executed` held only the last TEST step's count and `aps` was 0 when a workflow ended on a CHECK/METRIC step; `_merge_metric_results` returned None; metric types never matched on merge; SCP's transfer timing was written into the response; TimeAlignedResults averaged concurrent sources' rates and weighted elapsed by collection time. Tests: tests/unit/reporting/test_sample_digest_vopr.py, test_results_merge_vopr.py (exact Fraction references, counts past 2**63, mutation-checked).
+- Doc-obsolete: "Buffer replayed on reconnect". Results go to reporters once at a job's end, each submission on its own connection under a deadline; the gate keeps and delivers the result regardless; replaying into backends without idempotency keys would duplicate rows.
+- Not in scope here: per-backend unit tests (each needs its service or a local fake; Prometheus has one).
 
 #### R-G39 — 24h soak, 50K-VU spike — STILL PARTIAL — size M
 - Doc: SCENARIOS §36-40/§42.1 "24-hour soak"; "Spike pattern - 10K → 50K → 10K over 1 minute".
@@ -541,14 +543,16 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - Exists: gate shed returns `JobAck(retry_after_seconds=OVERLOAD_SAMPLE_INTERVAL_SECONDS)` (`nodes/gate/handlers/tcp_job.py:393-400`); client honors `RateLimitResponse.retry_after_seconds` (`nodes/client/submission.py:522-524`).
 - Missing: the client never reads `JobAck.retry_after_seconds` — a shed ack goes through `_rejection_outcome` (`submission.py:630`) and the retry loop sleeps its own exponential backoff from a literal `retry_base_delay = 0.5` (`submission.py:401`, `:433-444`). The gate's hint (and the replication-quorum hint) is dropped. NEW gap (Plan Phase 3 "Gate backpressure → client" built only the sending half).
 
-#### D-74 — Per-tenant quotas — STILL ABSENT — size L
+#### D-74 — Per-tenant quotas — DOC-OBSOLETE (user decision 2026-10-07)
 - Doc: improvements.md:29 "CPU/mem/connection budgets with enforcement."
 - Exists: per-client rate limiting (AD-24) and per-job AD-41 budgets.
 - Missing: tenant identity and quota model (zero `tenant|quota` hits under `hyperscale/distributed`).
+- Decision: hyperscale has no tenant concept: it is job-driven. Per-job budgets (AD-41), per-client rate limiting (AD-24), and D-65 caps / D-67 breakers per job class cover resource control; a tenant layer would invent a problem.
 
-#### D-75 — Job sandboxing (cgroups/containers) — STILL ABSENT — size L
+#### D-75 — Job sandboxing (cgroups/containers) — DOC-OBSOLETE (user decision 2026-10-07)
 - Doc: improvements.md:30.
 - Missing: any isolation (zero `cgroup|sandbox` hits under `hyperscale/`); trust model is the authenticated frame (Plan "Unpickler and by-value workflows" decision), which does not cover runtime isolation.
+- Decision: isolation is the deployment's job: nodes run in containers (the uv-only Dockerfile and release image), which provide the cgroup limits and filesystem isolation; hyperscale does not reimplement them.
 
 #### D-83 — Cyclomatic complexity caps — STILL PARTIAL — size L
 - Doc: REFACTOR.md:17 "Maximum cyclic complexity of 5 for classes and 4 for functions."
@@ -566,10 +570,10 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - Exists: ratchet `tests/simulation/lints/test_dataclass_conventions.py`; `models/` fully one-class-per-file.
 - Missing: 270 snapshot entries repo-wide (230 under distributed); within REFACTOR's scope 6 node dataclasses sit outside `models/` — `nodes/client/config.py::ClientConfig`, `nodes/manager/config.py::ManagerConfig`, `nodes/worker/config.py::WorkerConfig`, `nodes/worker/extension_trigger_config.py::ExtensionTriggerConfig`, `nodes/worker/_per_workflow_trigger_state.py`, +1. Plan Phase 8 "move the 30 dataclasses that sit outside models/" open.
 
-#### D-92 — SCENARIOS §7 workload patterns — STILL PARTIAL — size M
+#### D-92 — SCENARIOS §7 workload patterns — CLOSED 2026-10-07 — size M
 - Doc: docs/SCENARIOS.md §7: burst 100/s, sustained 10/s×60s, staggered, long-running, cancel, DAG, cross-DC dependencies, idempotent resubmit, submit-during-election/partition, adversarial workflows (panic/loop/OOM).
 - Exists: 100-job instant burst `tests/unit/simulation/sim/test_multiprocess_fanout.py`; DAG + dispatch exhaustion `test_multiprocess_workflow_lifecycle.py`; cancel `test_multiprocess_job_cancellation.py`; blackout `test_multiprocess_l2_submission_blackout.py`; long-running `test_multiprocess_l2_extension.py`.
-- Missing: sustained-rate and staggered-start scenarios; cross-DC dependency chains; adversarial workflows (a step that raises, loops forever, or exhausts memory) — none in `tests/simulation/harness/sim/multiprocess/`.
+- Closed: sustained `test_multiprocess_sustained_submission.py` (demo `sustained_submission_demo.py`); staggered across three gates `test_multiprocess_staggered_submission.py` (`staggered_submission_demo.py`); cross-DC chain via AD-36 failover between A and B `test_multiprocess_cross_dc_chain.py` (`cross_dc_chain_demo.py`); adversarial raise / never-ending step / memory hog `test_multiprocess_adversarial_workflows.py` (`adversarial_workflow_demo.py`). Fixed on the way: the worker skipped the executors' cancellation (it read the workflow's name after the TaskRunner cancel had dropped it, `nodes/worker/cancellation.py`), so every cancelled ACTION workflow ran to its natural end and starved the next job; cancelled runs now name their cause (worker `state.py` cancel reasons, `workflow_executor.py`, manager `cancellation.py` sends `WorkflowCancelRequest.reason`, worker `handlers/tcp_cancel.py` uses it). Open, core/jobs (peer-owned): `core/jobs/graphs/remote_graph_manager.py:1171` reports a raised step as "No results returned" (strict xfail); `core/jobs/graphs/workflow_runner.py:270` `hard_cancel` never confirms the run task ended, so a step swallowing cancellation keeps a task alive in its executor.
 
 #### D-95 — SCENARIOS §10 WAL corruption refusal — CLOSED (AD-38 Part 3.2; `test_node_wal_damage_vopr.py`)
 - Doc: docs/SCENARIOS.md §10 "WAL corruption. Detected at startup; node refuses to come up."
