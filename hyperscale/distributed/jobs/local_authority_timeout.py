@@ -4,7 +4,7 @@
 from typing import TYPE_CHECKING
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 from hyperscale.distributed.models.distributed import JobStatus
-from hyperscale.distributed.models.jobs import TimeoutTrackingState
+from hyperscale.distributed.models.jobs import JobInfo, TimeoutTrackingState
 from hyperscale.distributed.workflow import WorkflowState
 
 from .timeout_strategy_shared import _DEFAULT_CLOCK
@@ -105,14 +105,23 @@ class LocalAuthorityTimeout(TimeoutStrategy):
 
         Only times out once (checked via locally_timed_out flag).
         """
+        # Idempotent: already timed out
+        if (
+            job := self._tracked_job(job_id)
+        ) is None or job.timeout_tracking.locally_timed_out:
+            return False, ""
+
+        return await self._check_active_job(job_id, job)
+
+    def _tracked_job(self, job_id: str) -> JobInfo | None:
+        """The job while it exists and carries timeout tracking, else None."""
         job = self._manager._job_manager.get_job_by_id(job_id)
         if not job or not job.timeout_tracking:
-            return False, ""
+            return None
+        return job
 
-        # Idempotent: already timed out
-        if job.timeout_tracking.locally_timed_out:
-            return False, ""
-
+    async def _check_active_job(self, job_id: str, job: JobInfo) -> tuple[bool, str]:
+        """Time out a non-terminal job past its extended timeout, else check whether it is stuck."""
         # Check terminal state (race protection)
         if job.status in {
             JobStatus.COMPLETED.value,
@@ -131,33 +140,47 @@ class LocalAuthorityTimeout(TimeoutStrategy):
         # Check overall timeout (with extensions)
         elapsed = now - tracking.started_at
         if elapsed > effective_timeout:
-            async with job.lock:
-                tracking.locally_timed_out = True
-                tracking.timeout_reason = (
-                    f"Job timeout exceeded ({elapsed:.1f}s > {effective_timeout:.1f}s, "
-                    f"base={tracking.timeout_seconds:.1f}s + "
-                    f"extensions={tracking.total_extensions_granted:.1f}s)"
-                )
+            return await self._time_out_exceeded(
+                job_id, job, tracking, elapsed, effective_timeout
+            )
 
-            await self._manager._timeout_job(job_id, tracking.timeout_reason)
-            return True, tracking.timeout_reason
+        return await self._check_stuck(job_id, job, tracking, now)
 
+    async def _time_out_exceeded(
+        self,
+        job_id: str,
+        job: JobInfo,
+        tracking: TimeoutTrackingState,
+        elapsed: float,
+        effective_timeout: float,
+    ) -> tuple[bool, str]:
+        """Mark the job timed out (once) for exceeding its extended timeout, then time it out."""
+        async with job.lock:
+            tracking.locally_timed_out = True
+            tracking.timeout_reason = (
+                f"Job timeout exceeded ({elapsed:.1f}s > {effective_timeout:.1f}s, "
+                f"base={tracking.timeout_seconds:.1f}s + "
+                f"extensions={tracking.total_extensions_granted:.1f}s)"
+            )
+
+        await self._manager._timeout_job(job_id, tracking.timeout_reason)
+        return True, tracking.timeout_reason
+
+    async def _check_stuck(
+        self,
+        job_id: str,
+        job: JobInfo,
+        tracking: TimeoutTrackingState,
+        now: float,
+    ) -> tuple[bool, str]:
+        """Time out a job with work in flight and no progress past the extended stuck threshold."""
         # Check for stuck (no progress AND no recent extensions)
         time_since_progress = now - tracking.last_progress_at
-        time_since_extension = (
-            now - tracking.last_extension_at
-            if tracking.last_extension_at > 0
-            else float("inf")
-        )
+        time_since_extension = self._time_since_extension(tracking, now)
 
         # Only work in flight can be stuck: a job whose workflows all wait
         # for capacity or dependencies is waiting, bounded by its timeout.
-        lifecycle = self._manager._job_manager.workflow_lifecycle
-        if not any(
-            lifecycle.get_state(job_id, workflow_info.token.workflow_id or "")
-            in (WorkflowState.DISPATCHED, WorkflowState.RUNNING)
-            for workflow_info in job.workflows.values()
-        ):
+        if not self._has_work_in_flight(job_id, job):
             return False, ""
 
         # Stuck: no progress for longer than the threshold plus every AD-26
@@ -168,17 +191,48 @@ class LocalAuthorityTimeout(TimeoutStrategy):
             time_since_progress
             > tracking.stuck_threshold + tracking.extension_seconds_since_progress
         ):
-            async with job.lock:
-                tracking.locally_timed_out = True
-                tracking.timeout_reason = (
-                    f"Job stuck (no progress for {time_since_progress:.1f}s, "
-                    f"no extensions for {time_since_extension:.1f}s)"
-                )
-
-            await self._manager._timeout_job(job_id, tracking.timeout_reason)
-            return True, tracking.timeout_reason
+            return await self._time_out_stuck(
+                job_id, job, tracking, time_since_progress, time_since_extension
+            )
 
         return False, ""
+
+    async def _time_out_stuck(
+        self,
+        job_id: str,
+        job: JobInfo,
+        tracking: TimeoutTrackingState,
+        time_since_progress: float,
+        time_since_extension: float,
+    ) -> tuple[bool, str]:
+        """Mark the job timed out (once) as stuck, then time it out."""
+        async with job.lock:
+            tracking.locally_timed_out = True
+            tracking.timeout_reason = (
+                f"Job stuck (no progress for {time_since_progress:.1f}s, "
+                f"no extensions for {time_since_extension:.1f}s)"
+            )
+
+        await self._manager._timeout_job(job_id, tracking.timeout_reason)
+        return True, tracking.timeout_reason
+
+    @staticmethod
+    def _time_since_extension(tracking: TimeoutTrackingState, now: float) -> float:
+        """Seconds since the last AD-26 extension grant (infinite when none was granted)."""
+        return (
+            now - tracking.last_extension_at
+            if tracking.last_extension_at > 0
+            else float("inf")
+        )
+
+    def _has_work_in_flight(self, job_id: str, job: JobInfo) -> bool:
+        """Whether any of the job's workflows is DISPATCHED or RUNNING."""
+        lifecycle = self._manager._job_manager.workflow_lifecycle
+        return any(
+            lifecycle.get_state(job_id, workflow_info.token.workflow_id or "")
+            in (WorkflowState.DISPATCHED, WorkflowState.RUNNING)
+            for workflow_info in job.workflows.values()
+        )
 
     async def handle_global_timeout(
         self, job_id: str, reason: str, fence_token: int

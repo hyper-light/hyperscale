@@ -3,6 +3,7 @@
 
 import sys
 import time
+from itertools import filterfalse
 from typing import Callable
 
 from .cross_dc_correlation_shared import _DEFAULT_CLOCK
@@ -140,11 +141,7 @@ class CrossDCCorrelationDetector:
         self._known_datacenters.add(datacenter_id)
         if datacenter_id not in self._failure_records:
             self._failure_records[datacenter_id] = []
-        if datacenter_id not in self._dc_states:
-            self._dc_states[datacenter_id] = DCStateInfo(
-                datacenter_id=datacenter_id,
-                state_entered_at=now,
-            )
+        self._ensure_dc_state(datacenter_id, now)
 
         # Record the failure
         record = DCFailureRecord(
@@ -170,37 +167,66 @@ class CrossDCCorrelationDetector:
 
         # Count failures in flap detection window
         window_start = now - self._config.flap_detection_window_seconds
-        state.failure_count_in_window = sum(
-            1
-            for r in self._failure_records[datacenter_id]
-            if r.timestamp >= window_start
+        state.failure_count_in_window = self._count_records_since(
+            self._failure_records[datacenter_id], window_start
         )
 
         # State transitions
+        self._apply_failure_transition(state, now)
+
+    def _ensure_dc_state(self, datacenter_id: str, now: float) -> None:
+        """Create the DC's state-machine entry, entered at ``now``, if it is not tracked yet."""
+        if datacenter_id not in self._dc_states:
+            self._dc_states[datacenter_id] = DCStateInfo(
+                datacenter_id=datacenter_id,
+                state_entered_at=now,
+            )
+
+    @staticmethod
+    def _count_records_since(records: list[DCFailureRecord], window_start: float) -> int:
+        """Count the failure records stamped at or after ``window_start``."""
+        return sum(1 for r in records if r.timestamp >= window_start)
+
+    def _apply_failure_transition(self, state: DCStateInfo, now: float) -> None:
+        """Advance the DC state machine on a failure (hysteresis; FLAPPING stays put)."""
         if state.current_state == DCHealthState.HEALTHY:
             state.current_state = DCHealthState.FAILING
             state.state_entered_at = now
-        elif state.current_state == DCHealthState.RECOVERING:
-            # Was recovering but failed again - check for flapping
-            if state.is_flapping(
-                self._config.flap_threshold,
-                self._config.flap_detection_window_seconds,
-            ):
-                state.current_state = DCHealthState.FLAPPING
-                state.state_entered_at = now
-                self._flap_events_detected += 1
-            else:
-                state.current_state = DCHealthState.FAILING
-                state.state_entered_at = now
-        elif state.current_state == DCHealthState.FLAPPING:
-            # Already flapping, stay in that state
-            pass
-        elif state.current_state in (DCHealthState.FAILING, DCHealthState.FAILED):
-            # Already failing/failed, check if should upgrade to FAILED
-            if state.is_confirmed_failed(self._config.failure_confirmation_seconds):
-                if state.current_state != DCHealthState.FAILED:
-                    state.current_state = DCHealthState.FAILED
-                    state.state_entered_at = now
+            return
+        if state.current_state == DCHealthState.RECOVERING:
+            self._fail_while_recovering(state, now)
+            return
+        # Already flapping: stay in that state (the check below skips FLAPPING).
+        self._confirm_failure(state, now)
+
+    def _fail_while_recovering(self, state: DCStateInfo, now: float) -> None:
+        """A recovering DC failed again: enter FLAPPING when it oscillates, else FAILING."""
+        # Was recovering but failed again - check for flapping
+        if state.is_flapping(
+            self._config.flap_threshold,
+            self._config.flap_detection_window_seconds,
+        ):
+            state.current_state = DCHealthState.FLAPPING
+            state.state_entered_at = now
+            self._flap_events_detected += 1
+        else:
+            state.current_state = DCHealthState.FAILING
+            state.state_entered_at = now
+
+    def _confirm_failure(self, state: DCStateInfo, now: float) -> None:
+        """Already failing/failed: check whether the failure is confirmed (debouncing)."""
+        if state.current_state in (
+            DCHealthState.FAILING,
+            DCHealthState.FAILED,
+        ) and state.is_confirmed_failed(self._config.failure_confirmation_seconds):
+            self._promote_to_failed(state, now)
+
+    @staticmethod
+    def _promote_to_failed(state: DCStateInfo, now: float) -> None:
+        """Upgrade a confirmed failure to FAILED unless it already is."""
+        if state.current_state != DCHealthState.FAILED:
+            state.current_state = DCHealthState.FAILED
+            state.state_entered_at = now
 
     def record_recovery(self, datacenter_id: str) -> None:
         """
@@ -227,28 +253,40 @@ class CrossDCCorrelationDetector:
         state.recovery_count_in_window += 1
 
         # State transitions
+        self._apply_recovery_transition(datacenter_id, state, now)
+
+    def _apply_recovery_transition(self, datacenter_id: str, state: DCStateInfo, now: float) -> None:
+        """Advance the DC state machine on a recovery signal (already HEALTHY: nothing to do)."""
         if state.current_state == DCHealthState.FLAPPING:
-            # Need cooldown period before exiting flapping
-            if (now - state.state_entered_at) >= self._config.flap_cooldown_seconds:
-                state.current_state = DCHealthState.RECOVERING
-                state.state_entered_at = now
-            # Otherwise stay in FLAPPING
-        elif state.current_state in (DCHealthState.FAILING, DCHealthState.FAILED):
+            self._exit_flapping_after_cooldown(state, now)
+            return
+        if state.current_state in (DCHealthState.FAILING, DCHealthState.FAILED):
             # Start recovery process
             state.current_state = DCHealthState.RECOVERING
             state.state_entered_at = now
-        elif state.current_state == DCHealthState.RECOVERING:
-            # Check if recovery is confirmed
-            if state.is_confirmed_recovered(self._config.recovery_confirmation_seconds):
-                state.current_state = DCHealthState.HEALTHY
-                state.state_entered_at = now
-                # Clear failure records on confirmed recovery
-                self._failure_records[datacenter_id] = []
-                state.failure_count_in_window = 0
-                state.recovery_count_in_window = 0
-        elif state.current_state == DCHealthState.HEALTHY:
-            # Already healthy, nothing to do
-            pass
+            return
+        self._confirm_recovery(datacenter_id, state, now)
+
+    def _exit_flapping_after_cooldown(self, state: DCStateInfo, now: float) -> None:
+        """Leave FLAPPING for RECOVERING only once the flap cooldown has elapsed."""
+        # Need cooldown period before exiting flapping
+        if (now - state.state_entered_at) >= self._config.flap_cooldown_seconds:
+            state.current_state = DCHealthState.RECOVERING
+            state.state_entered_at = now
+        # Otherwise stay in FLAPPING
+
+    def _confirm_recovery(self, datacenter_id: str, state: DCStateInfo, now: float) -> None:
+        """A RECOVERING DC whose recovery is sustained becomes HEALTHY and drops its history."""
+        # Check if recovery is confirmed
+        if state.current_state == DCHealthState.RECOVERING and state.is_confirmed_recovered(
+            self._config.recovery_confirmation_seconds
+        ):
+            state.current_state = DCHealthState.HEALTHY
+            state.state_entered_at = now
+            # Clear failure records on confirmed recovery
+            self._failure_records[datacenter_id] = []
+            state.failure_count_in_window = 0
+            state.recovery_count_in_window = 0
 
     def record_latency(
         self,
@@ -442,16 +480,19 @@ class CrossDCCorrelationDetector:
         # Check if we're still in backoff from previous correlation
         if (
             now - self._last_correlation_time
-        ) < self._config.correlation_backoff_seconds:
-            if self._last_correlation_time > 0:
-                return CorrelationDecision(
-                    severity=CorrelationSeverity.MEDIUM,
-                    reason="Within correlation backoff period",
-                    affected_datacenters=self._get_confirmed_failing_dcs(),
-                    recommendation="Wait for backoff to expire before evicting",
-                    flapping_datacenters=self._get_flapping_dcs(),
-                )
+        ) < self._config.correlation_backoff_seconds and self._last_correlation_time > 0:
+            return CorrelationDecision(
+                severity=CorrelationSeverity.MEDIUM,
+                reason="Within correlation backoff period",
+                affected_datacenters=self._get_confirmed_failing_dcs(),
+                recommendation="Wait for backoff to expire before evicting",
+                flapping_datacenters=self._get_flapping_dcs(),
+            )
 
+        return self._evaluate_correlation(now, window_start)
+
+    def _evaluate_correlation(self, now: float, window_start: float) -> CorrelationDecision:
+        """Weigh confirmed, flapping and recent failures into a correlation decision (outside backoff)."""
         # Count DCs with CONFIRMED failures (not just transient)
         confirmed_failing_dcs = self._get_confirmed_failing_dcs()
         flapping_dcs = self._get_flapping_dcs()
@@ -463,11 +504,12 @@ class CrossDCCorrelationDetector:
 
         # But also consider recent unconfirmed failures if they're clustered
         # This helps detect rapidly developing situations
-        unconfirmed_recent = [
-            dc
-            for dc in recent_failing_dcs
-            if dc not in confirmed_failing_dcs and dc not in flapping_dcs
-        ]
+        unconfirmed_recent = list(
+            filterfalse(
+                set(confirmed_failing_dcs).union(flapping_dcs).__contains__,
+                recent_failing_dcs,
+            )
+        )
 
         # If we have many unconfirmed failures clustered together,
         # weight them partially (they might be a developing partition)
@@ -485,66 +527,21 @@ class CrossDCCorrelationDetector:
             )
 
         # Calculate fraction of known DCs failing
-        known_dc_count = len(self._known_datacenters)
-        if known_dc_count == 0:
-            known_dc_count = 1  # Avoid division by zero
+        # (at least one known DC, to avoid division by zero)
+        known_dc_count = max(len(self._known_datacenters), 1)
 
         failure_fraction = effective_failure_count / known_dc_count
 
         # Determine severity based on thresholds
-        severity: CorrelationSeverity
-        reason: str
-        recommendation: str
-
-        # HIGH: Both fraction AND high count threshold must be met
-        is_high_fraction = failure_fraction >= self._config.high_threshold_fraction
-        is_high_count = effective_failure_count >= self._config.high_count_threshold
-
-        if is_high_fraction and is_high_count:
-            severity = CorrelationSeverity.HIGH
-            reason = (
-                f"{effective_failure_count}/{known_dc_count} DCs ({failure_fraction:.0%}) "
-                f"confirmed failing within {self._config.correlation_window_seconds}s window"
-            )
-            if flapping_dcs:
-                reason += f" ({len(flapping_dcs)} flapping)"
-            recommendation = (
-                "High correlation detected - likely network issue. "
-                "Investigate connectivity before evicting any DC."
-            )
-            self._last_correlation_time = now
-            self._correlation_events_detected += 1
-
-        elif effective_failure_count >= self._config.medium_threshold:
-            severity = CorrelationSeverity.MEDIUM
-            reason = (
-                f"{effective_failure_count} DCs confirmed failing within "
-                f"{self._config.correlation_window_seconds}s window"
-            )
-            if flapping_dcs:
-                reason += f" ({len(flapping_dcs)} flapping)"
-            recommendation = (
-                "Medium correlation detected. "
-                "Delay eviction and investigate cross-DC connectivity."
-            )
-            self._last_correlation_time = now
-            self._correlation_events_detected += 1
-
-        elif total_weighted_failures >= self._config.low_threshold:
-            severity = CorrelationSeverity.LOW
-            reason = (
-                f"{effective_failure_count} confirmed + {len(unconfirmed_recent)} unconfirmed "
-                f"DCs failing within {self._config.correlation_window_seconds}s window"
-            )
-            recommendation = (
-                "Low correlation detected. "
-                "Consider investigating before evicting, but may proceed cautiously."
-            )
-
-        else:
-            severity = CorrelationSeverity.NONE
-            reason = "Failure count below correlation thresholds"
-            recommendation = "Safe to proceed with eviction"
+        severity, reason, recommendation = self._classify_severity(
+            now,
+            effective_failure_count,
+            known_dc_count,
+            failure_fraction,
+            total_weighted_failures,
+            len(unconfirmed_recent),
+            flapping_dcs,
+        )
 
         # Compute secondary correlation signals
         latency_metrics = self._compute_latency_correlation()
@@ -552,24 +549,17 @@ class CrossDCCorrelationDetector:
         lhm_metrics = self._compute_lhm_correlation()
 
         # Track correlation events for statistics
-        if latency_metrics["correlated"]:
-            self._latency_correlation_events += 1
-        if extension_metrics["correlated"]:
-            self._extension_correlation_events += 1
-        if lhm_metrics["correlated"]:
-            self._lhm_correlation_events += 1
+        self._latency_correlation_events += latency_metrics["correlated"]
+        self._extension_correlation_events += extension_metrics["correlated"]
+        self._lhm_correlation_events += lhm_metrics["correlated"]
 
         # Enhance recommendation if secondary signals suggest network issue
-        if latency_metrics["correlated"] and severity == CorrelationSeverity.NONE:
-            recommendation = (
-                "Latency elevated across DCs suggests network degradation. "
-                "Consider investigating before evicting."
-            )
-        if extension_metrics["correlated"] and lhm_metrics["correlated"]:
-            recommendation = (
-                "High extensions and LHM across DCs indicates load, not failure. "
-                "Delay eviction until load subsides."
-            )
+        recommendation = self._latency_recommendation(
+            recommendation, severity, latency_metrics["correlated"]
+        )
+        recommendation = self._load_recommendation(
+            recommendation, extension_metrics["correlated"], lhm_metrics["correlated"]
+        )
 
         affected = confirmed_failing_dcs + flapping_dcs
         if severity in (CorrelationSeverity.MEDIUM, CorrelationSeverity.HIGH):
@@ -590,6 +580,114 @@ class CrossDCCorrelationDetector:
             dcs_with_elevated_lhm=lhm_metrics["dcs_stressed"],
         )
 
+    def _classify_severity(
+        self,
+        now: float,
+        effective_failure_count: int,
+        known_dc_count: int,
+        failure_fraction: float,
+        total_weighted_failures: float,
+        unconfirmed_count: int,
+        flapping_dcs: list[str],
+    ) -> tuple[CorrelationSeverity, str, str]:
+        """Map failure counts to (severity, reason, recommendation); HIGH needs fraction AND count."""
+        # HIGH: Both fraction AND high count threshold must be met
+        is_high_fraction = failure_fraction >= self._config.high_threshold_fraction
+        is_high_count = effective_failure_count >= self._config.high_count_threshold
+
+        if is_high_fraction and is_high_count:
+            reason = (
+                f"{effective_failure_count}/{known_dc_count} DCs ({failure_fraction:.0%}) "
+                f"confirmed failing within {self._config.correlation_window_seconds}s window"
+            ) + self._flapping_suffix(flapping_dcs)
+            recommendation = (
+                "High correlation detected - likely network issue. "
+                "Investigate connectivity before evicting any DC."
+            )
+            self._last_correlation_time = now
+            self._correlation_events_detected += 1
+            return CorrelationSeverity.HIGH, reason, recommendation
+
+        return self._classify_below_high_severity(
+            now,
+            effective_failure_count,
+            total_weighted_failures,
+            unconfirmed_count,
+            flapping_dcs,
+        )
+
+    def _classify_below_high_severity(
+        self,
+        now: float,
+        effective_failure_count: int,
+        total_weighted_failures: float,
+        unconfirmed_count: int,
+        flapping_dcs: list[str],
+    ) -> tuple[CorrelationSeverity, str, str]:
+        """Classify MEDIUM / LOW / NONE once HIGH correlation has been ruled out."""
+        if effective_failure_count >= self._config.medium_threshold:
+            reason = (
+                f"{effective_failure_count} DCs confirmed failing within "
+                f"{self._config.correlation_window_seconds}s window"
+            ) + self._flapping_suffix(flapping_dcs)
+            recommendation = (
+                "Medium correlation detected. "
+                "Delay eviction and investigate cross-DC connectivity."
+            )
+            self._last_correlation_time = now
+            self._correlation_events_detected += 1
+            return CorrelationSeverity.MEDIUM, reason, recommendation
+
+        if total_weighted_failures >= self._config.low_threshold:
+            reason = (
+                f"{effective_failure_count} confirmed + {unconfirmed_count} unconfirmed "
+                f"DCs failing within {self._config.correlation_window_seconds}s window"
+            )
+            recommendation = (
+                "Low correlation detected. "
+                "Consider investigating before evicting, but may proceed cautiously."
+            )
+            return CorrelationSeverity.LOW, reason, recommendation
+
+        return (
+            CorrelationSeverity.NONE,
+            "Failure count below correlation thresholds",
+            "Safe to proceed with eviction",
+        )
+
+    @staticmethod
+    def _flapping_suffix(flapping_dcs: list[str]) -> str:
+        """The reason suffix naming how many DCs are flapping, or "" when none are."""
+        return f" ({len(flapping_dcs)} flapping)" if flapping_dcs else ""
+
+    @staticmethod
+    def _latency_recommendation(
+        recommendation: str,
+        severity: CorrelationSeverity,
+        latency_correlated: bool,
+    ) -> str:
+        """Latency elevated across DCs with no failure correlation points at network degradation."""
+        if latency_correlated and severity == CorrelationSeverity.NONE:
+            return (
+                "Latency elevated across DCs suggests network degradation. "
+                "Consider investigating before evicting."
+            )
+        return recommendation
+
+    @staticmethod
+    def _load_recommendation(
+        recommendation: str,
+        extension_correlated: bool,
+        lhm_correlated: bool,
+    ) -> str:
+        """High extensions AND high LHM across DCs indicate load, not failure (AD-33)."""
+        if extension_correlated and lhm_correlated:
+            return (
+                "High extensions and LHM across DCs indicates load, not failure. "
+                "Delay eviction until load subsides."
+            )
+        return recommendation
+
     def _get_confirmed_failing_dcs(self) -> list[str]:
         """
         Get list of DCs with confirmed (sustained) failures.
@@ -597,14 +695,18 @@ class CrossDCCorrelationDetector:
         Returns:
             List of datacenter IDs with confirmed failures.
         """
-        confirmed: list[str] = []
-        for dc_id, state in self._dc_states.items():
-            if state.current_state == DCHealthState.FAILED:
-                confirmed.append(dc_id)
-            elif state.current_state == DCHealthState.FAILING:
-                if state.is_confirmed_failed(self._config.failure_confirmation_seconds):
-                    confirmed.append(dc_id)
-        return confirmed
+        return [
+            dc_id
+            for dc_id, state in self._dc_states.items()
+            if self._is_confirmed_failing(state)
+        ]
+
+    def _is_confirmed_failing(self, state: DCStateInfo) -> bool:
+        """FAILED counts outright; FAILING counts once the failure is confirmed (debounced)."""
+        return state.current_state == DCHealthState.FAILED or (
+            state.current_state == DCHealthState.FAILING
+            and state.is_confirmed_failed(self._config.failure_confirmation_seconds)
+        )
 
     def _get_flapping_dcs(self) -> list[str]:
         """
@@ -629,13 +731,21 @@ class CrossDCCorrelationDetector:
         Returns:
             List of datacenter IDs with recent failures.
         """
-        failing_dcs: list[str] = []
-        for dc_id, records in self._failure_records.items():
-            for record in records:
-                if record.timestamp >= since:
-                    failing_dcs.append(dc_id)
-                    break  # Only count each DC once
-        return failing_dcs
+        # Only count each DC once
+        return [
+            dc_id
+            for dc_id, records in self._failure_records.items()
+            if self._has_record_since(records, since)
+        ]
+
+    @staticmethod
+    def _has_record_since(records: list[DCFailureRecord], since: float) -> bool:
+        """Whether any failure record is stamped at or after ``since``."""
+        return any(record.timestamp >= since for record in records)
+
+    def _secondary_signal_unavailable(self, enabled: bool) -> bool:
+        """A secondary correlation signal is skipped when disabled or no DC is known."""
+        return not enabled or len(self._known_datacenters) == 0
 
     def _compute_latency_correlation(self) -> dict:
         """
@@ -644,28 +754,16 @@ class CrossDCCorrelationDetector:
         Returns:
             Dict with correlated flag and metrics.
         """
-        if not self._config.enable_latency_correlation:
+        if self._secondary_signal_unavailable(self._config.enable_latency_correlation):
             return {"correlated": False, "avg_latency_ms": 0.0, "dcs_elevated": 0}
 
         known_dc_count = len(self._known_datacenters)
-        if known_dc_count == 0:
-            return {"correlated": False, "avg_latency_ms": 0.0, "dcs_elevated": 0}
 
         # Count DCs with elevated latency
-        dcs_with_elevated_latency = 0
-        total_avg_latency = 0.0
-        dcs_with_samples = 0
-
-        for state in self._dc_states.values():
-            if state.latency_elevated:
-                dcs_with_elevated_latency += 1
-            if state.avg_latency_ms > 0:
-                total_avg_latency += state.avg_latency_ms
-                dcs_with_samples += 1
-
-        avg_latency = (
-            total_avg_latency / dcs_with_samples if dcs_with_samples > 0 else 0.0
+        dcs_with_elevated_latency = sum(
+            state.latency_elevated for state in self._dc_states.values()
         )
+        avg_latency = self._mean_sampled_latency()
         fraction_elevated = dcs_with_elevated_latency / known_dc_count
 
         correlated = fraction_elevated >= self._config.latency_correlation_fraction
@@ -676,6 +774,21 @@ class CrossDCCorrelationDetector:
             "dcs_elevated": dcs_with_elevated_latency,
         }
 
+    def _mean_sampled_latency(self) -> float:
+        """Mean of the per-DC average latencies over DCs that have samples (0.0 when none do)."""
+        sampled_latencies = self._sampled_average_latencies()
+        return (
+            sum(sampled_latencies) / len(sampled_latencies) if sampled_latencies else 0.0
+        )
+
+    def _sampled_average_latencies(self) -> list[float]:
+        """Per-DC average latencies of the DCs that have recorded latency samples."""
+        return [
+            state.avg_latency_ms
+            for state in self._dc_states.values()
+            if state.avg_latency_ms > 0
+        ]
+
     def _compute_extension_correlation(self) -> dict:
         """
         Compute extension request correlation across DCs.
@@ -683,19 +796,16 @@ class CrossDCCorrelationDetector:
         Returns:
             Dict with correlated flag and metrics.
         """
-        if not self._config.enable_extension_correlation:
+        if self._secondary_signal_unavailable(self._config.enable_extension_correlation):
             return {"correlated": False, "dcs_with_extensions": 0}
 
         known_dc_count = len(self._known_datacenters)
-        if known_dc_count == 0:
-            return {"correlated": False, "dcs_with_extensions": 0}
 
         # Count DCs with significant extension activity
-        dcs_with_extensions = 0
-
-        for state in self._dc_states.values():
-            if state.active_extensions >= self._config.extension_count_threshold:
-                dcs_with_extensions += 1
+        dcs_with_extensions = sum(
+            state.active_extensions >= self._config.extension_count_threshold
+            for state in self._dc_states.values()
+        )
 
         fraction_with_extensions = dcs_with_extensions / known_dc_count
         correlated = (
@@ -714,19 +824,13 @@ class CrossDCCorrelationDetector:
         Returns:
             Dict with correlated flag and metrics.
         """
-        if not self._config.enable_lhm_correlation:
+        if self._secondary_signal_unavailable(self._config.enable_lhm_correlation):
             return {"correlated": False, "dcs_stressed": 0}
 
         known_dc_count = len(self._known_datacenters)
-        if known_dc_count == 0:
-            return {"correlated": False, "dcs_stressed": 0}
 
         # Count DCs with elevated LHM
-        dcs_stressed = 0
-
-        for state in self._dc_states.values():
-            if state.lhm_stressed:
-                dcs_stressed += 1
+        dcs_stressed = sum(state.lhm_stressed for state in self._dc_states.values())
 
         fraction_stressed = dcs_stressed / known_dc_count
         correlated = fraction_stressed >= self._config.lhm_correlation_fraction
@@ -775,11 +879,16 @@ class CrossDCCorrelationDetector:
 
         for dc_id in list(self._failure_records.keys()):
             old_records = self._failure_records[dc_id]
-            new_records = [r for r in old_records if r.timestamp >= window_start]
+            new_records = self._records_since(old_records, window_start)
             removed += len(old_records) - len(new_records)
             self._failure_records[dc_id] = new_records
 
         return removed
+
+    @staticmethod
+    def _records_since(records: list[DCFailureRecord], window_start: float) -> list[DCFailureRecord]:
+        """The failure records stamped at or after ``window_start``, in order."""
+        return [r for r in records if r.timestamp >= window_start]
 
     def clear_all(self) -> None:
         """Clear all failure records and reset state."""
@@ -813,7 +922,7 @@ class CrossDCCorrelationDetector:
         return {
             "known_datacenters": len(self._known_datacenters),
             "datacenters_with_failures": len(
-                [dc for dc, records in self._failure_records.items() if records]
+                list(filter(None, self._failure_records.values()))
             ),
             "recent_failing_count": len(recent_failing),
             "confirmed_failing_count": len(confirmed_failing),
@@ -888,25 +997,7 @@ class CrossDCCorrelationDetector:
         Returns:
             True if partition has healed, False otherwise
         """
-        if not self._was_in_partition:
-            return False
-
-        confirmed_failing = self._get_confirmed_failing_dcs()
-        flapping = self._get_flapping_dcs()
-
-        if confirmed_failing or flapping:
-            return False
-
-        all_healthy = all(
-            state.current_state == DCHealthState.HEALTHY
-            for state in self._dc_states.values()
-        )
-
-        if not all_healthy:
-            return False
-
-        decision = self.check_correlation("")
-        if decision.severity in (CorrelationSeverity.MEDIUM, CorrelationSeverity.HIGH):
+        if not self._was_in_partition or self._partition_still_active():
             return False
 
         now = _DEFAULT_CLOCK.monotonic()
@@ -915,25 +1006,68 @@ class CrossDCCorrelationDetector:
         self._partition_healed_count += 1
 
         healed_datacenters = list(self._known_datacenters)
-        for callback in self._partition_healed_callbacks:
-            try:
-                callback(healed_datacenters, now)
-            except Exception as callback_error:
-                if self._on_callback_error:
-                    try:
-                        self._on_callback_error(
-                            "partition_healed", healed_datacenters, callback_error
-                        )
-                    except Exception as handler_error:
-                        print(
-                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                            f"CRITICAL: partition_healed callback error handler failed: {handler_error}, "
-                            f"original_error={callback_error}, "
-                            f"datacenters={healed_datacenters}",
-                            file=sys.stderr,
-                        )
+        self._notify_partition_callbacks(
+            self._partition_healed_callbacks,
+            "partition_healed",
+            healed_datacenters,
+            now,
+        )
 
         return True
+
+    def _partition_still_active(self) -> bool:
+        """Whether any DC is still confirmed failing or flapping, unhealthy, or correlated."""
+        confirmed_failing = self._get_confirmed_failing_dcs()
+        flapping = self._get_flapping_dcs()
+
+        if confirmed_failing or flapping:
+            return True
+
+        return self._unhealthy_or_correlated()
+
+    def _unhealthy_or_correlated(self) -> bool:
+        """Whether some DC is not HEALTHY or MEDIUM/HIGH correlation is still detected."""
+        if not all(
+            state.current_state == DCHealthState.HEALTHY
+            for state in self._dc_states.values()
+        ):
+            return True
+
+        decision = self.check_correlation("")
+        return decision.severity in (CorrelationSeverity.MEDIUM, CorrelationSeverity.HIGH)
+
+    def _notify_partition_callbacks(
+        self,
+        callbacks: list[Callable[[list[str], float], None]],
+        event_type: str,
+        datacenters: list[str],
+        now: float,
+    ) -> None:
+        """Invoke each partition callback, routing a callback failure to the error handler."""
+        for callback in callbacks:
+            try:
+                callback(datacenters, now)
+            except Exception as callback_error:
+                self._report_callback_error(event_type, datacenters, callback_error)
+
+    def _report_callback_error(
+        self,
+        event_type: str,
+        datacenters: list[str],
+        callback_error: Exception,
+    ) -> None:
+        """Hand a partition callback failure to on_callback_error; a failing handler goes to stderr."""
+        if self._on_callback_error:
+            try:
+                self._on_callback_error(event_type, datacenters, callback_error)
+            except Exception as handler_error:
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"CRITICAL: {event_type} callback error handler failed: {handler_error}, "
+                    f"original_error={callback_error}, "
+                    f"datacenters={datacenters}",
+                    file=sys.stderr,
+                )
 
     def mark_partition_detected(self, affected_datacenters: list[str]) -> None:
         """
@@ -950,25 +1084,12 @@ class CrossDCCorrelationDetector:
 
         if not was_already_partitioned:
             now = _DEFAULT_CLOCK.monotonic()
-            for callback in self._partition_detected_callbacks:
-                try:
-                    callback(affected_datacenters, now)
-                except Exception as callback_error:
-                    if self._on_callback_error:
-                        try:
-                            self._on_callback_error(
-                                "partition_detected",
-                                affected_datacenters,
-                                callback_error,
-                            )
-                        except Exception as handler_error:
-                            print(
-                                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                                f"CRITICAL: partition_detected callback error handler failed: {handler_error}, "
-                                f"original_error={callback_error}, "
-                                f"datacenters={affected_datacenters}",
-                                file=sys.stderr,
-                            )
+            self._notify_partition_callbacks(
+                self._partition_detected_callbacks,
+                "partition_detected",
+                affected_datacenters,
+                now,
+            )
 
     def is_in_partition(self) -> bool:
         """Check if we are currently in a partition state."""

@@ -84,8 +84,7 @@ class ManagerDispatchCoordinator:
         if registration is None:
             await self._purge_stale_worker(worker_id)
             return DispatchOutcome.UNROUTABLE, f"worker {worker_id} is no longer registered"
-        if dispatch.job_leader_addr is None:
-            dispatch.job_leader_addr = (self._node_host, self._node_port)
+        self._default_job_leader_addr(dispatch)
         dispatched_at = self._clock.monotonic()
         try:
             response, _clock = await self._send_tcp(
@@ -95,36 +94,62 @@ class ManagerDispatchCoordinator:
                 timeout=self._dispatch_timeout_seconds,
             )
         except Exception as error:
-            await self._record_transport_failure(worker_id, str(error))
-            await self._logger.log(
-                ServerError(
-                    message=f"Workflow dispatch error: {error}",
-                    node_host=self._node_host,
-                    node_port=self._node_port,
-                    node_id=self._node_id,
-                )
-            )
-            return DispatchOutcome.UNREACHABLE, f"{type(error).__name__}: {error}"
+            return await self._fail_dispatch_unreachable(worker_id, error)
 
         answered_at = self._clock.monotonic()
-        if isinstance(response, bytes) and response:
+        self._record_response_latency(response, dispatched_at, answered_at)
+
+        return await self._classify_dispatch_response(worker_id, response)
+
+    def _default_job_leader_addr(self, dispatch: WorkflowDispatch) -> None:
+        """Name this manager as the job leader when the dispatch names none."""
+        if dispatch.job_leader_addr is None:
+            dispatch.job_leader_addr = (self._node_host, self._node_port)
+
+    async def _fail_dispatch_unreachable(
+        self,
+        worker_id: str,
+        error: Exception,
+    ) -> tuple[DispatchOutcome, str]:
+        """Record and log a transport failure (raised or returned); the worker is unreachable."""
+        await self._record_transport_failure(worker_id, str(error))
+        await self._logger.log(
+            ServerError(
+                message=f"Workflow dispatch error: {error}",
+                node_host=self._node_host,
+                node_port=self._node_port,
+                node_id=self._node_id,
+            )
+        )
+        return DispatchOutcome.UNREACHABLE, f"{type(error).__name__}: {error}"
+
+    @staticmethod
+    def _is_answered_dispatch(response: bytes | Exception | None) -> bool:
+        """Whether the worker answered with a non-empty payload."""
+        return isinstance(response, bytes) and response
+
+    def _record_response_latency(
+        self,
+        response: bytes | Exception | None,
+        dispatched_at: float,
+        answered_at: float,
+    ) -> None:
+        """Sample the round-trip for an answer, or the full timeout for a timed-out send."""
+        if self._is_answered_dispatch(response):
             self._record_dispatch_latency((answered_at - dispatched_at) * 1000.0, answered_at)
         elif isinstance(response, TimeoutError):
             self._record_dispatch_latency(self._dispatch_timeout_seconds * 1000.0, answered_at)
 
+    async def _classify_dispatch_response(
+        self,
+        worker_id: str,
+        response: bytes | Exception | None,
+    ) -> tuple[DispatchOutcome, str]:
+        """Turn the worker's reply into the dispatch outcome and its detail."""
         # send_tcp returns transport errors rather than raising: the same
         # failure, cause and log as one it raised.
         if isinstance(response, Exception):
-            await self._record_transport_failure(worker_id, str(response))
-            await self._logger.log(
-                ServerError(
-                    message=f"Workflow dispatch error: {response}",
-                    node_host=self._node_host,
-                    node_port=self._node_port,
-                    node_id=self._node_id,
-                )
-            )
-            return DispatchOutcome.UNREACHABLE, f"{type(response).__name__}: {response}"
+            return await self._fail_dispatch_unreachable(worker_id, response)
         if not response:
             await self._record_transport_failure(worker_id, "workflow dispatch returned no response")
             return DispatchOutcome.UNREACHABLE, "workflow dispatch returned no response"
@@ -138,13 +163,22 @@ class ManagerDispatchCoordinator:
             await self._record_success(worker_id)
             await self._stats.record_dispatch()
             return DispatchOutcome.ACCEPTED, ""
-        error = getattr(ack, "error", None) or "workflow dispatch rejected"
+        error = self._dispatch_ack_error(ack)
         if self.is_readiness_rejection(error):
-            if self._worker_pool.record_dispatch_readiness_rejection(worker_id, error):
-                await self._worker_pool.notify_cores_available()
+            await self._record_readiness_rejection(worker_id, error)
             return DispatchOutcome.NOT_READY, error
         await self._record_success(worker_id)
         return DispatchOutcome.REJECTED, error
+
+    @staticmethod
+    def _dispatch_ack_error(ack: WorkflowDispatchAck) -> str:
+        """The worker's rejection reason, or a generic one when it gave none."""
+        return getattr(ack, "error", None) or "workflow dispatch rejected"
+
+    async def _record_readiness_rejection(self, worker_id: str, error: str) -> None:
+        """Note a not-ready rejection; wake dispatch when the pool says cores may be free."""
+        if self._worker_pool.record_dispatch_readiness_rejection(worker_id, error):
+            await self._worker_pool.notify_cores_available()
 
     @staticmethod
     def is_readiness_rejection(error: str | None) -> bool:

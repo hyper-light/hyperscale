@@ -7,6 +7,7 @@ Extracted from worker_impl.py for modularity (AD-54 compliance).
 
 import asyncio
 from multiprocessing import active_children
+from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING
 
 from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
@@ -258,7 +259,7 @@ class WorkerLifecycleManager:
         if not self._remote_manager:
             raise RuntimeError("RemoteGraphManager not initialized")
 
-        effective_timeout = timeout if timeout is not None else self._pool_startup_timeout
+        effective_timeout = self._effective_pool_startup_timeout(timeout)
         worker_ips = self.get_worker_ips()
 
         try:
@@ -275,6 +276,10 @@ class WorkerLifecycleManager:
                 f"{effective_timeout + 10.0}s. Check logs for process "
                 "spawn errors."
             )
+
+    def _effective_pool_startup_timeout(self, timeout: float | None) -> float:
+        """The caller's pool-startup timeout, else the configured budget."""
+        return timeout if timeout is not None else self._pool_startup_timeout
 
     def set_on_cores_available(self, callback: Callable[[int], None]) -> None:
         """
@@ -319,23 +324,33 @@ class WorkerLifecycleManager:
     async def cancel_background_tasks(self) -> None:
         """Cancel all tracked background tasks."""
         for task in self._background_tasks:
-            if task and not task.done():
-                task.cancel()
-                cancels_requested_before_wait = asyncio.current_task().cancelling()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    # The task we cancelled ended; a cancel aimed at this task
-                    # while it waited goes on.
-                    if asyncio.current_task().cancelling() > cancels_requested_before_wait:
-                        raise
+            if self._task_is_pending(task):
+                await self._cancel_and_await(task)
 
         self._background_tasks.clear()
+
+    @staticmethod
+    def _task_is_pending(task: asyncio.Task[None] | None) -> bool:
+        """Whether a tracked background task exists and has not finished."""
+        return bool(task and not task.done())
+
+    @staticmethod
+    async def _cancel_and_await(task: asyncio.Task[None]) -> None:
+        """Cancel a task and await its end, re-raising only a cancel aimed at us."""
+        task.cancel()
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
+        try:
+            await task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
 
     def cancel_background_tasks_sync(self) -> None:
         """Cancel all tracked background tasks synchronously (for abort)."""
         for task in self._background_tasks:
-            if task and not task.done():
+            if self._task_is_pending(task):
                 task.cancel()
 
         self._background_tasks.clear()
@@ -374,22 +389,38 @@ class WorkerLifecycleManager:
         Restricting to ``self._server_pool``'s own ``_processes`` keeps
         the safety net while preserving cross-worker isolation.
         """
-        executor = getattr(self._server_pool, "_executor", None)
-        owned = list(getattr(executor, "_processes", {}).values()) if executor else []
-        if not owned:
+        owned = self._owned_pool_processes()
+        if await self._killed_without_inline_fallback(owned):
             return
+        for child in owned:
+            try:
+                child.kill()
+            except Exception:
+                pass
+
+    def _owned_pool_processes(self) -> list[BaseProcess]:
+        """This worker's own pool subprocesses (empty without an executor)."""
+        executor = getattr(self._server_pool, "_executor", None)
+        return list(getattr(executor, "_processes", {}).values()) if executor else []
+
+    @staticmethod
+    async def _kill_children_in_executor(owned: list[BaseProcess]) -> None:
+        """Kill every owned subprocess off-loop, gathering failures as results."""
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(
+            *[loop.run_in_executor(None, child.kill) for child in owned],
+            return_exceptions=True,
+        )
+
+    async def _killed_without_inline_fallback(self, owned: list[BaseProcess]) -> bool:
+        """Kill owned subprocesses off-loop; False when the inline fallback must run."""
+        if not owned:
+            return True
         try:
-            loop = asyncio.get_running_loop()
-            await asyncio.gather(
-                *[loop.run_in_executor(None, child.kill) for child in owned],
-                return_exceptions=True,
-            )
+            await self._kill_children_in_executor(owned)
         except RuntimeError:
-            for child in owned:
-                try:
-                    child.kill()
-                except Exception:
-                    pass
+            return False
+        return True
 
     def abort_monitors(self) -> None:
         """Abort all monitors (emergency shutdown)."""

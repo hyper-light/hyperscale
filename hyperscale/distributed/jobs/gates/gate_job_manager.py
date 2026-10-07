@@ -15,6 +15,7 @@ Key responsibilities:
 import asyncio
 import dataclasses
 from contextlib import asynccontextmanager
+from types import MappingProxyType
 from typing import AsyncIterator
 
 from hyperscale.distributed.models import (
@@ -28,6 +29,28 @@ from hyperscale.distributed.runtime import Clock, RealClock
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
+
+_TERMINAL_JOB_STATUSES = frozenset(
+    {
+        JobStatus.COMPLETED.value,
+        JobStatus.FAILED.value,
+        JobStatus.CANCELLED.value,
+        JobStatus.TIMEOUT.value,
+    }
+)
+
+# A datacenter's reported final status, normalized: timeouts and both
+# spellings of cancelled fold to one value; anything unrecognized is FAILED.
+_NORMALIZED_FINAL_JOB_STATUSES = MappingProxyType(
+    {
+        "timeout": JobStatus.TIMEOUT.value,
+        "timed_out": JobStatus.TIMEOUT.value,
+        "cancelled": JobStatus.CANCELLED.value,
+        "canceled": JobStatus.CANCELLED.value,
+        JobStatus.COMPLETED.value: JobStatus.COMPLETED.value,
+        JobStatus.FAILED.value: JobStatus.FAILED.value,
+    }
+)
 
 
 class GateJobManager:
@@ -245,33 +268,87 @@ class GateJobManager:
         if not (substitutions := self._job_datacenter_substitutions.get(job_id)):
             return target_dcs
 
-        substitution_by_replacement = {
+        substitution_by_replacement = self._substitution_by_replacement(substitutions)
+        expected_datacenters: set[str] = {
+            self._workflow_slot_holder(
+                target_dc,
+                workflow_id,
+                len(substitutions),
+                substitution_by_replacement,
+            )
+            for target_dc in target_dcs
+        }
+        # A lost datacenter nothing re-ran for delivered every workflow's
+        # result: it holds each slot still.
+        expected_datacenters.update(self._unreplaced_slot_holders(substitutions, workflow_id))
+        return expected_datacenters
+
+    @staticmethod
+    def _substitution_by_replacement(
+        substitutions: dict[str, DatacenterSubstitution],
+    ) -> dict[str, DatacenterSubstitution]:
+        """Each substitution keyed by the datacenter that replaced the lost one."""
+        return {
             substitution.replacement_datacenter: substitution
             for substitution in substitutions.values()
         }
-        expected_datacenters: set[str] = set()
-        for target_dc in target_dcs:
-            slot_holder = chain_datacenter = target_dc
-            # A replacement is never a datacenter the job held before, so a
-            # chain is no longer than the substitutions.
-            for _ in range(len(substitutions)):
-                if (
-                    substitution := substitution_by_replacement.get(chain_datacenter)
-                ) is None:
-                    break
-                if workflow_id in substitution.completed_workflow_ids:
-                    slot_holder = substitution.lost_datacenter
-                chain_datacenter = substitution.lost_datacenter
-            expected_datacenters.add(slot_holder)
-        # A lost datacenter nothing re-ran for delivered every workflow's
-        # result: it holds each slot still.
-        expected_datacenters.update(
+
+    def _workflow_slot_holder(
+        self,
+        target_dc: str,
+        workflow_id: str,
+        substitution_count: int,
+        substitution_by_replacement: dict[str, DatacenterSubstitution],
+    ) -> str:
+        """Follow the chain of losses back from ``target_dc``: the earliest
+        datacenter along it that delivered the workflow holds its slot."""
+        slot_holder = chain_datacenter = target_dc
+        # A replacement is never a datacenter the job held before, so a
+        # chain is no longer than the substitutions.
+        for _ in range(substitution_count):
+            if (
+                substitution := substitution_by_replacement.get(chain_datacenter)
+            ) is None:
+                break
+            slot_holder = self._slot_holder_after(substitution, workflow_id, slot_holder)
+            chain_datacenter = substitution.lost_datacenter
+        return slot_holder
+
+    @staticmethod
+    def _slot_holder_after(
+        substitution: DatacenterSubstitution,
+        workflow_id: str,
+        slot_holder: str,
+    ) -> str:
+        """The lost datacenter takes the slot when it delivered the workflow before it was lost."""
+        return (
+            substitution.lost_datacenter
+            if workflow_id in substitution.completed_workflow_ids
+            else slot_holder
+        )
+
+    def _unreplaced_slot_holders(
+        self,
+        substitutions: dict[str, DatacenterSubstitution],
+        workflow_id: str,
+    ) -> list[str]:
+        """Lost datacenters nothing re-ran for that delivered the workflow."""
+        return [
             substitution.lost_datacenter
             for substitution in substitutions.values()
-            if not substitution.replacement_datacenter
+            if self._delivered_without_replacement(substitution, workflow_id)
+        ]
+
+    @staticmethod
+    def _delivered_without_replacement(
+        substitution: DatacenterSubstitution,
+        workflow_id: str,
+    ) -> bool:
+        """Whether a lost datacenter with no replacement delivered the workflow."""
+        return (
+            not substitution.replacement_datacenter
             and workflow_id in substitution.completed_workflow_ids
         )
-        return expected_datacenters
 
     def rerun_origin(self, job_id: str, datacenter: str) -> str | None:
         """The datacenter whose share ``datacenter`` re-runs: the first
@@ -279,12 +356,21 @@ class GateJobManager:
         replaced none)."""
         if not (substitutions := self._job_datacenter_substitutions.get(job_id)):
             return None
-        substitution_by_replacement = {
-            substitution.replacement_datacenter: substitution
-            for substitution in substitutions.values()
-        }
+        return self._chain_origin(
+            datacenter,
+            len(substitutions),
+            self._substitution_by_replacement(substitutions),
+        )
+
+    @staticmethod
+    def _chain_origin(
+        datacenter: str,
+        substitution_count: int,
+        substitution_by_replacement: dict[str, DatacenterSubstitution],
+    ) -> str | None:
+        """Walk the chain of losses ending at ``datacenter`` back to its first lost datacenter."""
         origin: str | None = None
-        for _ in range(len(substitutions)):
+        for _ in range(substitution_count):
             if (substitution := substitution_by_replacement.get(datacenter)) is None:
                 break
             origin = datacenter = substitution.lost_datacenter
@@ -370,13 +456,7 @@ class GateJobManager:
 
     def _normalize_job_status(self, status: str) -> str:
         normalized = status.strip().lower()
-        if normalized in ("timeout", "timed_out"):
-            return JobStatus.TIMEOUT.value
-        if normalized in ("cancelled", "canceled"):
-            return JobStatus.CANCELLED.value
-        if normalized in (JobStatus.COMPLETED.value, JobStatus.FAILED.value):
-            return normalized
-        return JobStatus.FAILED.value
+        return _NORMALIZED_FINAL_JOB_STATUSES.get(normalized, JobStatus.FAILED.value)
 
     def aggregate_job_status(self, job_id: str) -> GlobalJobStatus | None:
         """
@@ -400,6 +480,18 @@ class GateJobManager:
         if not job:
             return None
 
+        completed_datacenters, failed_datacenters, errors = self._tally_final_results(job_id)
+
+        return dataclasses.replace(
+            job,
+            completed_datacenters=completed_datacenters,
+            failed_datacenters=failed_datacenters,
+            errors=errors,
+            elapsed_seconds=self._elapsed_seconds_now(job),
+        )
+
+    def _tally_final_results(self, job_id: str) -> tuple[int, int, list[str]]:
+        """Count the datacenters' completed and failed final results and gather their errors."""
         completed_datacenters = 0
         failed_datacenters = 0
         errors: list[str] = []
@@ -411,28 +503,64 @@ class GateJobManager:
             else:
                 failed_datacenters += 1
 
-            if result.errors:
-                errors.extend(f"{datacenter_id}: {error}" for error in result.errors)
-            elif status_value != JobStatus.COMPLETED.value:
-                errors.append(
-                    f"{datacenter_id}: reported status {result.status} without error details"
-                )
+            errors.extend(self._final_result_errors(datacenter_id, result, status_value))
 
-        return dataclasses.replace(
-            job,
-            completed_datacenters=completed_datacenters,
-            failed_datacenters=failed_datacenters,
-            errors=errors,
-            elapsed_seconds=(
-                _DEFAULT_CLOCK.monotonic() - job.timestamp
-                if job.timestamp > 0
-                else job.elapsed_seconds
-            ),
+        return completed_datacenters, failed_datacenters, errors
+
+    def _final_result_errors(
+        self,
+        datacenter_id: str,
+        result: JobFinalResult,
+        status_value: str,
+    ) -> list[str]:
+        """A final result's errors, or a stand-in for a non-completed result reported without any."""
+        if result.errors:
+            return self._prefixed_errors(datacenter_id, result.errors)
+        if status_value != JobStatus.COMPLETED.value:
+            return [
+                f"{datacenter_id}: reported status {result.status} without error details"
+            ]
+        return []
+
+    @staticmethod
+    def _prefixed_errors(datacenter_id: str, errors: list[str]) -> list[str]:
+        """Each error prefixed with the datacenter that reported it."""
+        return [f"{datacenter_id}: {error}" for error in errors]
+
+    @staticmethod
+    def _elapsed_seconds_now(job: GlobalJobStatus) -> float:
+        """Time since the job started, or its stored elapsed time when it has no start."""
+        return (
+            _DEFAULT_CLOCK.monotonic() - job.timestamp
+            if job.timestamp > 0
+            else job.elapsed_seconds
         )
 
     # =========================================================================
     # Cleanup
     # =========================================================================
+
+    def _expired_terminal_job_ids(self, max_age_seconds: float) -> list[str]:
+        """Jobs terminal for longer than ``max_age_seconds``, judged at one instant."""
+        now = _DEFAULT_CLOCK.monotonic()
+        return [
+            job_id
+            for job_id, job in list(self._jobs.items())
+            if self._is_terminal_job_expired(job_id, job, now, max_age_seconds)
+        ]
+
+    def _is_terminal_job_expired(
+        self,
+        job_id: str,
+        job: GlobalJobStatus,
+        now: float,
+        max_age_seconds: float,
+    ) -> bool:
+        """Whether the job is terminal and has been for longer than ``max_age_seconds``."""
+        if job.status not in _TERMINAL_JOB_STATUSES:
+            return False
+        age = now - self.terminal_since(job_id, now)
+        return age > max_age_seconds
 
     def cleanup_old_jobs(self, max_age_seconds: float) -> list[str]:
         """
@@ -441,20 +569,7 @@ class GateJobManager:
         Returns list of cleaned up job IDs.
         Note: Caller should be careful about locking - this iterates all jobs.
         """
-        now = _DEFAULT_CLOCK.monotonic()
-        terminal_statuses = {
-            JobStatus.COMPLETED.value,
-            JobStatus.FAILED.value,
-            JobStatus.CANCELLED.value,
-            JobStatus.TIMEOUT.value,
-        }
-        to_remove: list[str] = []
-
-        for job_id, job in list(self._jobs.items()):
-            if job.status in terminal_statuses:
-                age = now - self.terminal_since(job_id, now)
-                if age > max_age_seconds:
-                    to_remove.append(job_id)
+        to_remove = self._expired_terminal_job_ids(max_age_seconds)
 
         for job_id in to_remove:
             self.delete_job(job_id)

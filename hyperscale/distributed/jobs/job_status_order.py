@@ -71,10 +71,13 @@ class JobStatusOrder:
         if current_rank is None:
             return True
 
-        if current_rank == _TERMINAL_RANK:
-            return False
+        return self._advances(current_rank, new_rank, current_status, new_status)
 
-        if new_status == current_status:
-            return False
-
-        return new_rank >= current_rank
+    @staticmethod
+    def _advances(current_rank: int, new_rank: int, current_status: str, new_status: str) -> bool:
+        """Between ranked statuses: terminals absorb, a repeat never applies, forward rank applies."""
+        return (
+            current_rank != _TERMINAL_RANK
+            and new_status != current_status
+            and new_rank >= current_rank
+        )

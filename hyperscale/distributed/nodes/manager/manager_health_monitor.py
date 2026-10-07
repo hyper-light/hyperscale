@@ -208,11 +208,42 @@ class ManagerHealthMonitor:
         if total_workers == 0:
             return
 
+        if (message := self._aggregate_health_alert_message(counts, total_workers)) is not None:
+            await self._logger.log(
+                ServerWarning(
+                    message=message,
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+
+    def _aggregate_health_alert_message(
+        self,
+        counts: dict[str, int],
+        total_workers: int,
+    ) -> str | None:
+        """The worker-tier alert to raise, if any: all non-healthy first, then the ratio alerts."""
         overloaded_count = counts.get("overloaded", 0)
         stressed_count = counts.get("stressed", 0)
         busy_count = counts.get("busy", 0)
         healthy_count = counts.get("healthy", 0)
 
+        if healthy_count == 0 and total_workers > 0:
+            return f"ALERT: All {total_workers} workers in non-healthy state (overloaded={overloaded_count}, stressed={stressed_count}, busy={busy_count})"
+
+        return self._worker_ratio_alert_message(
+            overloaded_count, stressed_count, busy_count, total_workers
+        )
+
+    def _worker_ratio_alert_message(
+        self,
+        overloaded_count: int,
+        stressed_count: int,
+        busy_count: int,
+        total_workers: int,
+    ) -> str | None:
+        """The majority-overloaded or high-stress alert when its configured ratio is reached."""
         overloaded_ratio = overloaded_count / total_workers
         non_healthy_ratio = (
             overloaded_count + stressed_count + busy_count
@@ -221,33 +252,11 @@ class ManagerHealthMonitor:
         overloaded_threshold = self._config.health_alert_overloaded_ratio
         non_healthy_threshold = self._config.health_alert_non_healthy_ratio
 
-        if healthy_count == 0 and total_workers > 0:
-            await self._logger.log(
-                ServerWarning(
-                    message=f"ALERT: All {total_workers} workers in non-healthy state (overloaded={overloaded_count}, stressed={stressed_count}, busy={busy_count})",
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
-        elif overloaded_ratio >= overloaded_threshold:
-            await self._logger.log(
-                ServerWarning(
-                    message=f"ALERT: Majority workers overloaded ({overloaded_count}/{total_workers} = {overloaded_ratio:.0%})",
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
-        elif non_healthy_ratio >= non_healthy_threshold:
-            await self._logger.log(
-                ServerWarning(
-                    message=f"ALERT: High worker stress ({non_healthy_ratio:.0%} non-healthy: overloaded={overloaded_count}, stressed={stressed_count}, busy={busy_count})",
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
+        if overloaded_ratio >= overloaded_threshold:
+            return f"ALERT: Majority workers overloaded ({overloaded_count}/{total_workers} = {overloaded_ratio:.0%})"
+        if non_healthy_ratio >= non_healthy_threshold:
+            return f"ALERT: High worker stress ({non_healthy_ratio:.0%} non-healthy: overloaded={overloaded_count}, stressed={stressed_count}, busy={busy_count})"
+        return None
 
     def is_worker_responsive(self, worker_id: str, job_id: str) -> bool:
         """
@@ -286,11 +295,15 @@ class ManagerHealthMonitor:
         Args:
             job_id: Job ID to cleanup
         """
-        keys_to_remove = [
-            key for key in self._state._worker_job_last_progress if key[0] == job_id
-        ]
+        keys_to_remove = self._worker_job_progress_keys(job_id)
         for key in keys_to_remove:
             self._state._worker_job_last_progress.pop(key, None)
+
+    def _worker_job_progress_keys(self, job_id: str) -> list[tuple[str, str]]:
+        """The (job_id, worker_id) progress keys recorded for ``job_id``."""
+        return [
+            key for key in self._state._worker_job_last_progress if key[0] == job_id
+        ]
 
     # ========== AD-30: Job Suspicion Management ==========
 
@@ -421,18 +434,31 @@ class ManagerHealthMonitor:
         across ticks.
         """
         now = _DEFAULT_CLOCK.monotonic()
-        silent: list[tuple[str, str]] = []
-        for key, last_progress in self._state._worker_job_last_progress.items():
-            if key in self._job_suspicions:
-                continue
-            if now - last_progress >= threshold_seconds:
-                silent.append(key)
+        silent: list[tuple[str, str]] = [
+            key
+            for key, last_progress in self._state._worker_job_last_progress.items()
+            if self._is_silent_worker_job(key, last_progress, now, threshold_seconds)
+        ]
         return silent
 
+    def _is_silent_worker_job(
+        self,
+        key: tuple[str, str],
+        last_progress: float,
+        now: float,
+        threshold_seconds: float,
+    ) -> bool:
+        """An unsuspected (job, worker) pair whose last progress is at least the threshold old (AD-30)."""
+        return key not in self._job_suspicions and now - last_progress >= threshold_seconds
+
     def clear_job_suspicions(self, job_id: str) -> None:
-        keys_to_remove = [key for key in self._job_suspicions if key[0] == job_id]
+        keys_to_remove = self._job_suspicion_keys(job_id)
         for key in keys_to_remove:
             del self._job_suspicions[key]
+
+    def _job_suspicion_keys(self, job_id: str) -> list[tuple[str, str]]:
+        """The suspected (job_id, worker_id) pairs belonging to ``job_id``."""
+        return [key for key in self._job_suspicions if key[0] == job_id]
 
     def _count_peer_manager_health_states(
         self,
@@ -460,19 +486,47 @@ class ManagerHealthMonitor:
         if total_peers == 0:
             return
 
+        if await self._alert_if_leader_overloaded(health_states):
+            return
+
+        await self._fire_peer_manager_ratio_alert(counts, total_peers)
+
+    async def _alert_if_leader_overloaded(self, health_states: dict[str, str]) -> bool:
+        """Fire the DC-leader overload alert when the leader is overloaded; True when fired."""
         dc_leader_id = self._state._dc_leader_manager_id
         leader_state = health_states.get(dc_leader_id) if dc_leader_id else None
         if leader_state == "overloaded":
             await self._fire_leader_overload_alert(dc_leader_id)
-            return
+            return True
+        return False
 
+    async def _fire_peer_manager_ratio_alert(
+        self,
+        counts: dict[str, int],
+        total_peers: int,
+    ) -> None:
+        """Fire the all-unhealthy alert, else the majority-overloaded or high-stress alert."""
         overloaded_count = counts.get("overloaded", 0)
         healthy_count = counts.get("healthy", 0)
         non_healthy_count = total_peers - healthy_count
 
         if healthy_count == 0:
             await self._fire_all_managers_unhealthy_alert(counts, total_peers)
-        elif overloaded_count / total_peers >= 0.5:
+            return
+
+        await self._fire_peer_manager_overload_alert(
+            counts, overloaded_count, non_healthy_count, total_peers
+        )
+
+    async def _fire_peer_manager_overload_alert(
+        self,
+        counts: dict[str, int],
+        overloaded_count: int,
+        non_healthy_count: int,
+        total_peers: int,
+    ) -> None:
+        """Majority overloaded (>= 50%) wins over high stress (>= 80% non-healthy)."""
+        if overloaded_count / total_peers >= 0.5:
             await self._fire_majority_overloaded_alert(overloaded_count, total_peers)
         elif non_healthy_count / total_peers >= 0.8:
             await self._fire_high_stress_alert(counts, total_peers)

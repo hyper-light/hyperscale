@@ -98,35 +98,40 @@ class ManagerLeaseCoordinator:
         """
         current_leader = self._state._job_leaders.get(job_id)
 
-        can_claim = (
-            current_leader is None or current_leader == self._node_id or force_takeover
+        if not self._can_claim_job(current_leader, force_takeover):
+            return False
+
+        current_token = self._state._job_fencing_tokens.get(job_id, 0)
+        next_token = self._next_claim_fence_token(current_token, force_takeover)
+        self._state.apply_job_leadership(
+            job_id=job_id,
+            leader_id=self._node_id,
+            leader_addr=tcp_addr,
+            fencing_token=next_token,
         )
 
-        if can_claim:
-            current_token = self._state._job_fencing_tokens.get(job_id, 0)
-            next_token = current_token + 1 if force_takeover else max(1, current_token)
-            self._state.apply_job_leadership(
-                job_id=job_id,
-                leader_id=self._node_id,
-                leader_addr=tcp_addr,
-                fencing_token=next_token,
-            )
-
-            action = "Took over" if force_takeover else "Claimed"
-            await self._logger.log(
-                ServerDebug(
-                    message=(
-                        f"{action} leadership for job {job_id[:8]}... "
-                        f"(fence={self._state._job_fencing_tokens.get(job_id, 0)})"
-                    ),
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
+        action = "Took over" if force_takeover else "Claimed"
+        await self._logger.log(
+            ServerDebug(
+                message=(
+                    f"{action} leadership for job {job_id[:8]}... "
+                    f"(fence={self._state._job_fencing_tokens.get(job_id, 0)})"
                 ),
-            )
-            return True
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
+        )
+        return True
 
-        return False
+    def _can_claim_job(self, current_leader: str | None, force_takeover: bool) -> bool:
+        """No current leader, we already lead, or a forced takeover."""
+        return current_leader is None or current_leader == self._node_id or force_takeover
+
+    @staticmethod
+    def _next_claim_fence_token(current_token: int, force_takeover: bool) -> int:
+        """A takeover bumps the fence token; a plain claim keeps it (at least 1)."""
+        return current_token + 1 if force_takeover else max(1, current_token)
 
     def apply_job_leadership(
         self,

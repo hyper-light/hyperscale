@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 from hyperscale.distributed.runtime import Filesystem
@@ -9,6 +10,16 @@ from .joined_peer import JoinedPeer
 
 STORE_FORMAT = "hyperscale-joined-peers"
 STORE_VERSION = 1
+
+
+def _validate_format(stored: dict[str, object]) -> None:
+    """Refuse a file that is not this store's format and version.
+
+    Raises:
+        ValueError: the file is foreign or of another version.
+    """
+    if stored.get("format") != STORE_FORMAT or stored.get("version") != STORE_VERSION:
+        raise ValueError(f"not a {STORE_FORMAT} v{STORE_VERSION} file")
 
 
 class JoinedPeerStore:
@@ -43,21 +54,7 @@ class JoinedPeerStore:
         """The joined peers saved by earlier runs (none when the file is
         missing or cannot be read as this store's format)."""
         try:
-            if not await self._filesystem.exists(self._path):
-                return []
-
-            stored = json.loads(await self._filesystem.read_text(self._path, encoding="utf-8"))
-            if stored.get("format") != STORE_FORMAT or stored.get("version") != STORE_VERSION:
-                raise ValueError(f"not a {STORE_FORMAT} v{STORE_VERSION} file")
-
-            peers = [
-                JoinedPeer(
-                    datacenter=entry["datacenter"],
-                    tcp_address=(entry["tcp"][0], int(entry["tcp"][1])),
-                    udp_address=(entry["udp"][0], int(entry["udp"][1])),
-                )
-                for entry in stored["peers"]
-            ]
+            peers = await self._read_peers()
 
         except (OSError, ValueError, KeyError, IndexError, TypeError) as load_error:
             await self._log(
@@ -66,50 +63,80 @@ class JoinedPeerStore:
             )
             return []
 
+        if peers is None:
+            return []
+
+        return self._remember(peers)
+
+    async def _read_peers(self) -> list[JoinedPeer] | None:
+        """The peers the saved file holds, or None when there is no file.
+
+        Raises:
+            OSError, ValueError, KeyError, IndexError, TypeError: the file
+                cannot be read as this store's format.
+        """
+        if not await self._filesystem.exists(self._path):
+            return None
+
+        stored = json.loads(await self._filesystem.read_text(self._path, encoding="utf-8"))
+        _validate_format(stored)
+
+        return [
+            JoinedPeer(
+                datacenter=entry["datacenter"],
+                tcp_address=(entry["tcp"][0], int(entry["tcp"][1])),
+                udp_address=(entry["udp"][0], int(entry["udp"][1])),
+            )
+            for entry in stored["peers"]
+        ]
+
+    def _remember(self, peers: list[JoinedPeer]) -> list[JoinedPeer]:
+        """Hold the loaded peers as the known set; returns them."""
         self._peers = {peer.tcp_address: peer for peer in peers}
         return peers
 
     async def add(self, peers: list[JoinedPeer]) -> None:
         """Record newly joined peers and save the whole set."""
-        new_peers = [peer for peer in peers if self._peers.get(peer.tcp_address) != peer]
+        new_peers = self._changed_peers(peers)
         if not new_peers:
             return
 
         self._peers.update((peer.tcp_address, peer) for peer in new_peers)
-        stored = {
-            "format": STORE_FORMAT,
-            "version": STORE_VERSION,
-            "peers": [
-                {
-                    "datacenter": peer.datacenter,
-                    "tcp": list(peer.tcp_address),
-                    "udp": list(peer.udp_address),
-                }
-                for peer in self._peers.values()
-            ],
-        }
-
-        try:
-            await self._filesystem.mkdir(self._path.parent, parents=True, exist_ok=True)
-            await self._filesystem.atomic_write(self._path, json.dumps(stored).encode("utf-8"))
-
-        except OSError as save_error:
-            await self._log(
-                ServerError,
+        await self._save(
+            lambda save_error: (
                 f"Joined peers were not saved to {self._path} ({save_error}); "
-                "this node will not reconnect to them after a restart",
+                "this node will not reconnect to them after a restart"
             )
+        )
+
+    def _changed_peers(self, peers: list[JoinedPeer]) -> list[JoinedPeer]:
+        """The peers not already recorded exactly as given."""
+        return [peer for peer in peers if self._peers.get(peer.tcp_address) != peer]
 
     async def remove(self, tcp_addresses: list[tuple[str, int]]) -> None:
         """Forget peers that left their cluster (a resize took their
         address out of its cohort) and save the rest: a restart must not
         reconnect to them."""
-        removed = [address for address in tcp_addresses if address in self._peers]
+        removed = self._known_addresses(tcp_addresses)
         if not removed:
             return
 
         for address in removed:
             del self._peers[address]
+        await self._save(
+            lambda save_error: (
+                f"Departed peers were not removed from {self._path} ({save_error}); "
+                "a restart may try to reconnect to them"
+            )
+        )
+
+    def _known_addresses(self, tcp_addresses: list[tuple[str, int]]) -> list[tuple[str, int]]:
+        """The given addresses this store records a peer at."""
+        return [address for address in tcp_addresses if address in self._peers]
+
+    async def _save(self, failure_message: Callable[[OSError], str]) -> None:
+        """Save the whole set; a failed save is logged as ``failure_message``
+        describes it (persistence is opportunistic)."""
         stored = {
             "format": STORE_FORMAT,
             "version": STORE_VERSION,
@@ -128,11 +155,7 @@ class JoinedPeerStore:
             await self._filesystem.atomic_write(self._path, json.dumps(stored).encode("utf-8"))
 
         except OSError as save_error:
-            await self._log(
-                ServerError,
-                f"Departed peers were not removed from {self._path} ({save_error}); "
-                "a restart may try to reconnect to them",
-            )
+            await self._log(ServerError, failure_message(save_error))
 
     async def _log(self, model: type[ServerWarning] | type[ServerError], message: str) -> None:
         await self._logger.log(

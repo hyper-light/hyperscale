@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import asyncio
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 from hyperscale.distributed.models.distributed import JobFinalStatus, JobProgressReport, JobStatus, JobTimeoutReport
-from hyperscale.distributed.models.jobs import TimeoutTrackingState
+from hyperscale.distributed.models.jobs import JobInfo, TimeoutTrackingState
 from hyperscale.distributed.workflow import WorkflowState
 from hyperscale.distributed.models.distributed import JobLeaderTransfer
 
@@ -109,34 +109,59 @@ class GateCoordinatedTimeout(TimeoutStrategy):
         Does NOT mark job failed locally - waits for gate decision.
         Fallback: if can't reach gate for 5+ minutes, timeout locally.
         """
-        job = self._manager._job_manager.get_job_by_id(job_id)
-        if not job or not job.timeout_tracking:
+        if (job := self._tracked_job(job_id)) is None:
             return False, ""
 
         tracking = job.timeout_tracking
 
         # Already reported, waiting for gate decision
         if tracking.locally_timed_out:
-            # Fallback: gate unresponsive for 5+ minutes
-            if not tracking.globally_timed_out:
-                time_since_report = _DEFAULT_CLOCK.monotonic() - tracking.last_report_at
-                if time_since_report > 300.0:  # 5 minutes
-                    await self._manager._udp_logger.log(
-                        ServerWarning(
-                            message=f"Gate unresponsive for {time_since_report:.0f}s, "
-                            f"timing out job {job_id} locally",
-                            node_host=self._manager._host,
-                            node_port=self._manager._tcp_port,
-                            node_id=self._manager._node_id.short,
-                        )
-                    )
-                    await self._manager._timeout_job(
-                        job_id, "Gate unresponsive, local timeout fallback"
-                    )
-                    return True, "gate_unresponsive_fallback"
+            return await self._check_gate_unresponsive(job_id, tracking)
 
+        return await self._check_local_timeout(job_id, job, tracking)
+
+    def _tracked_job(self, job_id: str) -> JobInfo | None:
+        """The job while it exists and carries timeout tracking, else None."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return None
+        return job
+
+    async def _check_gate_unresponsive(
+        self,
+        job_id: str,
+        tracking: TimeoutTrackingState,
+    ) -> tuple[bool, str]:
+        """After a local timeout report, time out locally once the gate is silent for 5+ minutes."""
+        # Fallback: gate unresponsive for 5+ minutes
+        if tracking.globally_timed_out:
             return False, ""
 
+        time_since_report = _DEFAULT_CLOCK.monotonic() - tracking.last_report_at
+        if time_since_report > 300.0:  # 5 minutes
+            await self._manager._udp_logger.log(
+                ServerWarning(
+                    message=f"Gate unresponsive for {time_since_report:.0f}s, "
+                    f"timing out job {job_id} locally",
+                    node_host=self._manager._host,
+                    node_port=self._manager._tcp_port,
+                    node_id=self._manager._node_id.short,
+                )
+            )
+            await self._manager._timeout_job(
+                job_id, "Gate unresponsive, local timeout fallback"
+            )
+            return True, "gate_unresponsive_fallback"
+
+        return False, ""
+
+    async def _check_local_timeout(
+        self,
+        job_id: str,
+        job: JobInfo,
+        tracking: TimeoutTrackingState,
+    ) -> tuple[bool, str]:
+        """Report progress when due, then detect a DC-local timeout (extensions included) or stuck job."""
         # Check terminal state (race protection)
         if job.status in {
             JobStatus.COMPLETED.value,
@@ -149,10 +174,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
         now = _DEFAULT_CLOCK.monotonic()
 
         # Send periodic progress reports
-        if now - tracking.last_report_at > 10.0:
-            await self._send_progress_report(job_id)
-            async with job.lock:
-                tracking.last_report_at = now
+        await self._send_periodic_progress(job_id, job, tracking, now)
 
         # Calculate effective timeout with extensions
         effective_timeout = tracking.timeout_seconds + tracking.total_extensions_granted
@@ -165,31 +187,56 @@ class GateCoordinatedTimeout(TimeoutStrategy):
                 f"base={tracking.timeout_seconds:.1f}s + "
                 f"extensions={tracking.total_extensions_granted:.1f}s)"
             )
-            await self._send_timeout_report(job_id, reason)
+            return await self._report_local_timeout(job_id, job, tracking, reason, now)
 
+        return await self._check_stuck(job_id, job, tracking, now)
+
+    async def _send_periodic_progress(
+        self,
+        job_id: str,
+        job: JobInfo,
+        tracking: TimeoutTrackingState,
+        now: float,
+    ) -> None:
+        """Send a progress report to the gate when 10s have passed since the last report."""
+        if now - tracking.last_report_at > 10.0:
+            await self._send_progress_report(job_id)
             async with job.lock:
-                tracking.locally_timed_out = True
-                tracking.timeout_reason = reason
                 tracking.last_report_at = now
 
-            return True, reason
+    async def _report_local_timeout(
+        self,
+        job_id: str,
+        job: JobInfo,
+        tracking: TimeoutTrackingState,
+        reason: str,
+        now: float,
+    ) -> tuple[bool, str]:
+        """Report a DC-local timeout to the gate and mark it reported (gate decides globally)."""
+        await self._send_timeout_report(job_id, reason)
 
+        async with job.lock:
+            tracking.locally_timed_out = True
+            tracking.timeout_reason = reason
+            tracking.last_report_at = now
+
+        return True, reason
+
+    async def _check_stuck(
+        self,
+        job_id: str,
+        job: JobInfo,
+        tracking: TimeoutTrackingState,
+        now: float,
+    ) -> tuple[bool, str]:
+        """Detect a stuck job: work in flight with no progress past the extended threshold."""
         # Check for stuck (no progress AND no recent extensions)
         time_since_progress = now - tracking.last_progress_at
-        time_since_extension = (
-            now - tracking.last_extension_at
-            if tracking.last_extension_at > 0
-            else float("inf")
-        )
+        time_since_extension = self._time_since_extension(tracking, now)
 
         # Only work in flight can be stuck: a job whose workflows all wait
         # for capacity or dependencies is waiting, bounded by its timeout.
-        lifecycle = self._manager._job_manager.workflow_lifecycle
-        if not any(
-            lifecycle.get_state(job_id, workflow_info.token.workflow_id or "")
-            in (WorkflowState.DISPATCHED, WorkflowState.RUNNING)
-            for workflow_info in job.workflows.values()
-        ):
+        if not self._has_work_in_flight(job_id, job):
             return False, ""
 
         # Stuck: no progress for longer than the threshold plus every AD-26
@@ -204,16 +251,27 @@ class GateCoordinatedTimeout(TimeoutStrategy):
                 f"DC-local stuck (no progress for {time_since_progress:.1f}s, "
                 f"no extensions for {time_since_extension:.1f}s)"
             )
-            await self._send_timeout_report(job_id, reason)
-
-            async with job.lock:
-                tracking.locally_timed_out = True
-                tracking.timeout_reason = reason
-                tracking.last_report_at = now
-
-            return True, reason
+            return await self._report_local_timeout(job_id, job, tracking, reason, now)
 
         return False, ""
+
+    @staticmethod
+    def _time_since_extension(tracking: TimeoutTrackingState, now: float) -> float:
+        """Seconds since the last AD-26 extension grant (infinite when none was granted)."""
+        return (
+            now - tracking.last_extension_at
+            if tracking.last_extension_at > 0
+            else float("inf")
+        )
+
+    def _has_work_in_flight(self, job_id: str, job: JobInfo) -> bool:
+        """Whether any of the job's workflows is DISPATCHED or RUNNING."""
+        lifecycle = self._manager._job_manager.workflow_lifecycle
+        return any(
+            lifecycle.get_state(job_id, workflow_info.token.workflow_id or "")
+            in (WorkflowState.DISPATCHED, WorkflowState.RUNNING)
+            for workflow_info in job.workflows.values()
+        )
 
     async def handle_global_timeout(
         self, job_id: str, reason: str, fence_token: int
@@ -223,8 +281,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
         Validates fence token to reject stale decisions.
         """
-        job = self._manager._job_manager.get_job_by_id(job_id)
-        if not job or not job.timeout_tracking:
+        if (job := self._tracked_job(job_id)) is None:
             return False
 
         # Fence token validation (prevent stale decisions)
@@ -240,6 +297,10 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             )
             return False
 
+        return await self._apply_global_timeout(job_id, job, reason)
+
+    async def _apply_global_timeout(self, job_id: str, job: JobInfo, reason: str) -> bool:
+        """Accept the gate's (fence-valid) decision unless the job is already terminal (then correct the gate)."""
         # Check if already terminal
         if job.status in {
             JobStatus.COMPLETED.value,
@@ -301,8 +362,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
         Sends final status update to gate so gate can clean up tracking.
         """
-        job = self._manager._job_manager.get_job_by_id(job_id)
-        if not job or not job.timeout_tracking:
+        if (job := self._tracked_job(job_id)) is None:
             return
 
         async with job.lock:
@@ -411,8 +471,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
     async def _send_timeout_report(self, job_id: str, reason: str) -> None:
         """Send timeout report to gate (persistent until ACK'd)."""
-        job = self._manager._job_manager.get_job_by_id(job_id)
-        if not job or not job.timeout_tracking:
+        if (job := self._tracked_job(job_id)) is None:
             return
 
         report = JobTimeoutReport(
@@ -428,9 +487,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
         # Store for retry (in production, this would be persisted)
         async with self._report_lock:
-            if job_id not in self._pending_reports:
-                self._pending_reports[job_id] = []
-            self._pending_reports[job_id].append(report)
+            self._pending_reports.setdefault(job_id, []).append(report)
 
         # Pending until the gate acknowledges it (retried otherwise)
         if await self._send_to_gate(

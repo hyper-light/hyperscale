@@ -234,17 +234,22 @@ class WorkerState:
         # remove_active_workflow eventually.
         # Every callback runs even when one fails; the failures then raise
         # together, after this workflow's state is gone.
+        callback_errors = self._run_termination_callbacks(workflow_id)
+        if callback_errors:
+            raise ExceptionGroup(
+                f"workflow {workflow_id} termination callbacks failed", callback_errors
+            )
+        return progress
+
+    def _run_termination_callbacks(self, workflow_id: str) -> list[Exception]:
+        """Invoke every termination callback (Phase H4), collecting their failures."""
         callback_errors: list[Exception] = []
         for callback in list(self._workflow_termination_callbacks):
             try:
                 callback(workflow_id)
             except Exception as callback_error:
                 callback_errors.append(callback_error)
-        if callback_errors:
-            raise ExceptionGroup(
-                f"workflow {workflow_id} termination callbacks failed", callback_errors
-            )
-        return progress
+        return callback_errors
 
     def register_workflow_termination_callback(
         self, callback: "Callable[[str], None]"
@@ -340,14 +345,26 @@ class WorkerState:
         now = _DEFAULT_CLOCK.monotonic()
         stuck: list[tuple[str, float]] = []
         for workflow_id in list(self._active_workflows.keys()):
-            start_time = self._workflow_start_times.get(workflow_id)
-            timeout = self._workflow_timeout_seconds.get(workflow_id)
-            if start_time is None or timeout is None:
-                continue
-            elapsed = now - start_time
-            if elapsed > timeout:
+            if (elapsed := self._stuck_elapsed(workflow_id, now)) is not None:
                 stuck.append((workflow_id, elapsed))
         return stuck
+
+    def _stuck_elapsed(self, workflow_id: str, now: float) -> float | None:
+        """A workflow's elapsed seconds when past its timeout, else None."""
+        timing = self._workflow_timing(workflow_id)
+        if timing is None:
+            return None
+        start_time, timeout = timing
+        elapsed = now - start_time
+        return elapsed if elapsed > timeout else None
+
+    def _workflow_timing(self, workflow_id: str) -> tuple[float, float] | None:
+        """A workflow's (start time, timeout seconds), or None when either is unset."""
+        start_time = self._workflow_start_times.get(workflow_id)
+        timeout = self._workflow_timeout_seconds.get(workflow_id)
+        if start_time is None or timeout is None:
+            return None
+        return (start_time, timeout)
 
     def mark_workflow_orphaned(self, workflow_id: str) -> None:
         if workflow_id not in self._orphaned_workflows:

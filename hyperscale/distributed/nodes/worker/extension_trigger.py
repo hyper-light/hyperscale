@@ -126,9 +126,7 @@ class ExtensionTrigger:
         self._deadline_provider: Callable[[str], float | None] = deadline_provider
         self._is_extension_pending: Callable[[], bool] = is_extension_pending
         self._request_extension: Callable[..., None] = request_extension
-        self._config: ExtensionTriggerConfig = (
-            config if config is not None else ExtensionTriggerConfig()
-        )
+        self._config: ExtensionTriggerConfig = self._resolve_config(config)
         self._snapshot_builder: SnapshotBuilder = (
             snapshot_builder
             if snapshot_builder is not None
@@ -137,6 +135,11 @@ class ExtensionTrigger:
         self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
         self._now: Callable[[], float] = self._clock.monotonic
         self._workflows: dict[str, _PerWorkflowTriggerState] = {}
+
+    @staticmethod
+    def _resolve_config(config: ExtensionTriggerConfig | None) -> ExtensionTriggerConfig:
+        """The given config, or a default one when none was given."""
+        return config if config is not None else ExtensionTriggerConfig()
 
     @property
     def config(self) -> ExtensionTriggerConfig:
@@ -174,69 +177,121 @@ class ExtensionTrigger:
         if self._is_extension_pending():
             return []
 
-        triggered: list[str] = []
         now = self._now()
+        triggered_workflow_id = self._first_triggered_workflow(now)
+        return [triggered_workflow_id] if triggered_workflow_id is not None else []
 
+    def _first_triggered_workflow(self, now: float) -> str | None:
+        """Request an extension for the first due workflow; return its id."""
         for runtime in self._active_runtimes_provider():
-            workflow_id = runtime.workflow_id
-            if not workflow_id:
-                continue
+            if self._maybe_request_extension(runtime, now):
+                # One extension request per scan — the worker's
+                # heartbeat piggyback can only carry one snapshot at a
+                # time, so we yield to the next tick for any other
+                # workflows ready to ask.
+                return runtime.workflow_id
+        return None
 
-            deadline = self._deadline_provider(workflow_id)
-            if deadline is None or deadline <= 0.0:
-                continue
+    def _maybe_request_extension(self, runtime: WorkflowRuntimeState, now: float) -> bool:
+        """Steps 2-5 of ``tick`` for one workflow; True when a request was issued."""
+        workflow_id = runtime.workflow_id
+        if not workflow_id:
+            return False
 
-            elapsed = now - runtime.start_time
-            lookahead_seconds = max(
-                self._config.minimum_lookahead_seconds,
-                deadline * self._config.lookahead_fraction,
-            )
-            if elapsed < lookahead_seconds:
-                continue
+        deadline = self._deadline_provider(workflow_id)
+        if not self._deadline_is_set(deadline):
+            return False
 
-            snapshot = self._snapshot_builder(runtime)
-            tracker = self._workflows.get(workflow_id)
-            last_snapshot = (
-                tracker.last_request_snapshot if tracker is not None else None
-            )
-            if last_snapshot is not None and not snapshot.any_advanced(
-                last_snapshot
-            ):
-                # No progress on any dimension since the last
-                # request — let the manager's hard timeout fire.
-                continue
+        return self._request_if_due(runtime, workflow_id, deadline, now)
 
-            self._request_extension(
-                reason="autonomous-trigger",
-                progress=runtime.cores_completed,
-                completed_items=runtime.cores_completed,
-                total_items=runtime.vus,
-                estimated_completion=max(0.0, deadline - elapsed),
-                workflow_id=workflow_id,
-                step_transitions=runtime.step_transitions,
-                actions_completed=runtime.actions_completed,
-                snapshot_time=snapshot.snapshot_time,
-            )
+    @staticmethod
+    def _deadline_is_set(deadline: float | None) -> bool:
+        """Whether a deadline was recorded and is positive."""
+        return not (deadline is None or deadline <= 0.0)
 
-            new_state = _PerWorkflowTriggerState(
-                last_request_snapshot=snapshot,
-                last_request_time=now,
-                last_request_count=(
-                    (tracker.last_request_count + 1)
-                    if tracker is not None
-                    else 1
-                ),
-            )
-            self._workflows[workflow_id] = new_state
-            triggered.append(workflow_id)
+    def _request_if_due(
+        self,
+        runtime: WorkflowRuntimeState,
+        workflow_id: str,
+        deadline: float,
+        now: float,
+    ) -> bool:
+        """Request once elapsed runtime crosses the lookahead threshold."""
+        elapsed = now - runtime.start_time
+        lookahead_seconds = max(
+            self._config.minimum_lookahead_seconds,
+            deadline * self._config.lookahead_fraction,
+        )
+        if elapsed < lookahead_seconds:
+            return False
 
-            # One extension request per scan — the worker's
-            # heartbeat piggyback can only carry one snapshot at a
-            # time, so we yield to the next tick for any other
-            # workflows ready to ask.
-            break
+        return self._request_if_progressed(runtime, workflow_id, deadline, elapsed, now)
 
-        return triggered
+    def _request_if_progressed(
+        self,
+        runtime: WorkflowRuntimeState,
+        workflow_id: str,
+        deadline: float,
+        elapsed: float,
+        now: float,
+    ) -> bool:
+        """Request unless no progress dimension advanced since the last request."""
+        snapshot = self._snapshot_builder(runtime)
+        tracker = self._workflows.get(workflow_id)
+        if self._stalled_since_last_request(snapshot, tracker):
+            # No progress on any dimension since the last
+            # request — let the manager's hard timeout fire.
+            return False
+
+        self._issue_extension_request(runtime, workflow_id, deadline, elapsed, snapshot, tracker, now)
+        return True
+
+    @staticmethod
+    def _stalled_since_last_request(
+        snapshot: WorkflowProgressSnapshot,
+        tracker: _PerWorkflowTriggerState | None,
+    ) -> bool:
+        """Whether a previous request exists and no dimension advanced since."""
+        last_snapshot = (
+            tracker.last_request_snapshot if tracker is not None else None
+        )
+        return last_snapshot is not None and not snapshot.any_advanced(
+            last_snapshot
+        )
+
+    def _issue_extension_request(
+        self,
+        runtime: WorkflowRuntimeState,
+        workflow_id: str,
+        deadline: float,
+        elapsed: float,
+        snapshot: WorkflowProgressSnapshot,
+        tracker: _PerWorkflowTriggerState | None,
+        now: float,
+    ) -> None:
+        """Invoke ``request_extension`` and record the request's snapshot."""
+        self._request_extension(
+            reason="autonomous-trigger",
+            progress=runtime.cores_completed,
+            completed_items=runtime.cores_completed,
+            total_items=runtime.vus,
+            estimated_completion=max(0.0, deadline - elapsed),
+            workflow_id=workflow_id,
+            step_transitions=runtime.step_transitions,
+            actions_completed=runtime.actions_completed,
+            snapshot_time=snapshot.snapshot_time,
+        )
+
+        new_state = _PerWorkflowTriggerState(
+            last_request_snapshot=snapshot,
+            last_request_time=now,
+            last_request_count=(
+                (tracker.last_request_count + 1)
+                if tracker is not None
+                else 1
+            ),
+        )
+        self._workflows[workflow_id] = new_state
 
     async def run_loop(
         self,

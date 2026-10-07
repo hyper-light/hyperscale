@@ -4,9 +4,11 @@ AD-28 manager selection within a datacenter for gate dispatch.
 
 from __future__ import annotations
 
+from heapq import nlargest
+from operator import itemgetter
 from typing import Callable, Mapping
 
-from hyperscale.distributed.discovery import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryService, SelectionResult
 from hyperscale.distributed.models import ManagerHeartbeat
 
 
@@ -109,9 +111,10 @@ class DatacenterManagerSelector:
         leaders = [
             (heartbeat.term, manager_addr)
             for manager_addr in managers
-            if (heartbeat := heartbeats.get(manager_addr)) is not None and heartbeat.is_leader
+            if _claims_leadership(heartbeat := heartbeats.get(manager_addr))
         ]
-        return [max(leaders)[1]] if leaders else []
+        # nlargest(1) is max(): the highest-term claimant, or none at all.
+        return list(map(itemgetter(1), nlargest(1, leaders)))
 
     def _ranked(
         self,
@@ -128,11 +131,24 @@ class DatacenterManagerSelector:
             selection_key,
             count=len(managers),
         )
-        return [
-            candidates[selection.peer_id]
-            for selection in selections
-            if selection.peer_id in candidates
-        ]
+        return _selected_candidates(selections, candidates)
+
+
+def _selected_candidates(
+    selections: list[SelectionResult],
+    candidates: dict[str, ManagerAddress],
+) -> list[ManagerAddress]:
+    """The candidate managers discovery selected, in its ranking order."""
+    return [
+        candidates[selection.peer_id]
+        for selection in selections
+        if selection.peer_id in candidates
+    ]
+
+
+def _claims_leadership(heartbeat: ManagerHeartbeat | None) -> bool:
+    """Whether a manager's latest heartbeat (if any) claims datacenter leadership."""
+    return heartbeat is not None and heartbeat.is_leader
 
 
 def _peer_id(manager_addr: ManagerAddress) -> str:

@@ -10,7 +10,9 @@ module, exactly as before the split: mixed-version clusters keep
 talking and data written earlier keeps loading.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from operator import attrgetter
 from hyperscale.distributed.models import ManagerHeartbeat, DatacenterRegistrationState
 from hyperscale.distributed.health import ManagerHealthState, ManagerHealthConfig
 from hyperscale.distributed.reliability import BackpressureLevel
@@ -104,16 +106,9 @@ class DCHealthState:
         registered yet, or when none have reported any workflow
         latency observations.
         """
-        per_manager = self.manager_status.get(datacenter_id)
-        if not per_manager:
-            return SLOSummary.empty()
-
-        freshest: ManagerHeartbeat | None = None
-        for heartbeat in per_manager.values():
-            if heartbeat.slo_sample_count <= 0:
-                continue
-            if freshest is None or heartbeat.slo_updated_at > freshest.slo_updated_at:
-                freshest = heartbeat
+        freshest = self._freshest_slo_heartbeat(
+            self.manager_status.get(datacenter_id, {}).values()
+        )
         if freshest is None:
             return SLOSummary.empty()
 
@@ -125,6 +120,18 @@ class DCHealthState:
             compliance_score=freshest.slo_compliance_score,
             routing_factor=freshest.slo_routing_factor,
             updated_at=freshest.slo_updated_at,
+        )
+
+    @staticmethod
+    def _freshest_slo_heartbeat(
+        heartbeats: Iterable[ManagerHeartbeat],
+    ) -> ManagerHeartbeat | None:
+        """AD-42: the first heartbeat with the latest ``slo_updated_at`` among those
+        reporting latency samples, or None when none has."""
+        return max(
+            (heartbeat for heartbeat in heartbeats if heartbeat.slo_sample_count > 0),
+            key=attrgetter("slo_updated_at"),
+            default=None,
         )
 
     def get_all_dc_slo_summaries(self) -> dict[str, SLOSummary]:

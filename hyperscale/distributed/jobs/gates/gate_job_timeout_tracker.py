@@ -91,18 +91,22 @@ class GateJobTimeoutTracker:
         """Stop the timeout checking loop."""
         self._running = False
         if self._check_task:
-            self._check_task.cancel()
-            cancels_requested_before_wait = asyncio.current_task().cancelling()
-            try:
-                await self._check_task
-            except asyncio.CancelledError:
-                # The task we cancelled ended; a cancel aimed at this task
-                # while it waited goes on.
-                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
-                    raise
-            self._check_task = None
+            await self._cancel_check_task()
         async with self._lock:
             self._tracked_jobs.clear()
+
+    async def _cancel_check_task(self) -> None:
+        """Cancel the check loop and wait for it, re-raising only a cancel aimed at the caller."""
+        self._check_task.cancel()
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
+        try:
+            await self._check_task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
+        self._check_task = None
 
     async def start_tracking_job(
         self,
@@ -122,13 +126,13 @@ class GateJobTimeoutTracker:
                 submitted_at=now,
                 timeout_seconds=timeout_seconds,
                 target_datacenters=list(target_dcs),
-                dc_status={dc: "running" for dc in target_dcs},
-                dc_last_progress={dc: now for dc in target_dcs},
+                dc_status=dict.fromkeys(target_dcs, "running"),
+                dc_last_progress=dict.fromkeys(target_dcs, now),
                 dc_manager_addrs={},
                 dc_fence_tokens={},
-                dc_total_extensions={dc: 0.0 for dc in target_dcs},
-                dc_max_extension={dc: 0.0 for dc in target_dcs},
-                dc_workers_with_extensions={dc: 0 for dc in target_dcs},
+                dc_total_extensions=dict.fromkeys(target_dcs, 0.0),
+                dc_max_extension=dict.fromkeys(target_dcs, 0.0),
+                dc_workers_with_extensions=dict.fromkeys(target_dcs, 0),
                 timeout_fence_token=0,
             )
 
@@ -170,6 +174,29 @@ class GateJobTimeoutTracker:
         )
         return True
 
+    def _tracked_target_info(self, job_id: str, datacenter: str) -> GateJobTrackingInfo | None:
+        """The job's tracking info while ``datacenter`` is still one of its targets, else None."""
+        info = self._tracked_jobs.get(job_id)
+        if not info or datacenter not in info.target_datacenters:
+            return None
+        return info
+
+    async def _admitted_report_info(
+        self,
+        job_id: str,
+        datacenter: str,
+        fence_token: int,
+    ) -> GateJobTrackingInfo | None:
+        """The job's tracking info for a report from a current target that is not superseded, else None."""
+        # A datacenter the job moved off reports nothing the job's
+        # timeout depends on.
+        info = self._tracked_target_info(job_id, datacenter)
+        if info is None or await self._reject_superseded_report(
+            info, job_id, datacenter, fence_token
+        ):
+            return None
+        return info
+
     async def record_progress(self, report: JobProgressReport) -> None:
         """
         Record progress from a DC (AD-34 Part 5).
@@ -178,15 +205,10 @@ class GateJobTimeoutTracker:
         Best-effort - lost reports are tolerated.
         """
         async with self._lock:
-            info = self._tracked_jobs.get(report.job_id)
-            # A datacenter the job moved off reports nothing the job's
-            # timeout depends on.
-            if not info or report.datacenter not in info.target_datacenters:
-                return
-
-            if await self._reject_superseded_report(
-                info, report.job_id, report.datacenter, report.fence_token
-            ):
+            info = await self._admitted_report_info(
+                report.job_id, report.datacenter, report.fence_token
+            )
+            if info is None:
                 return
 
             # Update DC progress
@@ -217,13 +239,10 @@ class GateJobTimeoutTracker:
         Manager detected timeout but waits for gate's global decision.
         """
         async with self._lock:
-            info = self._tracked_jobs.get(report.job_id)
-            if not info or report.datacenter not in info.target_datacenters:
-                return
-
-            if await self._reject_superseded_report(
-                info, report.job_id, report.datacenter, report.fence_token
-            ):
+            info = await self._admitted_report_info(
+                report.job_id, report.datacenter, report.fence_token
+            )
+            if info is None:
                 return
 
             info.dc_status[report.datacenter] = "timed_out"
@@ -249,13 +268,10 @@ class GateJobTimeoutTracker:
         Updates tracking to route future timeout decisions to new leader.
         """
         async with self._lock:
-            info = self._tracked_jobs.get(report.job_id)
-            if not info or report.datacenter not in info.target_datacenters:
-                return
-
-            if await self._reject_superseded_report(
-                info, report.job_id, report.datacenter, report.fence_token
-            ):
+            info = await self._admitted_report_info(
+                report.job_id, report.datacenter, report.fence_token
+            )
+            if info is None:
                 return
 
             info.dc_manager_addrs[report.datacenter] = (
@@ -281,27 +297,15 @@ class GateJobTimeoutTracker:
         When all DCs report terminal status, remove job from tracking.
         """
         async with self._lock:
-            info = self._tracked_jobs.get(report.job_id)
-            if not info or report.datacenter not in info.target_datacenters:
+            info = self._tracked_target_info(report.job_id, report.datacenter)
+            if info is None:
                 return
 
             # Update DC status
             info.dc_status[report.datacenter] = report.status
 
             # Check if all DCs have terminal status
-            terminal_statuses = {
-                "completed",
-                "failed",
-                "cancelled",
-                "timed_out",
-                "timeout",
-            }
-            all_terminal = all(
-                info.dc_status.get(dc) in terminal_statuses
-                for dc in info.target_datacenters
-            )
-
-            if all_terminal:
+            if self._all_datacenters_terminal(info):
                 # All DCs done - cleanup tracking
                 del self._tracked_jobs[report.job_id]
                 await self._gate._udp_logger.log(
@@ -312,6 +316,21 @@ class GateJobTimeoutTracker:
                         node_id=self._gate._node_id.short,
                     )
                 )
+
+    @staticmethod
+    def _all_datacenters_terminal(info: GateJobTrackingInfo) -> bool:
+        """Whether every target datacenter has reported a terminal status (AD-34 lifecycle cleanup)."""
+        terminal_statuses = {
+            "completed",
+            "failed",
+            "cancelled",
+            "timed_out",
+            "timeout",
+        }
+        return all(
+            info.dc_status.get(dc) in terminal_statuses
+            for dc in info.target_datacenters
+        )
 
     async def replace_target_datacenter(
         self,
@@ -329,21 +348,7 @@ class GateJobTimeoutTracker:
             if not info:
                 return
             now = _DEFAULT_CLOCK.monotonic()
-            info.target_datacenters = [
-                datacenter
-                for datacenter in info.target_datacenters
-                if datacenter != lost_datacenter
-            ]
-            for per_datacenter in (
-                info.dc_status,
-                info.dc_last_progress,
-                info.dc_manager_addrs,
-                info.dc_fence_tokens,
-                info.dc_total_extensions,
-                info.dc_max_extension,
-                info.dc_workers_with_extensions,
-            ):
-                per_datacenter.pop(lost_datacenter, None)
+            self._drop_target_datacenter(info, lost_datacenter)
             if not replacement_datacenter:
                 return
             info.target_datacenters.append(replacement_datacenter)
@@ -352,6 +357,30 @@ class GateJobTimeoutTracker:
             info.dc_total_extensions[replacement_datacenter] = 0.0
             info.dc_max_extension[replacement_datacenter] = 0.0
             info.dc_workers_with_extensions[replacement_datacenter] = 0
+
+    @staticmethod
+    def _drop_target_datacenter(info: GateJobTrackingInfo, lost_datacenter: str) -> None:
+        """Stop counting ``lost_datacenter`` toward the job's timeout: untarget it and forget its state."""
+        info.target_datacenters = [
+            datacenter
+            for datacenter in info.target_datacenters
+            if datacenter != lost_datacenter
+        ]
+        GateJobTimeoutTracker._forget_datacenter_state(info, lost_datacenter)
+
+    @staticmethod
+    def _forget_datacenter_state(info: GateJobTrackingInfo, lost_datacenter: str) -> None:
+        """Drop every per-datacenter record the job keeps for ``lost_datacenter``."""
+        for per_datacenter in (
+            info.dc_status,
+            info.dc_last_progress,
+            info.dc_manager_addrs,
+            info.dc_fence_tokens,
+            info.dc_total_extensions,
+            info.dc_max_extension,
+            info.dc_workers_with_extensions,
+        ):
+            per_datacenter.pop(lost_datacenter, None)
 
     async def get_job_info(self, job_id: str) -> GateJobTrackingInfo | None:
         """Get tracking info for a job."""
@@ -365,25 +394,39 @@ class GateJobTimeoutTracker:
         Runs every check_interval and evaluates all tracked jobs.
         """
         while self._running:
-            try:
-                await _DEFAULT_CLOCK.sleep(self._check_interval)
-
-                # Check all tracked jobs
-                async with self._lock:
-                    jobs_to_check = list(self._tracked_jobs.items())
-
-                for job_id, info in jobs_to_check:
-                    if info.globally_timed_out:
-                        continue
-
-                    should_timeout, reason = await self._check_global_timeout(info)
-                    if should_timeout:
-                        await self._declare_global_timeout(job_id, reason)
-
-            except asyncio.CancelledError:
+            if not await self._run_timeout_check_pass():
                 break
-            except Exception as error:
-                await self._gate.handle_exception(error, "_timeout_check_loop")
+
+    async def _run_timeout_check_pass(self) -> bool:
+        """One sleep-then-check pass of the loop; False once the loop is cancelled (AD-34 Part 5)."""
+        try:
+            await _DEFAULT_CLOCK.sleep(self._check_interval)
+
+            # Check all tracked jobs
+            await self._check_tracked_jobs()
+
+        except asyncio.CancelledError:
+            return False
+        except Exception as error:
+            await self._gate.handle_exception(error, "_timeout_check_loop")
+        return True
+
+    async def _check_tracked_jobs(self) -> None:
+        """Snapshot the tracked jobs under the lock, then check each for a global timeout."""
+        async with self._lock:
+            jobs_to_check = list(self._tracked_jobs.items())
+
+        for job_id, info in jobs_to_check:
+            await self._check_job_timeout(job_id, info)
+
+    async def _check_job_timeout(self, job_id: str, info: GateJobTrackingInfo) -> None:
+        """Declare a global timeout for a job not already timed out when its check says so."""
+        if info.globally_timed_out:
+            return
+
+        should_timeout, reason = await self._check_global_timeout(info)
+        if should_timeout:
+            await self._declare_global_timeout(job_id, reason)
 
     async def _check_global_timeout(
         self, info: GateJobTrackingInfo
@@ -396,21 +439,14 @@ class GateJobTimeoutTracker:
         now = _DEFAULT_CLOCK.monotonic()
 
         # Skip if already terminal
-        terminal_statuses = {"completed", "failed", "cancelled", "timed_out", "timeout"}
-        running_dcs = [
-            dc
-            for dc in info.target_datacenters
-            if info.dc_status.get(dc) not in terminal_statuses
-        ]
+        running_dcs = self._running_datacenters(info)
 
         if not running_dcs:
             return False, ""
 
         # Calculate effective timeout with extensions
         # Use max extensions across all DCs (most conservative)
-        max_extensions = max(
-            info.dc_total_extensions.get(dc, 0.0) for dc in info.target_datacenters
-        )
+        max_extensions = self._max_extension_seconds(info)
         effective_timeout = info.timeout_seconds + max_extensions
 
         # Check overall timeout
@@ -421,32 +457,75 @@ class GateJobTimeoutTracker:
                 f"base={info.timeout_seconds:.1f}s + extensions={max_extensions:.1f}s)"
             )
 
-        # Check if all running DCs are stuck (no progress)
-        all_stuck = True
-        for dc in running_dcs:
-            last_progress = info.dc_last_progress.get(dc, info.submitted_at)
-            if now - last_progress < self._stuck_threshold:
-                all_stuck = False
-                break
+        return self._stuck_or_majority_verdict(info, running_dcs, now)
 
-        if all_stuck and running_dcs:
-            oldest_progress = min(
-                info.dc_last_progress.get(dc, info.submitted_at) for dc in running_dcs
-            )
-            stuck_duration = now - oldest_progress
-            return True, (
-                f"All DCs stuck (no progress for {stuck_duration:.1f}s across {len(running_dcs)} DCs)"
-            )
-
-        # Check if majority of DCs report local timeout
-        local_timeout_dcs = [
+    @staticmethod
+    def _running_datacenters(info: GateJobTrackingInfo) -> list[str]:
+        """Target datacenters that have not reported a terminal status."""
+        terminal_statuses = {"completed", "failed", "cancelled", "timed_out", "timeout"}
+        return [
             dc
             for dc in info.target_datacenters
-            if info.dc_status.get(dc) == "timed_out"
+            if info.dc_status.get(dc) not in terminal_statuses
         ]
-        if len(local_timeout_dcs) > len(info.target_datacenters) / 2:
+
+    @staticmethod
+    def _max_extension_seconds(info: GateJobTrackingInfo) -> float:
+        """The most extension time granted in any target datacenter (AD-26 integration)."""
+        return max(
+            info.dc_total_extensions.get(dc, 0.0) for dc in info.target_datacenters
+        )
+
+    def _stuck_or_majority_verdict(
+        self,
+        info: GateJobTrackingInfo,
+        running_dcs: list[str],
+        now: float,
+    ) -> tuple[bool, str]:
+        """Time out when every running DC is stuck, else when a majority timed out locally."""
+        # Check if all running DCs are stuck (no progress)
+        if self._all_running_stuck(info, running_dcs, now):
+            return True, self._stuck_reason(info, running_dcs, now)
+
+        return self._majority_timeout_verdict(info)
+
+    def _all_running_stuck(
+        self,
+        info: GateJobTrackingInfo,
+        running_dcs: list[str],
+        now: float,
+    ) -> bool:
+        """Whether no running DC has made progress within the stuck threshold."""
+        return all(
+            not (now - info.dc_last_progress.get(dc, info.submitted_at) < self._stuck_threshold)
+            for dc in running_dcs
+        )
+
+    @staticmethod
+    def _stuck_reason(
+        info: GateJobTrackingInfo,
+        running_dcs: list[str],
+        now: float,
+    ) -> str:
+        """Why the job is stuck: how long since the oldest running DC's last progress."""
+        oldest_progress = min(
+            info.dc_last_progress.get(dc, info.submitted_at) for dc in running_dcs
+        )
+        stuck_duration = now - oldest_progress
+        return (
+            f"All DCs stuck (no progress for {stuck_duration:.1f}s across {len(running_dcs)} DCs)"
+        )
+
+    @staticmethod
+    def _majority_timeout_verdict(info: GateJobTrackingInfo) -> tuple[bool, str]:
+        """Time out when a majority of target DCs report a local timeout."""
+        # Check if majority of DCs report local timeout
+        local_timeout_count = sum(
+            info.dc_status.get(dc) == "timed_out" for dc in info.target_datacenters
+        )
+        if local_timeout_count > len(info.target_datacenters) / 2:
             return True, (
-                f"Majority DCs timed out ({len(local_timeout_dcs)}/{len(info.target_datacenters)})"
+                f"Majority DCs timed out ({local_timeout_count}/{len(info.target_datacenters)})"
             )
 
         return False, ""
@@ -458,14 +537,9 @@ class GateJobTimeoutTracker:
         Sends JobGlobalTimeout to all target DCs.
         """
         async with self._lock:
-            info = self._tracked_jobs.get(job_id)
-            if not info or info.globally_timed_out:
-                return
-
-            # Mark as globally timed out
-            info.globally_timed_out = True
-            info.timeout_reason = reason
-            info.timeout_fence_token += 1
+            info = self._claim_global_timeout(job_id, reason)
+        if info is None:
+            return
 
         await self._gate._udp_logger.log(
             ServerWarning(
@@ -484,27 +558,7 @@ class GateJobTimeoutTracker:
             fence_token=info.timeout_fence_token,
         )
 
-        for dc, manager_addr in info.dc_manager_addrs.items():
-            if info.dc_status.get(dc) in {"completed", "failed", "cancelled"}:
-                continue  # Skip terminal DCs
-
-            # send_tcp returns a failure rather than raising; anything but
-            # the manager's b"ok" means the decision was not processed.
-            response, _ = await self._gate.send_tcp(
-                manager_addr,
-                "job_global_timeout",
-                timeout_msg.dump(),
-                timeout=5.0,
-            )
-            if response != b"ok":
-                await self._gate._udp_logger.log(
-                    ServerWarning(
-                        message=f"Global timeout for job {job_id[:8]}... not delivered to DC {dc}: {response!r}",
-                        node_host=self._gate._host,
-                        node_port=self._gate._tcp_port,
-                        node_id=self._gate._node_id.short,
-                    )
-                )
+        await self._broadcast_global_timeout(job_id, info, timeout_msg)
 
         try:
             await self._gate.handle_global_timeout(
@@ -515,6 +569,57 @@ class GateJobTimeoutTracker:
             )
         except Exception as error:
             await self._gate.handle_exception(error, "handle_global_timeout")
+
+    def _claim_global_timeout(self, job_id: str, reason: str) -> GateJobTrackingInfo | None:
+        """Mark a tracked job globally timed out (once) and advance its fence; None if not ours to declare."""
+        info = self._tracked_jobs.get(job_id)
+        if not info or info.globally_timed_out:
+            return None
+
+        # Mark as globally timed out
+        info.globally_timed_out = True
+        info.timeout_reason = reason
+        info.timeout_fence_token += 1
+        return info
+
+    async def _broadcast_global_timeout(
+        self,
+        job_id: str,
+        info: GateJobTrackingInfo,
+        timeout_msg: JobGlobalTimeout,
+    ) -> None:
+        """Send the global timeout to every non-terminal DC's manager."""
+        for dc, manager_addr in info.dc_manager_addrs.items():
+            if info.dc_status.get(dc) in {"completed", "failed", "cancelled"}:
+                continue  # Skip terminal DCs
+
+            await self._send_global_timeout(job_id, dc, manager_addr, timeout_msg)
+
+    async def _send_global_timeout(
+        self,
+        job_id: str,
+        dc: str,
+        manager_addr: tuple[str, int],
+        timeout_msg: JobGlobalTimeout,
+    ) -> None:
+        """Deliver the global timeout to one DC manager, warning when it is not acknowledged."""
+        # send_tcp returns a failure rather than raising; anything but
+        # the manager's b"ok" means the decision was not processed.
+        response, _ = await self._gate.send_tcp(
+            manager_addr,
+            "job_global_timeout",
+            timeout_msg.dump(),
+            timeout=5.0,
+        )
+        if response != b"ok":
+            await self._gate._udp_logger.log(
+                ServerWarning(
+                    message=f"Global timeout for job {job_id[:8]}... not delivered to DC {dc}: {response!r}",
+                    node_host=self._gate._host,
+                    node_port=self._gate._tcp_port,
+                    node_id=self._gate._node_id.short,
+                )
+            )
 
     async def stop_tracking(self, job_id: str) -> None:
         """

@@ -4,6 +4,8 @@ TCP handler for reporter result push notifications.
 Handles ReporterResultPush messages indicating reporter submission completion.
 """
 
+from typing import Callable
+
 from hyperscale.distributed.models import ReporterResultPush, ClientReporterResult
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
@@ -42,33 +44,12 @@ class ReporterResultPushHandler:
         try:
             push = ReporterResultPush.load(data)
 
-            job = self._state._jobs.get(push.job_id)
-            if job:
-                # Store the result
-                job.reporter_results[push.reporter_type] = ClientReporterResult(
-                    reporter_type=push.reporter_type,
-                    success=push.success,
-                    error=push.error,
-                    elapsed_seconds=push.elapsed_seconds,
-                    source=push.source,
-                    datacenter=push.datacenter,
-                )
+            self._store_reporter_result(push)
 
             # Call user callback if registered
             callback = self._state._reporter_callbacks.get(push.job_id)
             if callback:
-                try:
-                    callback(push)
-                except Exception as callback_error:
-                    if self._logger:
-                        await self._logger.log(
-                            ServerWarning(
-                                message=f"Reporter result callback error: {callback_error}",
-                                node_host="client",
-                                node_port=0,
-                                node_id="client",
-                            )
-                        )
+                await self._invoke_reporter_callback(callback, push)
 
             return b"ok"
 
@@ -82,3 +63,36 @@ class ReporterResultPushHandler:
                 )
             )
             return b"error"
+
+    def _store_reporter_result(self, push: ReporterResultPush) -> None:
+        """Store the reporter result on the job when the job is tracked."""
+        job = self._state._jobs.get(push.job_id)
+        if job:
+            # Store the result
+            job.reporter_results[push.reporter_type] = ClientReporterResult(
+                reporter_type=push.reporter_type,
+                success=push.success,
+                error=push.error,
+                elapsed_seconds=push.elapsed_seconds,
+                source=push.source,
+                datacenter=push.datacenter,
+            )
+
+    async def _invoke_reporter_callback(
+        self,
+        callback: Callable[[ReporterResultPush], None],
+        push: ReporterResultPush,
+    ) -> None:
+        """Run the caller's reporter-result callback, logging what it raises."""
+        try:
+            callback(push)
+        except Exception as callback_error:
+            if self._logger:
+                await self._logger.log(
+                    ServerWarning(
+                        message=f"Reporter result callback error: {callback_error}",
+                        node_host="client",
+                        node_port=0,
+                        node_id="client",
+                    )
+                )

@@ -5,6 +5,7 @@ Provides centralized registration and tracking of workers, gates,
 and peer managers.
 """
 
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
@@ -19,6 +20,17 @@ from hyperscale.distributed.runtime import Clock, RealClock
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
+
+# AD-17 dispatch bucket per worker health state; "overloaded" (and any
+# unknown state) has no bucket, so those workers are excluded like unhealthy.
+_HEALTH_STATE_BUCKETS: MappingProxyType[str, str] = MappingProxyType(
+    {
+        "healthy": "healthy",
+        "busy": "busy",
+        "stressed": "degraded",
+        "degraded": "degraded",
+    }
+)
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -80,9 +92,7 @@ class ManagerRegistry:
         # actual cluster size and ``wait_until(count <= 1)`` never fires
         # because the count never drops back down.
         for addr in (tcp_addr, udp_addr):
-            existing_worker_id = self._state._worker_addr_to_id.get(addr)
-            if existing_worker_id is not None and existing_worker_id != worker_id:
-                self.unregister_worker(existing_worker_id)
+            self._evict_stale_worker_at(addr, worker_id)
 
         self._state._workers[worker_id] = registration
         self._state._worker_addr_to_id[tcp_addr] = worker_id
@@ -108,6 +118,18 @@ class ManagerRegistry:
             ),
         )
 
+    def _evict_stale_worker_at(self, addr: tuple[str, int], worker_id: str) -> None:
+        """Unregister a different worker_id still mapped to ``addr`` (restart churn)."""
+        existing_worker_id = self._state._worker_addr_to_id.get(addr)
+        if existing_worker_id is not None and existing_worker_id != worker_id:
+            self.unregister_worker(existing_worker_id)
+
+    def _worker_progress_keys(self, worker_id: str) -> list[tuple[str, str]]:
+        """The (job_id, worker_id) progress keys recorded for ``worker_id``."""
+        return [
+            key for key in self._state._worker_job_last_progress if key[1] == worker_id
+        ]
+
     def unregister_worker(self, worker_id: str) -> None:
         """
         Unregister a worker from this manager.
@@ -129,9 +151,7 @@ class ManagerRegistry:
         self._state._worker_latency_samples.pop(worker_id, None)
         self._state._dispatch_semaphores.pop(worker_id, None)
 
-        progress_keys_to_remove = [
-            key for key in self._state._worker_job_last_progress if key[1] == worker_id
-        ]
+        progress_keys_to_remove = self._worker_progress_keys(worker_id)
         for key in progress_keys_to_remove:
             self._state._worker_job_last_progress.pop(key, None)
 
@@ -219,37 +239,71 @@ class ManagerRegistry:
         unhealthy_ids = set(self._state._worker_unhealthy_since.keys())
 
         for worker_id, worker in self._state._workers.items():
-            circuit = self._state._worker_circuits.get(worker_id)
-
-            if worker_id in unhealthy_ids:
-                if not circuit or circuit.circuit_state != CircuitState.HALF_OPEN:
-                    continue
-
-            if circuit and circuit.is_open():
+            if not self._worker_dispatchable(worker_id, worker, unhealthy_ids, cores_required):
                 continue
 
-            # Skip workers without capacity
-            if worker.total_cores < cores_required:
-                continue
-
-            health_state = self.get_worker_health_state(worker_id)
-
-            if health_state == "healthy":
-                buckets["healthy"].append(worker)
-            elif health_state == "busy":
-                buckets["busy"].append(worker)
-            elif health_state in ("stressed", "degraded"):
-                buckets["degraded"].append(worker)
-            # "overloaded" workers are excluded (treated like unhealthy)
+            self._place_in_health_bucket(buckets, worker_id, worker)
 
         # Sort each bucket by capacity (total_cores descending)
+        self._sort_buckets_by_capacity(buckets)
+
+        return buckets
+
+    @staticmethod
+    def _unhealthy_worker_excluded(
+        worker_id: str,
+        circuit: ErrorStats | None,
+        unhealthy_ids: set[str],
+    ) -> bool:
+        """An unhealthy worker stays dispatchable only while its circuit is half-open (AD-17)."""
+        return worker_id in unhealthy_ids and (
+            not circuit or circuit.circuit_state != CircuitState.HALF_OPEN
+        )
+
+    @staticmethod
+    def _circuit_blocks_dispatch(circuit: ErrorStats | None) -> bool:
+        """Whether the worker's circuit breaker is open."""
+        return circuit and circuit.is_open()
+
+    def _worker_dispatchable(
+        self,
+        worker_id: str,
+        worker: WorkerRegistration,
+        unhealthy_ids: set[str],
+        cores_required: int,
+    ) -> bool:
+        """AD-17 eligibility: not unhealthy (unless half-open), circuit closed, enough cores."""
+        circuit = self._state._worker_circuits.get(worker_id)
+
+        if self._unhealthy_worker_excluded(worker_id, circuit, unhealthy_ids):
+            return False
+
+        if self._circuit_blocks_dispatch(circuit):
+            return False
+
+        # Skip workers without capacity
+        return worker.total_cores >= cores_required
+
+    def _place_in_health_bucket(
+        self,
+        buckets: dict[str, list[WorkerRegistration]],
+        worker_id: str,
+        worker: WorkerRegistration,
+    ) -> None:
+        """Append the worker to its health bucket; "overloaded" workers are excluded (treated like unhealthy)."""
+        health_state = self.get_worker_health_state(worker_id)
+
+        if (bucket_name := _HEALTH_STATE_BUCKETS.get(health_state)) is not None:
+            buckets[bucket_name].append(worker)
+
+    @staticmethod
+    def _sort_buckets_by_capacity(buckets: dict[str, list[WorkerRegistration]]) -> None:
+        """Sort each bucket by capacity (total_cores descending)."""
         for bucket_name in buckets:
             buckets[bucket_name].sort(
                 key=lambda w: w.total_cores,
                 reverse=True,
             )
-
-        return buckets
 
     async def register_gate(self, gate_info: GateInfo) -> None:
         """
@@ -297,13 +351,17 @@ class ManagerRegistry:
         self._state.remove_gate_lock(gate_id)
 
         if gate_info is not None:
-            stale_udp_addrs = [
-                udp_addr
-                for udp_addr, tcp_addr in self._state._gate_udp_to_tcp.items()
-                if tcp_addr == (gate_info.tcp_host, gate_info.tcp_port)
-            ]
+            stale_udp_addrs = self._stale_gate_udp_addrs(gate_info)
             for udp_addr in stale_udp_addrs:
                 self._state._gate_udp_to_tcp.pop(udp_addr, None)
+
+    def _stale_gate_udp_addrs(self, gate_info: GateInfo) -> list[tuple[str, int]]:
+        """UDP addresses still mapped to the forgotten gate's TCP address."""
+        return [
+            udp_addr
+            for udp_addr, tcp_addr in self._state._gate_udp_to_tcp.items()
+            if tcp_addr == (gate_info.tcp_host, gate_info.tcp_port)
+        ]
 
     def get_gate(self, gate_id: str) -> GateInfo | None:
         """Get gate info by ID."""
@@ -338,15 +396,7 @@ class ManagerRegistry:
         """
         tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
         udp_addr = (peer_info.udp_host, peer_info.udp_port)
-        stale_peer_ids = [
-            peer_id
-            for peer_id, known_peer in self._state._known_manager_peers.items()
-            if peer_id != peer_info.node_id
-            and (
-                (known_peer.tcp_host, known_peer.tcp_port) == tcp_addr
-                or (known_peer.udp_host, known_peer.udp_port) == udp_addr
-            )
-        ]
+        stale_peer_ids = self._stale_manager_peer_ids(peer_info.node_id, tcp_addr, udp_addr)
         for stale_peer_id in stale_peer_ids:
             self.unregister_manager_peer(stale_peer_id)
 
@@ -360,6 +410,33 @@ class ManagerRegistry:
                 node_id=self._node_id,
             ),
         )
+
+    @staticmethod
+    def _is_stale_manager_peer(
+        peer_id: str,
+        known_peer: ManagerInfo,
+        node_id: str,
+        tcp_addr: tuple[str, int],
+        udp_addr: tuple[str, int],
+    ) -> bool:
+        """Whether a different known peer occupies either address of the registering peer."""
+        return peer_id != node_id and (
+            (known_peer.tcp_host, known_peer.tcp_port) == tcp_addr
+            or (known_peer.udp_host, known_peer.udp_port) == udp_addr
+        )
+
+    def _stale_manager_peer_ids(
+        self,
+        node_id: str,
+        tcp_addr: tuple[str, int],
+        udp_addr: tuple[str, int],
+    ) -> list[str]:
+        """Other peer ids still registered at the registering peer's TCP or UDP address."""
+        return [
+            peer_id
+            for peer_id, known_peer in self._state._known_manager_peers.items()
+            if self._is_stale_manager_peer(peer_id, known_peer, node_id, tcp_addr, udp_addr)
+        ]
 
     def unregister_manager_peer(self, peer_id: str) -> None:
         """

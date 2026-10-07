@@ -711,15 +711,23 @@ class GateHealthCoordinator:
         # Without a capacity to measure against, nothing is known.
         return self._resource_predictor.predict_slo_risk(
             cpu_pressure=view.cpu_pressure,
-            cpu_uncertainty_pressure=view.workload_cpu_uncertainty / view.cpu_capacity_percent
-            if view.cpu_capacity_percent > 0
-            else float("inf"),
+            cpu_uncertainty_pressure=self._uncertainty_share(
+                view.workload_cpu_uncertainty,
+                view.cpu_capacity_percent,
+            ),
             memory_pressure=view.memory_pressure,
-            memory_uncertainty_pressure=view.workload_memory_uncertainty / view.memory_capacity_bytes
-            if view.memory_capacity_bytes > 0
-            else float("inf"),
+            memory_uncertainty_pressure=self._uncertainty_share(
+                view.workload_memory_uncertainty,
+                view.memory_capacity_bytes,
+            ),
             current_slo_score=slo_routing_factor,
         )
+
+    @staticmethod
+    def _uncertainty_share(uncertainty: float, capacity: float) -> float:
+        """AD-42 Part 9: an uncertainty as a share of capacity; infinite when no
+        capacity is known to measure it against."""
+        return uncertainty / capacity if capacity > 0 else float("inf")
 
     def build_datacenter_candidates(
         self,
@@ -734,42 +742,63 @@ class GateHealthCoordinator:
         AD-43 aggregate. Managers are those the gate dispatches to; the
         ones whose circuit is open are the circuit-breaker pressure.
         """
-        candidates: list[DatacenterCandidate] = []
-        for datacenter_id in datacenter_ids:
-            status = self.classify_datacenter_health(datacenter_id)
-            health_bucket = status.health.upper()
-            if status.health == DatacenterHealth.UNHEALTHY.value:
-                correlation_decision = self._cross_dc_correlation.check_correlation(
-                    datacenter_id
-                )
-                if correlation_decision.should_delay_eviction:
-                    health_bucket = DatacenterHealth.DEGRADED.value.upper()
+        return [
+            self._build_datacenter_candidate(datacenter_id)
+            for datacenter_id in datacenter_ids
+        ]
 
-            if datacenter_id in self._partitioned_datacenters:
-                health_bucket = DatacenterHealth.DEGRADED.value.upper()
+    def _build_datacenter_candidate(self, datacenter_id: str) -> DatacenterCandidate:
+        """One datacenter's router view: its held health bucket, AD-43 capacity
+        and circuit-breaker pressure."""
+        status = self.classify_datacenter_health(datacenter_id)
+        health_bucket = self._datacenter_health_bucket(datacenter_id, status)
 
-            capacity = self._capacity_aggregator.get_capacity(datacenter_id)
-            managers = self._datacenter_managers.get(datacenter_id, [])
-            open_circuit_count = self._circuit_breaker_manager.count_open_circuits(
-                managers
-            )
-            candidates.append(
-                DatacenterCandidate(
-                    datacenter_id=datacenter_id,
-                    health_bucket=health_bucket,
-                    available_cores=capacity.available_cores,
-                    total_cores=capacity.total_cores,
-                    queue_depth=capacity.pending_workflow_count,
-                    total_managers=len(managers),
-                    healthy_managers=len(managers) - open_circuit_count,
-                    circuit_breaker_pressure=(
-                        open_circuit_count / len(managers) if managers else 0.0
-                    ),
-                    health_severity_weight=status.health_severity_weight,
-                    slo_routing_factor=self._datacenter_routing_factor(datacenter_id),
-                )
-            )
-        return candidates
+        capacity = self._capacity_aggregator.get_capacity(datacenter_id)
+        managers = self._datacenter_managers.get(datacenter_id, [])
+        open_circuit_count = self._circuit_breaker_manager.count_open_circuits(
+            managers
+        )
+        return DatacenterCandidate(
+            datacenter_id=datacenter_id,
+            health_bucket=health_bucket,
+            available_cores=capacity.available_cores,
+            total_cores=capacity.total_cores,
+            queue_depth=capacity.pending_workflow_count,
+            total_managers=len(managers),
+            healthy_managers=len(managers) - open_circuit_count,
+            circuit_breaker_pressure=(
+                open_circuit_count / len(managers) if managers else 0.0
+            ),
+            health_severity_weight=status.health_severity_weight,
+            slo_routing_factor=self._datacenter_routing_factor(datacenter_id),
+        )
+
+    def _datacenter_health_bucket(
+        self,
+        datacenter_id: str,
+        status: DatacenterStatus,
+    ) -> str:
+        """The routing health bucket: DEGRADED while a correlated failure delays
+        an UNHEALTHY eviction or the datacenter is partitioned (AD-33 Part 6)."""
+        if (
+            self._correlation_delays_eviction(datacenter_id, status)
+            or datacenter_id in self._partitioned_datacenters
+        ):
+            return DatacenterHealth.DEGRADED.value.upper()
+        return status.health.upper()
+
+    def _correlation_delays_eviction(
+        self,
+        datacenter_id: str,
+        status: DatacenterStatus,
+    ) -> bool:
+        """Whether an UNHEALTHY datacenter's eviction waits on a correlated cross-DC failure."""
+        return (
+            status.health == DatacenterHealth.UNHEALTHY.value
+            and self._cross_dc_correlation.check_correlation(
+                datacenter_id
+            ).should_delay_eviction
+        )
 
     def sample_datacenter_correlation(self) -> None:
         """Give the cross-datacenter correlation detector one sample of
@@ -786,19 +815,28 @@ class GateHealthCoordinator:
         datacenters stayed held at DEGRADED for good.
         """
         for datacenter_id, managers in self._datacenter_managers.items():
-            match self.classify_datacenter_health(datacenter_id).health:
-                case DatacenterHealth.UNHEALTHY.value:
-                    self._cross_dc_correlation.record_failure(
-                        datacenter_id, "unhealthy", len(managers)
-                    )
-                case (
-                    DatacenterHealth.HEALTHY.value
-                    | DatacenterHealth.BUSY.value
-                    | DatacenterHealth.DEGRADED.value
-                ):
-                    self._cross_dc_correlation.record_recovery(datacenter_id)
+            self._sample_datacenter_health(datacenter_id, managers)
         if self._cross_dc_correlation.is_in_partition():
             self._cross_dc_correlation.check_partition_healed()
+
+    def _sample_datacenter_health(
+        self,
+        datacenter_id: str,
+        managers: list[tuple[str, int]],
+    ) -> None:
+        """Feed one datacenter's merged health to the correlation detector: UNHEALTHY
+        is a failure, a reachable health a recovery, anything else no evidence."""
+        match self.classify_datacenter_health(datacenter_id).health:
+            case DatacenterHealth.UNHEALTHY.value:
+                self._cross_dc_correlation.record_failure(
+                    datacenter_id, "unhealthy", len(managers)
+                )
+            case (
+                DatacenterHealth.HEALTHY.value
+                | DatacenterHealth.BUSY.value
+                | DatacenterHealth.DEGRADED.value
+            ):
+                self._cross_dc_correlation.record_recovery(datacenter_id)
 
     def check_and_notify_partition_healed(self) -> bool:
         return self._cross_dc_correlation.check_partition_healed()

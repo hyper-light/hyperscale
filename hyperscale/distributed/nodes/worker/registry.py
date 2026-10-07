@@ -255,10 +255,7 @@ class WorkerRegistry:
         per-manager state dicts would grow unbounded under manager churn.
         """
         removed_manager = self._known_managers.pop(manager_id, None)
-        if removed_manager is not None:
-            removed_addr = (removed_manager.tcp_host, removed_manager.tcp_port)
-            if self._manager_id_by_addr.get(removed_addr) == manager_id:
-                del self._manager_id_by_addr[removed_addr]
+        self._forget_confirmed_addr(manager_id, removed_manager)
         self._healthy_manager_ids.discard(manager_id)
         self._manager_unhealthy_since.pop(manager_id, None)
         self._manager_circuits.pop(manager_id, None)
@@ -267,6 +264,15 @@ class WorkerRegistry:
         if manager_addr is not None:
             self._manager_addr_circuits.pop(manager_addr, None)
         self._signal_healthy_set_changed()
+
+    def _forget_confirmed_addr(
+        self, manager_id: str, removed_manager: ManagerInfo | None
+    ) -> None:
+        """Drop the removed manager's address confirmation if it still names it."""
+        if removed_manager is not None:
+            removed_addr = (removed_manager.tcp_host, removed_manager.tcp_port)
+            if self._manager_id_by_addr.get(removed_addr) == manager_id:
+                del self._manager_id_by_addr[removed_addr]
 
     def get_or_create_circuit(self, manager_id: str) -> ErrorStats:
         """Get or create the configured circuit breaker for a manager."""
@@ -297,14 +303,7 @@ class WorkerRegistry:
     ) -> ManagerCircuitStatus | ManagerCircuitLookupError | ManagerCircuitSummary:
         """Get circuit breaker status for a specific manager or summary."""
         if manager_id:
-            if not (circuit := self._manager_circuits.get(manager_id)):
-                return {"error": f"No circuit breaker for manager {manager_id}"}
-            return {
-                "manager_id": manager_id,
-                "circuit_state": circuit.circuit_state.name,
-                "error_count": circuit.error_count,
-                "error_rate": circuit.error_rate,
-            }
+            return self._manager_circuit_status(manager_id)
 
         return {
             "managers": {
@@ -314,14 +313,31 @@ class WorkerRegistry:
                 }
                 for mid, cb in self._manager_circuits.items()
             },
-            "open_circuits": [
-                mid
-                for mid, cb in self._manager_circuits.items()
-                if cb.circuit_state == CircuitState.OPEN
-            ],
+            "open_circuits": self._open_circuit_manager_ids(),
             "healthy_managers": len(self._healthy_manager_ids),
             "primary_manager": self._primary_manager_id,
         }
+
+    def _manager_circuit_status(
+        self, manager_id: str
+    ) -> ManagerCircuitStatus | ManagerCircuitLookupError:
+        """One manager's circuit breaker status, or an error without one."""
+        if not (circuit := self._manager_circuits.get(manager_id)):
+            return {"error": f"No circuit breaker for manager {manager_id}"}
+        return {
+            "manager_id": manager_id,
+            "circuit_state": circuit.circuit_state.name,
+            "error_count": circuit.error_count,
+            "error_rate": circuit.error_rate,
+        }
+
+    def _open_circuit_manager_ids(self) -> list[str]:
+        """Ids of managers whose circuit breaker is OPEN."""
+        return [
+            mid
+            for mid, cb in self._manager_circuits.items()
+            if cb.circuit_state == CircuitState.OPEN
+        ]
 
     async def select_new_primary_manager(self) -> str | None:
         """
@@ -333,12 +349,26 @@ class WorkerRegistry:
             Selected manager ID or None
         """
         # Prefer the leader if we know one
-        for manager_id in self._healthy_manager_ids:
-            if manager := self._known_managers.get(manager_id):
-                if manager.is_leader:
-                    self._primary_manager_id = manager_id
-                    return manager_id
+        if (leader_id := self._select_known_leader()) is not None:
+            return leader_id
 
+        return self._select_healthy_primary()
+
+    def _select_known_leader(self) -> str | None:
+        """Make the first known healthy leader primary and return it, if any."""
+        for manager_id in self._healthy_manager_ids:
+            if self._is_known_leader(manager_id):
+                self._primary_manager_id = manager_id
+                return manager_id
+        return None
+
+    def _is_known_leader(self, manager_id: str) -> bool:
+        """Whether a manager is known and reports itself leader."""
+        manager = self._known_managers.get(manager_id)
+        return bool(manager and manager.is_leader)
+
+    def _select_healthy_primary(self) -> str | None:
+        """Choose and set a primary among healthy managers via AD-28 selection."""
         # Otherwise let AD-28 selection choose: rendezvous ranking spreads
         # workers across managers deterministically and the EWMA latency
         # comparison steers away from slow ones. If it cannot choose

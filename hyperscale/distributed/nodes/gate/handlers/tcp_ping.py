@@ -74,30 +74,11 @@ class GatePingHandler:
             request = PingRequest.load(data)
 
             # Build per-datacenter info
-            datacenters: list[DatacenterInfo] = []
             datacenter_managers = self._get_datacenter_managers()
-
-            for dc_id in datacenter_managers.keys():
-                status = self._classify_dc_health(dc_id)
-
-                # Find the DC leader address
-                leader_addr: tuple[str, int] | None = None
-                manager_statuses = self._state._datacenter_manager_status.get(dc_id, {})
-                for manager_addr, heartbeat in manager_statuses.items():
-                    if heartbeat.is_leader:
-                        leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
-                        break
-
-                datacenters.append(
-                    DatacenterInfo(
-                        dc_id=dc_id,
-                        health=status.health,
-                        leader_addr=leader_addr,
-                        available_cores=status.available_capacity,
-                        manager_count=status.manager_count,
-                        worker_count=status.worker_count,
-                    )
-                )
+            datacenters: list[DatacenterInfo] = [
+                self._build_datacenter_info(dc_id)
+                for dc_id in datacenter_managers.keys()
+            ]
 
             # Get active job IDs
             active_job_ids = self._get_all_job_ids()
@@ -128,5 +109,26 @@ class GatePingHandler:
             await handle_exception(error, "handle_ping")
             return b"error"
 
+
+    def _build_datacenter_info(self, dc_id: str) -> DatacenterInfo:
+        """One datacenter's ping entry: its classified health and leader address."""
+        status = self._classify_dc_health(dc_id)
+
+        # Find the DC leader address
+        leader_addr: tuple[str, int] | None = None
+        manager_statuses = self._state._datacenter_manager_status.get(dc_id, {})
+        for manager_addr, heartbeat in manager_statuses.items():
+            if heartbeat.is_leader:
+                leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+                break
+
+        return DatacenterInfo(
+            dc_id=dc_id,
+            health=status.health,
+            leader_addr=leader_addr,
+            available_cores=status.available_capacity,
+            manager_count=status.manager_count,
+            worker_count=status.worker_count,
+        )
 
 __all__ = ["GatePingHandler"]

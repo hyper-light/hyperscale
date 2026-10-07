@@ -11,6 +11,7 @@ from .cluster_connection_state import ClusterConnectionState
 
 if TYPE_CHECKING:
     from hyperscale.distributed.taskex import TaskRunner
+    from hyperscale.distributed.taskex.run import Run
     from hyperscale.logging import Logger
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -118,16 +119,18 @@ class WorkerClusterConnection:
         ``__init__`` so the caller can finish wiring (the registry's
         change-signal hook, etc.) before the watchdog starts firing.
         """
-        if self._liveness_task is not None and not self._task_finished(
-            self._liveness_task
-        ):
+        if self._task_is_running(self._liveness_task):
             return
         self._liveness_task = self._task_runner.run(
             self._liveness_watchdog,
             alias="worker_cluster_liveness_watchdog",
         )
-        if len(self._get_healthy_manager_ids()) == 0 and self._seed_manager_tcp_addrs:
+        if self._isolated_with_seeds():
             self._transition_to(ClusterConnectionState.RECONNECTING)
+
+    def _isolated_with_seeds(self) -> bool:
+        """Whether no manager is healthy while seeds exist to rejoin through."""
+        return bool(len(self._get_healthy_manager_ids()) == 0 and self._seed_manager_tcp_addrs)
 
     def record_heartbeat(self, manager_id: str) -> None:
         """Record that we received evidence of a live manager.
@@ -187,12 +190,18 @@ class WorkerClusterConnection:
         # watchdog as soon as the threshold elapses since process
         # start.
         healthy_ids = self._get_healthy_manager_ids()
+        self._seed_missing_heartbeats(healthy_ids)
+        self._transition_for_healthy_count(len(healthy_ids))
+
+    def _seed_missing_heartbeats(self, healthy_ids: set[str]) -> None:
+        """Give each newly-healthy manager a heartbeat stamp of now (see ``update``)."""
         now = _DEFAULT_CLOCK.monotonic()
         for manager_id in healthy_ids:
             if manager_id not in self._manager_last_heartbeat:
                 self._manager_last_heartbeat[manager_id] = now
 
-        healthy_count = len(healthy_ids)
+    def _transition_for_healthy_count(self, healthy_count: int) -> None:
+        """Move to CONNECTED with live managers, or RECONNECTING after an isolation."""
         if healthy_count > 0:
             self._transition_to(ClusterConnectionState.CONNECTED)
         elif self._state == ClusterConnectionState.CONNECTING:
@@ -212,8 +221,8 @@ class WorkerClusterConnection:
         transitions. ``update()`` becomes a no-op.
         """
         self._running = False
-        await self._cancel_task("_rejoin_task")
-        await self._cancel_task("_liveness_task")
+        await self._cancel_task_attribute("_rejoin_task")
+        await self._cancel_task_attribute("_liveness_task")
 
     def _transition_to(self, new_state: ClusterConnectionState) -> None:
         if self._state == new_state:
@@ -221,44 +230,69 @@ class WorkerClusterConnection:
 
         old_state = self._state
         self._state = new_state
+        self._enter_state(old_state, new_state)
 
+    def _enter_state(
+        self,
+        old_state: ClusterConnectionState,
+        new_state: ClusterConnectionState,
+    ) -> None:
+        """Run the side effects of entering ``new_state`` from ``old_state``."""
         if new_state == ClusterConnectionState.RECONNECTING:
             self._task_runner.run(self._log_isolation, old_state)
             self._start_rejoin_task()
         elif new_state == ClusterConnectionState.CONNECTED:
-            if old_state == ClusterConnectionState.RECONNECTING:
-                # Recovery succeeded — the rejoin loop will observe
-                # the state change on its next check and exit
-                # voluntarily. We don't ``cancel()`` here because
-                # cancelling mid-register-call leaves the response
-                # handler racing the next dispatch. The task is
-                # self-terminating and short-lived.
-                self._task_runner.run(self._log_recovery)
+            self._enter_connected(old_state)
+
+    def _enter_connected(self, old_state: ClusterConnectionState) -> None:
+        """Log a recovery when CONNECTED is reached from RECONNECTING."""
+        if old_state == ClusterConnectionState.RECONNECTING:
+            # Recovery succeeded — the rejoin loop will observe
+            # the state change on its next check and exit
+            # voluntarily. We don't ``cancel()`` here because
+            # cancelling mid-register-call leaves the response
+            # handler racing the next dispatch. The task is
+            # self-terminating and short-lived.
+            self._task_runner.run(self._log_recovery)
 
     def _start_rejoin_task(self) -> None:
-        existing = self._rejoin_task
-        if existing is not None and not self._task_finished(existing):
+        if self._task_is_running(self._rejoin_task):
             return
         self._rejoin_task = self._task_runner.run(
             self._rejoin_loop,
             alias="worker_cluster_rejoin",
         )
 
-    async def _cancel_task(self, attr_name: str) -> None:
+    async def _cancel_task_attribute(self, attr_name: str) -> None:
+        """Clear a task attribute and cancel the task it held if still running."""
         task = getattr(self, attr_name, None)
         setattr(self, attr_name, None)
-        if task is None or self._task_finished(task):
+        if not self._task_is_running(task):
             return
+        await self._await_task_cancel(task)
+
+    async def _await_task_cancel(self, task: "Run") -> None:
+        """Cancel a running ``Run``, re-raising only a cancel aimed at this task."""
         cancels_requested_before_wait = asyncio.current_task().cancelling()
         try:
-            await task.cancel()
+            await self._cancel_task(task)
         except asyncio.CancelledError:
             # The task we cancelled ended; a cancel aimed at this task
             # while it waited goes on.
             if asyncio.current_task().cancelling() > cancels_requested_before_wait:
                 raise
+
+    @staticmethod
+    async def _cancel_task(task: "Run") -> None:
+        """Await a ``Run``'s cancel; a failure in the cancelled task is not ours."""
+        try:
+            await task.cancel()
         except Exception:
             pass
+
+    def _task_is_running(self, task: "Run | None") -> bool:
+        """Return True if ``task`` exists and is not yet finished."""
+        return task is not None and not self._task_finished(task)
 
     @staticmethod
     def _task_finished(task) -> bool:
@@ -297,66 +331,79 @@ class WorkerClusterConnection:
         try:
             while self._running:
                 await _DEFAULT_CLOCK.sleep(self._liveness_check_interval_seconds)
-                if not self._running:
-                    return
+                await self._liveness_pass(watchdog_start)
+        except asyncio.CancelledError:
+            return
 
-                now = _DEFAULT_CLOCK.monotonic()
-                stale_managers: list[str] = []
-                for manager_id in list(self._get_healthy_manager_ids()):
-                    last_heartbeat = self._manager_last_heartbeat.get(manager_id)
-                    if last_heartbeat is None:
-                        # No heartbeat recorded yet. Treat the
-                        # watchdog start time as the reference so a
-                        # manager that never produces a heartbeat
-                        # *does* eventually get marked stale, but
-                        # only after the full threshold has passed
-                        # since *we* started watching.
-                        if now - watchdog_start < self._heartbeat_staleness_threshold_seconds:
-                            continue
-                        stale_managers.append(manager_id)
-                        continue
-                    if now - last_heartbeat >= self._heartbeat_staleness_threshold_seconds:
-                        stale_managers.append(manager_id)
+    async def _liveness_pass(self, watchdog_start: float) -> None:
+        """One watchdog scan: downgrade every stale registry-healthy manager."""
+        if not self._running:
+            return
 
-                if not stale_managers:
-                    continue
+        stale_managers = self._collect_stale_managers(_DEFAULT_CLOCK.monotonic(), watchdog_start)
 
-                # Mark stale managers unhealthy. Each call fires the
-                # registry change-signal which calls back into
-                # ``update()`` — this is the single transition path,
-                # so the state machine reacts uniformly whether the
-                # trigger came from SWIM, peer-confirmation, or here.
-                for manager_id in stale_managers:
-                    try:
-                        await self._mark_manager_unhealthy(manager_id)
-                    except Exception as mark_error:
-                        await self._logger.log(
-                            ServerWarning(
-                                message=(
-                                    f"Liveness watchdog: failed to mark "
-                                    f"manager {manager_id[:8]}... unhealthy: "
-                                    f"{mark_error}"
-                                ),
-                                node_host=self._node_host,
-                                node_port=self._node_port,
-                                node_id=self._node_id_short,
-                            )
-                        )
+        if not stale_managers:
+            return
 
+        await self._mark_stale_managers_unhealthy(stale_managers)
+
+        await self._logger.log(
+            ServerWarning(
+                message=(
+                    f"Liveness watchdog: marked {len(stale_managers)} "
+                    f"manager(s) unhealthy for heartbeat staleness > "
+                    f"{self._heartbeat_staleness_threshold_seconds}s"
+                ),
+                node_host=self._node_host,
+                node_port=self._node_port,
+                node_id=self._node_id_short,
+            )
+        )
+
+    def _collect_stale_managers(self, now: float, watchdog_start: float) -> list[str]:
+        """The registry-healthy managers whose heartbeat is past the staleness threshold."""
+        return [
+            manager_id
+            for manager_id in list(self._get_healthy_manager_ids())
+            if self._is_manager_stale(manager_id, now, watchdog_start)
+        ]
+
+    def _is_manager_stale(self, manager_id: str, now: float, watchdog_start: float) -> bool:
+        """Whether a manager's last heartbeat (or the watchdog start) is past the threshold."""
+        last_heartbeat = self._manager_last_heartbeat.get(manager_id)
+        if last_heartbeat is None:
+            # No heartbeat recorded yet. Treat the
+            # watchdog start time as the reference so a
+            # manager that never produces a heartbeat
+            # *does* eventually get marked stale, but
+            # only after the full threshold has passed
+            # since *we* started watching.
+            return not (now - watchdog_start < self._heartbeat_staleness_threshold_seconds)
+        return now - last_heartbeat >= self._heartbeat_staleness_threshold_seconds
+
+    async def _mark_stale_managers_unhealthy(self, stale_managers: list[str]) -> None:
+        """Downgrade each stale manager, logging any that fail to downgrade."""
+        # Mark stale managers unhealthy. Each call fires the
+        # registry change-signal which calls back into
+        # ``update()`` — this is the single transition path,
+        # so the state machine reacts uniformly whether the
+        # trigger came from SWIM, peer-confirmation, or here.
+        for manager_id in stale_managers:
+            try:
+                await self._mark_manager_unhealthy(manager_id)
+            except Exception as mark_error:
                 await self._logger.log(
                     ServerWarning(
                         message=(
-                            f"Liveness watchdog: marked {len(stale_managers)} "
-                            f"manager(s) unhealthy for heartbeat staleness > "
-                            f"{self._heartbeat_staleness_threshold_seconds}s"
+                            f"Liveness watchdog: failed to mark "
+                            f"manager {manager_id[:8]}... unhealthy: "
+                            f"{mark_error}"
                         ),
                         node_host=self._node_host,
                         node_port=self._node_port,
                         node_id=self._node_id_short,
                     )
                 )
-        except asyncio.CancelledError:
-            return
 
     async def _rejoin_loop(self) -> None:
         """Retry seed managers until the live-manager set recovers.
@@ -377,68 +424,82 @@ class WorkerClusterConnection:
         the kill switch.
         """
         try:
-            while self._running and self._state == ClusterConnectionState.RECONNECTING:
-                for seed_addr in self._seed_manager_tcp_addrs:
-                    if (
-                        not self._running
-                        or self._state != ClusterConnectionState.RECONNECTING
-                    ):
-                        return
-                    # Drop any cached TCP client transport to this
-                    # seed before re-registering. We reach this code
-                    # only because the staleness watchdog has decided
-                    # the cluster (including this seed) is no longer
-                    # reachable at the application layer; a cached
-                    # transport that still reports ``is_closing() ==
-                    # False`` would otherwise route the new register
-                    # call back through whatever socket originally
-                    # accepted us — fatal in the kill→restart case
-                    # where a fresh process now listens on the same
-                    # address. Invalidating forces
-                    # ``_connect_tcp_client`` on the next send, which
-                    # establishes the connection against whoever is
-                    # listening *now*.
-                    self._invalidate_tcp_client(seed_addr)
-                    try:
-                        await self._register_with_manager(seed_addr)
-                    except Exception as register_error:
-                        await self._logger.log(
-                            ServerWarning(
-                                message=(
-                                    f"Cluster-rejoin: register attempt against "
-                                    f"seed {seed_addr} raised: {register_error}"
-                                ),
-                                node_host=self._node_host,
-                                node_port=self._node_port,
-                                node_id=self._node_id_short,
-                            )
-                        )
-                    # After each register attempt the response handler
-                    # may have already added a healthy manager —
-                    # re-check before moving to the next seed so we
-                    # exit as early as possible.
-                    if len(self._get_healthy_manager_ids()) > 0:
-                        return
-
-                # Full pass yielded no healthy manager — back off
-                # before the next pass. LHM-scaled so the cadence
-                # tracks the worker's self-health.
-                if (
-                    not self._running
-                    or self._state != ClusterConnectionState.RECONNECTING
-                ):
-                    return
-                backoff = self._rejoin_base_backoff_seconds * max(
-                    1.0, self._get_lhm_multiplier()
-                )
-                if self._rejoin_jitter_max_seconds > 0.0:
-                    backoff += _DEFAULT_RANDOM.uniform(
-                        self._rejoin_jitter_min_seconds,
-                        self._rejoin_jitter_max_seconds,
-                    )
-                await _DEFAULT_CLOCK.sleep(backoff)
+            await self._run_rejoin_passes()
         except asyncio.CancelledError:
             return
+
+    async def _run_rejoin_passes(self) -> None:
+        """Run seed passes with backoff between them while still RECONNECTING."""
+        while self._still_reconnecting():
+            if await self._rejoin_pass():
+                return
+            await self._rejoin_backoff()
+
+    def _still_reconnecting(self) -> bool:
+        """Whether the tracker runs and is still in RECONNECTING."""
+        return self._running and self._state == ClusterConnectionState.RECONNECTING
+
+    async def _rejoin_pass(self) -> bool:
+        """Try every seed once; True when the rejoin loop should exit."""
+        for seed_addr in self._seed_manager_tcp_addrs:
+            if await self._attempt_seed(seed_addr):
+                return True
+
+        # Full pass yielded no healthy manager — back off
+        # before the next pass. LHM-scaled so the cadence
+        # tracks the worker's self-health.
+        return not self._still_reconnecting()
+
+    async def _attempt_seed(self, seed_addr: tuple[str, int]) -> bool:
+        """Re-register through one seed; True when the rejoin loop should exit."""
+        if not self._still_reconnecting():
+            return True
+        # Drop any cached TCP client transport to this
+        # seed before re-registering. We reach this code
+        # only because the staleness watchdog has decided
+        # the cluster (including this seed) is no longer
+        # reachable at the application layer; a cached
+        # transport that still reports ``is_closing() ==
+        # False`` would otherwise route the new register
+        # call back through whatever socket originally
+        # accepted us — fatal in the kill→restart case
+        # where a fresh process now listens on the same
+        # address. Invalidating forces
+        # ``_connect_tcp_client`` on the next send, which
+        # establishes the connection against whoever is
+        # listening *now*.
+        self._invalidate_tcp_client(seed_addr)
+        try:
+            await self._register_with_manager(seed_addr)
+        except Exception as register_error:
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        f"Cluster-rejoin: register attempt against "
+                        f"seed {seed_addr} raised: {register_error}"
+                    ),
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id_short,
+                )
+            )
+        # After each register attempt the response handler
+        # may have already added a healthy manager —
+        # re-check before moving to the next seed so we
+        # exit as early as possible.
+        return len(self._get_healthy_manager_ids()) > 0
+
+    async def _rejoin_backoff(self) -> None:
+        """Sleep the LHM-scaled, jittered backoff between rejoin passes."""
+        backoff = self._rejoin_base_backoff_seconds * max(
+            1.0, self._get_lhm_multiplier()
+        )
+        if self._rejoin_jitter_max_seconds > 0.0:
+            backoff += _DEFAULT_RANDOM.uniform(
+                self._rejoin_jitter_min_seconds,
+                self._rejoin_jitter_max_seconds,
+            )
+        await _DEFAULT_CLOCK.sleep(backoff)
 
     async def _log_isolation(self, previous_state: ClusterConnectionState) -> None:
         await self._logger.log(

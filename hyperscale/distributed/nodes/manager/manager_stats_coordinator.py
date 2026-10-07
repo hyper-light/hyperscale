@@ -1,6 +1,7 @@
 """``ManagerStatsCoordinator`` -- pickled under the namespace
 ``hyperscale.distributed.nodes.manager.stats`` (see that module)."""
 
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 from collections.abc import Awaitable, Callable
 from hyperscale.distributed.reliability import (
@@ -9,11 +10,22 @@ from hyperscale.distributed.reliability import (
     StatsBuffer,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+from hyperscale.distributed.jobs.windowed_stats_push import WindowedStatsPush
 from hyperscale.distributed.runtime import Clock
 
 from .backpressure_level import BackpressureLevel
 from .models.manager_stats_metrics import ManagerStatsMetrics
 from .progress_state import ProgressState
+
+# AD-23: the stats buffer's backpressure level as the manager reports it;
+# any level not listed (NONE) maps to BackpressureLevel.NONE.
+_STATS_TO_MANAGER_BACKPRESSURE: MappingProxyType[StatsBackpressureLevel, BackpressureLevel] = MappingProxyType(
+    {
+        StatsBackpressureLevel.REJECT: BackpressureLevel.REJECT,
+        StatsBackpressureLevel.BATCH: BackpressureLevel.BATCH,
+        StatsBackpressureLevel.THROTTLE: BackpressureLevel.THROTTLE,
+    }
+)
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs import WindowedStatsCollector
@@ -137,13 +149,7 @@ class ManagerStatsCoordinator:
             Current BackpressureLevel
         """
         level = self._stats_buffer.get_backpressure_level()
-        if level == StatsBackpressureLevel.REJECT:
-            return BackpressureLevel.REJECT
-        if level == StatsBackpressureLevel.BATCH:
-            return BackpressureLevel.BATCH
-        if level == StatsBackpressureLevel.THROTTLE:
-            return BackpressureLevel.THROTTLE
-        return BackpressureLevel.NONE
+        return _STATS_TO_MANAGER_BACKPRESSURE.get(level, BackpressureLevel.NONE)
 
     def get_backpressure_signal(self) -> BackpressureSignal:
         """Return backpressure signal from the stats buffer."""
@@ -201,19 +207,11 @@ class ManagerStatsCoordinator:
         progress callbacks. Entries are cleared from the windowed collector
         after successful aggregation.
         """
-        # A gate-routed job's windows go to its origin gate (the windowed
-        # stats flush loop), not to a client callback.
-        job_ids = [
-            job_id
-            for job_id in self._windowed_stats.get_jobs_with_pending_stats()
-            if self._state.get_job_origin_gate(job_id) is None
-        ]
+        job_ids = self._callback_routed_jobs_with_pending_stats()
         if not job_ids:
             return
 
-        pushed_count = 0
-        for job_id in job_ids:
-            pushed_count += await self._push_job_stats(job_id)
+        pushed_count = await self._push_stats_for_jobs(job_ids)
 
         if pushed_count > 0:
             await self._logger.log(ServerDebug(
@@ -222,6 +220,25 @@ class ManagerStatsCoordinator:
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
             ))
+
+    def _callback_routed_jobs_with_pending_stats(self) -> list[str]:
+        """Jobs with pending windows and no origin gate.
+
+        A gate-routed job's windows go to its origin gate (the windowed
+        stats flush loop), not to a client callback.
+        """
+        return [
+            job_id
+            for job_id in self._windowed_stats.get_jobs_with_pending_stats()
+            if self._state.get_job_origin_gate(job_id) is None
+        ]
+
+    async def _push_stats_for_jobs(self, job_ids: list[str]) -> int:
+        """Push each job's aggregated stats in turn; the total windows pushed."""
+        pushed_count = 0
+        for job_id in job_ids:
+            pushed_count += await self._push_job_stats(job_id)
+        return pushed_count
 
     async def _push_job_stats(self, job_id: str) -> int:
         """
@@ -234,31 +251,55 @@ class ManagerStatsCoordinator:
         if not aggregated:
             return 0
 
-        callback_addr = self._state.get_progress_callback(job_id)
-        if not callback_addr or not self._send_to_callback:
+        if (callback_addr := self._progress_callback_for(job_id)) is None:
             return 0
 
+        return await self._push_stats_windows(job_id, callback_addr, aggregated)
+
+    def _progress_callback_for(self, job_id: str) -> tuple[str, int] | None:
+        """The job's progress callback, or None without one or without a send hook."""
+        callback_addr = self._state.get_progress_callback(job_id)
+        if not callback_addr or not self._send_to_callback:
+            return None
+        return callback_addr
+
+    async def _push_stats_windows(
+        self,
+        job_id: str,
+        callback_addr: tuple[str, int],
+        aggregated: list[WindowedStatsPush],
+    ) -> int:
+        """Send every aggregated window to the callback; how many were delivered."""
         pushed_windows = 0
         for stats_push in aggregated:
-            try:
-                reply = await self._send_to_callback(
-                    callback_addr,
-                    "windowed_stats_push",
-                    stats_push.dump(),
-                )
-                # send_tcp returns transport errors rather than raising.
-                if isinstance(reply, Exception):
-                    raise reply
-                pushed_windows += 1
-            except Exception as send_error:
-                await self._logger.log(ServerWarning(
-                    message=f"Failed to push stats for job {job_id[:8]}...: {send_error}",
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ))
-
+            pushed_windows += await self._push_stats_window(job_id, callback_addr, stats_push)
         return pushed_windows
+
+    async def _push_stats_window(
+        self,
+        job_id: str,
+        callback_addr: tuple[str, int],
+        stats_push: WindowedStatsPush,
+    ) -> int:
+        """Send one window; 1 when delivered, 0 after logging the failure."""
+        try:
+            reply = await self._send_to_callback(
+                callback_addr,
+                "windowed_stats_push",
+                stats_push.dump(),
+            )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(reply, Exception):
+                raise reply
+            return 1
+        except Exception as send_error:
+            await self._logger.log(ServerWarning(
+                message=f"Failed to push stats for job {job_id[:8]}...: {send_error}",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ))
+            return 0
 
     def get_stats_metrics(self) -> ManagerStatsMetrics:
         """Get stats-related metrics."""

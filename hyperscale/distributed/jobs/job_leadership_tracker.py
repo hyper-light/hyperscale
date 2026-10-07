@@ -226,16 +226,15 @@ class JobLeadershipTracker(Generic[T]):
         """
         Internal: Update DC manager without lock (caller must hold lock).
         """
-        if job_id not in self._dc_managers:
-            self._dc_managers[job_id] = {}
+        job_dc_managers = self._dc_managers.setdefault(job_id, {})
 
-        current = self._dc_managers[job_id].get(dc_id)
+        current = job_dc_managers.get(dc_id)
 
         # Accept if:
         # 1. We don't have info for this DC yet, OR
         # 2. The fencing token is higher (newer leadership epoch)
         if current is None or fencing_token > current.fencing_token:
-            self._dc_managers[job_id][dc_id] = DCManagerLeadership(
+            job_dc_managers[dc_id] = DCManagerLeadership(
                 manager_id=manager_id,
                 manager_addr=manager_addr,
                 fencing_token=fencing_token,
@@ -430,16 +429,29 @@ class JobLeadershipTracker(Generic[T]):
         # 1. We don't know about this job yet, OR
         # 2. The fencing token is higher (newer leadership epoch)
         if current is None or fencing_token > current.fencing_token:
-            self._leaderships[job_id] = JobLeadership(
-                leader_id=claimer_id,
-                leader_addr=claimer_addr,
-                fencing_token=fencing_token,
+            self._record_leadership(
+                job_id, claimer_id, claimer_addr, fencing_token, metadata
             )
-            if metadata is not None:
-                self._metadata[job_id] = metadata
             return True
 
         return False
+
+    def _record_leadership(
+        self,
+        job_id: str,
+        leader_id: str,
+        leader_addr: tuple[str, int],
+        fencing_token: int,
+        metadata: T | None,
+    ) -> None:
+        """Store an accepted fenced leadership, and its metadata when the claim carried any."""
+        self._leaderships[job_id] = JobLeadership(
+            leader_id=leader_id,
+            leader_addr=leader_addr,
+            fencing_token=fencing_token,
+        )
+        if metadata is not None:
+            self._metadata[job_id] = metadata
 
     def apply_leadership(
         self,
@@ -451,23 +463,33 @@ class JobLeadershipTracker(Generic[T]):
     ) -> bool:
         """Apply a deterministic fenced leadership value."""
         current = self._leaderships.get(job_id)
-        accepts_newer_token = current is None or fencing_token > current.fencing_token
-        accepts_idempotent_claim = (
-            current is not None
-            and fencing_token == current.fencing_token
-            and current.leader_id == leader_id
-        )
-        if not accepts_newer_token and not accepts_idempotent_claim:
+        if not self._accepts_fenced_value(current, fencing_token, leader_id):
             return False
 
-        self._leaderships[job_id] = JobLeadership(
-            leader_id=leader_id,
-            leader_addr=leader_addr,
-            fencing_token=fencing_token,
-        )
-        if metadata is not None:
-            self._metadata[job_id] = metadata
+        self._record_leadership(job_id, leader_id, leader_addr, fencing_token, metadata)
         return True
+
+    @staticmethod
+    def _accepts_fenced_value(
+        current: JobLeadership | None,
+        fencing_token: int,
+        leader_id: str,
+    ) -> bool:
+        """Accept an unknown job, a newer fencing token, or an idempotent repeat of the current claim."""
+        return current is None or JobLeadershipTracker._supersedes_or_repeats(
+            current, fencing_token, leader_id
+        )
+
+    @staticmethod
+    def _supersedes_or_repeats(
+        current: JobLeadership,
+        fencing_token: int,
+        leader_id: str,
+    ) -> bool:
+        """A strictly newer token, or the same token from the same leader."""
+        return fencing_token > current.fencing_token or (
+            fencing_token == current.fencing_token and current.leader_id == leader_id
+        )
 
     def is_leader(self, job_id: str) -> bool:
         """Check if this node is the leader for the given job."""

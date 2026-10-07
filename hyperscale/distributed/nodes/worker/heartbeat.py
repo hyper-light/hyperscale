@@ -195,10 +195,36 @@ class WorkerHeartbeatHandler:
         task_runner_run: RunTask,
     ) -> None:
         """Register a new manager discovered via SWIM heartbeat."""
+        new_manager = self._manager_info_from_heartbeat(heartbeat, manager_id, source_addr)
+        self._registry.confirm_manager(manager_id, new_manager)
+
+        self._log_discovered_manager(
+            heartbeat,
+            manager_id,
+            node_host,
+            node_port,
+            node_id_short,
+            task_runner_run,
+        )
+
+        # Trigger callback for new manager registration
+        self._trigger_new_manager_discovered(new_manager, task_runner_run)
+
+        # If this is a leader and we don't have a primary, use it
+        if heartbeat.is_leader and not self._registry._primary_manager_id:
+            self._registry.set_primary_manager(manager_id)
+
+    @staticmethod
+    def _manager_info_from_heartbeat(
+        heartbeat: ManagerHeartbeat,
+        manager_id: str,
+        source_addr: tuple[str, int],
+    ) -> ManagerInfo:
+        """Build a newly discovered manager's info, defaulting TCP to the UDP source."""
         tcp_host = heartbeat.tcp_host or source_addr[0]
         tcp_port = heartbeat.tcp_port or (source_addr[1] - 1)
 
-        new_manager = ManagerInfo(
+        return ManagerInfo(
             node_id=manager_id,
             tcp_host=tcp_host,
             tcp_port=tcp_port,
@@ -207,8 +233,17 @@ class WorkerHeartbeatHandler:
             datacenter=heartbeat.datacenter,
             is_leader=heartbeat.is_leader,
         )
-        self._registry.confirm_manager(manager_id, new_manager)
 
+    def _log_discovered_manager(
+        self,
+        heartbeat: ManagerHeartbeat,
+        manager_id: str,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: RunTask,
+    ) -> None:
+        """Log a manager first seen in a SWIM heartbeat."""
         if self._logger:
             task_runner_run(
                 self._logger.log,
@@ -220,16 +255,17 @@ class WorkerHeartbeatHandler:
                 ),
             )
 
-        # Trigger callback for new manager registration
+    def _trigger_new_manager_discovered(
+        self,
+        new_manager: ManagerInfo,
+        task_runner_run: RunTask,
+    ) -> None:
+        """Schedule registration with a newly discovered manager when wired."""
         if self._on_new_manager_discovered:
             task_runner_run(
                 self._on_new_manager_discovered,
                 (new_manager.tcp_host, new_manager.tcp_port),
             )
-
-        # If this is a leader and we don't have a primary, use it
-        if heartbeat.is_leader and not self._registry._primary_manager_id:
-            self._registry.set_primary_manager(manager_id)
 
     def _process_job_leadership_claims(
         self,

@@ -4,8 +4,10 @@ TCP handler for workflow result push notifications.
 Handles WorkflowResultPush messages with aggregated workflow completion results.
 """
 
+from typing import Callable
 
 from hyperscale.distributed.models import (
+    ClientJobResult,
     WorkflowResultPush,
     ClientWorkflowResult,
     ClientWorkflowDCResult,
@@ -81,32 +83,39 @@ class WorkflowResultPushHandler:
         Shared by pushed results and those a job's final result supplies.
         """
         job = self._state._jobs.get(push.job_id)
-        if job is None or push.workflow_id in job.workflow_results:
+        if self._already_recorded(job, push):
             # A workflow has one result. Another push of it -- re-sent, or
             # rebuilt by a manager that took the job over -- re-ran the
             # caller's callback and reported its stats a second time.
             return
 
+        stats = self._record_workflow_result(job, push)
+        # The job's results are complete once every workflow it was
+        # submitted with has one.
+        self._signal_results_complete(job, push)
+
+        # Call user callback if registered
+        callback = self._state._workflow_callbacks.get(push.job_id)
+        if callback:
+            await self._invoke_workflow_callback(callback, push)
+
+        await self._submit_to_local_reporters(push, stats)
+
+    @staticmethod
+    def _already_recorded(job: ClientJobResult | None, push: WorkflowResultPush) -> bool:
+        """Whether the job is untracked or already holds a result for the pushed workflow."""
+        return job is None or push.workflow_id in job.workflow_results
+
+    def _record_workflow_result(self, job: ClientJobResult, push: WorkflowResultPush):
+        """Store the workflow's result on the job and put it to the job's result streams; returns its stats."""
         # Aggregated stats: one item for a client-bound result
         stats = push.results[0] if push.results else None
 
         # Convert per-DC results from message format to client format
-        per_dc_results = [
-            ClientWorkflowDCResult(
-                datacenter=dc_result.datacenter,
-                status=dc_result.status,
-                stats=dc_result.stats,
-                error=dc_result.error,
-                elapsed_seconds=dc_result.elapsed_seconds,
-                rerun_of=dc_result.rerun_of,
-            )
-            for dc_result in push.per_dc_results
-        ]
+        per_dc_results = self._client_datacenter_results(push)
 
         # Use push.completed_at if provided, otherwise use current time
-        completed_at = (
-            push.completed_at if push.completed_at > 0 else _DEFAULT_CLOCK.time()
-        )
+        completed_at = self._completed_at(push)
 
         job.workflow_results[push.workflow_id] = ClientWorkflowResult(
             workflow_id=push.workflow_id,
@@ -120,8 +129,32 @@ class WorkflowResultPushHandler:
         )
         for stream in self._state.workflow_result_streams(push.job_id):
             stream.put_nowait(job.workflow_results[push.workflow_id])
-        # The job's results are complete once every workflow it was
-        # submitted with has one.
+        return stats
+
+    @staticmethod
+    def _client_datacenter_results(push: WorkflowResultPush) -> list[ClientWorkflowDCResult]:
+        """The push's per-datacenter results in client format."""
+        return [
+            ClientWorkflowDCResult(
+                datacenter=dc_result.datacenter,
+                status=dc_result.status,
+                stats=dc_result.stats,
+                error=dc_result.error,
+                elapsed_seconds=dc_result.elapsed_seconds,
+                rerun_of=dc_result.rerun_of,
+            )
+            for dc_result in push.per_dc_results
+        ]
+
+    @staticmethod
+    def _completed_at(push: WorkflowResultPush) -> float:
+        """The push's completion time when it carries one, else now."""
+        return (
+            push.completed_at if push.completed_at > 0 else _DEFAULT_CLOCK.time()
+        )
+
+    def _signal_results_complete(self, job: ClientJobResult, push: WorkflowResultPush) -> None:
+        """Set the job's results event once every workflow it was submitted with has a result."""
         if (
             results_event := self._state._job_results_events.get(push.job_id)
         ) is not None and self._state._job_expected_workflows.get(
@@ -129,22 +162,27 @@ class WorkflowResultPushHandler:
         ) <= job.workflow_results.keys():
             results_event.set()
 
-        # Call user callback if registered
-        callback = self._state._workflow_callbacks.get(push.job_id)
-        if callback:
-            try:
-                callback(push)
-            except Exception as callback_error:
-                if self._logger:
-                    await self._logger.log(
-                        ServerWarning(
-                            message=f"Workflow result callback error: {callback_error}",
-                            node_host="client",
-                            node_port=0,
-                            node_id="client",
-                        )
+    async def _invoke_workflow_callback(
+        self,
+        callback: Callable[[WorkflowResultPush], None],
+        push: WorkflowResultPush,
+    ) -> None:
+        """Run the caller's workflow-result callback, logging what it raises."""
+        try:
+            callback(push)
+        except Exception as callback_error:
+            if self._logger:
+                await self._logger.log(
+                    ServerWarning(
+                        message=f"Workflow result callback error: {callback_error}",
+                        node_host="client",
+                        node_port=0,
+                        node_id="client",
                     )
+                )
 
+    async def _submit_to_local_reporters(self, push: WorkflowResultPush, stats) -> None:
+        """Submit the aggregated stats to the local file-based reporters."""
         # Submit to local file-based reporters (aggregated stats only, not per-DC)
         if stats and self._reporting_manager:
             await self._reporting_manager.submit_to_local_reporters(

@@ -5,7 +5,7 @@ Handles job submission with retry logic, leader redirection, and protocol negoti
 """
 
 import asyncio
-from typing import Callable
+from typing import Callable, NoReturn
 
 import cloudpickle
 
@@ -36,6 +36,10 @@ from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
 
 _DEFAULT_CLOCK: Clock = RealClock()
 _DEFAULT_RANDOM: Random = RealRandom()
+
+# Submission outcomes that end the retry loop: "success", and
+# "permanent_failure" (a permanent rejection already raised its error).
+_FINISHED_SUBMISSION_RESULTS = frozenset({"success", "permanent_failure"})
 
 
 def _prepend_redirect_history(history: list[str], tail: str) -> str:
@@ -169,21 +173,9 @@ class ClientJobSubmitter:
         self._validate_submission_size(workflows_bytes)
 
         # Serialize reporter configs if provided
-        reporting_configs_bytes = b''
-        if reporting_configs:
-            reporting_configs_bytes = cloudpickle.dumps(reporting_configs)
+        reporting_configs_bytes = self._serialize_reporting_configs(reporting_configs)
 
-        # Phase H2 — explicit-vs-default detection. ``None`` means
-        # "let the manager apply the AD-26/AD-34 override hierarchy
-        # (workflow-class timeout > duration × multiplier)." Any
-        # positive number is treated as an explicit per-job override
-        # the manager honors verbatim.
-        is_explicit_timeout = (
-            timeout_seconds is not None and timeout_seconds > 0.0
-        )
-        effective_timeout_for_wire = (
-            timeout_seconds if is_explicit_timeout else 0.0
-        )
+        is_explicit_timeout, effective_timeout_for_wire = self._wire_timeout(timeout_seconds)
 
         # Build submission message
         submission = self._build_job_submission(
@@ -206,9 +198,7 @@ class ClientJobSubmitter:
         # Initialize job tracking
         self._tracker.initialize_job_tracking(
             job_id,
-            expected_workflow_ids=frozenset(
-                workflow_id for workflow_id, _, _ in workflows_with_ids
-            ),
+            expected_workflow_ids=self._expected_workflow_ids(workflows_with_ids),
             on_status_update=on_status_update,
             on_progress_update=on_progress_update,
             on_workflow_result=on_workflow_result,
@@ -216,11 +206,7 @@ class ClientJobSubmitter:
         )
 
         # Store reporting configs for local file-based reporting
-        explicit_local_configs = [
-            config
-            for config in (reporting_configs or [])
-            if getattr(config, 'reporter_type', None) in self._config.local_reporter_types
-        ]
+        explicit_local_configs = self._explicit_local_configs(reporting_configs)
         self._state._job_reporting_configs[job_id] = extracted_local_configs + explicit_local_configs
 
         # Submit with retry logic
@@ -230,6 +216,44 @@ class ClientJobSubmitter:
         except Exception as error:
             self._tracker.mark_job_failed(job_id, str(error))
             raise
+
+    @staticmethod
+    def _serialize_reporting_configs(reporting_configs: list | None) -> bytes:
+        """The reporter configs cloudpickled, or empty bytes when there are none."""
+        if reporting_configs:
+            return cloudpickle.dumps(reporting_configs)
+        return b''
+
+    @staticmethod
+    def _wire_timeout(timeout_seconds: float | None) -> tuple[bool, float]:
+        """Whether the job timeout is explicit, and the timeout to put on the wire (Phase H2)."""
+        # Phase H2 — explicit-vs-default detection. ``None`` means
+        # "let the manager apply the AD-26/AD-34 override hierarchy
+        # (workflow-class timeout > duration × multiplier)." Any
+        # positive number is treated as an explicit per-job override
+        # the manager honors verbatim.
+        is_explicit_timeout = (
+            timeout_seconds is not None and timeout_seconds > 0.0
+        )
+        effective_timeout_for_wire = (
+            timeout_seconds if is_explicit_timeout else 0.0
+        )
+        return (is_explicit_timeout, effective_timeout_for_wire)
+
+    @staticmethod
+    def _expected_workflow_ids(workflows_with_ids: list[tuple[str, list[str], object]]) -> frozenset[str]:
+        """The ids of the workflows the job is submitted with."""
+        return frozenset(
+            workflow_id for workflow_id, _, _ in workflows_with_ids
+        )
+
+    def _explicit_local_configs(self, reporting_configs: list | None) -> list:
+        """The explicitly passed reporter configs that are local file reporter types."""
+        return list(filter(self._is_local_reporter_config, reporting_configs or []))
+
+    def _is_local_reporter_config(self, config: object) -> bool:
+        """Whether a reporter config is a local file reporter type."""
+        return getattr(config, 'reporter_type', None) in self._config.local_reporter_types
 
     def _prepare_workflows(
         self,
@@ -252,21 +276,23 @@ class ClientJobSubmitter:
             workflows_with_ids.append((workflow_id, dependencies, workflow_instance))
 
             # Extract reporter config from workflow if present
-            workflow_reporting = getattr(workflow_instance, 'reporting', None)
-            if workflow_reporting is not None:
-                # Handle single config or list of configs
-                configs_to_check = (
-                    workflow_reporting
-                    if isinstance(workflow_reporting, list)
-                    else [workflow_reporting]
-                )
-                for config in configs_to_check:
-                    # Check if this is a local file reporter type
-                    reporter_type = getattr(config, 'reporter_type', None)
-                    if reporter_type in self._config.local_reporter_types:
-                        extracted_local_configs.append(config)
+            extracted_local_configs.extend(self._local_reporter_configs_of(workflow_instance))
 
         return (workflows_with_ids, extracted_local_configs)
+
+    def _local_reporter_configs_of(self, workflow_instance: object) -> list:
+        """The local file reporter configs a workflow carries in its ``reporting``."""
+        workflow_reporting = getattr(workflow_instance, 'reporting', None)
+        if workflow_reporting is None:
+            return []
+        # Handle single config or list of configs
+        configs_to_check = (
+            workflow_reporting
+            if isinstance(workflow_reporting, list)
+            else [workflow_reporting]
+        )
+        # Check if this is a local file reporter type
+        return list(filter(self._is_local_reporter_config, configs_to_check))
 
     def _validate_submission_size(self, workflows_bytes: bytes) -> None:
         """
@@ -366,9 +392,7 @@ class ClientJobSubmitter:
         # AD-28 order: gates then managers, each tier ranked per job, so
         # submissions spread across targets instead of all starting at the
         # first configured gate.
-        all_targets = self._targets.get_submission_targets(job_id)
-        if not all_targets:
-            raise RuntimeError("No managers or gates configured")
+        all_targets = self._submission_targets(job_id)
 
         # Retry loop with exponential backoff for transient errors
         last_error = None
@@ -386,23 +410,38 @@ class ClientJobSubmitter:
                 job_id, target, submission, max_redirects
             )
 
-            if redirect_result == "success":
-                return  # Success!
-            elif redirect_result == "permanent_failure":
-                # Permanent rejection - already raised error
+            # "success", or "permanent_failure" (a permanent rejection
+            # already raised its error): done.
+            if redirect_result in _FINISHED_SUBMISSION_RESULTS:
                 return
-            else:
-                # Transient error - retry
-                last_error = redirect_result
+            # Transient error - retry
+            last_error = redirect_result
 
-            # Exponential backoff before retry with jitter (AD-21)
-            if retry < max_retries and last_error:
-                base_delay = retry_base_delay * (2**retry)
-                delay = base_delay * (0.5 + _DEFAULT_RANDOM.random())  # Add 0-100% jitter
-                await _DEFAULT_CLOCK.sleep(delay)
+            await self._backoff_before_retry(retry, max_retries, last_error, retry_base_delay)
 
         # All retries exhausted
         raise RuntimeError(f"Job submission failed after {max_retries} retries: {last_error}")
+
+    def _submission_targets(self, job_id: str) -> list[tuple[str, int]]:
+        """The job's submission targets in ranked order; raises when none are configured."""
+        all_targets = self._targets.get_submission_targets(job_id)
+        if not all_targets:
+            raise RuntimeError("No managers or gates configured")
+        return all_targets
+
+    @staticmethod
+    async def _backoff_before_retry(
+        retry: int,
+        max_retries: int,
+        last_error: str | None,
+        retry_base_delay: float,
+    ) -> None:
+        """Sleep an exponential, jittered backoff before the next retry (AD-21)."""
+        # Exponential backoff before retry with jitter (AD-21)
+        if retry < max_retries and last_error:
+            base_delay = retry_base_delay * (2**retry)
+            delay = base_delay * (0.5 + _DEFAULT_RANDOM.random())  # Add 0-100% jitter
+            await _DEFAULT_CLOCK.sleep(delay)
 
     async def _submit_with_redirects(
         self,
@@ -445,91 +484,168 @@ class ClientJobSubmitter:
         redirects = 0
         redirect_history: list[str] = []
         while redirects <= max_redirects:
-            sent_at = _DEFAULT_CLOCK.monotonic()
-            response, _ = await self._send_tcp(
+            final_outcome, redirect_target = await self._submit_hop(
+                job_id,
                 target,
-                "job_submission",
-                submission.dump(),
-                timeout=self._config.submission_timeout_seconds,
+                submission,
+                redirect_history,
+                redirects < max_redirects,
             )
-
-            if isinstance(response, Exception):
-                self._targets.record_target_failure(target)
-                return _prepend_redirect_history(redirect_history, str(response))
-
-            # Check for rate limiting response (AD-32). ``Message.load``
-            # is intentionally lax about the deserialized type
-            # (it doubles as a restricted-unpickler shim for cloudpickled
-            # Workflow payloads that are not ``Message`` subclasses), so
-            # ``RateLimitResponse.load(jobAck_bytes)`` happily returns a
-            # ``JobAck`` typed as ``RateLimitResponse``. Without the
-            # ``isinstance`` guard below, any field shared between the
-            # two models (e.g. ``retry_after_seconds``) lets a successful
-            # ``JobAck`` silently masquerade as a rate-limit response,
-            # which broke submission retry semantics when
-            # ``gate_replication_quorum_unavailable`` retry hints were
-            # added to ``JobAck``. The narrow ``try`` scope around the
-            # load keeps real errors in the rate-limit branch
-            # (e.g. ``_DEFAULT_CLOCK.sleep`` cancellation) from being silently
-            # swallowed.
-            rate_limit_response: RateLimitResponse | None = None
-            try:
-                candidate = RateLimitResponse.load(response)
-            except Exception:
-                candidate = None
-            if isinstance(candidate, RateLimitResponse):
-                rate_limit_response = candidate
-            if rate_limit_response is not None:
-                await _DEFAULT_CLOCK.sleep(rate_limit_response.retry_after_seconds)
-                return rate_limit_response.error  # Transient error
-
-            ack = JobAck.load(response)
-
-            if ack.accepted:
-                self._targets.record_target_success(
-                    target,
-                    (_DEFAULT_CLOCK.monotonic() - sent_at) * 1000.0,
-                )
-
-                # Track which server accepted this job for future queries
-                self._state.mark_job_target(job_id, target)
-
-                # Store negotiated capabilities (AD-25)
-                self._protocol.negotiate_capabilities(
-                    server_addr=target,
-                    server_version_major=getattr(ack, 'protocol_version_major', 1),
-                    server_version_minor=getattr(ack, 'protocol_version_minor', 0),
-                    server_capabilities_str=getattr(ack, 'capabilities', ''),
-                )
-
-                return "success"
-
-            # Check for leader redirect
-            if ack.leader_addr and redirects < max_redirects:
-                # Remember why the origin bounced us before we
-                # follow the hint — the subsequent hop may fail
-                # with a lower-level transport error and lose this
-                # context.
-                if ack.error:
-                    redirect_history.append(f"{target}: {ack.error}")
-                target = tuple(ack.leader_addr)
-                redirects += 1
-                continue
-
-            # Check if this is a transient error that should be retried
-            if ack.error and self._is_transient_error(ack.error):
-                return _prepend_redirect_history(redirect_history, ack.error)
-
-            # Permanent rejection - fail immediately. The redirect
-            # trail (if any) is included so the caller sees the
-            # full causal chain, matching the transient-error
-            # branch.
-            if redirect_history:
-                trail = "; ".join(redirect_history)
-                raise RuntimeError(f"Job rejected: {trail}; {ack.error}")
-            raise RuntimeError(f"Job rejected: {ack.error}")
+            if redirect_target is None:
+                return final_outcome
+            target = redirect_target
+            redirects += 1
 
         return _prepend_redirect_history(redirect_history, "max_redirects_exceeded")
+
+    async def _submit_hop(
+        self,
+        job_id: str,
+        target: tuple[str, int],
+        submission: JobSubmission,
+        redirect_history: list[str],
+        may_redirect: bool,
+    ) -> tuple[str | None, tuple[str, int] | None]:
+        """Send the submission to one target: its final outcome, or the leader to redirect to."""
+        sent_at = _DEFAULT_CLOCK.monotonic()
+        response, _ = await self._send_tcp(
+            target,
+            "job_submission",
+            submission.dump(),
+            timeout=self._config.submission_timeout_seconds,
+        )
+
+        if isinstance(response, Exception):
+            self._targets.record_target_failure(target)
+            return (_prepend_redirect_history(redirect_history, str(response)), None)
+
+        if (rate_limit_response := self._rate_limit_response(response)) is not None:
+            await _DEFAULT_CLOCK.sleep(rate_limit_response.retry_after_seconds)
+            return (rate_limit_response.error, None)  # Transient error
+
+        return self._ack_outcome(
+            job_id,
+            target,
+            JobAck.load(response),
+            sent_at,
+            redirect_history,
+            may_redirect,
+        )
+
+    @staticmethod
+    def _rate_limit_response(response: bytes) -> RateLimitResponse | None:
+        """The response as a rate-limit response (AD-32), or None when it is not one."""
+        # Check for rate limiting response (AD-32). ``Message.load``
+        # is intentionally lax about the deserialized type
+        # (it doubles as a restricted-unpickler shim for cloudpickled
+        # Workflow payloads that are not ``Message`` subclasses), so
+        # ``RateLimitResponse.load(jobAck_bytes)`` happily returns a
+        # ``JobAck`` typed as ``RateLimitResponse``. Without the
+        # ``isinstance`` guard below, any field shared between the
+        # two models (e.g. ``retry_after_seconds``) lets a successful
+        # ``JobAck`` silently masquerade as a rate-limit response,
+        # which broke submission retry semantics when
+        # ``gate_replication_quorum_unavailable`` retry hints were
+        # added to ``JobAck``. The narrow ``try`` scope around the
+        # load keeps real errors in the rate-limit branch
+        # (e.g. ``_DEFAULT_CLOCK.sleep`` cancellation) from being silently
+        # swallowed.
+        try:
+            candidate = RateLimitResponse.load(response)
+        except Exception:
+            candidate = None
+        if isinstance(candidate, RateLimitResponse):
+            return candidate
+        return None
+
+    def _ack_outcome(
+        self,
+        job_id: str,
+        target: tuple[str, int],
+        ack: JobAck,
+        sent_at: float,
+        redirect_history: list[str],
+        may_redirect: bool,
+    ) -> tuple[str | None, tuple[str, int] | None]:
+        """The outcome of a target's ack: success, a leader redirect, or a rejection."""
+        if ack.accepted:
+            self._record_accepted_submission(job_id, target, ack, sent_at)
+            return ("success", None)
+
+        return self._rejected_ack_outcome(target, ack, redirect_history, may_redirect)
+
+    def _record_accepted_submission(
+        self,
+        job_id: str,
+        target: tuple[str, int],
+        ack: JobAck,
+        sent_at: float,
+    ) -> None:
+        """Record the accepting target's latency, the job's target, and the negotiated capabilities."""
+        self._targets.record_target_success(
+            target,
+            (_DEFAULT_CLOCK.monotonic() - sent_at) * 1000.0,
+        )
+
+        # Track which server accepted this job for future queries
+        self._state.mark_job_target(job_id, target)
+
+        # Store negotiated capabilities (AD-25)
+        self._protocol.negotiate_capabilities(
+            server_addr=target,
+            server_version_major=getattr(ack, 'protocol_version_major', 1),
+            server_version_minor=getattr(ack, 'protocol_version_minor', 0),
+            server_capabilities_str=getattr(ack, 'capabilities', ''),
+        )
+
+    def _rejected_ack_outcome(
+        self,
+        target: tuple[str, int],
+        ack: JobAck,
+        redirect_history: list[str],
+        may_redirect: bool,
+    ) -> tuple[str | None, tuple[str, int] | None]:
+        """Follow a rejected ack's leader redirect while redirects remain, else settle the rejection."""
+        # Check for leader redirect
+        if ack.leader_addr and may_redirect:
+            return (None, self._redirect_target(target, ack, redirect_history))
+
+        return (self._rejection_outcome(ack, redirect_history), None)
+
+    @staticmethod
+    def _redirect_target(
+        target: tuple[str, int],
+        ack: JobAck,
+        redirect_history: list[str],
+    ) -> tuple[str, int]:
+        """The leader a rejected ack redirects to, remembering why the origin bounced us."""
+        # Remember why the origin bounced us before we
+        # follow the hint — the subsequent hop may fail
+        # with a lower-level transport error and lose this
+        # context.
+        if ack.error:
+            redirect_history.append(f"{target}: {ack.error}")
+        return tuple(ack.leader_addr)
+
+    def _rejection_outcome(self, ack: JobAck, redirect_history: list[str]) -> str:
+        """A transient rejection's error with the redirect trail; a permanent rejection raises."""
+        # Check if this is a transient error that should be retried
+        if ack.error and self._is_transient_error(ack.error):
+            return _prepend_redirect_history(redirect_history, ack.error)
+
+        self._raise_permanent_rejection(ack, redirect_history)
+
+    @staticmethod
+    def _raise_permanent_rejection(ack: JobAck, redirect_history: list[str]) -> NoReturn:
+        """Fail a permanently rejected submission with the full redirect trail."""
+        # Permanent rejection - fail immediately. The redirect
+        # trail (if any) is included so the caller sees the
+        # full causal chain, matching the transient-error
+        # branch.
+        if redirect_history:
+            trail = "; ".join(redirect_history)
+            raise RuntimeError(f"Job rejected: {trail}; {ack.error}")
+        raise RuntimeError(f"Job rejected: {ack.error}")
 
     def _is_transient_error(self, error: str) -> bool:
         """

@@ -6,8 +6,9 @@ datacenter health, and metrics.
 """
 
 import asyncio
+from operator import attrgetter
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from hyperscale.distributed.slo.latency_observation import LatencyObservation
 from hyperscale.distributed.models import (
@@ -242,27 +243,63 @@ class GateRuntimeState:
             for udp_addr, tcp_addr in list(self._gate_udp_to_tcp.items())
             if tcp_addr == peer_addr
         }
+        udp_addrs_to_remove.update(
+            self._udp_addrs_advertising_tcp_addr(peer_addr, udp_addrs_to_remove)
+        )
+        return self._forget_peer_udp_addrs(udp_addrs_to_remove)
+
+    def _udp_addrs_advertising_tcp_addr(
+        self,
+        peer_addr: tuple[str, int],
+        excluded_udp_addrs: set[tuple[str, int]],
+    ) -> list[tuple[str, int]]:
+        """Peer UDP addresses (not already excluded) whose heartbeat advertises ``peer_addr`` as TCP."""
+        return [
+            udp_addr
+            for udp_addr, heartbeat in list(self._gate_peer_info.items())
+            if self._is_unexcluded_peer_advertising(udp_addr, heartbeat, peer_addr, excluded_udp_addrs)
+        ]
+
+    def _is_unexcluded_peer_advertising(
+        self,
+        udp_addr: tuple[str, int],
+        heartbeat: GateHeartbeat,
+        peer_addr: tuple[str, int],
+        excluded_udp_addrs: set[tuple[str, int]],
+    ) -> bool:
+        """Whether a not-yet-excluded peer heartbeat advertises ``peer_addr`` as its TCP address."""
+        return (
+            udp_addr not in excluded_udp_addrs
+            and self._peer_heartbeat_tcp_addr(udp_addr, heartbeat) == peer_addr
+        )
+
+    @staticmethod
+    def _peer_heartbeat_tcp_addr(
+        udp_addr: tuple[str, int],
+        heartbeat: GateHeartbeat,
+    ) -> tuple[str, int]:
+        """The TCP address a peer heartbeat advertises, defaulting each part to its UDP address."""
+        peer_tcp_host = heartbeat.tcp_host or udp_addr[0]
+        peer_tcp_port = heartbeat.tcp_port or udp_addr[1]
+        return (peer_tcp_host, peer_tcp_port)
+
+    def _forget_peer_udp_addrs(self, udp_addrs_to_remove: set[tuple[str, int]]) -> set[str]:
+        """Drop the UDP-keyed tracking for each address, returning the gate ids they carried."""
         gate_ids_to_remove: set[str] = set()
 
-        for udp_addr, heartbeat in list(self._gate_peer_info.items()):
-            if udp_addr in udp_addrs_to_remove:
-                continue
-
-            peer_tcp_host = heartbeat.tcp_host or udp_addr[0]
-            peer_tcp_port = heartbeat.tcp_port or udp_addr[1]
-            peer_tcp_addr = (peer_tcp_host, peer_tcp_port)
-            if peer_tcp_addr == peer_addr:
-                udp_addrs_to_remove.add(udp_addr)
-
         for udp_addr in udp_addrs_to_remove:
-            heartbeat = self._gate_peer_info.get(udp_addr)
-            if heartbeat and heartbeat.node_id:
-                gate_ids_to_remove.add(heartbeat.node_id)
+            if node_id := self._heartbeat_node_id(self._gate_peer_info.get(udp_addr)):
+                gate_ids_to_remove.add(node_id)
 
             self._gate_udp_to_tcp.pop(udp_addr, None)
             self._gate_peer_info.pop(udp_addr, None)
 
         return gate_ids_to_remove
+
+    @staticmethod
+    def _heartbeat_node_id(heartbeat: GateHeartbeat | None) -> str | None:
+        """The heartbeat's node id, or None when no heartbeat is held."""
+        return heartbeat.node_id if heartbeat else None
 
     def cleanup_peer_tracking(self, peer_addr: tuple[str, int]) -> set[str]:
         """Remove TCP and UDP tracking data for a peer address."""
@@ -305,14 +342,22 @@ class GateRuntimeState:
         from its next heartbeat."""
         async with self._get_manager_state_lock():
             self._manager_last_status.pop(manager_addr, None)
-            for datacenter_id in list(self._datacenter_manager_status):
-                datacenter_managers = self._datacenter_manager_status[datacenter_id]
-                datacenter_managers.pop(manager_addr, None)
-                if not datacenter_managers:
-                    del self._datacenter_manager_status[datacenter_id]
-        for health_key in [key for key in self._manager_health if key[1] == manager_addr]:
+            self._remove_manager_statuses_locked(manager_addr)
+        for health_key in self._manager_health_keys(manager_addr):
             del self._manager_health[health_key]
         self._manager_negotiated_caps.pop(manager_addr, None)
+
+    def _remove_manager_statuses_locked(self, manager_addr: tuple[str, int]) -> None:
+        """Drop the manager's heartbeat from every datacenter, removing datacenters left empty."""
+        for datacenter_id in list(self._datacenter_manager_status):
+            datacenter_managers = self._datacenter_manager_status[datacenter_id]
+            datacenter_managers.pop(manager_addr, None)
+            if not datacenter_managers:
+                del self._datacenter_manager_status[datacenter_id]
+
+    def _manager_health_keys(self, manager_addr: tuple[str, int]) -> list[tuple[str, tuple[str, int]]]:
+        """Every (datacenter, manager) health key held for the manager."""
+        return [key for key in self._manager_health if key[1] == manager_addr]
 
     def set_job_dc_manager(
         self, job_id: str, datacenter_id: str, manager_addr: tuple[str, int]
@@ -367,22 +412,22 @@ class GateRuntimeState:
         Used by AD-36 routing scorer to deprioritize DCs that are
         violating their latency SLOs.
         """
-        per_manager = self._datacenter_manager_status.get(datacenter_id)
-        if not per_manager:
-            return 1.0
+        freshest = self._freshest_slo_heartbeat(
+            self._datacenter_manager_status.get(datacenter_id, {}).values()
+        )
+        return 1.0 if freshest is None else freshest.slo_routing_factor
 
-        freshest: ManagerHeartbeat | None = None
-        for heartbeat in per_manager.values():
-            if heartbeat.slo_sample_count <= 0:
-                continue
-            if (
-                freshest is None
-                or heartbeat.slo_updated_at > freshest.slo_updated_at
-            ):
-                freshest = heartbeat
-        if freshest is None:
-            return 1.0
-        return freshest.slo_routing_factor
+    @staticmethod
+    def _freshest_slo_heartbeat(
+        heartbeats: Iterable[ManagerHeartbeat],
+    ) -> ManagerHeartbeat | None:
+        """AD-42: the first heartbeat with the latest ``slo_updated_at`` among those
+        reporting latency samples, or None when none has."""
+        return max(
+            (heartbeat for heartbeat in heartbeats if heartbeat.slo_sample_count > 0),
+            key=attrgetter("slo_updated_at"),
+            default=None,
+        )
 
     def get_dc_latency_observation(self, datacenter_id: str) -> LatencyObservation | None:
         """AD-42: the datacenter's freshest latency percentiles -- from the
@@ -521,12 +566,15 @@ class GateRuntimeState:
 
     def cleanup_job_progress_tracking(self, job_id: str) -> None:
         """Clean up progress tracking state for a completed job."""
-        keys_to_remove = [
-            key for key in self._job_progress_sequences if key[0] == job_id
-        ]
-        for key in keys_to_remove:
+        for key in self._job_progress_keys(job_id):
             self._job_progress_sequences.pop(key, None)
             self._job_progress_seen.pop(key, None)
+
+    def _job_progress_keys(self, job_id: str) -> list[tuple[str, str]]:
+        """Every (job, datacenter) progress-sequence key held for the job."""
+        return [
+            key for key in self._job_progress_sequences if key[0] == job_id
+        ]
 
     # Orphan/leadership methods
     def mark_leader_dead(self, leader_addr: tuple[str, int]) -> None:
@@ -698,18 +746,45 @@ class GateRuntimeState:
             if sequence <= position:
                 return
 
-            delivered_ahead = self._job_client_updates_delivered_ahead.setdefault(
-                job_id, {}
-            ).setdefault(callback, set())
-            delivered_ahead.add(sequence)
-            if history := self._job_update_history.get(job_id):
-                position = max(position, history[0][0] - 1)
-            while position + 1 in delivered_ahead:
-                position += 1
-                delivered_ahead.remove(position)
-            for held_sequence in [held for held in delivered_ahead if held <= position]:
-                delivered_ahead.remove(held_sequence)
-            positions[callback] = position
+            positions[callback] = self._advance_client_update_position_locked(
+                job_id,
+                callback,
+                sequence,
+                position,
+            )
+
+    def _advance_client_update_position_locked(
+        self,
+        job_id: str,
+        callback: tuple[str, int],
+        sequence: int,
+        position: int,
+    ) -> int:
+        """Hold ``sequence`` aside, close gaps older than the retained history,
+        and return the position the contiguous deliveries now reach."""
+        delivered_ahead = self._job_client_updates_delivered_ahead.setdefault(
+            job_id, {}
+        ).setdefault(callback, set())
+        delivered_ahead.add(sequence)
+        if history := self._job_update_history.get(job_id):
+            position = max(position, history[0][0] - 1)
+        return self._drain_contiguous_deliveries(delivered_ahead, position)
+
+    def _drain_contiguous_deliveries(self, delivered_ahead: set[int], position: int) -> int:
+        """Advance past every held delivery contiguous with ``position``, then
+        drop held deliveries the position has passed."""
+        while position + 1 in delivered_ahead:
+            position += 1
+            delivered_ahead.remove(position)
+        self._discard_deliveries_through(delivered_ahead, position)
+        return position
+
+    @staticmethod
+    def _discard_deliveries_through(delivered_ahead: set[int], position: int) -> None:
+        """Drop held deliveries at or below ``position``: the gap they sat past has closed."""
+        delivered_ahead.difference_update(
+            [held for held in delivered_ahead if held <= position]
+        )
 
     async def get_client_update_position(
         self,
@@ -734,8 +809,16 @@ class GateRuntimeState:
             return [], 0, 0
         oldest_sequence = history[0][0]
         latest_sequence = history[-1][0]
-        updates = [entry for entry in history if entry[0] > last_sequence]
+        updates = self._updates_after(history, last_sequence)
         return updates, oldest_sequence, latest_sequence
+
+    @staticmethod
+    def _updates_after(
+        history: list[tuple[int, str, bytes, float]],
+        last_sequence: int,
+    ) -> list[tuple[int, str, bytes, float]]:
+        """The retained updates whose sequence is past ``last_sequence``."""
+        return [entry for entry in history if entry[0] > last_sequence]
 
     async def cleanup_job_update_state(self, job_id: str) -> None:
         async with self._get_counter_lock():

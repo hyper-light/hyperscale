@@ -6,6 +6,7 @@ Handles ping, workflow query, and datacenter discovery operations.
 
 import asyncio
 import secrets
+from typing import Callable
 
 from hyperscale.distributed.models import (
     PingRequest,
@@ -69,24 +70,18 @@ class ClientDiscovery:
         Raises:
             RuntimeError: If no managers configured or ping fails.
         """
-        target = addr or self._targets.get_next_manager()
-        if not target:
-            raise RuntimeError("No managers configured")
+        target = self._resolve_target(addr, self._targets.get_next_manager, "No managers configured")
 
         request = PingRequest(request_id=secrets.token_hex(8))
 
-        response, _ = await self._send_tcp(
+        response = await self._send_checked(
             target,
             "ping",
             request.dump(),
-            timeout=timeout,
+            timeout,
+            "Ping failed",
+            "Ping failed: server returned error",
         )
-
-        if isinstance(response, Exception):
-            raise RuntimeError(f"Ping failed: {response}")
-
-        if response == b'error':
-            raise RuntimeError("Ping failed: server returned error")
 
         return ManagerPingResponse.load(response)
 
@@ -108,26 +103,57 @@ class ClientDiscovery:
         Raises:
             RuntimeError: If no gates configured or ping fails.
         """
-        target = addr or self._targets.get_next_gate()
-        if not target:
-            raise RuntimeError("No gates configured")
+        target = self._resolve_target(addr, self._targets.get_next_gate, "No gates configured")
 
         request = PingRequest(request_id=secrets.token_hex(8))
 
-        response, _ = await self._send_tcp(
+        response = await self._send_checked(
             target,
             "ping",
             request.dump(),
+            timeout,
+            "Ping failed",
+            "Ping failed: server returned error",
+        )
+
+        return GatePingResponse.load(response)
+
+    @staticmethod
+    def _resolve_target(
+        addr: tuple[str, int] | None,
+        next_target: Callable[[], tuple[str, int] | None],
+        missing_message: str,
+    ) -> tuple[str, int]:
+        """The given address, else the next one in rotation; raises when none is configured."""
+        target = addr or next_target()
+        if not target:
+            raise RuntimeError(missing_message)
+        return target
+
+    async def _send_checked(
+        self,
+        target: tuple[str, int],
+        action: str,
+        payload: bytes,
+        timeout: float,
+        failure_prefix: str,
+        error_reply_message: str,
+    ) -> bytes:
+        """Send a request, raising RuntimeError on a transport error or an error reply."""
+        response, _ = await self._send_tcp(
+            target,
+            action,
+            payload,
             timeout=timeout,
         )
 
         if isinstance(response, Exception):
-            raise RuntimeError(f"Ping failed: {response}")
+            raise RuntimeError(f"{failure_prefix}: {response}")
 
         if response == b'error':
-            raise RuntimeError("Ping failed: server returned error")
+            raise RuntimeError(error_reply_message)
 
-        return GatePingResponse.load(response)
+        return response
 
     async def ping_all_managers(
         self,
@@ -229,52 +255,105 @@ class ClientDiscovery:
         results: dict[str, list[WorkflowStatusInfo]] = {}
         query_errors: list[Exception] = []
 
-        async def query_one(addr: tuple[str, int]) -> None:
-            try:
-                response_data, _ = await self._send_tcp(
-                    addr,
-                    "workflow_query",
-                    request.dump(),
-                    timeout=timeout,
-                )
-
-                if isinstance(response_data, Exception):
-                    raise response_data
-                if response_data == b'error':
-                    raise RuntimeError(f"manager {addr[0]}:{addr[1]} answered the workflow query with an error")
-
-                response = WorkflowQueryResponse.load(response_data)
-                dc_id = response.datacenter
-
-                if dc_id not in results:
-                    results[dc_id] = []
-                results[dc_id].extend(response.workflows)
-
-            except Exception as query_error:
-                # Another manager may answer; if none does, these raise.
-                query_errors.append(query_error)
-
         # If we know which manager accepted this job, query it first
         # This ensures we get results from the job leader
-        if job_id:
-            job_target = self._state.get_job_target(job_id)
-            if job_target:
-                await query_one(job_target)
-                # If we got results, return them (job leader has authoritative state)
-                if results:
-                    return results
+        if await self._query_job_target_first(job_id, request, timeout, results, query_errors):
+            # If we got results, return them (job leader has authoritative state)
+            return results
 
         # Query all managers (either no job_id, or job target query failed)
+        await self._query_all_managers(request, timeout, results, query_errors)
+        return results
+
+    async def _query_job_target_first(
+        self,
+        job_id: str | None,
+        request: WorkflowQueryRequest,
+        timeout: float,
+        results: dict[str, list[WorkflowStatusInfo]],
+        query_errors: list[Exception],
+    ) -> bool:
+        """Query the manager that accepted the job, when known; True when it returned results."""
+        if job_id:
+            return await self._query_known_job_target(job_id, request, timeout, results, query_errors)
+        return False
+
+    async def _query_known_job_target(
+        self,
+        job_id: str,
+        request: WorkflowQueryRequest,
+        timeout: float,
+        results: dict[str, list[WorkflowStatusInfo]],
+        query_errors: list[Exception],
+    ) -> bool:
+        """Query the job's accepting manager if this client recorded one; True when it returned results."""
+        job_target = self._state.get_job_target(job_id)
+        if not job_target:
+            return False
+        await self._query_manager_workflows(job_target, request, timeout, results, query_errors)
+        return bool(results)
+
+    async def _query_all_managers(
+        self,
+        request: WorkflowQueryRequest,
+        timeout: float,
+        results: dict[str, list[WorkflowStatusInfo]],
+        query_errors: list[Exception],
+    ) -> None:
+        """Query every configured manager concurrently; raises when every one of them failed."""
         query_errors.clear()
         await asyncio.gather(
-            *[query_one(addr) for addr in self._config.managers],
+            *[
+                self._query_manager_workflows(addr, request, timeout, results, query_errors)
+                for addr in self._config.managers
+            ],
             return_exceptions=False,
         )
 
         # Every manager failing is not "no workflows".
         if len(query_errors) == len(self._config.managers):
             raise ExceptionGroup("every manager failed the workflow query", list(query_errors))
-        return results
+
+    async def _query_manager_workflows(
+        self,
+        addr: tuple[str, int],
+        request: WorkflowQueryRequest,
+        timeout: float,
+        results: dict[str, list[WorkflowStatusInfo]],
+        query_errors: list[Exception],
+    ) -> None:
+        """Query one manager, merging its workflows into the results or recording its error."""
+        try:
+            await self._collect_manager_workflows(addr, request, timeout, results)
+
+        except Exception as query_error:
+            # Another manager may answer; if none does, these raise.
+            query_errors.append(query_error)
+
+    async def _collect_manager_workflows(
+        self,
+        addr: tuple[str, int],
+        request: WorkflowQueryRequest,
+        timeout: float,
+        results: dict[str, list[WorkflowStatusInfo]],
+    ) -> None:
+        """Send the workflow query to one manager and add its workflows under its datacenter."""
+        response_data, _ = await self._send_tcp(
+            addr,
+            "workflow_query",
+            request.dump(),
+            timeout=timeout,
+        )
+
+        if isinstance(response_data, Exception):
+            raise response_data
+        if response_data == b'error':
+            raise RuntimeError(f"manager {addr[0]}:{addr[1]} answered the workflow query with an error")
+
+        response = WorkflowQueryResponse.load(response_data)
+        dc_id = response.datacenter
+
+        results.setdefault(dc_id, []).extend(response.workflows)
 
     async def query_workflows_via_gate(
         self,
@@ -301,9 +380,7 @@ class ClientDiscovery:
         Raises:
             RuntimeError: If no gates configured or query fails.
         """
-        target = addr or self._targets.get_next_gate()
-        if not target:
-            raise RuntimeError("No gates configured")
+        target = self._resolve_target(addr, self._targets.get_next_gate, "No gates configured")
 
         request = WorkflowQueryRequest(
             request_id=secrets.token_hex(8),
@@ -311,25 +388,21 @@ class ClientDiscovery:
             job_id=job_id,
         )
 
-        response_data, _ = await self._send_tcp(
+        response_data = await self._send_checked(
             target,
             "workflow_query",
             request.dump(),
-            timeout=timeout,
+            timeout,
+            "Workflow query failed",
+            "Workflow query failed: gate returned error",
         )
-
-        if isinstance(response_data, Exception):
-            raise RuntimeError(f"Workflow query failed: {response_data}")
-
-        if response_data == b'error':
-            raise RuntimeError("Workflow query failed: gate returned error")
 
         response = GateWorkflowQueryResponse.load(response_data)
 
         # Convert to dict format
-        results: dict[str, list[WorkflowStatusInfo]] = {}
-        for dc_status in response.datacenters:
-            results[dc_status.dc_id] = dc_status.workflows
+        results: dict[str, list[WorkflowStatusInfo]] = {
+            dc_status.dc_id: dc_status.workflows for dc_status in response.datacenters
+        }
 
         return results
 
@@ -408,26 +481,20 @@ class ClientDiscovery:
         Raises:
             RuntimeError: If no gates configured or query fails.
         """
-        target = addr or self._targets.get_next_gate()
-        if not target:
-            raise RuntimeError("No gates configured")
+        target = self._resolve_target(addr, self._targets.get_next_gate, "No gates configured")
 
         request = DatacenterListRequest(
             request_id=secrets.token_hex(8),
         )
 
-        response_data, _ = await self._send_tcp(
+        response_data = await self._send_checked(
             target,
             "datacenter_list",
             request.dump(),
-            timeout=timeout,
+            timeout,
+            "Datacenter list query failed",
+            "Datacenter list query failed: gate returned error",
         )
-
-        if isinstance(response_data, Exception):
-            raise RuntimeError(f"Datacenter list query failed: {response_data}")
-
-        if response_data == b'error':
-            raise RuntimeError("Datacenter list query failed: gate returned error")
 
         return DatacenterListResponse.load(response_data)
 

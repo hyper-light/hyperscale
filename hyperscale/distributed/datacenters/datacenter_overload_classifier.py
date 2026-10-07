@@ -87,23 +87,25 @@ class DatacenterOverloadClassifier:
 
     def _classify_by_worker_overload(self, ratio: float) -> DatacenterOverloadState:
         config = self._config
-        if ratio >= config.worker_overload_unhealthy_threshold:
-            return DatacenterOverloadState.UNHEALTHY
-        if ratio >= config.worker_overload_degraded_threshold:
-            return DatacenterOverloadState.DEGRADED
-        if ratio >= config.worker_overload_busy_threshold:
-            return DatacenterOverloadState.BUSY
-        return DatacenterOverloadState.HEALTHY
+        return self._first_crossed_state(
+            ratio,
+            (
+                (config.worker_overload_unhealthy_threshold, DatacenterOverloadState.UNHEALTHY),
+                (config.worker_overload_degraded_threshold, DatacenterOverloadState.DEGRADED),
+                (config.worker_overload_busy_threshold, DatacenterOverloadState.BUSY),
+            ),
+        )
 
     def _classify_by_manager_health(self, ratio: float) -> DatacenterOverloadState:
         config = self._config
-        if ratio >= config.manager_unhealthy_unhealthy_threshold:
-            return DatacenterOverloadState.UNHEALTHY
-        if ratio >= config.manager_unhealthy_degraded_threshold:
-            return DatacenterOverloadState.DEGRADED
-        if ratio >= config.manager_unhealthy_busy_threshold:
-            return DatacenterOverloadState.BUSY
-        return DatacenterOverloadState.HEALTHY
+        return self._first_crossed_state(
+            ratio,
+            (
+                (config.manager_unhealthy_unhealthy_threshold, DatacenterOverloadState.UNHEALTHY),
+                (config.manager_unhealthy_degraded_threshold, DatacenterOverloadState.DEGRADED),
+                (config.manager_unhealthy_busy_threshold, DatacenterOverloadState.BUSY),
+            ),
+        )
 
     def _classify_by_manager_overload(
         self,
@@ -112,21 +114,35 @@ class DatacenterOverloadClassifier:
     ) -> DatacenterOverloadState:
         if leader_overloaded:
             return DatacenterOverloadState.DEGRADED
-        if ratio >= 0.5:
-            return DatacenterOverloadState.DEGRADED
-        if ratio >= 0.3:
-            return DatacenterOverloadState.BUSY
-        return DatacenterOverloadState.HEALTHY
+        return self._first_crossed_state(
+            ratio,
+            (
+                (0.5, DatacenterOverloadState.DEGRADED),
+                (0.3, DatacenterOverloadState.BUSY),
+            ),
+        )
 
     def _classify_by_capacity(self, utilization: float) -> DatacenterOverloadState:
         config = self._config
-        if utilization >= config.capacity_utilization_unhealthy_threshold:
-            return DatacenterOverloadState.UNHEALTHY
-        if utilization >= config.capacity_utilization_degraded_threshold:
-            return DatacenterOverloadState.DEGRADED
-        if utilization >= config.capacity_utilization_busy_threshold:
-            return DatacenterOverloadState.BUSY
-        return DatacenterOverloadState.HEALTHY
+        return self._first_crossed_state(
+            utilization,
+            (
+                (config.capacity_utilization_unhealthy_threshold, DatacenterOverloadState.UNHEALTHY),
+                (config.capacity_utilization_degraded_threshold, DatacenterOverloadState.DEGRADED),
+                (config.capacity_utilization_busy_threshold, DatacenterOverloadState.BUSY),
+            ),
+        )
+
+    @staticmethod
+    def _first_crossed_state(
+        value: float,
+        threshold_ladder: tuple[tuple[float, DatacenterOverloadState], ...],
+    ) -> DatacenterOverloadState:
+        """The state of the first (most severe) threshold ``value`` reaches, else HEALTHY."""
+        return next(
+            (state for threshold, state in threshold_ladder if value >= threshold),
+            DatacenterOverloadState.HEALTHY,
+        )
 
     def _get_worst_state(
         self,

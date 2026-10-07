@@ -18,6 +18,18 @@ MemberAddress = tuple[str, int]
 SendWatch = Callable[[MemberAddress, bytes, float], Awaitable[bytes | Exception | None]]
 
 
+def _loaded_reply(response: bytes | Exception | None) -> ClusterWatchReply | None:
+    """The reply a poll's response carries; None for a failure or nothing."""
+    return None if isinstance(response, Exception) or not response else ClusterWatchReply.load(response)
+
+
+def _served_reply(response: bytes | Exception | None) -> ClusterWatchReply | None:
+    """The reply a member served; None when the poll failed or the member
+    did not serve it."""
+    reply = _loaded_reply(response)
+    return reply if reply is not None and reply.served else None
+
+
 class ClusterWatchFollower:
     """Long-polls one member of a cluster at a time for its membership
     changes and folds them into a ``ClusterViewCache``. A member that does
@@ -91,45 +103,58 @@ class ClusterWatchFollower:
         self._running = True
         failures_in_a_row = 0
         while self._running:
-            view = self._cache.view
-            targets = sorted({*self._seeds(), *view.holders.keys()})
-            if not targets:
-                await self._clock.sleep(self._poll_wait_seconds)
-                continue
-            target = targets[self._target_index % len(targets)]
-            sent_at = self._clock.monotonic()
-            response = await self._send_watch(
-                target,
-                ClusterWatchRequest(
-                    cluster_uuid=view.cluster_uuid,
-                    after_index=view.applied_index,
-                    wait_seconds=self._poll_wait_seconds,
-                ).dump(),
-                self._poll_timeout_seconds,
-            )
-            reply = (
-                None
-                if isinstance(response, Exception) or not response
-                else ClusterWatchReply.load(response)
-            )
-            if reply is None or not reply.served:
-                self._polls_failed += 1
-                self._target_index += 1
-                failures_in_a_row += 1
-                if (disconnected := self._cache.is_disconnected(self._clock.monotonic())) != self._disconnected:
-                    self._disconnected = disconnected
-                    await self._on_disconnected_changed(disconnected)
-                if failures_in_a_row >= len(targets):
-                    failures_in_a_row = 0
-                    await self._clock.sleep(self._poll_wait_seconds)
-                continue
-            self._polls_answered += 1
-            failures_in_a_row = 0
-            if (applied := self._cache.apply(reply, sent_at)) != view:
-                self._on_view_changed(applied)
-            if (disconnected := self._cache.is_disconnected(self._clock.monotonic())) != self._disconnected:
-                self._disconnected = disconnected
-                await self._on_disconnected_changed(disconnected)
+            failures_in_a_row = await self._poll_once(failures_in_a_row)
+
+    async def _poll_once(self, failures_in_a_row: int) -> int:
+        """Poll the next member once and fold in its answer (AD-52 section
+        9); returns the failures in a row after this poll."""
+        view = self._cache.view
+        targets = sorted({*self._seeds(), *view.holders.keys()})
+        if not targets:
+            await self._clock.sleep(self._poll_wait_seconds)
+            return failures_in_a_row
+        target = targets[self._target_index % len(targets)]
+        sent_at = self._clock.monotonic()
+        response = await self._send_watch(
+            target,
+            ClusterWatchRequest(
+                cluster_uuid=view.cluster_uuid,
+                after_index=view.applied_index,
+                wait_seconds=self._poll_wait_seconds,
+            ).dump(),
+            self._poll_timeout_seconds,
+        )
+        if (reply := _served_reply(response)) is None:
+            return await self._record_failure(failures_in_a_row, len(targets))
+        await self._record_answer(reply, sent_at, view)
+        return 0
+
+    async def _record_failure(self, failures_in_a_row: int, target_count: int) -> int:
+        """Pass over a member that did not answer; once none of the round
+        answered, wait one poll's wait (never a spin). Returns the failures
+        in a row."""
+        self._polls_failed += 1
+        self._target_index += 1
+        failures_in_a_row += 1
+        await self._refresh_disconnected()
+        if failures_in_a_row >= target_count:
+            await self._clock.sleep(self._poll_wait_seconds)
+            return 0
+        return failures_in_a_row
+
+    async def _record_answer(self, reply: ClusterWatchReply, sent_at: float, view: ClusterView) -> None:
+        """Fold an answer into the cache and tell whoever listens of a new
+        view and of a disconnected-mode change (AD-52 section 10)."""
+        self._polls_answered += 1
+        if (applied := self._cache.apply(reply, sent_at)) != view:
+            self._on_view_changed(applied)
+        await self._refresh_disconnected()
+
+    async def _refresh_disconnected(self) -> None:
+        """Announce each entry into or exit from disconnected mode."""
+        if (disconnected := self._cache.is_disconnected(self._clock.monotonic())) != self._disconnected:
+            self._disconnected = disconnected
+            await self._on_disconnected_changed(disconnected)
 
     def stop(self) -> None:
         self._running = False

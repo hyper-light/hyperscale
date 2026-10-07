@@ -370,15 +370,19 @@ class ManagerState:
         self._progress_callbacks.pop(job_id, None)
         self._job_submissions.pop(job_id, None)
         self._job_gate_routing_fences.pop(job_id, None)
-        prefix_keys = [
-            key for key in self._workflow_result_sequences if key[0] == job_id
-        ]
+        prefix_keys = self._workflow_result_sequence_keys(job_id)
         for key in prefix_keys:
             self._workflow_result_sequences.pop(key, None)
         self._job_timeout_strategies.pop(job_id, None)
         self._job_aggregated_results.pop(job_id, None)
         self.clear_cancellation_state(job_id)
         self._cancelled_workflows.pop(job_id, None)
+
+    def _workflow_result_sequence_keys(self, job_id: str) -> list[tuple]:
+        """Workflow-result sequence keys prefixed by ``job_id``."""
+        return [
+            key for key in self._workflow_result_sequences if key[0] == job_id
+        ]
 
     def remove_gate_lock(self, gate_id: str) -> None:
         """Remove lock when gate disconnects to prevent memory leak."""
@@ -396,13 +400,17 @@ class ManagerState:
         self._peer_state_epoch.pop(peer_addr, None)
         self._manager_peer_info.pop(peer_addr, None)
         self._recovery_verification_pending.pop(peer_addr, None)
-        stale_udp_addrs = [
+        stale_udp_addrs = self._manager_udp_addrs_mapped_to(peer_addr)
+        for udp_addr in stale_udp_addrs:
+            self._manager_udp_to_tcp.pop(udp_addr, None)
+
+    def _manager_udp_addrs_mapped_to(self, peer_addr: tuple[str, int]) -> list[tuple[str, int]]:
+        """Manager UDP addresses whose UDP->TCP mapping points at ``peer_addr``."""
+        return [
             udp_addr
             for udp_addr, tcp_addr in self._manager_udp_to_tcp.items()
             if tcp_addr == peer_addr
         ]
-        for udp_addr in stale_udp_addrs:
-            self._manager_udp_to_tcp.pop(udp_addr, None)
 
     def remove_peer_latency_samples(self, peer_id: str) -> None:
         """Remove latency sample deque for a peer to prevent memory leak.
@@ -427,20 +435,28 @@ class ManagerState:
         # includes the worker_id (TrackingToken sub-workflow tokens),
         # so substring match is sufficient and avoids a separate
         # workflow→worker reverse index.
-        stale_workflow_ids = [
+        stale_workflow_ids = self._stale_workflow_progress_ids(worker_id)
+        for wf_id in stale_workflow_ids:
+            self._workflow_last_progress_snapshot.pop(wf_id, None)
+
+        progress_keys_to_remove = self._job_progress_keys_for_worker(worker_id)
+        for key in progress_keys_to_remove:
+            self._worker_job_last_progress.pop(key, None)
+        self._dispatch_semaphores.pop(worker_id, None)
+
+    def _stale_workflow_progress_ids(self, worker_id: str) -> list[str]:
+        """Progress-snapshot workflow ids embedding ``worker_id`` (Phase H3 substring match)."""
+        return [
             wf_id
             for wf_id in self._workflow_last_progress_snapshot
             if worker_id in wf_id
         ]
-        for wf_id in stale_workflow_ids:
-            self._workflow_last_progress_snapshot.pop(wf_id, None)
 
-        progress_keys_to_remove = [
+    def _job_progress_keys_for_worker(self, worker_id: str) -> list[tuple[str, str]]:
+        """The (job_id, worker_id) progress keys recorded for ``worker_id``."""
+        return [
             key for key in self._worker_job_last_progress if key[1] == worker_id
         ]
-        for key in progress_keys_to_remove:
-            self._worker_job_last_progress.pop(key, None)
-        self._dispatch_semaphores.pop(worker_id, None)
 
     def get_workflow_last_progress_snapshot(
         self, workflow_id: str
@@ -724,15 +740,7 @@ class ManagerState:
         fencing_token: int,
     ) -> bool:
         """Apply a fenced job-leadership claim to manager-visible state."""
-        current_token = self._job_fencing_tokens.get(job_id)
-        current_leader = self._job_leaders.get(job_id)
-        accepts_newer_token = current_token is None or fencing_token > current_token
-        accepts_idempotent_claim = (
-            current_token == fencing_token
-            and (current_leader is None or current_leader == leader_id)
-        )
-
-        if not accepts_newer_token and not accepts_idempotent_claim:
+        if not self._accepts_job_leadership_claim(job_id, leader_id, fencing_token):
             return False
 
         self._job_leaders[job_id] = leader_id
@@ -1008,12 +1016,45 @@ class ManagerState:
             self._dispatch_failure_count += 1
             return self._dispatch_failure_count
 
+    def _accepts_job_leadership_claim(
+        self,
+        job_id: str,
+        leader_id: str,
+        fencing_token: int,
+    ) -> bool:
+        """A strictly newer fence token, or the same token from the same (or no) leader."""
+        current_token = self._job_fencing_tokens.get(job_id)
+        current_leader = self._job_leaders.get(job_id)
+        accepts_newer_token = current_token is None or fencing_token > current_token
+        accepts_idempotent_claim = self._is_idempotent_leadership_claim(
+            current_token, current_leader, fencing_token, leader_id
+        )
+        return accepts_newer_token or accepts_idempotent_claim
+
+    @staticmethod
+    def _is_idempotent_leadership_claim(
+        current_token: int | None,
+        current_leader: str | None,
+        fencing_token: int,
+        leader_id: str,
+    ) -> bool:
+        """The same fence token re-claimed by the current (or an unset) leader."""
+        return (
+            current_token == fencing_token
+            and (current_leader is None or current_leader == leader_id)
+        )
+
+    @staticmethod
+    def _dispatch_throughput_now(now: float | None) -> float:
+        """The caller's timestamp, else the running loop's clock."""
+        return now if now is not None else asyncio.get_running_loop().time()
+
     async def update_dispatch_throughput(
         self,
         interval_seconds: float,
         now: float | None = None,
     ) -> float:
-        current_time = now if now is not None else asyncio.get_running_loop().time()
+        current_time = self._dispatch_throughput_now(now)
         async with self._get_counter_lock():
             elapsed = current_time - self._dispatch_throughput_interval_start
             if elapsed >= interval_seconds and elapsed > 0:

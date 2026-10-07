@@ -165,6 +165,14 @@ class ClientProtocol:
         if not negotiated.compatible:
             return (False, "Server marked as incompatible")
 
+        return self._check_required_features(negotiated, required_features)
+
+    @staticmethod
+    def _check_required_features(
+        negotiated: NegotiatedCapabilities,
+        required_features: set[str] | None,
+    ) -> tuple[bool, str]:
+        """Compatible unless the server lacks a required feature (AD-25)."""
         if required_features:
             missing = required_features - negotiated.common_features
             if missing:

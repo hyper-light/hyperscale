@@ -290,84 +290,163 @@ class GateStateSyncHandler:
                 ),
             )
 
-            if await self._is_from_a_stale_producer(result):
-                return b"stale_producer"
-
-            leader_id = self._job_leadership_tracker.get_leader(result.job_id)
-            is_job_leader = self._job_leadership_tracker.is_leader(result.job_id)
-            if leader_id and not is_job_leader:
-                # A result a peer gate forwarded ends here: forwarding it on
-                # could send it back round the gates that do not lead it.
-                if forward_final_result is None:
-                    return b"not_leader"
-                leader_addr = self._job_leadership_tracker.get_leader_addr(
-                    result.job_id
-                )
-                if leader_addr:
-                    forwarded = await self._forward_job_final_result_to_leader(
-                        result.job_id,
-                        leader_addr,
-                        data,
-                    )
-                    if forwarded:
-                        return b"forwarded"
-                    return b"error"
-
-                await self._logger.log(
-                    ServerWarning(
-                        message=(
-                            f"Leader gate {leader_id[:8]}... for job "
-                            f"{result.job_id[:8]}... has no known address; "
-                            "attempting peer forward."
-                        ),
-                        node_host=self._get_host(),
-                        node_port=self._get_tcp_port(),
-                        node_id=self._get_node_id().short,
-                    )
-                )
-                if forward_final_result:
-                    forwarded = await forward_final_result(data)
-                    if forwarded:
-                        return b"forwarded"
-                    await self._logger.log(
-                        ServerWarning(
-                            message=(
-                                "Failed to forward job final result for "
-                                f"{result.job_id[:8]}... to peer gates"
-                            ),
-                            node_host=self._get_host(),
-                            node_port=self._get_tcp_port(),
-                            node_id=self._get_node_id().short,
-                        )
-                    )
-                return b"error"
-
-            job_exists = self._job_manager.get_job(result.job_id) is not None
-            if not job_exists:
-                if forward_final_result:
-                    forwarded = await forward_final_result(data)
-                    if forwarded:
-                        return b"forwarded"
-                    await self._logger.log(
-                        ServerWarning(
-                            message=(
-                                "Failed to forward final result for unknown job "
-                                f"{result.job_id[:8]}... to peer gates"
-                            ),
-                            node_host=self._get_host(),
-                            node_port=self._get_tcp_port(),
-                            node_id=self._get_node_id().short,
-                        )
-                    )
-                return b"unknown_job"
-
-            completed = await complete_job(result.job_id, result)
-            if not completed:
-                return b"already_completed"
-
-            return b"ok"
+            return await self._accept_final_result(
+                result,
+                data,
+                complete_job,
+                forward_final_result,
+            )
 
         except Exception as error:
             await handle_exception(error, "handle_job_final_result")
             return b"error"
+
+    async def _accept_final_result(
+        self,
+        result: JobFinalResult,
+        data: bytes,
+        complete_job: Callable[[str, object], "asyncio.Coroutine[None, None, bool]"],
+        forward_final_result: Callable[[bytes], "asyncio.Coroutine[None, None, bool]"] | None,
+    ) -> bytes:
+        """Drop a stale producer's final result, otherwise route or apply it."""
+        if await self._is_from_a_stale_producer(result):
+            return b"stale_producer"
+
+        return await self._dispatch_final_result(
+            result,
+            data,
+            complete_job,
+            forward_final_result,
+        )
+
+    async def _dispatch_final_result(
+        self,
+        result: JobFinalResult,
+        data: bytes,
+        complete_job: Callable[[str, object], "asyncio.Coroutine[None, None, bool]"],
+        forward_final_result: Callable[[bytes], "asyncio.Coroutine[None, None, bool]"] | None,
+    ) -> bytes:
+        """Route the final result to the gate leading the job, or apply it here."""
+        leader_id = self._job_leadership_tracker.get_leader(result.job_id)
+        is_job_leader = self._job_leadership_tracker.is_leader(result.job_id)
+        if leader_id and not is_job_leader:
+            return await self._route_final_result_to_leader(
+                result,
+                leader_id,
+                data,
+                forward_final_result,
+            )
+
+        return await self._apply_final_result(
+            result,
+            data,
+            complete_job,
+            forward_final_result,
+        )
+
+    async def _route_final_result_to_leader(
+        self,
+        result: JobFinalResult,
+        leader_id: str,
+        data: bytes,
+        forward_final_result: Callable[[bytes], "asyncio.Coroutine[None, None, bool]"] | None,
+    ) -> bytes:
+        """Forward a final result to the job's leader gate, through peers when its address is unknown."""
+        # A result a peer gate forwarded ends here: forwarding it on
+        # could send it back round the gates that do not lead it.
+        if forward_final_result is None:
+            return b"not_leader"
+        leader_addr = self._job_leadership_tracker.get_leader_addr(
+            result.job_id
+        )
+        if leader_addr:
+            return await self._forward_final_result_to_leader_addr(
+                result.job_id,
+                leader_addr,
+                data,
+            )
+
+        await self._logger.log(
+            ServerWarning(
+                message=(
+                    f"Leader gate {leader_id[:8]}... for job "
+                    f"{result.job_id[:8]}... has no known address; "
+                    "attempting peer forward."
+                ),
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().short,
+            )
+        )
+        return await self._forward_final_result_to_peers(
+            data,
+            forward_final_result,
+            (
+                "Failed to forward job final result for "
+                f"{result.job_id[:8]}... to peer gates"
+            ),
+            b"error",
+        )
+
+    async def _forward_final_result_to_leader_addr(
+        self,
+        job_id: str,
+        leader_addr: tuple[str, int],
+        data: bytes,
+    ) -> bytes:
+        """Forward the final result straight to the leader gate's known address."""
+        forwarded = await self._forward_job_final_result_to_leader(
+            job_id,
+            leader_addr,
+            data,
+        )
+        return b"forwarded" if forwarded else b"error"
+
+    async def _forward_final_result_to_peers(
+        self,
+        data: bytes,
+        forward_final_result: Callable[[bytes], "asyncio.Coroutine[None, None, bool]"] | None,
+        failure_message: str,
+        unforwarded_response: bytes,
+    ) -> bytes:
+        """Hand the final result to peer gates when allowed, logging a failed forward."""
+        if not forward_final_result:
+            return unforwarded_response
+        if await forward_final_result(data):
+            return b"forwarded"
+        await self._logger.log(
+            ServerWarning(
+                message=failure_message,
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().short,
+            )
+        )
+        return unforwarded_response
+
+    async def _apply_final_result(
+        self,
+        result: JobFinalResult,
+        data: bytes,
+        complete_job: Callable[[str, object], "asyncio.Coroutine[None, None, bool]"],
+        forward_final_result: Callable[[bytes], "asyncio.Coroutine[None, None, bool]"] | None,
+    ) -> bytes:
+        """Complete a job this gate knows, or pass an unknown job's result to peer gates."""
+        job_exists = self._job_manager.get_job(result.job_id) is not None
+        if not job_exists:
+            return await self._forward_final_result_to_peers(
+                data,
+                forward_final_result,
+                (
+                    "Failed to forward final result for unknown job "
+                    f"{result.job_id[:8]}... to peer gates"
+                ),
+                b"unknown_job",
+            )
+
+        completed = await complete_job(result.job_id, result)
+        if not completed:
+            return b"already_completed"
+
+        return b"ok"
 

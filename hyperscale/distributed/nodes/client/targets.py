@@ -135,17 +135,25 @@ class ClientTargetSelector:
         if not tier_targets:
             return []
 
-        tier_peer_ids = {_peer_id(target) for target in tier_targets}
+        ranked = self._rank_tier_targets(job_id, tier_targets)
+        return list(dict.fromkeys([*ranked, *tier_targets]))
+
+    def _rank_tier_targets(
+        self,
+        job_id: str,
+        tier_targets: list[tuple[str, int]],
+    ) -> list[tuple[str, int]]:
+        """The tier's targets in AD-28 rendezvous order for the job."""
+        tier_peer_ids = set(map(_peer_id, tier_targets))
         selections = self._discovery.select_peers(
             job_id,
             count=len(self._target_by_peer_id),
         )
-        ranked = [
+        return [
             self._target_by_peer_id[selection.peer_id]
             for selection in selections
             if selection.peer_id in tier_peer_ids
         ]
-        return list(dict.fromkeys([*ranked, *tier_targets]))
 
     def get_targets_for_job(self, job_id: str) -> list[tuple[str, int]]:
         """
@@ -168,7 +176,15 @@ class ClientTargetSelector:
             return all_targets
 
         # Put job target first, then others
-        return [job_target] + [t for t in all_targets if t != job_target]
+        return [job_target] + self._targets_other_than(all_targets, job_target)
+
+    @staticmethod
+    def _targets_other_than(
+        all_targets: list[tuple[str, int]],
+        job_target: tuple[str, int],
+    ) -> list[tuple[str, int]]:
+        """Every target except the job's, in order."""
+        return [target for target in all_targets if target != job_target]
 
     def get_preferred_gate_for_job(self, job_id: str) -> tuple[str, int] | None:
         """

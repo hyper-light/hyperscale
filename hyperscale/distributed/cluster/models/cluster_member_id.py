@@ -43,6 +43,6 @@ class ClusterMemberId:
         identity, separator, participation = text.rpartition("#")
         node_id, at_sign, address = identity.rpartition("@")
         host, colon, port = address.rpartition(":")
-        if not (separator and at_sign and colon and node_id and host):
+        if not all((separator, at_sign, colon, node_id, host)):
             raise ValueError(f"not a cluster member id: {text!r}")
         return cls(node_id=node_id, host=host, port=int(port), participation=int(participation))

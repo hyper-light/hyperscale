@@ -25,6 +25,7 @@ talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
+from operator import attrgetter
 from typing import Callable
 from hyperscale.distributed.models import ManagerHeartbeat, DatacenterHealth, DatacenterStatus
 from hyperscale.distributed.datacenters.datacenter_overload_config import (
@@ -190,9 +191,7 @@ class DatacenterHealthManager:
             dc_id
         )
 
-        if self._get_configured_managers:
-            configured = self._get_configured_managers(dc_id)
-            total_count = max(total_count, len(configured))
+        total_count = self._expected_manager_count(dc_id, total_count)
 
         if total_count == 0:
             return self._build_unhealthy_status(dc_id, 0, 0)
@@ -207,6 +206,25 @@ class DatacenterHealthManager:
         if not self._dc_manager_info.get(dc_id):
             return self._build_initializing_status(dc_id)
 
+        return self._classify_reporting_datacenter(
+            dc_id, best_heartbeat, alive_count, total_count
+        )
+
+    def _expected_manager_count(self, dc_id: str, tracked_count: int) -> int:
+        """Managers expected in the DC: the tracked count, raised to the configured count when known."""
+        if self._get_configured_managers:
+            configured = self._get_configured_managers(dc_id)
+            return max(tracked_count, len(configured))
+        return tracked_count
+
+    def _classify_reporting_datacenter(
+        self,
+        dc_id: str,
+        best_heartbeat: ManagerHeartbeat | None,
+        alive_count: int,
+        total_count: int,
+    ) -> DatacenterStatus:
+        """Classify a DC some manager has reported from: stale, unwritable, or by its workers."""
         if not best_heartbeat:
             return self._build_unhealthy_status(dc_id, alive_count, 0)
 
@@ -219,6 +237,16 @@ class DatacenterHealthManager:
                 dc_id, alive_count, best_heartbeat.worker_count
             )
 
+        return self._classify_by_workers(dc_id, best_heartbeat, alive_count, total_count)
+
+    def _classify_by_workers(
+        self,
+        dc_id: str,
+        best_heartbeat: ManagerHeartbeat,
+        alive_count: int,
+        total_count: int,
+    ) -> DatacenterStatus:
+        """Classify a writable DC: BUSY with no workers, else by its overload signals (AD-16)."""
         # Live managers, zero workers: no capacity right now, but the
         # tier that accepts and queues work is up. Per the
         # DatacenterHealth contract that is BUSY ("transient, will clear
@@ -331,17 +359,26 @@ class DatacenterHealthManager:
         }
 
         for manager_addr, info in dc_managers.items():
-            is_fresh = self._manager_detectors[(dc_id, manager_addr)].is_available(now)
-            if not is_fresh or not info.is_alive:
-                continue
-
-            health_state = info.heartbeat.health_overload_state
-            if health_state in counts:
-                counts[health_state] += 1
-            else:
-                counts["healthy"] += 1
+            if self._manager_is_live(dc_id, manager_addr, info, now):
+                self._count_manager_health_state(counts, info)
 
         return counts
+
+    def _manager_is_live(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+        info: CachedManagerInfo,
+        now: float,
+    ) -> bool:
+        """A manager counts while its phi-accrual detector is available (AD-52 section 8) and SWIM has it alive."""
+        return self._manager_detectors[(dc_id, manager_addr)].is_available(now) and info.is_alive
+
+    @staticmethod
+    def _count_manager_health_state(counts: dict[str, int], info: CachedManagerInfo) -> None:
+        """Tally the manager's reported overload state; an unrecognized state counts as healthy."""
+        health_state = info.heartbeat.health_overload_state
+        counts[health_state if health_state in counts else "healthy"] += 1
 
     def _map_overload_state_to_health(
         self,
@@ -420,29 +457,31 @@ class DatacenterHealthManager:
         dc_managers = self._dc_manager_info.get(dc_id, {})
         now = _DEFAULT_CLOCK.monotonic()
 
-        best_heartbeat: ManagerHeartbeat | None = None
-        leader_heartbeat: ManagerHeartbeat | None = None
-        alive_count = 0
+        live_heartbeats = self._live_heartbeats(dc_id, dc_managers, now)
 
-        for manager_addr, info in dc_managers.items():
-            is_fresh = self._manager_detectors[(dc_id, manager_addr)].is_available(now)
+        return self._preferred_heartbeat(live_heartbeats), len(live_heartbeats), len(dc_managers)
 
-            if is_fresh and info.is_alive:
-                alive_count += 1
+    def _live_heartbeats(
+        self,
+        dc_id: str,
+        dc_managers: dict[tuple[str, int], CachedManagerInfo],
+        now: float,
+    ) -> list[ManagerHeartbeat]:
+        """The heartbeats of the DC's fresh, alive managers, in tracking order."""
+        return [
+            info.heartbeat
+            for manager_addr, info in dc_managers.items()
+            if self._manager_is_live(dc_id, manager_addr, info, now)
+        ]
 
-                # Track leader separately
-                if info.heartbeat.is_leader:
-                    leader_heartbeat = info.heartbeat
-
-                # Keep any fresh heartbeat as fallback
-                if best_heartbeat is None:
-                    best_heartbeat = info.heartbeat
-
-        # Prefer leader if available
+    @staticmethod
+    def _preferred_heartbeat(live_heartbeats: list[ManagerHeartbeat]) -> ManagerHeartbeat | None:
+        """Prefer the (last-seen) leader's heartbeat; else keep the first fresh one as fallback."""
+        # Track leader separately
+        leader_heartbeat = next(filter(attrgetter("is_leader"), reversed(live_heartbeats)), None)
         if leader_heartbeat is not None:
-            best_heartbeat = leader_heartbeat
-
-        return best_heartbeat, alive_count, len(dc_managers)
+            return leader_heartbeat
+        return live_heartbeats[0] if live_heartbeats else None
 
     def get_leader_address(self, dc_id: str) -> tuple[str, int] | None:
         """
@@ -455,24 +494,31 @@ class DatacenterHealthManager:
         now = _DEFAULT_CLOCK.monotonic()
 
         for manager_addr, info in dc_managers.items():
-            is_fresh = self._manager_detectors[(dc_id, manager_addr)].is_available(now)
-            if is_fresh and info.is_alive and info.heartbeat.is_leader:
+            if self._manager_is_live_leader(dc_id, manager_addr, info, now):
                 return manager_addr
 
         return None
+
+    def _manager_is_live_leader(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+        info: CachedManagerInfo,
+        now: float,
+    ) -> bool:
+        """A fresh, alive manager whose heartbeat claims DC leadership."""
+        return self._manager_is_live(dc_id, manager_addr, info, now) and info.heartbeat.is_leader
 
     def get_alive_managers(self, dc_id: str) -> list[tuple[str, int]]:
         """Get list of alive manager addresses in a datacenter."""
         dc_managers = self._dc_manager_info.get(dc_id, {})
         now = _DEFAULT_CLOCK.monotonic()
 
-        result: list[tuple[str, int]] = []
-        for manager_addr, info in dc_managers.items():
-            is_fresh = self._manager_detectors[(dc_id, manager_addr)].is_available(now)
-            if is_fresh and info.is_alive:
-                result.append(manager_addr)
-
-        return result
+        return [
+            manager_addr
+            for manager_addr, info in dc_managers.items()
+            if self._manager_is_live(dc_id, manager_addr, info, now)
+        ]
 
     # =========================================================================
     # Statistics
@@ -519,11 +565,7 @@ class DatacenterHealthManager:
 
         for dc_id in list(self._dc_manager_info.keys()):
             dc_managers = self._dc_manager_info[dc_id]
-            to_remove: list[tuple[str, int]] = []
-
-            for manager_addr, info in dc_managers.items():
-                if (now - info.last_seen) > timeout:
-                    to_remove.append(manager_addr)
+            to_remove = self._stale_manager_addresses(dc_managers, now, timeout)
 
             for addr in to_remove:
                 dc_managers.pop(addr, None)
@@ -531,6 +573,19 @@ class DatacenterHealthManager:
                 removed += 1
 
         return removed
+
+    @staticmethod
+    def _stale_manager_addresses(
+        dc_managers: dict[tuple[str, int], CachedManagerInfo],
+        now: float,
+        timeout: float,
+    ) -> list[tuple[str, int]]:
+        """Addresses of the managers last seen more than ``timeout`` seconds before ``now``."""
+        return [
+            manager_addr
+            for manager_addr, info in dc_managers.items()
+            if (now - info.last_seen) > timeout
+        ]
 
 _REHOMED = (
     CachedManagerInfo,

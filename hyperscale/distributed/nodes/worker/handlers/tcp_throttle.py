@@ -7,12 +7,13 @@ worker's executors.
 
 from typing import TYPE_CHECKING
 
-from hyperscale.distributed.models import WorkflowStatus
+from hyperscale.distributed.models import WorkflowProgress, WorkflowStatus
 from hyperscale.distributed.resources.workflow_throttle_request import WorkflowThrottleRequest
 from hyperscale.distributed.resources.workflow_throttle_response import WorkflowThrottleResponse
 from hyperscale.logging.hyperscale_logging_models import ServerError
 
 if TYPE_CHECKING:
+    from hyperscale.core.jobs.models import WorkflowThrottleUpdate
     from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
     from hyperscale.distributed.nodes.worker.server import WorkerServer
 
@@ -58,22 +59,11 @@ class WorkflowThrottleHandler:
     async def _apply(self, request: WorkflowThrottleRequest) -> WorkflowThrottleResponse:
         progress = self._server._active_workflows.get(request.workflow_id)
         workflow_name = self._server._worker_state._workflow_id_to_name.get(request.workflow_id)
-        if (
-            progress is None
-            or progress.job_id != request.job_id
-            or progress.status != WorkflowStatus.RUNNING.value
-            or workflow_name is None
-        ):
+        if (refusal := self._throttle_refusal(progress, request, workflow_name)) is not None:
             return WorkflowThrottleResponse(
                 job_id=request.job_id,
                 workflow_id=request.workflow_id,
-                error="workflow is not running on this worker",
-            )
-        if self._remote_manager is None:
-            return WorkflowThrottleResponse(
-                job_id=request.job_id,
-                workflow_id=request.workflow_id,
-                error="worker executors are not started",
+                error=refusal,
             )
 
         # The run id the worker dispatched this workflow under (the same
@@ -81,10 +71,62 @@ class WorkflowThrottleHandler:
         updates = await self._remote_manager.throttle_workflow(
             hash(request.workflow_id) % (2**31), workflow_name, request.scale
         )
-        concurrency_caps = [update.concurrency_cap for update in updates if update.concurrency_cap is not None]
+        return self._throttle_response(request, updates)
+
+    def _throttle_refusal(
+        self,
+        progress: WorkflowProgress | None,
+        request: WorkflowThrottleRequest,
+        workflow_name: str | None,
+    ) -> str | None:
+        """Why the throttle cannot be applied here, or None when it can."""
+        if not self._runs_here(progress, request, workflow_name):
+            return "workflow is not running on this worker"
+        if self._remote_manager is None:
+            return "worker executors are not started"
+        return None
+
+    @staticmethod
+    def _runs_here(
+        progress: WorkflowProgress | None,
+        request: WorkflowThrottleRequest,
+        workflow_name: str | None,
+    ) -> bool:
+        """Whether the request's workflow is RUNNING here, for its job, under a known name."""
+        return (
+            WorkflowThrottleHandler._is_running_for_job(progress, request.job_id)
+            and workflow_name is not None
+        )
+
+    @staticmethod
+    def _is_running_for_job(progress: WorkflowProgress | None, job_id: str) -> bool:
+        """Whether a tracked workflow belongs to ``job_id`` and is RUNNING."""
+        return (
+            progress is not None
+            and progress.job_id == job_id
+            and progress.status == WorkflowStatus.RUNNING.value
+        )
+
+    @staticmethod
+    def _throttle_response(
+        request: WorkflowThrottleRequest,
+        updates: list["WorkflowThrottleUpdate"],
+    ) -> WorkflowThrottleResponse:
+        """Summarize the executors' throttle updates into the response."""
+        concurrency_caps = WorkflowThrottleHandler._concurrency_caps(updates)
         return WorkflowThrottleResponse(
             job_id=request.job_id,
             workflow_id=request.workflow_id,
             applied=any(update.applied for update in updates),
-            concurrency_cap=sum(concurrency_caps) if concurrency_caps else None,
+            concurrency_cap=WorkflowThrottleHandler._summed_cap(concurrency_caps),
         )
+
+    @staticmethod
+    def _concurrency_caps(updates: list["WorkflowThrottleUpdate"]) -> list[int]:
+        """The concurrency caps the executors reported."""
+        return [update.concurrency_cap for update in updates if update.concurrency_cap is not None]
+
+    @staticmethod
+    def _summed_cap(concurrency_caps: list[int]) -> int | None:
+        """The total cap across executors, or None when none reported one."""
+        return sum(concurrency_caps) if concurrency_caps else None

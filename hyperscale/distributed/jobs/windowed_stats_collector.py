@@ -30,6 +30,33 @@ from .worker_window_stats import WorkerWindowStats
 _DEFAULT_CLOCK: Clock = RealClock()
 
 
+def _average(total: float, worker_count: int) -> float:
+    """``total`` averaged over the workers that reported (0.0 for none)."""
+    return total / worker_count if worker_count > 0 else 0.0
+
+
+def _merge_step_stats(step_stats_by_name: dict[str, StepStats], step_stats: list[StepStats]) -> None:
+    """Fold one worker's step stats into the totals by step name, copying
+    each so no original is mutated."""
+    for step in step_stats:
+        if step.step_name in step_stats_by_name:
+            existing = step_stats_by_name[step.step_name]
+            step_stats_by_name[step.step_name] = StepStats(
+                step_name=step.step_name,
+                completed_count=existing.completed_count + step.completed_count,
+                failed_count=existing.failed_count + step.failed_count,
+                total_count=existing.total_count + step.total_count,
+            )
+        else:
+            # Copy to avoid mutating original
+            step_stats_by_name[step.step_name] = StepStats(
+                step_name=step.step_name,
+                completed_count=step.completed_count,
+                failed_count=step.failed_count,
+                total_count=step.total_count,
+            )
+
+
 class WindowedStatsCollector:
     """
     Collects workflow progress updates into time-correlated windows.
@@ -136,27 +163,11 @@ class WindowedStatsCollector:
             total_cpu += progress.avg_cpu_percent
             total_memory += progress.avg_memory_mb
 
-            for step in progress.step_stats:
-                if step.step_name in step_stats_by_name:
-                    existing = step_stats_by_name[step.step_name]
-                    step_stats_by_name[step.step_name] = StepStats(
-                        step_name=step.step_name,
-                        completed_count=existing.completed_count + step.completed_count,
-                        failed_count=existing.failed_count + step.failed_count,
-                        total_count=existing.total_count + step.total_count,
-                    )
-                else:
-                    # Copy to avoid mutating original
-                    step_stats_by_name[step.step_name] = StepStats(
-                        step_name=step.step_name,
-                        completed_count=step.completed_count,
-                        failed_count=step.failed_count,
-                        total_count=step.total_count,
-                    )
+            _merge_step_stats(step_stats_by_name, progress.step_stats)
 
         worker_count = len(bucket.worker_stats)
-        avg_cpu = total_cpu / worker_count if worker_count > 0 else 0.0
-        avg_memory = total_memory / worker_count if worker_count > 0 else 0.0
+        avg_cpu = _average(total_cpu, worker_count)
+        avg_memory = _average(total_memory, worker_count)
 
         return WindowedStatsPush(
             job_id=bucket.job_id,
@@ -224,18 +235,34 @@ class WindowedStatsCollector:
         results: list[WindowedStatsPush] = []
 
         async with self._lock:
-            keys_to_flush = [key for key in self._buckets.keys() if key[0] == job_id]
+            keys_to_flush = self._job_keys(job_id)
 
             for key in keys_to_flush:
                 bucket = self._buckets[key]
-                if aggregate:
-                    push = self._aggregate_bucket(bucket)
-                else:
-                    push = self._unaggregated_bucket(bucket)
+                push = self._bucket_push(bucket, aggregate)
                 results.append(push)
                 del self._buckets[key]
 
         return results
+
+    def _bucket_push(self, bucket: WindowBucket, aggregate: bool) -> WindowedStatsPush:
+        """A bucket's push: aggregated for clients, per-worker for gates."""
+        if aggregate:
+            return self._aggregate_bucket(bucket)
+        return self._unaggregated_bucket(bucket)
+
+    def _job_keys(self, job_id: str) -> list[tuple[str, str, int]]:
+        """The keys of every window of one job."""
+        return [key for key in self._buckets.keys() if key[0] == job_id]
+
+    def _workflow_keys(self, job_id: str, workflow_id: str) -> list[tuple[str, str, int]]:
+        """The keys of every window of one workflow of one job."""
+        return [key for key in self._buckets.keys() if key[:2] == (job_id, workflow_id)]
+
+    def _delete_buckets(self, keys: list[tuple[str, str, int]]) -> None:
+        """Remove the windows at ``keys``."""
+        for key in keys:
+            del self._buckets[key]
 
     async def cleanup_job_windows(self, job_id: str) -> int:
         """
@@ -251,9 +278,8 @@ class WindowedStatsCollector:
             Number of windows removed.
         """
         async with self._lock:
-            keys_to_remove = [key for key in self._buckets.keys() if key[0] == job_id]
-            for key in keys_to_remove:
-                del self._buckets[key]
+            keys_to_remove = self._job_keys(job_id)
+            self._delete_buckets(keys_to_remove)
             return len(keys_to_remove)
 
     async def cleanup_workflow_windows(self, job_id: str, workflow_id: str) -> int:
@@ -270,13 +296,8 @@ class WindowedStatsCollector:
             Number of windows removed.
         """
         async with self._lock:
-            keys_to_remove = [
-                key
-                for key in self._buckets.keys()
-                if key[0] == job_id and key[1] == workflow_id
-            ]
-            for key in keys_to_remove:
-                del self._buckets[key]
+            keys_to_remove = self._workflow_keys(job_id, workflow_id)
+            self._delete_buckets(keys_to_remove)
             return len(keys_to_remove)
 
     def get_pending_window_count(self) -> int:
@@ -349,29 +370,35 @@ class WindowedStatsCollector:
 
         async with self._lock:
             for key, bucket in self._buckets.items():
-                if key[0] != job_id:
-                    continue
+                if key[0] == job_id:
+                    self._flush_closed_window(key, bucket, now, aggregate, results, keys_to_remove)
 
-                _, _, bucket_num = key
-                if self._is_window_closed(bucket_num, now):
-                    push = (
-                        self._aggregate_bucket(bucket)
-                        if aggregate
-                        else self._unaggregated_bucket(bucket)
-                    )
-                    results.append(push)
-                    keys_to_remove.append(key)
-                    self._metrics.windows_flushed += 1
-
-                elif (now - bucket.created_at) * 1000 > self._max_window_age_ms:
-                    keys_to_remove.append(key)
-                    self._metrics.windows_dropped_late += 1
-                    self._metrics.stats_dropped_late += len(bucket.worker_stats)
-
-            for key in keys_to_remove:
-                del self._buckets[key]
+            self._delete_buckets(keys_to_remove)
 
         return results
+
+    def _flush_closed_window(
+        self,
+        key: tuple[str, str, int],
+        bucket: WindowBucket,
+        now: float,
+        aggregate: bool,
+        results: list[WindowedStatsPush],
+        keys_to_remove: list[tuple[str, str, int]],
+    ) -> None:
+        """Flush one window once closed, or drop it once older than the
+        maximum window age without closing (a clock running ahead)."""
+        _, _, bucket_num = key
+        if self._is_window_closed(bucket_num, now):
+            push = self._bucket_push(bucket, aggregate)
+            results.append(push)
+            keys_to_remove.append(key)
+            self._metrics.windows_flushed += 1
+
+        elif (now - bucket.created_at) * 1000 > self._max_window_age_ms:
+            keys_to_remove.append(key)
+            self._metrics.windows_dropped_late += 1
+            self._metrics.stats_dropped_late += len(bucket.worker_stats)
 
     async def record(self, worker_id: str, progress: WorkflowProgress) -> bool:
         return await self.add_progress(worker_id, progress)

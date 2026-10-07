@@ -57,40 +57,51 @@ class ManagerDiscoveryCoordinator:
 
         # Initialize discovery services if not provided
         if worker_discovery is None:
-            worker_config = env.get_discovery_config(
-                node_role="manager",
-                static_seeds=[],
-                allow_dynamic_registration=True,
-            )
-            self._worker_discovery: DiscoveryService = DiscoveryService(worker_config)
+            self._worker_discovery: DiscoveryService = self._build_worker_discovery(env)
         else:
             self._worker_discovery: DiscoveryService = worker_discovery
 
         if peer_discovery is None:
-            peer_static_seeds = [
-                f"{host}:{port}" for host, port in config.seed_managers
-            ]
-            # A solo manager (no seeds, no peers) is a valid topology for
-            # L1 smoke tests and degenerate single-node deployments.
-            # DiscoveryConfig refuses an empty seed list otherwise, so
-            # fall back to dynamic registration in that case.
-            peer_config = env.get_discovery_config(
-                node_role="manager",
-                static_seeds=peer_static_seeds,
-                allow_dynamic_registration=not peer_static_seeds,
-            )
-            self._peer_discovery: DiscoveryService = DiscoveryService(peer_config)
-            # Pre-register seed managers
-            for host, port in config.seed_managers:
-                self._peer_discovery.add_peer(
-                    peer_id=f"{host}:{port}",
-                    host=host,
-                    port=port,
-                    role="manager",
-                    datacenter_id=config.datacenter_id,
-                )
+            self._peer_discovery: DiscoveryService = self._build_peer_discovery(env, config)
         else:
             self._peer_discovery: DiscoveryService = peer_discovery
+
+    @staticmethod
+    def _build_worker_discovery(env: "Env") -> DiscoveryService:
+        """Worker discovery (AD-28): no static seeds, workers register dynamically."""
+        worker_config = env.get_discovery_config(
+            node_role="manager",
+            static_seeds=[],
+            allow_dynamic_registration=True,
+        )
+        return DiscoveryService(worker_config)
+
+    @staticmethod
+    def _build_peer_discovery(env: "Env", config: "ManagerConfig") -> DiscoveryService:
+        """Peer-manager discovery (AD-28) seeded with, and pre-registering, the seed managers."""
+        peer_static_seeds = [
+            f"{host}:{port}" for host, port in config.seed_managers
+        ]
+        # A solo manager (no seeds, no peers) is a valid topology for
+        # L1 smoke tests and degenerate single-node deployments.
+        # DiscoveryConfig refuses an empty seed list otherwise, so
+        # fall back to dynamic registration in that case.
+        peer_config = env.get_discovery_config(
+            node_role="manager",
+            static_seeds=peer_static_seeds,
+            allow_dynamic_registration=not peer_static_seeds,
+        )
+        peer_discovery = DiscoveryService(peer_config)
+        # Pre-register seed managers
+        for host, port in config.seed_managers:
+            peer_discovery.add_peer(
+                peer_id=f"{host}:{port}",
+                host=host,
+                port=port,
+                role="manager",
+                datacenter_id=config.datacenter_id,
+            )
+        return peer_discovery
 
     def add_worker(
         self,
@@ -215,14 +226,18 @@ class ManagerDiscoveryCoordinator:
         if self._state._discovery_maintenance_task:
             self._state._discovery_maintenance_task.cancel()
             cancels_requested_before_wait = asyncio.current_task().cancelling()
-            try:
-                await self._state._discovery_maintenance_task
-            except asyncio.CancelledError:
-                # The task we cancelled ended; a cancel aimed at this task
-                # while it waited goes on.
-                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
-                    raise
+            await self._await_cancelled_maintenance_task(cancels_requested_before_wait)
             self._state._discovery_maintenance_task = None
+
+    async def _await_cancelled_maintenance_task(self, cancels_requested_before_wait: int) -> None:
+        """Wait out the cancelled maintenance task; re-raise a cancel aimed at this task meanwhile."""
+        try:
+            await self._state._discovery_maintenance_task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
 
     async def maintenance_loop(self) -> None:
         """
@@ -232,34 +247,40 @@ class ManagerDiscoveryCoordinator:
         """
         interval = self._config.discovery_failure_decay_interval_seconds
 
-        while True:
-            try:
-                await _DEFAULT_CLOCK.sleep(interval)
+        while await self._run_maintenance_pass(interval):
+            continue
 
-                # Decay failure counts
-                self._worker_discovery.decay_failures()
-                self._peer_discovery.decay_failures()
+    async def _run_maintenance_pass(self, interval: float) -> bool:
+        """One AD-28 maintenance pass; False once the loop is cancelled, errors are logged."""
+        try:
+            await _DEFAULT_CLOCK.sleep(interval)
 
-                await self._logger.log(
-                    ServerDebug(
-                        message="Discovery maintenance completed",
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
-                )
+            # Decay failure counts
+            self._worker_discovery.decay_failures()
+            self._peer_discovery.decay_failures()
 
-            except asyncio.CancelledError:
-                break
-            except Exception as maintenance_error:
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"Discovery maintenance error: {maintenance_error}",
-                        node_host=self._config.host,
-                        node_port=self._config.tcp_port,
-                        node_id=self._node_id,
-                    ),
-                )
+            await self._logger.log(
+                ServerDebug(
+                    message="Discovery maintenance completed",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+            return True
+
+        except asyncio.CancelledError:
+            return False
+        except Exception as maintenance_error:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Discovery maintenance error: {maintenance_error}",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+            return True
 
     def get_discovery_metrics(self) -> dict[str, int]:
         """Get discovery-related metrics."""

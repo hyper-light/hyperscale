@@ -173,6 +173,11 @@ class ManagerConfig:
     wal_data_dir: Path | None = None
 
 
+def _addresses_or_empty(addresses: list[tuple[str, int]] | None) -> list[tuple[str, int]]:
+    """The given address list, or a fresh empty one when none (or an empty one) was given."""
+    return addresses or []
+
+
 def create_manager_config_from_env(
     host: str,
     tcp_port: int,
@@ -211,10 +216,10 @@ def create_manager_config_from_env(
         tcp_port=tcp_port,
         udp_port=udp_port,
         datacenter_id=datacenter_id,
-        seed_gates=seed_gates or [],
-        gate_udp_addrs=gate_udp_addrs or [],
-        seed_managers=seed_managers or [],
-        manager_udp_peers=manager_udp_peers or [],
+        seed_gates=_addresses_or_empty(seed_gates),
+        gate_udp_addrs=_addresses_or_empty(gate_udp_addrs),
+        seed_managers=_addresses_or_empty(seed_managers),
+        manager_udp_peers=_addresses_or_empty(manager_udp_peers),
         quorum_timeout_seconds=quorum_timeout,
         workflow_timeout_seconds=workflow_timeout,
         # From env

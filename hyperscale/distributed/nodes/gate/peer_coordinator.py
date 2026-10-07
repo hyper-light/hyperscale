@@ -280,16 +280,7 @@ class GatePeerCoordinator:
         Returns:
             Set of gate IDs removed from runtime state.
         """
-        udp_addr: tuple[str, int] | None = None
-        peer_heartbeat: GateHeartbeat | None = None
-
-        for candidate_udp_addr, candidate_tcp_addr in list(
-            self._state.iter_udp_to_tcp_mappings()
-        ):
-            if candidate_tcp_addr == peer_addr:
-                udp_addr = candidate_udp_addr
-                peer_heartbeat = self._state.get_gate_peer_heartbeat(udp_addr)
-                break
+        udp_addr, peer_heartbeat = self._find_peer_udp_mapping(peer_addr)
 
         peer_host, peer_port = peer_addr
         fallback_peer_id = f"{peer_host}:{peer_port}"
@@ -318,6 +309,19 @@ class GatePeerCoordinator:
         )
 
         return gate_ids_to_remove
+
+    def _find_peer_udp_mapping(
+        self,
+        peer_addr: tuple[str, int],
+    ) -> tuple[tuple[str, int] | None, GateHeartbeat | None]:
+        """The UDP address mapped to the peer's TCP address and its last heartbeat (None, None if unmapped)."""
+        for candidate_udp_addr, candidate_tcp_addr in list(
+            self._state.iter_udp_to_tcp_mappings()
+        ):
+            if candidate_tcp_addr == peer_addr:
+                return candidate_udp_addr, self._state.get_gate_peer_heartbeat(candidate_udp_addr)
+
+        return None, None
 
     def get_healthy_gates(self) -> list[GateInfo]:
         gates: list[GateInfo] = []

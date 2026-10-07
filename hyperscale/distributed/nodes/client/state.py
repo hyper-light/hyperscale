@@ -124,6 +124,10 @@ class ClientState:
         a newer one replaces the one held."""
         if job_id not in self._jobs:
             return
+        self._hold_newer_read_view(job_id, fence_token, view_time)
+
+    def _hold_newer_read_view(self, job_id: str, fence_token: int, view_time: float) -> None:
+        """Replace the held read view of a job only with a newer one."""
         held = self._job_read_views.get(job_id)
         if held is None or (fence_token, view_time) > held:
             self._job_read_views[job_id] = (fence_token, view_time)
@@ -165,26 +169,38 @@ class ClientState:
         self._progress_callbacks.pop(job_id, None)
         self._gate_job_leaders.pop(job_id, None)
         self._request_routing_locks.pop(job_id, None)
-        for leader_key in [key for key in self._manager_job_leaders if key[0] == job_id]:
+        for leader_key in self._manager_job_leader_keys(job_id):
             del self._manager_job_leaders[leader_key]
+
+    def _manager_job_leader_keys(self, job_id: str) -> list:
+        """The manager job-leader keys held for a job."""
+        return [key for key in self._manager_job_leaders if key[0] == job_id]
 
     def release_finished_jobs(self, now: float, retention_seconds: float) -> list[str]:
         """Forget the jobs found finished at least ``retention_seconds``
         ago (a job's age counts from the first sweep that finds it
         finished). Returns the released job ids."""
-        for job_id, event in self._job_events.items():
-            if event.is_set():
-                self._job_finished_seen_at.setdefault(job_id, now)
+        self._mark_newly_finished_jobs(now)
 
-        expired_job_ids = [
-            job_id
-            for job_id, finished_seen_at in self._job_finished_seen_at.items()
-            if now - finished_seen_at >= retention_seconds
-        ]
+        expired_job_ids = self._expired_finished_job_ids(now, retention_seconds)
         for job_id in expired_job_ids:
             self.release_job(job_id)
 
         return expired_job_ids
+
+    def _mark_newly_finished_jobs(self, now: float) -> None:
+        """Note the first sweep that finds each job finished."""
+        for job_id, event in self._job_events.items():
+            if event.is_set():
+                self._job_finished_seen_at.setdefault(job_id, now)
+
+    def _expired_finished_job_ids(self, now: float, retention_seconds: float) -> list[str]:
+        """The jobs found finished at least ``retention_seconds`` ago."""
+        return [
+            job_id
+            for job_id, finished_seen_at in self._job_finished_seen_at.items()
+            if now - finished_seen_at >= retention_seconds
+        ]
 
     def mark_job_target(self, job_id: str, target: tuple[str, int]) -> None:
         """

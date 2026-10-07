@@ -57,6 +57,10 @@ class ManagerLeadershipCoordinator:
         """
         return self._state.get_active_peer_count() >= self.get_quorum_size()
 
+    def _should_step_down_for_quorum(self, failure_count: int) -> bool:
+        """AD-3: a leader that has lacked quorum for MAX_CONSECUTIVE_QUORUM_FAILURES checks."""
+        return self._is_leader() and failure_count >= MAX_CONSECUTIVE_QUORUM_FAILURES
+
     async def check_quorum_status(self) -> None:
         """One lost-quorum check: reset the failure streak while quorum
         holds; a leader that has lacked quorum for
@@ -67,7 +71,7 @@ class ManagerLeadershipCoordinator:
             return
 
         failure_count = self._state.increment_quorum_failures()
-        if not self._is_leader() or failure_count < MAX_CONSECUTIVE_QUORUM_FAILURES:
+        if not self._should_step_down_for_quorum(failure_count):
             return
 
         await self._logger.log(

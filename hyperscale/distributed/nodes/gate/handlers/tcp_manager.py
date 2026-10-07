@@ -19,12 +19,14 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
+    NegotiatedCapabilities,
     NodeCapabilities,
     ProtocolVersion,
     negotiate_capabilities,
 )
 from hyperscale.distributed.reliability import BackpressureLevel, BackpressureSignal
 from hyperscale.distributed.discovery.security import RoleValidator
+from hyperscale.distributed.discovery.security.certificate_claims import CertificateClaims
 from hyperscale.distributed.discovery.security.role_validator import (
     CertificateParseError,
     NodeRole as SecurityNodeRole,
@@ -255,226 +257,12 @@ class GateManagerHandler:
         try:
             heartbeat = ManagerHeartbeat.load(data)
 
-            datacenter_id = heartbeat.datacenter
-            manager_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+            if (
+                rejection := await self._reject_manager_registration(heartbeat, transport)
+            ) is not None:
+                return rejection
 
-            # Cluster isolation validation (AD-28 Issue 2)
-            if heartbeat.cluster_id != self._env.CLUSTER_ID:
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"Manager {heartbeat.node_id} rejected: cluster_id mismatch "
-                        f"(manager={heartbeat.cluster_id}, gate={self._env.CLUSTER_ID})",
-                        node_host=self._get_host(),
-                        node_port=self._get_tcp_port(),
-                        node_id=self._get_node_id().short,
-                    ),
-                )
-                return ManagerRegistrationResponse(
-                    accepted=False,
-                    gate_id=self._get_node_id().full,
-                    healthy_gates=[],
-                    error=f"Cluster isolation violation: manager cluster_id '{heartbeat.cluster_id}' "
-                    f"does not match gate cluster_id '{self._env.CLUSTER_ID}'",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            if heartbeat.environment_id != self._env.ENVIRONMENT_ID:
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"Manager {heartbeat.node_id} rejected: environment_id mismatch "
-                        f"(manager={heartbeat.environment_id}, gate={self._env.ENVIRONMENT_ID})",
-                        node_host=self._get_host(),
-                        node_port=self._get_tcp_port(),
-                        node_id=self._get_node_id().short,
-                    ),
-                )
-                return ManagerRegistrationResponse(
-                    accepted=False,
-                    gate_id=self._get_node_id().full,
-                    healthy_gates=[],
-                    error=f"Environment isolation violation: manager environment_id '{heartbeat.environment_id}' "
-                    f"does not match gate environment_id '{self._env.ENVIRONMENT_ID}'",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            # Role-based mTLS validation (AD-28 Issue 1)
-            cert_der = get_peer_certificate_der(transport)
-            if cert_der is not None:
-                try:
-                    claims = self._role_validator.extract_peer_claims(cert_der)
-                except CertificateParseError as parse_error:
-                    # Strict mode treats an unparseable certificate as
-                    # a validation failure, not a fallback to defaults
-                    # -- the defaults are this gate's own cluster and
-                    # environment, so defaulted claims would pass
-                    # validate_claims below (and parse to CLIENT, an
-                    # allowed edge into gates).
-                    await self._logger.log(
-                        ServerWarning(
-                            message=(
-                                f"Manager {heartbeat.node_id} rejected: "
-                                f"unparseable certificate in strict mode: {parse_error}"
-                            ),
-                            node_host=self._get_host(),
-                            node_port=self._get_tcp_port(),
-                            node_id=self._get_node_id().short,
-                        ),
-                    )
-                    return ManagerRegistrationResponse(
-                        accepted=False,
-                        gate_id=self._get_node_id().full,
-                        healthy_gates=[],
-                        error=f"Certificate validation failed: unparseable certificate: {parse_error}",
-                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                    ).dump()
-
-                validation_result = self._role_validator.validate_claims(claims)
-                if not validation_result.allowed:
-                    await self._logger.log(
-                        ServerWarning(
-                            message=f"Manager {heartbeat.node_id} rejected: certificate claims validation failed - {validation_result.reason}",
-                            node_host=self._get_host(),
-                            node_port=self._get_tcp_port(),
-                            node_id=self._get_node_id().short,
-                        ),
-                    )
-                    return ManagerRegistrationResponse(
-                        accepted=False,
-                        gate_id=self._get_node_id().full,
-                        healthy_gates=[],
-                        error=f"Certificate claims validation failed: {validation_result.reason}",
-                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                    ).dump()
-
-                if not self._role_validator.is_allowed(
-                    claims.role, SecurityNodeRole.GATE
-                ):
-                    await self._logger.log(
-                        ServerWarning(
-                            message=f"Manager {heartbeat.node_id} rejected: role-based access denied ({claims.role.value}->gate not allowed)",
-                            node_host=self._get_host(),
-                            node_port=self._get_tcp_port(),
-                            node_id=self._get_node_id().short,
-                        ),
-                    )
-                    return ManagerRegistrationResponse(
-                        accepted=False,
-                        gate_id=self._get_node_id().full,
-                        healthy_gates=[],
-                        error=f"Role-based access denied: {claims.role.value} cannot register with gates",
-                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                    ).dump()
-            else:
-                if not self._role_validator.is_allowed(
-                    SecurityNodeRole.MANAGER, SecurityNodeRole.GATE
-                ):
-                    await self._logger.log(
-                        ServerWarning(
-                            message=f"Manager {heartbeat.node_id} registration rejected: role-based access denied (manager->gate not allowed)",
-                            node_host=self._get_host(),
-                            node_port=self._get_tcp_port(),
-                            node_id=self._get_node_id().short,
-                        ),
-                    )
-                    return ManagerRegistrationResponse(
-                        accepted=False,
-                        gate_id=self._get_node_id().full,
-                        healthy_gates=[],
-                        error="Role-based access denied: managers cannot register with gates in this configuration",
-                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                    ).dump()
-
-            # Protocol version negotiation (AD-25)
-            manager_version = ProtocolVersion(
-                major=getattr(heartbeat, "protocol_version_major", 1),
-                minor=getattr(heartbeat, "protocol_version_minor", 0),
-            )
-            manager_caps_str = getattr(heartbeat, "capabilities", "")
-            manager_capabilities = (
-                set(manager_caps_str.split(",")) if manager_caps_str else set()
-            )
-
-            manager_node_caps = NodeCapabilities(
-                protocol_version=manager_version,
-                capabilities=manager_capabilities,
-                node_version=heartbeat.node_id,
-            )
-
-            negotiated = negotiate_capabilities(
-                self._node_capabilities, manager_node_caps
-            )
-
-            if not negotiated.compatible:
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"Manager registration rejected: incompatible protocol version "
-                        f"{manager_version} (we are {CURRENT_PROTOCOL_VERSION})",
-                        node_host=self._get_host(),
-                        node_port=self._get_tcp_port(),
-                        node_id=self._get_node_id().short,
-                    ),
-                )
-                return ManagerRegistrationResponse(
-                    accepted=False,
-                    gate_id=self._get_node_id().full,
-                    healthy_gates=[],
-                    error=f"Incompatible protocol version: {manager_version} vs {CURRENT_PROTOCOL_VERSION}",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                ).dump()
-
-            self._state._manager_negotiated_caps[manager_addr] = negotiated
-
-            await self._record_heartbeat_canonically(heartbeat, addr, manager_addr)
-
-            if heartbeat.backpressure_level > 0 or heartbeat.backpressure_delay_ms > 0:
-                backpressure_signal = BackpressureSignal(
-                    level=BackpressureLevel(heartbeat.backpressure_level),
-                    suggested_delay_ms=heartbeat.backpressure_delay_ms,
-                )
-                await self._handle_manager_backpressure_signal(
-                    manager_addr, datacenter_id, backpressure_signal
-                )
-
-            await self._logger.log(
-                ServerInfo(
-                    message=f"Manager registered: {heartbeat.node_id} from DC {datacenter_id} "
-                    f"({heartbeat.worker_count} workers, protocol {manager_version}, "
-                    f"{len(negotiated.common_features)} features)",
-                    node_host=self._get_host(),
-                    node_port=self._get_tcp_port(),
-                    node_id=self._get_node_id().short,
-                ),
-            )
-
-            negotiated_caps_str = ",".join(sorted(negotiated.common_features))
-            response = ManagerRegistrationResponse(
-                accepted=True,
-                gate_id=self._get_node_id().full,
-                healthy_gates=self._get_healthy_gates(),
-                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                capabilities=negotiated_caps_str,
-            )
-
-            self._task_runner.run(
-                self._broadcast_manager_discovery,
-                datacenter_id,
-                manager_addr,
-                None,
-                heartbeat.worker_count,
-                getattr(heartbeat, "healthy_worker_count", heartbeat.worker_count),
-                heartbeat.available_cores,
-                getattr(heartbeat, "total_cores", 0),
-            )
-
-            return response.dump()
+            return await self._negotiate_manager_registration(heartbeat, addr)
 
         except Exception as error:
             await handle_exception(error, "manager_register")
@@ -484,6 +272,226 @@ class GateManagerHandler:
                 healthy_gates=[],
                 error=str(error),
             ).dump()
+
+    async def _reject_registration(self, warning_message: str, error: str) -> bytes:
+        """Log why a manager registration was refused and build the refusal response."""
+        await self._logger.log(
+            ServerWarning(
+                message=warning_message,
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().short,
+            ),
+        )
+        return ManagerRegistrationResponse(
+            accepted=False,
+            gate_id=self._get_node_id().full,
+            healthy_gates=[],
+            error=error,
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+        ).dump()
+
+    async def _reject_manager_registration(
+        self,
+        heartbeat: ManagerHeartbeat,
+        transport: asyncio.Transport,
+    ) -> bytes | None:
+        """The refusal for a manager failing isolation (AD-28 Issue 2) or mTLS
+        role validation (AD-28 Issue 1), or None when it passes both."""
+        if (rejection := await self._reject_isolation_violation(heartbeat)) is not None:
+            return rejection
+        return await self._reject_certificate(heartbeat, transport)
+
+    async def _reject_isolation_violation(self, heartbeat: ManagerHeartbeat) -> bytes | None:
+        """Refuse a manager from another cluster or environment (AD-28 Issue 2)."""
+        # Cluster isolation validation (AD-28 Issue 2)
+        if heartbeat.cluster_id != self._env.CLUSTER_ID:
+            return await self._reject_registration(
+                f"Manager {heartbeat.node_id} rejected: cluster_id mismatch "
+                f"(manager={heartbeat.cluster_id}, gate={self._env.CLUSTER_ID})",
+                f"Cluster isolation violation: manager cluster_id '{heartbeat.cluster_id}' "
+                f"does not match gate cluster_id '{self._env.CLUSTER_ID}'",
+            )
+
+        if heartbeat.environment_id != self._env.ENVIRONMENT_ID:
+            return await self._reject_registration(
+                f"Manager {heartbeat.node_id} rejected: environment_id mismatch "
+                f"(manager={heartbeat.environment_id}, gate={self._env.ENVIRONMENT_ID})",
+                f"Environment isolation violation: manager environment_id '{heartbeat.environment_id}' "
+                f"does not match gate environment_id '{self._env.ENVIRONMENT_ID}'",
+            )
+
+        return None
+
+    async def _reject_certificate(
+        self,
+        heartbeat: ManagerHeartbeat,
+        transport: asyncio.Transport,
+    ) -> bytes | None:
+        """Refuse a manager whose certificate (or, without one, whose role) may
+        not register with gates (AD-28 Issue 1)."""
+        # Role-based mTLS validation (AD-28 Issue 1)
+        cert_der = get_peer_certificate_der(transport)
+        if cert_der is not None:
+            return await self._reject_certificate_claims(heartbeat, cert_der)
+
+        if not self._role_validator.is_allowed(
+            SecurityNodeRole.MANAGER, SecurityNodeRole.GATE
+        ):
+            return await self._reject_registration(
+                f"Manager {heartbeat.node_id} registration rejected: role-based access denied (manager->gate not allowed)",
+                "Role-based access denied: managers cannot register with gates in this configuration",
+            )
+
+        return None
+
+    async def _reject_certificate_claims(
+        self,
+        heartbeat: ManagerHeartbeat,
+        cert_der: bytes,
+    ) -> bytes | None:
+        """Refuse a manager whose certificate does not parse or whose claims fail (AD-28 Issue 1)."""
+        try:
+            claims = self._role_validator.extract_peer_claims(cert_der)
+        except CertificateParseError as parse_error:
+            # Strict mode treats an unparseable certificate as
+            # a validation failure, not a fallback to defaults
+            # -- the defaults are this gate's own cluster and
+            # environment, so defaulted claims would pass
+            # validate_claims below (and parse to CLIENT, an
+            # allowed edge into gates).
+            return await self._reject_registration(
+                (
+                    f"Manager {heartbeat.node_id} rejected: "
+                    f"unparseable certificate in strict mode: {parse_error}"
+                ),
+                f"Certificate validation failed: unparseable certificate: {parse_error}",
+            )
+
+        return await self._reject_disallowed_claims(heartbeat, claims)
+
+    async def _reject_disallowed_claims(
+        self,
+        heartbeat: ManagerHeartbeat,
+        claims: CertificateClaims,
+    ) -> bytes | None:
+        """Refuse a manager whose certificate claims fail validation or whose role may not reach gates."""
+        validation_result = self._role_validator.validate_claims(claims)
+        if not validation_result.allowed:
+            return await self._reject_registration(
+                f"Manager {heartbeat.node_id} rejected: certificate claims validation failed - {validation_result.reason}",
+                f"Certificate claims validation failed: {validation_result.reason}",
+            )
+
+        if not self._role_validator.is_allowed(
+            claims.role, SecurityNodeRole.GATE
+        ):
+            return await self._reject_registration(
+                f"Manager {heartbeat.node_id} rejected: role-based access denied ({claims.role.value}->gate not allowed)",
+                f"Role-based access denied: {claims.role.value} cannot register with gates",
+            )
+
+        return None
+
+    async def _negotiate_manager_registration(
+        self,
+        heartbeat: ManagerHeartbeat,
+        addr: tuple[str, int],
+    ) -> bytes:
+        """Negotiate the manager's protocol version and capabilities (AD-25),
+        accepting it when compatible."""
+        # Protocol version negotiation (AD-25)
+        manager_version = ProtocolVersion(
+            major=getattr(heartbeat, "protocol_version_major", 1),
+            minor=getattr(heartbeat, "protocol_version_minor", 0),
+        )
+        manager_caps_str = getattr(heartbeat, "capabilities", "")
+        manager_capabilities = (
+            set(manager_caps_str.split(",")) if manager_caps_str else set()
+        )
+
+        manager_node_caps = NodeCapabilities(
+            protocol_version=manager_version,
+            capabilities=manager_capabilities,
+            node_version=heartbeat.node_id,
+        )
+
+        negotiated = negotiate_capabilities(
+            self._node_capabilities, manager_node_caps
+        )
+
+        if not negotiated.compatible:
+            return await self._reject_registration(
+                f"Manager registration rejected: incompatible protocol version "
+                f"{manager_version} (we are {CURRENT_PROTOCOL_VERSION})",
+                f"Incompatible protocol version: {manager_version} vs {CURRENT_PROTOCOL_VERSION}",
+            )
+
+        return await self._accept_manager_registration(
+            heartbeat,
+            addr,
+            manager_version,
+            negotiated,
+        )
+
+    async def _accept_manager_registration(
+        self,
+        heartbeat: ManagerHeartbeat,
+        addr: tuple[str, int],
+        manager_version: ProtocolVersion,
+        negotiated: NegotiatedCapabilities,
+    ) -> bytes:
+        """Record an accepted manager, apply its backpressure, and answer with the healthy gates."""
+        datacenter_id = heartbeat.datacenter
+        manager_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+
+        self._state._manager_negotiated_caps[manager_addr] = negotiated
+
+        await self._record_heartbeat_canonically(heartbeat, addr, manager_addr)
+
+        if heartbeat.backpressure_level > 0 or heartbeat.backpressure_delay_ms > 0:
+            backpressure_signal = BackpressureSignal(
+                level=BackpressureLevel(heartbeat.backpressure_level),
+                suggested_delay_ms=heartbeat.backpressure_delay_ms,
+            )
+            await self._handle_manager_backpressure_signal(
+                manager_addr, datacenter_id, backpressure_signal
+            )
+
+        await self._logger.log(
+            ServerInfo(
+                message=f"Manager registered: {heartbeat.node_id} from DC {datacenter_id} "
+                f"({heartbeat.worker_count} workers, protocol {manager_version}, "
+                f"{len(negotiated.common_features)} features)",
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().short,
+            ),
+        )
+
+        negotiated_caps_str = ",".join(sorted(negotiated.common_features))
+        response = ManagerRegistrationResponse(
+            accepted=True,
+            gate_id=self._get_node_id().full,
+            healthy_gates=self._get_healthy_gates(),
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            capabilities=negotiated_caps_str,
+        )
+
+        self._task_runner.run(
+            self._broadcast_manager_discovery,
+            datacenter_id,
+            manager_addr,
+            None,
+            heartbeat.worker_count,
+            getattr(heartbeat, "healthy_worker_count", heartbeat.worker_count),
+            heartbeat.available_cores,
+            getattr(heartbeat, "total_cores", 0),
+        )
+
+        return response.dump()
 
     async def handle_discovery(
         self,
@@ -513,11 +521,11 @@ class GateManagerHandler:
             datacenter_id = broadcast.datacenter
             manager_addr = tuple(broadcast.manager_tcp_addr)
 
-            if broadcast.manager_udp_addr:
-                dc_udp = datacenter_manager_udp.setdefault(datacenter_id, [])
-                udp_addr = tuple(broadcast.manager_udp_addr)
-                if udp_addr not in dc_udp:
-                    dc_udp.append(udp_addr)
+            self._track_discovered_manager_udp(
+                datacenter_manager_udp,
+                datacenter_id,
+                broadcast,
+            )
 
             dc_managers = self._datacenter_managers.setdefault(datacenter_id, [])
             if manager_addr not in dc_managers:
@@ -559,6 +567,19 @@ class GateManagerHandler:
             await handle_exception(error, "manager_discovery")
             return b"error"
 
+    @staticmethod
+    def _track_discovered_manager_udp(
+        datacenter_manager_udp: dict[str, list[tuple[str, int]]],
+        datacenter_id: str,
+        broadcast: ManagerDiscoveryBroadcast,
+    ) -> None:
+        """Add a discovered manager's UDP address to its datacenter's list, once."""
+        if broadcast.manager_udp_addr:
+            dc_udp = datacenter_manager_udp.setdefault(datacenter_id, [])
+            udp_addr = tuple(broadcast.manager_udp_addr)
+            if udp_addr not in dc_udp:
+                dc_udp.append(udp_addr)
+
     async def handle_reporter_result_push(
         self,
         addr: tuple[str, int],
@@ -594,38 +615,55 @@ class GateManagerHandler:
                 ),
             )
 
-            if self._get_progress_callback is None or self._send_tcp is None:
-                return b"no_callback"
-
-            callback_addr = self._get_progress_callback(push.job_id)
-            if callback_addr is None:
-                return b"no_callback"
-
-            try:
-                response, _ = await self._send_tcp(
-                    callback_addr,
-                    "reporter_result_push",
-                    data,
-                    timeout=self._env.GATE_TCP_TIMEOUT_STANDARD,
-                )
-                # send_tcp returns transport errors rather than raising.
-                if isinstance(response, Exception):
-                    raise response
-                return b"ok"
-            except Exception as forward_error:
-                await self._logger.log(
-                    ServerWarning(
-                        message=(
-                            f"Failed to forward reporter result for job {push.job_id[:8]}... "
-                            f"to client {callback_addr}: {forward_error}"
-                        ),
-                        node_host=self._get_host(),
-                        node_port=self._get_tcp_port(),
-                        node_id=self._get_node_id().short,
-                    ),
-                )
-                return b"forward_failed"
+            return await self._forward_reporter_result(push, data)
 
         except Exception as error:
             await handle_exception(error, "reporter_result_push")
             return b"error"
+
+    async def _forward_reporter_result(self, push: ReporterResultPush, data: bytes) -> bytes:
+        """Forward a reporter result to the job's client callback, if one is registered."""
+        if not self._can_forward_reporter_results():
+            return b"no_callback"
+
+        callback_addr = self._get_progress_callback(push.job_id)
+        if callback_addr is None:
+            return b"no_callback"
+
+        return await self._send_reporter_result_to_client(push, data, callback_addr)
+
+    def _can_forward_reporter_results(self) -> bool:
+        """Whether this handler was wired with a client-callback lookup and a TCP sender."""
+        return self._get_progress_callback is not None and self._send_tcp is not None
+
+    async def _send_reporter_result_to_client(
+        self,
+        push: ReporterResultPush,
+        data: bytes,
+        callback_addr: tuple[str, int],
+    ) -> bytes:
+        """Send the reporter result to the client, logging a failed forward."""
+        try:
+            response, _ = await self._send_tcp(
+                callback_addr,
+                "reporter_result_push",
+                data,
+                timeout=self._env.GATE_TCP_TIMEOUT_STANDARD,
+            )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
+            return b"ok"
+        except Exception as forward_error:
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to forward reporter result for job {push.job_id[:8]}... "
+                        f"to client {callback_addr}: {forward_error}"
+                    ),
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=self._get_node_id().short,
+                ),
+            )
+            return b"forward_failed"

@@ -14,7 +14,7 @@ from hyperscale.distributed.raft.models import (
     RaftLogEntry,
 )
 from hyperscale.distributed.raft.models.ledger_append_command import LEDGER_APPEND_COMMAND, LedgerAppendCommand
-from hyperscale.distributed.raft.raft_node import HEARTBEAT_INTERVAL
+from hyperscale.distributed.raft.raft_node import HEARTBEAT_INTERVAL, RaftNode
 
 if TYPE_CHECKING:
     from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
@@ -84,23 +84,37 @@ class LedgerRegionSpan:
         if not self.tier_spans_regions():
             return False
 
+        return await self._await_holders_spanning_regions(entry)
+
+    async def _await_holders_spanning_regions(self, entry: "WALEntry") -> bool:
+        """Poll the job group's leader each heartbeat until the entry's holders
+        span two regions (AD-38 GLOBAL), or the group retires."""
         job_id = msgspec.msgpack.decode(entry.payload)[0]
         while (node := self._consensus.get_node(job_id)) is not None:
-            leader_id = node.current_leader
-            if leader_id is not None and self._spans_regions(
-                await self._holders_via(leader_id, job_id, entry.payload)
-            ):
+            if await self._leader_holders_span_regions(node, job_id, entry.payload):
                 return True
             await self._clock.sleep(HEARTBEAT_INTERVAL)
 
         # The group retired (job cleaned up) before a second region held it.
         return False
 
+    async def _leader_holders_span_regions(self, node: RaftNode, job_id: str, payload: bytes) -> bool:
+        """Whether the group has a leader and the holders it reports span two regions."""
+        leader_id = node.current_leader
+        return leader_id is not None and self._spans_regions(
+            await self._holders_via(leader_id, job_id, payload)
+        )
+
     def holders(self, job_id: str, payload: bytes) -> list[str]:
         """Members holding the entry, answered by the group's leader."""
         node = self._consensus.get_node(job_id)
         if node is None or not node.is_leader():
             return []
+        return self._leader_holders(node, payload)
+
+    @staticmethod
+    def _leader_holders(node: RaftNode, payload: bytes) -> list[str]:
+        """Members the leader ``node`` knows hold the latest entry carrying ``payload``."""
         index = node.last_index_where(lambda log_entry: _carries_payload(log_entry, payload))
         if index is None:
             return []
@@ -117,6 +131,16 @@ class LedgerRegionSpan:
         if (leader_addr := self._consensus.member_address(leader_id)) is None:
             return []
 
+        return await self._query_leader_holders(leader_id, leader_addr, job_id, payload)
+
+    async def _query_leader_holders(
+        self,
+        leader_id: str,
+        leader_addr: tuple[str, int],
+        job_id: str,
+        payload: bytes,
+    ) -> list[str]:
+        """Ask the remote group leader which members hold the entry; none on no answer."""
         response = await self._send_tcp(
             leader_addr,
             self._query_method,
