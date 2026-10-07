@@ -21,13 +21,7 @@ class ThroughputWitnessConfig:
     # so the BOCPD detector has at least a handful of samples to
     # establish a prior before its decisions are honored.
     cold_start_min_observations: int = 5
-    # Maximum samples retained per (worker, workflow) for the K-S
-    # adaptive-window test. Bounded so memory stays O(streams ×
-    # max_history_per_stream).
-    max_history_per_stream: int = 1024
-    # When the K-S test rejects stationarity at this level, the
-    # witness narrows the BOCPD's effective baseline to the most
-    # recent half of the history. ``alpha_system`` from the budget
-    # config is used by default — exposing it here lets a deployment
-    # tune the K-S sensitivity independently of the FPR budget.
-    ks_alpha_override: float | None = None
+    # Shortest time between two samples a stream takes; 0.0 takes every
+    # sample. The manager derives it from the K-S sample sizes its α
+    # floor needs (``witness_feed_derivation``).
+    minimum_sample_interval_seconds: float = 0.0

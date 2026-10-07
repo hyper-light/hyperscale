@@ -95,7 +95,10 @@ class WorkflowClassAlphaPosterior:
 
     @property
     def posterior_mean(self) -> float:
-        """E[p] = α / (α + β). Range: (0, 1)."""
+        """E[p] = α / (α + β), the success mean under the stored prior.
+        Range: (0, 1). Observability only: the outcome-weighted α
+        budget (``HierarchicalAlphaTuner.alpha_budget``) reads the
+        evidence net of the prior."""
         denom = self.alpha + self.beta
         if denom <= 0.0:
             return 0.0
@@ -104,42 +107,29 @@ class WorkflowClassAlphaPosterior:
     @property
     def posterior_variance(self) -> float:
         """Var[p] = αβ / ((α+β)² (α+β+1)). Smaller variance = more
-        confident posterior. Used as the bounds-tightening signal
-        when composing with H6's hierarchical α budget."""
+        confident posterior. Observability only."""
         sum_ab = self.alpha + self.beta
         if sum_ab <= 0.0:
             return 0.0
         return (self.alpha * self.beta) / (sum_ab * sum_ab * (sum_ab + 1.0))
 
-    def alpha_budget(self, floor: float, ceiling: float) -> float:
-        """Compose posterior mean with the H6 α budget bounds.
-
-        Returns ``clamp(posterior_mean, floor, ceiling)``. Floor
-        and ceiling come from ``HierarchicalAlphaConfig`` in the
-        progress-witness module, so this method bridges H8's
-        Bayesian learning with H6's policy bounds without H8
-        needing to know about that module's internals.
-        """
-        mean = self.posterior_mean
-        if mean < floor:
-            return floor
-        if mean > ceiling:
-            return ceiling
-        return mean
-
     def to_bytes(self) -> bytes:
         """Serialize for AD-34 in-state persistence.
 
         Format: 7 ``:``-delimited fields. ``workflow_class`` is the
-        trailing free-form slot.
+        trailing free-form slot. Floats are written as ``repr`` -- the
+        shortest string that parses back to the same float -- so a
+        new leader restores the posterior bit-for-bit and budgets α
+        exactly as the old one did (``from_bytes`` parses any float
+        text, so snapshots written at six decimals still load).
         """
         parts = [
-            f"{self.alpha:.6f}".encode(),
-            f"{self.beta:.6f}".encode(),
+            repr(self.alpha).encode(),
+            repr(self.beta).encode(),
             str(self.successes).encode(),
             str(self.failures).encode(),
             str(self.total_seen).encode(),
-            f"{self.last_outcome_at:.6f}".encode(),
+            repr(self.last_outcome_at).encode(),
             self.workflow_class.encode(),
         ]
         return b":".join(parts)

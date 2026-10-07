@@ -40,6 +40,7 @@ from hyperscale.distributed.models import HealthcheckExtensionRequest, Healthche
 from hyperscale.distributed.health.progress_witness import WitnessVerdictKind
 from hyperscale.distributed.health.extension_decision import ExtensionWitnessEvidence
 
+from .applied_outcome_window import AppliedOutcomeWindow
 from .worker_health_manager_config import WorkerHealthManagerConfig
 
 if TYPE_CHECKING:
@@ -117,13 +118,35 @@ class WorkerHealthManager:
         # Track consecutive extension failures for eviction decisions
         self._extension_failures: dict[str, int] = {}
 
+        # Phase H8 — Bayesian per-workflow-class outcome posterior.
+        # Updated whenever an outcome event is applied (locally on
+        # workflow termination, or remotely via AD-48 #|o
+        # dissemination); read by the H5 evaluator, which weights each
+        # throughput-witness test's α by the class's learned failure
+        # rate via ``alpha_budget``.
+        alpha_tuner_config = HierarchicalAlphaTunerConfig()
+        self._alpha_tuner: HierarchicalAlphaTuner = HierarchicalAlphaTuner(
+            alpha_tuner_config
+        )
+        # Each terminated workflow counts once in the tuner however
+        # many gossip copies of its outcome arrive. Ids are held for
+        # the tuner's own staleness horizon: past it an outcome no
+        # longer shapes a posterior the tuner keeps, and it exceeds
+        # the O(log n)-round dissemination of a ``#|o`` event (Das,
+        # Gupta & Motivala 2002, SWIM §4) by orders of magnitude.
+        self._applied_outcomes: AppliedOutcomeWindow = AppliedOutcomeWindow(
+            alpha_tuner_config.stale_after_seconds
+        )
+
         # Phase H5 — multi-witness decision orchestrator. Lazy: a manager
         # without a witness wired in (e.g. unit tests) gets the legacy
         # path; ManagerServer passes one, so the full multi-witness
         # logic decides in production.
         self._throughput_witness: ThroughputWitness | None = throughput_witness
         self._decision_evaluator: ExtensionDecisionEvaluator | None = (
-            self._build_decision_evaluator(throughput_witness, decision_config)
+            self._build_decision_evaluator(
+                throughput_witness, decision_config, self._alpha_tuner
+            )
         )
 
         # Phase H7 — local authoritative ledger of every extension
@@ -132,19 +155,11 @@ class WorkerHealthManager:
         # cross-DC correlation tooling can query consistently.
         self._ledger: ExtensionLedger = ExtensionLedger(ExtensionLedgerConfig())
 
-        # Phase H8 — Bayesian per-workflow-class α posterior tuner.
-        # Updated whenever an outcome event is applied (locally on
-        # workflow termination, or remotely via AD-48 #|o
-        # dissemination). Composes with H6's hierarchical α budget
-        # via ``alpha_budget(class, floor, ceiling)``.
-        self._alpha_tuner: HierarchicalAlphaTuner = HierarchicalAlphaTuner(
-            HierarchicalAlphaTunerConfig()
-        )
-
     @staticmethod
     def _build_decision_evaluator(
         throughput_witness: ThroughputWitness | None,
         decision_config: ExtensionDecisionConfig | None,
+        alpha_tuner: HierarchicalAlphaTuner,
     ) -> ExtensionDecisionEvaluator | None:
         """The AD-26 H5 multi-witness evaluator, or ``None`` (legacy path)
         when no throughput witness is wired in."""
@@ -152,6 +167,7 @@ class WorkerHealthManager:
             ExtensionDecisionEvaluator(
                 throughput_witness=throughput_witness,
                 config=decision_config,
+                alpha_tuner=alpha_tuner,
             )
             if throughput_witness is not None
             else None
@@ -244,6 +260,7 @@ class WorkerHealthManager:
         active_in_dc: int,
         active_on_manager: int,
         active_on_worker: int,
+        workflow_class: str,
         job_id: str = "",
         fence_token: int = 0,
         leader_term: int = 0,
@@ -264,6 +281,10 @@ class WorkerHealthManager:
         Returns both the wire response (for the worker) and the
         full ``ExtensionDecision`` value (for H7 ledger replication
         and H8 outcome feedback).
+
+        ``workflow_class`` keys the H8 outcome posterior that weights
+        the throughput witness's significance level for this
+        workflow.
 
         Falls back to the legacy ``handle_extension_request`` path
         when no throughput witness is wired (i.e. the manager was
@@ -293,6 +314,7 @@ class WorkerHealthManager:
             active_in_dc=active_in_dc,
             active_on_manager=active_on_manager,
             active_on_worker=active_on_worker,
+            workflow_class=workflow_class,
         )
 
         # Commit tracker state mutation.
@@ -530,27 +552,34 @@ class WorkerHealthManager:
 
     def ingest_remote_outcome_event(
         self, event: ExtensionOutcomeEvent
-    ) -> None:
+    ) -> bool:
         """Apply an outcome event received from a peer manager via
-        AD-48 ``#|o`` dissemination. Idempotent through the
-        ledger's stale-term rejection.
-        """
-        self._apply_outcome_locally(event)
+        AD-48 ``#|o`` dissemination.
 
-    def _apply_outcome_locally(self, event: ExtensionOutcomeEvent) -> None:
+        Returns True for the first copy of this workflow's outcome
+        (the caller re-arms its dissemination), False for a repeat,
+        which leaves the tuner untouched: gossip delivers every
+        outcome many times, and each workflow is one observation.
+        """
+        return self._apply_outcome_locally(event)
+
+    def _apply_outcome_locally(self, event: ExtensionOutcomeEvent) -> bool:
         """Shared codepath for both leader-emitted and follower-
         ingested outcome events. Pairs the ledger update with the
         tuner update in a single call so the two stay coherent.
+
+        The ledger record is idempotent itself (stale-term rejection).
+        The tuner is fed only the first copy of each workflow's
+        outcome inside the ``AppliedOutcomeWindow``; the return says
+        whether this was it. A workflow never seen as an extension
+        request locally still informs its class's posterior: the
+        tuner needs only the outcome kind and progress fraction.
         """
-        applied = self._ledger.record_outcome(event)
-        # Even when the workflow was never seen as an extension
-        # request locally (``applied is None``), the outcome still
-        # informs the global per-workflow-class posterior. The
-        # only caveat is that we won't have decision counts to
-        # cross-reference; the tuner only needs outcome_kind +
-        # final_progress_fraction.
-        del applied
+        self._ledger.record_outcome(event)
+        if not self._applied_outcomes.admit(event.workflow_id, self._clock.monotonic()):
+            return False
         self._alpha_tuner.apply_outcome(event)
+        return True
 
     @property
     def alpha_tuner(self) -> HierarchicalAlphaTuner:
@@ -636,6 +665,16 @@ class WorkerHealthManager:
             posterior.workflow_class: posterior.to_bytes()
             for posterior in self._alpha_tuner
         }
+
+    def ingest_workflow_progress(
+        self, worker_id: str, workflow_id: str, completed_count: int, elapsed_seconds: float
+    ) -> None:
+        """Feed one ``WorkflowProgress`` report of an in-flight workflow to
+        the H6 throughput witness (no-op without one). The manager's
+        progress path calls this; the witness samples the workflow's rate
+        between reports at most once per its derived sampling interval."""
+        if self._throughput_witness is not None:
+            self._throughput_witness.ingest_progress(worker_id, workflow_id, completed_count, elapsed_seconds)
 
     def forget_workflow(self, workflow_id: str) -> None:
         """Drop H7 ledger state and H6 throughput streams for a

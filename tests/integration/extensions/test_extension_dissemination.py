@@ -166,6 +166,7 @@ def test_decision_dissemination_round_trip() -> None:
             active_in_dc=1,
             active_on_manager=1,
             active_on_worker=1,
+            workflow_class="LoadTest",
             job_id="job-1",
             fence_token=42,
             leader_term=7,
@@ -234,6 +235,7 @@ def test_outcome_dissemination_round_trip() -> None:
         active_in_dc=1,
         active_on_manager=1,
         active_on_worker=1,
+        workflow_class="LoadTest",
         job_id="job-1",
         fence_token=42,
         leader_term=7,
@@ -382,6 +384,7 @@ def test_leader_transfer_replay_round_trip() -> None:
             active_in_dc=1,
             active_on_manager=1,
             active_on_worker=1,
+            workflow_class="LoadTest",
             job_id="job-1",
             fence_token=42,
             leader_term=7,
@@ -528,6 +531,7 @@ def test_idempotent_event_replay() -> None:
         active_in_dc=1,
         active_on_manager=1,
         active_on_worker=1,
+        workflow_class="LoadTest",
         job_id="job-1",
         fence_token=42,
         leader_term=7,
@@ -557,18 +561,22 @@ def test_idempotent_event_replay() -> None:
         leader_term=7,
     )
     leader_post_mean = leader.alpha_tuner.get("LoadTest").posterior_mean
-    for _ in range(3):
-        follower.ingest_remote_outcome_event(outcome)
-    follower_post = follower.alpha_tuner.get("LoadTest")
-    # The outcome event itself isn't deduped on the tuner — but the
-    # ledger's record_outcome rejects re-records past leader_term.
-    # Tuner sees 3 applications. Either way, both managers should
-    # converge eventually; we just verify no exception.
+    first_copies = [follower.ingest_remote_outcome_event(outcome) for _ in range(3)]
     check(
-        follower_post is not None,
-        "follower posterior present after redundant ingest",
+        first_copies == [True, False, False],
+        f"follower admits only the first outcome copy ({first_copies})",
     )
-    del leader_post_mean  # variant retained for future stricter check
+    check(
+        leader.ingest_remote_outcome_event(outcome) is False,
+        "leader drops the echo of its own outcome",
+    )
+    follower_post = follower.alpha_tuner.get("LoadTest")
+    check(
+        follower_post is not None
+        and abs(follower_post.posterior_mean - leader_post_mean) < 1e-9
+        and follower_post.total_seen == 1,
+        "one outcome counts once on every manager however many copies arrive",
+    )
 
 
 # ============================================================================

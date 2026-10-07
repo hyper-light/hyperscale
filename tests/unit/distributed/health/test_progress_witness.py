@@ -250,10 +250,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=100.0,
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
             assert verdict.kind == WitnessVerdictKind.COLD_START
 
@@ -271,10 +268,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(100.0, 1.0),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
             last_kind = verdict.kind
         assert last_kind == WitnessVerdictKind.STATIONARY
@@ -299,10 +293,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(100.0, 0.5),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
         # Drop to 10 — well outside the prior — for several samples
         any_regime_down = False
@@ -311,10 +302,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(10.0, 0.5),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
             if verdict.kind == WitnessVerdictKind.REGIME_CHANGE_DOWN:
                 any_regime_down = True
@@ -341,10 +329,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(10.0, 0.5),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
         any_regime_up = False
         for _ in range(10):
@@ -352,10 +337,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(100.0, 0.5),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
             if verdict.kind == WitnessVerdictKind.REGIME_CHANGE_UP:
                 any_regime_up = True
@@ -372,10 +354,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=10.0,
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
         assert ("w1", "wf1") in witness._streams
         witness.reset_stream("w1", "wf1")
@@ -389,19 +368,13 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=100.0,
-                active_in_cluster=2,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(2, 1, 1, 1),
             )
             witness.observe(
                 worker_id="w2",
                 workflow_id="wf2",
                 throughput=10.0,
-                active_in_cluster=2,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(2, 1, 1, 1),
             )
         # Each detector saw 20 observations. The means should differ.
         s1 = witness._streams[("w1", "wf1")]
@@ -420,10 +393,7 @@ class TestThroughputWitness:
             worker_id="w1",
             workflow_id="wf1",
             throughput=42.0,
-            active_in_cluster=1,
-            active_in_dc=1,
-            active_on_manager=1,
-            active_on_worker=1,
+            alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
         )
         assert verdict.observation == 42.0
         assert verdict.observation_count == 1

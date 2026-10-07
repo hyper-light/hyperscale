@@ -26,10 +26,7 @@ def observe(witness: ThroughputWitness, worker_id: str, workflow_id: str) -> Non
         worker_id=worker_id,
         workflow_id=workflow_id,
         throughput=1.0,
-        active_in_cluster=1,
-        active_in_dc=1,
-        active_on_manager=1,
-        active_on_worker=1,
+        alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
     )
 
 

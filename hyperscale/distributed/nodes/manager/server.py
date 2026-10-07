@@ -120,11 +120,9 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.distributed.resources import ProcessResourceMonitor, ResourceMetrics
 from hyperscale.distributed.health import WorkerHealthManager
-from hyperscale.distributed.health.progress_witness import (
-    HierarchicalAlphaConfig,
-    ThroughputWitness,
-    ThroughputWitnessConfig,
-)
+from hyperscale.distributed.health.progress_witness import ThroughputWitness
+from hyperscale.distributed.health.progress_witness.witness_feed_derivation import throughput_witness_config
+from hyperscale.distributed.taskex.util.time_parser import TimeParser
 from hyperscale.distributed.health.workflow_progress_snapshot import (
     WorkflowProgressSnapshot,
 )
@@ -843,11 +841,21 @@ class ManagerServer(HealthAwareServer):
         # Worker health manager (AD-26), its extension policy from Env.
         # The H6 throughput witness makes the H5 multi-witness decision
         # live, its false-deny rate held to the configured budget.
+        # The witness samples each in-flight workflow's progress rate at
+        # the interval its K-S confirmation needs at the α floor (8
+        # samples per 5 s trigger poll at floor 1e-5: 0.625 s) and models
+        # one base extension deadline as its fresh-run window (30 s /
+        # 0.625 s / 0.25 = 192 run lengths). Measured cost ~208 us per
+        # update -> ~0.33 ms per in-flight workflow per second; taking all
+        # 20 progress reports/s at the old 1000 cap cost 18.5 ms. The
+        # arithmetic is in progress_witness/witness_feed_derivation.py.
         self._worker_health_manager = WorkerHealthManager(
             self.env.get_worker_health_manager_config(),
             throughput_witness=ThroughputWitness(
-                ThroughputWitnessConfig(
-                    alpha=HierarchicalAlphaConfig(alpha_system=self.env.HYPERSCALE_EXTENSION_FPR_BUDGET),
+                throughput_witness_config(
+                    self.env.HYPERSCALE_EXTENSION_FPR_BUDGET,
+                    TimeParser(self.env.HYPERSCALE_EXTENSION_TRIGGER_INTERVAL).time,
+                    self.env.EXTENSION_BASE_DEADLINE,
                 ),
                 clock=self._clock,
             ),
@@ -6644,16 +6652,18 @@ class ManagerServer(HealthAwareServer):
         """AD-26 H8b: decode an inbound ``#|o`` frame and ingest each
         outcome event into the local ``WorkerHealthManager``.
 
-        Each accepted event is also re-added to the local buffer so
-        this manager continues its dissemination — same fan-out
-        discipline as the decision channel.
+        The first copy of each workflow's outcome is applied and
+        re-added to the local buffer so this manager continues its
+        dissemination — same fan-out discipline as the decision
+        channel. Repeat copies are dropped: re-counting them would
+        skew the H8 posterior, and re-arming them would restart the
+        epidemic once a peer's buffer had let the event go.
         """
         events = ExtensionOutcomeGossipBuffer.decode_piggyback(piggyback_data)
-        if not events:
-            return
         number_of_managers = len(self._manager_state._active_manager_peers) + 1
         for event in events:
-            self._worker_health_manager.ingest_remote_outcome_event(event)
+            if not self._worker_health_manager.ingest_remote_outcome_event(event):
+                continue
             self._extension_outcome_buffer.add_event(
                 event, number_of_managers=number_of_managers
             )
@@ -6735,6 +6745,7 @@ class ManagerServer(HealthAwareServer):
                 active_in_dc=active_in_dc,
                 active_on_manager=active_on_manager,
                 active_on_worker=active_on_worker,
+                workflow_class=workflow_class,
                 job_id=job_id,
                 fence_token=fence_token,
                 leader_term=leader_term,
@@ -6953,10 +6964,19 @@ class ManagerServer(HealthAwareServer):
         self._settle_terminal_outcome(job, event, workflow_id)
 
     def _in_flight_sub_workflow_id(self, sub_info: SubWorkflowInfo) -> str:
-        """The sub's workflow id while it has no result yet, else ""."""
+        """The sub's workflow id while it has no result yet, else "".
+
+        The id is the full sub-workflow token string: the id the
+        workflow was dispatched under (``WorkflowDispatch.workflow_id``),
+        so the one its extension requests, H7 ledger entry, H6 streams
+        and ``WorkflowFinalResult`` carry. The token's bare
+        ``workflow_id`` names the parent workflow shared by every sub:
+        it found no ledger snapshot (every in-flight outcome read as
+        zero progress, the heaviest failure weight) and forgot nothing.
+        """
         if sub_info.result is not None:
             return ""
-        return sub_info.token.workflow_id or ""
+        return str(sub_info.token)
 
     def _latest_progress_fraction(self, ledger: ExtensionLedger, workflow_id: str) -> float:
         """The workflow's progress fraction from its most-recent H7 snapshot, capped at 1."""
@@ -7006,9 +7026,10 @@ class ManagerServer(HealthAwareServer):
 
         This closes the AD-26 outcome feedback loop: every
         terminating workflow contributes one Bernoulli observation
-        to the per-workflow-class Beta posterior, which the H6
-        ThroughputWitness consults on the next decision via
-        ``HierarchicalAlphaTuner.alpha_budget``.
+        to the per-workflow-class Beta posterior, which the H5
+        evaluator reads through ``HierarchicalAlphaTuner.alpha_budget``
+        to set the significance level of the H6 throughput witness's
+        next test on a workflow of that class.
 
         Outcome classification:
 
@@ -8893,6 +8914,7 @@ class ManagerServer(HealthAwareServer):
             self._record_held_job_progress(progress.job_id, worker_id)
 
             await self._report_workflow_progress_to_timeout(progress)
+            self._feed_throughput_witness(worker_id, progress)
             await self._update_worker_cores_from_workflow_progress(worker_id, progress)
             await self._record_workflow_progress_stats(addr, worker_id, progress)
 
@@ -8924,6 +8946,20 @@ class ManagerServer(HealthAwareServer):
                 backpressure_delay_ms=0,
                 backpressure_batch_only=False,
             ).dump()
+
+    def _feed_throughput_witness(self, worker_id: str | None, progress: WorkflowProgress) -> None:
+        """AD-26 H6: feed the workflow's progress counters to the throughput
+        witness, which samples the workflow's own rate between reports.
+
+        Only while the sub-workflow is in flight on a live job: a report
+        arriving after its result, or after its job ended, would reopen a
+        stream the workflow's end already forgot. The check and the
+        ingest run with no await between them, so no result can land in
+        the gap."""
+        if worker_id and self._job_manager.sub_workflow_in_flight(progress.workflow_id):
+            self._worker_health_manager.ingest_workflow_progress(
+                worker_id, progress.workflow_id, progress.completed_count, progress.elapsed_seconds
+            )
 
     async def _report_workflow_progress_to_timeout(self, progress: WorkflowProgress) -> None:
         """

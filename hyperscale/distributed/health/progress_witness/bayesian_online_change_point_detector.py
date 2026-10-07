@@ -172,10 +172,19 @@ class BayesianOnlineChangePointDetector:
         new_log_unnormalised: list[float] = [log_change_total] + log_growth
         new_stats_full: list[_RunSuffStats] = [_RunSuffStats().update(x)] + new_stats_grow
 
-        # Step 6: truncate at run_length_max (drop the longest runs,
-        # which carry vanishing probability) — keeps memory bounded.
+        # Step 6: cap the run length at ``run_length_max - 1``, keeping
+        # memory and per-update cost O(run_length_max). Every run that
+        # long or longer is lumped into the last state (its mass is the
+        # sum of theirs, its predictive the newest ``run_length_max``
+        # samples -- a sliding window), so probability is conserved.
+        # Dropping the longest runs instead discarded the very regime a
+        # stationary stream is in once it outlived the cap: the MAP run
+        # length then collapsed to 1-2 (measured 2026-10-06 at caps
+        # 50-1000) and read as a fresh change point on every sample.
         if len(new_log_unnormalised) > cfg.run_length_max:
-            new_log_unnormalised = new_log_unnormalised[: cfg.run_length_max]
+            capped_log_mass = _logsumexp(new_log_unnormalised[cfg.run_length_max - 1 :])
+            new_log_unnormalised = new_log_unnormalised[: cfg.run_length_max - 1]
+            new_log_unnormalised.append(capped_log_mass)
             new_stats_full = new_stats_full[: cfg.run_length_max]
         return new_log_unnormalised, new_stats_full
 

@@ -4,18 +4,19 @@ AD-26 Phase H8 outcome feedback loop: every time a workflow
 terminates, its outcome (completed vs. timed-out / failed /
 evicted) is fed into a Bayesian tuner keyed on the workflow's
 Python class name. The posterior is a standard Beta(α, β) over
-the success probability ``p`` of the underlying Bernoulli
-"extension was warranted" trial. The posterior mean (α/(α+β))
-becomes the workflow-class-level α budget that H6's
-``ThroughputWitness`` uses on the next decision.
+the success probability ``p`` of the workflow class. Its failure
+evidence re-weights the H6 hierarchical α of every throughput-
+witness test on a workflow of that class
+(``HierarchicalAlphaTuner.alpha_budget``): classes that fail more
+often get more of the false-positive budget, classes that rarely
+fail get less (Genovese, Roeder & Wasserman 2006 p-value weighting).
 
 Why Beta:
 
 * Conjugate to Bernoulli: closed-form sufficient stats means the
   update is O(1) and lossless (no sample-size truncation).
-* Bounded: posterior mean stays in [0, 1] without clamping, so
-  it composes naturally with the H6 hierarchical α budget which
-  is also a probability.
+* Bounded: the failure rate stays in (0, 1) without clamping, so
+  the weight it yields is finite and positive.
 * Persists cleanly: the posterior collapses to two floats — easy
   to ship in ``TimeoutTrackingState`` for AD-34 leader-transfer
   survivability.
@@ -33,10 +34,9 @@ Why per-class (not per-workflow-id):
 
 Initialization:
 
-* ``alpha_prior`` and ``beta_prior`` start at the H6 floor and
-  ceiling respectively. This expresses a weakly-informative prior
-  centered at the H6 alpha_workflow_floor (the safest default),
-  with low confidence so the data quickly dominates.
+* New classes store the ``alpha_prior``/``beta_prior`` offset (see
+  ``alpha_posterior_shared``); the α budget reads only the evidence
+  net of it, shrunk toward the failure rate pooled over all classes.
 
 This module is the pickling namespace of the classes and functions
 below. Each lives in a file of its own and is re-homed here -- its

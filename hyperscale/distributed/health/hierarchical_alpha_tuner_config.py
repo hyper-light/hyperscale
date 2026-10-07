@@ -25,10 +25,12 @@ class HierarchicalAlphaTunerConfig:
         stale_after_seconds: A class with no outcome update for
             this long is eligible for eviction when the cap is
             exceeded.
-        alpha_prior: Initial α for new classes. Defaults match a
-            weakly-informative prior centered on the H6 default
-            ``alpha_workflow_floor``.
-        beta_prior: Initial β for new classes.
+        alpha_prior: Initial α stored in new class posteriors. The
+            α budget subtracts it to read the class's success
+            evidence, so it must equal the value the posteriors
+            were created with (see ``alpha_posterior_shared``).
+        beta_prior: Initial β stored in new class posteriors; read
+            back the same way for the failure evidence.
     """
 
     max_classes: int = 10_000

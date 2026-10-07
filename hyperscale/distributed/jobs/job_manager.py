@@ -1389,6 +1389,17 @@ class JobManager:
             return self._jobs.get(job_token_str)
         return None
 
+    def sub_workflow_in_flight(self, sub_workflow_token: str) -> bool:
+        """Whether the sub-workflow belongs to a job that has not ended and
+        has no final result yet -- the window in which per-workflow state
+        (such as the AD-26 H6 throughput stream) may be opened for it
+        without outliving the cleanup its end triggers."""
+        if (job := self.get_job_for_sub_workflow(sub_workflow_token)) is None:
+            return False
+        return job.status not in TERMINAL_JOB_STATUS_VALUES and (
+            self._sub_workflow_awaiting_result(job, sub_workflow_token) is not None
+        )
+
     async def remove_job(self, job_id: str) -> bool:
         """
         Remove a job and everything kept for it: its lookups, fence tokens,

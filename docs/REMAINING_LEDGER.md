@@ -63,10 +63,9 @@ Note: none of AD_1/7/9/11/16/24/28/32.md has changed since 2026-01 (git log), so
 
 ### Still Partial / Still Absent
 
-#### AD26-2 — H8 outcome posterior is learned but never consumed — STILL PARTIAL — size M
-- Doc: docs/architecture/AD_26.md §H8a: "Posterior mean E[p] = α/(α+β) is composed with H6's hierarchical α floor/ceiling via `alpha_budget(class, floor, ceiling)`."
-- Exists: H6 witness wired (nodes/manager/server.py:845-855 `WorkerHealthManager(..., throughput_witness=ThroughputWitness(...))`); H8 outcomes applied (health/worker_health_manager.py:553 `apply_outcome`), persisted (:581,:601,:628), gossiped `#|o` (manager/server.py:886, :6650). The diverged manager-local `ExtensionTracker` copy is gone (only health/extension_tracker_impl.py:11). Tests: tests/unit/distributed/health/test_progress_witness.py, test_throughput_witness_cleanup.py.
-- Missing: `HierarchicalAlphaTuner.alpha_budget` (health/hierarchical_alpha_tuner.py:59) and `WorkflowClassAlphaPosterior.alpha_budget` (workflow_class_alpha_posterior.py:114) have zero production callers. The K-S test reads the fixed `alpha.alpha_system` (health/progress_witness/throughput_witness.py:334), so per-class outcome learning never changes a decision. The loop needs closing, or the doc needs to say H8 is observability only.
+#### AD26-2 — H8 outcome posterior is learned but never consumed — CLOSED 2026-10-06 — size M
+- Closed: the H5 evaluator composes the H6 α with the class posterior via `HierarchicalAlphaTuner.alpha_budget(class, alpha_H6, floor, ceiling)` (p-value weighting, AD_26.md §H8a). The witness confirms a BOCPD change point with K-S at that level, fed each workflow's own progress rate (§H6 "Feed"). Outcomes count once per workflow (`AppliedOutcomeWindow`).
+- Proof: tests/unit/distributed/health/test_outcome_weighted_alpha.py (learned outcomes flip a decision) and test_throughput_witness_feed.py (a collapse is denied at the controlled α; false denials stay within that α). Both fail when the wiring or the feed is removed.
 
 #### AD24-1 — Rate-limit Env settings are dead; doc still describes token buckets — STILL PARTIAL — size M (limits pinned by the storm SIM; measure first)
 - Doc: docs/architecture/AD_24.md:9-46 "token bucket rate limiting … `class TokenBucket`"; Env `RATE_LIMIT_DEFAULT_BUCKET_SIZE`/`REFILL_RATE`.
@@ -96,7 +95,6 @@ Note: none of AD_1/7/9/11/16/24/28/32.md has changed since 2026-01 (git log), so
 ### New gaps found
 - Dead Env fields from AD-32: `OUTGOING_OVERFLOW_SIZE` and `OUTGOING_MAX_DESTINATIONS` (env/env.py:1035-1038) and `Env.get_outgoing_queue_config()` (:1788) have zero consumers since D10 chose semaphores. Delete them, or the "all settings are real Env fields" rule is violated. Size S.
 - Dead rate-limit Env surface (six fields + two getters, env.py:735-743, :1560-1590); see AD24-1.
-- AD-26 H8 `alpha_budget` is never called; see AD26-2. Plan Phase 3 marked AD-26-2 ✅, but only H5/H6 are live.
 - `ManagerDiscoveryCoordinator` is a constructed-but-unfed object (built-but-unwired pattern), nodes/manager/discovery.py; see AD28-1.
 - The in-code docstrings of datacenters/datacenter_health_manager.py:8,179 contradict its own BUSY-on-zero-workers behaviour (:259).
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Callable
 from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.health.extension_tracker import ExtensionTracker
+from hyperscale.distributed.health.hierarchical_alpha_tuner import HierarchicalAlphaTuner
 from hyperscale.distributed.health.progress_witness import ThroughputWitness, WitnessVerdictKind
 from hyperscale.distributed.health.workflow_progress_snapshot import WorkflowProgressSnapshot
 
@@ -28,9 +29,9 @@ class ExtensionDecisionEvaluator:
     """Orchestrates the AD-26 H5 multi-witness extension decision.
 
     Stateless (per-call) orchestrator. Holds references to the
-    deployment-shared throughput witness and the per-decision config;
-    each ``decide(...)`` invocation is a pure function of those plus
-    the per-(worker, workflow) inputs.
+    deployment-shared throughput witness, the H8 outcome tuner and the
+    per-decision config; each ``decide(...)`` invocation is a pure
+    function of those plus the per-(worker, workflow) inputs.
 
     Thread-safety: NOT thread-safe with respect to the throughput
     witness, which mutates per-stream state on each ``observe()``
@@ -43,6 +44,7 @@ class ExtensionDecisionEvaluator:
         throughput_witness: ThroughputWitness,
         config: ExtensionDecisionConfig | None = None,
         *,
+        alpha_tuner: HierarchicalAlphaTuner,
         clock: Clock | None = None,
     ) -> None:
         # Phase 5 DI seam — replaces the prior ``time_source:
@@ -52,6 +54,10 @@ class ExtensionDecisionEvaluator:
         # mode passes ``VirtualClock`` here and ``decide`` sees the
         # simulated timeline.
         self._throughput_witness: ThroughputWitness = throughput_witness
+        # AD-26 H8: the per-workflow-class outcome posterior. Owned by
+        # ``WorkerHealthManager``, which feeds it every outcome; read
+        # here to weight each throughput-witness test's α.
+        self._alpha_tuner: HierarchicalAlphaTuner = alpha_tuner
         self._config: ExtensionDecisionConfig = (
             config if config is not None else ExtensionDecisionConfig()
         )
@@ -78,6 +84,7 @@ class ExtensionDecisionEvaluator:
         active_in_dc: int,
         active_on_manager: int,
         active_on_worker: int,
+        workflow_class: str,
     ) -> ExtensionDecision:
         """Run all five witnesses and return a structured decision.
 
@@ -99,6 +106,8 @@ class ExtensionDecisionEvaluator:
             active_in_cluster, active_in_dc, active_on_manager,
             active_on_worker: Concurrent-workflow counts feeding the
                 H6 hierarchical α-budget allocator.
+            workflow_class: The workflow's class name -- the key of
+                its H8 outcome posterior, which re-weights the H6 α.
         """
         now = self._now()
 
@@ -127,6 +136,7 @@ class ExtensionDecisionEvaluator:
             active_in_dc=active_in_dc,
             active_on_manager=active_on_manager,
             active_on_worker=active_on_worker,
+            workflow_class=workflow_class,
         )
 
     def _worker_witness_denial(
@@ -324,18 +334,36 @@ class ExtensionDecisionEvaluator:
         active_in_dc: int,
         active_on_manager: int,
         active_on_worker: int,
+        workflow_class: str,
     ) -> ExtensionDecision:
-        """Witness 5 (AD-26 H6 BOCPD): deny on a downward throughput regime
-        change, otherwise grant the geometric-decay extension."""
-        # Witness 5 — workflow-level: throughput witness (H6 BOCPD)
-        verdict = self._throughput_witness.observe(
+        """Witness 5 (AD-26 H6 BOCPD): deny on a confirmed downward
+        throughput regime change, otherwise grant the geometric-decay
+        extension.
+
+        The test's level is the H6 hierarchical α composed with the
+        workflow class's H8 outcome posterior
+        (``HierarchicalAlphaTuner.alpha_budget``), clamped to the H6
+        floor and ceiling: a class whose workflows fail more often
+        needs less evidence before a deny, one that rarely fails
+        needs more."""
+        budget = self._throughput_witness.budget
+        alpha_workflow = self._alpha_tuner.alpha_budget(
+            workflow_class,
+            budget.workflow_alpha_from_counts(
+                active_in_cluster=active_in_cluster,
+                active_in_dc=active_in_dc,
+                active_on_manager=active_on_manager,
+                active_on_worker=active_on_worker,
+            ),
+            budget.config.alpha_workflow_floor,
+            budget.config.alpha_workflow_ceiling,
+        )
+        # Witness 5 — workflow-level: throughput witness (H6 BOCPD), fed
+        # the workflow's own progress rate by the manager's progress path.
+        verdict = self._throughput_witness.assess(
             worker_id=tracker.worker_id,
             workflow_id=snapshot.workflow_id,
-            throughput=throughput,
-            active_in_cluster=active_in_cluster,
-            active_in_dc=active_in_dc,
-            active_on_manager=active_on_manager,
-            active_on_worker=active_on_worker,
+            alpha_workflow=alpha_workflow,
         )
 
         if verdict.kind == WitnessVerdictKind.REGIME_CHANGE_DOWN:
@@ -343,9 +371,8 @@ class ExtensionDecisionEvaluator:
                 tracker,
                 ExtensionDenialCode.THROUGHPUT_REGIME_DOWN,
                 (
-                    "Throughput regime shifted down: "
-                    f"P(change-point | history) = {verdict.change_point_probability:.4f} "
-                    f"> α_workflow = {verdict.alpha_workflow:.4f} "
+                    "Throughput regime shifted down: BOCPD change point "
+                    f"confirmed by K-S at α_workflow = {verdict.alpha_workflow:.6f} "
                     f"({verdict.predictive_mean_before:.2f} -> "
                     f"{verdict.predictive_mean_after:.2f})"
                 ),
