@@ -86,7 +86,11 @@ def takeover_after_one_follower_missed_a_sync(
 
 
 # Schedules: each seed is one replayed run of elections and deliveries.
-SEEDS = range(1, 5)
+# Which survivor wins is a fair draw per schedule (measured over seeds
+# 13-32: the fresh follower 19-22 times in 40), so the corpus spans enough
+# schedules to take both directions -- the leadership heartbeat
+# acknowledgements (AD-5 addendum) reshuffled which seeds take which.
+SEEDS = range(1, 11)
 
 
 def test_a_takeover_does_not_regress_the_job_to_a_stale_peers_copy() -> None:

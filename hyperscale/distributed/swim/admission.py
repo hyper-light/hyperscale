@@ -61,6 +61,7 @@ _LEADERSHIP_TYPES: frozenset[bytes] = frozenset(
         b"leader-claim",
         b"leader-elected",
         b"leader-heartbeat",
+        b"leader-heartbeat-ack",
         b"leader-stepdown",
         b"vote-grant",
         b"vote-deny",

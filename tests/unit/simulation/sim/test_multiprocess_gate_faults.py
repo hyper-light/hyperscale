@@ -93,7 +93,7 @@ from tests.simulation.harness.sim.multiprocess.soak_job_demo import (
 from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
     worker_entry,
 )
-from tests.simulation.oracle import JobStatusOracle
+from tests.simulation.oracle import ClusterTraceOracle, JobStatusOracle
 
 import pytest
 
@@ -920,10 +920,10 @@ def _run_leader_total_isolation(seed: int = _DISTINCT_ROLE_SEEDS[0]) -> dict:
     Probed timeline: the majority (a, b) marks the unreachable leader
     dead and gate-b claims leadership at t=20.5 (leader-unreachability
     is evidence-accelerated — 10.5s, NOT the ~70s witness-less reap);
-    the islanded gate-c keeps believing it is leader until heal
-    (harmless: it can reach no client, no manager, no peer) and steps
-    down at t=100.5 — 0.5s after heal — when it learns of the higher
-    term. The job (owned by gate-b) completes at the baseline instant.
+    the islanded gate-c steps down once its quorum lease lapses — one
+    lease after the last beat a peer acknowledged, before the majority
+    can elect — so the two never lead at one instant (AD-5 addendum).
+    The job (owned by gate-b) completes at the baseline instant.
 
     Post-heal, the peer-readmission watch re-admits every falsely
     evicted membership (probed: all three gates back to active-peer
@@ -992,11 +992,11 @@ def test_leader_total_isolation_majority_elects_and_islander_steps_down(seed: in
         ]
         assert not late_leader_moves, (gate_pid, late_leader_moves)
 
-    # The islanded ex-leader must NOT hold a leadership claim past
-    # heal: it steps down as soon as connectivity returns (probed
-    # 0.5s after heal). Its claim while islanded is harmless split-
-    # window — it can affect nobody — but persisting past heal would be
-    # real split-brain.
+    # The islanded ex-leader gives the flag up when its quorum lease
+    # lapses, before the majority elects: leadership is exclusive at
+    # every instant, and it holds no claim past heal.
+    oracle = ClusterTraceOracle(gate_process_ids=_GATE_PIDS)
+    assert oracle.check_gate_leader_exclusivity(results) == [], results
     islander_log = results[baseline.leader_gate]
     islander_flags = [
         entry for entry in islander_log if entry[0] == "gate-leader"
@@ -1023,6 +1023,79 @@ def test_leader_total_isolation_majority_elects_and_islander_steps_down(seed: in
 
 def test_leader_total_isolation_is_replay_deterministic():
     assert _run_leader_total_isolation() == _run_leader_total_isolation()
+
+
+_FREEZE_SECONDS = 30.0
+_FREEZE_CEILING = 150.0
+_FREEZE_WAIT_TIMEOUT = 100.0
+# The gate-leader watcher samples the flag every half second
+# (gate_leader_watch_demo.watch_gate_leadership), so a transition is
+# recorded at most one sample after it happens.
+_LEADER_WATCH_SAMPLE_SECONDS = 0.5
+
+
+def _freeze_window(seed: int) -> tuple[GateClusterBaseline, float, float]:
+    """The twin's baseline and a SIGSTOP window on its leader: from its
+    mid-execution instant, longer than a lease plus a re-election."""
+    baseline = _distinct_role_baseline(seed, _FREEZE_CEILING, _FREEZE_WAIT_TIMEOUT)
+    return baseline, baseline.mid_execution_at, baseline.mid_execution_at + _FREEZE_SECONDS
+
+
+def _run_leader_freeze(seed: int = _DISTINCT_ROLE_SEEDS[0]) -> dict:
+    """FREEZE the twin's leader gate (SIGSTOP for 30s): the two followers
+    stop hearing it, their leases lapse and they elect one of themselves,
+    while the frozen leader's own clock still runs its lead ticks (the
+    coordinator's thaw sweep, ``schedule_pause``)."""
+    baseline, freeze_at, thaw_at = _freeze_window(seed)
+    coordinator = _build_cluster(seed, _FREEZE_CEILING, wait_timeout=_FREEZE_WAIT_TIMEOUT)
+    coordinator.schedule_pause(baseline.leader_gate, freeze_at, thaw_at)
+    return coordinator.run()
+
+
+@pytest.mark.parametrize("seed", _DISTINCT_ROLE_SEEDS)
+def test_frozen_leader_gate_steps_down_before_a_successor_is_elected(seed: int):
+    """A frozen leader holds the flag only while its quorum lease lasts
+    (Raft thesis 6.2 CheckQuorum, 6.4.1 leases): no beat it sends during
+    the freeze is acknowledged, so it steps down one lease after its last
+    acknowledged beat -- before the followers, whose leases ran from the
+    same beats, can elect a successor. Leadership is exclusive at every
+    instant (chaos seed 5 caught two gates holding the flag at once)."""
+    baseline, freeze_at, thaw_at = _freeze_window(seed)
+    results = _run_leader_freeze(seed)
+    _assert_no_unswapped_seams(results)
+
+    oracle = ClusterTraceOracle(gate_process_ids=_GATE_PIDS)
+    assert oracle.check_gate_leader_exclusivity(results) == [], results
+
+    frozen_leader_flags = [
+        entry for entry in results[baseline.leader_gate] if entry[0] == "gate-leader"
+    ]
+    step_downs_after_freeze = [
+        entry[2] for entry in frozen_leader_flags if entry[1] == 0 and entry[2] > freeze_at
+    ]
+    lease_ends_by = freeze_at + Env().LEADER_LEASE_DURATION + _LEADER_WATCH_SAMPLE_SECONDS
+    assert step_downs_after_freeze and step_downs_after_freeze[0] <= lease_ends_by, (
+        frozen_leader_flags
+    )
+
+    successor_claims = [
+        entry[2]
+        for gate_pid in (baseline.follower_gate, baseline.submission_gate)
+        for entry in results[gate_pid]
+        if entry[0] == "gate-leader" and entry[1] == 1 and freeze_at < entry[2] < thaw_at
+    ]
+    # One successor, holding steady for the rest of the freeze: its own
+    # quorum lease is renewed by the other follower's acknowledgements.
+    assert len(successor_claims) == 1, results
+    # Same watcher sample at the earliest: the flag dropped first.
+    assert min(successor_claims) >= step_downs_after_freeze[0], (
+        successor_claims,
+        frozen_leader_flags,
+    )
+
+
+def test_leader_freeze_is_replay_deterministic():
+    assert _run_leader_freeze() == _run_leader_freeze()
 
 
 _DATACENTER_CUT_HEALS_AT = 60.0
@@ -1564,13 +1637,11 @@ def _run_long_horizon_chaos_waves(seed: int = _DISTINCT_ROLE_SEEDS[0]) -> dict:
     the aspirational completion test stays skip-marked with that
     mechanism.
 
-    The leadership tail pins the composite CONVERGING: the mutual
-    partition eviction of the survivors is undone by the post-heal
-    peer-readmission watch (probed: both survivors re-admit each other
-    at t=62.0 — heal 60 + one check tick), so the initial leader's
-    quorum recovers before consecutive-failure step-down matures and
-    leadership simply HOLDS (no step-down at 73.5, no churn, exactly
-    one leader end to end). The killed gate's membership is reaped on
+    The leadership tail pins the composite CONVERGING: with the
+    follower dead, the wave-2 cut leaves the initial leader without a
+    majority, so its quorum lease lapses and it steps down (AD-5
+    addendum); nobody leads until the heal, then the pair elects one
+    leader that holds to the end -- exclusive at every instant. The killed gate's membership is reaped on
     the witness-less bound (gate-b peer count 2 -> 1 at 88.5) and
     never re-admitted — its readmission ping fails forever, which is
     the correct truth for a genuinely dead peer.
@@ -1687,24 +1758,52 @@ def test_long_horizon_chaos_then_quiesce_holds_loud_invariants(seed: int):
         results["worker"],
     )
 
-    # Leadership tail — the composite CONVERGES: post-heal peer
-    # re-admission (probed: both survivors back to each other at
-    # t=62.0) restores the initial leader's quorum before step-down
-    # matures, so leadership HOLDS end to end — the initial leader
-    # keeps its single flag, the other survivor never claims, and no
-    # leader transition of any kind lands after t=10 (every twin's
-    # initial election settles before it).
+    # Leadership tail — exclusive throughout, and CONVERGED after heal.
+    # With the follower dead, the wave-2 cut leaves the initial leader
+    # without a majority: its quorum lease lapses one lease after the
+    # last beat the other survivor acknowledged, and it steps down (Raft
+    # thesis 6.2/6.4.1, AD-5 addendum) -- no gate leads while no
+    # majority can be reached. After the heal the pair elects one leader
+    # within a lease (a vote binds its voter that long) plus the
+    # randomized election wait, and it holds to the end.
+    settings = Env()
+    partition_at, heal_at = 30.0, 60.0
     assert baseline.leader_claimed_at < 10.0, baseline
+    oracle = ClusterTraceOracle(gate_process_ids=_GATE_PIDS)
+    assert oracle.check_gate_leader_exclusivity(
+        results, killed_process_ids=(baseline.follower_gate,)
+    ) == [], results
+    initial_leader_step_downs = [
+        entry[2]
+        for entry in results[baseline.leader_gate]
+        if entry[0] == "gate-leader" and entry[1] == 0 and entry[2] > 10.0
+    ]
+    assert initial_leader_step_downs, results[baseline.leader_gate]
+    assert (
+        partition_at
+        < initial_leader_step_downs[0]
+        <= partition_at + settings.LEADER_LEASE_DURATION + _LEADER_WATCH_SAMPLE_SECONDS
+    ), results[baseline.leader_gate]
+    leaderless_claims = [
+        entry
+        for gate_pid in survivors
+        for entry in results[gate_pid]
+        if entry[0] == "gate-leader" and entry[1] == 1 and 10.0 < entry[2] < heal_at
+    ]
+    assert not leaderless_claims, leaderless_claims
     flags = _final_leader_flags(results, survivors)
-    assert flags == {
-        baseline.submission_gate: 0,
-        baseline.leader_gate: 1,
-    }, flags
+    assert sum(flags.values()) == 1, flags
+    settled_by = (
+        heal_at
+        + settings.LEADER_LEASE_DURATION
+        + settings.LEADER_ELECTION_TIMEOUT_JITTER
+        + _LEADER_WATCH_SAMPLE_SECONDS
+    )
     for gate_pid in survivors:
         late_leader_moves = [
             entry
             for entry in results[gate_pid]
-            if entry[0] == "gate-leader" and entry[2] > 10.0
+            if entry[0] == "gate-leader" and entry[2] > settled_by
         ]
         assert not late_leader_moves, (gate_pid, late_leader_moves)
 
@@ -1808,15 +1907,11 @@ def test_long_horizon_late_job_completes_after_quiesce():
 
 def test_long_horizon_survivors_reelect_exactly_one_leader():
     """After the chaos waves quiesce, the surviving two-gate tier ends
-    with EXACTLY ONE leader. Post-heal peer re-admission (probed:
-    survivors re-admit each other at t=62.0) restores quorum before
-    the initial leader's consecutive-quorum-failure step-down matures,
-    so the composite converges by the leader simply HOLDING — probed:
-    the initial leader keeps flag 1 from t=1.5 through the t=420
-    ceiling with zero transitions, and the other survivor never
-    claims. (Pre-fix truth: mutual partition eviction decayed quorum,
-    the leader stepped down at t=73.5, and the remainder was
-    permanently leaderless.)"""
+    with EXACTLY ONE leader. The initial leader steps down when the
+    wave-2 cut takes its majority (its quorum lease lapses, AD-5
+    addendum); after the heal the pair re-elects one leader. (Pre-fix
+    truth, before re-admission: mutual partition eviction decayed
+    quorum and the remainder was permanently leaderless.)"""
     baseline = _long_horizon_baseline(_DISTINCT_ROLE_SEEDS[0])
     results = _run_long_horizon_chaos_waves()
     _assert_no_unswapped_seams(results)

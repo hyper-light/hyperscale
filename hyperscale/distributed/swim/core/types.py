@@ -18,6 +18,7 @@ Message = Literal[
     b"leader-vote",
     b"leader-elected",
     b"leader-heartbeat",
+    b"leader-heartbeat-ack",
     b"leader-stepdown",
     b"pre-vote-req",
     b"pre-vote-resp",

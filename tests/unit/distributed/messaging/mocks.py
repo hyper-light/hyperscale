@@ -49,6 +49,16 @@ class MockLeaderElection:
     ) -> None:
         pass
 
+    def heartbeat_acknowledgement(
+        self, leader: tuple[str, int], term: int
+    ) -> bytes | None:
+        return None
+
+    def handle_heartbeat_ack(
+        self, voter: tuple[str, int], term: int, heartbeat_seq: int
+    ) -> None:
+        pass
+
     async def handle_stepdown(self, target: tuple[str, int], term: int) -> None:
         pass
 

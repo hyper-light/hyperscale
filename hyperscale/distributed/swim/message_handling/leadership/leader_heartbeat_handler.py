@@ -84,8 +84,24 @@ class LeaderHeartbeatHandler(BaseHandler):
             await self._server.leader_election.handle_heartbeat(
                 target, term, heartbeat_seq, lease_duration
             )
+            await self._acknowledge_heartbeat(target, term)
 
         return self._ack()
+
+    async def _acknowledge_heartbeat(self, leader: tuple[str, int], term: int) -> None:
+        """Tell ``leader`` which of its beats renewed this node's lease, so the
+        beat counts toward its quorum lease (Raft thesis 6.2/6.4.1)."""
+        acknowledgement = self._server.leader_election.heartbeat_acknowledgement(leader, term)
+        if acknowledgement is None:
+            return
+        base_timeout = await self._server.get_current_timeout()
+        timeout = self._server.get_lhm_adjusted_timeout(base_timeout)
+        self._server.task_runner.run(
+            self._server.send,
+            leader,
+            acknowledgement,
+            timeout=timeout,
+        )
 
     async def _handle_split_brain(
         self,

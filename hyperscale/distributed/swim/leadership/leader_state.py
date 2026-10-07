@@ -71,6 +71,12 @@ class LeaderState:
     votes_received: set[tuple[str, int]] = field(default_factory=set)
     voted_for: tuple[str, int] | None = None
     voted_in_term: int = -1
+    # When this node last granted its vote to another candidate. Raft
+    # resets a voter's election timer on every vote it grants (section
+    # 5.2); here the grant holds like a lease for ``lease_duration``: the
+    # voter neither grants pre-votes nor stands meanwhile, so the claim it
+    # answered anchors the winner's quorum lease (LeaderQuorumLease).
+    vote_granted_at: float = float("-inf")
     election_timeout: float = 10.0  # Seconds
     last_heartbeat_time: float = 0.0
     max_votes: int = MAX_VOTES  # Configurable bound
@@ -135,7 +141,23 @@ class LeaderState:
         """Check if we should start a new election."""
         if self.role == 'leader':
             return False
-        return not self.is_lease_valid()
+        return not self.is_bound_to_leader()
+
+    def is_bound_to_leader(self) -> bool:
+        """Whether a leader's lease, or a vote this node granted, still binds it."""
+        return self.is_lease_valid() or self.holds_granted_vote()
+
+    def time_until_unbound(self) -> float:
+        """Seconds until neither the leader's lease nor a granted vote binds this node."""
+        bound_until = max(
+            self.leader_lease_start + self.lease_duration,
+            self.vote_granted_at + self.lease_duration,
+        )
+        return max(0, bound_until - _DEFAULT_CLOCK.monotonic())
+
+    def holds_granted_vote(self) -> bool:
+        """Whether a vote granted to another candidate is younger than the lease duration."""
+        return _DEFAULT_CLOCK.monotonic() < self.vote_granted_at + self.lease_duration
     
     def is_term_valid(self, term: int) -> bool:
         """Check if a term value is within valid range."""
@@ -226,14 +248,24 @@ class LeaderState:
         self.votes_received.clear()
         
         if leader:
+            self._adopt_leader_term(term)
             self.current_leader = leader
-            self.leader_term = term
             self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
             self.abort_pre_vote()
         
         self._announce_lost_leadership(was_leader)
         
         self._announce_leader_change(leader, old_leader)
+
+    def _adopt_leader_term(self, term: int) -> None:
+        """Follow the leader of ``term``: the applied-beat watermark is per
+        leadership epoch, so a new term restarts it. Kept across a new
+        term, the previous leader's sequence numbers rejected the new
+        leader's first beats as replays -- its lease went unrenewed until
+        its own sequence caught up, and it lost followers it still had."""
+        if term != self.leader_term:
+            self.applied_heartbeat_seq = -1
+        self.leader_term = term
 
     def _announce_lost_leadership(self, was_leader: bool) -> None:
         """Invoke on_lose_leadership when this node was the leader."""
@@ -314,6 +346,11 @@ class LeaderState:
         self.voted_for = candidate
         self.voted_in_term = term
         self.current_term = max(self.current_term, term)
+
+    def grant_vote(self, candidate: tuple[str, int], term: int) -> None:
+        """Vote for another candidate, binding this node to it for a lease duration."""
+        self.vote_for(candidate, term)
+        self.vote_granted_at = _DEFAULT_CLOCK.monotonic()
     
     # Pre-voting methods (split-brain prevention)
     def start_pre_vote(self, term: int) -> None:
@@ -369,7 +406,7 @@ class LeaderState:
         
         Grant pre-vote if:
         1. Candidate's term is >= our term
-        2. We don't have a valid leader lease
+        2. No leader lease, nor a vote we granted, still binds us
         3. Candidate's LHM is acceptable
         """
         # Don't grant if candidate's term is too low
@@ -377,7 +414,7 @@ class LeaderState:
         # Don't grant if candidate is unhealthy
         return (
             term >= self.current_term
-            and not self.is_lease_valid()
+            and not self.is_bound_to_leader()
             and candidate_lhm <= max_leader_lhm
         )
     

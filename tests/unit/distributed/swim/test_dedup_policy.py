@@ -17,6 +17,9 @@ from hyperscale.distributed.swim.message_handling.core.base_handler import (
 from hyperscale.distributed.swim.message_handling.leadership.leader_heartbeat_handler import (
     LeaderHeartbeatHandler,
 )
+from hyperscale.distributed.swim.message_handling.leadership.leader_heartbeat_ack_handler import (
+    LeaderHeartbeatAckHandler,
+)
 from hyperscale.distributed.swim.message_handling.leadership.leader_claim_handler import (
     LeaderClaimHandler,
 )
@@ -60,6 +63,7 @@ from hyperscale.distributed.swim.message_handling.membership.leave_handler impor
 # repeat is a liveness bug; they must be processed every time.
 _CONTROL_HANDLERS = (
     LeaderHeartbeatHandler,
+    LeaderHeartbeatAckHandler,
     LeaderClaimHandler,
     LeaderVoteHandler,
     PreVoteReqHandler,

@@ -10,6 +10,7 @@ from hyperscale.distributed.runtime import Clock, Random, RealClock, RealRandom
 from .leader_state import LeaderState
 from .leader_eligibility import LeaderEligibility
 from .flapping_detector import FlappingDetector
+from .leader_quorum_lease import LeaderQuorumLease
 from hyperscale.distributed.swim.core.errors import ElectionError, UnexpectedError, NotEligibleError
 
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
@@ -48,6 +49,10 @@ class LocalLeaderElection:
     state: LeaderState = field(default_factory=LeaderState)
     eligibility: LeaderEligibility = field(default_factory=LeaderEligibility)
     flapping_detector: FlappingDetector = field(default_factory=FlappingDetector)
+    # How long this node, leading, may still hold leadership: until a
+    # majority of the cohort stops acknowledging its beats (Raft thesis
+    # 6.2 CheckQuorum, 6.4.1 leases). Opened at each claim.
+    quorum_lease: LeaderQuorumLease = field(default_factory=LeaderQuorumLease)
     
     # Configuration
     heartbeat_interval: float = 2.0  # Seconds between leader heartbeats
@@ -292,12 +297,38 @@ class LocalLeaderElection:
         return self._should_refuse_leadership and self._should_refuse_leadership()
 
     def should_step_down(self) -> bool:
-        """Check if the leader should step down: its role refuses
+        """Check if the leader should step down: its quorum lease lapsed
+        (a majority may already be electing another), its role refuses
         leadership now (it cannot do a leader's work while a peer can),
         or its load (LHM) warrants handing off."""
         if not self.state.is_leader():
             return False
+        return not self.holds_quorum_lease() or self._hands_off_leadership()
+
+    def _hands_off_leadership(self) -> bool:
+        """Whether this leader's role or load asks it to hand leadership to a peer."""
         return self._relinquishes_leadership() or self._lhm_warrants_step_down()
+
+    def holds_leadership(self) -> bool:
+        """Whether this node leads and may act as leader: its quorum lease
+        still holds, so no other node can have been elected (an expired
+        lease is stepped down from on the next lead tick; until then -- a
+        process thawed from a freeze, say -- it must not act)."""
+        return self.state.is_leader() and self.holds_quorum_lease()
+
+    def holds_quorum_lease(self) -> bool:
+        """Whether the lease opened at this term's claim is still held."""
+        return self._seconds_left_on_quorum_lease() > 0
+
+    def _seconds_left_on_quorum_lease(self) -> float:
+        """Seconds until the quorum lease lapses: a majority, this node
+        included, last acknowledged beats sent that long ago."""
+        lease_expires_at = self.quorum_lease.expires_at(
+            self.state.current_term,
+            self._member_count_or(1) // 2,
+            self.state.lease_duration,
+        )
+        return lease_expires_at - self._clock.monotonic()
 
     def _relinquishes_leadership(self) -> bool:
         """Whether this node's role asks it to hand leadership off."""
@@ -442,19 +473,23 @@ class LocalLeaderElection:
             await self._follow_tick()
 
     async def _lead_tick(self) -> None:
-        """Leader: step down when LHM warrants it, else wait a heartbeat interval and beat."""
+        """Leader: step down when the quorum lease lapsed or role or LHM warrants it, else
+        wait a heartbeat interval -- no longer than the lease lasts -- and beat while it holds."""
         self._stand_for_election_at = None
         # Leader: check if we should step down
         if self.should_step_down():
             await self._log_debug(
-                f"step_down triggered (leadership refusal or LHM) "
+                f"step_down triggered (quorum lease lapsed, leadership refusal or LHM) "
                 f"term={self.state.current_term}"
             )
             await self._step_down()
-        else:
-            await self._wait_for_election_wake(
-                self.heartbeat_interval
-            )
+            return
+        await self._wait_for_election_wake(
+            min(self.heartbeat_interval, self._seconds_left_on_quorum_lease())
+        )
+        # A lapsed lease must not be renewed at followers by one more beat:
+        # the next tick steps down instead.
+        if self.holds_quorum_lease():
             await self._send_heartbeat()
 
     async def _candidate_tick(self) -> None:
@@ -529,7 +564,7 @@ class LocalLeaderElection:
         # expiry, a lapsed lease starts the randomized wait
         # above -- the spread a fixed slack here never gave.
         self._stand_for_election_at = None
-        wait_time = self.state.time_until_lease_expiry()
+        wait_time = self.state.time_until_unbound()
         await self._wait_for_election_wake(
             min(wait_time, self.heartbeat_interval)
         )
@@ -752,6 +787,9 @@ class LocalLeaderElection:
         # Vote for self
         self.state.vote_for(self.self_addr, new_term)
         self.state.record_vote(self.self_addr)
+        # Every vote that can win this term is cast after the claim leaves:
+        # the claim's send instant anchors the winner's quorum lease.
+        self.quorum_lease.open_term(new_term, self._clock.monotonic())
 
         # Broadcast claim
         lhm = self._lhm_score_or_zero()
@@ -851,6 +889,12 @@ class LocalLeaderElection:
         # leader grants, so followers honor the leader's duration rather
         # than their own local config.
         self.state.heartbeat_seq += 1
+        self.quorum_lease.record_beat(
+            self.state.current_term,
+            self.state.heartbeat_seq,
+            self._clock.monotonic(),
+            self.state.lease_duration,
+        )
         lease_ms = int(self.state.lease_duration * 1000)
         heartbeat_msg = (
             b'leader-heartbeat:' +
@@ -922,8 +966,9 @@ class LocalLeaderElection:
         if not self.state.can_vote_for(candidate, term):
             return None
         
-        # Vote for the candidate
-        self.state.vote_for(candidate, term)
+        # Vote for the candidate (binding this node to it for a lease
+        # duration: the winner's quorum lease is anchored at its claim)
+        self.state.grant_vote(candidate, term)
         
         vote_msg = (
             b'leader-vote:' +
@@ -986,6 +1031,33 @@ class LocalLeaderElection:
         if old_leader != leader and leader is not None:
             await self._record_leader_change(old_leader, leader, 'heartbeat')
             self._wake_election_loop()
+
+    def heartbeat_acknowledgement(self, leader: tuple[str, int], term: int) -> bytes | None:
+        """The acknowledgement owed to ``leader`` for its ``term`` beat, once applied.
+
+        Names the newest beat this follower applied -- the one its lease
+        now runs from -- so the leader credits that beat's send instant
+        to its quorum lease. None when the beat was not applied (a deposed
+        leader's term, another leader followed) or carried no sequence.
+        """
+        if not self._follows_beat_from(leader, term) or self.state.applied_heartbeat_seq < 0:
+            return None
+        return (
+            b'leader-heartbeat-ack:' +
+            str(term).encode() + b':' +
+            str(self.state.applied_heartbeat_seq).encode() + b'>' +
+            f'{leader[0]}:{leader[1]}'.encode()
+        )
+
+    def _follows_beat_from(self, leader: tuple[str, int], term: int) -> bool:
+        """Whether this node follows ``leader`` in ``term``: the beat renewed its lease."""
+        return self.state.current_leader == leader and self.state.leader_term == term
+
+    def handle_heartbeat_ack(self, voter: tuple[str, int], term: int, heartbeat_seq: int) -> None:
+        """Credit a cohort voter's acknowledgement of beat ``heartbeat_seq`` to the quorum lease."""
+        if self._rejects_voter(voter):
+            return
+        self.quorum_lease.record_acknowledgement(voter, term, heartbeat_seq)
 
     async def handle_stepdown(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-stepdown message."""

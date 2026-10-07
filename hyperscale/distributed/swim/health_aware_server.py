@@ -5551,8 +5551,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         return self._leader_election.get_current_leader()
 
     def is_leader(self) -> bool:
-        """Check if this node is the current leader."""
-        return self._leader_election.state.is_leader()
+        """Check if this node is the current leader and may act as one: its
+        quorum lease holds, so no other node can have been elected meanwhile."""
+        return self._leader_election.holds_leadership()
 
     def get_leadership_status(self) -> dict:
         """Get current leadership status for debugging."""

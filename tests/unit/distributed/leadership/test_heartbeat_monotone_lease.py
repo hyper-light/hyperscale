@@ -101,3 +101,18 @@ def test_leader_resets_outgoing_sequence_on_election():
     # beat it sends is seq 1.
     assert state.heartbeat_seq == 0
     assert state.applied_heartbeat_seq == -1
+
+
+def test_following_an_elected_leader_restarts_the_sequence_watermark():
+    """A leader-elected announcement adopts the new term before its first
+    beat arrives: the previous leader's watermark must not reject the new
+    leader's low sequence numbers as replays (they renew the lease)."""
+    state = _fresh_state()
+    state.update_heartbeat(LEADER_A, term=1, heartbeat_seq=9)
+
+    state.become_follower(2, LEADER_B)
+    state.update_heartbeat(LEADER_B, term=2, heartbeat_seq=1)
+
+    assert state.current_leader == LEADER_B
+    assert state.leader_term == 2
+    assert state.applied_heartbeat_seq == 1

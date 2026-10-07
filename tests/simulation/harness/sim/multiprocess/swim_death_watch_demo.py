@@ -17,8 +17,9 @@ as ``sim-gate-c``, never node ids, so identical-seed runs compare equal):
 * ``("swim-suspicion", peer_host, confirmations, required, min_timeout,
   max_timeout, start, expiry, t)`` — this node's global (AD-30) suspicion
   of the peer, on each change of its counted Lifeguard confirmations or
-  expiry instant (``start + calculate_timeout()``), sampled once per SWIM
-  protocol period like ``swim-suspectable``.
+  expiry instant (``start + calculate_timeout()``): recorded the instant
+  a suspect or confirm call changes it, and sampled once per SWIM
+  protocol period like ``swim-suspectable`` for any other change.
 * ``("swim-dead", peer_host, t)`` — this node's tracker took the peer DEAD
   (own suspicion expiry, gossip, or burst confirmation alike), written
   from ``register_on_node_dead`` at the transition's exact instant.
@@ -62,23 +63,46 @@ def _watch_swim_transitions(context, server, environment: Env, watched_peers: li
                 pending_peers.remove(peer)
             await asyncio.sleep(environment.SWIM_UDP_POLL_INTERVAL)
 
+    detector = server._hierarchical_detector
+    global_wheel = detector._global_wheel
+    watched_peer_set = {tuple(peer) for peer in watched_peers}
+    last_snapshots: dict[tuple, tuple | None] = {}
+
+    def record_suspicion(peer: tuple) -> None:
+        state = global_wheel.get_state_sync(peer)
+        snapshot = None if state is None else (
+            state.confirmation_count,
+            state.required_confirmations,
+            round(state.min_timeout, 6),
+            round(state.max_timeout, 6),
+            round(state.start_time, 6),
+            round(state.start_time + state.calculate_timeout(), 6),
+        )
+        if snapshot is not None and snapshot != last_snapshots.get(peer):
+            log.append(("swim-suspicion", peer[0], *snapshot, round(context.loop.time(), 6)))
+        last_snapshots[peer] = snapshot
+
+    def recording(detector_call):
+        """Record the peer's suspicion the instant a suspect or confirm
+        call returns: a confirmation that shortens the timeout below one
+        sampling period, so the peer dies before the next sample, is
+        still observed."""
+
+        async def call_then_record(node, incarnation, from_node):
+            outcome = await detector_call(node, incarnation, from_node)
+            if tuple(node) in watched_peer_set:
+                record_suspicion(tuple(node))
+            return outcome
+
+        return call_then_record
+
+    detector.suspect_global = recording(detector.suspect_global)
+    detector.confirm_global = recording(detector.confirm_global)
+
     async def watch_suspicions() -> None:
-        global_wheel = server._hierarchical_detector._global_wheel
-        last_snapshots: dict[tuple, tuple | None] = {}
         while True:
-            for peer in [tuple(peer) for peer in watched_peers]:
-                state = global_wheel.get_state_sync(peer)
-                snapshot = None if state is None else (
-                    state.confirmation_count,
-                    state.required_confirmations,
-                    round(state.min_timeout, 6),
-                    round(state.max_timeout, 6),
-                    round(state.start_time, 6),
-                    round(state.start_time + state.calculate_timeout(), 6),
-                )
-                if snapshot is not None and snapshot != last_snapshots.get(peer):
-                    log.append(("swim-suspicion", peer[0], *snapshot, round(context.loop.time(), 6)))
-                last_snapshots[peer] = snapshot
+            for peer in sorted(watched_peer_set):
+                record_suspicion(peer)
             await asyncio.sleep(environment.SWIM_UDP_POLL_INTERVAL)
 
     context.loop.create_task(watch_suspectable())

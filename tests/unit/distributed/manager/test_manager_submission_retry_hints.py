@@ -53,6 +53,7 @@ def make_manager(
     manager._clock_offset_monitor = SimpleNamespace(is_fenced=clock_fenced)
     manager._leader_election = SimpleNamespace(
         state=SimpleNamespace(is_leader=lambda: is_leader),
+        holds_leadership=lambda: is_leader,
         seconds_until_next_decision=lambda: ELECTION_READING_SECONDS,
     )
     manager._resolve_dc_leader_addr = lambda: known_leader

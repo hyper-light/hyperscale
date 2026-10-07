@@ -138,6 +138,11 @@ async def _apply_leadership_message(
             await election.handle_heartbeat(
                 target, int(fields[0]), int(fields[1]), int(fields[2]) / 1000.0
             )
+            if acknowledgement := election.heartbeat_acknowledgement(target, int(fields[0])):
+                send(recipient, target, acknowledgement)
+
+    elif message_type == b"leader-heartbeat-ack":
+        election.handle_heartbeat_ack(sender, int(fields[0]), int(fields[1]))
 
     elif message_type == b"leader-stepdown":
         await election.handle_stepdown(target, int(fields[0]))
