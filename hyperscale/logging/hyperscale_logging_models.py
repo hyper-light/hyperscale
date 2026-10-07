@@ -353,6 +353,18 @@ class WALTailDiscarded(Entry, kw_only=True):
     level: LogLevel = LogLevel.WARN
 
 
+class WALUntrustworthy(Entry, kw_only=True):
+    """AD-38 Part 3.2: a job WAL is damaged at ``damage_offset`` with
+    ``bytes_after_damage`` written bytes after it -- not a torn tail -- so
+    the node refuses to start; the file is left as found."""
+
+    path: str
+    damage_offset: int
+    bytes_after_damage: int
+    recovered_entries: int
+    level: LogLevel = LogLevel.CRITICAL
+
+
 class WorkerStarted(Entry, kw_only=True):
     node_id: str
     node_host: str

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import zlib
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, AsyncIterator, Mapping
@@ -28,7 +30,7 @@ from hyperscale.distributed.ledger.storage_format import (
     require_stable_read,
     set_aside_unrecognized,
 )
-from hyperscale.logging.hyperscale_logging_models import WALTailDiscarded
+from hyperscale.logging.hyperscale_logging_models import WALTailDiscarded, WALUntrustworthy
 from hyperscale.distributed.runtime import Filesystem, RealFilesystem
 
 from .entry_state import WALEntryState, TransitionResult
@@ -36,6 +38,7 @@ from .wal_entry import HEADER_SIZE, WALEntry
 from .wal_status_snapshot import WALStatusSnapshot
 from .wal_writer import WALWriter, WALWriterConfig, WriteRequest, WALBackpressureError
 from .wal_append_result import WALAppendResult
+from .wal_untrustworthy_error import WALUntrustworthyError
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -48,6 +51,9 @@ _DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 # without it -- earlier layouts, other programs, corruption -- are never
 # read as entries.
 WAL_FORMAT = StorageFormat(b"HSWL", 1)
+
+# A frame's leading fields: its checksum, and its total length.
+FRAME_PREFIX = struct.Struct(">II")
 
 
 class NodeWAL:
@@ -138,14 +144,22 @@ class NodeWAL:
         await self._writer.start()
 
     async def _recover_existing_file(self) -> None:
-        """Recover the WAL file on disk, cutting back any unrecoverable
-        tail (a file not accepted as this format recovers nothing)."""
+        """Recover the WAL file on disk, cutting back a torn tail and
+        refusing a file damaged anywhere else (a file not accepted as this
+        format recovers nothing).
+
+        Raises:
+            WALUntrustworthyError: damage with written bytes after it.
+            UnstableStorageReadError: a second read disagrees with the
+                bytes a damage verdict was drawn from.
+        """
         data = await self._filesystem.read_bytes(self._path)
         if not await self._accept_existing_file(data):
             return
-        recovered_count, recovered_length = self._recover(data)
-        if recovered_length < len(data):
-            await self._discard_unrecoverable_tail(data, recovered_count, recovered_length)
+        recovered_entries, frames_length = self._parse_frames(WAL_FORMAT.decode(data))
+        if (recovered_length := WAL_FORMAT.header_size + frames_length) < len(data):
+            await self._settle_damage(data, len(recovered_entries), recovered_length)
+        self._adopt_recovery(recovered_entries)
 
     async def _accept_existing_file(self, data: bytes) -> bool:
         """Whether the file on disk is a WAL in this format to recover.
@@ -177,18 +191,53 @@ class NodeWAL:
             self._filesystem, self._path, data, format_error.reason, self._logger
         )
 
-    async def _discard_unrecoverable_tail(
-        self, data: bytes, recovered_count: int, recovered_length: int
-    ) -> None:
-        """Cut the file back to its last recoverable frame.
+    async def _settle_damage(self, data: bytes, recovered_count: int, recovered_length: int) -> None:
+        """Cut a torn tail; refuse damage anywhere else (AD-38 Part 3.2).
 
-        Recovery stops at the first torn or corrupt frame; left in place,
-        that frame would hide every entry appended after it from the next
-        recovery -- acknowledged writes lost on the following restart. The
-        discarded bytes (a crash's torn append, or damage) are preserved
-        beside the WAL, never destroyed.
+        Only on a second read that agrees: a verdict drawn from bytes a
+        faulty read path flipped must neither cut an acknowledged entry
+        nor condemn an intact log.
+
+        Raises:
+            WALUntrustworthyError: the damage has written bytes after it.
+            UnstableStorageReadError: the second read disagrees.
         """
         await require_stable_read(self._filesystem, self._path, data)
+        if not self._is_torn_tail(data, recovered_length):
+            await self._refuse_untrustworthy(data, recovered_count, recovered_length)
+        await self._discard_torn_tail(data, recovered_count, recovered_length)
+
+    async def _refuse_untrustworthy(self, data: bytes, recovered_count: int, damage_offset: int) -> None:
+        """Report the damage loudly, then refuse to start; the file is
+        left exactly as found.
+
+        Raises:
+            WALUntrustworthyError: always.
+        """
+        untrustworthy = WALUntrustworthyError(self._path, damage_offset, len(data) - damage_offset)
+        if self._logger is not None:
+            await self._logger.log(
+                WALUntrustworthy(
+                    message=str(untrustworthy),
+                    path=str(self._path),
+                    damage_offset=damage_offset,
+                    bytes_after_damage=len(data) - damage_offset,
+                    recovered_entries=recovered_count,
+                )
+            )
+        raise untrustworthy
+
+    async def _discard_torn_tail(
+        self, data: bytes, recovered_count: int, recovered_length: int
+    ) -> None:
+        """Cut the file back to its last whole frame.
+
+        A crash mid-append leaves at most a torn last frame (never
+        acknowledged: its batch never finished its fsync); left in place,
+        it would hide every entry appended after the restart from the next
+        recovery. The cut bytes are preserved beside the WAL, never
+        destroyed.
+        """
         preserved_path = await free_sibling_path(self._filesystem, self._path, "discarded")
         await self._filesystem.atomic_write(preserved_path, data[recovered_length:])
         await self._filesystem.atomic_write(self._path, data[:recovered_length])
@@ -196,8 +245,8 @@ class NodeWAL:
             await self._logger.log(
                 WALTailDiscarded(
                     message=(
-                        f"WAL {self._path}: {len(data) - recovered_length} bytes after the last "
-                        f"recoverable entry discarded (preserved at {preserved_path})"
+                        f"WAL {self._path}: {len(data) - recovered_length} bytes of a torn last entry "
+                        f"discarded (preserved at {preserved_path})"
                     ),
                     path=str(self._path),
                     preserved_path=str(preserved_path),
@@ -206,11 +255,48 @@ class NodeWAL:
                 )
             )
 
-    def _recover(self, data: bytes) -> tuple[int, int]:
-        """Recover the entries in ``data``: how many, and the length of
-        its recoverable prefix (format header plus every whole, valid
-        frame)."""
-        recovered_entries, frames_length = self._parse_frames(WAL_FORMAT.decode(data))
+    @staticmethod
+    def _is_torn_tail(data: bytes, damage_offset: int) -> bool:
+        """Whether the damage at ``damage_offset`` is a torn tail: nothing
+        written after the damaged frame (only zeros, or the end of the
+        file), and no whole frame anywhere from the damage on. A frame
+        whose length was damaged claims an extent past the end of the
+        file or a short one; either way the scan finds the whole frames
+        written after it."""
+        damaged_frame_end = NodeWAL._damaged_frame_end(data, damage_offset)
+        return not any(memoryview(data)[damaged_frame_end:]) and not NodeWAL._has_whole_frame_from(
+            data, damage_offset
+        )
+
+    @staticmethod
+    def _damaged_frame_end(data: bytes, damage_offset: int) -> int:
+        """Where the damaged frame at ``damage_offset`` claims to end --
+        past its header at least -- clamped to the end of the file."""
+        if damage_offset + HEADER_SIZE > len(data):
+            return len(data)
+        _checksum, total_length = FRAME_PREFIX.unpack_from(data, damage_offset)
+        return min(len(data), damage_offset + max(total_length, HEADER_SIZE))
+
+    @staticmethod
+    def _has_whole_frame_from(data: bytes, start_offset: int) -> bool:
+        """Whether a whole frame -- a possible length and a checksum that
+        holds -- begins at any byte from ``start_offset`` on. One at the
+        damage itself held its checksum yet did not decode: written whole,
+        in a form this build does not read."""
+        data_length = len(data)
+        data_view = memoryview(data)
+        candidate_offsets = range(start_offset, data_length - HEADER_SIZE + 1)
+        return any(
+            zlib.crc32(data_view[offset + 4 : offset + total_length]) == checksum
+            for offset, (checksum, total_length) in zip(
+                candidate_offsets, map(partial(FRAME_PREFIX.unpack_from, data), candidate_offsets)
+            )
+            if HEADER_SIZE <= total_length <= data_length - offset
+        )
+
+    def _adopt_recovery(self, recovered_entries: list[WALEntry]) -> None:
+        """Adopt the recovered entries: the next LSN follows the highest,
+        the last is synced, and every unapplied one is pending."""
         next_lsn = max((entry.lsn + 1 for entry in recovered_entries), default=0)
         last_synced_lsn = recovered_entries[-1].lsn if recovered_entries else -1
 
@@ -223,7 +309,6 @@ class NodeWAL:
             closed=False,
         )
         self._pending_snapshot = MappingProxyType(dict(self._pending_entries_internal))
-        return len(recovered_entries), WAL_FORMAT.header_size + frames_length
 
     def _adopt_recovered_entries(self, recovered_entries: list[WALEntry]) -> None:
         """Witness every recovered entry's HLC and hold each one not yet
@@ -237,8 +322,8 @@ class NodeWAL:
     @staticmethod
     def _parse_frames(frames: bytes) -> tuple[list[WALEntry], int]:
         """The entries in the bytes after the format header, up to the
-        first torn or corrupt frame (a crash mid-append leaves at most
-        one, at the tail), and how many bytes those entries span."""
+        first torn or corrupt frame, and how many bytes those entries
+        span. Recovery accepts such a frame only as a torn tail."""
         entries: list[WALEntry] = []
         offset = 0
         while offset + HEADER_SIZE <= len(frames):

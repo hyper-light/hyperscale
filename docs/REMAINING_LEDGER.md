@@ -34,8 +34,7 @@ D-83/84), and AD-44 late results / `RETRY_BUDGET_DEFAULT` (P-AD44-1, A3-G-50).
 
 ### The ten most important remaining items
 
-1. **D-95 (new): `NodeWAL` recovery cuts at the first corrupt frame anywhere in the file.**
-   `ledger/wal/node_wal.py:180-247`. `_discard_unrecoverable_tail` cuts the WAL there. The cut bytes are preserved in a sibling file, but every acknowledged entry after a mid-file bad frame drops out of recovery, and the node starts anyway. `RaftStore` accepts only a torn *last* frame. Size M.
+1. **D-95: CLOSED.** `NodeWAL` used to cut at the first corrupt frame anywhere in the file. It now accepts only a torn tail and otherwise refuses to start with `WALUntrustworthyError` (AD-38 Part 3.2). The same change closed a length-field gap in `RaftStoreCodec`, which had silently truncated acknowledged records after a mid-file frame whose length was damaged.
 2. **A2-G-266: the gate takeover replica (`GateJobReplica`) is not persisted before its prepare-ack.**
    It is an in-memory two-phase commit (`nodes/gate/replication_coordinator.py:167`), so it survives only while a gate majority stays up. `docs/architecture.md:148` and principle 4 wrongly say "through Raft". Size M.
 3. **D-70 (new): the client ignores `JobAck.retry_after_seconds`.**
@@ -548,10 +547,10 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - Exists: 100-job instant burst `tests/unit/simulation/sim/test_multiprocess_fanout.py`; DAG + dispatch exhaustion `test_multiprocess_workflow_lifecycle.py`; cancel `test_multiprocess_job_cancellation.py`; blackout `test_multiprocess_l2_submission_blackout.py`; long-running `test_multiprocess_l2_extension.py`.
 - Missing: sustained-rate and staggered-start scenarios; cross-DC dependency chains; adversarial workflows (a step that raises, loops forever, or exhausts memory) — none in `tests/simulation/harness/sim/multiprocess/`.
 
-#### D-95 — SCENARIOS §10 WAL corruption refusal — STILL PARTIAL — size S
+#### D-95 — SCENARIOS §10 WAL corruption refusal — CLOSED (AD-38 Part 3.2; `test_node_wal_damage_vopr.py`)
 - Doc: docs/SCENARIOS.md §10 "WAL corruption. Detected at startup; node refuses to come up."
 - Exists: Raft store applies a torn-last-frame-only rule and sets aside an untrustworthy disk (Plan D1 stage A); restart/idempotency/incarnation/snapshot-install covered (`tests/unit/distributed/raft/test_raft_snapshot_install.py`, `test_wal_reclamation.py`).
-- Missing: the job `NodeWAL` treats any bad frame as a torn tail — `_parse_frames` stops at the first corrupt frame and `_discard_unrecoverable_tail` cuts everything after it (`ledger/wal/node_wal.py:180-196, 236-247`), so mid-file damage silently drops later acknowledged entries (logged `WALTailDiscarded`, bytes preserved) and the node starts. Either adopt the RaftStore rule (refuse/set aside unless the bad frame is the last) or change §10 with a decision.
+- Closed: `NodeWAL` accepts only a torn tail. It cuts the tail after a stable second read, and refuses any other damage with `WALUntrustworthyError` and a CRITICAL `WALUntrustworthy` log, leaving the file as found. Refusal was chosen over set-aside because nothing rebuilds a node's ledger from peers and LOCAL entries are never replicated (AD-38 Part 3.2). Tested in `tests/unit/distributed/ledger/wal/test_node_wal_damage_vopr.py`.
 
 #### D-13b (G-96) — SCENARIOS §11 continuous 9-invariant checker — STILL PARTIAL — size M
 - Doc: SCENARIOS.md §11, nine invariants every 100 ms.
@@ -575,7 +574,7 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 
 ### New gaps found
 - Client drops `JobAck.retry_after_seconds` (gate overload shed and replication-quorum hints) and backs off from a literal 0.5 s (`nodes/client/submission.py:401,630`) — see D-70.
-- Job `NodeWAL` truncates at mid-file corruption, losing acknowledged entries after the damaged frame, unlike `RaftStore`'s torn-last-frame-only rule (`ledger/wal/node_wal.py:180-247`) — see D-95.
+- (Closed) Job `NodeWAL` mid-file corruption now refuses to start; see D-95.
 - Harness drops cleanup errors and a pending invariant violation when the test body already raised (`tests/simulation/harness/cluster_harness.py:166-170`) — see D-9.
 - Nightly CI `vopr` job runs only the default 4-seed sweep and never the soak (`.github/workflows/ci.yml:129`) — see D-42.
 - God files grew ~35–46% since 2026-08 despite the complexity program — see D-84.

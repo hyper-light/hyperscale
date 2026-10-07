@@ -65,7 +65,7 @@ EXPECTED_MULTI_CLASS_FILES: dict[str, int] = {
     'hyperscale/core/jobs/protocols/encryption.py': 2,
     'hyperscale/core/jobs/protocols/replay_guard.py': 2,
     'hyperscale/core/jobs/protocols/restricted_unpickler.py': 2,
-    'hyperscale/logging/hyperscale_logging_models.py': 68,
+    'hyperscale/logging/hyperscale_logging_models.py': 69,
     'hyperscale/tools/filesystem/base.py': 2,
     'hyperscale/tools/filesystem/binary.py': 6,
     'hyperscale/tools/filesystem/text.py': 2,

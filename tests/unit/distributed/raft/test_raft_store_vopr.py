@@ -417,6 +417,32 @@ async def test_damage_before_the_last_record_sets_the_store_aside() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("length_bit", range(32))
+async def test_a_damaged_length_before_the_last_record_sets_the_store_aside(length_bit: int) -> None:
+    """A flipped bit in a record's length makes it claim to run past the
+    end of the file -- or end short, or exactly there -- like a torn last
+    record; the whole records after it prove it is not one."""
+    filesystem = SimFilesystem()
+    _store, task_runner, _logger = await written_store(filesystem)
+    await task_runner.shutdown()
+    data = bytearray(await filesystem.read_bytes(STORE_DIRECTORY / "store.wal"))
+    second = frame_offsets(bytes(data))[1]
+    data[second + 4 + 3 - length_bit // 8] ^= 1 << (length_bit % 8)
+    await filesystem.atomic_write(STORE_DIRECTORY / "store.wal", bytes(data))
+
+    original = await original_files(filesystem)
+    recovery, _logger = await reopen(filesystem)
+    assert not recovery.resumed and recovery.set_aside_reason is not None, length_bit
+    (set_aside_directory,) = [
+        directory
+        for directory in await filesystem.list_subdirectories(STORE_DIRECTORY.parent)
+        if directory.name.startswith("raft.set-aside.")
+    ]
+    for name, content in original.items():
+        assert await filesystem.read_bytes(set_aside_directory / name) == content
+
+
+@pytest.mark.asyncio
 async def test_another_identitys_store_is_set_aside() -> None:
     filesystem = SimFilesystem()
     _store, task_runner, _logger = await written_store(filesystem)

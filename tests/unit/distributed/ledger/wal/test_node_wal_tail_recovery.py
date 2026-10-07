@@ -8,10 +8,12 @@ after the following restart. Pinned:
 
 * Torn tail (a crash mid-append), then appends, then a restart: every
   entry -- before and after the crash -- is recovered, in order.
-* A corrupt frame mid-file: recovery keeps the entries before it, and
-  appends after the restart survive the next one.
-* The discarded bytes are preserved beside the WAL (never destroyed) and
-  the discard is reported.
+* A corrupt frame mid-file (entries written after it) is not a torn
+  tail: the WAL refuses to open, loudly, and the file is left as found
+  (AD-38 Part 3.2). ``test_node_wal_damage_vopr.py`` covers every damage
+  shape.
+* The discarded torn bytes are preserved beside the WAL (never
+  destroyed) and the discard is reported.
 * Seeded crash cycles (random appends, power loss, random torn debris,
   repeated): every entry made durable before a crash is recovered, in
   order, after every later restart.
@@ -25,7 +27,8 @@ import pytest
 
 from hyperscale.distributed.ledger.wal.node_wal import WAL_FORMAT, NodeWAL
 from hyperscale.distributed.ledger.wal.wal_entry import JobEventType
-from hyperscale.logging.hyperscale_logging_models import WALTailDiscarded
+from hyperscale.distributed.ledger.wal.wal_untrustworthy_error import WALUntrustworthyError
+from hyperscale.logging.hyperscale_logging_models import WALTailDiscarded, WALUntrustworthy
 from tests.simulation.harness.sim import SimFilesystem
 from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
@@ -75,7 +78,7 @@ async def test_appends_after_recovering_a_torn_tail_survive_the_next_restart() -
 
 
 @pytest.mark.asyncio
-async def test_a_corrupt_frame_mid_file_is_cut_with_everything_after_it_preserved() -> None:
+async def test_a_corrupt_frame_mid_file_refuses_to_open_and_leaves_the_file_as_found() -> None:
     filesystem = SimFilesystem()
     await _append_all(filesystem, [b"first", b"second", b"third"])
     intact = await filesystem.read_bytes(WAL_PATH)
@@ -86,12 +89,14 @@ async def test_a_corrupt_frame_mid_file_is_cut_with_everything_after_it_preserve
     await filesystem.atomic_write(WAL_PATH, bytes(damaged))
     logger = RecordingLogger()
 
-    assert await _recovered(filesystem, logger) == [b"first"]
-    (report,) = [entry for entry in logger.entries if isinstance(entry, WALTailDiscarded)]
-    assert await filesystem.read_bytes(Path(report.preserved_path)) == bytes(damaged[first_frame_end:])
+    with pytest.raises(WALUntrustworthyError) as refusal:
+        await _recovered(filesystem, logger)
 
-    await _append_all(filesystem, [b"after"])
-    assert await _recovered(filesystem) == [b"first", b"after"]
+    assert refusal.value.damage_offset == first_frame_end
+    (report,) = [entry for entry in logger.entries if isinstance(entry, WALUntrustworthy)]
+    assert (report.damage_offset, report.recovered_entries) == (first_frame_end, 1)
+    assert await filesystem.read_bytes(WAL_PATH) == bytes(damaged)
+    assert await filesystem.list_directory(WAL_PATH.parent, "*.discarded-*") == []
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ Frame: ``[4: crc32 of body][4: body length][body]``, big-endian.
 
 import struct
 import zlib
+from functools import partial
 
 import msgspec
 
@@ -90,15 +91,45 @@ class RaftStoreCodec:
 
         Raises:
             RaftStoreUntrustworthyError: a damaged frame with written bytes
-                after it, or an intact frame that does not decode.
+                or a whole frame after it, or an intact frame that does not
+                decode.
         """
         if (frame := self._frame_at(data, offset)) is None:
+            self._raise_if_whole_frame_after(data, offset)
             return None
         frame_end, checksum, body_length, body = frame
         if self._frame_is_damaged(checksum, body_length, body):
             self._raise_unless_torn_tail(data, offset, frame_end)
+            self._raise_if_whole_frame_after(data, offset)
             return None
         return frame_end, self._decode_record(body, offset)
+
+    @staticmethod
+    def _raise_if_whole_frame_after(data: bytes, offset: int) -> None:
+        """A frame whose length was damaged claims to run past the end of
+        the file (or to end exactly there): only the whole frames written
+        after it tell it from a torn tail.
+
+        Raises:
+            RaftStoreUntrustworthyError: a whole frame begins after ``offset``.
+        """
+        if RaftStoreCodec._has_whole_frame_after(data, offset):
+            raise RaftStoreUntrustworthyError(f"the record at byte {offset} is damaged with whole records after it")
+
+    @staticmethod
+    def _has_whole_frame_after(data: bytes, offset: int) -> bool:
+        """Whether a whole frame -- a possible length and a checksum that
+        holds -- begins at any byte after ``offset``."""
+        size = len(data)
+        data_view = memoryview(data)
+        candidate_offsets = range(offset + 1, size - FRAME_HEADER.size + 1)
+        return any(
+            zlib.crc32(data_view[candidate_offset + FRAME_HEADER.size :][:body_length]) == checksum
+            for candidate_offset, (checksum, body_length) in zip(
+                candidate_offsets, map(partial(FRAME_HEADER.unpack_from, data), candidate_offsets)
+            )
+            if 0 < body_length <= size - candidate_offset - FRAME_HEADER.size
+        )
 
     @staticmethod
     def _frame_is_damaged(checksum: int, body_length: int, body: bytes) -> bool:
