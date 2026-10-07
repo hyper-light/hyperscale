@@ -268,8 +268,7 @@ class LocalServerPool:
         on_executor_exit: Callable[[tuple[str, int]], None] | None = None,
     ) -> None:
         # Phase 6 SIM seam. ``process_spawner`` is ``None`` in REAL mode —
-        # the pool fans its executors out through a ``ProcessPoolExecutor``
-        # exactly as before. Under SIM the spawner (the coordinator child
+        # each executor slot runs in a ``ProcessPoolExecutor`` of its own. Under SIM the spawner (the coordinator child
         # context) requests each executor as a *coordinator child process*
         # instead, so every executor still runs in its own OS process
         # (multi-process preserved) but on a ``SimulationLoop`` the
@@ -280,13 +279,23 @@ class LocalServerPool:
         # ``get_event_loop`` never resolves a non-simulation loop.
         self._pool_size = pool_size
         self._context: SpawnContext | None = None
-        self._executor: ProcessPoolExecutor | None = None
+        # REAL: worker address -> the one-process ``ProcessPoolExecutor``
+        # running that slot's executor. One per slot, so an executor that
+        # dies abruptly breaks only its own pool: a shared pool would
+        # terminate every sibling and refuse new work.
+        self._executors: Dict[tuple[str, int], ProcessPoolExecutor] = {}
+        # REAL: worker address -> the call that runs that slot's executor;
+        # its replacement runs the same call.
+        self._executor_calls: Dict[tuple[str, int], functools.partial] = {}
         self._loop: asyncio.AbstractEventLoop | None = loop
         self._process_spawner = process_spawner
         # Told the listen address of every executor whose process exit
         # the pool reaps, at the reap — the pool leader withdraws that
         # executor from its hand-outs before anything can dispatch to it.
-        self._on_executor_exit = on_executor_exit
+        # Without a listener, nobody is told.
+        self._on_executor_exit: Callable[[tuple[str, int]], None] = (
+            on_executor_exit if on_executor_exit is not None else lambda executor_address: None
+        )
         # SIM: live executor process id -> (worker index, worker address)
         # of the slot it fills; a reaped id leaves, its replacement joins.
         self._executor_slots: dict[str, tuple[int, tuple[str, int]]] = {}
@@ -318,12 +327,6 @@ class LocalServerPool:
             return
 
         self._context = multiprocessing.get_context("spawn")
-        self._executor = ProcessPoolExecutor(
-            max_workers=self._pool_size,
-            mp_context=self._context,
-            initializer=set_process_name,
-            max_tasks_per_child=1,
-        )
 
         async with self._logger.context(
             name="local_server_pool",
@@ -393,29 +396,18 @@ class LocalServerPool:
                 )
 
                 config = LoggingConfig()
+                worker_env = env.model_dump()
 
-                # Ctrl+C belongs to the leader, which shuts the workers down.
-                # Spawned with SIGINT blocked, the workers (and the executor
-                # thread that later replaces them) inherit the mask through
-                # fork and exec, so the terminal's SIGINT never interrupts their
-                # imports or their run. A SIGINT that arrives meanwhile stays
-                # pending and reaches the leader once unblocked.
-                leader_signal_mask = (
-                    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
-                    if hasattr(signal, "pthread_sigmask")
-                    else None
-                )
-
-                try:
-                    executor_futures = [
-                        self._loop.run_in_executor(
-                            self._executor,
+                self._pool_task = asyncio.gather(
+                    *[
+                        self._start_executor(
+                            worker_ip,
                             functools.partial(
                                 run_thread,
                                 idx,
                                 leader_address,
                                 worker_ip,
-                                env.model_dump(),
+                                worker_env,
                                 config.directory,
                                 log_level=config.level.name.lower(),
                                 cert_path=cert_path,
@@ -424,24 +416,9 @@ class LocalServerPool:
                             ),
                         )
                         for idx, worker_ip in enumerate(worker_ips)
-                    ]
-
-                    # An executor's future completes when the pool reaps its
-                    # process — on return, or with ``BrokenProcessPool`` when
-                    # it died abruptly. That completion is the reap event.
-                    # No respawn here: an abrupt death breaks the
-                    # ``ProcessPoolExecutor`` (it terminates every sibling and
-                    # refuses new work), so each sibling is reaped in turn.
-                    self._watch_executor_futures(executor_futures, worker_ips)
-
-                    self._pool_task = asyncio.gather(
-                        *executor_futures,
-                        return_exceptions=True,
-                    )
-
-                finally:
-                    if leader_signal_mask is not None:
-                        signal.pthread_sigmask(signal.SIG_SETMASK, leader_signal_mask)
+                    ],
+                    return_exceptions=True,
+                )
 
             except (Exception, KeyboardInterrupt):
                 pass
@@ -524,8 +501,7 @@ class LocalServerPool:
         down does not respawn.
         """
         worker_index, worker_address = self._executor_slots.pop(process_id)
-        if self._on_executor_exit is not None:
-            self._on_executor_exit(worker_address)
+        self._on_executor_exit(worker_address)
 
         if self._cleaned_up:
             return
@@ -539,27 +515,90 @@ class LocalServerPool:
             worker_address,
         )
 
-    def _watch_executor_futures(
-        self,
-        executor_futures: List[asyncio.Future],
-        worker_ips: List[tuple[str, int]],
-    ) -> None:
-        """REAL: report each executor's exit when the pool reaps it."""
-        if self._on_executor_exit is None:
-            return
-
-        for executor_future, worker_address in zip(executor_futures, worker_ips):
-            executor_future.add_done_callback(
-                functools.partial(self._report_executor_future_exit, worker_address)
-            )
-
-    def _report_executor_future_exit(
+    def _start_executor(
         self,
         worker_address: tuple[str, int],
+        executor_call: functools.partial,
+    ) -> asyncio.Future:
+        """REAL: run the slot at ``worker_address`` in a pool of its own.
+
+        The single REAL spawn path: the initial fan-out and every
+        replacement go through it, so a replacement runs the identical
+        ``run_thread`` lifecycle, including the start acknowledgement that
+        is its ready handshake with the leader. The returned future
+        completes when the pool reaps the process: on return, or with
+        ``BrokenProcessPool`` when it died abruptly.
+        """
+        self._executor_calls[worker_address] = executor_call
+        executor = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=self._context,
+            initializer=set_process_name,
+            max_tasks_per_child=1,
+        )
+        self._executors[worker_address] = executor
+
+        # Ctrl+C belongs to the leader, which shuts the workers down.
+        # Spawned with SIGINT blocked, the worker (and the executor thread
+        # that later replaces it) inherits the mask through fork and exec,
+        # so the terminal's SIGINT never interrupts its imports or its run.
+        # A SIGINT that arrives meanwhile stays pending and reaches the
+        # leader once unblocked.
+        leader_signal_mask = (
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+            if hasattr(signal, "pthread_sigmask")
+            else None
+        )
+        try:
+            executor_future = self._loop.run_in_executor(executor, executor_call)
+
+        finally:
+            if leader_signal_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, leader_signal_mask)
+
+        executor_future.add_done_callback(
+            functools.partial(self._handle_executor_exit, worker_address, executor)
+        )
+        return executor_future
+
+    def _handle_executor_exit(
+        self,
+        worker_address: tuple[str, int],
+        executor: ProcessPoolExecutor,
         executor_future: asyncio.Future,
     ) -> None:
-        """REAL reap listener: the executor at ``worker_address`` exited."""
+        """REAL reap listener: withdraw the exited executor; refill a dead one.
+
+        The leader is told first, so the slot is out of every hand-out
+        before a replacement is requested; the replacement takes the slot
+        back only through its own start acknowledgement. Only an abrupt
+        death (``BrokenProcessPool``) is replaced: an executor that
+        returned was stopped.
+        """
+        # Read on every exit, so an outcome nobody else awaits (a
+        # replacement's) is never left unretrieved.
+        died = not executor_future.cancelled() and isinstance(executor_future.exception(), BrokenProcessPool)
+
         self._on_executor_exit(worker_address)
+
+        if died:
+            self._replace_executor(worker_address, executor)
+
+    def _replace_executor(
+        self,
+        worker_address: tuple[str, int],
+        executor: ProcessPoolExecutor,
+    ) -> None:
+        """REAL: refill the slot whose executor died, in a new pool.
+
+        A pool shutting down does not respawn, and a slot already refilled
+        is left alone. The broken pool's process is already gone.
+        """
+        if self._cleaned_up or self._executors.get(worker_address) is not executor:
+            return
+
+        executor.shutdown(wait=False, cancel_futures=True)
+        self._start_executor(worker_address, self._executor_calls[worker_address])
 
     def get_process_exitcodes(self) -> dict[int | str, int | None]:
         """Return a snapshot of worker-process id to exit code.
@@ -575,16 +614,10 @@ class LocalServerPool:
         if self._process_spawner is not None:
             return self._process_spawner.get_process_exitcodes()
 
-        if self._executor is None:
-            return {}
-
-        processes = getattr(self._executor, "_processes", None)
-        if not processes:
-            return {}
-
         return {
             int(process_id): process.exitcode
-            for process_id, process in list(processes.items())
+            for executor in list(self._executors.values())
+            for process_id, process in list((getattr(executor, "_processes", None) or {}).items())
         }
 
     async def shutdown(self, wait: bool = True):
@@ -622,9 +655,9 @@ class LocalServerPool:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
 
-                    if self._executor and self._executor._processes:
+                    for executor in list(self._executors.values()):
                         # Kill processes immediately - no graceful termination needed
-                        for pid, proc in list(self._executor._processes.items()):
+                        for pid, proc in list((executor._processes or {}).items()):
                             if proc.is_alive():
                                 try:
                                     proc.kill()
@@ -632,10 +665,10 @@ class LocalServerPool:
                                     pass
 
                         # Now shutdown the executor (processes are already dead)
-                        self._executor.shutdown(wait=False, cancel_futures=True)
+                        executor.shutdown(wait=False, cancel_futures=True)
 
-                    # Clear executor reference to allow GC
-                    self._executor = None
+                    # Clear executor references to allow GC
+                    self._executors.clear()
 
             except (
                 Exception,
@@ -645,9 +678,9 @@ class LocalServerPool:
             ):
                 # Last resort: force shutdown without wait
                 try:
-                    if self._executor:
-                        self._executor.shutdown(wait=False, cancel_futures=True)
-                        self._executor = None
+                    for executor in list(self._executors.values()):
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    self._executors.clear()
                 except Exception:
                     pass
 
@@ -677,9 +710,9 @@ class LocalServerPool:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
 
-                if self._executor and self._executor._processes:
+                for executor in list(self._executors.values()):
                     # Force kill all processes immediately
-                    for pid, proc in list(self._executor._processes.items()):
+                    for pid, proc in list((executor._processes or {}).items()):
                         try:
                             if proc.is_alive():
                                 proc.kill()
@@ -687,10 +720,10 @@ class LocalServerPool:
                             pass
 
                     # Shutdown executor
-                    self._executor.shutdown(wait=False, cancel_futures=True)
+                    executor.shutdown(wait=False, cancel_futures=True)
 
-                # Clear executor reference to allow GC
-                self._executor = None
+                # Clear executor references to allow GC
+                self._executors.clear()
 
         except Exception:
             pass

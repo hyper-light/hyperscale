@@ -1011,7 +1011,7 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/core/jobs/runner/local_runner.py::abort': 8,
     'hyperscale/core/jobs/runner/local_server_pool.py::LocalServerPool.abort': 11,
     'hyperscale/core/jobs/runner/local_server_pool.py::LocalServerPool.get_process_exitcodes': 5,
-    'hyperscale/core/jobs/runner/local_server_pool.py::LocalServerPool.run_pool': 6,
+    'hyperscale/core/jobs/runner/local_server_pool.py::LocalServerPool.run_pool': 4,
     'hyperscale/core/jobs/runner/local_server_pool.py::LocalServerPool.setup': 5,
     'hyperscale/core/jobs/runner/local_server_pool.py::LocalServerPool.shutdown': 14,
     'hyperscale/core/jobs/runner/local_server_pool.py::run_server': 13,
