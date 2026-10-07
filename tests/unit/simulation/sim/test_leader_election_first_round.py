@@ -155,6 +155,7 @@ async def _run_group(
     addresses: tuple[tuple[str, int], ...] = _ADDRESSES,
     cohort: frozenset[tuple[str, int]] = frozenset(_ADDRESSES),
     refusing_leadership: frozenset[tuple[str, int]] = frozenset(),
+    restart_followers_after: float | None = None,
 ) -> tuple[
     list[tuple[float, tuple[str, int], int]],
     list[tuple[float, tuple[str, int], int]],
@@ -164,7 +165,10 @@ async def _run_group(
     """Boot an election per address, leaderless, each counting its
     majority over ``cohort`` and admitting only the cohort's votes (as
     managers and gates do); ``refusing_leadership`` never stand, but vote.
-    Optionally stop whichever leads ``stop_leader_after`` seconds in.
+    Optionally restart every follower ``restart_followers_after`` seconds
+    in -- each replaced by a fresh election, as a restarted node comes back
+    knowing no term -- and stop whichever leads ``stop_leader_after``
+    seconds in.
     Returns every election a node stood for (when, who, term), every
     leader stop (when, who, term), each running node's final (role, term,
     leader), and when each node first led."""
@@ -184,7 +188,7 @@ async def _run_group(
     def send(sender: tuple[str, int], recipient: tuple[str, int], message: bytes) -> None:
         task_runner.run(deliver, sender, recipient, message)
 
-    for index, address in enumerate(addresses):
+    def new_election(index: int, address: tuple[str, int]) -> LocalLeaderElection:
         election = LocalLeaderElection(
             dc_id="sim",
             heartbeat_interval=leader_config["heartbeat_interval"],
@@ -217,7 +221,10 @@ async def _run_group(
             should_refuse_leadership=lambda refuses=address in refusing_leadership: refuses,
             is_cohort_voter=cohort.__contains__,
         )
-        elections[address] = election
+        return election
+
+    for index, address in enumerate(addresses):
+        elections[address] = new_election(index, address)
 
     async def watch_leadership() -> None:
         while True:
@@ -231,8 +238,16 @@ async def _run_group(
         await election.start()
 
     try:
+        if restart_followers_after is not None:
+            await clock.sleep(restart_followers_after)
+            for index, address in enumerate(addresses):
+                if not elections[address].state.is_leader():
+                    await elections[address].stop()
+                    elections[address] = new_election(len(addresses) + index, address)
+                    await elections[address].start()
         if stop_leader_after is not None:
-            await clock.sleep(stop_leader_after)
+            # Virtual time starts at 0.0: sleep to the instant itself.
+            await clock.sleep(stop_leader_after - clock.monotonic())
             leaders = [address for address, election in elections.items() if election.state.is_leader()]
             assert len(leaders) == 1, f"expected one leader before the stop, found {leaders}"
             stopped_leader = leaders[0]
@@ -324,6 +339,39 @@ def test_followers_replace_a_stopped_leader_in_one_round() -> None:
             for address, state in final_states.items()
             if address != winner
         ), f"seed {seed}: {final_states}"
+
+
+def test_restarted_followers_campaign_past_the_term_they_followed() -> None:
+    """Both followers restart -- a rolling restart -- and come back knowing
+    no term. Following the leader's heartbeats (Raft section 5.1: a message
+    of a newer term advances the receiver's) brings each to the leader's
+    term, so when the leader then stops, the replacement is elected for the
+    next term. A follower that only recorded the beat's term as its
+    leader's stood for term 1 below a term the cluster had already used:
+    every gate fencing results by the datacenter's leadership term refused
+    the new leader's, and the job it ran never delivered its results."""
+    restart_followers_after = 10.0
+    stop_leader_after = 30.0
+    for seed in _SEEDS:
+
+        async def scenario(clock: VirtualClock, seed: int = seed) -> Any:
+            return await _run_group(
+                clock,
+                seed,
+                stop_leader_after=stop_leader_after,
+                restart_followers_after=restart_followers_after,
+            )
+
+        election_starts, leader_stops, final_states, _ = _simulate(scenario, _OBSERVE_SECONDS + 1.0)
+
+        (stopped_at, stopped_leader, stopped_term), = leader_stops
+        failover_starts = [start for start in election_starts if start[0] > stopped_at]
+        assert failover_starts, f"seed {seed}: no node stood after the leader stopped"
+        assert all(term > stopped_term for _stood_at, _candidate, term in failover_starts), (
+            f"seed {seed}: stood below the stopped leader's term {stopped_term}: {failover_starts}"
+        )
+        winner = next(address for address, state in final_states.items() if state[0] == "leader")
+        assert final_states[winner][1] > stopped_term, f"seed {seed}: {final_states}"
 
 
 def test_a_cohort_of_one_leads_the_moment_it_stands() -> None:

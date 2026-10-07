@@ -319,6 +319,11 @@ class LeaderState:
 
         self.current_leader = leader
         self.leader_term = term
+        # Raft section 5.1: a beat of a newer term advances this node's term.
+        # Recorded only as the leader's, a node that joined or restarted
+        # after the election -- it never voted -- stayed at its old term and
+        # stood next for one the cluster had already used.
+        self.current_term = max(self.current_term, term)
         self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
         self.last_heartbeat_time = _DEFAULT_CLOCK.monotonic()
         if lease_duration is not None and lease_duration > 0:
