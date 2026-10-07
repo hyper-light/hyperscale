@@ -2202,13 +2202,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     # === Message Size Helpers ===
 
-    def _membership_piggyback(self, base_message: bytes, buddy_entry: bytes) -> bytes:
+    def _membership_piggyback(
+        self,
+        base_message: bytes,
+        buddy_entry: bytes,
+        destination: tuple[str, int] | None,
+    ) -> bytes:
         """The membership gossip section for ``base_message``: ``buddy_entry``
         first (its room reserved ahead of the gossip buffer's selection),
-        then the buffer's own updates, all within the UDP MTU."""
+        then the buffer's own updates, all within the UDP MTU. An update
+        about ``destination`` itself rides along uncharged (see
+        ``GossipBuffer.mark_broadcasts``)."""
         buddy_reservation = self._buddy_reservation(base_message, buddy_entry)
         membership_piggyback = self._gossip_buffer.encode_piggyback_with_base(
-            base_message + buddy_reservation
+            base_message + buddy_reservation,
+            destination=destination,
         )
         if not buddy_reservation:
             return membership_piggyback
@@ -2255,7 +2263,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             node_id=self._get_registered_node_id_for_addr(target),
         ).to_bytes()
 
-    def _add_piggyback_safe(self, base_message: bytes, buddy_entry: bytes = b"") -> bytes:
+    def _add_piggyback_safe(
+        self,
+        base_message: bytes,
+        buddy_entry: bytes = b"",
+        destination: tuple[str, int] | None = None,
+    ) -> bytes:
         """
         Add piggybacked gossip updates to a message, respecting MTU limits.
 
@@ -2269,6 +2282,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 message (the Lifeguard buddy-system suspicion, see
                 ``_buddy_suspicion_entry``); room is reserved for it ahead
                 of the gossip buffer's own selection.
+            destination: The address ``base_message`` is sent to, when
+                known (None for an ack built before its sender is known).
 
         Returns:
             Message with piggybacked updates that fits within UDP MTU.
@@ -2279,7 +2294,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Add membership gossip (format: #|mtype:incarnation:host:port...)
         message_with_membership = base_message + self._membership_piggyback(
-            base_message, buddy_entry
+            base_message, buddy_entry, destination
         )
 
         # Calculate remaining space for health gossip
@@ -7338,7 +7353,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Add piggyback data (membership + health gossip) to outgoing messages
         message_with_piggyback = self._add_piggyback_safe(
-            message, self._buddy_suspicion_entry(addr, message)
+            message, self._buddy_suspicion_entry(addr, message), addr
         )
 
         return (

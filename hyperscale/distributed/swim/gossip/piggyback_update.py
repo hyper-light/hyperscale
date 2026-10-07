@@ -62,10 +62,6 @@ class PiggybackUpdate:
         """Check if this update should still be piggybacked."""
         return self.broadcast_count < self.max_broadcasts
     
-    def mark_broadcast(self) -> None:
-        """Mark that this update was piggybacked."""
-        self.broadcast_count += 1
-    
     def to_bytes(self) -> bytes:
         """
         Serialize update for transmission.
