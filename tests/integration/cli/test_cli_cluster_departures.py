@@ -117,11 +117,26 @@ async def test_members_leave_by_removal_and_by_drain(run_marker: str) -> None:
         )
 
         # The drained address is no longer held: removing it finds no member.
-        returncode, output = await run_remove(surviving.address, draining.address, third_client)
-        assert returncode == 1 and "no member holds" in output, output
+        # The drained manager led the survivor, which names it until it
+        # elects past it.
+        output = await _remove_until_answered(
+            surviving.address, draining.address, third_client, within=NEW_LEADER_BOUND_SECONDS
+        )
+        assert "no member holds" in output, output
 
     finally:
         await kill_remaining(managers)
+
+
+async def _remove_until_answered(node: str, member: str, client_port: int, within: float) -> str:
+    """`hyperscale remove` until a leader answers it -- not a departed
+    leader the survivors still name, unreachable until they elect past it."""
+    deadline = time.monotonic() + within
+    while True:
+        _returncode, output = await run_remove(node, member, client_port)
+        if "is unreachable" not in output or time.monotonic() >= deadline:
+            return output
+        await asyncio.sleep(ENV.CLUSTER_FORMATION_INTERVAL_SECONDS)
 
 
 async def _remove_until_released(node: str, member: str, client_port: int, within: float) -> str:

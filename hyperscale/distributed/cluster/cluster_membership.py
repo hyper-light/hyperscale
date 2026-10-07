@@ -819,8 +819,53 @@ class ClusterMembership:
             return True
         if not self._holds_adopted_group():
             return False
+        await self._rejoin_held_cluster(replies)
         await self._abandon_if_inoperable(group)
         return True
+
+    async def _rejoin_held_cluster(self, replies: dict[tuple[str, int], ClusterHelloReply]) -> None:
+        """Ask back into the cluster this member holds, inoperable. A member
+        its cluster no longer counts -- it drained as it stopped, then
+        resumed from its disk (a rolling restart), or went unheard past the
+        tombstone retention -- hears nothing from the group's leader, so its
+        group never becomes operable and ``_reclaim_address`` never runs. A
+        founder answering for this same formed cluster names its leader:
+        claim the address again through it now, as an operable member
+        reclaims a released one, instead of sitting out of the cohort until
+        the retention abandons the group. The leader greets this address
+        before it commits the claim, and claiming an address this member
+        still holds changes nothing."""
+        if (leader := self._held_cluster_leader(replies)) is None:
+            return
+        outcome = await self._reclaim_through_leader(leader)
+        await self._logger.log(
+            RaftInfo(
+                message=f"Asked {leader} to take {self.member_id} back into its cluster ({outcome})",
+                node_id=self._node_id,
+                job_id=self._log_job_id,
+            )
+        )
+
+    def _held_cluster_leader(self, replies: dict[tuple[str, int], ClusterHelloReply]) -> str | None:
+        """A leader -- the lowest member id, when founders disagree -- that
+        founders answering for this member's own formed cluster name, other
+        than this member; None for none."""
+        return min(
+            (
+                reply.leader_member_id
+                for reply in self._accepted_replies(replies).values()
+                if self._names_held_cluster_leader(reply)
+            ),
+            default=None,
+        )
+
+    def _names_held_cluster_leader(self, reply: ClusterHelloReply) -> bool:
+        """Whether ``reply`` answers for this member's own formed cluster
+        and names a leader other than this member."""
+        return self._names_formed_cluster(reply, self._cluster_uuid) and reply.leader_member_id not in (
+            None,
+            self.member_id,
+        )
 
     def _holds_adopted_group(self) -> bool:
         """Whether the held group formed here, or was joined."""
