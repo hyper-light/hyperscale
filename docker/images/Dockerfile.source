@@ -34,8 +34,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY README.md LICENSE MANIFEST.in ./
 COPY hyperscale ./hyperscale
+# --reinstall-package: uv caches a local project's build keyed only on its
+# pyproject.toml/setup.py/setup.cfg (tool.uv cache-keys default), so without
+# it a source edit reuses the cached wheel and the image runs stale code.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable
+    uv sync --frozen --no-dev --no-editable --reinstall-package hyperscale
 
 FROM python:${PYTHON_VERSION}-slim-${OS_BASE} AS runtime
 
