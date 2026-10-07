@@ -266,6 +266,7 @@ class LocalServerPool:
         loop: asyncio.AbstractEventLoop | None = None,
         process_spawner: ProcessSpawner | None = None,
         on_executor_exit: Callable[[tuple[str, int]], None] | None = None,
+        owns_process_signals: bool = True,
     ) -> None:
         # Phase 6 SIM seam. ``process_spawner`` is ``None`` in REAL mode —
         # each executor slot runs in a ``ProcessPoolExecutor`` of its own. Under SIM the spawner (the coordinator child
@@ -289,6 +290,12 @@ class LocalServerPool:
         self._executor_calls: Dict[tuple[str, int], functools.partial] = {}
         self._loop: asyncio.AbstractEventLoop | None = loop
         self._process_spawner = process_spawner
+        # False when a host owns SIGINT/SIGTERM and aborts this pool as part
+        # of aborting itself (a `hyperscale run worker` node): a loop keeps
+        # one handler per signal, so claiming them here would turn the
+        # host's Ctrl-C into an abort of the pool alone while the host
+        # waits on executors that will never connect.
+        self._owns_process_signals = owns_process_signals
         # Told the listen address of every executor whose process exit
         # the pool reaps, at the reap — the pool leader withdraws that
         # executor from its hand-outs before anything can dispatch to it.
@@ -327,7 +334,14 @@ class LocalServerPool:
             return
 
         self._context = multiprocessing.get_context("spawn")
+        self._loop = asyncio.get_event_loop()
 
+        if self._owns_process_signals:
+            await self._claim_process_signals()
+
+    async def _claim_process_signals(self) -> None:
+        """Abort the pool on SIGINT, SIGTERM and SIGHUP (where the platform
+        has them): for a pool no host aborts on those signals."""
         async with self._logger.context(
             name="local_server_pool",
             path="hyperscale.leader.log.json",
@@ -339,8 +353,6 @@ class LocalServerPool:
                     level=LogLevel.TRACE,
                 )
             )
-
-            self._loop = asyncio.get_event_loop()
 
             # Handle SIGINT, SIGTERM, and SIGHUP
             for signame in ("SIGINT", "SIGTERM", "SIGHUP"):

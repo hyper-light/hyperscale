@@ -304,6 +304,8 @@ class TestWorkerLifecycleManagerRemoteManager:
                 status_update_poll_interval=1.0,
                 loop=None,
                 transport_factory=None,
+                # The worker's host command owns SIGINT/SIGTERM.
+                owns_process_signals=False,
             )
             assert result is mock_instance
             assert manager._remote_manager is mock_instance

@@ -16,6 +16,10 @@ E2E: the live dashboards of real `hyperscale run manager|worker` processes.
   their nodes with --quiet: no dashboard, logs on stderr.)
 - Every role's dashboard opens with the run UI's Hyperscale header and
   plots its role's charts.
+- Ctrl-C while a worker is still booting -- its executor pool spawned and
+  not yet connected -- stops the worker at once, with nothing left
+  running: the pool must not take the signal for itself and leave the
+  boot waiting out the pool's startup budget.
 """
 
 import asyncio
@@ -31,6 +35,7 @@ import time
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.ui.node_dashboard import GateDashboardReader, ManagerDashboardReader, WorkerDashboardReader
 from hyperscale.ui.node_dashboard.models import NodeDashboardLayout
 from hyperscale.ui.ci_safe.terminal_capability import CI_ENVIRONMENT_VARIABLES
@@ -45,6 +50,7 @@ from tests.integration.cli.node_processes import (
     boot,
     command_environment,
     kill_remaining,
+    marked_survivors,
     node_at,
     reserve_port_blocks,
     stop_all,
@@ -252,6 +258,71 @@ async def test_full_dashboard_on_a_terminal_restores_the_cursor_on_ctrl_c(
         if process.returncode is None:
             os.killpg(process.pid, signal.SIGKILL)
             await process.wait()
+
+
+# How long a booting worker waits for its executor pool to connect: a
+# worker that lost a Ctrl-C to its pool cannot exit before this runs out.
+POOL_STARTUP_BUDGET_SECONDS = Env.model_fields["WORKER_POOL_STARTUP_TIMEOUT_SECONDS"].default
+
+
+async def wait_for_spawned_executors(run_marker: str, log_path: pathlib.Path) -> bool:
+    """Whether the worker's executor pool has spawned (a process besides
+    the worker carries the run marker) while the worker has not yet logged
+    its boot: the window in which the pool used to claim SIGINT."""
+    deadline = time.monotonic() + BOOT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        booted = log_path.exists() and BOOT_MARKERS["worker"] in log_path.read_text()
+        if len(marked_survivors(run_marker)) > 1:
+            return not booted
+        await asyncio.sleep(0.02)
+    return False
+
+
+async def test_ctrl_c_while_a_worker_boots_stops_it_at_once(run_marker: str, tmp_path: pathlib.Path) -> None:
+    config_path, logs_directory = write_config(tmp_path, "full")
+    (worker_start,) = reserve_port_blocks([worker_block(WORKER_CORES)])
+    master_descriptor, slave_descriptor = pty.openpty()
+    fcntl.ioctl(slave_descriptor, termios.TIOCSWINSZ, struct.pack("HHHH", TERMINAL_LINES, TERMINAL_COLUMNS, 0, 0))
+    os.set_blocking(master_descriptor, False)
+    collected = bytearray()
+    closed = asyncio.Event()
+    process = await asyncio.create_subprocess_exec(
+        HYPERSCALE, "run", "worker",
+        "--tcp-port", str(worker_start), "--udp-port", str(worker_start + 1),
+        "--workers", str(WORKER_CORES),
+        "--shutdown-timeout", f"{int(SHUTDOWN_TIMEOUT_SECONDS)}s",
+        "--log-level", "info",
+        "--config", str(config_path),
+        stdin=slave_descriptor,
+        stdout=slave_descriptor,
+        stderr=slave_descriptor,
+        start_new_session=True,
+        env=capable_terminal_environment(**{RUN_MARKER_ENVAR: run_marker}),
+    )
+    os.close(slave_descriptor)
+    await read_terminal(master_descriptor, collected, closed)
+    try:
+        assert await wait_for_spawned_executors(run_marker, node_log(logs_directory, "worker", worker_start)), (
+            "the worker booted before its executor pool was seen spawning"
+        )
+
+        # A terminal's Ctrl-C reaches its whole foreground process group.
+        pressed_at = time.monotonic()
+        os.killpg(process.pid, signal.SIGINT)
+        await asyncio.wait_for(process.wait(), timeout=min(SHUTDOWN_TIMEOUT_SECONDS, POOL_STARTUP_BUDGET_SECONDS))
+        stopped_after = time.monotonic() - pressed_at
+
+        assert process.returncode == 0, bytes(collected[-3000:])
+        assert stopped_after < POOL_STARTUP_BUDGET_SECONDS, f"the worker took {stopped_after:.1f}s to stop"
+        assert await wait_for_no_survivors(run_marker) == []
+    finally:
+        asyncio.get_running_loop().remove_reader(master_descriptor)
+        os.close(master_descriptor)
+        if process.returncode is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            await process.wait()
+        for survivor in marked_survivors(run_marker):
+            os.kill(survivor, signal.SIGKILL)
 
 
 ESCAPE = b"\x1b"

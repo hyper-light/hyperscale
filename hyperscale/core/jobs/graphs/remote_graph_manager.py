@@ -114,6 +114,7 @@ class RemoteGraphManager:
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         transport_factory: TransportFactory | None = None,
+        owns_process_signals: bool = True,
     ) -> None:
         # Phase 6 SIM seams, forwarded to the leader ``RemoteGraphController``
         # this manager constructs in ``start``. ``None`` in REAL mode — the
@@ -124,6 +125,9 @@ class RemoteGraphManager:
         # boundary like every other server in the simulation.
         self._injected_loop = loop
         self._transport_factory = transport_factory
+        # Forwarded to the leader controller: False when a host owns
+        # SIGINT/SIGTERM (see UDPProtocol).
+        self._owns_process_signals = owns_process_signals
 
         self._updates = updates
         self._workers: List[Tuple[str, int]] | None = None
@@ -214,6 +218,7 @@ class RemoteGraphManager:
                     env,
                     loop=self._injected_loop,
                     transport_factory=self._transport_factory,
+                    owns_process_signals=self._owns_process_signals,
                     # An executor's ready handshake returns its slot if
                     # its predecessor at that address was retired.
                     on_start_acknowledged=self._provisioner.readmit_node,

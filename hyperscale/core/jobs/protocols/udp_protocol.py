@@ -72,6 +72,7 @@ class UDPProtocol(Generic[T, K]):
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         transport_factory: TransportFactory | None = None,
+        owns_process_signals: bool = True,
     ) -> None:
         self._node_id_base = derive_protocol_node_id(host, port)
         self.node_id: int | None = None
@@ -88,6 +89,13 @@ class UDPProtocol(Generic[T, K]):
         # the kernel-socket byte transit with the deterministic
         # coordinator boundary.
         self._transport_factory = transport_factory
+        # Whether this server claims SIGINT/SIGTERM for its own abort: not
+        # under SIM, and not when a host owns them and aborts this server
+        # as part of aborting itself (``owns_process_signals`` False, as in
+        # a `hyperscale run worker` node) -- a loop keeps one handler per
+        # signal, so claiming them would turn the host's Ctrl-C into an
+        # abort of this server alone.
+        self._claims_process_signals = owns_process_signals and transport_factory is None
 
         self._logger = Logger()
 
@@ -185,7 +193,7 @@ class UDPProtocol(Generic[T, K]):
 
         # Signal handlers are process-global and need a real loop
         # selector — skip under SIM (see start_server).
-        if self._transport_factory is None and not self._abort_handle_created:
+        if self._claims_process_signals and not self._abort_handle_created:
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(
@@ -343,7 +351,7 @@ class UDPProtocol(Generic[T, K]):
         # selector — banned and meaningless under SIM (the coordinator,
         # not signals, drives shutdown). Skip when running under a
         # transport factory.
-        if self._transport_factory is None and not self._abort_handle_created:
+        if self._claims_process_signals and not self._abort_handle_created:
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(

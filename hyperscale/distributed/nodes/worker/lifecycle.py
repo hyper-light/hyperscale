@@ -102,6 +102,8 @@ class WorkerLifecycleManager:
             loop=loop,
             process_spawner=process_spawner,
             on_executor_exit=self._retire_executor,
+            # The node's host owns SIGINT/SIGTERM: its abort aborts the pool.
+            owns_process_signals=False,
         )
         self._remote_manager: RemoteGraphManager | None = None
 
@@ -166,6 +168,9 @@ class WorkerLifecycleManager:
             status_update_poll_interval=status_update_poll_interval,
             loop=self._loop,
             transport_factory=self._transport_factory,
+            # The node's host owns SIGINT/SIGTERM: its abort aborts the
+            # manager's leader controller.
+            owns_process_signals=False,
         )
         return self._remote_manager
 
