@@ -214,4 +214,4 @@ Only real gaps are listed. Ledger ids refer to `docs/REMAINING_LEDGER.md`. Items
 
 ## Notes
 - AD-27 is excluded per scan parameters.
-- Line numbers are as of commit 700b9aac and the working copy at `/private/tmp/claude-501/p54_integration`.
+- Line numbers are as of commit 700b9aac.
