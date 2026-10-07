@@ -104,6 +104,7 @@ class WorkerState:
 
         # Backpressure tracking (AD-23)
         self._manager_backpressure: dict[str, BackpressureLevel] = {}
+        self._manager_backpressure_delay_ms: dict[str, int] = {}
         self._backpressure_delay_ms: int = 0
 
         # Orphaned workflow tracking (Section 2.7)
@@ -517,6 +518,20 @@ class WorkerState:
     def set_backpressure_delay_ms(self, delay_ms: int) -> None:
         """Set backpressure delay from manager."""
         self._backpressure_delay_ms = delay_ms
+
+    def apply_manager_backpressure(self, manager_id: str, level: BackpressureLevel, delay_ms: int) -> None:
+        """Record a manager's current signal, NONE included, and take the
+        delay as the largest any manager currently asks for (AD-23/AD-37:
+        the worker returns to NO_BACKPRESSURE once every manager clears)."""
+        self._manager_backpressure[manager_id] = level
+        self._manager_backpressure_delay_ms[manager_id] = delay_ms
+        self._backpressure_delay_ms = max(self._manager_backpressure_delay_ms.values())
+
+    def remove_manager_backpressure(self, manager_id: str) -> None:
+        """Forget a removed manager's signal so its last level stops counting."""
+        self._manager_backpressure.pop(manager_id, None)
+        self._manager_backpressure_delay_ms.pop(manager_id, None)
+        self._backpressure_delay_ms = max(self._manager_backpressure_delay_ms.values(), default=0)
 
     def get_backpressure_delay_ms(self) -> int:
         """Get current backpressure delay."""

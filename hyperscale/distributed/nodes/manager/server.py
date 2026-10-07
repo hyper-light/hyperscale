@@ -118,6 +118,7 @@ from hyperscale.distributed.reliability import (
     ServerRateLimiter,
     StatsBuffer,
     StatsBufferConfig,
+    classify_handler_to_priority,
     create_reliability_config_from_env,
 )
 from hyperscale.distributed.resources import ProcessResourceMonitor, ResourceMetrics
@@ -6295,19 +6296,27 @@ class ManagerServer(HealthAwareServer):
         self,
         client_id: str,
         operation: str,
+        handler_name: str,
     ) -> tuple[bool, float]:
         """
         Check if a client request is within rate limits for a specific operation.
 
+        The check runs at the priority ``handler_name``'s AD-37 message class
+        assigns: cancellation and extensions are CONTROL (CRITICAL), so an
+        overloaded manager never refuses them (AD-20/AD-37).
+
         Args:
             client_id: Identifier for the client (typically addr as string)
-            operation: Type of operation being performed
+            operation: AD-24 operation whose budget the request draws from
+            handler_name: The TCP handler serving the request
 
         Returns:
             Tuple of (allowed, retry_after_seconds). If not allowed,
             retry_after_seconds indicates when client can retry.
         """
-        result = await self._rate_limiter.check_rate_limit(client_id, operation)
+        result = await self._rate_limiter.check_rate_limit_with_priority(
+            client_id, operation, classify_handler_to_priority(handler_name)
+        )
         return result.allowed, result.retry_after_seconds
 
     async def _cleanup_inactive_rate_limit_clients(self) -> int:
@@ -10232,7 +10241,7 @@ class ManagerServer(HealthAwareServer):
         # Rate limit check (AD-24)
         client_id = f"{addr[0]}:{addr[1]}"
         allowed, retry_after = await self._check_rate_limit_for_operation(
-            client_id, "extension"
+            client_id, "extension", "extension_request"
         )
         if not allowed:
             return self._extension_denial(f"Rate limited, retry after {retry_after:.1f}s")

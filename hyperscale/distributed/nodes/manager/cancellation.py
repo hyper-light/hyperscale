@@ -42,6 +42,7 @@ from hyperscale.distributed.models import (
     WorkflowStatus,
     WorkerRegistration,
 )
+from hyperscale.distributed.reliability import classify_handler_to_priority
 from hyperscale.distributed.workflow import WorkflowLifecycleStateMachine, WorkflowState
 from hyperscale.logging.hyperscale_logging_models import ServerError, ServerInfo, ServerWarning
 
@@ -105,7 +106,7 @@ class ManagerCancellationCoordinator:
         send_tcp: Callable[..., Awaitable],
         send_to_worker: Callable[..., Awaitable],
         send_to_client: Callable[..., Awaitable],
-        check_rate_limit_for_operation: Callable[[str, str], Awaitable[tuple[bool, float]]],
+        check_rate_limit_for_operation: Callable[[str, str, str], Awaitable[tuple[bool, float]]],
         take_over_job_leadership_as_cluster_leader: Callable[..., Awaitable[bool]],
         resolve_dc_leader_addr: Callable[..., "tuple[str, int] | None"],
         manager_tcp_addr_is_live: Callable[[tuple[str, int]], bool],
@@ -838,7 +839,7 @@ class ManagerCancellationCoordinator:
         job this manager leads (AD-20)."""
         client_id = f"{addr[0]}:{addr[1]}"
         allowed, retry_after = await self._check_rate_limit_for_operation(
-            client_id, "cancel"
+            client_id, "cancel", "cancel_job"
         )
         if not allowed:
             return RateLimitResponse(
@@ -1826,8 +1827,8 @@ class ManagerCancellationCoordinator:
 
         # Rate limit check
         client_id = f"{addr[0]}:{addr[1]}"
-        rate_limit_result = await self._rate_limiter.check_rate_limit(
-            client_id, "cancel_workflow"
+        rate_limit_result = await self._rate_limiter.check_rate_limit_with_priority(
+            client_id, "cancel_workflow", classify_handler_to_priority("receive_cancel_single_workflow")
         )
         if not rate_limit_result.allowed:
             return RateLimitResponse(

@@ -40,6 +40,7 @@ class WorkerRegistry:
         *,
         select_manager: Callable[[set[str]], str | None],
         circuit_breaker_config: dict[str, int | float],
+        forget_manager_backpressure: Callable[[str], None],
     ) -> None:
         """
         Initialize worker registry.
@@ -54,10 +55,14 @@ class WorkerRegistry:
                 returns the chosen id or None when it cannot choose
             circuit_breaker_config: The configured breaker for each manager
                 link (``Env.get_circuit_breaker_config``)
+            forget_manager_backpressure: Drops a removed manager's AD-23
+                backpressure signal (``WorkerState.remove_manager_backpressure``),
+                so a dead manager's last level never pins the worker
         """
         self._logger: "Logger" = logger
         self._select_manager: Callable[[set[str]], str | None] = select_manager
         self._circuit_breaker_config = circuit_breaker_config
+        self._forget_manager_backpressure: Callable[[str], None] = forget_manager_backpressure
         self._recovery_jitter_min: float = recovery_jitter_min
         self._recovery_jitter_max: float = recovery_jitter_max
         self._recovery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
@@ -251,7 +256,7 @@ class WorkerRegistry:
         """Remove all per-manager tracking when a manager is reaped.
 
         Drops the per-manager lock, epoch counter, circuit breaker, address
-        circuit breaker, and health/registry entries. Without this cleanup the
+        circuit breaker, backpressure signal, and health/registry entries. Without this cleanup the
         per-manager state dicts would grow unbounded under manager churn.
         """
         removed_manager = self._known_managers.pop(manager_id, None)
@@ -261,6 +266,7 @@ class WorkerRegistry:
         self._manager_circuits.pop(manager_id, None)
         self._manager_state_locks.pop(manager_id, None)
         self._manager_state_epoch.pop(manager_id, None)
+        self._forget_manager_backpressure(manager_id)
         if manager_addr is not None:
             self._manager_addr_circuits.pop(manager_addr, None)
         self._signal_healthy_set_changed()

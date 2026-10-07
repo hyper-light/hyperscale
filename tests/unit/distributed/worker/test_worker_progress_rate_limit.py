@@ -48,7 +48,7 @@ class RecordingSendTcp:
 def make_reporter() -> tuple[WorkerProgressReporter, WorkerRegistry]:
     logger = MagicMock()
     logger.log = AsyncMock()
-    registry = WorkerRegistry(logger, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=lambda manager_ids: None)
+    registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=lambda manager_ids: None)
     state = WorkerState(
         core_allocator=MagicMock(),
         throughput_interval_seconds=Env().WORKER_THROUGHPUT_INTERVAL_SECONDS,

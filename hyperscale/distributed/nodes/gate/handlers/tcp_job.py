@@ -101,7 +101,7 @@ class GateJobHandler:
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
         is_leader: Callable[[], bool],
-        check_rate_limit: Callable[[str, str], tuple[bool, float]],
+        check_rate_limit: Callable[[str, str, str], Awaitable[tuple[bool, float]]],
         should_shed_request: Callable[[str], bool],
         has_quorum_available: Callable[[], bool],
         quorum_size: Callable[[], int],
@@ -200,7 +200,7 @@ class GateJobHandler:
         self._get_host: Callable[[], str] = get_host
         self._get_tcp_port: Callable[[], int] = get_tcp_port
         self._is_leader: Callable[[], bool] = is_leader
-        self._check_rate_limit: Callable[[str, str], tuple[bool, float]] = (
+        self._check_rate_limit: Callable[[str, str, str], Awaitable[tuple[bool, float]]] = (
             check_rate_limit
         )
         self._should_shed_request: Callable[[str], bool] = should_shed_request
@@ -389,7 +389,7 @@ class GateJobHandler:
         """Refuse a submission the client's rate limit or the gate's load
         shedding turns away; None when it may proceed."""
         client_id = f"{addr[0]}:{addr[1]}"
-        allowed, retry_after = await self._check_rate_limit(client_id, "job_submit")
+        allowed, retry_after = await self._check_rate_limit(client_id, "job_submit", "job_submission")
         if not allowed:
             return RateLimitResponse(
                 operation="job_submit",
@@ -1115,7 +1115,7 @@ class GateJobHandler:
         """Answer a status request the client's rate limit and the gate's
         load shedding admit."""
         client_id = f"{addr[0]}:{addr[1]}"
-        allowed, retry_after = await self._check_rate_limit(client_id, "job_status")
+        allowed, retry_after = await self._check_rate_limit(client_id, "job_status", "job_status")
         if not allowed:
             return RateLimitResponse(
                 operation="job_status",

@@ -15,7 +15,6 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.reliability import (
     BackpressureLevel,
-    BackpressureSignal,
     RetryConfig,
     RetryExecutor,
     JitterStrategy,
@@ -1163,21 +1162,14 @@ class WorkerProgressReporter:
             self._state.set_workflow_job_leader(workflow_id, job_leader_addr)
 
     def _apply_ack_backpressure(self, ack: WorkflowProgressAck) -> None:
-        """Apply an ack's backpressure signal (AD-23)."""
-        # Handle backpressure signal (AD-23)
-        if ack.backpressure_level > 0:
-            signal = BackpressureSignal(
-                level=BackpressureLevel(ack.backpressure_level),
-                suggested_delay_ms=ack.backpressure_delay_ms,
-                batch_only=ack.backpressure_batch_only,
-            )
-            self._state.set_manager_backpressure(ack.manager_id, signal.level)
-            self._state.set_backpressure_delay_ms(
-                max(
-                    self._state.get_backpressure_delay_ms(),
-                    signal.suggested_delay_ms,
-                )
-            )
+        """Apply an ack's backpressure signal (AD-23), NONE included: a
+        manager's release must reach the worker, or the level and delay
+        stay at their peak (base 2e6d0532 ``worker_progress_reporter.py:1168-1180``)."""
+        self._state.apply_manager_backpressure(
+            ack.manager_id,
+            BackpressureLevel(ack.backpressure_level),
+            ack.backpressure_delay_ms,
+        )
 
     def _log_unparsed_progress_ack(self, data: bytes, error: Exception) -> None:
         """Log an ack that failed to parse, unless it is the legacy ``ok``."""

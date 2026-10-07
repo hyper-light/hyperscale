@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import pytest
 
+from hyperscale.distributed.jobs.gates import gate_job_timeout_tracker as gate_job_timeout_tracker_module
 from hyperscale.distributed.jobs.gates.gate_job_timeout_tracker import (
     GateJobTimeoutTracker,
 )
@@ -35,6 +36,37 @@ from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 JOB_ID = "job-fence-test"
 DATACENTER = "dc-east"
+# A report's own timestamp is the manager's monotonic clock, which the gate
+# never compares with its own; the gate records when it received the report.
+MANAGER_CLOCK_READING = 7.0
+
+
+class _SteppedClock:
+    """The gate's monotonic clock, set by each test to a report's receipt time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.fixture(autouse=True)
+def gate_clock(monkeypatch: pytest.MonkeyPatch) -> _SteppedClock:
+    clock = _SteppedClock()
+    monkeypatch.setattr(gate_job_timeout_tracker_module, "_DEFAULT_CLOCK", clock)
+    return clock
+
+
+async def _receive_progress(
+    tracker: GateJobTimeoutTracker,
+    gate_clock: _SteppedClock,
+    received_at: float,
+    report: JobProgressReport,
+) -> None:
+    """Deliver ``report`` to the tracker at gate time ``received_at``."""
+    gate_clock.now = received_at
+    await tracker.record_progress(report)
 
 
 class _RecordingLogger:
@@ -63,7 +95,6 @@ class _StubGate:
 
 def _progress_report(
     fence_token: int,
-    timestamp: float,
     manager_port: int = 8000,
     workflows_completed: int = 1,
 ) -> JobProgressReport:
@@ -77,7 +108,7 @@ def _progress_report(
         workflows_completed=workflows_completed,
         workflows_failed=0,
         has_recent_progress=True,
-        timestamp=timestamp,
+        timestamp=MANAGER_CLOCK_READING,
         fence_token=fence_token,
         total_extensions_granted=float(fence_token),
     )
@@ -125,12 +156,12 @@ def _superseded_warnings(gate: _StubGate) -> list[ServerWarning]:
 
 
 @pytest.mark.asyncio
-async def test_first_report_for_a_datacenter_is_accepted() -> None:
+async def test_first_report_for_a_datacenter_is_accepted(gate_clock: _SteppedClock) -> None:
     """No known fence means nothing to be behind — first contact from a
     DC must record, or a freshly tracked job would never hear anything."""
     tracker, gate = await _tracked_job()
 
-    await tracker.record_progress(_progress_report(fence_token=5, timestamp=100.0))
+    await _receive_progress(tracker, gate_clock, 100.0, _progress_report(fence_token=5))
 
     info = tracker._tracked_jobs[JOB_ID]
     assert info.dc_last_progress[DATACENTER] == 100.0
@@ -139,26 +170,26 @@ async def test_first_report_for_a_datacenter_is_accepted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_equal_fence_token_keeps_reporting() -> None:
+async def test_equal_fence_token_keeps_reporting(gate_clock: _SteppedClock) -> None:
     """The same leader reports every ~10s at the same fence; equality
     must pass or steady-state progress tracking dies after one report."""
     tracker, _gate = await _tracked_job()
 
-    await tracker.record_progress(_progress_report(fence_token=5, timestamp=100.0))
-    await tracker.record_progress(_progress_report(fence_token=5, timestamp=110.0))
+    await _receive_progress(tracker, gate_clock, 100.0, _progress_report(fence_token=5))
+    await _receive_progress(tracker, gate_clock, 110.0, _progress_report(fence_token=5))
 
     info = tracker._tracked_jobs[JOB_ID]
     assert info.dc_last_progress[DATACENTER] == 110.0
 
 
 @pytest.mark.asyncio
-async def test_newer_fence_supersedes_and_advances() -> None:
+async def test_newer_fence_supersedes_and_advances(gate_clock: _SteppedClock) -> None:
     """A legitimate leadership transfer raises the fence; the new
     leader's reports must both record and become the new bar."""
     tracker, _gate = await _tracked_job()
 
-    await tracker.record_progress(_progress_report(fence_token=5, timestamp=100.0))
-    await tracker.record_progress(_progress_report(fence_token=6, timestamp=105.0))
+    await _receive_progress(tracker, gate_clock, 100.0, _progress_report(fence_token=5))
+    await _receive_progress(tracker, gate_clock, 105.0, _progress_report(fence_token=6))
 
     info = tracker._tracked_jobs[JOB_ID]
     assert info.dc_fence_tokens[DATACENTER] == 6
@@ -166,23 +197,25 @@ async def test_newer_fence_supersedes_and_advances() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stale_progress_cannot_refresh_the_progress_clock() -> None:
+async def test_stale_progress_cannot_refresh_the_progress_clock(gate_clock: _SteppedClock) -> None:
     """The core of FIX.md 1.2: a report behind the known fence is
     evidence from a deposed leader and must not touch ANY tracking
     state — before the guard, its timestamp bumped ``dc_last_progress``
     and delayed the global timeout decision."""
     tracker, gate = await _tracked_job()
 
-    await tracker.record_progress(
-        _progress_report(fence_token=5, timestamp=100.0, manager_port=8005)
+    await _receive_progress(
+        tracker, gate_clock, 100.0, _progress_report(fence_token=5, manager_port=8005)
     )
-    await tracker.record_progress(
+    await _receive_progress(
+        tracker,
+        gate_clock,
+        200.0,
         _progress_report(
             fence_token=3,
-            timestamp=200.0,
             manager_port=8003,
             workflows_completed=4,
-        )
+        ),
     )
 
     info = tracker._tracked_jobs[JOB_ID]
@@ -207,12 +240,12 @@ async def test_stale_progress_cannot_refresh_the_progress_clock() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stale_timeout_report_cannot_mark_a_datacenter_timed_out() -> None:
+async def test_stale_timeout_report_cannot_mark_a_datacenter_timed_out(gate_clock: _SteppedClock) -> None:
     """A deposed leader declaring a timeout is the inverse skew: it
     would push the gate TOWARD a global timeout on stale evidence."""
     tracker, _gate = await _tracked_job()
 
-    await tracker.record_progress(_progress_report(fence_token=5, timestamp=100.0))
+    await _receive_progress(tracker, gate_clock, 100.0, _progress_report(fence_token=5))
     await tracker.record_timeout(_timeout_report(fence_token=3))
 
     info = tracker._tracked_jobs[JOB_ID]

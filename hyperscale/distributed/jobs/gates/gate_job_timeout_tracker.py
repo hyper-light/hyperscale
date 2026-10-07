@@ -211,8 +211,12 @@ class GateJobTimeoutTracker:
             if info is None:
                 return
 
-            # Update DC progress
-            info.dc_last_progress[report.datacenter] = report.timestamp
+            # The gate's own receipt time, never ``report.timestamp``: that is
+            # the manager's boot-relative monotonic clock, and the stuck check
+            # compares this with the gate's (AD-34 Part 5). Readings from two
+            # hosts' monotonic clocks have no common origin (base 2e6d0532
+            # stored the manager's here and compared it at ``:439``).
+            info.dc_last_progress[report.datacenter] = _DEFAULT_CLOCK.monotonic()
             info.dc_manager_addrs[report.datacenter] = (
                 report.manager_host,
                 report.manager_port,

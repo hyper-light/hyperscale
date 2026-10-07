@@ -133,7 +133,7 @@ def create_mock_handler(
         )
         return (ack.dump(), None)
 
-    async def mock_check_rate_limit(client_id, op):
+    async def mock_check_rate_limit(client_id, op, handler_name):
         return (rate_limit_allowed, rate_limit_retry)
 
     return GateCancellationHandler(
@@ -435,7 +435,7 @@ class TestHandleCancelJobFailureModes:
         async def failing_send(addr, msg_type, data, timeout=None):
             raise ConnectionError("Connection refused")
 
-        async def mock_check_rate_limit(client_id, op):
+        async def mock_check_rate_limit(client_id, op, handler_name):
             return (True, 0)
 
         state = GateRuntimeState(forward_throughput_interval_start=0.0)
@@ -788,7 +788,7 @@ async def test_a_cancel_reaches_exactly_the_jobs_datacenters() -> None:
         sent_to.append(addr)
         return (CancelAck(job_id="job-123", cancelled=True, workflows_cancelled=1).dump(), None)
 
-    async def allow(client_id, op):
+    async def allow(client_id, op, handler_name):
         return (True, 0)
 
     handler = GateCancellationHandler(

@@ -256,7 +256,7 @@ class MockGateInfo:
 
 
 def make_async_rate_limiter(allowed: bool = True, retry_after: float = 0.0):
-    async def check_rate_limit(client_id: str, op: str) -> tuple[bool, float]:
+    async def check_rate_limit(client_id: str, op: str, handler_name: str) -> tuple[bool, float]:
         return (allowed, retry_after)
 
     return check_rate_limit
@@ -332,7 +332,7 @@ def create_mock_handler(
     if select_dcs is None:
         select_dcs = ["dc-east", "dc-west"]
 
-    async def mock_check_rate_limit(client_id, op):
+    async def mock_check_rate_limit(client_id, op, handler_name):
         return (rate_limit_allowed, rate_limit_retry)
 
     return GateJobHandler(
@@ -814,7 +814,7 @@ class TestHandleSubmissionRateLimiting:
         """Different clients are rate limited separately."""
         rate_limited_clients = {"10.0.0.1:8000"}
 
-        async def check_rate(client_id: str, op: str):
+        async def check_rate(client_id: str, op: str, handler_name: str):
             if client_id in rate_limited_clients:
                 return (False, 5.0)
             return (True, 0.0)

@@ -39,7 +39,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable
 
-import cloudpickle
 
 from hyperscale.distributed.idempotency.idempotency_key import IdempotencyKey
 from hyperscale.distributed.slo.latency_slo import LatencySLO
@@ -170,6 +169,7 @@ from hyperscale.distributed.reliability import (
     AdaptiveRateLimitConfig,
     ServerRateLimiter,
     BackpressureSignal,
+    classify_handler_to_priority,
 )
 from hyperscale.distributed.jobs.gates import (
     GateJobManager,
@@ -2415,7 +2415,7 @@ class GateServer(HealthAwareServer):
 
     async def _handle_register_callback(self, addr: tuple[str, int], data: bytes) -> bytes:
         """Register a reconnecting client's callback and replay what it missed."""
-        if (rejection := await self._rate_limit_rejection(addr, "reconnect")) is not None:
+        if (rejection := await self._rate_limit_rejection(addr, "reconnect", "register_callback")) is not None:
             return rejection
 
         request = RegisterCallback.load(data)
@@ -2462,11 +2462,13 @@ class GateServer(HealthAwareServer):
 
         return response.dump()
 
-    async def _rate_limit_rejection(self, addr: tuple[str, int], operation: str) -> bytes | None:
+    async def _rate_limit_rejection(
+        self, addr: tuple[str, int], operation: str, handler_name: str
+    ) -> bytes | None:
         """The rate-limit response for a client over its limit for the operation (AD-24), else None."""
         client_id = f"{addr[0]}:{addr[1]}"
         allowed, retry_after = await self._check_rate_limit_for_operation(
-            client_id, operation
+            client_id, operation, handler_name
         )
         if not allowed:
             return RateLimitResponse(
@@ -2506,7 +2508,7 @@ class GateServer(HealthAwareServer):
 
     async def _handle_workflow_query(self, addr: tuple[str, int], data: bytes) -> bytes:
         """Answer a client's workflow query with every datacenter's workflow statuses."""
-        if (rejection := await self._rate_limit_rejection(addr, "workflow_query")) is not None:
+        if (rejection := await self._rate_limit_rejection(addr, "workflow_query", "workflow_query")) is not None:
             return rejection
 
         request = WorkflowQueryRequest.load(data)
@@ -2549,7 +2551,7 @@ class GateServer(HealthAwareServer):
 
     async def _handle_datacenter_list(self, addr: tuple[str, int], data: bytes) -> bytes:
         """Answer a client's datacenter list request with each datacenter's health and capacity."""
-        if (rejection := await self._rate_limit_rejection(addr, "datacenter_list")) is not None:
+        if (rejection := await self._rate_limit_rejection(addr, "datacenter_list", "datacenter_list")) is not None:
             return rejection
 
         request = DatacenterListRequest.load(data)
@@ -2962,7 +2964,7 @@ class GateServer(HealthAwareServer):
 
     async def _handle_windowed_stats_push(self, data: bytes) -> bytes:
         """Feed a manager's windowed stats into the collector, unless the job is unknown or ended."""
-        push: WindowedStatsPush = cloudpickle.loads(data)
+        push = WindowedStatsPush.load(data)
 
         if not self._job_manager.has_job(push.job_id):
             await self._udp_logger.log(
@@ -6247,9 +6249,14 @@ class GateServer(HealthAwareServer):
         self,
         client_id: str,
         operation: str,
+        handler_name: str,
     ) -> tuple[bool, float]:
-        """Check rate limit for an operation."""
-        result = await self._rate_limiter.check_rate_limit(client_id, operation)
+        """Check the client's AD-24 budget for ``operation`` at the priority
+        ``handler_name``'s AD-37 message class assigns: a cancel is CONTROL
+        (CRITICAL), so overload never refuses it (AD-20/AD-37)."""
+        result = await self._rate_limiter.check_rate_limit_with_priority(
+            client_id, operation, classify_handler_to_priority(handler_name)
+        )
         return result.allowed, result.retry_after_seconds
 
     def _should_shed_request(self, request_type: str) -> bool:

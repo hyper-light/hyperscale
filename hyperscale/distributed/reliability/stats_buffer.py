@@ -80,7 +80,7 @@ class StatsBuffer:
         if timestamp is None:
             timestamp = _DEFAULT_CLOCK.monotonic()
 
-        # Check if we should drop due to backpressure
+        # Check if we should drop due to backpressure (the level ages HOT first)
         level = self.get_backpressure_level()
         if level >= BackpressureLevel.REJECT:
             self._total_dropped += 1
@@ -90,9 +90,6 @@ class StatsBuffer:
         self._hot.append(entry)
         self._total_recorded += 1
         self._archive_dirty = True
-
-        # Check for tier promotions
-        self._maybe_promote_tiers()
 
         return True
 
@@ -116,9 +113,15 @@ class StatsBuffer:
         """
         Get current backpressure level based on buffer fill.
 
+        HOT entries past their age are promoted first, so the level falls
+        as pressure drops (AD-23's 0-60 s HOT window is the hysteresis; AD-37
+        returns to NONE below THROTTLE). Promoting only after an accepted
+        record latched REJECT for good (base 2e6d0532 ``stats_buffer.py:83-95``).
+
         Returns:
             BackpressureLevel indicating how full the buffer is
         """
+        self._maybe_promote_tiers()
         fill_ratio = len(self._hot) / self._config.hot_max_entries
 
         if fill_ratio >= self._config.reject_threshold:

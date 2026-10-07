@@ -87,7 +87,7 @@ class GateCancellationHandler:
         get_node_id: Callable[[], "NodeId"],
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
-        check_rate_limit: Callable[[str, str], tuple[bool, float]],
+        check_rate_limit: Callable[[str, str, str], Awaitable[tuple[bool, float]]],
         send_tcp: Callable,
         record_cancellation: Callable[
             [str, str, str, list[tuple[str, int]]], Awaitable[None]
@@ -127,7 +127,7 @@ class GateCancellationHandler:
         self._record_cancellation: Callable[
             [str, str, str, list[tuple[str, int]]], Awaitable[None]
         ] = record_cancellation
-        self._check_rate_limit: Callable[[str, str], tuple[bool, float]] = (
+        self._check_rate_limit: Callable[[str, str, str], Awaitable[tuple[bool, float]]] = (
             check_rate_limit
         )
         self._send_tcp: Callable = send_tcp
@@ -212,7 +212,7 @@ class GateCancellationHandler:
         """Cancel a job the client's rate limit admits, unless the cancel is
         refused or the job already ended."""
         client_id = f"{addr[0]}:{addr[1]}"
-        allowed, retry_after = await self._check_rate_limit(client_id, "cancel")
+        allowed, retry_after = await self._check_rate_limit(client_id, "cancel", "cancel_job")
         if not allowed:
             return RateLimitResponse(
                 operation="cancel",
@@ -888,7 +888,7 @@ class GateCancellationHandler:
 
         client_id = f"{addr[0]}:{addr[1]}"
         allowed, retry_after = await self._check_rate_limit(
-            client_id, "cancel_workflow"
+            client_id, "cancel_workflow", "receive_cancel_single_workflow"
         )
         if not allowed:
             return RateLimitResponse(

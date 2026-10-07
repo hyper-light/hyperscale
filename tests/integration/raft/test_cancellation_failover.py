@@ -69,6 +69,7 @@ from hyperscale.distributed.nodes.manager.state import ManagerState
 from hyperscale.distributed.nodes.worker.cancellation import WorkerCancellationHandler
 from hyperscale.distributed.nodes.worker.models.worker_config import WorkerConfig
 from hyperscale.distributed.nodes.worker.state import WorkerState
+from hyperscale.distributed.reliability import classify_handler_to_priority
 from hyperscale.distributed.reliability.rate_limiting import ServerRateLimiter
 from hyperscale.distributed.runtime import (
     RealClock,
@@ -321,8 +322,12 @@ class ManagerNode:
             complete_job_if_done=self.record_completion_check,
         )
 
-    async def check_rate_limit_for_operation(self, client_id: str, operation: str) -> tuple[bool, float]:
-        result = await self.rate_limiter.check_rate_limit(client_id, operation)
+    async def check_rate_limit_for_operation(
+        self, client_id: str, operation: str, handler_name: str
+    ) -> tuple[bool, float]:
+        result = await self.rate_limiter.check_rate_limit_with_priority(
+            client_id, operation, classify_handler_to_priority(handler_name)
+        )
         return result.allowed, result.retry_after_seconds
 
     async def take_over_job_leadership(self, job_id: str, old_leader_id: str | None) -> bool:
@@ -1070,8 +1075,10 @@ class TestSingleWorkflowCancellationThroughGate:
 
         gate_rate_limiter = ServerRateLimiter()
 
-        async def gate_check_rate_limit(client_id: str, operation: str) -> tuple[bool, float]:
-            result = await gate_rate_limiter.check_rate_limit(client_id, operation)
+        async def gate_check_rate_limit(client_id: str, operation: str, handler_name: str) -> tuple[bool, float]:
+            result = await gate_rate_limiter.check_rate_limit_with_priority(
+                client_id, operation, classify_handler_to_priority(handler_name)
+            )
             return result.allowed, result.retry_after_seconds
 
         gate_job_manager = GateJobManager()

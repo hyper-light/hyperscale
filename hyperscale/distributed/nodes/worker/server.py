@@ -181,6 +181,7 @@ class WorkerServer(HealthAwareServer):
             recovery_jitter_max=env.RECOVERY_JITTER_MAX,
             recovery_semaphore_size=env.RECOVERY_SEMAPHORE_SIZE,
             circuit_breaker_config=env.get_circuit_breaker_config(),
+            forget_manager_backpressure=self._worker_state.remove_manager_backpressure,
             # Resolved at call time: the discovery manager is built below.
             select_manager=lambda healthy_manager_ids: (
                 self._discovery_manager.select_best_manager(

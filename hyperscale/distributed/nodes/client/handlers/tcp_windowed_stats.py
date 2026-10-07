@@ -1,5 +1,4 @@
 import inspect
-import cloudpickle
 
 from hyperscale.distributed.reliability.rate_limiting import RequestPriority
 from hyperscale.distributed.nodes.client.state import ClientState
@@ -32,7 +31,7 @@ class WindowedStatsPushHandler:
 
         Args:
             addr: Source address (gate/manager)
-            data: Cloudpickle-serialized WindowedStatsPush message
+            data: Pickled WindowedStatsPush message
             clock_time: Logical clock time
 
         Returns:
@@ -50,9 +49,8 @@ class WindowedStatsPushHandler:
                 if not result.allowed:
                     return b"rate_limited"
 
-            # Import WindowedStatsPush from jobs module (avoid circular import)
-
-            push: WindowedStatsPush = cloudpickle.loads(data)
+            # Network bytes: read through the restricted unpickler, never cloudpickle.loads.
+            push = WindowedStatsPush.load(data)
 
             callback = self._state._progress_callbacks.get(push.job_id)
             if callback:
