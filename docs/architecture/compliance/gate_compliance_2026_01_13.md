@@ -5,7 +5,7 @@
 **Scope**: AD-9 through AD-50 (excluding AD-27)
 **Module**: `hyperscale/distributed/nodes/gate/`
 
-> **Revised 2026-10-06 (checked against the code).** The 2026-01-13 verdict "fully compliant, no action items" did not hold: the 2026-08 assessment found a dead `GateCancellationCoordinator`, uncalled coordinator methods, a `submit_job`/`fence_token` NameError in `GateDispatchCoordinator`, an unwired `reap_expired_prepared` and a duplicated `_push_global_job_result`. All of those are now fixed or deleted. Rows that no longer describe the code are marked inline below; one finding remains open (see Action Items). Current status of every item: `docs/REMAINING_LEDGER.md` (P-COMPLIANCE-1).
+> **Revised 2026-10-06 (checked against the code).** The 2026-01-13 verdict "fully compliant, no action items" did not hold: the 2026-08 assessment found a dead `GateCancellationCoordinator`, uncalled coordinator methods, a `submit_job`/`fence_token` NameError in `GateDispatchCoordinator`, an unwired `reap_expired_prepared` and a duplicated `_push_global_job_result`. All of those are now fixed or deleted, and the last one (an unwired `GatePeerCoordinator.on_peer_confirmed`) was deleted 2026-10-07. Rows that no longer describe the code are marked inline below. Current status of every item: `docs/REMAINING_LEDGER.md` (P-COMPLIANCE-1).
 
 ---
 
@@ -116,7 +116,7 @@ Gate server properly integrates all coordinators:
 | ~~`GateCancellationCoordinator`~~ | Job cancellation (AD-43) | deleted (dead code) |
 | `GateDispatchCoordinator` | Job dispatch (AD-41) | ✓ |
 | `GateLeadershipCoordinator` | Leadership/quorum (AD-44) | ✓ |
-| `GatePeerCoordinator` | Peer management (AD-20) | ✓ (but see Action Items: `on_peer_confirmed` is unused) |
+| `GatePeerCoordinator` | Peer management (AD-20) | ✓ (unwired `on_peer_confirmed` twin deleted 2026-10-07) |
 | `GateHealthCoordinator` | DC health (AD-16, AD-19) | ✓ |
 | `GateOrphanJobCoordinator` | Orphan handling (AD-31) | ✓ |
 
@@ -126,8 +126,10 @@ Gate server properly integrates all coordinators:
 
 ~~None. All gate-relevant ADs are compliant.~~ (2026-01-13)
 
-Open as of 2026-10-06:
-- `GatePeerCoordinator.on_peer_confirmed` (`nodes/gate/peer_coordinator.py:120`) has no caller. The server registers its own inline twin, `GateServer._on_peer_confirmed` (`nodes/gate/server.py:699`, defined at `:4890`), so the coordinator's version is a built-but-unwired duplicate. One of the two should be deleted.
+Closed 2026-10-07:
+- `GatePeerCoordinator.on_peer_confirmed` had no caller; the server registers its own `GateServer._on_peer_confirmed` with SWIM (AD-29: map the UDP address to TCP and add the active peer through the TaskRunner). The wired server method is kept and the unwired coordinator twin deleted.
+
+Open:
 - No manager, worker or client compliance report exists; this is the only one.
 
 ---

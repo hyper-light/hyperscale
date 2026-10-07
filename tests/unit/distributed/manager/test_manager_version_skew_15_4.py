@@ -14,7 +14,7 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock
 
 from hyperscale.distributed.nodes.manager.version_skew import ManagerVersionSkewHandler
-from hyperscale.distributed.nodes.manager.config import ManagerConfig
+from hyperscale.distributed.nodes.manager.models.manager_config import ManagerConfig
 from hyperscale.distributed.nodes.manager.state import ManagerState
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.slo import SLOConfig

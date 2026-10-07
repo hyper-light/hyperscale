@@ -24,11 +24,11 @@ from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerErro
 from hyperscale.distributed.runtime import Clock, RealClock, SendTcp, RunTask
 from hyperscale.distributed.swim.core import ErrorStats
 
-from .pending_result import PendingResult
+from hyperscale.distributed.nodes.worker.models.pending_result import PendingResult
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
-    from .config import WorkerConfig
+    from .models.worker_config import WorkerConfig
     from .registry import WorkerRegistry
     from .state import WorkerState
 

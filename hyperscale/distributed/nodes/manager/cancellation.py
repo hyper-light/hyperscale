@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.env import Env
     from hyperscale.distributed.jobs import JobManager, WorkflowDispatcher
     from hyperscale.distributed.ledger.job_ledger import JobLedger
-    from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.nodes.manager.models.manager_config import ManagerConfig
     from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.reliability.rate_limiting import ServerRateLimiter

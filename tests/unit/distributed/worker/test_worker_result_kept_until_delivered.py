@@ -17,7 +17,7 @@ import pytest
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.models import WorkflowFinalResult
 from hyperscale.distributed.nodes.worker import worker_progress_reporter
-from hyperscale.distributed.nodes.worker.config import WorkerConfig
+from hyperscale.distributed.nodes.worker.models.worker_config import WorkerConfig
 from hyperscale.distributed.nodes.worker.progress import WorkerProgressReporter
 
 SETTINGS = Env()

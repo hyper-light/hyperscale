@@ -54,8 +54,8 @@ class TestBatchFsyncTimeout:
             log_format="binary",
             enable_lsn=True,
             instance_id=1,
+            batch_timeout_ms=50,
         )
-        stream._batch_timeout_ms = 50
         await stream.initialize(
             stdout_writer=create_mock_stream_writer(),
             stderr_writer=create_mock_stream_writer(),
@@ -66,6 +66,40 @@ class TestBatchFsyncTimeout:
 
         await asyncio.sleep(0.1)
 
+        assert len(stream._pending_batch) == 0
+
+        await stream.close()
+
+    @pytest.mark.asyncio
+    async def test_configured_batch_timeout_bounds_a_lone_entry_durability(
+        self,
+        temp_log_directory: str,
+    ):
+        """A lone FSYNC_BATCH entry is durable only once the configured
+        batch timeout fires: log() returns no sooner than it, and the
+        default (10 ms) would return far sooner."""
+        configured_timeout_seconds = 0.3
+        stream = LoggerStream(
+            name="test_configured_timeout",
+            filename="configured_timeout_test.wal",
+            directory=temp_log_directory,
+            durability=DurabilityMode.FSYNC_BATCH,
+            log_format="binary",
+            enable_lsn=True,
+            instance_id=1,
+            batch_timeout_ms=configured_timeout_seconds * 1000.0,
+        )
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
+        event_loop = asyncio.get_running_loop()
+
+        started_at = event_loop.time()
+        await stream.log(Entry(message="lone entry", level=LogLevel.INFO))
+        durable_after_seconds = event_loop.time() - started_at
+
+        assert durable_after_seconds >= configured_timeout_seconds * 0.9
         assert len(stream._pending_batch) == 0
 
         await stream.close()

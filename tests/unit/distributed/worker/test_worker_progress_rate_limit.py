@@ -18,7 +18,7 @@ from hyperscale.distributed.models import (
     WorkflowProgress,
 )
 from hyperscale.distributed.env import Env
-from hyperscale.distributed.nodes.worker.config import WorkerConfig
+from hyperscale.distributed.nodes.worker.models.worker_config import WorkerConfig
 from hyperscale.distributed.nodes.worker.progress import WorkerProgressReporter
 from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
 from hyperscale.distributed.nodes.worker.state import WorkerState

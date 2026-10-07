@@ -33,6 +33,7 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.jobs import AllocationResult, CoreAllocator
 from hyperscale.distributed.resources import ProcessResourceMonitor
+from hyperscale.distributed.resources.file_descriptor_ceiling import FileDescriptorCeiling
 from hyperscale.distributed.resources.workflow_resource_tracker import WorkflowResourceTracker
 from hyperscale.distributed.protocol.version import (
     NodeCapabilities,
@@ -66,11 +67,9 @@ from hyperscale.logging.hyperscale_logging_models import (
     WorkerStopping,
 )
 
-from .config import WorkerConfig
-from .extension_trigger import (
-    ExtensionTrigger,
-    ExtensionTriggerConfig,
-)
+from .models.worker_config import WorkerConfig
+from .models.extension_trigger_config import ExtensionTriggerConfig
+from .extension_trigger import ExtensionTrigger
 from .models import WorkflowRuntimeState
 from .state import WorkerState
 from .registry import WorkerRegistry
@@ -172,6 +171,7 @@ class WorkerServer(HealthAwareServer):
         self._stopping: bool = False
 
         self._resource_monitor: ProcessResourceMonitor = ProcessResourceMonitor()
+        self._file_descriptor_ceiling: FileDescriptorCeiling = FileDescriptorCeiling.from_env(env)
 
         # Initialize modules (will be fully wired after super().__init__)
         self._registry: WorkerRegistry = WorkerRegistry(
@@ -1154,7 +1154,8 @@ class WorkerServer(HealthAwareServer):
     async def _resource_sample_iteration(self) -> bool:
         """One resource sample and its one-second wait; False once cancelled."""
         try:
-            await self._resource_monitor.sample()
+            metrics = await self._resource_monitor.sample()
+            await self._judge_file_descriptors(metrics.largest_process_file_descriptor_count)
             await self._clock.sleep(1.0)
             return True
         except asyncio.CancelledError:
@@ -1430,12 +1431,33 @@ class WorkerServer(HealthAwareServer):
         return self._worker_state_for_degradation()
 
     def _worker_state_for_degradation(self) -> WorkerStateEnum:
-        """A running worker's state by degradation level: DRAINING at 3+, DEGRADED at 2, else HEALTHY."""
-        if self._degradation.current_level.value >= 3:
+        """A running worker's state by degradation level: DRAINING at 3+, DEGRADED at 2, else HEALTHY.
+
+        The level is at least the descriptor ceiling's floor: a process
+        at its descriptor ceiling drains the worker (AD-41).
+        """
+        level = max(self._degradation.current_level.value, self._file_descriptor_ceiling.degradation_floor.value)
+        if level >= 3:
             return WorkerStateEnum.DRAINING
-        if self._degradation.current_level.value >= 2:
+        if level >= 2:
             return WorkerStateEnum.DEGRADED
         return WorkerStateEnum.HEALTHY
+
+    async def _judge_file_descriptors(self, largest_process_descriptors: int) -> None:
+        """Fold a sample into the descriptor ceiling, warning when the worker starts refusing new work."""
+        if self._file_descriptor_ceiling.observe(largest_process_descriptors) is None:
+            return
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"A worker process holds {largest_process_descriptors} file descriptors of its "
+                    f"{self._file_descriptor_ceiling.descriptor_limit} limit: refusing new workflows (draining)"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     async def _increment_version(self) -> int:
         return await self._state_sync.increment_version()

@@ -117,31 +117,6 @@ class GatePeerCoordinator:
         )
         self._is_leader: Callable[[], bool] = is_leader or (lambda: False)
 
-    async def on_peer_confirmed(self, peer: tuple[str, int]) -> None:
-        """
-        Add confirmed peer to active peer sets (AD-29).
-
-        Called when a peer is confirmed via successful SWIM communication.
-        This is the ONLY place where peers should be added to active sets,
-        ensuring failure detection only applies to peers we've communicated with.
-
-        Args:
-            peer: The UDP address of the confirmed peer.
-        """
-        tcp_addr = self._state._gate_udp_to_tcp.get(peer)
-        if not tcp_addr:
-            return
-
-        await self._state.add_active_peer(tcp_addr)
-        await self._logger.log(
-            ServerDebug(
-                message=f"AD-29: Gate peer {tcp_addr[0]}:{tcp_addr[1]} confirmed via SWIM, added to active sets",
-                node_host=self._get_host(),
-                node_port=self._get_tcp_port(),
-                node_id=self._get_node_id().short,
-            ),
-        )
-
     async def handle_peer_failure(
         self,
         udp_addr: tuple[str, int],

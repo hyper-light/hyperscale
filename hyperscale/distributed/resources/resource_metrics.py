@@ -19,6 +19,9 @@ class ResourceMetrics:
     timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     sample_count: int = 1
     process_count: int = 1
+    # The largest single process's descriptor count: RLIMIT_NOFILE is per
+    # process, so this, not the tree's sum, is what nears the ceiling.
+    largest_process_file_descriptor_count: int = 0
 
     def is_stale(self, max_age_seconds: float = 30.0) -> bool:
         """Return True if metrics are older than max_age_seconds."""

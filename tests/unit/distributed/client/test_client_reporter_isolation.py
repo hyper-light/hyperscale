@@ -33,7 +33,7 @@ import pytest
 
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.models import JobFinalResult, WorkflowResult
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.handlers.tcp_job_result import JobFinalResultHandler
 from hyperscale.distributed.nodes.client.handlers.tcp_workflow_result import WorkflowResultPushHandler
 from hyperscale.distributed.nodes.client.reporting import ClientReportingManager

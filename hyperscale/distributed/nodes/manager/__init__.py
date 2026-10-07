@@ -9,7 +9,8 @@ to workers and reporting status to gates.
 # Export ManagerServer from new modular server implementation
 from .server import ManagerServer
 
-from .config import ManagerConfig, create_manager_config_from_env
+from .config import create_manager_config_from_env
+from .models.manager_config import ManagerConfig
 from .state import ManagerState
 from .registry import ManagerRegistry
 from .cancellation import ManagerCancellationCoordinator

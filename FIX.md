@@ -5,6 +5,8 @@ Scope: Full re-trace of `SCENARIOS.md` against current code paths (no cached fin
 
 This file listed the issues verified on 2026-01-14. Both are now closed; the sections below keep the original finding and record the fix.
 
+This is a dated trace, not a running bug list: fixes made after it (Phase 1 / Phase 9, ASSESSMENT.md delta A1-A7 and B) are recorded with their commits and tests in `docs/REMAINING_LEDGER.md` and `docs/REMAINING_WORK_PLAN.md`, and are deliberately not copied here, where a second copy would go stale.
+
 ---
 
 ## Summary
@@ -23,7 +25,7 @@ This file listed the issues verified on 2026-01-14. Both are now closed; the sec
 
 Original finding (2026-01-14): `extract_claims_from_cert()` was called without `strict=True` at the manager's worker-registration handler, the gate's manager-registration handler and the manager's `_validate_mtls_claims()`, so with `mtls_strict_mode` enabled a certificate parse failure fell back to defaults and could pass validation (Scenario 41.23).
 
-Fix: `RoleValidator.extract_peer_claims(cert_der)` (`distributed/discovery/security/role_validator.py:294-323`) parses with `strict=self.strict_mode`, the validator's own config-wired flag, so no call site has to thread it. Callers: `distributed/nodes/manager/server.py:8275` and `distributed/nodes/gate/handlers/tcp_manager.py:356` (the manager's worker-registration handler file no longer exists). Test: `tests/unit/distributed/discovery/test_mtls_strict_claims.py`.
+Fix: `RoleValidator.extract_peer_claims(cert_der)` (`distributed/discovery/security/role_validator.py:294-323`) parses with `strict=self.strict_mode`, the validator's own config-wired flag, so no call site has to thread it. Callers: `ManagerServer._validate_peer_certificate_claims` (`distributed/nodes/manager/server.py`) and the gate's `_reject_certificate_claims` (`distributed/nodes/gate/handlers/tcp_manager.py`) (the manager's worker-registration handler file no longer exists). Test: `tests/unit/distributed/discovery/test_mtls_strict_claims.py`.
 
 ### 1.2 Timeout Tracker Accepts Stale Progress Reports — FIXED
 
@@ -35,11 +37,11 @@ Fix: `record_progress`, `record_timeout` and `record_leader_transfer` first call
 
 ## Notes (Verified Behaviors)
 
-Line numbers re-verified 2026-10-06.
+Line numbers re-verified 2026-10-07; references that drift with every edit cite the symbol instead.
 
 - Federated health handles first‑probe ACK timeouts using `last_probe_sent`: `distributed/swim/health/federated_health_monitor.py:517,662`.
-- Probe error callbacks fall back to logging when no callback is set or it fails: `distributed/swim/health/federated_health_monitor.py:468-471`.
+- Probe error callbacks fall back to logging when no callback is set or it fails: `FederatedHealthMonitor._report_datacenter_probe_error` (`distributed/swim/health/federated_health_monitor.py`).
 - Cross‑DC correlation callbacks route failures to `on_callback_error`, and a failing handler goes to stderr: `distributed/datacenters/cross_dc_correlation_detector.py:1050-1070`.
-- Lease cleanup: the job lease cleanup is a TaskRunner loop (`distributed/leases/job_lease_manager.py:189-195`, started at `distributed/nodes/gate/server.py:1557`); its error callback and expiry hook were removed on 2026-10-06 along with lease import/export (every lease is the local gate's own).
+- Lease cleanup: the job lease cleanup is a TaskRunner loop (`distributed/leases/job_lease_manager.py:189-195`, started by `GateServer._start_background_loops`); its error callback and expiry hook were removed on 2026-10-06 along with lease import/export (every lease is the local gate's own).
 - Local reporter submission logs failures (best‑effort, deadline-bounded): `distributed/nodes/client/reporting.py:109-120`.
 - OOB health receive loop logs exceptions with socket context: `distributed/swim/health/out_of_band_health_channel.py:361-373`.

@@ -22,7 +22,7 @@ from hyperscale.distributed.nodes.client.reporting import ClientReportingManager
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.nodes.client.discovery import ClientDiscovery
 from hyperscale.distributed.nodes.client.state import ClientState
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector

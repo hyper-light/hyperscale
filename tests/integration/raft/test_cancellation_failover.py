@@ -67,7 +67,7 @@ from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator
 from hyperscale.distributed.nodes.manager.server import ManagerServer
 from hyperscale.distributed.nodes.manager.state import ManagerState
 from hyperscale.distributed.nodes.worker.cancellation import WorkerCancellationHandler
-from hyperscale.distributed.nodes.worker.config import WorkerConfig
+from hyperscale.distributed.nodes.worker.models.worker_config import WorkerConfig
 from hyperscale.distributed.nodes.worker.state import WorkerState
 from hyperscale.distributed.reliability.rate_limiting import ServerRateLimiter
 from hyperscale.distributed.runtime import (

@@ -5,7 +5,7 @@ Handles submission to local file-based reporters (JSON/CSV/XML).
 """
 
 from hyperscale.distributed.nodes.client.state import ClientState
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.runtime import Clock
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerWarning

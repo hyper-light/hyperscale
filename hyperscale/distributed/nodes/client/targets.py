@@ -6,7 +6,7 @@ of gates/managers for queries, and sticky routing to job targets.
 """
 
 from hyperscale.distributed.discovery import DiscoveryService
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
 
 

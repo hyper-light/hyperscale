@@ -55,6 +55,17 @@ BINARY_HEADER_SIZE_V1 = 16
 BINARY_HEADER_SIZE = 24
 DEFAULT_QUEUE_MAX_SIZE = 10000
 DEFAULT_BATCH_MAX_SIZE = 100
+# FSYNC_BATCH: the longest the first entry of a batch waits before its batch
+# is synced, so an entry's durability latency is at most this plus one
+# flush. Established group-commit practice bounds an added batching delay to
+# the order of one flush: PostgreSQL's commit_delay guidance is half the
+# flush time pg_test_fsync measures, Kafka's producer linger.ms defaults to
+# 5 ms (4.0, KIP-1030). Rotational and networked-volume flushes run 10-20 ms,
+# the slowest substrate a stream must run on without assuming its disk, so
+# 10 ms gathers about one such flush's arrivals into a batch while keeping
+# durability latency within two flushes there. Latency-critical callers use
+# DurabilityMode.FSYNC.
+DEFAULT_BATCH_TIMEOUT_MS = 10.0
 
 try:
     import uvloop as uvloop
@@ -108,6 +119,7 @@ class LoggerStream:
         instance_id: int = 0,
         queue_max_size: int = DEFAULT_QUEUE_MAX_SIZE,
         batch_max_size: int = DEFAULT_BATCH_MAX_SIZE,
+        batch_timeout_ms: float = DEFAULT_BATCH_TIMEOUT_MS,
         filesystem: Filesystem | None = None,
     ) -> None:
         self._name = name if name is not None else "default"
@@ -176,7 +188,7 @@ class LoggerStream:
 
         self._pending_batch: list[tuple[str, asyncio.Future[None]]] = []
         self._batch_lock: asyncio.Lock | None = None
-        self._batch_timeout_ms: int = 10
+        self._batch_timeout_ms: float = batch_timeout_ms
         self._batch_max_size: int = batch_max_size
         self._batch_timer_handle: asyncio.TimerHandle | None = None
         self._batch_flush_task: asyncio.Task[None] | None = None

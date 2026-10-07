@@ -19,10 +19,8 @@ import pytest
 import time
 from unittest.mock import MagicMock
 
-from hyperscale.distributed.nodes.manager.config import (
-    ManagerConfig,
-    create_manager_config_from_env,
-)
+from hyperscale.distributed.nodes.manager.config import create_manager_config_from_env
+from hyperscale.distributed.nodes.manager.models.manager_config import ManagerConfig
 from hyperscale.distributed.nodes.manager.state import ManagerState
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.slo import SLOConfig

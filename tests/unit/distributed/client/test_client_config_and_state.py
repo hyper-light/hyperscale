@@ -17,10 +17,8 @@ import time
 import pytest
 
 from hyperscale.distributed.env import Env
-from hyperscale.distributed.nodes.client.config import (
-    ClientConfig,
-    TRANSIENT_ERRORS,
-)
+from hyperscale.distributed.nodes.client.config import TRANSIENT_ERRORS
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.reporting.common import ReporterTypes
 from hyperscale.distributed.models import (

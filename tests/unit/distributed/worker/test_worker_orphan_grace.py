@@ -21,7 +21,7 @@ import pytest
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.worker import background_loops, state as worker_state_module
 from hyperscale.distributed.nodes.worker.background_loops import WorkerBackgroundLoops
-from hyperscale.distributed.nodes.worker.config import derive_orphan_grace_seconds
+from hyperscale.distributed.nodes.worker.worker_config_derivation import derive_orphan_grace_seconds
 from hyperscale.distributed.nodes.worker.state import WorkerState
 
 SETTINGS = Env()

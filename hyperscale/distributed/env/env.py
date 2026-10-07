@@ -353,7 +353,7 @@ class Env(BaseModel):
 
     # Worker orphan handling (Section 2.7). The grace a workflow whose job
     # leader died waits for its new leader is derived from the cluster's
-    # own timings (nodes/worker/config.py derive_orphan_grace_seconds),
+    # own timings (nodes/worker/worker_config_derivation.py derive_orphan_grace_seconds),
     # learned from the rescues the worker observes, and extended (AD-26)
     # while managers keep heartbeating it.
     WORKER_ORPHAN_CHECK_INTERVAL: StrictFloat = (
@@ -410,7 +410,13 @@ class Env(BaseModel):
     # timed-out jobs stay an hour for investigation.
     COMPLETED_JOB_MAX_AGE: StrictFloat = 300.0
     FAILED_JOB_MAX_AGE: StrictFloat = 3600.0
-    JOB_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between cleanup checks
+    # Seconds between job cleanup sweeps. The sweep also reconciles a copy of
+    # a job led elsewhere that heard no sync for a whole interval; its leader
+    # re-syncs every MANAGER_PEER_JOB_SYNC_INTERVAL (15 s), so 60 s spans four
+    # syncs and tolerates three consecutive lost ones before asking (the
+    # missed-heartbeat multiple failure detectors use) while retention ends
+    # within one interval (20%) of COMPLETED_JOB_MAX_AGE.
+    JOB_CLEANUP_INTERVAL: StrictFloat = 60.0
 
     # AD-41 resource guards: the per-job budget a workflow is enforced
     # against when the job assigns none, and the graduated-response
@@ -619,9 +625,9 @@ class Env(BaseModel):
     )
 
     # Manager Batch Stats Settings
-    MANAGER_BATCH_PUSH_INTERVAL: StrictFloat = (
-        0.25  # Seconds between batch stats pushes to clients (when no gates)
-    )
+    # Seconds between batch stats pushes to clients (when no gates): the
+    # gateless twin of GATE_BATCH_STATS_INTERVAL, derived there.
+    MANAGER_BATCH_PUSH_INTERVAL: StrictFloat = 0.25
 
     # ==========================================================================
     # Gate Settings
@@ -630,9 +636,14 @@ class Env(BaseModel):
     GATE_RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = (
         60.0  # Seconds between rate limit client cleanup
     )
-    GATE_BATCH_STATS_INTERVAL: StrictFloat = (
-        0.25  # Seconds between batch stats pushes to clients
-    )
+    # Seconds between AD-15 Tier-2 batch stats pushes to clients. The push is
+    # a gate-fronted client's only live aggregate progress, so this is the
+    # staleness bound on what the operator watches: Nielsen's response-time
+    # limits keep continuous feedback under 1.0 s. The floor is the upstream
+    # refresh (WORKER_PROGRESS_FLUSH_INTERVAL, 0.05 s): 0.25 s folds five
+    # worker flushes into one push, four messages/s per job callback. Equal to
+    # MANAGER_BATCH_PUSH_INTERVAL so gateless clients see the same cadence.
+    GATE_BATCH_STATS_INTERVAL: StrictFloat = 0.25
     GATE_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations
     GATE_TCP_TIMEOUT_STANDARD: StrictFloat = (
         5.0  # Standard timeout for job dispatch, result forwarding

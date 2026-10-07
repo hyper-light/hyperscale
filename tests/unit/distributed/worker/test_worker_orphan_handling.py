@@ -789,7 +789,7 @@ class TestOrphanConfiguration:
         the managers' worst-case suspicion window, a leader election and the
         transfer's request -- not a constant."""
         from hyperscale.distributed.env import Env
-        from hyperscale.distributed.nodes.worker.config import derive_orphan_grace_seconds
+        from hyperscale.distributed.nodes.worker.worker_config_derivation import derive_orphan_grace_seconds
 
         env = Env()
         assert derive_orphan_grace_seconds(env) == (

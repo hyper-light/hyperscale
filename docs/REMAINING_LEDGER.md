@@ -53,7 +53,9 @@ D-83/84), and AD-44 late results / `RETRY_BUDGET_DEFAULT` (P-AD44-1, A3-G-50).
 10. **D-42 / D-13: nightly CI and continuous invariants.**
     The nightly `vopr` job runs the default 4-seed sweep and never the soak (`.github/workflows/ci.yml:129`). Only 2 of SCENARIOS §11's continuous invariants exist. Size M.
 
-Also notable, small (closed 2026-10-07): the unfed `ManagerDiscoveryCoordinator` was deleted (AD-28-1); `DiscoveryService` logs failed DNS lookups (R-G67); the raw-task lint covers all of `hyperscale/` (R-G66). Doc banners are stale: architecture.md:21085 still says read consistency is "Not built", AD_52.md contradicts its own Status, and FIX.md still lists §1.1/§1.2 as open.
+Also notable, small (closed 2026-10-07): the unfed `ManagerDiscoveryCoordinator` was deleted (AD-28-1); `DiscoveryService` logs failed DNS lookups (R-G67); the raw-task lint covers all of `hyperscale/` (R-G66). Doc banners are stale: architecture.md:21085 still says read consistency is "Not built" and AD_52.md contradicts its own Status (FIX.md's §1.1/§1.2 status was corrected, R-G51).
+
+Also closed 2026-10-07 (thirteen S rows): A1-G-14, A1-G-56, A1-G-42, A1-G-48, A1-G-77, A3-G-9, R-G11, R-G51, P-COMPLIANCE-1, D-9, D-11 (Doc-obsolete), D-66, D-81. The per-ledger counts above are as of the regrade.
 
 ## Ledger: AD-1–36
 Counts: old P/A 12/0 → Built 4 · Doc-obsolete 4 · Still Partial 4 · Still Absent 0
@@ -116,7 +118,8 @@ P-AUDIT-1, P-COMPLIANCE-1, P-AD52-1/2/3, P-AD52PLAN-2/3) plus the 11 rows of
 - `RETRY_BUDGET_DEFAULT = 10` kept on merit (SRE/Finagle/Envoy floors, sweep over `RetryBudgetManager`); reasoning in the Env comment and AD_44.md Part 6.
 - Tests: `tests/unit/simulation/sim/test_multiprocess_best_effort_late_results.py`, `tests/unit/distributed/reliability/test_ad44_late_results_and_observability.py`.
 
-#### P-COMPLIANCE-1 — Gate compliance report "no action items" — STILL PARTIAL — size S
+#### P-COMPLIANCE-1 — Gate compliance report "no action items" — CLOSED 2026-10-07 — size S
+- Closed: Deleted the unwired `GatePeerCoordinator.on_peer_confirmed`; the wired `GateServer._on_peer_confirmed` (registered with SWIM) stays. Compliance report's action item closed.
 - Doc: gate AD compliance report (2026-01-13) "fully compliant / Action Items: None".
 - Exists: every 2026-08 finding cured — `GateCancellationCoordinator` deleted; `GateLeadershipCoordinator`'s 3 methods all called; `GateDispatchCoordinator` is down to the two called methods (`dispatch_coordinator.py:282,745`, dead `submit_job`/`fence_token` NameError gone); `reap_expired_prepared` runs (`nodes/gate/server.py:9324`); `_push_global_job_result` defined once (:4485).
 - Missing: `GatePeerCoordinator.on_peer_confirmed` (`nodes/gate/peer_coordinator.py:120`) has no caller — the server registers its own inline twin `GateServer._on_peer_confirmed` (`nodes/gate/server.py:698,4889`), which reads `_modular_state` and skips the coordinator's debug log. Delete one (built-but-unwired duplicate). Report text itself needs the Phase 9 doc sweep.
@@ -144,7 +147,7 @@ P-AUDIT-1, P-COMPLIANCE-1, P-AD52-1/2/3, P-AD52PLAN-2/3) plus the 11 rows of
 ### New gaps found
 - Doc contradiction, architecture.md:21085 Part 8 "**Not built (2026-10).** Reads are not leveled" — false since plan D2 (`ReadConsistency` EVENTUAL/SESSION/BOUNDED_STALENESS/STRONG; `tests/unit/distributed/manager/test_job_status_consistency.py`). Size S.
 - Doc contradiction inside AD_52.md: Status says leader leases and the §10 soft-state cache are built and "every section of this AD is built", but the §9 paragraph (AD_52.md Status, ~line 190) still says "section 10, which is not built" and the §11 paragraph (~line 205) "Leader leases are not built"; §2 (:624) and the flag appendix (:1559) still promise `--max-seed-candidates`, which the Status calls unbuilt (a fixed `--cohort-size` cohort is never sampled). Size S.
-- `GatePeerCoordinator.on_peer_confirmed` dead duplicate (see P-COMPLIANCE-1). Size S.
+- ~~`GatePeerCoordinator.on_peer_confirmed` dead duplicate (see P-COMPLIANCE-1).~~ Deleted 2026-10-07.
 - (Closed, b56858c2) The cluster cookie syncs through `RealFilesystem` (F_FULLFSYNC on darwin) and fsyncs its directory after `os.link`.
 
 ## Ledger: architecture.md §1
@@ -154,27 +157,32 @@ Counts: old P/A 25/0 → Built 13 · Doc-obsolete 7 · Still Partial 5 · Still 
 
 ### Still Partial / Still Absent
 
-#### A1-G-14 — Tiered cross-DC stats: periodic-tier cadence — STILL PARTIAL — size S
+#### A1-G-14 — Tiered cross-DC stats: periodic-tier cadence — CLOSED 2026-10-07 — size S
+- Closed: Kept 0.25 s on merit: the Tier-2 push is the operator's only live aggregate, so the interval is its staleness bound (Nielsen's 1.0 s continuous-feedback limit rules out "1-5 s"); the floor is the 0.05 s worker flush (five flushes per push, 4 msg/s per job callback); equal to `MANAGER_BATCH_PUSH_INTERVAL` for gateless parity. Derivation at `GATE_BATCH_STATS_INTERVAL` (env.py); AD_15.md table and architecture.md AD-15 corrected.
 - Doc: architecture.md:400 "Periodic | Workflow progress, aggregate rates | Every 1-5s | TCP batch"
 - Exists: `GATE_BATCH_STATS_INTERVAL = 0.25` (hyperscale/distributed/env/env.py:607-609) drives the gate batch loop; immediate and on-demand tiers live.
 - Missing: constant/doc drift only (0.25 s vs "1-5s"). Justify 0.25 s in the doc or change the default.
 
-#### A1-G-56 — Client push Tier-2 interval — STILL PARTIAL — size S
+#### A1-G-56 — Client push Tier-2 interval — CLOSED 2026-10-07 — size S
+- Closed: Closed with A1-G-14 (same `GATE_BATCH_STATS_INTERVAL`, same derivation); the push-notification diagram already names it.
 - Doc: architecture.md:8294 "On Tier 2 interval (every 2s)"
 - Exists: the same `GATE_BATCH_STATS_INTERVAL = 0.25` (env.py:607); push and callback cleanup are live.
 - Missing: the same drift as A1-G-14 (one fix closes both).
 
-#### A1-G-42 — Worker health state from resource thresholds — STILL PARTIAL — size S
+#### A1-G-42 — Worker health state from resource thresholds — CLOSED 2026-10-07 — size S
+- Closed: Doc changed, with one exception built. CPU, memory and queue depth get no thresholds because none is derivable: a load generator's intended operating point is saturated cores (its harm is measured directly by loop lag and LHM); per-workflow memory is AD-41's; workers never queue (`_pending_workflows` is never appended, depth is always 0). File descriptors do have a derivable ceiling (RLIMIT_NOFILE) and now drain the worker (D-66). architecture.md Worker States note and diagram state the degradation mapping (LHM 2/4/6/7, lag ratio 0.5/1.0/1.5/2.0).
 - Doc: architecture.md:5260-5263 HEALTHY requires "CPU < 80% · Memory < 85% · Queue depth < soft_limit · LHM score < 4"
 - Exists: `_get_worker_state` → `_worker_state_for_degradation` (hyperscale/distributed/nodes/worker/server.py:1424-1438) maps the GracefulDegradation level (inputs: LHM and event-loop lag only, swim/health/graceful_degradation.py:232-254) to DRAINING/DEGRADED/HEALTHY; DRAINING rejects dispatch.
 - Missing: CPU, memory and queue-depth conditions in the state decision (server.py:1432-1438). Either feed them in (the worker already samples cpu/memory for heartbeats) or change the doc to "LHM + loop lag".
 
-#### A1-G-48 — Zombie-detection check interval — STILL PARTIAL — size S
+#### A1-G-48 — Zombie-detection check interval — CLOSED 2026-10-07 — size S
+- Closed: Kept `JOB_CLEANUP_INTERVAL` 60 s on merit: it is the silence threshold for reconciling a job copy, and its leader re-syncs every `MANAGER_PEER_JOB_SYNC_INTERVAL` (15 s), so 60 s tolerates three consecutive lost syncs before asking; retention overshoots `COMPLETED_JOB_MAX_AGE` by at most 20%. Derivation at the Env field. architecture.md: the zombie-detection box described a `check_timeouts` age eviction that no longer exists (AD-44 retry budget + backoff replaced it) and is rewritten; the cleanup-loop box and the config table (`MERCURY_SYNC_CLEANUP_INTERVAL 30s`) now say `JOB_CLEANUP_INTERVAL` 60 s.
 - Doc: architecture.md:6495 "Check interval: 30 seconds (via _job_cleanup_loop)"
 - Exists: `default_timeout_seconds=300` and `max_dispatch_attempts=5` match; `_job_cleanup_loop` is live (nodes/manager/server.py:1415, :4749).
 - Missing: `JOB_CLEANUP_INTERVAL = 60.0` (env/env.py:413) vs the documented 30 s. Fix the doc or the default.
 
-#### A1-G-77 — Message protocol reference: gossip priority and message tables — STILL PARTIAL — size S
+#### A1-G-77 — Message protocol reference: gossip priority and message tables — CLOSED 2026-10-07 — size S
+- Closed: Doc changed: fewest-transmits-first is SWIM's λ·log n dissemination (memberlist's TransmitLimitedQueue); a type priority would starve the lowest class (ALIVE refutations among them) past its dissemination deadline under churn. Gossip Buffer box corrected; Provision* already pruned; the failure table's "Lease transfer"/DC-lease-expiry lines rewritten for per-job takeover and AD-44 settlement.
 - Doc: architecture.md:4739 "Priority: JOIN > LEAVE > ALIVE > SUSPECT > DEAD"; :7993 "Priority ensures important updates propagate first when space limited"; the message tables list Provision*, DatacenterLease, LeaseTransfer.
 - Exists: `GossipBuffer.get_updates_to_piggyback` picks the fewest-broadcast updates (swim/gossip/gossip_buffer.py:159-179, memberlist-style); a same-incarnation conflict resolves dead/leave > suspect > alive/join (:144).
 - Missing: no update-type transmission priority (gossip_buffer.py:179 orders by `broadcast_count` only). The doc also still lists messages deleted in Phase 6 (D5 Provision*, DC lease/LeaseTransfer 2026-10-06). The likely resolution is a doc change to the transmit-count ordering plus pruning the deleted messages.
@@ -275,7 +283,8 @@ Counts: old P/A 28/7 → Built 18 · Doc-obsolete 15 · Still Partial 2 · Still
 
 ### Still Partial / Still Absent
 
-#### A3-G-9 — LoggerStream batch timeout is a buried constant — STILL PARTIAL — size S
+#### A3-G-9 — LoggerStream batch timeout is a buried constant — CLOSED 2026-10-07 — size S
+- Closed: `LoggerStream(batch_timeout_ms=...)` is a constructor parameter; default `DEFAULT_BATCH_TIMEOUT_MS = 10.0`, derived where set (added batching delay of about one flush: PostgreSQL commit_delay guidance, Kafka linger.ms; 10 ms ≈ one rotational/networked-volume flush). Test `tests/unit/logging/test_batch_fsync.py::test_configured_batch_timeout_bounds_a_lone_entry_durability` (mutation: ignoring the parameter fails it). Part 12/13 notes updated.
 - Doc: architecture.md Part 13 "LoggerStream gains `enable_coalescing`, `batch_timeout_ms`, `batch_max_size`".
 - Exists: `batch_max_size` constructor param (`hyperscale/logging/streams/logger_stream.py:110`); FSYNC_BATCH timer (`:1290-1295`). The `enable_coalescing`/per-path WALWriter half is Doc-obsolete (see A3-G-6).
 - Missing: `self._batch_timeout_ms: int = 10` is hardcoded (`logger_stream.py:179`), not a constructor/config parameter.
@@ -332,7 +341,8 @@ Items: root-docs.md G-rows (R-G*) plus delta-partials/delta-changed-code finding
 - Exists: hot-path work (pooled connections, pre-encoded args); plan Phase 9 lists "Probes you run: throughput+RSS" (REMAINING_WORK_PLAN.md:340).
 - Missing: no throughput/RSS probe script or benchmark anywhere under tests/ or a probes dir (grep `ru_maxrss|requests_per_second|benchmark` over tests/ → only lint snapshots). The number stays unverified until the probe exists and is run.
 
-#### R-G11 — README points at a schema doc that does not exist — STILL PARTIAL — size S
+#### R-G11 — README points at a schema doc that does not exist — CLOSED 2026-10-07 — size S
+- Closed: README.md now points at the schema's source of truth, the spec classes' `from_dict` validators in `tests/framework/specs/`, and at worked examples (`tests/end_to_end/gate_manager/`); a prose README.txt would duplicate and drift from them.
 - Doc: README.md:255 "See `tests/framework/README.txt` for the full schema and examples."
 - Exists: tests/framework/{actions,results,runner,runtime,specs}.
 - Missing: tests/framework/README.txt (no file). Write it, or drop README.md:255.
@@ -352,7 +362,8 @@ Items: root-docs.md G-rows (R-G*) plus delta-partials/delta-changed-code finding
 - Exists: tests/simulation/soak/test_soak.py (1800 virtual s, opt-in `HYPERSCALE_SIM_SOAK=1`, :37-42; seed 902 un-skipped, :110-124); gate `stop()` cancels every loop (plan Phase 1 #10).
 - Missing: no horizon beyond 1800 virtual s; no spike-profile harness; nightly VOPR/soak counts not yet timed into ci.yml (plan :131).
 
-#### R-G51 — FIX.md status claims are stale — STILL PARTIAL — size S
+#### R-G51 — FIX.md status claims are stale — CLOSED 2026-10-07 — size S
+- Closed: FIX.md marks §1.1/§1.2 FIXED with their tests, cites symbols instead of drifting line numbers, and records that it is a dated trace: later fixes live here and in REMAINING_WORK_PLAN.md, not copied into it.
 - Doc: FIX.md:14 "| **High Priority** | 0 | 🟢 None found |"; §1.1/§1.2 listed as open.
 - Exists: §1.1 fixed (role_validator.py:294-323 `extract_peer_claims`; callers manager/server.py:8275, gate/handlers/tcp_manager.py:356); §1.2 fixed (gate_job_timeout_tracker.py:207-212). The bugs that falsified "0 high" are fixed (delta-changed-code A1-A7, B).
 - Missing: FIX.md still describes §1.1/§1.2 as open (FIX.md:22-42) and lists none of the ~19 Phase 9 / Phase 1 fixes; rewrite in the Phase 9 doc sweep (plan :345).
@@ -459,12 +470,14 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - Exists: one `TimeWindowedTDigest` per manager, `nodes/manager/state.py:239`, fed only dispatch→response (`record_dispatch_latency` state.py:522); tests `tests/unit/distributed/manager/test_manager_slo_digest_times.py`.
 - Missing: per-target keying and the other latency types (`LatencyType` absent). The comment at state.py:234-238 argues workflow run time says nothing about DC health — a deliberate narrowing, but no plan decision records it; either key per target or change slo.md.
 
-#### D-9 — Harness CleanupReport — STILL PARTIAL — size S
+#### D-9 — Harness CleanupReport — CLOSED 2026-10-07 — size S
+- Closed: `CleanupReport` (`tests/simulation/harness/cleanup_report.py`) built and wired in `ClusterHarness.__aexit__`: a failed body carries every cleanup error and the pending invariant violation as PEP 678 notes on its own exception; a passing body fails with the violation (cleanup errors as notes) or a RuntimeError listing the errors. Test `tests/unit/simulation/test_harness_cleanup_report.py` (mutation: not attaching fails two).
 - Doc: simulation_framework.md:284 "Errors collect into a `CleanupReport` attached to the test failure."
 - Exists: `tests/simulation/harness/cluster_harness.py:159-170` collects `cleanup_errors` and raises them when the test passed.
 - Missing: no `CleanupReport`; when the test body already failed (`exc_type is not None`) both the cleanup errors and a pending invariant violation are dropped (cluster_harness.py:166-170) instead of attached to the failure.
 
-#### D-11 — Scenario retries with declared retryable exceptions — STILL ABSENT — size S
+#### D-11 — Scenario retries with declared retryable exceptions — CLOSED 2026-10-07 — size S
+- Closed: Doc-obsolete (decision 2026-10-07): SIM runs are a pure function of the seed, so a retry replays the failure or hides it behind another seed; REAL-mode election/quorum misses are the bugs the scenarios exist to catch. simulation_framework.md §8.2 retired with the reasons; the decorator is not built.
 - Doc: simulation_framework.md `@scenario(retries=3, retry_on=(...))`.
 - Exists: nothing (`retry_on|retries=` zero hits in `tests/simulation/harness`, `tests/simulation/scenarios`).
 - Missing: the decorator. Candidate for Doc-obsolete (SIM determinism makes retries a flake-mask), but no decision recorded.
@@ -494,7 +507,8 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - Exists: `MAX_WORKERS_PER_MANAGER` (`env/env.py:388`, default None), core allocation, `MERCURY_SYNC_MAX_CONCURRENCY`.
 - Missing: per-DC cap and job-class vocabulary (zero hits `job_class|per_job_class|MAX_.*PER_DC`).
 
-#### D-66 — Resource guards: FD ceiling — STILL PARTIAL — size S
+#### D-66 — Resource guards: FD ceiling — CLOSED 2026-10-07 — size S
+- Closed: `ResourceViolationType.FILE_DESCRIPTORS_EXCEEDED` and `resources/file_descriptor_ceiling.py`: the ceiling is the RLIMIT_NOFILE soft limit read at runtime (none on Windows or when unlimited), against the largest single process's count (`ResourceMetrics.largest_process_file_descriptor_count`); at the AD-41 kill fraction the worker logs the violation and drains, resuming under the warning fraction. Worker-wide, not per workflow: executor processes are not attributable from the worker, and per-workflow counts would have to come from the executors' `WorkflowStatusUpdate` (`hyperscale/core/jobs`). Test `tests/unit/distributed/resources/test_file_descriptor_ceiling.py` (real pipes; mutations: no hysteresis, no worker floor). AD_41.md, improvements.md updated.
 - Doc: improvements.md:15 "enforce CPU/mem/FD ceilings per workflow; kill/evict on violation."
 - Exists: AD-41 `ResourceEnforcer` (`resources/resource_enforcer.py`) wired at `nodes/manager/server.py:709` (on by default, `env.py:418`), checked per progress report `server.py:9097`, kill via cancel path `server.py:9208`, evict `on_evict_worker`; test `tests/unit/distributed/resources/test_resource_enforcer.py`.
 - Missing: FD budget — `ResourceViolationType` has only CPU/MEMORY (`resources/resource_violation_type.py`) although FDs are sampled (`process_resource_monitor.py:120-137`).
@@ -533,7 +547,8 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - Exists: dead-code deletions (Plan Phase 6).
 - Missing: the god files grew: `nodes/manager/server.py` 10,810 → 14,604 lines, `nodes/gate/server.py` 6,901 → 10,102, `swim/health_aware_server.py` 6,547 → 7,601 (complexity splits added methods in place instead of moving domains into composed classes — Plan Phase 8 "remaining manager, gate and health_aware_server domains move into composed classes" is still open).
 
-#### D-81 — Node dataclasses in models/ with slots — STILL PARTIAL — size S
+#### D-81 — Node dataclasses in models/ with slots — CLOSED 2026-10-07 — size S
+- Closed: The six moved into their node's `models/` with `slots=True`: `ClientConfig`, `ManagerConfig`, `WorkerConfig` (its derivations to `nodes/worker/worker_config_derivation.py`), `ExtensionTriggerConfig`, `_PerWorkflowTriggerState`, `PendingResult` (slots added; in-memory only). Pickle namespaces unchanged; every importer updated; dataclass ratchet lowered by 7.
 - Doc: REFACTOR.md:5,14 "Dataclasses must be defined in `models/` submodules and declared with `slots=True`."
 - Exists: ratchet `tests/simulation/lints/test_dataclass_conventions.py`; `models/` fully one-class-per-file.
 - Missing: 270 snapshot entries repo-wide (230 under distributed); within REFACTOR's scope 6 node dataclasses sit outside `models/` — `nodes/client/config.py::ClientConfig`, `nodes/manager/config.py::ManagerConfig`, `nodes/worker/config.py::WorkerConfig`, `nodes/worker/extension_trigger_config.py::ExtensionTriggerConfig`, `nodes/worker/_per_workflow_trigger_state.py`, +1. Plan Phase 8 "move the 30 dataclasses that sit outside models/" open.

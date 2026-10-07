@@ -416,6 +416,17 @@ class JobStatsCRDT:
 | Periodic | Workflow progress, aggregate rates | Every 0.25 s (`GATE_BATCH_STATS_INTERVAL`) | TCP batch |
 | On-Demand | Step-level stats, historical data | Client request | TCP pull |
 
+**Periodic-tier cadence** (`GATE_BATCH_STATS_INTERVAL`, default 0.25 s): the
+batch push is a gate-fronted client's only source of live aggregate progress,
+so the interval is the staleness bound on what the operator watches. Nielsen's
+response-time limits put continuous feedback under 1.0 s (beyond it the user
+loses the sense of a live system); a "1-5 s" cadence breaks that bound. The
+floor is the upstream refresh: workers flush progress every
+`WORKER_PROGRESS_FLUSH_INTERVAL` (0.05 s), so 0.25 s folds five worker flushes
+into one push and costs four messages per second per job callback. It equals
+`MANAGER_BATCH_PUSH_INTERVAL`, so gate-fronted and gateless clients see the
+same cadence.
+
 **Implementation**:
 - `_send_immediate_update()` for tier 1 events
 - `_batch_stats_loop()` aggregates tier 2 stats periodically
@@ -4831,7 +4842,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                    Gossip Buffer                         │    │
 │  │  • Piggybacked membership updates                       │    │
-│  │  • Priority: JOIN > LEAVE > ALIVE > SUSPECT > DEAD      │    │
+│  │  • Fewest-transmits first (memberlist), no type order   │    │
 │  │  • Bounded size with overflow callback                  │    │
 │  │  • Efficient encoding within UDP MTU                    │    │
 │  └─────────────────────────────────────────────────────────┘    │
@@ -5339,11 +5350,22 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 > `WorkerServer._get_worker_state` returns OFFLINE when not running, DRAINING
 > while stopping, and otherwise maps `GracefulDegradation.current_level`
 > (`swim/health/graceful_degradation.py`, the worse of the LHM score and event
-> loop lag levels; LHM thresholds 2/4/6/7, lag 0.5/1.0/1.5/2.0 s) to DRAINING at
-> HEAVY or worse, DEGRADED at MODERATE, else HEALTHY. DRAINING refuses
-> dispatch. The worker samples CPU and memory for its heartbeat, but they do
-> not decide its state; the conditions in the diagram below are not
-> implemented.
+> loop lag ratio levels; LHM thresholds 2/4/6/7, lag ratio 0.5/1.0/1.5/2.0) to
+> DRAINING at HEAVY or worse, DEGRADED at MODERATE, else HEALTHY. DRAINING
+> refuses dispatch. One resource does feed the state, because its threshold
+> is derivable: a process at its RLIMIT_NOFILE descriptor ceiling raises the
+> level to HEAVY (AD-41 `FileDescriptorCeiling`, see AD_41.md). The worker samples CPU and memory for its heartbeat, but they do
+> not decide its state, by decision (2026-10, ledger A1-G-42): no threshold
+> on them can be derived. CPU: a worker is a load generator whose intended
+> operating point is saturated cores, so a "CPU < 80%" bar would mark every
+> productive worker DEGRADED; what CPU pressure harms (timely processing) is
+> measured directly by event loop lag and the LHM (Lifeguard's
+> probe-timeout-driven local health). Memory: per-workflow budgets are
+> enforced by AD-41's `ResourceEnforcer` (kill/evict) from the same samples;
+> a node-wide percentage has no derivable value (host vs container limits,
+> co-tenant processes). Queue depth: workers do not queue; a dispatch is
+> admitted against free cores (`CoreAllocator`) or refused, so the depth is
+> always 0. Shedding by overload is the manager's AD-18 hybrid detector.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -5363,24 +5385,24 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │   │                        HEALTHY                                 │    │ │
 │  │   │                                                                │    │ │
 │  │   │  Conditions:                                                   │    │ │
-│  │   │  • CPU < 80%                                                  │    │ │
-│  │   │  • Memory < 85%                                               │    │ │
-│  │   │  • Queue depth < soft_limit                                   │    │ │
-│  │   │  • LHM score < 4                                              │    │ │
+│  │   │  • Degradation level NORMAL or LIGHT                          │    │ │
+│  │   │    (LHM < 4, lag ratio < 1.0, FD < ceiling)                   │    │ │
+│  │   │  • Not stopping                                               │    │ │
+│  │   │                                                               │    │ │
 │  │   │                                                                │    │ │
 │  │   │  Behavior: Accepts new workflows normally                     │    │ │
 │  │   └────────────────────────────┬──────────────────────────────────┘    │ │
 │  │                                │                                        │ │
 │  │              resource pressure increases                                │ │
-│  │              (CPU ≥ 80% OR memory ≥ 85% OR queue ≥ soft_limit)         │ │
+│  │              (LHM ≥ 4 OR event loop lag ratio ≥ 1.0)                   │ │
 │  │                                │                                        │ │
 │  │                                ▼                                        │ │
 │  │   ┌───────────────────────────────────────────────────────────────┐    │ │
 │  │   │                       DEGRADED                                 │    │ │
 │  │   │                                                                │    │ │
 │  │   │  Conditions:                                                   │    │ │
-│  │   │  • CPU 80-95% OR Memory 85-95% OR Queue at soft_limit         │    │ │
-│  │   │  • LHM score 4-6                                              │    │ │
+│  │   │  • Degradation level MODERATE                                 │    │ │
+│  │   │    (LHM 4-5 OR lag ratio 1.0-1.5)                             │    │ │
 │  │   │                                                                │    │ │
 │  │   │  Behavior:                                                     │    │ │
 │  │   │  • Accepts work with backpressure signaling                   │    │ │
@@ -5389,7 +5411,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │   └──────────┬─────────────────────────────────┬──────────────────┘    │ │
 │  │              │                                 │                        │ │
 │  │    pressure relieved                  pressure critical                 │ │
-│  │    (metrics return to normal)         (CPU > 95% OR OOM risk)          │ │
+│  │    (metrics return to normal)         (LHM≥6, lag≥1.5, FD ceiling)     │ │
 │  │              │                                 │                        │ │
 │  │              ▼                                 ▼                        │ │
 │  │   ┌─────────────────┐               ┌─────────────────┐                │ │
@@ -6300,13 +6322,13 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
 │  │                │                     │                                  ││
 │  │ Gate leader    │ SWIM among gates    │ New gate leader elected          ││
-│  │ crash          │                     │ Lease transfer to new leader     ││
+│  │ crash          │                     │ Per-job takeover, fence raised   ││
 │  │                │                     │ Jobs continue with new gate      ││
 │  │                │                     │                                  ││
 │  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
 │  │                │                     │                                  ││
 │  │ Datacenter     │ All managers DEAD   │ Gate marks DC as failed          ││
-│  │ total failure  │ No ManagerHeartbeat │ Lease expires → job FAILED       ││
+│  │ total failure  │ No ManagerHeartbeat │ DC settles as failed (AD-44)     ││
 │  │                │                     │ Return failure to client         ││
 │  │                │                     │                                  ││
 │  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
@@ -6406,7 +6428,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  Behavior:                                                                   │
 │  • Gate stops receiving ManagerHeartbeat from DC-A                          │
 │  • Gate marks DC-A managers as DEAD via SWIM                                │
-│  • Lease for DC-A jobs expires                                              │
+│  • Gate settles DC-A's part of each job as failed                           │
 │  • Gate returns job failure to client (no cross-DC retry)                   │
 │  • DC-A workflows eventually timeout or complete (ignored by gate)          │
 │                                                                              │
@@ -6590,33 +6612,15 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ 1. WORKFLOW TIMEOUT DETECTION (WorkflowDispatcher)                     │ │
+│  │ 1. PENDING WORKFLOW RETRY BUDGET (WorkflowDispatcher, AD-44)           │ │
 │  │                                                                        │ │
-│  │    Location: hyperscale/distributed_rewrite/jobs/workflow_dispatcher.py│ │
+│  │    Location: hyperscale/distributed/jobs/workflow_dispatcher.py        │ │
 │  │                                                                        │ │
-│  │    ┌─────────────────────────────────────────────────────────────────┐ │ │
-│  │    │                                                                  │ │ │
-│  │    │    WorkflowDispatcher.check_timeouts()                          │ │ │
-│  │    │           │                                                      │ │ │
-│  │    │           ▼                                                      │ │ │
-│  │    │    for pending in self._pending:                                │ │ │
-│  │    │        age = now - pending.registered_at                        │ │ │
-│  │    │        │                                                         │ │ │
-│  │    │        ├── if age > pending.timeout_seconds:                    │ │ │
-│  │    │        │       └── EVICT (reason: "timeout")                    │ │ │
-│  │    │        │                                                         │ │ │
-│  │    │        └── if pending.dispatch_attempts > max_attempts:         │ │ │
-│  │    │                └── EVICT (reason: "max_dispatch_attempts")       │ │ │
-│  │    │                                                                  │ │ │
-│  │    │    Default timeout_seconds: 300 (5 minutes)                     │ │ │
-│  │    │    Default max_dispatch_attempts: 5                             │ │ │
-│  │    │    Check interval: JOB_CLEANUP_INTERVAL, 60 s (_job_cleanup_loop)│ │ │
-│  │    │                                                                  │ │ │
-│  │    └─────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                        │ │
-│  │    Callbacks Invoked:                                                  │ │
-│  │    • on_workflow_evicted(job_id, workflow_id, reason)                 │ │
-│  │    • on_dispatch_failed(job_id, workflow_id)                          │ │
+│  │    No age-based eviction sweep: dispatch is event-driven. A failed     │ │
+│  │    attempt (no worker took it) spends the job's AD-44 retry budget     │ │
+│  │    and backs off; waiting for capacity spends nothing. Budget spent,   │ │
+│  │    the workflow fails for good with its last attempt's cause.          │ │
+│  │    Running jobs are bounded by their timeout strategy (AD-34).         │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
@@ -6832,33 +6836,18 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
 │  │ 1. MANAGER JOB CLEANUP LOOP                                            │ │
 │  │                                                                        │ │
-│  │    Location: Manager._job_cleanup_loop() (manager.py:6225)             │ │
+│  │    Location: ManagerServer._job_cleanup_loop()                         │ │
+│  │    Interval: JOB_CLEANUP_INTERVAL (default 60 s = 4 x                  │ │
+│  │    MANAGER_PEER_JOB_SYNC_INTERVAL)                                     │ │
 │  │                                                                        │ │
-│  │    Interval: MERCURY_SYNC_CLEANUP_INTERVAL (default: 30s)              │ │
-│  │                                                                        │ │
-│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
-│  │    │                                                                 │  │ │
-│  │    │  while running:                                                 │  │ │
-│  │    │      await sleep(cleanup_interval)                             │  │ │
-│  │    │                                                                 │  │ │
-│  │    │      # 1. Check workflow timeouts via dispatcher               │  │ │
-│  │    │      evicted = await _workflow_dispatcher.check_timeouts()     │  │ │
-│  │    │      for (job_id, workflow_id, reason) in evicted:             │  │ │
-│  │    │          mark_workflow_failed(job_id, workflow_id, reason)     │  │ │
-│  │    │                                                                 │  │ │
-│  │    │      # 2. Clean completed jobs after retention period          │  │ │
-│  │    │      for job_id, job in _jobs.items():                         │  │ │
-│  │    │          if job.status == COMPLETED:                           │  │ │
-│  │    │              if age > _completed_job_max_age:  # ~30 min       │  │ │
-│  │    │                  cleanup_job(job_id)                           │  │ │
-│  │    │                                                                 │  │ │
-│  │    │      # 3. Clean failed/cancelled/timeout jobs                  │  │ │
-│  │    │      for job_id, job in _jobs.items():                         │  │ │
-│  │    │          if job.status in [FAILED, CANCELLED, TIMEOUT]:        │  │ │
-│  │    │              if age > _failed_job_max_age:  # longer retention │  │ │
-│  │    │                  cleanup_job(job_id)                           │  │ │
-│  │    │                                                                 │  │ │
-│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │    Each sweep:                                                         │ │
+│  │    1. Drop terminal jobs past retention: COMPLETED_JOB_MAX_AGE         │ │
+│  │       (300 s) for completed, FAILED_JOB_MAX_AGE (3600 s) for           │ │
+│  │       failed, cancelled and timed-out jobs.                            │ │
+│  │    2. Reconcile silent copies: a live job led elsewhere that heard     │ │
+│  │       no sync for a whole interval asks its leader (or the DC          │ │
+│  │       leader) for the settled status. The leader re-syncs every        │ │
+│  │       15 s, so silence spans four missed syncs before it counts.       │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
@@ -7217,7 +7206,7 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  ┌────────────────────────────────────┬──────────┬────────────────────────┐ │
 │  │ Variable                           │ Default  │ Description            │ │
 │  ├────────────────────────────────────┼──────────┼────────────────────────┤ │
-│  │ MERCURY_SYNC_CLEANUP_INTERVAL      │ 30s      │ Job cleanup loop freq  │ │
+│  │ JOB_CLEANUP_INTERVAL               │ 60s      │ Job cleanup loop freq  │ │
 │  │ MANAGER_DEAD_WORKER_REAP_INTERVAL  │ 86400s   │ Dead worker reap (24h) │ │
 │  │ MANAGER_DEAD_PEER_REAP_INTERVAL    │ 86400s   │ Dead peer reap (24h)   │ │
 │  │ MANAGER_DEAD_GATE_REAP_INTERVAL    │ 86400s   │ Dead gate reap (24h)   │ │
@@ -26833,8 +26822,9 @@ def _write_to_file(
 > `LoggerStream` designed in 12.5-12.8 was not built. Group commit lives in the
 > ledger `WALWriter` (`hyperscale/distributed/ledger/wal/wal_writer.py`), and
 > `LoggerStream` keeps its durability modes (plan decision D11): FSYNC_BATCH
-> batches up to `batch_max_size` entries (a constructor parameter) or a 10 ms
-> timer (`_batch_timeout_ms`, a hard-coded attribute, not configurable), `log()`
+> batches up to `batch_max_size` entries or a `batch_timeout_ms` timer (both
+> constructor parameters; the 10 ms default's derivation is at
+> `DEFAULT_BATCH_TIMEOUT_MS` in `logging/streams/logger_stream.py`), `log()`
 > returns once its entry is durable, and a full batch raises
 > `WALBatchOverflowError` rather than dropping or blocking. Reads go through
 > `LoggerStream.read_entries` / `get_last_lsn`, which always verify CRCs; there
@@ -27940,9 +27930,10 @@ Write coalescing is the recommended approach for high-concurrency WAL operations
 ## Part 13: Portable High-Concurrency I/O Design
 
 > **Superseded (2026-10).** See the Part 12 note: `LoggerStream` did not gain
-> `enable_coalescing` or a configurable `batch_timeout_ms` (its 10 ms batch
-> timer is a hard-coded attribute); coalesced group commit is the ledger
-> `WALWriter`'s.
+> `enable_coalescing`; it takes `batch_timeout_ms` (default 10 ms, about one
+> rotational flush: PostgreSQL commit_delay / Kafka linger.ms practice) and
+> `batch_max_size` as constructor parameters. Coalesced group commit is the
+> ledger `WALWriter`'s.
 
 This section provides a definitive answer to the question: **What is the most correct and robust approach for high-concurrency, low-latency logging that is asyncio-compatible AND portable?**
 

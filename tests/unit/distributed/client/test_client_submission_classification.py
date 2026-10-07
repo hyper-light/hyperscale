@@ -18,7 +18,7 @@ How a client classifies what it submits and what it is told.
 from types import SimpleNamespace
 
 from hyperscale.distributed.env import Env
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.submission import ClientJobSubmitter
 from hyperscale.distributed.protocol.transient_errors import is_transient_rejection
 from hyperscale.reporting.common import ReporterTypes

@@ -257,7 +257,7 @@ from hyperscale.distributed.health.extension_outcome import (
     ExtensionOutcomeEvent,
     ExtensionOutcomeKind,
 )
-from .config import ManagerConfig
+from .models.manager_config import ManagerConfig
 
 
 if TYPE_CHECKING:

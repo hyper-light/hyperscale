@@ -46,8 +46,8 @@ from hyperscale.distributed.health.workflow_progress_snapshot import WorkflowPro
 from hyperscale.distributed.nodes.worker.models.workflow_runtime_state import WorkflowRuntimeState
 from hyperscale.distributed.taskex.util.time_parser import TimeParser
 
-from .extension_trigger_config import ExtensionTriggerConfig
-from ._per_workflow_trigger_state import _PerWorkflowTriggerState
+from hyperscale.distributed.nodes.worker.models.extension_trigger_config import ExtensionTriggerConfig
+from hyperscale.distributed.nodes.worker.models.per_workflow_trigger_state import _PerWorkflowTriggerState
 
 _DEFAULT_CLOCK: Clock = RealClock()
 

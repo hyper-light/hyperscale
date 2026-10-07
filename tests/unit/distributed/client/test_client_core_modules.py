@@ -26,7 +26,7 @@ from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.nodes.client.protocol import ClientProtocol
 from hyperscale.distributed.nodes.client.leadership import ClientLeadershipTracker
 from hyperscale.distributed.nodes.client.tracking import ClientJobTracker
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.models import ClientJobResult
 

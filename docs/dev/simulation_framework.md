@@ -280,13 +280,15 @@ __aexit__:
 
 Rules:
 
-- Cleanup **never** raises out of `__aexit__`. Errors collect into a
-  `CleanupReport` attached to the test failure.
-  *As built (2026-10-06): there is no `CleanupReport`.
-  `ClusterHarness.__aexit__` (`tests/simulation/harness/cluster_harness.py:159-170`)
-  collects the supervisor's `cleanup_errors` and raises them (or a pending
-  invariant violation) only when the test body passed; when the body already
-  raised, both are dropped rather than attached to the failure.*
+- Cleanup never replaces the test's own failure, and never drops a finding.
+  `ClusterHarness.__aexit__` collects the supervisor's `cleanup_errors` and
+  the invariant violation still pending into a `CleanupReport`
+  (`tests/simulation/harness/cleanup_report.py`). When the body already
+  failed, every finding is attached to that exception as a PEP 678 note, so
+  it keeps its type and traceback; when the body passed, the pending
+  violation is raised carrying the cleanup errors as notes, or the cleanup
+  errors alone are raised as one `RuntimeError`. Test:
+  `tests/unit/simulation/test_harness_cleanup_report.py`.
 - All harness background tasks go through the project's `TaskRunner`
   (CLAUDE.md: "we never create asyncio orphaned tasks or futures").
 - **Step 8 is the critical one.** Leaked asyncio tasks across tests cause
@@ -317,19 +319,21 @@ Built-in predicates: `has_quorum`, `has_primary`, `has_n_workers`,
 `gate_cluster_formed`, `job_running`, `job_completed`, `workflow_status`,
 `no_in_flight_rpcs`.
 
-### 8.2 Scenario-level retries — for legitimately stochastic tests
+### 8.2 Scenario-level retries — retired (2026-10-07, ledger D-11)
 
-```python
-@scenario(retries=3, retry_on=(ElectionTimeoutError, QuorumNotFormedError))
-async def test_election_under_partition(harness): ...
-```
+The original design proposed `@scenario(retries=3, retry_on=(...))` for
+"legitimately stochastic" scenarios. It is retired, not deferred:
 
-The retry policy declares **what** is acceptable to retry, so true bugs are
-not masked under blanket `@flaky`.
-
-*As built (2026-10-06): not built. No `@scenario` decorator with
-`retries`/`retry_on` exists under `tests/simulation/`; SIM runs are
-seed-deterministic, so a retry would only mask a reproducible failure.*
+- A SIM run is a pure function of its seed. A retry with the same seed
+  replays the same failure; a retry with another seed is a different test
+  that hides the failing one. Either way the retry adds nothing but a
+  chance to report green over a reproducible bug.
+- A REAL-mode election or quorum that misses its deadline is what these
+  scenarios exist to catch (the SWIM/election latency bugs in the VOPR gate
+  findings were exactly such "flakes"). The remedy is a deadline derived
+  from the protocol's detection latency in the wait condition, or a fix in
+  the code, then a SIM reproduction under the failing seed — never a
+  retry.
 
 ## 9. Configuration variety
 
@@ -527,7 +531,6 @@ Scenarios are plain `async def` functions taking a harness:
 Example:
 
 ```python
-@scenario(retries=3, retry_on=(ElectionTimeoutError,))
 @pytest.mark.parametrize("mode", [ExecutionMode.REAL, ExecutionMode.SIM])
 async def test_manager_primary_dies_mid_dispatch(harness, mode):
     async with ClusterHarness(SINGLE_DC_3M_4W, mode=mode) as cluster:

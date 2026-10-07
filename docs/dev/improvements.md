@@ -14,7 +14,7 @@
 
 ## Execution Safety
 - Max concurrency caps: hard limits per worker, per manager, per DC; configurable by job class. *Partial: `MAX_WORKERS_PER_MANAGER` (default None), core allocation and `MERCURY_SYNC_MAX_CONCURRENCY`; no per-DC cap and no job-class vocabulary.*
-- Resource guards: enforce CPU/mem/FD ceilings per workflow; kill/evict on violation. *Partial: AD-41 `ResourceEnforcer` enforces CPU and memory (WARN→THROTTLE→KILL→EVICT, on by default); FDs are sampled but have no budget (`resources/resource_violation_type.py` has only CPU/MEMORY).*
+- Resource guards: enforce CPU/mem/FD ceilings per workflow; kill/evict on violation. *Built (2026-10-07): AD-41 `ResourceEnforcer` enforces CPU and memory per workflow (WARN→THROTTLE→KILL→EVICT, on by default); FDs are guarded per worker by `FileDescriptorCeiling` (RLIMIT_NOFILE soft limit detected at runtime, largest process's count; drains the worker at the kill line, resumes under the warning line) -- see AD_41.md.*
 - Circuit‑breaker for noisy jobs: auto‑throttle or quarantine high‑impact tests. *Not built: breakers are per peer; the closest thing is AD-41 throttling a workflow over its own budget.*
 
 ## Progress & Metrics

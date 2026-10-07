@@ -26,7 +26,7 @@ from hyperscale.distributed.jobs.logical_id_generator import (
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.nodes.client.submission import ClientJobSubmitter
 from hyperscale.distributed.nodes.client.cancellation import ClientCancellationManager
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.env import Env

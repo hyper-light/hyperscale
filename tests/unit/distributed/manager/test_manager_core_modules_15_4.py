@@ -27,7 +27,7 @@ from hyperscale.distributed.jobs import WindowedStatsCollector
 from hyperscale.distributed.nodes.manager.state import ManagerState
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.slo import SLOConfig
-from hyperscale.distributed.nodes.manager.config import ManagerConfig
+from hyperscale.distributed.nodes.manager.models.manager_config import ManagerConfig
 from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
 from hyperscale.distributed.reliability import StatsBuffer, StatsBufferConfig
 from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator

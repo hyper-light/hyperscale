@@ -12,7 +12,8 @@ root refactoring in Phase 15.2.7.
 
 
 # Also export the new modular components
-from .config import WorkerConfig, create_worker_config_from_env
+from .config import create_worker_config_from_env
+from .models.worker_config import WorkerConfig
 from .state import WorkerState
 from .models import WorkflowRuntimeState
 from .handlers import (

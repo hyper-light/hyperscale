@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from hyperscale.distributed.models import WorkflowFinalResult
 
 
-@dataclass
+@dataclass(slots=True)
 class PendingResult:
     final_result: WorkflowFinalResult
     enqueued_at: float

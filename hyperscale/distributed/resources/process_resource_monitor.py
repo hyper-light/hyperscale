@@ -83,10 +83,8 @@ class ProcessResourceMonitor:
 
         try:
             processes = self._collect_processes()
-            raw_cpu, raw_memory, total_fds, live_count = self._aggregate_samples(
-                processes
-            )
-            metrics = self._build_metrics(raw_cpu, raw_memory, total_fds, live_count)
+            raw_cpu, raw_memory, total_fds, largest_process_fds, live_count = self._aggregate_samples(processes)
+            metrics = self._build_metrics(raw_cpu, raw_memory, total_fds, largest_process_fds, live_count)
             self._last_metrics = metrics
             return metrics
         except psutil.NoSuchProcess:
@@ -107,10 +105,11 @@ class ProcessResourceMonitor:
 
     def _aggregate_samples(
         self, processes: list[psutil.Process]
-    ) -> tuple[float, int, int, int]:
+    ) -> tuple[float, int, int, int, int]:
         raw_cpu = 0.0
         raw_memory = 0
         total_fds = 0
+        largest_process_fds = 0
         live_count = 0
 
         for process in processes:
@@ -121,9 +120,10 @@ class ProcessResourceMonitor:
             raw_cpu += cpu
             raw_memory += memory
             total_fds += file_descriptors
+            largest_process_fds = max(largest_process_fds, file_descriptors)
             live_count += 1
 
-        return raw_cpu, raw_memory, total_fds, live_count
+        return raw_cpu, raw_memory, total_fds, largest_process_fds, live_count
 
     def _sample_process(self, process: psutil.Process) -> tuple[float, int, int] | None:
         try:
@@ -145,6 +145,7 @@ class ProcessResourceMonitor:
         raw_cpu: float,
         raw_memory: int,
         total_fds: int,
+        largest_process_fds: int,
         live_count: int,
     ) -> ResourceMetrics:
         cpu_estimate, cpu_uncertainty = self._cpu_filter.update(raw_cpu)
@@ -169,6 +170,7 @@ class ProcessResourceMonitor:
             timestamp_monotonic=_DEFAULT_CLOCK.monotonic(),
             sample_count=self._cpu_filter.get_sample_count(),
             process_count=live_count,
+            largest_process_file_descriptor_count=largest_process_fds,
         )
 
     def _empty_metrics(self) -> ResourceMetrics:

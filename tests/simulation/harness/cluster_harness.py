@@ -22,6 +22,7 @@ from hyperscale.distributed.nodes.gate import GateServer
 from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
+from tests.simulation.harness.cleanup_report import CleanupReport
 from tests.simulation.harness.cluster_spec import ClusterSpec
 from tests.simulation.harness.conditions import (
     lhm_at_baseline,
@@ -162,12 +163,16 @@ class ClusterHarness:
         try:
             await self._supervisor.shutdown()
         finally:
-            errors = self._supervisor.cleanup_errors
-            if invariant_violation is not None and exc_type is None:
-                raise invariant_violation
-            if errors and exc_type is None:
-                joined = "\n  - ".join(errors)
-                raise RuntimeError(f"harness cleanup reported errors:\n  - {joined}")
+            # Never drop a teardown finding: a failed body carries them as
+            # notes on its own exception; a passing body fails with them.
+            cleanup_report = CleanupReport(
+                cleanup_errors=tuple(self._supervisor.cleanup_errors),
+                invariant_violation=None if invariant_violation is exc_val else invariant_violation,
+            )
+            if exc_val is not None:
+                cleanup_report.attach_to(exc_val)
+            elif (teardown_failure := cleanup_report.failure()) is not None:
+                raise teardown_failure
 
     async def dump_diagnostics(self, reason: str = "manual") -> None:
         """Write a complete diagnostic snapshot. Safe to call any time after __aenter__."""

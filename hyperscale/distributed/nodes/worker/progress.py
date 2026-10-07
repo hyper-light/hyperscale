@@ -37,7 +37,7 @@ from .worker_progress_reporter import _DEFAULT_CLOCK
 from .worker_progress_reporter import _TRANSIENT_SEND_ERRORS
 from .worker_progress_reporter import _LOCAL_BUG_ERRORS
 from .worker_progress_reporter import _classify_send_error
-from .pending_result import PendingResult
+from hyperscale.distributed.nodes.worker.models.pending_result import PendingResult
 from .worker_progress_reporter import WorkerProgressReporter
 
 _REHOMED = (

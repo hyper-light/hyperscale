@@ -12,17 +12,15 @@ Covers:
 """
 
 import os
-from hyperscale.distributed.nodes.worker.config import derive_orphan_grace_seconds
+from hyperscale.distributed.nodes.worker.worker_config_derivation import derive_orphan_grace_seconds
 from unittest.mock import patch, MagicMock
 
 import pytest
 
 from hyperscale.distributed.env import Env
-from hyperscale.distributed.nodes.worker.config import (
-    WorkerConfig,
-    create_worker_config_from_env,
-    _get_os_cpus,
-)
+from hyperscale.distributed.nodes.worker.config import create_worker_config_from_env
+from hyperscale.distributed.nodes.worker.models.worker_config import WorkerConfig
+from hyperscale.distributed.nodes.worker.worker_config_derivation import _get_os_cpus
 
 
 class TestWorkerConfig:
@@ -534,7 +532,7 @@ class TestGetOsCpus:
         assert isinstance(result, int)
         assert result >= 1
 
-    @patch("hyperscale.distributed.nodes.worker.config.os.cpu_count")
+    @patch("os.cpu_count")
     def test_fallback_to_os_cpu_count(self, mock_cpu_count):
         """Test fallback when psutil is not available."""
         # Simulate psutil import failure

@@ -26,7 +26,7 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarni
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs import JobManager
-    from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.nodes.manager.models.manager_config import ManagerConfig
     from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator
     from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
     from hyperscale.distributed.nodes.manager.state import ManagerState

@@ -13,7 +13,8 @@ from hyperscale.distributed.models import (
     RateLimitResponse,
 )
 from hyperscale.distributed.nodes.client.state import ClientState
-from hyperscale.distributed.nodes.client.config import ClientConfig, TRANSIENT_ERRORS
+from hyperscale.distributed.nodes.client.config import TRANSIENT_ERRORS
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.logging import Logger
 
 from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom

@@ -24,7 +24,7 @@ from hyperscale.distributed.models import JobAck, JobCancelResponse, RateLimitRe
 from hyperscale.distributed.nodes.client import cancellation as cancellation_module
 from hyperscale.distributed.nodes.client import submission as submission_module
 from hyperscale.distributed.nodes.client.cancellation import ClientCancellationManager
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.protocol import ClientProtocol
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.nodes.client.submission import ClientJobSubmitter

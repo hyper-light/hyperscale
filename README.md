@@ -252,7 +252,10 @@ Key capabilities:
 - Port safety defaults: manager and worker ports are gapped by 500, worker UDP
   ports use a 50 offset and 100 stride by default (configurable)
 
-See `tests/framework/README.txt` for the full schema and examples.
+The schema is the spec classes' `from_dict` validators in `tests/framework/specs/`
+(`scenario_spec.py`, `cluster_spec.py`, `node_spec.py`, `action_spec.py`), which
+reject a malformed scenario with the field at fault; the scenarios under
+`tests/end_to_end/gate_manager/` (e.g. `section_08.py`) are worked examples.
 
 ## <b>Clients and Reporters</b>
 

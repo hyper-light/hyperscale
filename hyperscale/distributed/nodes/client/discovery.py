@@ -20,7 +20,7 @@ from hyperscale.distributed.models import (
     DatacenterListResponse,
 )
 from hyperscale.distributed.nodes.client.state import ClientState
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.logging import Logger
 
 
