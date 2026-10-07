@@ -1,51 +1,50 @@
-#!/usr/bin/env python3
 """
-SWIM Failure Scenario Integration Tests.
+SWIM failure scenarios (fixes for gaps G1-G8 in the failure scenario analysis):
 
-Tests critical failure scenarios in the SWIM protocol implementation:
-1. Zombie detection - Dead nodes rejoining with stale incarnations
-2. Partition recovery - Callbacks when partitions heal
-3. Incarnation persistence - Incarnations survive restarts
-
-These tests validate the fixes implemented for gaps G1-G8 in
-the failure scenario analysis.
+- Zombie detection: a node marked DEAD that rejoins with a stale incarnation
+  is rejected, until the detection window expires; expired death records
+  are cleaned up.
+- Incarnation persistence: incarnations survive a restart with a bump.
+- Partition recovery: the cross-DC correlation detector recommends delaying
+  eviction when several datacenters fail together, and calls the healed
+  callbacks when the partition heals.
+- Suspicion timeouts: a bounded confirmation target lets a large cluster's
+  global suspicion approach its minimum timeout, and a tiny cluster never
+  waits for confirmations it cannot collect.
 """
 
 import asyncio
-import os
-import sys
-import tempfile
+import pathlib
 from dataclasses import dataclass, field
-from pathlib import Path
 
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
+
+from hyperscale.distributed.datacenters.cross_dc_correlation import (
+    CorrelationSeverity,
+    CrossDCCorrelationConfig,
+    CrossDCCorrelationDetector,
 )
-
 from hyperscale.distributed.swim.detection import (
     HierarchicalConfig,
     HierarchicalFailureDetector,
-    IncarnationTracker,
     IncarnationStore,
+    IncarnationTracker,
     SuspicionState,
 )
-from hyperscale.distributed.datacenters.cross_dc_correlation import (
-    CrossDCCorrelationDetector,
-    CrossDCCorrelationConfig,
-    CorrelationSeverity,
-)
-from hyperscale.logging.config.logging_config import LoggingConfig
 
-_logging_config = LoggingConfig()
-_logging_config.update(log_directory=os.getcwd())
+# Anything these components log lands in the test's own directory.
+pytestmark = pytest.mark.usefixtures("node_directory")
+
+PARTITIONED_DATACENTERS = ["dc-west", "dc-east", "dc-north"]
+ALL_DATACENTERS = [*PARTITIONED_DATACENTERS, "dc-south"]
 
 
 @dataclass
-class CallbackCapture:
+class PartitionCallbackCapture:
+    """Records every partition callback the correlation detector makes."""
+
     partition_healed_calls: list[tuple[list[str], float]] = field(default_factory=list)
-    partition_detected_calls: list[tuple[list[str], float]] = field(
-        default_factory=list
-    )
+    partition_detected_calls: list[tuple[list[str], float]] = field(default_factory=list)
 
     def on_partition_healed(self, datacenters: list[str], timestamp: float) -> None:
         self.partition_healed_calls.append((datacenters, timestamp))
@@ -54,327 +53,151 @@ class CallbackCapture:
         self.partition_detected_calls.append((datacenters, timestamp))
 
 
-async def scenario_zombie_detection_rejects_stale_incarnation() -> bool:
-    """
-    Test that the incarnation tracker rejects zombie nodes with stale incarnations.
-
-    A zombie is a node that was marked DEAD but tries to rejoin with an
-    incarnation lower than required (death_incarnation + minimum_bump).
-    """
-    print(f"\n{'=' * 70}")
-    print("TEST: Zombie Detection - Rejects Stale Incarnation")
-    print(f"{'=' * 70}")
-
+async def test_zombie_detection_rejects_stale_incarnation() -> None:
+    """A node that died at incarnation 10 must rejoin at 10 + 5 or above."""
     tracker = IncarnationTracker(
         zombie_detection_window_seconds=60.0,
         minimum_rejoin_incarnation_bump=5,
     )
-
     node = ("127.0.0.1", 9000)
-    death_incarnation = 10
+    tracker.record_node_death(node, incarnation_at_death=10)
 
-    print("\n[1/4] Recording node death at incarnation 10...")
-    tracker.record_node_death(node, death_incarnation)
-
-    print("\n[2/4] Checking if incarnation 12 is rejected as zombie...")
-    is_zombie_12 = tracker.is_potential_zombie(node, claimed_incarnation=12)
-    required = tracker.get_required_rejoin_incarnation(node)
-    print(f"  Required incarnation: {required}")
-    print(f"  Incarnation 12 is zombie: {is_zombie_12}")
-
-    print("\n[3/4] Checking if incarnation 15 is accepted...")
-    is_zombie_15 = tracker.is_potential_zombie(node, claimed_incarnation=15)
-    print(f"  Incarnation 15 is zombie: {is_zombie_15}")
-
-    print("\n[4/4] Verifying zombie rejection count...")
-    stats = tracker.get_stats()
-    rejections = stats.get("zombie_rejections", 0)
-    print(f"  Zombie rejections: {rejections}")
-
-    passed = is_zombie_12 and not is_zombie_15 and rejections == 1
-
-    print(f"\n{'=' * 70}")
-    result = "PASSED" if passed else "FAILED"
-    print(f"TEST RESULT: {result}")
-    print(f"{'=' * 70}")
-
-    return passed
+    assert tracker.is_potential_zombie(node, claimed_incarnation=12), (
+        f"incarnation 12 is below the required {tracker.get_required_rejoin_incarnation(node)}: a zombie"
+    )
+    assert not tracker.is_potential_zombie(node, claimed_incarnation=15), "incarnation 15 rejoins"
+    zombie_rejections = tracker.get_stats().get("zombie_rejections", 0)
+    assert zombie_rejections == 1, f"one zombie rejection counted, got {zombie_rejections}"
 
 
-async def scenario_zombie_detection_window_expiry() -> bool:
-    """
-    Test that zombie detection expires after the window.
-
-    After zombie_detection_window_seconds, a node should be able to
-    rejoin with any incarnation since the death record is stale.
-    """
-    print(f"\n{'=' * 70}")
-    print("TEST: Zombie Detection - Window Expiry")
-    print(f"{'=' * 70}")
-
+async def test_zombie_detection_window_expiry() -> None:
+    """After the detection window, a stale death record no longer rejects."""
     tracker = IncarnationTracker(
         zombie_detection_window_seconds=0.5,
         minimum_rejoin_incarnation_bump=5,
     )
-
     node = ("127.0.0.1", 9001)
-    death_incarnation = 10
+    tracker.record_node_death(node, incarnation_at_death=10)
 
-    print("\n[1/3] Recording node death at incarnation 10...")
-    tracker.record_node_death(node, death_incarnation)
-
-    print("\n[2/3] Checking immediately - should be zombie...")
-    is_zombie_immediate = tracker.is_potential_zombie(node, claimed_incarnation=12)
-    print(f"  Incarnation 12 is zombie immediately: {is_zombie_immediate}")
-
-    print("\n[3/3] Waiting for window to expire and checking again...")
+    assert tracker.is_potential_zombie(node, claimed_incarnation=12), "incarnation 12 is a zombie inside the window"
     await asyncio.sleep(0.6)
-    is_zombie_after = tracker.is_potential_zombie(node, claimed_incarnation=12)
-    print(f"  Incarnation 12 is zombie after expiry: {is_zombie_after}")
-
-    passed = is_zombie_immediate and not is_zombie_after
-
-    print(f"\n{'=' * 70}")
-    result = "PASSED" if passed else "FAILED"
-    print(f"TEST RESULT: {result}")
-    print(f"{'=' * 70}")
-
-    return passed
-
-
-async def scenario_incarnation_persistence() -> bool:
-    """
-    Test that incarnation numbers persist and reload correctly.
-
-    This validates G2 fix - the IncarnationStore should persist
-    incarnation numbers to disk and reload them on restart with
-    an appropriate bump.
-    """
-    print(f"\n{'=' * 70}")
-    print("TEST: Incarnation Persistence")
-    print(f"{'=' * 70}")
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        storage_path = Path(temp_dir)
-        node_address = "127.0.0.1:9000"
-
-        print("\n[1/4] Creating initial incarnation store...")
-        store1 = IncarnationStore(
-            storage_directory=storage_path,
-            node_address=node_address,
-            restart_incarnation_bump=10,
-        )
-        initial_incarnation = await store1.initialize()
-        print(f"  Initial incarnation: {initial_incarnation}")
-
-        print("\n[2/4] Incrementing incarnation several times...")
-        await store1.update_incarnation(initial_incarnation + 5)
-        await store1.update_incarnation(initial_incarnation + 10)
-        current = await store1.get_incarnation()
-        print(f"  Current incarnation after updates: {current}")
-
-        print("\n[3/4] Creating new store (simulating restart)...")
-        store2 = IncarnationStore(
-            storage_directory=storage_path,
-            node_address=node_address,
-            restart_incarnation_bump=10,
-        )
-        reloaded_incarnation = await store2.initialize()
-        print(f"  Reloaded incarnation: {reloaded_incarnation}")
-
-        print("\n[4/4] Verifying incarnation is higher than before restart...")
-        expected_minimum = current + 10
-        is_higher = reloaded_incarnation >= expected_minimum
-        print(f"  Expected minimum: {expected_minimum}")
-        print(f"  Is higher: {is_higher}")
-
-        passed = is_higher
-
-    print(f"\n{'=' * 70}")
-    result = "PASSED" if passed else "FAILED"
-    print(f"TEST RESULT: {result}")
-    print(f"{'=' * 70}")
-
-    return passed
-
-
-async def scenario_partition_healed_callback() -> bool:
-    """
-    Test that partition healed callbacks are invoked correctly.
-
-    This validates G6/G7 fix - the CrossDCCorrelationDetector should
-    invoke callbacks when a partition heals.
-    """
-    print(f"\n{'=' * 70}")
-    print("TEST: Partition Healed Callback")
-    print(f"{'=' * 70}")
-
-    config = CrossDCCorrelationConfig(
-        correlation_window_seconds=30.0,
-        low_threshold=2,
-        medium_threshold=3,
-        high_count_threshold=3,
-        high_threshold_fraction=0.5,
-        failure_confirmation_seconds=0.1,
-        recovery_confirmation_seconds=0.1,
+    assert not tracker.is_potential_zombie(node, claimed_incarnation=12), (
+        "incarnation 12 rejoins once the window expired"
     )
 
-    detector = CrossDCCorrelationDetector(config=config)
-    capture = CallbackCapture()
 
+async def test_incarnation_persists_across_restart(tmp_path: pathlib.Path) -> None:
+    """G2: a restarted node's incarnation reloads above its last one plus the restart bump."""
+    node_address = "127.0.0.1:9000"
+    first_store = IncarnationStore(
+        storage_directory=tmp_path,
+        node_address=node_address,
+        restart_incarnation_bump=10,
+    )
+    initial_incarnation = await first_store.initialize()
+    await first_store.update_incarnation(initial_incarnation + 5)
+    await first_store.update_incarnation(initial_incarnation + 10)
+    incarnation_before_restart = await first_store.get_incarnation()
+
+    restarted_store = IncarnationStore(
+        storage_directory=tmp_path,
+        node_address=node_address,
+        restart_incarnation_bump=10,
+    )
+    reloaded_incarnation = await restarted_store.initialize()
+
+    expected_minimum = incarnation_before_restart + 10
+    assert reloaded_incarnation >= expected_minimum, (
+        f"reloaded incarnation {reloaded_incarnation} is at least {expected_minimum}"
+    )
+
+
+async def test_partition_healed_callback_fires() -> None:
+    """G6/G7: the detector calls the healed callbacks when a partition heals."""
+    detector = CrossDCCorrelationDetector(
+        config=CrossDCCorrelationConfig(
+            correlation_window_seconds=30.0,
+            low_threshold=2,
+            medium_threshold=3,
+            high_count_threshold=3,
+            high_threshold_fraction=0.5,
+            failure_confirmation_seconds=0.1,
+            recovery_confirmation_seconds=0.1,
+        )
+    )
+    capture = PartitionCallbackCapture()
     detector.register_partition_healed_callback(capture.on_partition_healed)
     detector.register_partition_detected_callback(capture.on_partition_detected)
+    for datacenter in ALL_DATACENTERS:
+        detector.add_datacenter(datacenter)
 
-    print("\n[1/5] Adding datacenters...")
-    for dc in ["dc-west", "dc-east", "dc-north", "dc-south"]:
-        detector.add_datacenter(dc)
-    print("  Added 4 datacenters")
-
-    print("\n[2/5] Recording failures to trigger partition...")
-    detector.record_failure("dc-west", "unhealthy")
-    detector.record_failure("dc-east", "unhealthy")
-    detector.record_failure("dc-north", "unhealthy")
+    for datacenter in PARTITIONED_DATACENTERS:
+        detector.record_failure(datacenter, "unhealthy")
     await asyncio.sleep(0.2)
-    detector.record_failure("dc-west", "unhealthy")
-    detector.record_failure("dc-east", "unhealthy")
-    detector.record_failure("dc-north", "unhealthy")
+    for datacenter in PARTITIONED_DATACENTERS:
+        detector.record_failure(datacenter, "unhealthy")
 
-    print("\n[3/5] Checking correlation and marking partition...")
     decision = detector.check_correlation("dc-west")
-    print(f"  Correlation severity: {decision.severity.value}")
+    assert decision.severity in (CorrelationSeverity.MEDIUM, CorrelationSeverity.HIGH), (
+        f"three of four datacenters failing together is a partition, got severity {decision.severity.value}"
+    )
+    detector.mark_partition_detected(decision.affected_datacenters)
 
-    if decision.severity in (CorrelationSeverity.MEDIUM, CorrelationSeverity.HIGH):
-        detector.mark_partition_detected(decision.affected_datacenters)
-        print(f"  Partition marked, affected DCs: {decision.affected_datacenters}")
-
-    print(f"  Partition detected callbacks: {len(capture.partition_detected_calls)}")
-
-    print("\n[4/5] Recording recoveries...")
-    for dc in ["dc-west", "dc-east", "dc-north", "dc-south"]:
-        detector.record_recovery(dc)
+    for datacenter in ALL_DATACENTERS:
+        detector.record_recovery(datacenter)
     await asyncio.sleep(0.2)
-    for dc in ["dc-west", "dc-east", "dc-north", "dc-south"]:
-        detector.record_recovery(dc)
+    for datacenter in ALL_DATACENTERS:
+        detector.record_recovery(datacenter)
 
-    print("\n[5/5] Checking if partition healed...")
-    healed = detector.check_partition_healed()
-    print(f"  Partition healed: {healed}")
-    print(f"  Partition healed callbacks: {len(capture.partition_healed_calls)}")
-
-    in_partition = detector.is_in_partition()
-    print(f"  Still in partition: {in_partition}")
-
-    passed = len(capture.partition_healed_calls) >= 1 and not in_partition
-
-    print(f"\n{'=' * 70}")
-    result = "PASSED" if passed else "FAILED"
-    print(f"TEST RESULT: {result}")
-    print(f"{'=' * 70}")
-
-    return passed
+    detector.check_partition_healed()
+    assert len(capture.partition_healed_calls) >= 1, "the healed callback fired"
+    assert not detector.is_in_partition(), "the detector left the partition state"
 
 
-async def scenario_partition_detection_delays_eviction() -> bool:
-    """
-    Test that partition detection recommends delaying eviction.
+async def test_partition_detection_delays_eviction() -> None:
+    """Simultaneous failures of several datacenters recommend delaying eviction."""
+    detector = CrossDCCorrelationDetector(
+        config=CrossDCCorrelationConfig(
+            correlation_window_seconds=30.0,
+            low_threshold=2,
+            medium_threshold=2,
+            failure_confirmation_seconds=0.1,
+        )
+    )
+    for datacenter in ["dc-1", "dc-2", "dc-3"]:
+        detector.add_datacenter(datacenter)
 
-    When multiple DCs fail simultaneously, the correlation detector
-    should recommend delaying eviction (should_delay_eviction=True).
-    """
-    print(f"\n{'=' * 70}")
-    print("TEST: Partition Detection Delays Eviction")
-    print(f"{'=' * 70}")
+    detector.record_failure("dc-1", "unhealthy")
+    detector.record_failure("dc-2", "unhealthy")
+    await asyncio.sleep(0.2)
+    detector.record_failure("dc-1", "unhealthy")
+    detector.record_failure("dc-2", "unhealthy")
 
-    config = CrossDCCorrelationConfig(
-        correlation_window_seconds=30.0,
-        low_threshold=2,
-        medium_threshold=2,
-        failure_confirmation_seconds=0.1,
+    decision = detector.check_correlation("dc-1")
+    assert decision.should_delay_eviction, (
+        f"severity {decision.severity.value} recommends delaying eviction ({decision.recommendation})"
     )
 
-    detector = CrossDCCorrelationDetector(config=config)
 
-    print("\n[1/3] Adding datacenters...")
-    for dc in ["dc-1", "dc-2", "dc-3"]:
-        detector.add_datacenter(dc)
-
-    print("\n[2/3] Recording simultaneous failures...")
-    detector.record_failure("dc-1", "unhealthy")
-    detector.record_failure("dc-2", "unhealthy")
-    await asyncio.sleep(0.2)
-    detector.record_failure("dc-1", "unhealthy")
-    detector.record_failure("dc-2", "unhealthy")
-
-    print("\n[3/3] Checking correlation decision...")
-    decision = detector.check_correlation("dc-1")
-    print(f"  Severity: {decision.severity.value}")
-    print(f"  Should delay eviction: {decision.should_delay_eviction}")
-    print(f"  Recommendation: {decision.recommendation}")
-
-    passed = decision.should_delay_eviction
-
-    print(f"\n{'=' * 70}")
-    result = "PASSED" if passed else "FAILED"
-    print(f"TEST RESULT: {result}")
-    print(f"{'=' * 70}")
-
-    return passed
-
-
-async def scenario_death_record_cleanup() -> bool:
-    """
-    Test that death records are cleaned up properly.
-
-    The cleanup_death_records method should remove records older
-    than the zombie detection window.
-    """
-    print(f"\n{'=' * 70}")
-    print("TEST: Death Record Cleanup")
-    print(f"{'=' * 70}")
-
+async def test_expired_death_records_are_cleaned_up() -> None:
+    """cleanup_death_records removes every record older than the window."""
     tracker = IncarnationTracker(
         zombie_detection_window_seconds=0.3,
         minimum_rejoin_incarnation_bump=5,
     )
+    for port_offset in range(5):
+        tracker.record_node_death(("127.0.0.1", 9000 + port_offset), incarnation_at_death=10)
 
-    print("\n[1/3] Recording multiple node deaths...")
-    nodes = [("127.0.0.1", 9000 + i) for i in range(5)]
-    for node in nodes:
-        tracker.record_node_death(node, incarnation_at_death=10)
-
-    stats_before = tracker.get_stats()
-    print(f"  Active death records before: {stats_before['active_death_records']}")
-
-    print("\n[2/3] Waiting for records to expire...")
     await asyncio.sleep(0.4)
+    cleaned_records = await tracker.cleanup_death_records()
 
-    print("\n[3/3] Running cleanup and checking...")
-    cleaned = await tracker.cleanup_death_records()
-    stats_after = tracker.get_stats()
-    print(f"  Records cleaned: {cleaned}")
-    print(f"  Active death records after: {stats_after['active_death_records']}")
-
-    passed = cleaned == 5 and stats_after["active_death_records"] == 0
-
-    print(f"\n{'=' * 70}")
-    result = "PASSED" if passed else "FAILED"
-    print(f"TEST RESULT: {result}")
-    print(f"{'=' * 70}")
-
-    return passed
+    assert cleaned_records == 5, f"five records cleaned, got {cleaned_records}"
+    remaining_records = tracker.get_stats()["active_death_records"]
+    assert remaining_records == 0, f"no death records remain, got {remaining_records}"
 
 
-async def scenario_suspicion_timeout_uses_bounded_confirmations() -> bool:
-    """
-    Test that global suspicion can use a bounded confirmation target.
-
-    A large cluster should not require confirmations proportional to
-    total membership before the suspicion timer approaches its minimum.
-    """
-    print(f"\n{'=' * 70}")
-    print("TEST: Suspicion Timeout - Bounded Confirmations")
-    print(f"{'=' * 70}")
-
+async def test_suspicion_timeout_uses_bounded_confirmations() -> None:
+    """A large cluster need not collect confirmations proportional to membership."""
     bounded_state = SuspicionState(
         node=("127.0.0.1", 9200),
         incarnation=1,
@@ -384,7 +207,7 @@ async def scenario_suspicion_timeout_uses_bounded_confirmations() -> bool:
         n_members=50,
         required_confirmations=2,
     )
-    legacy_state = SuspicionState(
+    membership_scaled_state = SuspicionState(
         node=("127.0.0.1", 9201),
         incarnation=1,
         start_time=0.0,
@@ -392,35 +215,21 @@ async def scenario_suspicion_timeout_uses_bounded_confirmations() -> bool:
         max_timeout=30.0,
         n_members=50,
     )
-
     confirmer = ("127.0.0.1", 9300)
     bounded_state.add_confirmation(confirmer)
-    legacy_state.add_confirmation(confirmer)
+    membership_scaled_state.add_confirmation(confirmer)
 
     bounded_timeout = bounded_state.calculate_timeout()
-    legacy_timeout = legacy_state.calculate_timeout()
+    membership_scaled_timeout = membership_scaled_state.calculate_timeout()
 
-    print(f"  Bounded timeout: {bounded_timeout:.3f}s")
-    print(f"  Legacy timeout: {legacy_timeout:.3f}s")
-
-    passed = bounded_timeout < legacy_timeout and bounded_timeout < 20.0
-
-    print(f"\n{'=' * 70}")
-    result = "PASSED" if passed else "FAILED"
-    print(f"TEST RESULT: {result}")
-    print(f"{'=' * 70}")
-
-    return passed
+    assert bounded_timeout < membership_scaled_timeout, (
+        f"bounded timeout {bounded_timeout:.3f}s is below the membership-scaled {membership_scaled_timeout:.3f}s"
+    )
+    assert bounded_timeout < 20.0, f"bounded timeout {bounded_timeout:.3f}s is below 20s"
 
 
-async def scenario_global_detector_sets_confirmation_target() -> bool:
-    """
-    Test that global HFD suspicions receive the configured confirmation target.
-    """
-    print(f"\n{'=' * 70}")
-    print("TEST: Global Detector - Confirmation Target")
-    print(f"{'=' * 70}")
-
+async def test_global_detector_sets_confirmation_target() -> None:
+    """Global suspicions carry the configured confirmation target."""
     detector = HierarchicalFailureDetector(
         config=HierarchicalConfig(
             global_min_timeout=5.0,
@@ -429,42 +238,22 @@ async def scenario_global_detector_sets_confirmation_target() -> bool:
         ),
         get_n_members=lambda: 50,
     )
+    try:
+        target = ("127.0.0.1", 9400)
+        created = await detector.suspect_global(target, 1, ("127.0.0.1", 9401))
+        state = await detector.get_global_suspicion_state(target)
 
-    target = ("127.0.0.1", 9400)
-    from_node = ("127.0.0.1", 9401)
-    created = await detector.suspect_global(target, 1, from_node)
-    state = await detector.get_global_suspicion_state(target)
-
-    timeout = state.calculate_timeout() if state else 0.0
-    print(f"  Suspicion created: {created}")
-    print(f"  Required confirmations: {state.required_confirmations if state else None}")
-    print(f"  Initial timeout: {timeout:.3f}s")
-
-    passed = bool(
-        created
-        and state is not None
-        and state.required_confirmations == 2
-        and timeout < 20.0
-    )
-
-    await detector.stop()
-
-    print(f"\n{'=' * 70}")
-    result = "PASSED" if passed else "FAILED"
-    print(f"TEST RESULT: {result}")
-    print(f"{'=' * 70}")
-
-    return passed
+        assert created, "the global suspicion was created"
+        assert state is not None, "the global suspicion has a state"
+        assert state.required_confirmations == 2, f"target is 2, got {state.required_confirmations}"
+        initial_timeout = state.calculate_timeout()
+        assert initial_timeout < 20.0, f"initial timeout {initial_timeout:.3f}s is below 20s"
+    finally:
+        await detector.stop()
 
 
-async def scenario_global_detector_clamps_impossible_confirmations() -> bool:
-    """
-    Test that tiny clusters do not wait for impossible confirmation counts.
-    """
-    print(f"\n{'=' * 70}")
-    print("TEST: Global Detector - Confirmation Clamp")
-    print(f"{'=' * 70}")
-
+async def test_global_detector_clamps_impossible_confirmations() -> None:
+    """A two-member cluster never waits for confirmations it cannot collect."""
     detector = HierarchicalFailureDetector(
         config=HierarchicalConfig(
             global_min_timeout=5.0,
@@ -473,96 +262,17 @@ async def scenario_global_detector_clamps_impossible_confirmations() -> bool:
         ),
         get_n_members=lambda: 2,
     )
+    try:
+        target = ("127.0.0.1", 9500)
+        created = await detector.suspect_global(target, 1, ("127.0.0.1", 9501))
+        state = await detector.get_global_suspicion_state(target)
 
-    target = ("127.0.0.1", 9500)
-    from_node = ("127.0.0.1", 9501)
-    created = await detector.suspect_global(target, 1, from_node)
-    state = await detector.get_global_suspicion_state(target)
-
-    timeout = state.calculate_timeout() if state else 0.0
-    print(f"  Suspicion created: {created}")
-    print(f"  Required confirmations: {state.required_confirmations if state else None}")
-    print(f"  Initial timeout: {timeout:.3f}s")
-
-    passed = bool(
-        created
-        and state is not None
-        and state.required_confirmations == 0
-        and timeout == state.min_timeout
-    )
-
-    await detector.stop()
-
-    print(f"\n{'=' * 70}")
-    result = "PASSED" if passed else "FAILED"
-    print(f"TEST RESULT: {result}")
-    print(f"{'=' * 70}")
-
-    return passed
-
-
-async def run_all_scenarios() -> dict[str, bool]:
-    results = {}
-
-    scenarios = [
-        (
-            "zombie_detection_rejects_stale",
-            scenario_zombie_detection_rejects_stale_incarnation,
-        ),
-        ("zombie_detection_window_expiry", scenario_zombie_detection_window_expiry),
-        ("incarnation_persistence", scenario_incarnation_persistence),
-        ("partition_healed_callback", scenario_partition_healed_callback),
-        (
-            "partition_detection_delays_eviction",
-            scenario_partition_detection_delays_eviction,
-        ),
-        ("death_record_cleanup", scenario_death_record_cleanup),
-        (
-            "suspicion_timeout_uses_bounded_confirmations",
-            scenario_suspicion_timeout_uses_bounded_confirmations,
-        ),
-        (
-            "global_detector_sets_confirmation_target",
-            scenario_global_detector_sets_confirmation_target,
-        ),
-        (
-            "global_detector_clamps_impossible_confirmations",
-            scenario_global_detector_clamps_impossible_confirmations,
-        ),
-    ]
-
-    for name, scenario_func in scenarios:
-        try:
-            results[name] = await scenario_func()
-        except Exception:
-            import traceback
-
-            print(f"\nScenario {name} failed with exception:")
-            traceback.print_exc()
-            results[name] = False
-
-    return results
-
-
-def print_summary(results: dict[str, bool]) -> None:
-    print(f"\n{'=' * 70}")
-    print("FAILURE SCENARIOS TEST SUMMARY")
-    print(f"{'=' * 70}")
-
-    passed = sum(1 for v in results.values() if v)
-    total = len(results)
-
-    for name, result in results.items():
-        status = "PASS" if result else "FAIL"
-        print(f"  {name}: [{status}]")
-
-    print(f"\n  Total: {passed}/{total} scenarios passed")
-    print(f"{'=' * 70}")
-
-
-if __name__ == "__main__":
-    results = asyncio.run(run_all_scenarios())
-    print_summary(results)
-
-    all_passed = all(results.values())
-    sys.exit(0 if all_passed else 1)
+        assert created, "the global suspicion was created"
+        assert state is not None, "the global suspicion has a state"
+        assert state.required_confirmations == 0, f"target clamps to 0, got {state.required_confirmations}"
+        initial_timeout = state.calculate_timeout()
+        assert initial_timeout == state.min_timeout, (
+            f"initial timeout {initial_timeout:.3f}s is the minimum {state.min_timeout}s"
+        )
+    finally:
+        await detector.stop()

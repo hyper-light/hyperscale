@@ -1,169 +1,63 @@
-#!/usr/bin/env python3
 """
-Single Worker Startup/Shutdown Test.
-
-Tests that:
-1. A single worker with 8 CPUs starts correctly
-2. The worker shuts down cleanly without errors
-
-This is a basic sanity test before more complex integration tests.
+A standalone worker (no seed managers) with 8 cores starts, reports all of
+its cores free with nothing running, and shuts down cleanly: the sanity
+check under every other worker integration test.
 """
 
 import asyncio
-import sys
-import os
+import pathlib
+from collections.abc import AsyncIterator
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+import pytest
 
-from hyperscale.distributed.nodes.worker import WorkerServer
-from hyperscale.distributed.env.env import Env
-from hyperscale.logging.config.logging_config import LoggingConfig
+from hyperscale.distributed.nodes import WorkerServer
+from tests.integration.in_process_nodes import LOCALHOST, node_env, reserve_worker_ports
 
-# Every node and client of this test shares one explicit secret: there is
-# no default cluster secret.
-TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
-
-# Initialize logging directory (required for server pool)
-_logging_config = LoggingConfig()
-_logging_config.update(log_directory=os.getcwd())
-
-
-# ==========================================================================
-# Configuration
-# ==========================================================================
-
-DC_ID = "DC-TEST"
-WORKER_TCP_PORT = 9200
-WORKER_UDP_PORT = 9201
+DATACENTER_ID = "DC-TEST"
 WORKER_CORES = 8
+# A worker's start spawns its executor pool, bounded by the pool's own
+# WORKER_POOL_STARTUP_TIMEOUT_SECONDS (60 s by default).
+WORKER_START_SECONDS = 120.0
+WORKER_STOP_SECONDS = 30.0
 
-# No seed managers for this standalone test
-SEED_MANAGERS: list[tuple[str, int]] = []
 
-
-async def run_test():
-    """Run the single worker startup/shutdown test."""
-    
-    worker: WorkerServer | None = None
-    
+@pytest.fixture
+async def standalone_worker(node_directory: pathlib.Path) -> AsyncIterator[WorkerServer]:
+    """An unstarted standalone worker of ``WORKER_CORES`` cores. A worker
+    the test left running (a failed start or assertion) is aborted at
+    teardown."""
+    (worker_tcp_port,) = reserve_worker_ports([WORKER_CORES])
+    worker = WorkerServer(
+        host=LOCALHOST,
+        tcp_port=worker_tcp_port,
+        udp_port=worker_tcp_port + 1,
+        env=node_env(node_directory),
+        dc_id=DATACENTER_ID,
+        total_cores=WORKER_CORES,
+        seed_managers=[],
+    )
     try:
-        # ==============================================================
-        # STEP 1: Create worker
-        # ==============================================================
-        print("[1/4] Creating worker with 8 CPUs...")
-        print("-" * 50)
-        
-        worker = WorkerServer(
-            host='127.0.0.1',
-            tcp_port=WORKER_TCP_PORT,
-            udp_port=WORKER_UDP_PORT,
-            env=Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
-            dc_id=DC_ID,
-            total_cores=WORKER_CORES,
-            seed_managers=SEED_MANAGERS,
-        )
-        
-        print(f"  ✓ Worker created")
-        print(f"    - TCP Port: {WORKER_TCP_PORT}")
-        print(f"    - UDP Port: {WORKER_UDP_PORT}")
-        print(f"    - Total Cores: {WORKER_CORES}")
-        print(f"    - Datacenter: {DC_ID}")
-        print()
-        
-        # ==============================================================
-        # STEP 2: Start worker
-        # ==============================================================
-        print("[2/4] Starting worker...")
-        print("-" * 50)
-        
-        await worker.start()
-        
-        print(f"  ✓ Worker started")
-        print(f"    - Node ID: {worker._node_id.short}")
-        print(f"    - Available Cores: {worker._available_cores}")
-        print(f"    - Running: {worker._running}")
-        print()
-        
-        # ==============================================================
-        # STEP 3: Verify worker state
-        # ==============================================================
-        print("[3/4] Verifying worker state...")
-        print("-" * 50)
-        
-        # Check core counts
-        if worker._total_cores == WORKER_CORES:
-            print(f"  ✓ Total cores correct: {worker._total_cores}")
-        else:
-            print(f"  ✗ Total cores mismatch: expected {WORKER_CORES}, got {worker._total_cores}")
-            return False
-        
-        if worker._available_cores == WORKER_CORES:
-            print(f"  ✓ Available cores correct: {worker._available_cores}")
-        else:
-            print(f"  ✗ Available cores mismatch: expected {WORKER_CORES}, got {worker._available_cores}")
-            return False
-        
-        # Check running state
-        if worker._running:
-            print(f"  ✓ Worker is running")
-        else:
-            print(f"  ✗ Worker is not running")
-            return False
-        
-        # Check no active workflows
-        if len(worker._active_workflows) == 0:
-            print(f"  ✓ No active workflows (expected)")
-        else:
-            print(f"  ✗ Unexpected active workflows: {len(worker._active_workflows)}")
-            return False
-        
-        print()
-        
-        # ==============================================================
-        # STEP 4: Shutdown worker
-        # ==============================================================
-        print("[4/4] Shutting down worker...")
-        print("-" * 50)
-        
-        await worker.stop()
-        
-        print(f"  ✓ Worker shutdown complete")
-        print()
-        
-        # ==============================================================
-        # SUCCESS
-        # ==============================================================
-        print("=" * 50)
-        print("TEST PASSED: Single worker startup/shutdown successful")
-        print("=" * 50)
-        return True
-        
-    except Exception as e:
-        print(f"\n✗ TEST FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-        
+        yield worker
     finally:
-        # Cleanup
-        if worker is not None:
-            try:
-                await worker.stop()
-            except Exception:
-                pass
+        if worker._running:
+            await worker.abort_and_wait(timeout=WORKER_STOP_SECONDS)
 
 
-async def main():
-    """Main entry point."""
-    success = await run_test()
-    sys.exit(0 if success else 1)
+async def test_standalone_worker_starts_with_every_core_free_and_stops_cleanly(
+    standalone_worker: WorkerServer,
+) -> None:
+    await asyncio.wait_for(standalone_worker.start(), timeout=WORKER_START_SECONDS)
 
+    assert standalone_worker._total_cores == WORKER_CORES, (
+        f"total cores: expected {WORKER_CORES}, got {standalone_worker._total_cores}"
+    )
+    available_cores = standalone_worker._core_allocator.available_cores
+    assert available_cores == WORKER_CORES, f"available cores: expected {WORKER_CORES}, got {available_cores}"
+    assert standalone_worker._running, "the worker is not running after start"
+    assert len(standalone_worker._active_workflows) == 0, (
+        f"unexpected active workflows on a fresh worker: {list(standalone_worker._active_workflows)}"
+    )
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nTest interrupted by user")
-        sys.exit(130)
+    await asyncio.wait_for(standalone_worker.stop(), timeout=WORKER_STOP_SECONDS)
 
+    assert not standalone_worker._running, "the worker still reports running after stop"

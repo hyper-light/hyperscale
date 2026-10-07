@@ -1,784 +1,240 @@
-#!/usr/bin/env python3
 """
-Gate-to-Gate Peer Discovery Integration Tests (AD-28).
-
-Tests that gates correctly discover and select peer gates using the
-DiscoveryService with adaptive EWMA-based selection.
-
-Test scenarios:
-1. Gate peer discovery for varying cluster sizes (2, 3, 5 gates)
-2. Gate peer discovery failure and recovery
-3. Load-aware peer selection based on latency feedback
-4. GateHeartbeat message validation
-
-This validates:
-- Gates initialize peer discovery with configured peers
-- Peers are tracked on heartbeat receipt
-- GateHeartbeat messages contain correct fields
-- Failed peers are removed from discovery
-- Recovery allows peers to rejoin discovery
-- Adaptive selection prefers lower-latency peers
+Gate-to-gate peer discovery (AD-28): gates started in-process on loopback
+with each other as configured peers discover every peer in their
+DiscoveryService and track it as active; their state, addresses and
+UDP-to-TCP peer mappings are consistent; selecting a peer for a key is
+deterministic and yields a valid address, and latency feedback moves a
+peer's effective latency; a gate that fails is dropped from its peers'
+active set, and once restarted on the same address it sees every peer
+and every peer sees it again.
 """
 
 import asyncio
-import sys
-import os
-from dataclasses import dataclass, field
+import pathlib
+from collections.abc import AsyncIterator
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+import pytest
 
-from hyperscale.distributed.nodes.gate import GateServer
-from hyperscale.distributed.env.env import Env
-from hyperscale.distributed.models import GateHeartbeat
-from hyperscale.logging.config.logging_config import LoggingConfig
+from hyperscale.distributed.nodes import GateServer
+from tests.integration.gates.gate_cluster import new_gate, new_gates, start_nodes
+from tests.integration.in_process_nodes import LOCALHOST, reserve_node_ports, stop_nodes, wait_until
 
-# Every node and client of this test shares one explicit secret: there is
-# no default cluster secret.
-TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
-
-# Initialize logging directory
-_logging_config = LoggingConfig()
-_logging_config.update(log_directory=os.getcwd())
-
-
-# ==========================================================================
-# Message Capture Helper
-# ==========================================================================
-
-@dataclass
-class MessageCapture:
-    """Captures messages for validation."""
-    gate_heartbeats: list[GateHeartbeat] = field(default_factory=list)
-    heartbeat_sources: dict[str, list[GateHeartbeat]] = field(default_factory=dict)
-
-    def record_heartbeat(self, heartbeat: GateHeartbeat, source_addr: tuple[str, int]) -> None:
-        """Record a received heartbeat."""
-        self.gate_heartbeats.append(heartbeat)
-        source_key = f"{source_addr[0]}:{source_addr[1]}"
-        if source_key not in self.heartbeat_sources:
-            self.heartbeat_sources[source_key] = []
-        self.heartbeat_sources[source_key].append(heartbeat)
-
-    def get_unique_node_ids(self) -> set[str]:
-        """Get unique node IDs from captured heartbeats."""
-        return {hb.node_id for hb in self.gate_heartbeats}
-
-    def get_heartbeat_count_by_node(self) -> dict[str, int]:
-        """Get heartbeat count per node."""
-        counts: dict[str, int] = {}
-        for hb in self.gate_heartbeats:
-            counts[hb.node_id] = counts.get(hb.node_id, 0) + 1
-        return counts
+# Shorter SWIM suspicion timeouts, so a failed gate is detected sooner.
+GATE_ENV_OVERRIDES: dict[str, str | float] = {
+    "MERCURY_SYNC_LOG_LEVEL": "error",
+    "MERCURY_SYNC_REQUEST_TIMEOUT": "5s",
+    "SWIM_SUSPICION_MIN_TIMEOUT": 1.0,
+    "SWIM_SUSPICION_MAX_TIMEOUT": 3.0,
+}
+NODE_START_SECONDS = 30.0
+# The script this replaces checked discovery 10-25s after start (scaled
+# with cluster size); this bounds the same convergence.
+PEER_DISCOVERY_SECONDS = 60.0
+# The script waited 15s per gate for SWIM to detect the failed gate.
+FAILURE_DETECTION_SECONDS_PER_GATE = 15.0
+# The script waited 20s for the restarted gate to rejoin.
+RECOVERY_SECONDS = 60.0
+SHUTDOWN_SECONDS = 30.0
+SELECTION_KEYS = ("test-key-1", "test-key-2", "workflow-abc")
+SELECTIONS_PER_KEY = 3
+RECORDED_SUCCESS_LATENCIES_MS = (10.0, 15.0, 12.0)
+HIGHEST_PORT = 65535
 
 
-# ==========================================================================
-# Configuration Helpers
-# ==========================================================================
-
-def generate_gate_configs(count: int, base_tcp_port: int = 8000) -> list[dict]:
-    """Generate gate configurations for a given cluster size."""
-    configs = []
-    for i in range(count):
-        configs.append({
-            "name": f"Gate {i + 1}",
-            "tcp": base_tcp_port + (i * 2),
-            "udp": base_tcp_port + (i * 2) + 1,
-        })
-    return configs
-
-
-def get_gate_peer_tcp_addrs(configs: list[dict], exclude_tcp: int) -> list[tuple[str, int]]:
-    """Get TCP addresses of all gates except the one with exclude_tcp."""
-    return [
-        ('127.0.0.1', cfg['tcp'])
-        for cfg in configs
-        if cfg['tcp'] != exclude_tcp
-    ]
-
-
-def get_gate_peer_udp_addrs(configs: list[dict], exclude_udp: int) -> list[tuple[str, int]]:
-    """Get UDP addresses of all gates except the one with exclude_udp."""
-    return [
-        ('127.0.0.1', cfg['udp'])
-        for cfg in configs
-        if cfg['udp'] != exclude_udp
-    ]
-
-
-# ==========================================================================
-# Test: Gate Peer Discovery - Basic Cluster Formation
-# ==========================================================================
-
-async def scenario_gate_peer_discovery_cluster_size(cluster_size: int) -> bool:
-    """
-    Test that gates discover each other for a given cluster size.
-
-    Validates:
-    - All gates start successfully
-    - Each gate discovers all other peers via SWIM heartbeats
-    - Peer discovery service tracks all peers
-    """
-    print(f"\n{'=' * 70}")
-    print(f"TEST: Gate Peer Discovery - {cluster_size} Gates")
-    print(f"{'=' * 70}")
-
-    gate_configs = generate_gate_configs(cluster_size)
-    gates: list[GateServer] = []
-    stabilization_time = 10 + (cluster_size * 2)  # Scale with cluster size
-
+@pytest.fixture
+async def running_gates(
+    node_directory: pathlib.Path,
+    request: pytest.FixtureRequest,
+) -> AsyncIterator[list[GateServer]]:
+    """``request.param`` gates, each with every other as a configured peer
+    and no datacenter managers, started together. The fixture stops every
+    gate in the list at teardown, so a test that replaces a gate swaps it
+    in the list."""
+    gate_count: int = request.param
+    gates = new_gates(node_directory, reserve_node_ports(gate_count), {}, **GATE_ENV_OVERRIDES)
     try:
-        # Create gates
-        print(f"\n[1/4] Creating {cluster_size} gates...")
-        for config in gate_configs:
-            gate = GateServer(
-                host='127.0.0.1',
-                tcp_port=config["tcp"],
-                udp_port=config["udp"],
-                env=Env(
-                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
-                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
-                    MERCURY_SYNC_LOG_LEVEL="error",
-                    # Shorter suspicion timeouts for faster test failure detection
-                    SWIM_SUSPICION_MIN_TIMEOUT=1.0,
-                    SWIM_SUSPICION_MAX_TIMEOUT=3.0,
-                ),
-                dc_id="global",
-                datacenter_managers={},  # No managers for this test
-                datacenter_manager_udp={},
-                gate_peers=get_gate_peer_tcp_addrs(gate_configs, config["tcp"]),
-                gate_udp_peers=get_gate_peer_udp_addrs(gate_configs, config["udp"]),
-            )
-            gates.append(gate)
-            print(f"  Created {config['name']} (TCP:{config['tcp']} UDP:{config['udp']})")
-
-        # Start all gates
-        print(f"\n[2/4] Starting gates...")
-        start_tasks = [gate.start() for gate in gates]
-        await asyncio.gather(*start_tasks)
-
-        for i, gate in enumerate(gates):
-            print(f"  Started {gate_configs[i]['name']} - Node ID: {gate._node_id.short}")
-
-        # Wait for cluster stabilization
-        print(f"\n[3/4] Waiting for peer discovery ({stabilization_time}s)...")
-        await asyncio.sleep(stabilization_time)
-
-        # Verify peer discovery
-        print(f"\n[4/4] Verifying peer discovery...")
-        all_peers_discovered = True
-        expected_peer_count = cluster_size - 1  # Each gate should see all others
-
-        for i, gate in enumerate(gates):
-            peer_count = gate._peer_discovery.peer_count
-            active_peers = len(gate._active_gate_peers)
-
-            peers_ok = peer_count >= expected_peer_count
-            active_ok = active_peers >= expected_peer_count
-
-            status = "PASS" if (peers_ok and active_ok) else "FAIL"
-            print(f"  {gate_configs[i]['name']}: {peer_count} peers in discovery, {active_peers} active [{status}]")
-
-            if not (peers_ok and active_ok):
-                all_peers_discovered = False
-
-        # Summary
-        print(f"\n{'=' * 70}")
-        result = "PASSED" if all_peers_discovered else "FAILED"
-        print(f"TEST RESULT: {result}")
-        print(f"  Cluster size: {cluster_size}")
-        print(f"  Expected peers per gate: {expected_peer_count}")
-        print(f"  All peers discovered: {'YES' if all_peers_discovered else 'NO'}")
-        print(f"{'=' * 70}")
-
-        return all_peers_discovered
-
-    except Exception as e:
-        import traceback
-        print(f"\nTest failed with exception: {e}")
-        traceback.print_exc()
-        return False
-
+        await start_nodes(gates, NODE_START_SECONDS)
+        yield gates
     finally:
-        print("\nCleaning up...")
-        for i, gate in enumerate(gates):
-            try:
-                await gate.stop(drain_timeout=0.5, broadcast_leave=False)
-                print(f"  {gate_configs[i]['name']} stopped")
-            except Exception as e:
-                print(f"  {gate_configs[i]['name']} stop failed: {e}")
+        await stop_nodes(gates, SHUTDOWN_SECONDS)
 
 
-# ==========================================================================
-# Test: Gate Heartbeat Message Validation
-# ==========================================================================
+@pytest.mark.parametrize("running_gates", [2, 3, 5], indirect=True)
+async def test_every_gate_discovers_and_tracks_every_peer(running_gates: list[GateServer]) -> None:
+    expected_peer_count = len(running_gates) - 1
 
-async def scenario_gate_heartbeat_message_validation(cluster_size: int) -> bool:
-    """
-    Test that GateHeartbeat messages contain correct fields.
+    await wait_until(
+        lambda: all(
+            gate._peer_discovery.peer_count >= expected_peer_count
+            and gate._modular_state.get_active_peer_count() >= expected_peer_count
+            for gate in running_gates
+        ),
+        within_seconds=PEER_DISCOVERY_SECONDS,
+        description=f"every gate discovering and tracking {expected_peer_count} active peers",
+    )
 
-    Validates:
-    - GateHeartbeat messages are sent between peers
-    - node_id field is populated correctly
-    - datacenter field matches configured dc_id
-    - tcp_host/tcp_port are populated for routing
-    - known_gates dict contains peer information
-    - state field is valid (syncing, active, draining)
-    """
-    print(f"\n{'=' * 70}")
-    print(f"TEST: Gate Heartbeat Message Validation - {cluster_size} Gates")
-    print(f"{'=' * 70}")
-
-    gate_configs = generate_gate_configs(cluster_size)
-    gates: list[GateServer] = []
-    stabilization_time = 15 + (cluster_size * 2)
-
-    try:
-        # Create gates
-        print(f"\n[1/5] Creating {cluster_size} gates...")
-        for config in gate_configs:
-            gate = GateServer(
-                host='127.0.0.1',
-                tcp_port=config["tcp"],
-                udp_port=config["udp"],
-                env=Env(
-                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
-                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
-                    MERCURY_SYNC_LOG_LEVEL="error",
-                    # Shorter suspicion timeouts for faster test failure detection
-                    SWIM_SUSPICION_MIN_TIMEOUT=1.0,
-                    SWIM_SUSPICION_MAX_TIMEOUT=3.0,
-                ),
-                dc_id="global",
-                datacenter_managers={},
-                datacenter_manager_udp={},
-                gate_peers=get_gate_peer_tcp_addrs(gate_configs, config["tcp"]),
-                gate_udp_peers=get_gate_peer_udp_addrs(gate_configs, config["udp"]),
-            )
-            gates.append(gate)
-            print(f"  Created {config['name']}")
-
-        # Start gates
-        print(f"\n[2/5] Starting gates...")
-        start_tasks = [gate.start() for gate in gates]
-        await asyncio.gather(*start_tasks)
-
-        # Collect node IDs
-        node_ids = {str(gate._node_id) for gate in gates}
-        print(f"  Node IDs: {[gate._node_id.short for gate in gates]}")
-
-        print(f"\n[3/5] Waiting for heartbeat exchange ({stabilization_time}s)...")
-        await asyncio.sleep(stabilization_time)
-
-        # Validate gate state and peer tracking
-        print(f"\n[4/5] Validating gate state and peer tracking...")
-        validation_results = {
-            "node_ids_valid": True,
-            "peer_tracking_valid": True,
-            "state_valid": True,
-            "address_tracking_valid": True,
-            "known_gates_valid": True,
-        }
-
-        for i, gate in enumerate(gates):
-            config = gate_configs[i]
-            print(f"\n  {config['name']} validation:")
-
-            # Validate node_id is set
-            if not gate._node_id or not str(gate._node_id):
-                print(f"    node_id: MISSING [FAIL]")
-                validation_results["node_ids_valid"] = False
-            else:
-                print(f"    node_id: {gate._node_id.short} [PASS]")
-
-            # Validate gate is tracking peers
-            active_peers = len(gate._active_gate_peers)
-            expected_peers = cluster_size - 1
-            if active_peers >= expected_peers:
-                print(f"    active_peers: {active_peers}/{expected_peers} [PASS]")
-            else:
-                print(f"    active_peers: {active_peers}/{expected_peers} [FAIL]")
-                validation_results["peer_tracking_valid"] = False
-
-            # Validate gate state
-            gate_state = gate._gate_state.value if hasattr(gate._gate_state, 'value') else str(gate._gate_state)
-            valid_states = {"syncing", "active", "draining"}
-            if gate_state.lower() in valid_states:
-                print(f"    state: {gate_state} [PASS]")
-            else:
-                print(f"    state: {gate_state} (invalid) [FAIL]")
-                validation_results["state_valid"] = False
-
-            # Validate address tracking
-            if gate._tcp_port == config["tcp"] and gate._udp_port == config["udp"]:
-                print(f"    addresses: TCP:{gate._tcp_port} UDP:{gate._udp_port} [PASS]")
-            else:
-                print(f"    addresses: TCP:{gate._tcp_port} UDP:{gate._udp_port} (mismatch) [FAIL]")
-                validation_results["address_tracking_valid"] = False
-
-            # Validate UDP-to-TCP mapping for peers
-            udp_to_tcp_count = len(gate._gate_udp_to_tcp)
-            if udp_to_tcp_count >= expected_peers:
-                print(f"    udp_to_tcp mappings: {udp_to_tcp_count} [PASS]")
-            else:
-                print(f"    udp_to_tcp mappings: {udp_to_tcp_count} (expected {expected_peers}) [FAIL]")
-                validation_results["known_gates_valid"] = False
-
-        # Validate peer discovery service state
-        print(f"\n[5/5] Validating discovery service state...")
-        discovery_valid = True
-
-        for i, gate in enumerate(gates):
-            config = gate_configs[i]
-            discovery = gate._peer_discovery
-
-            # Check that peers were added to discovery
-            peer_count = discovery.peer_count
-            if peer_count >= cluster_size - 1:
-                print(f"  {config['name']}: {peer_count} peers in discovery [PASS]")
-            else:
-                print(f"  {config['name']}: {peer_count} peers in discovery (expected {cluster_size - 1}) [FAIL]")
-                discovery_valid = False
-
-            # Verify peer addresses are retrievable
-            all_peers = discovery.get_all_peers()
-            for peer in all_peers:
-                if peer.host and peer.port > 0:
-                    continue
-                else:
-                    print(f"    Peer {peer.peer_id}: invalid address [FAIL]")
-                    discovery_valid = False
-
-        # Summary
-        print(f"\n{'=' * 70}")
-        all_valid = all(validation_results.values()) and discovery_valid
-        result = "PASSED" if all_valid else "FAILED"
-        print(f"TEST RESULT: {result}")
-        print(f"  Node IDs valid: {'PASS' if validation_results['node_ids_valid'] else 'FAIL'}")
-        print(f"  Peer tracking valid: {'PASS' if validation_results['peer_tracking_valid'] else 'FAIL'}")
-        print(f"  State valid: {'PASS' if validation_results['state_valid'] else 'FAIL'}")
-        print(f"  Address tracking valid: {'PASS' if validation_results['address_tracking_valid'] else 'FAIL'}")
-        print(f"  Known gates valid: {'PASS' if validation_results['known_gates_valid'] else 'FAIL'}")
-        print(f"  Discovery service valid: {'PASS' if discovery_valid else 'FAIL'}")
-        print(f"{'=' * 70}")
-
-        return all_valid
-
-    except Exception as e:
-        import traceback
-        print(f"\nTest failed with exception: {e}")
-        traceback.print_exc()
-        return False
-
-    finally:
-        print("\nCleaning up...")
-        for i, gate in enumerate(gates):
-            try:
-                await gate.stop(drain_timeout=0.5, broadcast_leave=False)
-            except Exception:
-                pass
-        print("  Cleanup complete")
-
-
-# ==========================================================================
-# Test: Gate Peer Discovery - Failure and Recovery
-# ==========================================================================
-
-async def scenario_gate_peer_discovery_failure_recovery(cluster_size: int) -> bool:
-    """
-    Test that gate peer discovery handles failure and recovery.
-
-    Validates:
-    - Gates detect peer failure via SWIM
-    - Failed peers are removed from active peers
-    - Recovered gate can rejoin and see peers
-    - Other gates can see the recovered gate
-
-    Note: When a gate restarts, it gets a new NodeId but uses the same address.
-    SWIM handles this as a "rejoin" from the same UDP address.
-    """
-    print(f"\n{'=' * 70}")
-    print(f"TEST: Gate Peer Discovery Failure/Recovery - {cluster_size} Gates")
-    print(f"{'=' * 70}")
-
-    gate_configs = generate_gate_configs(cluster_size)
-    gates: list[GateServer] = []
-    stabilization_time = 15 + (cluster_size * 2)
-    failure_detection_time = 15  # Time for SWIM to detect failure
-    recovery_time = 20  # Time for recovered peer to rejoin
-
-    try:
-        # Create and start gates
-        print(f"\n[1/7] Creating {cluster_size} gates...")
-        for config in gate_configs:
-            gate = GateServer(
-                host='127.0.0.1',
-                tcp_port=config["tcp"],
-                udp_port=config["udp"],
-                env=Env(
-                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
-                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
-                    MERCURY_SYNC_LOG_LEVEL="error",
-                    # Shorter suspicion timeouts for faster test failure detection
-                    SWIM_SUSPICION_MIN_TIMEOUT=1.0,
-                    SWIM_SUSPICION_MAX_TIMEOUT=3.0,
-                ),
-                dc_id="global",
-                datacenter_managers={},
-                datacenter_manager_udp={},
-                gate_peers=get_gate_peer_tcp_addrs(gate_configs, config["tcp"]),
-                gate_udp_peers=get_gate_peer_udp_addrs(gate_configs, config["udp"]),
-            )
-            gates.append(gate)
-            print(f"  Created {config['name']}")
-
-        print(f"\n[2/7] Starting gates...")
-        start_tasks = [gate.start() for gate in gates]
-        await asyncio.gather(*start_tasks)
-
-        print(f"\n[3/7] Waiting for initial discovery ({stabilization_time}s)...")
-        await asyncio.sleep(stabilization_time)
-
-        # Record initial state
-        expected_peer_count = cluster_size - 1
-        initial_discovery_ok = True
-
-        for i, gate in enumerate(gates):
-            active_peers = len(gate._active_gate_peers)
-            discovery_peers = gate._peer_discovery.peer_count
-            if active_peers < expected_peer_count:
-                initial_discovery_ok = False
-            print(f"    {gate_configs[i]['name']}: active_peers={active_peers}, discovery_peers={discovery_peers}")
-
-        print(f"  Initial discovery: {'OK' if initial_discovery_ok else 'INCOMPLETE'}")
-
-        # Stop one gate to simulate failure
-        failed_gate_index = cluster_size - 1  # Stop the last gate
-        failed_gate = gates[failed_gate_index]
-        failed_gate_name = gate_configs[failed_gate_index]['name']
-
-        print(f"\n[4/7] Simulating failure of {failed_gate_name}...")
-        await failed_gate.stop(drain_timeout=0.5, broadcast_leave=False)
-        print(f"  {failed_gate_name} stopped")
-
-        print(f"\n[5/7] Waiting for failure detection ({failure_detection_time}s)...")
-        await asyncio.sleep(failure_detection_time * len(gates))
-
-        # Verify failure detected
-        remaining_gates = gates[:failed_gate_index]
-        failure_detected = True
-
-        for i, gate in enumerate(remaining_gates):
-            active_peers = len(gate._active_gate_peers)
-            expected_after_failure = cluster_size - 2  # One less peer
-
-            status = "DETECTED" if active_peers <= expected_after_failure else "NOT DETECTED"
-            print(f"  {gate_configs[i]['name']}: {active_peers} active peers [{status}]")
-
-            if active_peers > expected_after_failure:
-                failure_detected = False
-
-        # Restart the failed gate
-        print(f"\n[6/7] Recovering {failed_gate_name}...")
-        recovered_gate = GateServer(
-            host='127.0.0.1',
-            tcp_port=gate_configs[failed_gate_index]["tcp"],
-            udp_port=gate_configs[failed_gate_index]["udp"],
-            env=Env(
-                MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
-                MERCURY_SYNC_REQUEST_TIMEOUT='5s',
-                MERCURY_SYNC_LOG_LEVEL="error",
-                # Shorter suspicion timeouts for faster test failure detection
-                SWIM_SUSPICION_MIN_TIMEOUT=1.0,
-                SWIM_SUSPICION_MAX_TIMEOUT=3.0,
-            ),
-            dc_id="global",
-            datacenter_managers={},
-            datacenter_manager_udp={},
-            gate_peers=get_gate_peer_tcp_addrs(gate_configs, gate_configs[failed_gate_index]["tcp"]),
-            gate_udp_peers=get_gate_peer_udp_addrs(gate_configs, gate_configs[failed_gate_index]["udp"]),
+    for gate in running_gates:
+        discovered_peer_count = gate._peer_discovery.peer_count
+        active_peer_count = gate._modular_state.get_active_peer_count()
+        assert discovered_peer_count >= expected_peer_count, (
+            f"gate {gate._node_id.short} has {discovered_peer_count}/{expected_peer_count} peers in discovery"
         )
-        gates[failed_gate_index] = recovered_gate
-        await recovered_gate.start()
-        print(f"  {failed_gate_name} restarted")
-
-        print(f"\n[7/7] Waiting for recovery detection ({recovery_time}s)...")
-        await asyncio.sleep(recovery_time)
-
-        # Verify recovery from multiple perspectives:
-        # 1. The recovered gate should see other gates
-        # 2. Other gates should see the recovered gate (via address-based tracking)
-        recovery_detected = True
-
-        # Check recovered gate's view
-        recovered_gate = gates[failed_gate_index]
-        recovered_peers = len(recovered_gate._active_gate_peers)
-        expected_peers = cluster_size - 1
-
-        recovered_status = "OK" if recovered_peers >= expected_peers else "INCOMPLETE"
-        print(f"  {failed_gate_name} (recovered): sees {recovered_peers}/{expected_peers} peers [{recovered_status}]")
-
-        if recovered_peers < expected_peers:
-            recovery_detected = False
-
-        # Check other gates' view of the recovered gate
-        # They track by TCP address, so should see the recovered gate
-        for i, gate in enumerate(gates[:failed_gate_index]):
-            # Check if the failed gate's TCP address is in active_gate_peers
-            failed_tcp_addr = ('127.0.0.1', gate_configs[failed_gate_index]['tcp'])
-            has_recovered_peer = failed_tcp_addr in gate._active_gate_peers
-            active_peers = len(gate._active_gate_peers)
-
-            status = "RECOVERED" if has_recovered_peer else "NOT RECOVERED"
-            print(f"  {gate_configs[i]['name']}: {active_peers} active peers, sees recovered gate: {has_recovered_peer} [{status}]")
-
-            if not has_recovered_peer:
-                recovery_detected = False
-
-        # Summary
-        print(f"\n{'=' * 70}")
-        all_passed = initial_discovery_ok and failure_detected and recovery_detected
-        result = "PASSED" if all_passed else "FAILED"
-        print(f"TEST RESULT: {result}")
-        print(f"  Initial discovery: {'PASS' if initial_discovery_ok else 'FAIL'}")
-        print(f"  Failure detection: {'PASS' if failure_detected else 'FAIL'}")
-        print(f"  Recovery detection: {'PASS' if recovery_detected else 'FAIL'}")
-        print(f"{'=' * 70}")
-
-        return all_passed
-
-    except Exception as e:
-        import traceback
-        print(f"\nTest failed with exception: {e}")
-        traceback.print_exc()
-        return False
-
-    finally:
-        print("\nCleaning up...")
-        for i, gate in enumerate(gates):
-            try:
-                await gate.stop(drain_timeout=0.5, broadcast_leave=False)
-                print(f"  {gate_configs[i]['name']} stopped")
-            except Exception as e:
-                print(f"  {gate_configs[i]['name']} stop failed: {e}")
+        assert active_peer_count >= expected_peer_count, (
+            f"gate {gate._node_id.short} tracks {active_peer_count}/{expected_peer_count} active peers"
+        )
 
 
-# ==========================================================================
-# Test: Gate Discovery Service Selection
-# ==========================================================================
+@pytest.mark.parametrize("running_gates", [3], indirect=True)
+async def test_gate_state_addresses_and_peer_tracking_hold_after_heartbeat_exchange(
+    running_gates: list[GateServer],
+) -> None:
+    expected_peer_count = len(running_gates) - 1
+    gate_ports = {gate._node_id.short: (gate._tcp_port, gate._udp_port) for gate in running_gates}
 
-async def scenario_gate_discovery_peer_selection(cluster_size: int) -> bool:
-    """
-    Test that gate discovery service correctly selects peers.
+    await wait_until(
+        lambda: all(
+            gate._modular_state.get_active_peer_count() >= expected_peer_count
+            and len(gate._modular_state.get_all_udp_to_tcp_mappings()) >= expected_peer_count
+            and gate._peer_discovery.peer_count >= expected_peer_count
+            for gate in running_gates
+        ),
+        within_seconds=PEER_DISCOVERY_SECONDS,
+        description=f"every gate tracking and mapping {expected_peer_count} peers after exchanging heartbeats",
+    )
 
-    Validates:
-    - _select_best_peer returns valid peer addresses
-    - Selection is deterministic for same key
-    - Peer addresses are correctly formatted
-    """
-    print(f"\n{'=' * 70}")
-    print(f"TEST: Gate Discovery Peer Selection - {cluster_size} Gates")
-    print(f"{'=' * 70}")
+    for gate in running_gates:
+        gate_name = gate._node_id.short
+        assert gate._node_id and str(gate._node_id), "a gate has no node id"
+        active_peer_count = gate._modular_state.get_active_peer_count()
+        assert active_peer_count >= expected_peer_count, (
+            f"gate {gate_name} tracks {active_peer_count}/{expected_peer_count} active peers"
+        )
+        gate_state = gate._modular_state.get_gate_state().value
+        assert gate_state in {"syncing", "active", "draining"}, f"gate {gate_name} is in invalid state {gate_state}"
+        assert (gate._tcp_port, gate._udp_port) == gate_ports[gate_name], (
+            f"gate {gate_name} moved to TCP:{gate._tcp_port} UDP:{gate._udp_port} from {gate_ports[gate_name]}"
+        )
+        udp_to_tcp_mapping_count = len(gate._modular_state.get_all_udp_to_tcp_mappings())
+        assert udp_to_tcp_mapping_count >= expected_peer_count, (
+            f"gate {gate_name} maps {udp_to_tcp_mapping_count}/{expected_peer_count} peer UDP addresses to TCP"
+        )
+        discovered_peer_count = gate._peer_discovery.peer_count
+        assert discovered_peer_count >= expected_peer_count, (
+            f"gate {gate_name} has {discovered_peer_count}/{expected_peer_count} peers in discovery"
+        )
+        invalid_peer_ids = [
+            peer.peer_id for peer in gate._peer_discovery.get_all_peers() if not peer.host or peer.port <= 0
+        ]
+        assert not invalid_peer_ids, f"gate {gate_name} discovered peers with invalid addresses: {invalid_peer_ids}"
 
-    gate_configs = generate_gate_configs(cluster_size)
-    gates: list[GateServer] = []
-    stabilization_time = 15 + (cluster_size * 2)
 
-    try:
-        # Create and start gates
-        print(f"\n[1/4] Creating and starting {cluster_size} gates...")
-        for config in gate_configs:
-            gate = GateServer(
-                host='127.0.0.1',
-                tcp_port=config["tcp"],
-                udp_port=config["udp"],
-                env=Env(
-                    MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
-                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
-                    MERCURY_SYNC_LOG_LEVEL="error",
-                    # Shorter suspicion timeouts for faster test failure detection
-                    SWIM_SUSPICION_MIN_TIMEOUT=1.0,
-                    SWIM_SUSPICION_MAX_TIMEOUT=3.0,
-                ),
-                dc_id="global",
-                datacenter_managers={},
-                datacenter_manager_udp={},
-                gate_peers=get_gate_peer_tcp_addrs(gate_configs, config["tcp"]),
-                gate_udp_peers=get_gate_peer_udp_addrs(gate_configs, config["udp"]),
+@pytest.mark.parametrize("running_gates", [3], indirect=True)
+async def test_peer_selection_is_deterministic_and_latency_feedback_is_recorded(
+    running_gates: list[GateServer],
+) -> None:
+    expected_peer_count = len(running_gates) - 1
+
+    await wait_until(
+        lambda: all(gate._peer_discovery.peer_count >= expected_peer_count for gate in running_gates),
+        within_seconds=PEER_DISCOVERY_SECONDS,
+        description=f"every gate discovering {expected_peer_count} peers",
+    )
+
+    for gate in running_gates:
+        gate_name = gate._node_id.short
+        peer_discovery = gate._peer_discovery
+        for selection_key in SELECTION_KEYS:
+            selections = [peer_discovery.select_peer(selection_key) for _ in range(SELECTIONS_PER_KEY)]
+            assert all(selection is not None for selection in selections), (
+                f"gate {gate_name} selected no peer for key {selection_key!r}"
             )
-            gates.append(gate)
+            selected_peer_ids = {selection.peer_id for selection in selections if selection is not None}
+            assert len(selected_peer_ids) == 1, (
+                f"gate {gate_name} selected different peers for key {selection_key!r}: {sorted(selected_peer_ids)}"
+            )
+            [selected_peer_id] = selected_peer_ids
+            selected_address = peer_discovery.get_peer_address(selected_peer_id)
+            assert selected_address is not None, (
+                f"gate {gate_name} selected peer {selected_peer_id} for key {selection_key!r} with no address"
+            )
+            selected_host, selected_port = selected_address
+            assert isinstance(selected_host, str) and isinstance(selected_port, int), (
+                f"gate {gate_name} selected a malformed address {selected_address!r}"
+            )
+            assert 0 < selected_port <= HIGHEST_PORT, f"gate {gate_name} selected invalid port {selected_port}"
 
-        await asyncio.gather(*[gate.start() for gate in gates])
-        print(f"  All gates started")
+    for gate in running_gates:
+        peer_discovery = gate._peer_discovery
+        discovered_peers = peer_discovery.get_all_peers()
+        assert discovered_peers, f"gate {gate._node_id.short} has no discovered peer to record latency for"
+        feedback_peer_id = discovered_peers[0].peer_id
+        for latency_ms in RECORDED_SUCCESS_LATENCIES_MS:
+            peer_discovery.record_success(feedback_peer_id, latency_ms)
+        peer_discovery.record_failure(feedback_peer_id)
 
-        print(f"\n[2/4] Waiting for discovery ({stabilization_time}s)...")
-        await asyncio.sleep(stabilization_time)
-
-        # Test peer selection
-        print(f"\n[3/4] Testing peer selection...")
-        selection_valid = True
-        test_keys = ["test-key-1", "test-key-2", "workflow-abc"]
-
-        for i, gate in enumerate(gates):
-            config = gate_configs[i]
-            print(f"\n  {config['name']}:")
-
-            for key in test_keys:
-                # Select peer multiple times to verify determinism
-                selections = []
-                for _ in range(3):
-                    selected = gate._select_best_peer(key)
-                    selections.append(selected)
-
-                # Verify selection returned a result
-                if selections[0] is None:
-                    print(f"    key='{key}': No peer selected [FAIL]")
-                    selection_valid = False
-                    continue
-
-                # Verify all selections are the same (deterministic)
-                if all(s == selections[0] for s in selections):
-                    host, port = selections[0]
-                    print(f"    key='{key}': ({host}:{port}) [PASS - deterministic]")
-                else:
-                    print(f"    key='{key}': Non-deterministic selection [FAIL]")
-                    selection_valid = False
-
-                # Verify address format
-                host, port = selections[0]
-                if not isinstance(host, str) or not isinstance(port, int):
-                    print(f"      Invalid address format [FAIL]")
-                    selection_valid = False
-                elif port <= 0 or port > 65535:
-                    print(f"      Invalid port number [FAIL]")
-                    selection_valid = False
-
-        # Validate latency recording
-        print(f"\n[4/4] Testing latency feedback recording...")
-        feedback_valid = True
-
-        for i, gate in enumerate(gates):
-            config = gate_configs[i]
-            discovery = gate._peer_discovery
-
-            # Get a peer to test with
-            all_peers = discovery.get_all_peers()
-            if not all_peers:
-                continue
-
-            test_peer = all_peers[0]
-
-            # Record some successes
-            for latency in [10.0, 15.0, 12.0]:
-                gate._record_peer_success(test_peer.peer_id, latency)
-
-            # Record a failure
-            gate._record_peer_failure(test_peer.peer_id)
-
-            # Verify effective latency changed
-            effective_latency = discovery.get_effective_latency(test_peer.peer_id)
-            if effective_latency > 0:
-                print(f"  {config['name']}: Latency tracking working (effective={effective_latency:.1f}ms) [PASS]")
-            else:
-                print(f"  {config['name']}: Latency tracking not working [FAIL]")
-                feedback_valid = False
-
-        # Summary
-        print(f"\n{'=' * 70}")
-        all_valid = selection_valid and feedback_valid
-        result = "PASSED" if all_valid else "FAILED"
-        print(f"TEST RESULT: {result}")
-        print(f"  Peer selection valid: {'PASS' if selection_valid else 'FAIL'}")
-        print(f"  Feedback recording valid: {'PASS' if feedback_valid else 'FAIL'}")
-        print(f"{'=' * 70}")
-
-        return all_valid
-
-    except Exception as e:
-        import traceback
-        print(f"\nTest failed with exception: {e}")
-        traceback.print_exc()
-        return False
-
-    finally:
-        print("\nCleaning up...")
-        for gate in gates:
-            try:
-                await gate.stop(drain_timeout=0.5, broadcast_leave=False)
-            except Exception:
-                pass
-        print("  Cleanup complete")
+        effective_latency_ms = peer_discovery.get_effective_latency(feedback_peer_id)
+        assert effective_latency_ms > 0, (
+            f"gate {gate._node_id.short} recorded no latency for peer {feedback_peer_id}: {effective_latency_ms}"
+        )
 
 
-# ==========================================================================
-# Main Test Runner
-# ==========================================================================
+@pytest.mark.parametrize("running_gates", [3, 5], indirect=True)
+async def test_gates_drop_a_failed_peer_and_rediscover_it_after_restart(
+    node_directory: pathlib.Path,
+    running_gates: list[GateServer],
+) -> None:
+    gate_count = len(running_gates)
+    expected_peer_count = gate_count - 1
+    gate_ports = [gate._tcp_port for gate in running_gates]
 
-async def run_all_tests():
-    """Run all gate peer discovery tests."""
-    results = {}
+    await wait_until(
+        lambda: all(gate._modular_state.get_active_peer_count() >= expected_peer_count for gate in running_gates),
+        within_seconds=PEER_DISCOVERY_SECONDS,
+        description=f"every gate tracking {expected_peer_count} active peers before the failure",
+    )
 
-    # Test cluster sizes: 2, 3, 5 gates
-    cluster_sizes = [2, 3, 5]
+    # Fail the last gate without a leave broadcast; it leaves the fixture's
+    # list first, so teardown stops only the gates still running.
+    failed_gate = running_gates.pop()
+    failed_gate_port = failed_gate._tcp_port
+    await asyncio.wait_for(failed_gate.stop(drain_timeout=0.5, broadcast_leave=False), timeout=SHUTDOWN_SECONDS)
 
-    print("\n" + "=" * 70)
-    print("GATE-TO-GATE PEER DISCOVERY INTEGRATION TESTS")
-    print("=" * 70)
-    print("\nThis test suite validates:")
-    print("  1. Gates discover each other via SWIM heartbeats")
-    print("  2. Peer discovery service tracks all peers")
-    print("  3. GateHeartbeat messages contain correct fields")
-    print("  4. Failed peers are detected and removed")
-    print("  5. Recovered peers are re-discovered")
-    print("  6. Peer selection works correctly")
-    print(f"\nCluster sizes to test: {cluster_sizes}")
+    expected_peer_count_after_failure = gate_count - 2
+    await wait_until(
+        lambda: all(
+            gate._modular_state.get_active_peer_count() <= expected_peer_count_after_failure for gate in running_gates
+        ),
+        within_seconds=FAILURE_DETECTION_SECONDS_PER_GATE * gate_count,
+        description=(
+            f"every remaining gate dropping the failed gate to {expected_peer_count_after_failure} active peers"
+        ),
+    )
+    for gate in running_gates:
+        active_peer_count = gate._modular_state.get_active_peer_count()
+        assert active_peer_count <= expected_peer_count_after_failure, (
+            f"gate {gate._node_id.short} still tracks {active_peer_count} active peers after the failure"
+        )
 
-    # Basic discovery tests
-    for size in cluster_sizes:
-        result = await scenario_gate_peer_discovery_cluster_size(size)
-        results[f"discovery_{size}_gates"] = result
-        await asyncio.sleep(2)  # Allow port cleanup between tests
+    # A restarted gate gets a new node id on the same address: SWIM sees a
+    # rejoin from that UDP address, and the peers track it by TCP address.
+    recovered_gate = new_gate(node_directory, failed_gate_port, gate_ports, {}, **GATE_ENV_OVERRIDES)
+    running_gates.append(recovered_gate)
+    await start_nodes([recovered_gate], NODE_START_SECONDS)
 
-    # Message validation tests
-    for size in [3]:
-        result = await scenario_gate_heartbeat_message_validation(size)
-        results[f"heartbeat_validation_{size}_gates"] = result
-        await asyncio.sleep(2)
-
-    # Peer selection tests
-    for size in [3]:
-        result = await scenario_gate_discovery_peer_selection(size)
-        results[f"peer_selection_{size}_gates"] = result
-        await asyncio.sleep(2)
-
-    # Failure/recovery tests (only for 3 and 5 gates to save time)
-    for size in [3, 5]:
-        result = await scenario_gate_peer_discovery_failure_recovery(size)
-        results[f"failure_recovery_{size}_gates"] = result
-        await asyncio.sleep(2)
-
-    # Final summary
-    print("\n" + "=" * 70)
-    print("FINAL TEST SUMMARY")
-    print("=" * 70)
-
-    all_passed = True
-    for test_name, passed in results.items():
-        status = "PASS" if passed else "FAIL"
-        print(f"  {test_name}: {status}")
-        if not passed:
-            all_passed = False
-
-    print(f"\nOverall: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
-    print("=" * 70)
-
-    return all_passed
-
-
-def main():
-    success = asyncio.run(run_all_tests())
-    sys.exit(0 if success else 1)
-
-
-if __name__ == "__main__":
-    main()
+    recovered_gate_address = (LOCALHOST, failed_gate_port)
+    surviving_gates = running_gates[:-1]
+    await wait_until(
+        lambda: recovered_gate._modular_state.get_active_peer_count() >= expected_peer_count
+        and all(gate._modular_state.is_peer_active(recovered_gate_address) for gate in surviving_gates),
+        within_seconds=RECOVERY_SECONDS,
+        description="the restarted gate seeing every peer and every peer seeing it",
+    )
+    recovered_peer_count = recovered_gate._modular_state.get_active_peer_count()
+    assert recovered_peer_count >= expected_peer_count, (
+        f"the restarted gate sees {recovered_peer_count}/{expected_peer_count} peers"
+    )
+    for gate in surviving_gates:
+        assert gate._modular_state.is_peer_active(recovered_gate_address), (
+            f"gate {gate._node_id.short} does not see the restarted gate at {recovered_gate_address}; "
+            f"active peers: {sorted(gate._modular_state.get_active_peers())}"
+        )

@@ -1,5 +1,7 @@
 # Gate Module AD Compliance Report
 
+> **Superseded by [`gate_compliance_2026_10_07.md`](gate_compliance_2026_10_07.md)** (graded against commit 700b9aac from handlers' first statements).
+
 **Date**: 2026-01-13
 **Commit**: 31b1ddc3
 **Scope**: AD-9 through AD-50 (excluding AD-27)
@@ -130,7 +132,7 @@ Closed 2026-10-07:
 - `GatePeerCoordinator.on_peer_confirmed` had no caller; the server registers its own `GateServer._on_peer_confirmed` with SWIM (AD-29: map the UDP address to TCP and add the active peer through the TaskRunner). The wired server method is kept and the unwired coordinator twin deleted.
 
 Open:
-- No manager, worker or client compliance report exists; this is the only one.
+- ~~No manager, worker or client compliance report exists; this is the only one.~~ Closed 2026-10-07: see the 2026-10-07 reports beside this file.
 
 ---
 

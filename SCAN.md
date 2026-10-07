@@ -4626,6 +4626,8 @@ Architecture Decision documents (ADs) specify required behaviors, message types,
 
 ### AD Compliance Matrix
 
+> The names below predate several AD renumberings (e.g. AD-35 is Vivaldi, AD-16 datacenter health); the 2026-10-07 reports grade by the names in `docs/architecture/AD_<n>.md`.
+
 **Scope**: AD-9 through AD-50, excluding AD-27
 
 | AD | Name | Primary Node | Key Artifacts to Verify |
@@ -4792,9 +4794,11 @@ Store compliance report in `docs/architecture/compliance/`:
 
 ```
 docs/architecture/compliance/
-├── gate_compliance_2026_01_13.md
-├── manager_compliance_2026_01_13.md
-└── worker_compliance_2026_01_13.md
+├── gate_compliance_2026_01_13.md      (superseded)
+├── gate_compliance_2026_10_07.md
+├── manager_compliance_2026_10_07.md
+├── worker_compliance_2026_10_07.md
+└── client_compliance_2026_10_07.md
 ```
 
 Include:

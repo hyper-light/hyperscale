@@ -11,7 +11,6 @@ Tests the full consensus lifecycle:
 """
 
 import asyncio
-import time
 from collections import defaultdict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -365,30 +364,3 @@ async def test_single_node_consensus() -> None:
     assert [entry.command for entry in network._applied_entries["solo"]] == [b"cmd"]
     assert await nodes["solo"].apply_committed_entries() == 0
 
-
-if __name__ == "__main__":
-    print("Running Raft consensus integration tests...")
-
-    tests = [
-        ("Leader election (3 nodes)", test_leader_election_three_nodes),
-        ("Log replication", test_log_replication),
-        ("Follower applies committed", test_follower_applies_committed_entries),
-        ("Multiple proposals", test_multiple_proposals),
-        ("Step down on higher term", test_step_down_on_higher_term),
-        ("Re-election after leader loss", test_re_election_after_leader_loss),
-        ("Cleanup releases state", test_cleanup_releases_all_state),
-        ("Single node consensus", test_single_node_consensus),
-    ]
-
-    passed = 0
-    failed = 0
-    for name, test_func in tests:
-        try:
-            asyncio.run(test_func())
-            print(f"  PASS: {name}")
-            passed += 1
-        except Exception as error:
-            print(f"  FAIL: {name} -- {error}")
-            failed += 1
-
-    print(f"\nResults: {passed} passed, {failed} failed out of {len(tests)} tests")
