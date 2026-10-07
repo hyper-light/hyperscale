@@ -30,7 +30,7 @@ class GoogleSearch(Workflow):
     screenshots show where each iteration ended up.
     """
 
-    vus = 2
+    vus = 5
     duration = "20s"
 
     @step()
