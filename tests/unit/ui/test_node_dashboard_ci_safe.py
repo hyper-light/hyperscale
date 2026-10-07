@@ -26,12 +26,8 @@ from hyperscale.logging import Logger
 from hyperscale.ui.node_dashboard import ManagerDashboardReader, NodeDashboard, NodeDashboardConfig
 from hyperscale.ui.node_dashboard.models import NodeDashboardFrame
 from hyperscale.ui.node_dashboard.node_dashboard_summary_lines import NodeDashboardSummaryLines
-from hyperscale.ui.node_dashboard.terminal_capability import (
-    CI_ENVIRONMENT_VARIABLES,
-    environment_fallback,
-    layout_fallback,
-    select_node_terminal_mode,
-)
+from hyperscale.ui.ci_safe.terminal_capability import CI_ENVIRONMENT_VARIABLES, environment_fallback
+from hyperscale.ui.node_dashboard.terminal_capability import layout_fallback, select_node_terminal_mode
 from tests.integration.cli.node_processes import reserve_port_blocks
 from tests.integration.ui.node_dashboard_harness import (
     dashboard_env,

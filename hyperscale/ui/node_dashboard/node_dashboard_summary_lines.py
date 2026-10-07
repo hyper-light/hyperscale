@@ -1,31 +1,10 @@
 import asyncio
 import math
-import os
 from typing import BinaryIO
 
-from .dashboard_formatting import format_duration
+from hyperscale.ui.ci_safe.summary_line_output import SUMMARY_ENCODING, format_duration, write_summary_line
+
 from .models import NodeDashboardFrame
-
-# What a summary line becomes on the wire: plain ASCII whatever the locale,
-# a character outside it written as "?".
-SUMMARY_ENCODING = "ascii"
-
-
-def write_summary_line(output: BinaryIO, line: bytes) -> None:
-    """Write and flush one summary line. A reader that has gone away
-    (EPIPE) leaves the output pointed at the null device, so the process's
-    own final flush of it cannot fail as well -- the remedy the Python
-    documentation gives for SIGPIPE (library/signal, "Note on SIGPIPE") --
-    and the error is raised for the caller to report."""
-    try:
-        output.write(line)
-        output.flush()
-
-    except BrokenPipeError:
-        null_device = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(null_device, output.fileno())
-        os.close(null_device)
-        raise
 
 
 def summary_text(frame: NodeDashboardFrame, readings: list[str]) -> str:

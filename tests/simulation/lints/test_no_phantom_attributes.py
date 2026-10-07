@@ -121,7 +121,9 @@ DECLARED_FIELD_BINDERS: frozenset[str] = frozenset({"Message"})
 # subclasses the stdlib's `Exception`.
 # Raised from 619 to 621 for the gate's no-room hold: `RetryAfterError`
 # (the stdlib's `Exception`) and `DatacentersWithoutRoomError` below it.
-MAX_UNPROVABLE_CLASSES = 621
+# Raised from 621 to 622 for `RunSummaryStopped` (the stdlib's
+# `Exception`): a run's CI-safe summary ending on an error of its own.
+MAX_UNPROVABLE_CLASSES = 622
 
 
 class ClassFacts:

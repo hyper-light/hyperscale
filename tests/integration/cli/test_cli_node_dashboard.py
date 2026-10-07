@@ -33,7 +33,7 @@ import pytest
 
 from hyperscale.ui.node_dashboard import GateDashboardReader, ManagerDashboardReader, WorkerDashboardReader
 from hyperscale.ui.node_dashboard.models import NodeDashboardLayout
-from hyperscale.ui.node_dashboard.terminal_capability import CI_ENVIRONMENT_VARIABLES
+from hyperscale.ui.ci_safe.terminal_capability import CI_ENVIRONMENT_VARIABLES
 from tests.integration.cli.node_processes import (
     BOOT_MARKERS,
     BOOT_TIMEOUT_SECONDS,

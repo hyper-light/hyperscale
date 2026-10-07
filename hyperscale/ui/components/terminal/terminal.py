@@ -226,6 +226,19 @@ class Terminal:
             on_update=cls.trigger_render,
         )
 
+    @classmethod
+    def subscribe(cls, channel: str, update: Callable[[ActionData], Awaitable[None]]) -> None:
+        """Receive every update a wrapped action publishes on ``channel``,
+        as a component does, without rendering: a reader of the actions
+        other than a terminal (the CI-safe summary of a run)."""
+        cls._updates.add_topic(channel, [update])
+
+    @classmethod
+    def unsubscribe(cls, updates: list[Callable[[ActionData], Awaitable[None]]]) -> None:
+        """Stop ``updates`` receiving any channel's updates, and release
+        them."""
+        cls._updates.remove_updates(updates)
+
     @contextlib.asynccontextmanager
     async def updating(self) -> AsyncIterator[None]:
         """Hold the next frame while a batch of updates is published, so

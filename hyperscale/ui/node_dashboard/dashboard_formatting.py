@@ -22,13 +22,6 @@ def format_reading(value: float | None) -> str:
     return f"{value:.1f}"
 
 
-def format_duration(total_seconds: float) -> str:
-    """``total_seconds`` as hours, minutes and whole seconds: ``1h02m03s``."""
-    minutes, seconds = divmod(int(total_seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h{minutes:02d}m{seconds:02d}s"
-
-
 def describe_cluster_role(membership: ClusterMembership) -> str:
     """The node's place in its cluster: standalone (a cohort of itself),
     leader, follower, or the formation stage it has reached."""

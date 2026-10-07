@@ -12,9 +12,10 @@ from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerError, ServerWarning
 from hyperscale.ui.components.table import TableConfig
 from hyperscale.ui.components.terminal import Terminal
+from hyperscale.ui.ci_safe.summary_line_output import format_duration
 from hyperscale.ui.config.mode import TerminalDisplayMode
 
-from .dashboard_formatting import format_duration, format_reading
+from .dashboard_formatting import format_reading
 from .models import NodeDashboardFrame, NodeDashboardLayout, TableRow
 from .node_dashboard_actions import (
     update_node_dashboard_chart,

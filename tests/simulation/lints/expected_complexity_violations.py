@@ -105,7 +105,6 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/commands/run/seed_locators.py::resolve_locators': 9,
     'hyperscale/commands/run/seed_locators.py::resolve_seed_addresses': 5,
     'hyperscale/commands/run/worker.py::worker': 4,
-    'hyperscale/commands/run/workflow.py::workflow': 15,
     'hyperscale/core/engines/client/client.py::Client.__getitem__': 16,
     'hyperscale/core/engines/client/client.py::Client.close': 4,
     'hyperscale/core/engines/client/ftp/mercury_sync_ftp_connection.py::MercurySyncFTPConnection._change_directory': 10,

@@ -17,7 +17,8 @@ from hyperscale.distributed.runtime import RealClock, RealFilesystem, RealRandom
 from hyperscale.distributed.swim.core.node_id import NodeId
 from hyperscale.distributed.taskex import TaskRunner
 from hyperscale.logging import Logger
-from hyperscale.ui.node_dashboard.models import NodeDashboardLayout, NodeTerminalSelection
+from hyperscale.ui.ci_safe import TerminalSelection
+from hyperscale.ui.node_dashboard.models import NodeDashboardLayout
 from hyperscale.ui.node_dashboard.terminal_capability import select_node_terminal_mode
 
 from .cluster_cookie import ClusterCookie
@@ -116,7 +117,7 @@ async def node_terminal_mode(
     configured_mode: TerminalMode,
     quiet: bool,
     layout: NodeDashboardLayout,
-) -> NodeTerminalSelection:
+) -> TerminalSelection:
     """The terminal mode a ``hyperscale run worker|manager|gate`` node's
     dashboard runs in, detected at runtime (``select_node_terminal_mode``):
     "full" only where stdout can show ``layout``'s dashboard, otherwise
