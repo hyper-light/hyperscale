@@ -91,11 +91,12 @@ def run_clock_fence_scenario(
     clock_skew_schedule: list[tuple[str, float, float]],
     job_timeout_seconds: float = 30.0,
     wait_timeout_seconds: float = 45.0,
+    seed: int = 23,
 ) -> dict:
     """Three peered managers (``skewed_host`` follows the skew schedule),
     one worker seeded at the first manager, and a client submitting one
-    job to the tier. Returns every child's log."""
-    coordinator = SimulationCoordinator(latency=0.01, max_virtual_time=max_virtual_time, seed=23)
+    job to the tier, under ``seed``. Returns every child's log."""
+    coordinator = SimulationCoordinator(latency=0.01, max_virtual_time=max_virtual_time, seed=seed)
     for host, tcp_port, udp_port in PEERED_MANAGERS:
         coordinator.add_process(
             host,

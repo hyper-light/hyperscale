@@ -23,6 +23,10 @@ Pinned:
 * Replay-deterministic.
 """
 
+import functools
+
+import pytest
+
 from hyperscale.distributed.env import Env
 from tests.simulation.harness.sim.multiprocess.clock_fence_demo import (
     WATCH_INTERVAL_SECONDS,
@@ -42,9 +46,17 @@ _RESTORE_AT = 40.0
 _CEILING = 60.0
 _MANAGERS = ("sim-mgr-a", "sim-mgr-b", "sim-mgr-c")
 _SKEWED = "sim-mgr-c"
-# With the mid-run schedule, sim-mgr-c is the datacenter leader before the
-# skew (asserted below: the scenario fences a sitting leader).
+# The mid-run schedule skews whichever manager leads the datacenter over
+# the second before the skew -- read from the fault-free twin, never
+# hardcoded (which manager wins the election is a function of the seed
+# and of every change that shifts the deterministic schedule).
 _MID_RUN_SKEW_AT = 20.0
+_PRE_SKEW_WINDOW = (_MID_RUN_SKEW_AT - 1.0, _MID_RUN_SKEW_AT)
+_SCENARIO_SEED = 23
+# Seeds whose fault-free twins elect each of the three managers (probed:
+# 23 -> sim-mgr-b, 2 -> sim-mgr-c, 6 -> sim-mgr-a), so the sweep fences
+# every manager as the sitting leader.
+_LEADER_FENCE_SEEDS = (_SCENARIO_SEED, 1, 2, 3, 4, 5, 6, 7)
 _SKEWED_GATE = GATE_HOSTS[1]  # the client's only gate
 _GATE_RESTORE_AT = 20.0
 _GATE_CEILING = 50.0
@@ -107,12 +119,34 @@ def _run_fenced_from_boot() -> dict:
     )
 
 
-def _run_leader_fenced_mid_run() -> dict:
-    return run_clock_fence_scenario(
+@functools.cache
+def _leader_before_mid_run_skew(seed: int) -> str:
+    """The manager leading the datacenter over the second before the
+    mid-run skew in the scenario's fault-free twin (same seed, topology
+    and ceiling, no skew). A skew step cannot change anything before its
+    own instant, so the twin IS the faulted run up to the skew; the
+    faulted run re-asserts the premise from its own rows."""
+    twin = run_clock_fence_scenario(_CEILING, _SKEWED, [], seed=seed)
+    pre_skew_leaders = [
+        manager
+        for manager in _MANAGERS
+        if _overlaps(_windows(twin[manager], "dc-leader", True), _PRE_SKEW_WINDOW)
+    ]
+    assert len(pre_skew_leaders) == 1, ("the fault-free twin must have one sitting leader before the skew", twin)
+    return pre_skew_leaders[0]
+
+
+def _run_leader_fenced_mid_run(seed: int = _SCENARIO_SEED) -> tuple[dict, str]:
+    """Skew the sitting datacenter leader mid-run; returns the run's
+    results and the skewed manager."""
+    skewed_manager = _leader_before_mid_run_skew(seed)
+    results = run_clock_fence_scenario(
         _CEILING,
-        _SKEWED,
+        skewed_manager,
         [("wall_skew", _MID_RUN_SKEW_AT, _SKEW_SECONDS), ("wall_skew", _RESTORE_AT, 0.0)],
+        seed=seed,
     )
+    return results, skewed_manager
 
 
 def test_a_manager_fast_from_boot_fences_and_the_job_completes_without_it():
@@ -129,25 +163,26 @@ def test_a_manager_fast_from_boot_fences_and_the_job_completes_without_it():
     _assert_job_completed(results["client"])
 
 
-def test_a_fenced_leader_steps_down_and_a_healthy_manager_takes_over():
-    results = _run_leader_fenced_mid_run()
-    skewed_log = results[_SKEWED]
+@pytest.mark.parametrize("seed", _LEADER_FENCE_SEEDS)
+def test_a_fenced_leader_steps_down_and_a_healthy_manager_takes_over(seed: int):
+    results, skewed_manager = _run_leader_fenced_mid_run(seed)
+    skewed_log = results[skewed_manager]
 
-    assert _overlaps(_windows(skewed_log, "dc-leader", True), (_MID_RUN_SKEW_AT - 1.0, _MID_RUN_SKEW_AT)), (
+    assert _overlaps(_windows(skewed_log, "dc-leader", True), _PRE_SKEW_WINDOW), (
         "precondition: the skewed manager leads before the skew",
         skewed_log,
     )
     ((fenced_at, unfenced_at),) = _windows(skewed_log, "fenced", True)
     assert _MID_RUN_SKEW_AT < fenced_at <= _MID_RUN_SKEW_AT + _DETECTION_BOUND_SECONDS, skewed_log
 
-    _assert_only_the_skewed_node_fences(results, _MANAGERS, _SKEWED)
+    _assert_only_the_skewed_node_fences(results, _MANAGERS, skewed_manager)
     _assert_fenced_node_holds_nothing(skewed_log)
     _assert_unfenced_within_bound(skewed_log)
 
     successors = [
         manager
         for manager in _MANAGERS
-        if manager != _SKEWED and _overlaps(_windows(results[manager], "dc-leader", True), (fenced_at, unfenced_at))
+        if manager != skewed_manager and _overlaps(_windows(results[manager], "dc-leader", True), (fenced_at, unfenced_at))
     ]
     assert len(successors) == 1, results
 

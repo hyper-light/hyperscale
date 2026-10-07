@@ -35,6 +35,8 @@ anchors; see the per-scenario docstrings for the measured timelines):
 """
 
 
+import functools
+from collections.abc import Callable
 
 from hyperscale.distributed.env import Env
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
@@ -53,6 +55,9 @@ from tests.simulation.harness.sim.multiprocess.worker_manager_demo import (
 from tests.simulation.oracle import JobStatusOracle
 
 _SEED = 61
+# Coordinator link latency, one way: the earliest instant any reaction to
+# an observed row can take effect.
+_LATENCY = 0.01
 _DURATION_SECONDS = 8.0
 _JOB_TIMEOUT_SECONDS = 60.0
 
@@ -216,39 +221,70 @@ def _final_health(gate_log: list) -> dict[str, str]:
     return {entry[1]: entry[2] for entry in gate_log if entry[0] == "dc-health"}
 
 
+def _is_running_status(row: tuple) -> bool:
+    """The client's first observation of its job ``running``."""
+    return row[:2] == ("status-seen", "running")
+
+
+def _schedule_on_client_running(
+    coordinator: SimulationCoordinator,
+    fault_instants: dict[str, float],
+    schedule_fault: Callable[[float], None],
+) -> None:
+    """Fault the run one coordinator latency after the client first
+    observes its job ``running`` -- inside live execution on dc-west,
+    whatever instant the seed's schedule puts dispatch at (a pinned
+    instant stops landing inside execution the moment the schedule
+    moves). ``schedule_fault(fault_at)`` arms the scenario's faults;
+    the instant is recorded as ``fault_instants["fault_at"]``."""
+
+    def fault_once_running(running_row: tuple) -> None:
+        fault_at = running_row[2] + _LATENCY
+        fault_instants["fault_at"] = fault_at
+        schedule_fault(fault_at)
+
+    coordinator.schedule_on_event("client-a", _is_running_status, fault_once_running)
+
+
+def _schedule_west_loss_once_running(
+    coordinator: SimulationCoordinator, fault_instants: dict[str, float]
+) -> None:
+    """Kill all of dc-west (manager, worker, both executors) once the
+    client has observed its job running there."""
+
+    def kill_west(loss_at: float) -> None:
+        for victim_id in _DC_VICTIMS["dc-west"]:
+            coordinator.schedule_kill(victim_id, loss_at)
+
+    _schedule_on_client_running(coordinator, fault_instants, kill_west)
+
+
 # ---------------------------------------------------------------------------
 # Scenario 1: total loss of the job's OWN datacenter mid-execution
 # ---------------------------------------------------------------------------
 
-# Inside dc-west's probed execution window [3.0, 4.25] (seed 61), half a
-# second after dispatch as before. Re-probed 2026-10-04: dispatch moved
-# from 11.0 to 3.0 once a lone manager leads the moment its own vote is
-# the majority of its cohort (Raft section 5.2), instead of waiting out
-# a full pre-vote and vote wait.
-_LOSS_AT = 3.5
 _LOSS_CEILING = 140.0
 
 
-def _run_stranded_dc_loss() -> dict:
-    """Kill dc-west (manager + worker + both executors) at t=3.5 —
-    probe-pinned to land INSIDE live execution: the job is placed in
-    dc-west, dispatch reaches the worker at 3.0, and the workflow (an
-    action hook: about a second whatever its duration) executes over
-    [3.0, 4.25]. Re-probed 2026-10-04; the timeline below is the
-    original probe's.
+def _run_stranded_dc_loss() -> tuple[dict, dict[str, float]]:
+    """Kill dc-west (manager + worker + both executors) one latency after
+    the client first observes its job running there -- INSIDE live
+    execution: the job is placed in dc-west and the workflow (an action
+    hook: about a second whatever its duration) is still executing.
+    Returns the results and the kill instant (``fault_at``).
 
-    Measured timeline: submit 2.12, dispatch 9.5, kill 9.8, gate flips
-    dc-west unhealthy 38.5, client observes terminal ``timeout`` 77.01
-    (= submit + 60s job timeout + one 15s AD-34 tick - just-missed
-    check at 62.0)."""
+    Original probe (when the kill was a pinned instant): submit
+    2.12, dispatch 9.5, kill 9.8, gate flips dc-west unhealthy 38.5,
+    client observes terminal ``timeout`` 77.01 (= submit + 60s job
+    timeout + one 15s AD-34 tick - just-missed check at 62.0)."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
     _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
-    for victim_id in _DC_VICTIMS["dc-west"]:
-        coordinator.schedule_kill(victim_id, _LOSS_AT)
-    return coordinator.run()
+    fault_instants: dict[str, float] = {}
+    _schedule_west_loss_once_running(coordinator, fault_instants)
+    return coordinator.run(), fault_instants
 
 
 def test_dc_loss_strands_job_to_loud_gate_timeout():
@@ -258,21 +294,22 @@ def test_dc_loss_strands_job_to_loud_gate_timeout():
     constraint lists dc-west alone, so AD-36's mid-flight failover finds
     no datacenter to move its share to and asks again every check until
     the timeout ends the job."""
-    results = _run_stranded_dc_loss()
+    results, fault_instants = _run_stranded_dc_loss()
+    loss_at = fault_instants["fault_at"]
     client_log = results["client-a"]
 
     submitted_time = _submitted_at(client_log)
-    assert submitted_time < _LOSS_AT, client_log
+    assert submitted_time < loss_at, client_log
 
     # The kill landed inside live execution: the client had already
-    # observed ``running`` (probe: 9.62 < 9.8). The worker's own log is
+    # observed ``running`` (the kill's trigger). The worker's own log is
     # unavailable — SIGKILLed children never report their milestones.
     running_times = [
         entry[2]
         for entry in client_log
         if entry[0] == "status-seen" and entry[1] == "running"
     ]
-    assert running_times and running_times[0] < _LOSS_AT, client_log
+    assert running_times and running_times[0] < loss_at, client_log
 
     # Loud terminal, correctly bounded: never before the job timeout,
     # never later than one full tracker tick past it.
@@ -294,7 +331,7 @@ def test_dc_loss_strands_job_to_loud_gate_timeout():
     gate_log = results["sim-gate-a"]
     west_unhealthy_times = _health_times(gate_log, "dc-west", "unhealthy")
     assert west_unhealthy_times, gate_log
-    detection_latency = west_unhealthy_times[-1] - _LOSS_AT
+    detection_latency = west_unhealthy_times[-1] - loss_at
     assert _DEATH_CLASSIFY_MIN <= detection_latency <= _DEATH_CLASSIFY_MAX, (
         f"dead-DC classification latency {detection_latency}s outside "
         "the heartbeat-staleness design bound (30s timeout - up to one "
@@ -317,20 +354,16 @@ def test_dc_loss_strand_is_replay_deterministic():
 # Scenario 2: manager power-loss restart inside one DC, mid-execution
 # ---------------------------------------------------------------------------
 
-# Inside dc-west's probed execution window [3.0, 4.25] (seed 61), half a
-# second after dispatch as before. Re-probed 2026-10-04: dispatch moved
-# from 11.0 to 3.0 once a lone manager leads the moment its own vote is
-# the majority of its cohort (Raft section 5.2), instead of waiting out
-# a full pre-vote and vote wait.
-_RESTART_AT = 3.5
 _RESTART_DOWN_SECONDS = 30.0
 _RESTART_CEILING = 160.0
 
 
-def _run_manager_restart_mid_execution() -> dict:
-    """Power-lose dc-west's manager at t=3.5 (the workflow is running on
-    its worker) and reboot from the surviving durable disk at t=33.5.
-    Re-probed 2026-10-04; the timeline below is the original probe's.
+def _run_manager_restart_mid_execution() -> tuple[dict, dict[str, float]]:
+    """Power-lose dc-west's manager one latency after the client first
+    observes its job running (the workflow is running on its worker) and
+    reboot it from the surviving durable disk 30s later. Returns the
+    results and the power-loss instant (``fault_at``). The timeline
+    below is the original (pinned-instant) probe's.
 
     Measured timeline: dispatch 9.5, restart 9.8, first worker
     execution cycle ends 34.0 (its result had no live manager), gen-2
@@ -340,14 +373,19 @@ def _run_manager_restart_mid_execution() -> dict:
     dc-west dips unhealthy at 38.5 (staleness bound) and returns
     healthy at 42.5 on gen-2 heartbeats."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_RESTART_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_RESTART_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
     _add_soak_client(coordinator, "client-a", "sim-cli-a", 140.0, pinned_datacenters=_JOB_PLACEMENT)
-    coordinator.schedule_restart(
-        "manager-dc-west", _RESTART_AT, down_seconds=_RESTART_DOWN_SECONDS
+    fault_instants: dict[str, float] = {}
+    _schedule_on_client_running(
+        coordinator,
+        fault_instants,
+        lambda restart_at: coordinator.schedule_restart(
+            "manager-dc-west", restart_at, down_seconds=_RESTART_DOWN_SECONDS
+        ),
     )
-    return coordinator.run()
+    return coordinator.run(), fault_instants
 
 
 def test_job_completes_exactly_once_across_manager_restart_in_l3():
@@ -355,15 +393,16 @@ def test_job_completes_exactly_once_across_manager_restart_in_l3():
     submitted through the GATE completes across the mid-execution
     manager reboot, exactly once at the client, and BEFORE the AD-34
     job timeout would have fired."""
-    results = _run_manager_restart_mid_execution()
+    results, fault_instants = _run_manager_restart_mid_execution()
+    restart_at = fault_instants["fault_at"]
     client_log = results["client-a"]
 
     submitted_time = _submitted_at(client_log)
-    assert submitted_time < _RESTART_AT, client_log
+    assert submitted_time < restart_at, client_log
 
     (_tag, final_status, finished_time) = _finished(client_log)
     assert final_status == "completed", client_log
-    generation_two_up = _RESTART_AT + _RESTART_DOWN_SECONDS
+    generation_two_up = restart_at + _RESTART_DOWN_SECONDS
     assert generation_two_up < finished_time < (
         submitted_time + _JOB_TIMEOUT_SECONDS
     ), (
@@ -376,7 +415,7 @@ def test_job_completes_exactly_once_across_manager_restart_in_l3():
     # re-dispatch.
     west_rises = _active_rise_times(results["worker-dc-west"])
     assert len(west_rises) >= 2, results["worker-dc-west"]
-    assert west_rises[0] < _RESTART_AT < west_rises[-1], results[
+    assert west_rises[0] < restart_at < west_rises[-1], results[
         "worker-dc-west"
     ]
     assert not _active_rise_times(results["worker-dc-east"]), results[
@@ -401,7 +440,7 @@ def test_job_completes_exactly_once_across_manager_restart_in_l3():
     gate_log = results["sim-gate-a"]
     west_unhealthy_times = _health_times(gate_log, "dc-west", "unhealthy")
     assert west_unhealthy_times, gate_log
-    dip_latency = west_unhealthy_times[-1] - _RESTART_AT
+    dip_latency = west_unhealthy_times[-1] - restart_at
     assert _DEATH_CLASSIFY_MIN <= dip_latency <= _DEATH_CLASSIFY_MAX, gate_log
     assert _final_health(gate_log) == {
         "dc-east": "healthy",
@@ -423,23 +462,22 @@ def test_manager_restart_mid_execution_is_replay_deterministic():
 # Scenario 3: gate<->DC partition covering the completion push
 # ---------------------------------------------------------------------------
 
-# Inside dc-west's probed execution window [3.0, 4.25] (seed 61), half a
-# second after dispatch as before. Re-probed 2026-10-04: dispatch moved
-# from 11.0 to 3.0 once a lone manager leads the moment its own vote is
-# the majority of its cohort (Raft section 5.2), instead of waiting out
-# a full pre-vote and vote wait.
-_PUSH_CUT_AT = 3.5
-# Healed before the gate's detector could suspect dc-west (12.0s after the
-# cut at the earliest measured), after the completion send (~4.0) died in
-# the cut: eight seconds after it, as before.
-_PUSH_CUT_HEAL = 11.5
+# The cut opens once the client observes its job running (the workflow is
+# still executing, so the completion send lands inside the cut) and heals
+# before the gate's detector could suspect dc-west (12.0s after the cut at
+# the earliest measured): eight seconds after it opens, as before.
+_PUSH_CUT_SECONDS = 8.0
+# Measured (2026-10-04): the client observed the completion 13.99 - 11.5
+# seconds after the heal.
+_POST_HEAL_DELIVERY_SECONDS = 2.49
 
 
-def _run_partition_over_completion_push() -> dict:
-    """Cable-cut gate <-> manager-dc-west over [3.5, 11.5) — the window
-    covers the manager's completion notification (~4.0) but heals before
+def _run_partition_over_completion_push() -> tuple[dict, dict[str, float]]:
+    """Cable-cut gate <-> manager-dc-west for 8s from one latency after
+    the client first observes its job running (``fault_at``) — the
+    window covers the manager's completion notification but heals before
     the gate's phi-accrual detector suspects dc-west, so classification
-    never flips. (Re-probed 2026-10-04; the history below is the original
+    never flips. (The history below is the original pinned-instant
     probe.)
 
     Measured (post notice-backoff): the workflow runs to completion on
@@ -452,14 +490,19 @@ def _run_partition_over_completion_push() -> dict:
     cleanup: the completion was lost FOREVER and the gate resolved the
     job as a false ``timeout`` at 77.01 despite the successful run."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
     _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
-    coordinator.schedule_partition(
-        "sim-gate-a", "manager-dc-west", _PUSH_CUT_AT, heal_time=_PUSH_CUT_HEAL
+    fault_instants: dict[str, float] = {}
+    _schedule_on_client_running(
+        coordinator,
+        fault_instants,
+        lambda cut_at: coordinator.schedule_partition(
+            "sim-gate-a", "manager-dc-west", cut_at, heal_time=cut_at + _PUSH_CUT_SECONDS
+        ),
     )
-    return coordinator.run()
+    return coordinator.run(), fault_instants
 
 
 def test_partition_over_completion_push_delivers_after_heal():
@@ -472,12 +515,14 @@ def test_partition_over_completion_push_delivers_after_heal():
     measured 65.06. Never the false ``timeout`` at 77.01 the
     single-send behavior produced, and never past the AD-34 bound
     (which remains the backstop if delivery ever regresses)."""
-    results = _run_partition_over_completion_push()
+    results, fault_instants = _run_partition_over_completion_push()
+    cut_at = fault_instants["fault_at"]
+    heal_at = cut_at + _PUSH_CUT_SECONDS
     client_log = results["client-a"]
 
     # The workflow genuinely ran and drained on dc-west.
     west_rises = _active_rise_times(results["worker-dc-west"])
-    assert west_rises and west_rises[0] < _PUSH_CUT_AT, results[
+    assert west_rises and west_rises[0] < cut_at, results[
         "worker-dc-west"
     ]
 
@@ -493,13 +538,15 @@ def test_partition_over_completion_push_delivers_after_heal():
         + _TRACKER_TICK_SECONDS
         + _TERMINAL_SLACK_SECONDS
     )
-    assert _PUSH_CUT_HEAL < finished_time < ad34_backstop, client_log
-    # Measured 13.99 (2026-10-04): heal 11.5 + the owed notice's next
-    # resend + gate->client delivery. (21.87 with the heal at 19.5; 60.04
-    # when the cut healed at 25 and the resend backoff had grown longer.)
-    assert abs(finished_time - 13.99) <= 2.0, (
+    assert heal_at < finished_time < ad34_backstop, client_log
+    # Measured 13.99 (2026-10-04) with the heal pinned at 11.5: heal + the
+    # owed notice's next resend + gate->client delivery. (21.87 with the
+    # heal at 19.5; 60.04 when the cut healed at 25 and the resend backoff
+    # had grown longer.) Pinned relative to the heal the run derived.
+    expected_delivery_at = heal_at + _POST_HEAL_DELIVERY_SECONDS
+    assert abs(finished_time - expected_delivery_at) <= 2.0, (
         f"post-heal delivery at {finished_time} drifted from the "
-        f"measured 13.99: {client_log}"
+        f"measured heal + {_POST_HEAL_DELIVERY_SECONDS}s ({expected_delivery_at}): {client_log}"
     )
 
     # The window stayed under the staleness bound: dc-west must never
@@ -541,7 +588,7 @@ def _run_standby_dc_long_partition() -> dict:
     healthy at 58.5 (heal + 8.5: next 10s-period heartbeat +
     reclassification)."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
     _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
@@ -624,7 +671,7 @@ def _run_slow_disk_through_execution() -> dict:
     exactly the charged completion-path operations; dispatch arrival
     shifts 9.5 -> 9.75."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(
         coordinator, storage_schedule_by_dc={"dc-west": _SLOW_DISK_SCHEDULE}
@@ -672,47 +719,70 @@ def test_slow_disk_execution_is_replay_deterministic():
 # Scenario 6: disk-full manager — loud dispatch-time failure
 # ---------------------------------------------------------------------------
 
-# Between the gate's durable acceptance (2.8525) and dc-west's
-# dispatch-time WAL appends, which now follow it at once: probed
-# 2026-10-04, an arm at 2.86 fails the job at its first dispatch write
-# (2.89), one at 2.9 already misses them. Dispatch was ~8.0 before a lone
-# manager led the moment its own vote made the majority.
+# Scenario 6b's arm: before the first job's dispatch-time writes.
 _DISK_FULL_ARM_AT = 2.86
-_DISK_FULL_SCHEDULE = (("disk_full", _DISK_FULL_ARM_AT, 1024),)
+_DISK_FULL_BUDGET_BYTES = 1024
 
 
-def _run_disk_full_dispatch_failure() -> dict:
-    """dc-west's manager disk accepts 1024 further bytes from t=2.86,
-    then every write raises ENOSPC — armed after submission (2.8525, so
-    the job is durably accepted) but before dispatch, so the
-    dispatch-time WAL appends exhaust it mid-job.
-
-    Measured: the client observes a LOUD ``failed`` at 2.89 — right
-    after the dispatch attempt hit ENOSPC. Neither worker ever runs
-    the workflow (no silent cross-DC re-route of a dispatch-time
-    storage failure). The refused write makes the manager report its
-    storage unwritable, and the gate classifies dc-west UNHEALTHY from
-    the next heartbeat for as long as the disk stays full."""
+@functools.cache
+def _fault_free_pinned_job_twin() -> dict:
+    """The pinned-job topology run WITHOUT faults (cached): a storage
+    fault cannot change anything before its own instant, so this twin IS
+    the disk-full run's timeline up to the arm."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
-    _add_multi_dc_topology(
-        coordinator, storage_schedule_by_dc={"dc-west": _DISK_FULL_SCHEDULE}
-    )
+    _add_multi_dc_topology(coordinator)
     _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
     return coordinator.run()
 
 
+def _disk_full_arm_at() -> float:
+    """One coordinator latency after the twin's client observed the
+    gate's durable acceptance: the job is accepted before the disk
+    fills, and dc-west's dispatch-time WAL appends (probed 2026-10-04:
+    ~37ms after the acceptance) follow the arm."""
+    return _submitted_at(_fault_free_pinned_job_twin()["client-a"]) + _LATENCY
+
+
+def _run_disk_full_dispatch_failure() -> tuple[dict, float]:
+    """dc-west's manager disk accepts 1024 further bytes from just after
+    the job's acceptance (derived from the fault-free twin), then every
+    write raises ENOSPC — armed after submission (so the job is durably
+    accepted) but before dispatch, so the dispatch-time WAL appends
+    exhaust it mid-job. Returns the results and the arm instant.
+
+    Measured (original pinned probe: accepted 2.8525, armed 2.86): the
+    client observes a LOUD ``failed`` at 2.89 — right after the dispatch
+    attempt hit ENOSPC. Neither worker ever runs the workflow (no silent
+    cross-DC re-route of a dispatch-time storage failure). The refused
+    write makes the manager report its storage unwritable, and the gate
+    classifies dc-west UNHEALTHY from the next heartbeat for as long as
+    the disk stays full."""
+    disk_full_arm_at = _disk_full_arm_at()
+    coordinator = SimulationCoordinator(
+        latency=_LATENCY, max_virtual_time=_LOSS_CEILING, seed=_SEED
+    )
+    _add_multi_dc_topology(
+        coordinator,
+        storage_schedule_by_dc={
+            "dc-west": (("disk_full", disk_full_arm_at, _DISK_FULL_BUDGET_BYTES),)
+        },
+    )
+    _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
+    return coordinator.run(), disk_full_arm_at
+
+
 def test_disk_full_manager_fails_job_loudly_without_cross_dc_retry():
-    results = _run_disk_full_dispatch_failure()
+    results, disk_full_arm_at = _run_disk_full_dispatch_failure()
     client_log = results["client-a"]
 
     submitted_time = _submitted_at(client_log)
-    assert submitted_time < _DISK_FULL_ARM_AT, client_log
+    assert submitted_time < disk_full_arm_at, client_log
 
     (_tag, final_status, finished_time) = _finished(client_log)
     assert final_status == "failed", client_log
-    assert _DISK_FULL_ARM_AT <= finished_time <= 20.0, (
+    assert disk_full_arm_at <= finished_time <= 20.0, (
         "dispatch-time ENOSPC must fail the job promptly and loudly "
         f"(never waiting out the 60s job timeout): {client_log}"
     )
@@ -757,7 +827,9 @@ def test_disk_full_failure_is_replay_deterministic():
 # scenario 6) and frees at _DISK_FREED_AT. A second, UNPINNED job is
 # submitted while the disk is full.
 _DISK_FREED_AT = 40.0
-_DISK_FULL_WINDOW_SCHEDULE = (("disk_full_window", _DISK_FULL_ARM_AT, 1024, _DISK_FREED_AT),)
+_DISK_FULL_WINDOW_SCHEDULE = (
+    ("disk_full_window", _DISK_FULL_ARM_AT, _DISK_FULL_BUDGET_BYTES, _DISK_FREED_AT),
+)
 _SECOND_JOB_SUBMIT_AT = 15.0
 # The manager probes its storage on its dead-node check cadence and the
 # gate learns the outcome from the next manager heartbeat.
@@ -772,7 +844,7 @@ def _run_full_disk_then_freed() -> dict:
     at 40.0, the manager's next storage probe (60.0) proves the refused
     size fits, and dc-west is HEALTHY again at 60.5."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_LOSS_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(
         coordinator, storage_schedule_by_dc={"dc-west": _DISK_FULL_WINDOW_SCHEDULE}
@@ -833,10 +905,11 @@ _LONG_HORIZON_CEILING = 420.0
 _SECOND_SUBMIT_AT = 250.0
 
 
-def _run_chaos_then_quiesce_two_jobs() -> dict:
+def _run_chaos_then_quiesce_two_jobs() -> tuple[dict, dict[str, float]]:
     """>=400 virtual seconds, two jobs in sequence: job-a is stranded
     by the total loss of its datacenter mid-execution (dc-west killed
-    at _LOSS_AT, exactly the scenario-1 chaos), the cluster quiesces for
+    once its client observes it running, exactly the scenario-1 chaos;
+    the kill instant is returned as ``fault_at``), the cluster quiesces for
     ~170s, then job-b submits at t=250 with free DC selection.
 
     Measured: job-a replays scenario 1's timeline exactly (submit 2.12,
@@ -846,7 +919,7 @@ def _run_chaos_then_quiesce_two_jobs() -> dict:
     dc-east by free selection, and completes at 251.2 (dispatch 250.25,
     the client-visible completion ~1s later)."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_LONG_HORIZON_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_LONG_HORIZON_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
     _add_soak_client(coordinator, "client-a", "sim-cli-a", 150.0, pinned_datacenters=_JOB_PLACEMENT)
@@ -857,9 +930,9 @@ def _run_chaos_then_quiesce_two_jobs() -> dict:
         150.0,
         submit_at=_SECOND_SUBMIT_AT,
     )
-    for victim_id in _DC_VICTIMS["dc-west"]:
-        coordinator.schedule_kill(victim_id, _LOSS_AT)
-    return coordinator.run()
+    fault_instants: dict[str, float] = {}
+    _schedule_west_loss_once_running(coordinator, fault_instants)
+    return coordinator.run(), fault_instants
 
 
 def test_post_quiesce_job_completes_cleanly_after_dc_loss_chaos():
@@ -867,12 +940,13 @@ def test_post_quiesce_job_completes_cleanly_after_dc_loss_chaos():
     in-flight work, a job submitted AFTER the system has re-converged
     must complete cleanly — accepted first-try, placed in the
     surviving datacenter, done within seconds."""
-    results = _run_chaos_then_quiesce_two_jobs()
+    results, fault_instants = _run_chaos_then_quiesce_two_jobs()
+    loss_at = fault_instants["fault_at"]
 
     # Job-a: the scenario-1 stranding, unchanged by the second client.
     client_a_log = results["client-a"]
     submitted_a = _submitted_at(client_a_log)
-    assert submitted_a < _LOSS_AT, client_a_log
+    assert submitted_a < loss_at, client_a_log
     (_tag, status_a, finished_a) = _finished(client_a_log)
     assert status_a == "timeout", client_a_log
     earliest = submitted_a + _JOB_TIMEOUT_SECONDS
@@ -908,7 +982,7 @@ def test_post_quiesce_job_completes_cleanly_after_dc_loss_chaos():
     gate_log = results["sim-gate-a"]
     west_unhealthy_times = _health_times(gate_log, "dc-west", "unhealthy")
     assert west_unhealthy_times, gate_log
-    detection_latency = west_unhealthy_times[0] - _LOSS_AT
+    detection_latency = west_unhealthy_times[0] - loss_at
     assert _DEATH_CLASSIFY_MIN <= detection_latency <= _DEATH_CLASSIFY_MAX, (
         gate_log
     )
@@ -963,7 +1037,7 @@ def _run_concurrent_jobs_dc_loss_after_completion() -> dict:
     terminal ABSORPTION: a datacenter dying with delivered results
     must not un-complete anything."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_CONCURRENT_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_CONCURRENT_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
     coordinator.add_process(
@@ -1068,7 +1142,7 @@ def test_dc_loss_with_job_mid_dispatch_must_not_livelock_the_gate():
     the run completes to its ceiling — this test living at all is the
     regression pin."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_CONCURRENT_CEILING, seed=_SEED
+        latency=_LATENCY, max_virtual_time=_CONCURRENT_CEILING, seed=_SEED
     )
     _add_multi_dc_topology(coordinator)
     for client_id, client_host in (
