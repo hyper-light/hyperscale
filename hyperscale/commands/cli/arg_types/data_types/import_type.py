@@ -5,7 +5,9 @@ import importlib
 import importlib.util
 import inspect
 import itertools
+import os
 import pathlib
+import re
 import sys
 import types
 from typing import Any, Generic, TypeVar
@@ -13,6 +15,9 @@ from typing import Any, Generic, TypeVar
 from .reduce_pattern_type import reduce_pattern_type
 
 T = TypeVar("T")
+
+# Characters a Python identifier cannot hold.
+NON_IDENTIFIER_CHARACTERS = re.compile(r"\W")
 
 
 class ImportType(Generic[T]):
@@ -60,8 +65,12 @@ class ImportType(Generic[T]):
             return Exception("no argument passed for filepath")
 
         try:
-            resolved_path = await self._loop.run_in_executor(None, pathlib.Path(arg).resolve)
-            sources = await self._loop.run_in_executor(None, _module_sources, resolved_path)
+            # Absolute with ".." collapsed, but symlinks kept: modules are
+            # named by the path as given. A Kubernetes ConfigMap file
+            # resolves into a hidden "..<timestamp>" directory, which is no
+            # package name.
+            given_path = pathlib.Path(await self._loop.run_in_executor(None, os.path.abspath, arg))
+            sources = await self._loop.run_in_executor(None, _module_sources, given_path)
             return self._defined_types(await self._import_modules(sources), arg)
 
         except Exception as e:
@@ -132,22 +141,22 @@ def _is_base_of_another(candidate: type, named: dict[str, type]) -> bool:
     return any(other is not candidate and issubclass(other, candidate) for other in named.values())
 
 
-def _module_sources(resolved_path: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
-    """Each module to import for ``resolved_path`` -- the file, or every
+def _module_sources(given_path: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
+    """Each module to import for ``given_path`` -- the file, or every
     Python file under the directory -- named under the directory's package
     as a file's always was, with that package's parent put on ``sys.path`` so
     its imports resolve."""
-    package_root, sources = _package_and_sources(resolved_path)
+    package_root, sources = _package_and_sources(given_path)
     _add_to_sys_path(package_root.parent)
     return [(_module_name(package_root, source), source) for source in sources]
 
 
-def _package_and_sources(resolved_path: pathlib.Path) -> tuple[pathlib.Path, list[pathlib.Path]]:
-    if resolved_path.is_file():
-        return resolved_path.parent, [resolved_path]
-    if resolved_path.is_dir():
-        return resolved_path, _python_sources(resolved_path)
-    raise FileNotFoundError(f"{resolved_path} is neither a file nor a directory")
+def _package_and_sources(given_path: pathlib.Path) -> tuple[pathlib.Path, list[pathlib.Path]]:
+    if given_path.is_file():
+        return given_path.parent, [given_path]
+    if given_path.is_dir():
+        return given_path, _python_sources(given_path)
+    raise FileNotFoundError(f"{given_path} is neither a file nor a directory")
 
 
 def _python_sources(directory: pathlib.Path) -> list[pathlib.Path]:
@@ -167,6 +176,15 @@ def _add_to_sys_path(directory: pathlib.Path) -> None:
 
 def _module_name(package_root: pathlib.Path, source: pathlib.Path) -> str:
     """``source``'s dotted module name under ``package_root``'s package (a
-    package's ``__init__.py`` is the package itself)."""
-    parts = [package_root.name, *source.relative_to(package_root).with_suffix("").parts]
+    package's ``__init__.py`` is the package itself). Every part is made an
+    identifier: a Workflow imports its own module by name, and a part such
+    as "" (the filesystem root) or "..data" is no importable name."""
+    parts = [_identifier(part) for part in (package_root.name, *source.relative_to(package_root).with_suffix("").parts)]
     return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+
+
+def _identifier(name_part: str) -> str:
+    """``name_part`` with each character an identifier cannot hold made
+    "_", and "_" leading one that is empty or starts with a digit."""
+    identifier = NON_IDENTIFIER_CHARACTERS.sub("_", name_part)
+    return identifier if identifier.isidentifier() else f"_{identifier}"

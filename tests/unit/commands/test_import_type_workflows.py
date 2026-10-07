@@ -114,6 +114,50 @@ async def test_a_file_without_workflows_is_refused(tmp_path: pathlib.Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_a_configmap_mounted_file_loads_workflows_that_construct(tmp_path: pathlib.Path) -> None:
+    """Kubernetes mounts a ConfigMap key as a symlink through "..data" into
+    a hidden "..<timestamp>" directory. A Workflow imports its own module by
+    name when constructed, so that module's name must be importable: it
+    once came from the hidden directory ("..2026_10_07_...") and every run
+    from a ConfigMap failed with "the 'package' argument is required"."""
+    mount = tmp_path / "work"
+    write_module(
+        mount / "..2026_10_07_20_40_01.2323764433" / "cluster_test.py",
+        """
+        from hyperscale.graph import Workflow
+
+        class ClusterTest(Workflow):
+            pass
+        """,
+    )
+    (mount / "..data").symlink_to("..2026_10_07_20_40_01.2323764433")
+    (mount / "cluster_test.py").symlink_to(pathlib.Path("..data") / "cluster_test.py")
+
+    for path in (mount / "cluster_test.py", mount):
+        loaded = await load(path)
+
+        assert list(loaded) == ["ClusterTest"], loaded
+        assert loaded["ClusterTest"]().__module__ == "work.cluster_test"
+
+
+@pytest.mark.asyncio
+async def test_a_directory_named_as_no_identifier_loads_workflows_that_construct(tmp_path: pathlib.Path) -> None:
+    test_file = write_module(
+        tmp_path / "2026.10-load tests" / "smoke.py",
+        """
+        from hyperscale.graph import Workflow
+
+        class SmokeTest(Workflow):
+            pass
+        """,
+    )
+
+    loaded = await load(test_file)
+
+    assert loaded["SmokeTest"]().__module__ == "_2026_10_load_tests.smoke"
+
+
+@pytest.mark.asyncio
 async def test_a_missing_path_is_refused(tmp_path: pathlib.Path) -> None:
     loaded = await load(tmp_path / "suite_f" / "missing.py")
 
