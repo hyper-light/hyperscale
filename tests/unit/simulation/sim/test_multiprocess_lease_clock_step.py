@@ -34,6 +34,8 @@ its lifetime).
 Every scenario has a replay twin.
 """
 
+import functools
+
 import pytest
 
 from hyperscale.distributed.env import Env
@@ -69,9 +71,11 @@ _LEASE_SECONDS = ELECTION_TIMEOUT_MIN / (1.0 + _ENV.RAFT_CLOCK_DRIFT_BOUND)
 # still exceeds a whole lease, so a lease judged on the wall clock would
 # outlive -- or fall short of -- its bound by more than a lease.
 _STEP_SECONDS = _ENV.HLC_MAX_CLOCK_OFFSET_MS * FENCE_FRACTION_OF_MAX_OFFSET / 1000 / 2
-# The group formed and elected sim-mgr-a long before (probed 2026-10-05:
-# elected at 0.44, serving lease reads from 0.52; asserted below).
-_LEADER = "sim-mgr-a"
+# The group forms and elects its leader long before the cut. Which member
+# wins is the seed's outcome, not part of the scenario: it is found by a
+# fault-free run of the same seed up to the cut (the faults begin at the
+# cut, so the run is the same until then), and that member is the one cut
+# off -- its leading at the cut is asserted below.
 _PARTITION_AT = 10.0
 # The last round whose answer was SENT before the cut: rounds go out every
 # heartbeat interval and an answer is sent one link latency after its
@@ -130,7 +134,38 @@ _JOB_TIMEOUT_SECONDS = 60.0
 _GATE_CEILING = 40.0
 
 
-def _run_leader_lease(step_seconds: float) -> dict:
+@functools.cache
+def _leader_at_the_cut() -> str:
+    """The member leading at the cut, from a fault-free run of the seed."""
+    coordinator = SimulationCoordinator(
+        latency=LINK_LATENCY_SECONDS, max_virtual_time=_PARTITION_AT, seed=_SEED
+    )
+    for host, tcp_port, udp_port in PEERED_MANAGERS:
+        coordinator.add_process(
+            host,
+            lease_reading_manager_entry,
+            host,
+            tcp_port,
+            udp_port,
+            "sim-dc",
+            [(peer, peer_tcp) for peer, peer_tcp, _ in PEERED_MANAGERS if peer != host],
+            [(peer, peer_udp) for peer, _, peer_udp in PEERED_MANAGERS if peer != host],
+            [],
+            _READ_INTERVAL_SECONDS,
+        )
+    results = coordinator.run()
+    leaders = [
+        host
+        for host, _, _ in PEERED_MANAGERS
+        if any(start < _PARTITION_AT <= until for _term, start, until in _leadership_spans(results[host]))
+    ]
+    assert len(leaders) == 1, results
+    return leaders[0]
+
+
+def _run_leader_lease(step_seconds: float) -> tuple[str, dict]:
+    """The cut-off leader, and every member's log."""
+    leader = _leader_at_the_cut()
     coordinator = SimulationCoordinator(
         latency=LINK_LATENCY_SECONDS, max_virtual_time=_RAFT_CEILING, seed=_SEED
     )
@@ -144,13 +179,13 @@ def _run_leader_lease(step_seconds: float) -> dict:
             "sim-dc",
             [(peer, peer_tcp) for peer, peer_tcp, _ in PEERED_MANAGERS if peer != host],
             [(peer, peer_udp) for peer, _, peer_udp in PEERED_MANAGERS if peer != host],
-            [("wall_skew", _PARTITION_AT, step_seconds)] if host == _LEADER else [],
+            [("wall_skew", _PARTITION_AT, step_seconds)] if host == leader else [],
             _READ_INTERVAL_SECONDS,
         )
     for host, _, _ in PEERED_MANAGERS:
-        if host != _LEADER:
-            coordinator.schedule_partition(_LEADER, host, _PARTITION_AT)
-    return coordinator.run()
+        if host != leader:
+            coordinator.schedule_partition(leader, host, _PARTITION_AT)
+    return leader, coordinator.run()
 
 
 def _run_job_lease(lease_duration_seconds: float) -> dict:
@@ -213,9 +248,9 @@ def _served_read_times(log: list) -> list[float]:
     return lease_reads + round_reads
 
 
-def _assert_leader_lease_held_across_the_step(results: dict) -> None:
-    leader_log = results[_LEADER]
-    followers = [host for host, _, _ in PEERED_MANAGERS if host != _LEADER]
+def _assert_leader_lease_held_across_the_step(leader: str, results: dict) -> None:
+    leader_log = results[leader]
+    followers = [host for host, _, _ in PEERED_MANAGERS if host != leader]
 
     # Precondition: the stepped member leads, from its lease, at the cut.
     leader_spans = _leadership_spans(leader_log)
@@ -256,11 +291,11 @@ def _assert_leader_lease_held_across_the_step(results: dict) -> None:
 
 
 def test_a_backward_wall_step_at_the_cut_never_extends_the_leader_lease():
-    _assert_leader_lease_held_across_the_step(_run_leader_lease(-_STEP_SECONDS))
+    _assert_leader_lease_held_across_the_step(*_run_leader_lease(-_STEP_SECONDS))
 
 
 def test_a_forward_wall_step_at_the_cut_never_ends_the_leader_lease_early():
-    _assert_leader_lease_held_across_the_step(_run_leader_lease(_STEP_SECONDS))
+    _assert_leader_lease_held_across_the_step(*_run_leader_lease(_STEP_SECONDS))
 
 
 def test_leader_lease_across_a_wall_step_is_replay_deterministic():

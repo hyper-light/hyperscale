@@ -9,30 +9,28 @@ retry SHAPE comes from the traced mechanism, not the checklist's
 "~1/s rejection" sketch — that cadence is impossible under a CUT:
 
 * Each ``submit_job`` call runs an INTERNAL retry cycle
-  (``ClientJobSubmitter._submit_with_retry``): 6 attempts
-  (``submission_max_retries=5``), each a ``send_tcp`` with the dial
-  INSIDE a 10s timeout, joined by seeded-jitter exponential backoff
-  ``0.5 x 2^k x (0.5 + r)``, ``r in [0, 1)`` (sum bounds
-  [7.75, 23.25]s). Under total silence every attempt times out, so
-  one call's rejection cycle is timeout-paced — the entry-level
-  ``submit-rejected`` cadence is one per [55, 95]s, NEVER a hot spin
-  and NEVER a give-up (the entry's outer loop is unbounded).
+  (``ClientJobSubmitter._submit_with_retry``): ``1 + submission_max_retries``
+  attempts, each a ``send_tcp`` with the dial INSIDE a
+  ``CLIENT_SUBMISSION_TIMEOUT`` timeout, joined by un-hinted back-offs on the
+  RFC 6298 retransmission timeout -- under a cut no round trip lowers it
+  below ``CLIENT_RETRANSMISSION_TIMEOUT_MIN_SECONDS`` -- doubling per back-off
+  and equal-jittered by ``0.5 + r``, ``r in [0, 1)``. Under total silence
+  every attempt times out, so one call's rejection cycle is timeout-paced --
+  NEVER a hot spin and NEVER a give-up (the entry's outer loop is unbounded).
+  The bounds below are derived from those settings, not traced.
 * Only the exhausted call surfaces: ``RuntimeError("Job submission
-  failed after 5 retries: ...")`` — logged as the milestone's
+  failed after 5 retries: ...")`` -- logged as the milestone's
   exception type.
 * An attempt whose dial straddles the heal still times out (its SYN
   was already dropped; the harness models no retransmit), so
-  acceptance lands within ONE attempt-timeout + one max backoff + the
-  entry sleep of the heal — bounded by heal + 25s.
-
-Measured on seed 103 (cut [1, 95), 6s workflow, ceiling 200):
-cycle-1 rejection 41.598168 (its first attempt got a FAST pre-cut
-formation rejection at ~0.1, shortening the cycle), cycle-2 rejection
-102.598168 (fully-cut cycle: gap 61.0 = 60.0 internal + 1.0 entry
-sleep), acceptance 103.658168 (heal + 8.658), dispatch 103.75,
-execution 103.75 -> 109.75, client completion 109.698168.
+  acceptance lands within ONE attempt timeout + one max back-off + the
+  entry sleep of the heal.
+* The cut lasts until exactly two full cycles have been refused: the heal
+  comes after the latest the second rejection can land and before the
+  earliest a third could.
 """
 
+from hyperscale.distributed.env import Env
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.l2_workload_demo import (
     dag_worker_entry,
@@ -46,20 +44,30 @@ from tests.simulation.oracle import ClusterTraceOracle, JobStatusOracle
 
 _SEED = 103
 _CUT_AT = 1.0
-_HEAL_AT = 95.0
 _WORKFLOW_DURATION_SECONDS = 6.0
-_CEILING = 200.0
 
-# Traced internal-cycle bounds for a FULLY-cut submit_job call: six
-# 10s-timeout attempts + seeded backoff sum in [7.75, 23.25] — the
-# entry adds a 1s sleep between calls. A first cycle that caught a
-# fast pre-cut rejection can undercut this; the INTER-rejection gap is
-# the pure-cut cycle and must sit inside the bracket.
-_MIN_REJECTION_GAP = 55.0
-_MAX_REJECTION_GAP = 95.0
-# Acceptance after heal: one straddling attempt timeout (10) + one max
-# backoff (12) + entry sleep (1) + RTT slop.
-_MAX_ACCEPTANCE_AFTER_HEAL = 25.0
+_CLIENT_ENV = Env()
+_ATTEMPT_TIMEOUT = _CLIENT_ENV.CLIENT_SUBMISSION_TIMEOUT
+_ATTEMPTS = _CLIENT_ENV.CLIENT_SUBMISSION_MAX_RETRIES + 1
+_BACKOFF_BASE = _CLIENT_ENV.CLIENT_RETRANSMISSION_TIMEOUT_MIN_SECONDS
+# The entry's sleep between submit_job calls.
+_ENTRY_SLEEP = 1.0
+# One un-hinted back-off per retry, doubling, jittered by [0.5, 1.5).
+_BACKOFF_SUM = _BACKOFF_BASE * sum(2**backoff for backoff in range(_ATTEMPTS - 1))
+_MAX_BACKOFF = _BACKOFF_BASE * 2 ** (_ATTEMPTS - 2) * 1.5
+# The INTER-rejection gap is a fully cut cycle plus the entry sleep.
+_MIN_REJECTION_GAP = _ATTEMPTS * _ATTEMPT_TIMEOUT + 0.5 * _BACKOFF_SUM + _ENTRY_SLEEP
+_MAX_REJECTION_GAP = _ATTEMPTS * _ATTEMPT_TIMEOUT + 1.5 * _BACKOFF_SUM + _ENTRY_SLEEP
+# The first cycle's first attempt is refused at once, before the cut.
+_MIN_FIRST_REJECTION = (_ATTEMPTS - 1) * _ATTEMPT_TIMEOUT + 0.5 * _BACKOFF_SUM
+_MAX_FIRST_REJECTION = _CUT_AT + (_ATTEMPTS - 1) * _ATTEMPT_TIMEOUT + 1.5 * _BACKOFF_SUM
+# Two full cycles refused, never a third.
+_HEAL_AT = 210.0
+assert _MAX_FIRST_REJECTION + _MAX_REJECTION_GAP < _HEAL_AT < _MIN_FIRST_REJECTION + 2 * _MIN_REJECTION_GAP
+# Acceptance after heal: one straddling attempt timeout + one max back-off
+# + the entry sleep + round-trip slop.
+_MAX_ACCEPTANCE_AFTER_HEAL = _ATTEMPT_TIMEOUT + _MAX_BACKOFF + _ENTRY_SLEEP + 1.0
+_CEILING = _HEAL_AT + _MAX_ACCEPTANCE_AFTER_HEAL + _WORKFLOW_DURATION_SECONDS + 50.0
 
 
 def _run_submission_blackout() -> dict:

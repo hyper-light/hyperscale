@@ -75,6 +75,11 @@ def _rounds(jobs: int) -> int:
     return math.ceil(jobs / _CONCURRENT_WORKFLOWS)
 
 
+# What a worker keeps per manager: the manager itself, and its last
+# backpressure level and delay.
+_ENTRIES_PER_MANAGER = 3
+
+
 def _run_fanout(jobs: int) -> dict:
     coordinator = SimulationCoordinator(
         latency=_LINK_LATENCY_SECONDS, max_virtual_time=_ceiling(jobs), seed=_SEED
@@ -190,8 +195,10 @@ def test_every_job_of_a_fanout_completes_exactly_once_fairly_and_leaves_nothing_
     assert manager_final <= manager_idle + _WORKERS, (manager_idle, manager_final)
     for worker_host in _WORKER_HOSTS:
         worker_idle, worker_final = _idle_then_final(results[worker_host], "state-entries")
-        # Its one peer: the manager.
-        assert worker_final <= worker_idle + 1, (worker_host, worker_idle, worker_final)
+        # Its one peer, the manager, and nothing per job: the manager's
+        # entry, and the backpressure level and delay it last signalled
+        # (AD-23; NONE included, forgotten with the manager).
+        assert worker_final <= worker_idle + _ENTRIES_PER_MANAGER, (worker_host, worker_idle, worker_final)
 
 
 def test_fanout_is_replay_deterministic():
