@@ -5,18 +5,20 @@ crash/restart cycles over the gateless L2 restart-resume scenario
 
 Recovery must be idempotent: however many generations replay the WAL
 and resume the persisted submission, the client observes exactly one
-terminal result and the durable truth never regresses. Two probed
-placements of the second crash:
+terminal result and the durable truth never regresses. Every crash is
+derived from the run by event triggers: R1 lands 0.15 after the worker's
+first activation sample (gen-1's dispatch is live: activated at 3.5,
+R1 at 3.65, gen-2 boots at 48.65). Two placements of the second crash:
 
-* R2 = gen-2 boot + 2.6 (49.75) — INSIDE gen-2's recovery span. Gen-2
-  boots at 47.15, replays the WAL, re-activates the job and queues its
+* R2 = gen-2's observed boot + 2.6 (51.25) — INSIDE gen-2's recovery
+  span. Gen-2 replays the WAL, re-activates the job and queues its
   dispatch, and dies BEFORE the worker's re-registration (boot + 4.5) —
   its generation log carries ``manager-started`` and nothing else, the
-  structural proof the crash landed mid-recovery. Gen-3 boots at 74.75,
+  structural proof the crash landed mid-recovery. Gen-3 boots at 76.25,
   replays the SAME still-ACTIVE ledger + submission payload, resumes
-  again, re-admits the worker (80.25), re-dispatches (80.0-80.5) and the
-  client observes exactly one ``completed`` at 80.428157 — prompt: boot
-  + 5.68s.
+  again, re-admits the worker (78.25), re-dispatches (78.0-78.5) and the
+  client observes exactly one ``completed`` at 78.407213 — prompt: boot
+  + 2.16s.
 * R2 = one coordinator latency after the worker's first activation under
   gen-2 — AFTER gen-2's re-dispatch, BEFORE the completion record,
   derived from the run (an event trigger) rather than a fixed offset
@@ -27,8 +29,11 @@ placements of the second crash:
 
 Re-probed 2026-10-04: the first restart moved from 9.4 to 2.15 (0.15
 after the activation sample, as before) once a lone manager led the
-moment its own vote made the majority; the second crashes are expressed
-from gen-2's boot so they keep their places in its recovery.
+moment its own vote made the majority. Derived 2026-10-06: the fixed
+2.15 went stale when the client's un-hinted submission back-off base
+became one overload sample interval (the submission accepted at 3.49,
+not 1.80), so R1 now follows the activation itself and every later
+crash follows the generation boots the run observed.
 
 FIXED GAP (second placement): gen-3's completion used to arrive ~44s
 late (130.9). Every manager generation re-registers under a new node id
@@ -56,24 +61,25 @@ from tests.simulation.oracle import JobStatusOracle
 _SEED = 101
 _WAIT_TIMEOUT_SECONDS = 200.0
 
-# Mid-run (seed 101: the worker's activation is sampled at 2.0, the
-# completion record lands ~2.37), 0.15 after the activation sample as
-# before (9.25 -> 9.4 while a lone manager waited out a full pre-vote and
-# vote wait for a majority its own vote already made).
-_RESTART_ONE_AT = 2.15
+# Mid-run: derived from the run, 0.15 after the worker's first activation
+# sample (the rule since 9.25 -> 9.4; the sampler publishes the activation
+# at the window edge, and the completion record follows it by ~0.37s).
+# A fixed instant went stale whenever the client's submission timing
+# moved: 2.15 sat 0.15 after the activation sampled at 2.0, but once the
+# client's un-hinted back-off base became one overload sample interval
+# its accepted submission moved to 3.45 and 2.15 crashed gen-1 before the
+# job existed.
+_RESTART_ONE_AFTER_ACTIVATION_SECONDS = 0.15
 _DOWN_ONE_SECONDS = 45.0
-_GENERATION_TWO_BOOT = _RESTART_ONE_AT + _DOWN_ONE_SECONDS  # 47.15
 
 # Inside gen-2's recovery span: before it re-admits the worker (probed
-# boot + 4.5).
-_MID_RECOVERY_RESTART_AT = _GENERATION_TWO_BOOT + 2.6
+# boot + 4.5), from gen-2's OBSERVED boot.
+_MID_RECOVERY_AFTER_BOOT_SECONDS = 2.6
 _MID_RECOVERY_DOWN_SECONDS = 25.0
-_GENERATION_THREE_BOOT = (
-    _MID_RECOVERY_RESTART_AT + _MID_RECOVERY_DOWN_SECONDS
-)  # 74.75
 _MID_RECOVERY_CEILING = 140.0
 # Gen-3's resume leg (boot -> worker re-registration -> re-dispatch ->
-# completion push) measured 3.97s; gen-2's equivalent leg in the house
+# completion push) measured 2.16s (3.97s before the 2026-10-06 R1
+# derivation); gen-2's equivalent leg in the house
 # baseline measured 8.26s — bound the completion by the slower leg
 # plus slack.
 _RESUME_LEG_CEILING_SECONDS = 12.0
@@ -89,10 +95,20 @@ _MID_REDISPATCH_DOWN_SECONDS = 25.0
 _MID_REDISPATCH_CEILING = 160.0
 
 
+def _is_first_activation(row: tuple) -> bool:
+    """The worker running its first workflow (gen-1's dispatch)."""
+    return row[0] == "workflows-active" and row[1] > 0
+
+
 def _run_double_restart(
-    arm_second_restart: Callable[[SimulationCoordinator], None],
+    arm_second_restart: Callable[[SimulationCoordinator, dict[str, float]], None],
     ceiling: float,
-) -> dict:
+) -> tuple[dict, dict[str, float]]:
+    """Run the scenario; returns its results and the fault instants the
+    triggers derived: ``restart_one_at`` (0.15 after the worker's first
+    activation), ``generation_two_boot`` (that plus the downtime), and
+    whatever ``arm_second_restart`` records."""
+    fault_instants: dict[str, float] = {}
     coordinator = SimulationCoordinator(
         latency=_LATENCY, max_virtual_time=ceiling, seed=_SEED
     )
@@ -123,11 +139,20 @@ def _run_double_restart(
         ("sim-mgr", 9000),
         _WAIT_TIMEOUT_SECONDS,
     )
-    coordinator.schedule_restart(
-        "manager", _RESTART_ONE_AT, down_seconds=_DOWN_ONE_SECONDS
-    )
-    arm_second_restart(coordinator)
-    return coordinator.run()
+
+    def restart_mid_run(activation_row: tuple) -> None:
+        restart_one_at = activation_row[2] + _RESTART_ONE_AFTER_ACTIVATION_SECONDS
+        fault_instants.update(
+            restart_one_at=restart_one_at,
+            generation_two_boot=restart_one_at + _DOWN_ONE_SECONDS,
+        )
+        coordinator.schedule_restart(
+            "manager", restart_one_at, down_seconds=_DOWN_ONE_SECONDS
+        )
+
+    coordinator.schedule_on_event("worker", _is_first_activation, restart_mid_run)
+    arm_second_restart(coordinator, fault_instants)
+    return coordinator.run(), fault_instants
 
 
 def _assert_no_unswapped_imports(results: dict) -> None:
@@ -181,18 +206,28 @@ def _activation_times(worker_log: list) -> list[float]:
 # ---------------------------------------------------------------------------
 
 
-def _schedule_mid_recovery_restart(coordinator: SimulationCoordinator) -> None:
-    coordinator.schedule_restart(
-        "manager",
-        _MID_RECOVERY_RESTART_AT,
-        down_seconds=_MID_RECOVERY_DOWN_SECONDS,
-    )
+def _arm_mid_recovery_restart(
+    coordinator: SimulationCoordinator, fault_instants: dict[str, float]
+) -> None:
+    """Crash gen-2 2.6s after its observed boot (``restart_two_at``)."""
+
+    def is_generation_two_boot(row: tuple) -> bool:
+        return row[0] == "manager-started" and row[1] > fault_instants.get(
+            "restart_one_at", row[1]
+        )
+
+    def restart_mid_recovery(boot_row: tuple) -> None:
+        restart_two_at = boot_row[1] + _MID_RECOVERY_AFTER_BOOT_SECONDS
+        fault_instants.update(restart_two_at=restart_two_at)
+        coordinator.schedule_restart(
+            "manager", restart_two_at, down_seconds=_MID_RECOVERY_DOWN_SECONDS
+        )
+
+    coordinator.schedule_on_event("manager", is_generation_two_boot, restart_mid_recovery)
 
 
-def _run_crash_during_recovery() -> dict:
-    return _run_double_restart(
-        _schedule_mid_recovery_restart, _MID_RECOVERY_CEILING
-    )
+def _run_crash_during_recovery() -> tuple[dict, dict[str, float]]:
+    return _run_double_restart(_arm_mid_recovery_restart, _MID_RECOVERY_CEILING)
 
 
 def test_second_crash_inside_recovery_is_idempotent_and_completes():
@@ -200,10 +235,15 @@ def test_second_crash_inside_recovery_is_idempotent_and_completes():
     but before its dispatch could reach the (not yet re-registered)
     worker. Gen-3 must replay the SAME durable state and finish the
     job — exactly-once at the client, prompt on the resume leg."""
-    results = _run_crash_during_recovery()
+    results, fault_instants = _run_crash_during_recovery()
     client_log = results["client"]
+    restart_one_at = fault_instants["restart_one_at"]
+    generation_two_boot = fault_instants["generation_two_boot"]
+    generation_three_boot = round(
+        fault_instants["restart_two_at"] + _MID_RECOVERY_DOWN_SECONDS, 6
+    )
 
-    assert _submitted_at(client_log) < _RESTART_ONE_AT, client_log
+    assert _submitted_at(client_log) < restart_one_at, client_log
 
     # Generation bookkeeping: both dead generations kept their logs.
     assert "manager.gen1" in results and "manager.gen2" in results, (
@@ -216,7 +256,7 @@ def test_second_crash_inside_recovery_is_idempotent_and_completes():
     # Structural proof R2 landed inside the recovery span: gen-2 booted
     # at the window edge and never reached worker re-registration.
     generation_two_log = results["manager.gen2"]
-    assert _manager_started_at(generation_two_log) == _GENERATION_TWO_BOOT, (
+    assert _manager_started_at(generation_two_log) == round(generation_two_boot, 6), (
         generation_two_log
     )
     assert not any(
@@ -229,7 +269,7 @@ def test_second_crash_inside_recovery_is_idempotent_and_completes():
     # Gen-3 recovered and finished the job.
     generation_three_log = results["manager"]
     assert (
-        _manager_started_at(generation_three_log) == _GENERATION_THREE_BOOT
+        _manager_started_at(generation_three_log) == generation_three_boot
     ), generation_three_log
     assert any(
         entry[0] == "worker-registered" for entry in generation_three_log
@@ -237,19 +277,19 @@ def test_second_crash_inside_recovery_is_idempotent_and_completes():
 
     (_tag, final_status, finished_time) = _finished(client_log)
     assert final_status == "completed", client_log
-    resume_ceiling = _GENERATION_THREE_BOOT + _RESUME_LEG_CEILING_SECONDS
-    assert _GENERATION_THREE_BOOT < finished_time <= resume_ceiling, (
+    resume_ceiling = generation_three_boot + _RESUME_LEG_CEILING_SECONDS
+    assert generation_three_boot < finished_time <= resume_ceiling, (
         f"triple-generation completion at {finished_time} outside the "
-        f"resume-leg design bound ({_GENERATION_THREE_BOOT}, "
-        f"{resume_ceiling}] (measured 80.428157): {client_log}"
+        f"resume-leg design bound ({generation_three_boot}, "
+        f"{resume_ceiling}] (measured 78.407213): {client_log}"
     )
 
     # Execution truth: the doomed gen-1 dispatch plus gen-3's resumed
     # dispatch — gen-2 died before it could dispatch.
     activation_times = _activation_times(results["worker"])
     assert len(activation_times) == 2, results["worker"]
-    assert activation_times[0] < _RESTART_ONE_AT, results["worker"]
-    assert activation_times[1] > _GENERATION_THREE_BOOT, results["worker"]
+    assert activation_times[0] < restart_one_at, results["worker"]
+    assert activation_times[1] > generation_three_boot, results["worker"]
 
     _assert_oracle_clean(client_log)
     _assert_no_unswapped_imports(results)
@@ -265,20 +305,6 @@ def test_crash_during_recovery_is_replay_deterministic():
 # ---------------------------------------------------------------------------
 
 
-def _is_generation_two_activation(row: tuple) -> bool:
-    """The worker running a workflow gen-2 re-dispatched."""
-    return (
-        row[0] == "workflows-active"
-        and row[1] > 0
-        and row[2] > _GENERATION_TWO_BOOT
-    )
-
-
-def _is_generation_two_registration(row: tuple) -> bool:
-    """Gen-2's registry holding the re-registered worker."""
-    return row[0] == "worker-registered" and row[1] > _GENERATION_TWO_BOOT
-
-
 def _run_crash_during_redispatch() -> tuple[dict, dict[str, float]]:
     """Run the scenario; returns its results and the instant the
     re-dispatch triggers derived (``restart_at``).
@@ -287,10 +313,22 @@ def _run_crash_during_redispatch() -> tuple[dict, dict[str, float]]:
     the re-dispatched workflow and gen-2's registry holding the worker --
     and lands one coordinator latency after the later one, whichever
     order their samplers publish them in."""
-    fault_instants: dict[str, float] = {}
     milestone_instants: list[float] = []
 
-    def arm_mid_redispatch_restart(coordinator: SimulationCoordinator) -> None:
+    def arm_mid_redispatch_restart(
+        coordinator: SimulationCoordinator, fault_instants: dict[str, float]
+    ) -> None:
+        def after_generation_two_boot(instant: float) -> bool:
+            return instant > fault_instants.get("generation_two_boot", instant)
+
+        def is_generation_two_activation(row: tuple) -> bool:
+            """The worker running a workflow gen-2 re-dispatched."""
+            return row[0] == "workflows-active" and row[1] > 0 and after_generation_two_boot(row[2])
+
+        def is_generation_two_registration(row: tuple) -> bool:
+            """Gen-2's registry holding the re-registered worker."""
+            return row[0] == "worker-registered" and after_generation_two_boot(row[1])
+
         def restart_after_both_milestones(milestone_row: tuple) -> None:
             milestone_instants.append(milestone_row[-1])
             if len(milestone_instants) < 2:
@@ -302,16 +340,13 @@ def _run_crash_during_redispatch() -> tuple[dict, dict[str, float]]:
             )
 
         coordinator.schedule_on_event(
-            "worker", _is_generation_two_activation, restart_after_both_milestones
+            "worker", is_generation_two_activation, restart_after_both_milestones
         )
         coordinator.schedule_on_event(
-            "manager", _is_generation_two_registration, restart_after_both_milestones
+            "manager", is_generation_two_registration, restart_after_both_milestones
         )
 
-    results = _run_double_restart(
-        arm_mid_redispatch_restart, _MID_REDISPATCH_CEILING
-    )
-    return results, fault_instants
+    return _run_double_restart(arm_mid_redispatch_restart, _MID_REDISPATCH_CEILING)
 
 
 def test_second_crash_after_redispatch_never_double_delivers():
@@ -344,9 +379,9 @@ def test_second_crash_after_redispatch_never_double_delivers():
     # Execution at-least-once, three times, at the probed placements.
     activation_times = _activation_times(results["worker"])
     assert len(activation_times) == 3, results["worker"]
-    assert activation_times[0] < _RESTART_ONE_AT, results["worker"]
+    assert activation_times[0] < fault_instants["restart_one_at"], results["worker"]
     assert (
-        _GENERATION_TWO_BOOT < activation_times[1] < restart_at
+        fault_instants["generation_two_boot"] < activation_times[1] < restart_at
     ), results["worker"]
     assert activation_times[2] > generation_three_boot, results["worker"]
 
@@ -360,7 +395,7 @@ def test_second_crash_after_redispatch_never_double_delivers():
         f"exactly-once completion at {finished_time} outside "
         f"({generation_three_boot}, {resume_deadline}) -- the resumed "
         f"job's result must reach the live generation promptly "
-        f"(measured 77.337345): {client_log}"
+        f"(measured 80.537345): {client_log}"
     )
 
     _assert_oracle_clean(client_log)

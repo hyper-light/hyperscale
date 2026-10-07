@@ -15,8 +15,8 @@ Pinned:
   job's gate group; the leader's records reach GLOBAL (its global
   watermark equals its newest LSN: holders span two regions); every
   group retires with the terminal and every gate keeps the job for its
-  retention after it saw the job end, then releases it within one cleanup
-  interval (and one sample of its watcher).
+  retention after its cleanup sweep found the job ended, then releases it
+  within one more cleanup interval (and one sample of its watcher).
 * east/east/east: GLOBAL is unachievable, so it is never claimed — the
   records are REGIONAL (regional watermark == newest LSN, global 0) and
   the job still completes.
@@ -74,13 +74,20 @@ def test_two_region_tier_records_reach_global_and_every_gate_releases_the_job():
         assert max(count for count, _ in _rows(log, "raft-groups")) == 1, (host, log)
         group_retired_count, group_retired_seen_at = _rows(log, "raft-groups")[-1]
         assert group_retired_count == 0, (host, log)
-        # Retention runs from when THIS gate saw the job end -- a peer
-        # learns it through the job's group, which retires with the
+        # Retention runs from when THIS gate's cleanup sweep first finds
+        # the job terminal (``GateJobManager.terminal_since``) -- a peer
+        # learns the end through the job's group, which retires with the
         # terminal, so no later than this gate's sample of the retirement
-        # (the client may see the end first). It releases one retention,
-        # at most one cleanup interval and one sample of its watcher later.
+        # (the client may see the end first), and the next sweep finds it
+        # at most one cleanup interval after that. The releasing sweep is
+        # the first strictly past one retention: at most one more cleanup
+        # interval later, seen within one sample of the gate's watcher.
+        # (The sweeps' phase decides which interval is spent: probed
+        # 2026-10-06, a job ending at 7.12 was found by the 8.41 sweep and
+        # released by the 30.41 one, since 28.41 is exactly one retention.)
         release_bound = (
             group_retired_seen_at
+            + _JOB_CLEANUP_INTERVAL_SECONDS
             + _JOB_MAX_AGE_SECONDS
             + _JOB_CLEANUP_INTERVAL_SECONDS
             + WATCH_INTERVAL_SECONDS

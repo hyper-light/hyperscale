@@ -440,15 +440,21 @@ class ClientJobSubmitter:
         A refusal that carried the server's ``retry_after_seconds`` hint
         waits the hint plus up to one more hint of jitter -- never less,
         since the server will refuse again until then, while the jitter
-        keeps clients refused together from returning together. An
-        un-hinted transient refusal waits an exponential, equal-jittered
+        keeps clients refused together from returning together. The last
+        refused attempt waits its hint too, before the failure is raised:
+        a caller that resubmits on that failure (a submit loop) otherwise
+        reaches the server well inside the hint it was just given.
+
+        An un-hinted transient refusal waits an exponential, equal-jittered
         back-off from the configured base. Every transient failure backs
-        off, including one whose error text is empty (a bare timeout).
+        off, including one whose error text is empty (a bare timeout);
+        after the last un-hinted one no attempt follows, so the failure is
+        raised at once.
         """
-        if retry >= max_retries:
-            return
         if retry_after_seconds > 0.0:
             await _DEFAULT_CLOCK.sleep(retry_after_seconds * (1.0 + _DEFAULT_RANDOM.random()))
+            return
+        if retry >= max_retries:
             return
         base_delay = self._config.retry_base_delay_seconds * (2**retry)
         await _DEFAULT_CLOCK.sleep(base_delay * (0.5 + _DEFAULT_RANDOM.random()))

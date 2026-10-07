@@ -218,19 +218,56 @@ async def test_an_unhinted_refusal_backs_off_from_the_derived_base(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_the_final_hinted_refusal_fails_without_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No attempt follows the last one, so the client does not sleep out its hint before failing."""
+async def test_the_final_unhinted_refusal_fails_without_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No attempt follows the last one and the server gave no hint, so the failure is raised at once."""
     env = Env()
     clock = install_time(monkeypatch, submission_module, 0.0)
     attempts = env.CLIENT_SUBMISSION_MAX_RETRIES + 1
-    retry_after_seconds = env.OVERLOAD_SAMPLE_INTERVAL_SECONDS
-    transport = RecordingTransport(clock, [shed_refusal(retry_after_seconds)] * attempts)
+    unhinted_refusal = JobAck(job_id="job-retry-hint", accepted=False, error="syncing").dump()
+    transport = RecordingTransport(clock, [unhinted_refusal] * attempts)
 
     with pytest.raises(RuntimeError, match="Job submission failed"):
         await submit_one_job(make_submitter(env, transport))
 
     assert len(transport.send_times) == attempts
     assert clock.now == transport.send_times[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("random_value", [0.0, 0.5, 0.999])
+@pytest.mark.parametrize("hinted_refusal", ["shed", "rate_limited"])
+async def test_a_caller_resubmitting_after_the_final_hinted_refusal_waits_out_the_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    random_value: float,
+    hinted_refusal: str,
+) -> None:
+    """
+    Regression (rejection storm): a caller that calls ``submit_job`` again as soon as one fails -- the storm's
+    back-to-back submit loop -- must not reach the server inside the hint its last refused attempt carried.
+    The final hinted refusal is waited out before the failure is raised.
+    """
+    env = Env()
+    retry_after_seconds = env.OVERLOAD_SAMPLE_INTERVAL_SECONDS
+    refusal = (
+        shed_refusal(retry_after_seconds)
+        if hinted_refusal == "shed"
+        else RateLimitResponse(operation="job_submission", retry_after_seconds=retry_after_seconds).dump()
+    )
+    clock = install_time(monkeypatch, submission_module, random_value)
+    attempts = env.CLIENT_SUBMISSION_MAX_RETRIES + 1
+    transport = RecordingTransport(clock, [refusal] * attempts + [accepted_ack()])
+    submitter = make_submitter(env, transport)
+
+    with pytest.raises(RuntimeError, match="Job submission failed"):
+        await submit_one_job(submitter)
+    await submit_one_job(submitter)
+
+    assert len(transport.send_times) == attempts + 1
+    gaps = [
+        later_send - earlier_send
+        for earlier_send, later_send in zip(transport.send_times, transport.send_times[1:])
+    ]
+    assert all(retry_after_seconds <= gap < 2 * retry_after_seconds for gap in gaps), gaps
 
 
 @pytest.mark.asyncio

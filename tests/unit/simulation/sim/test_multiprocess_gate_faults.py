@@ -105,18 +105,24 @@ _GATE_HOSTS = {
 }
 
 # The original pinned seed. Under the current schedule its fault-free
-# twin elects gate-a, which is ALSO the submission gate -- so it sweeps
-# every scenario whose premise holds for any layout, and the scenarios
-# that need the leader and the submission gate to differ sweep only
-# distinct-layout seeds (each asserted from the twin).
+# twin elects gate-a and submits through gate-b; it sweeps every scenario
+# whose premise holds for any layout, and the scenarios that need the
+# leader and the submission gate to differ sweep only distinct-layout
+# seeds (each asserted from the twin).
 _SEED = 210
 # Seeds whose fault-free twins have DISTINCT leader / submission gates,
-# across different role assignments (probed 2026-10-06): 200 leader
-# gate-c / submission gate-a (the original layout), 203 leader gate-b /
+# across different role assignments (re-probed 2026-10-06 over seeds
+# 200-223 after the client's hinted refusals were waited out on the final
+# attempt too): 200 leader gate-c / submission gate-b, 217 leader gate-b /
 # submission gate-a, 220 leader gate-a / submission gate-b.
-_DISTINCT_ROLE_SEEDS = (200, 203, 220)
-# Any layout: 210 and 207 collapse leader and submission gate (gate-a at
-# index 0; gate-b at index 1), 220 does not.
+# 217 replaces 203 for the premise "leader and submission gate differ"
+# (and keeps 203's old leader gate-b / submission gate-a layout): 203's
+# twin now collapses both roles onto gate-b.
+_DISTINCT_ROLE_SEEDS = (200, 217, 220)
+# Any layout (re-probed 2026-10-06): 210 (leader gate-a / submission
+# gate-b) and 207 (leader gate-b / submission gate-c) and 220 (leader
+# gate-a / submission gate-b) -- the premise holds for every layout, so
+# the seeds stay as pinned.
 _ANY_LAYOUT_SEEDS = (_SEED, 207, 220)
 _LATENCY = 0.01
 _WORKFLOW_DURATION = 6.0
@@ -1219,21 +1225,44 @@ def test_gate_peers_readmit_after_total_isolation_heals():
     )
 
 
+# One blackout submit cycle: every attempt (the first and
+# CLIENT_SUBMISSION_MAX_RETRIES retries) runs out its silent
+# CLIENT_SUBMISSION_TIMEOUT, and each retry first backs off an un-hinted,
+# equal-jittered base * 2**retry * [0.5, 1.5) (base: one
+# OVERLOAD_SAMPLE_INTERVAL_SECONDS) -- so the back-offs sum to between
+# half and one and a half times base * (2**retries - 1).
+_BLACKOUT_ENV = Env()
+_BLACKOUT_ATTEMPTS_SECONDS = (
+    _BLACKOUT_ENV.CLIENT_SUBMISSION_MAX_RETRIES + 1
+) * _BLACKOUT_ENV.CLIENT_SUBMISSION_TIMEOUT
+_BLACKOUT_BACKOFF_SUM_SECONDS = _BLACKOUT_ENV.OVERLOAD_SAMPLE_INTERVAL_SECONDS * (
+    2**_BLACKOUT_ENV.CLIENT_SUBMISSION_MAX_RETRIES - 1
+)
+_BLACKOUT_CYCLE_MIN_SECONDS = _BLACKOUT_ATTEMPTS_SECONDS + 0.5 * _BLACKOUT_BACKOFF_SUM_SECONDS
+_BLACKOUT_CYCLE_MAX_SECONDS = _BLACKOUT_ATTEMPTS_SECONDS + 1.5 * _BLACKOUT_BACKOFF_SUM_SECONDS
+# The multi-gate client entry pauses this long between submit cycles.
+_BLACKOUT_CYCLE_PAUSE_SECONDS = 1.0
+# The cut outlasts both cycles at their slowest, and the run outlasts the
+# cut by a few link latencies' worth of settling (as before: 10s).
+_BLACKOUT_HEAL_AT = 2 * _BLACKOUT_CYCLE_MAX_SECONDS + _BLACKOUT_CYCLE_PAUSE_SECONDS
+_BLACKOUT_CEILING = _BLACKOUT_HEAL_AT + 10.0
+
+
 def _run_submission_blackout() -> dict:
     """Cut the client from ALL THREE gates for the entire retry budget
-    (a 150s blackout against a 2-attempt client): submission must be
-    abandoned LOUDLY — rejection milestones then an explicit
+    (a blackout outlasting both cycles of a 2-attempt client): submission
+    must be abandoned LOUDLY — rejection milestones then an explicit
     submit-abandoned — never a silent hang.
 
-    Probed timeline: submit_job cycle 1 exhausts its 6 target attempts
-    against silent cuts and raises at t=60.0; cycle 2 raises at
-    t=121.0; the bounded client logs submit-abandoned at t=121.0."""
+    Each submit_job cycle exhausts its 6 target attempts against silent
+    cuts, backing off between them, and raises; the bounded client logs
+    submit-abandoned at its second raise."""
     coordinator = _build_cluster(
-        _SEED, 160.0, wait_timeout=60.0, max_submit_attempts=2
+        _SEED, _BLACKOUT_CEILING, wait_timeout=60.0, max_submit_attempts=2
     )
     for gate_pid in _GATE_PIDS:
         coordinator.schedule_partition(
-            "client", gate_pid, 0.0, heal_time=150.0
+            "client", gate_pid, 0.0, heal_time=_BLACKOUT_HEAL_AT
         )
     return coordinator.run()
 
@@ -1252,9 +1281,16 @@ def test_submission_blackout_abandons_loudly_never_silently():
     assert len(rejections) == 2, client_log
     assert len(abandoned) == 1, client_log
     # Each blackout submit cycle costs its full target-attempt budget
-    # (probed: 60.0s and 121.0s); the loud give-up follows immediately.
-    assert 55.0 <= rejections[0][-1] <= 65.0, client_log
-    assert 115.0 <= abandoned[0][1] <= 130.0, client_log
+    # plus its back-offs; the loud give-up follows the second at once.
+    first_raise_at = rejections[0][-1]
+    assert _BLACKOUT_CYCLE_MIN_SECONDS <= first_raise_at <= _BLACKOUT_CYCLE_MAX_SECONDS, client_log
+    second_cycle_start = first_raise_at + _BLACKOUT_CYCLE_PAUSE_SECONDS
+    assert (
+        second_cycle_start + _BLACKOUT_CYCLE_MIN_SECONDS
+        <= abandoned[0][1]
+        <= second_cycle_start + _BLACKOUT_CYCLE_MAX_SECONDS
+    ), client_log
+    assert abandoned[0][1] == rejections[1][-1], client_log
 
     # Nothing was ever accepted and nothing finished — and that is the
     # LOUD contract: no job-submitted, no job-finished, no silence.
@@ -1393,16 +1429,16 @@ def test_dispatch_window_manager_partition_is_replay_deterministic():
 
 
 # Probed with the first-target cut and the client-link delay schedule in
-# place (no delivery cut): acceptance on gate-c (index 2) at 11.336 after
-# one 10s timeout against the cut gate-a (the first attempt starts inside
-# the cut; a heal anywhere before its timeout leaves the timeline
-# identical -- probed at 10.0 and 12.0), 'running' at 11.836, worker
-# active [11.5, 18.5]. Re-probed 2026-10-01 on the clock-offset fencing
-# base.
+# place (no delivery cut): gate-b refuses the first attempt, the attempt
+# against the cut gate-a starts inside the cut and costs one 10s timeout,
+# and after its un-hinted back-off gate-c (index 2) accepts at 13.238;
+# 'running' at 13.738. Re-probed 2026-10-06 once a bare timeout backs off
+# like any transient failure (was: gate-c at 11.336 when a timeout retried
+# at once).
 _CLIENT_LINK_FIRST_CUT_HEAL_AT = 10.0
 _CLIENT_LINK_ACCEPTING_GATE = "gate-c"
-_CLIENT_LINK_ACCEPTED_AT = 11.336276
-_CLIENT_LINK_RUNNING_AT = 11.836276
+_CLIENT_LINK_ACCEPTED_AT = 13.238149
+_CLIENT_LINK_RUNNING_AT = 13.738149
 _CLIENT_LINK_DELIVERY_CUT_AT = (_CLIENT_LINK_ACCEPTED_AT + _CLIENT_LINK_RUNNING_AT) / 2
 _CLIENT_LINK_DELIVERY_HEAL_AT = 30.0
 
@@ -1410,7 +1446,7 @@ _CLIENT_LINK_DELIVERY_HEAL_AT = 30.0
 def _run_client_link_faults() -> dict:
     """Client-tier connectivity faults, all three classes at once:
 
-    * client <-> gate-a cut over [0, 10): the FIRST submission target
+    * client <-> gate-a cut over [0, 10): a submission target
       is unreachable, so acceptance must converge through the retry
       cycle onto a reachable gate (gate-c);
     * client <-> gate-c cut from between acceptance and dispatch until
@@ -1458,8 +1494,8 @@ def test_client_link_faults_converge_to_clean_completion():
     client_log = results["client"]
     finish_time = _assert_clean_completed_client(client_log, "client-link-faults")
 
-    # Acceptance converged through the retry cycle: the cut first
-    # target costs the silent 10s TCP timeout, then gate-c accepts --
+    # Acceptance converged through the retry cycle: the cut target
+    # costs the silent 10s TCP timeout, then gate-c accepts --
     # after the first cut and before the delivery-window cut.
     submit_targets = [entry for entry in client_log if entry[0] == "submit-target"]
     assert submit_targets and submit_targets[0][1] == _GATE_PIDS.index(_CLIENT_LINK_ACCEPTING_GATE), client_log
