@@ -176,15 +176,35 @@ class DiscoveryConfig:
 
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
+        self._validate_identity()
+        if self._has_no_peer_source():
+            raise ValueError("At least one of dns_names or static_seeds is required")
+        self._validate_selection_tuning()
+        if self.node_role not in ("client", "gate", "manager", "worker"):
+            raise ValueError(f"Invalid node_role: {self.node_role}")
+
+    def _validate_identity(self) -> None:
+        """Require the cluster and environment IDs.
+
+        Raises:
+            ValueError: either is empty.
+        """
         if not self.cluster_id:
             raise ValueError("cluster_id is required")
         if not self.environment_id:
             raise ValueError("environment_id is required")
-        if not self.allow_dynamic_registration and not self.dns_names and not self.static_seeds:
-            raise ValueError("At least one of dns_names or static_seeds is required")
+
+    def _has_no_peer_source(self) -> bool:
+        """Whether no way to find peers is configured (no dynamic registration, DNS names or seeds)."""
+        return not self.allow_dynamic_registration and not self.dns_names and not self.static_seeds
+
+    def _validate_selection_tuning(self) -> None:
+        """Bound the candidate set size and the EWMA smoothing factor.
+
+        Raises:
+            ValueError: ``candidate_set_size`` < 1 or ``ewma_alpha`` outside (0, 1].
+        """
         if self.candidate_set_size < 1:
             raise ValueError("candidate_set_size must be at least 1")
         if not 0.0 < self.ewma_alpha <= 1.0:
             raise ValueError("ewma_alpha must be in (0, 1]")
-        if self.node_role not in ("client", "gate", "manager", "worker"):
-            raise ValueError(f"Invalid node_role: {self.node_role}")

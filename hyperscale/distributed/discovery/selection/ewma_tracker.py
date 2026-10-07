@@ -128,9 +128,7 @@ class EWMATracker:
         Returns:
             peer_id with lowest effective latency, or None if empty
         """
-        if not peer_ids:
-            return None
-
+        # An empty list never enters the loop: ``best_peer`` stays None.
         best_peer: str | None = None
         best_latency = float("inf")
 

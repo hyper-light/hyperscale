@@ -3,6 +3,7 @@
 
 from typing import TYPE_CHECKING
 from dataclasses import dataclass, field
+from operator import attrgetter
 from .datacenter_registration_status import DatacenterRegistrationStatus
 from .manager_registration_state import ManagerRegistrationState
 
@@ -46,31 +47,41 @@ class DatacenterRegistrationState:
             return DatacenterRegistrationStatus.UNAVAILABLE
 
         # Count non-stale registered managers
-        active_count = sum(
-            1
-            for state in self.manager_states.values()
-            if state.is_registered and not state.is_stale(now, staleness_multiplier)
-        )
+        active_count = self.get_active_manager_count(now, staleness_multiplier)
 
         quorum = configured_count // 2 + 1
 
-        if active_count == 0:
-            if self.first_heartbeat_at == 0:
-                # Never received any heartbeats
-                return DatacenterRegistrationStatus.AWAITING_INITIAL
-            else:
-                # Had heartbeats before but all are now stale/lost
-                return DatacenterRegistrationStatus.UNAVAILABLE
-        elif active_count < quorum:
-            if self.first_heartbeat_at == 0 or self._was_ever_ready():
-                # Was ready before, now below quorum
-                return DatacenterRegistrationStatus.PARTIAL
-            else:
-                # Still coming up, not yet at quorum
-                return DatacenterRegistrationStatus.INITIALIZING
-        else:
+        return self._status_from_active_count(active_count, quorum)
+
+    def _status_from_active_count(self, active_count: int, quorum: int) -> DatacenterRegistrationStatus:
+        """Classify by active managers against the quorum (quorum >= 1, so
+        the READY check never shadows the zero-active case)."""
+        if active_count >= quorum:
             # At or above quorum
             return DatacenterRegistrationStatus.READY
+
+        if active_count == 0:
+            return self._status_without_active_managers()
+
+        return self._status_below_quorum()
+
+    def _status_without_active_managers(self) -> DatacenterRegistrationStatus:
+        """Status when no registered manager is fresh."""
+        if self.first_heartbeat_at == 0:
+            # Never received any heartbeats
+            return DatacenterRegistrationStatus.AWAITING_INITIAL
+
+        # Had heartbeats before but all are now stale/lost
+        return DatacenterRegistrationStatus.UNAVAILABLE
+
+    def _status_below_quorum(self) -> DatacenterRegistrationStatus:
+        """Status when some, but fewer than a quorum of, managers are fresh."""
+        if self.first_heartbeat_at == 0 or self._was_ever_ready():
+            # Was ready before, now below quorum
+            return DatacenterRegistrationStatus.PARTIAL
+
+        # Still coming up, not yet at quorum
+        return DatacenterRegistrationStatus.INITIALIZING
 
     def _was_ever_ready(self) -> bool:
         """Check if this DC ever had quorum (any manager with heartbeat_count > 1)."""
@@ -81,11 +92,8 @@ class DatacenterRegistrationState:
         self, now: float, staleness_multiplier: float = 3.0
     ) -> int:
         """Get count of non-stale registered managers."""
-        return sum(
-            1
-            for state in self.manager_states.values()
-            if state.is_registered and not state.is_stale(now, staleness_multiplier)
-        )
+        registered_states = filter(attrgetter("is_registered"), self.manager_states.values())
+        return sum(1 for state in registered_states if not state.is_stale(now, staleness_multiplier))
 
     def record_heartbeat(
         self,

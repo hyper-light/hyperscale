@@ -70,7 +70,8 @@ class WorkflowReassignmentNotification(Message):
                 reason=parts[4],
                 originating_manager_id=sys.intern(parts[5]),
                 timestamp=float(parts[6]),
-                datacenter=parts[7] if parts[7] else "",
+                # An empty field is already "" -- taken as is.
+                datacenter=parts[7],
             )
         except (ValueError, UnicodeDecodeError, IndexError):
             return None

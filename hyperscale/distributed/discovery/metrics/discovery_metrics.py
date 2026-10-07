@@ -94,10 +94,14 @@ class DiscoveryMetrics:
         elif negative_cached:
             self._dns_negative_cache_hits += 1
         else:
-            self._dns_cache_misses += 1
-            if latency_ms is not None:
-                self._dns_latency_sum_ms += latency_ms
-                self._dns_latency_count += 1
+            self._record_dns_cache_miss(latency_ms)
+
+    def _record_dns_cache_miss(self, latency_ms: float | None) -> None:
+        """Count a query that missed both caches, with its resolution latency if known."""
+        self._dns_cache_misses += 1
+        if latency_ms is not None:
+            self._dns_latency_sum_ms += latency_ms
+            self._dns_latency_count += 1
 
     def record_dns_failure(self) -> None:
         """Record a DNS resolution failure."""
@@ -194,6 +198,19 @@ class DiscoveryMetrics:
         snapshot.connections_active = self._connections_active
 
         # Peer health metrics (from selector if available)
+        self._apply_peer_stats(snapshot)
+
+        # Latency percentiles
+        self._apply_latency_percentiles(snapshot)
+
+        # Notify callback if set
+        if self._on_snapshot is not None:
+            self._on_snapshot(snapshot)
+
+        return snapshot
+
+    def _apply_peer_stats(self, snapshot: MetricsSnapshot) -> None:
+        """Copy the peer-health counts from the stats provider, if one is set."""
         if self._get_peer_stats is not None:
             peer_stats = self._get_peer_stats()
             snapshot.peers_total = peer_stats.get("total", 0)
@@ -201,7 +218,8 @@ class DiscoveryMetrics:
             snapshot.peers_degraded = peer_stats.get("degraded", 0)
             snapshot.peers_unhealthy = peer_stats.get("unhealthy", 0)
 
-        # Latency percentiles
+    def _apply_latency_percentiles(self, snapshot: MetricsSnapshot) -> None:
+        """Fill the average, p50 and p99 peer latency when any latency was recorded."""
         if self._peer_latencies_ms:
             sorted_latencies = sorted(self._peer_latencies_ms)
             count = len(sorted_latencies)
@@ -209,12 +227,6 @@ class DiscoveryMetrics:
             snapshot.peer_avg_latency_ms = sum(sorted_latencies) / count
             snapshot.peer_p50_latency_ms = sorted_latencies[int(count * 0.5)]
             snapshot.peer_p99_latency_ms = sorted_latencies[int(count * 0.99)]
-
-        # Notify callback if set
-        if self._on_snapshot is not None:
-            self._on_snapshot(snapshot)
-
-        return snapshot
 
     def reset(self) -> None:
         """Reset all metrics to zero."""

@@ -2,6 +2,7 @@
 ``hyperscale.distributed.protocol.version`` (see that module)."""
 
 from dataclasses import dataclass, field
+from operator import attrgetter
 
 from .protocol_version import CURRENT_PROTOCOL_VERSION
 from .protocol_version import get_features_for_version
@@ -51,16 +52,10 @@ class NodeCapabilities:
         common = self.capabilities & other.capabilities
 
         # Filter to features supported by both versions
-        min_version = (
-            self.protocol_version
-            if self.protocol_version.minor <= other.protocol_version.minor
-            else other.protocol_version
-        )
+        # min() keeps the first of equal minors, so ties pick our own version.
+        min_version = min((self.protocol_version, other.protocol_version), key=attrgetter("minor"))
 
-        return {
-            cap for cap in common
-            if min_version.supports_feature(cap)
-        }
+        return set(filter(min_version.supports_feature, common))
 
     def is_compatible_with(self, other: "NodeCapabilities") -> bool:
         """Check if this node is compatible with another."""

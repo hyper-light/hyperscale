@@ -251,13 +251,23 @@ class ResourceEnforcer:
     ) -> EnforcementAction:
         """Kill (first request or its retry), then evict a worker that ignores it."""
         if state.kill_attempts >= MAX_KILL_ATTEMPTS:
-            if await self._on_evict_worker(worker_id, violation_type):
-                self.release_workflow(workflow_id)
-                return EnforcementAction.EVICT_WORKER
-            return EnforcementAction.NONE
+            return await self._evict_unresponsive_worker(workflow_id, worker_id, violation_type)
 
         state.kill_attempts += 1
         state.kill_requested_at = now
         if await self._on_kill_workflow(workflow_id, worker_id, state.job_id, violation_type):
             return EnforcementAction.KILL_WORKFLOW
+        return EnforcementAction.NONE
+
+    async def _evict_unresponsive_worker(
+        self,
+        workflow_id: str,
+        worker_id: str,
+        violation_type: ResourceViolationType,
+    ) -> EnforcementAction:
+        """Evict a worker that ignored both kill requests (AD-41 failure
+        modes), forgetting the workflow once the eviction took."""
+        if await self._on_evict_worker(worker_id, violation_type):
+            self.release_workflow(workflow_id)
+            return EnforcementAction.EVICT_WORKER
         return EnforcementAction.NONE

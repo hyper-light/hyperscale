@@ -55,15 +55,7 @@ class ObservedLatencyState:
             alpha: EWMA decay factor (0.0-1.0, higher = more responsive).
             now: The observing node's monotonic time.
         """
-        if self.sample_count == 0:
-            self.ewma_ms = latency_ms
-            self.ewma_variance = 0.0
-        else:
-            delta = latency_ms - self.ewma_ms
-            self.ewma_ms = self.ewma_ms + alpha * delta
-            self.ewma_variance = (1 - alpha) * (
-                self.ewma_variance + alpha * delta * delta
-            )
+        self._update_ewma(latency_ms, alpha)
 
         self.sample_count += 1
         self.last_update = now
@@ -78,6 +70,19 @@ class ObservedLatencyState:
         if self._recent_samples is not None:
             self._recent_samples.append(latency_ms)
             self._update_percentiles()
+
+    def _update_ewma(self, latency_ms: float, alpha: float) -> None:
+        """Fold ``latency_ms`` into the EWMA and its variance (AD-45); the
+        first sample seeds them."""
+        if self.sample_count == 0:
+            self.ewma_ms = latency_ms
+            self.ewma_variance = 0.0
+        else:
+            delta = latency_ms - self.ewma_ms
+            self.ewma_ms = self.ewma_ms + alpha * delta
+            self.ewma_variance = (1 - alpha) * (
+                self.ewma_variance + alpha * delta * delta
+            )
 
     def _update_percentiles(self) -> None:
         """Update percentile calculations from recent samples (Task 61)."""

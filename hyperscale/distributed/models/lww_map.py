@@ -53,22 +53,20 @@ class LWWMap(Generic[KeyT, ValueT]):
         """Merge with another LWWMap."""
         merged: LWWMap[KeyT, ValueT] = LWWMap()
         all_keys = set(self._entries.keys()) | set(other._entries.keys())
+        shared_keys = self._entries.keys() & other._entries.keys()
 
         for key in all_keys:
-            if key in self._entries and key in other._entries:
+            if key in shared_keys:
                 merged._entries[key] = self._entries[key].merge(other._entries[key])
-            elif key in self._entries:
-                merged._entries[key] = LWWRegister(
-                    _value=self._entries[key]._value,
-                    _timestamp=self._entries[key]._timestamp,
-                    _node_id=self._entries[key]._node_id,
-                )
-            else:
-                merged._entries[key] = LWWRegister(
-                    _value=other._entries[key]._value,
-                    _timestamp=other._entries[key]._timestamp,
-                    _node_id=other._entries[key]._node_id,
-                )
+                continue
+
+            # Present on one side only: copy that side's register (ours first).
+            source_register = self._entries.get(key, other._entries.get(key))
+            merged._entries[key] = LWWRegister(
+                _value=source_register._value,
+                _timestamp=source_register._timestamp,
+                _node_id=source_register._node_id,
+            )
 
         return merged
 

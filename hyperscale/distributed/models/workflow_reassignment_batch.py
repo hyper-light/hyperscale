@@ -57,9 +57,9 @@ class WorkflowReassignmentBatch(Message):
     def from_bytes(cls, data: bytes) -> "WorkflowReassignmentBatch | None":
         """Deserialize from TCP transmission."""
         try:
+            # bytes.split always yields at least one part; an empty result
+            # would raise IndexError on parts[0] below and return None anyway.
             parts = data.split(b"||")
-            if not parts:
-                return None
 
             # Parse header
             header = parts[0].split(b"|")
@@ -74,17 +74,7 @@ class WorkflowReassignmentBatch(Message):
             count = int(header[5].decode())
 
             # Parse reassignments
-            reassignments: list[tuple[str, str, str]] = []
-            for reassignment_bytes in parts[1 : count + 1]:
-                reassignment_parts = reassignment_bytes.decode().split(":", maxsplit=2)
-                if len(reassignment_parts) == 3:
-                    reassignments.append(
-                        (
-                            sys.intern(reassignment_parts[0]),
-                            sys.intern(reassignment_parts[1]),
-                            sys.intern(reassignment_parts[2]),
-                        )
-                    )
+            reassignments = cls._parse_reassignments(parts[1 : count + 1])
 
             return cls(
                 originating_manager_id=originating_manager_id,
@@ -96,3 +86,23 @@ class WorkflowReassignmentBatch(Message):
             )
         except (ValueError, UnicodeDecodeError, IndexError):
             return None
+
+    @staticmethod
+    def _parse_reassignments(reassignment_segments: list[bytes]) -> list[tuple[str, str, str]]:
+        """Decode each job_id:workflow_id:sub_token segment, skipping malformed ones.
+
+        Decoding errors propagate to from_bytes, which maps them to None.
+        """
+        reassignments: list[tuple[str, str, str]] = []
+        for reassignment_bytes in reassignment_segments:
+            reassignment_parts = reassignment_bytes.decode().split(":", maxsplit=2)
+            if len(reassignment_parts) == 3:
+                reassignments.append(
+                    (
+                        sys.intern(reassignment_parts[0]),
+                        sys.intern(reassignment_parts[1]),
+                        sys.intern(reassignment_parts[2]),
+                    )
+                )
+
+        return reassignments

@@ -1721,23 +1721,14 @@ class Env(BaseModel):
             DiscoveryConfig,
         )
 
-        # Parse DNS names from comma-separated string
-        dns_names: list[str] = []
-        if self.DISCOVERY_DNS_NAMES:
-            dns_names = [
-                name.strip()
-                for name in self.DISCOVERY_DNS_NAMES.split(",")
-                if name.strip()
-            ]
+        # Parse DNS names from comma-separated string (StrictStr: "" splits
+        # to [""], which the blank filter drops, so no emptiness guard).
+        dns_names: list[str] = list(filter(None, map(str.strip, self.DISCOVERY_DNS_NAMES.split(","))))
 
         # Parse allowed CIDRs from comma-separated string
-        dns_allowed_cidrs: list[str] = []
-        if self.DISCOVERY_DNS_ALLOWED_CIDRS:
-            dns_allowed_cidrs = [
-                cidr.strip()
-                for cidr in self.DISCOVERY_DNS_ALLOWED_CIDRS.split(",")
-                if cidr.strip()
-            ]
+        dns_allowed_cidrs: list[str] = list(
+            filter(None, map(str.strip, self.DISCOVERY_DNS_ALLOWED_CIDRS.split(",")))
+        )
 
         return DiscoveryConfig(
             cluster_id=self.CLUSTER_ID,

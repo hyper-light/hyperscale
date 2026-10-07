@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
+from operator import attrgetter, itemgetter
 
 from hyperscale.distributed.resources.datacenter_resource_view import (
     DatacenterResourceView,
@@ -81,26 +83,37 @@ class DatacenterResourceAggregator:
             return None
 
         newest_report, _ = max(fresh_reports.values(), key=lambda entry: entry[1])
+        return self._view_from_reports(datacenter, newest_report, fresh_reports.values())
+
+    @staticmethod
+    def _view_from_reports(
+        datacenter: str,
+        newest_report: ManagerResourceReport,
+        held_reports: Iterable[tuple[ManagerResourceReport, float]],
+    ) -> DatacenterResourceView | None:
+        """Sum the fresh reports' workloads against the newest report's
+        capacity (AD-41); None when that report does not know the capacity."""
         if newest_report.cpu_capacity_percent <= 0.0 or newest_report.memory_capacity_bytes <= 0:
             return None
 
-        reports = [report for report, _ in fresh_reports.values()]
-        workload_cpu_percent = sum(report.workload.cpu_percent for report in reports)
-        workload_memory_bytes = sum(report.workload.memory_bytes for report in reports)
-        manager_metrics = [report.manager_metrics for report in reports if report.manager_metrics]
+        reports = list(map(itemgetter(0), held_reports))
+        workloads = list(map(attrgetter("workload"), reports))
+        workload_cpu_percent = sum(map(attrgetter("cpu_percent"), workloads))
+        workload_memory_bytes = sum(map(attrgetter("memory_bytes"), workloads))
+        manager_metrics = list(filter(None, map(attrgetter("manager_metrics"), reports)))
         return DatacenterResourceView(
             datacenter=datacenter,
             reporting_manager_count=len(reports),
             workload_cpu_percent=workload_cpu_percent,
-            workload_cpu_uncertainty=math.sqrt(sum(report.workload.cpu_variance for report in reports)),
+            workload_cpu_uncertainty=math.sqrt(sum(map(attrgetter("cpu_variance"), workloads))),
             workload_memory_bytes=workload_memory_bytes,
-            workload_memory_uncertainty=math.sqrt(sum(report.workload.memory_variance for report in reports)),
+            workload_memory_uncertainty=math.sqrt(sum(map(attrgetter("memory_variance"), workloads))),
             cpu_capacity_percent=newest_report.cpu_capacity_percent,
             memory_capacity_bytes=newest_report.memory_capacity_bytes,
             cpu_pressure=min(1.0, workload_cpu_percent / newest_report.cpu_capacity_percent),
             memory_pressure=min(1.0, workload_memory_bytes / newest_report.memory_capacity_bytes),
-            manager_cpu_percent=sum(metrics.cpu_percent for metrics in manager_metrics),
-            manager_memory_bytes=sum(metrics.memory_bytes for metrics in manager_metrics),
+            manager_cpu_percent=sum(map(attrgetter("cpu_percent"), manager_metrics)),
+            manager_memory_bytes=sum(map(attrgetter("memory_bytes"), manager_metrics)),
         )
 
     def _drop_stale(self, datacenter: str) -> None:

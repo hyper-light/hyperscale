@@ -63,21 +63,34 @@ class WorkflowProgressAck(Message):
             sender_incarnation = state.get("sender_incarnation")
         elif isinstance(state, (list, tuple)):
             values = list(state)
-            manager_id = values[0] if len(values) > 0 else ""
-            is_leader = values[1] if len(values) > 1 else False
-            healthy_managers = values[2] if len(values) > 2 else []
+            # Positional states: the 7+ field layout carries job_leader_addr at
+            # index 3 and the optional message_id/sender_incarnation at 7/8; the
+            # legacy <=6 field layout has no job_leader_addr. Missing trailing
+            # fields take their defaults by padding (inline: per-ack path).
             if len(values) > 6:
-                job_leader_addr = values[3] if len(values) > 3 else None
-                backpressure_level = values[4] if len(values) > 4 else 0
-                backpressure_delay_ms = values[5] if len(values) > 5 else 0
-                backpressure_batch_only = values[6] if len(values) > 6 else False
+                (
+                    manager_id,
+                    is_leader,
+                    healthy_managers,
+                    job_leader_addr,
+                    backpressure_level,
+                    backpressure_delay_ms,
+                    backpressure_batch_only,
+                    message_id,
+                    sender_incarnation,
+                ) = (values + [None, None])[:9]
             else:
+                (
+                    manager_id,
+                    is_leader,
+                    healthy_managers,
+                    backpressure_level,
+                    backpressure_delay_ms,
+                    backpressure_batch_only,
+                ) = values + ["", False, [], 0, 0, False][len(values):]
                 job_leader_addr = None
-                backpressure_level = values[3] if len(values) > 3 else 0
-                backpressure_delay_ms = values[4] if len(values) > 4 else 0
-                backpressure_batch_only = values[5] if len(values) > 5 else False
-            message_id = values[7] if len(values) > 7 else None
-            sender_incarnation = values[8] if len(values) > 8 else None
+                message_id = None
+                sender_incarnation = None
         else:
             raise TypeError("Unsupported WorkflowProgressAck state")
 

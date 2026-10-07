@@ -5,6 +5,8 @@ Datacenter capacity aggregation for gate routing (AD-43).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import chain
+from operator import attrgetter, itemgetter
 
 from hyperscale.distributed.models.distributed import ManagerHeartbeat
 
@@ -67,29 +69,45 @@ class DatacenterCapacity:
             heartbeats,
             key=lambda entry: (entry[0].is_leader, entry[0].term, entry[1]),
         )
+        manager_heartbeats = list(map(itemgetter(0), heartbeats))
         return cls(
             datacenter_id=datacenter_id,
             total_cores=authoritative_heartbeat.total_cores,
             available_cores=authoritative_heartbeat.available_cores,
             pending_workflow_count=sum(
-                heartbeat.pending_workflow_count for heartbeat, _ in heartbeats
+                map(attrgetter("pending_workflow_count"), manager_heartbeats)
             ),
             pending_duration_seconds=sum(
-                heartbeat.pending_duration_seconds for heartbeat, _ in heartbeats
+                map(attrgetter("pending_duration_seconds"), manager_heartbeats)
             ),
             active_remaining_seconds=sum(
-                heartbeat.active_remaining_seconds for heartbeat, _ in heartbeats
+                map(attrgetter("active_remaining_seconds"), manager_heartbeats)
             ),
-            last_updated=max(received_at for _, received_at in heartbeats),
+            last_updated=max(map(itemgetter(1), heartbeats)),
             release_schedule=tuple(
                 sorted(
-                    (max(received_at + release_offset - now, 0.0), released_cores)
-                    for heartbeat, received_at in heartbeats
-                    for release_offset, released_cores in heartbeat.cores_freeing_schedule
-                    if received_at + release_offset > authoritative_received_at
+                    chain.from_iterable(
+                        cls._releases_after(heartbeat, received_at, now, authoritative_received_at)
+                        for heartbeat, received_at in heartbeats
+                    )
                 )
             ),
         )
+
+    @staticmethod
+    def _releases_after(
+        heartbeat: ManagerHeartbeat,
+        received_at: float,
+        now: float,
+        authoritative_received_at: float,
+    ) -> list[tuple[float, int]]:
+        """A manager's releases after the authoritative heartbeat, as
+        ``(seconds from now, cores)`` (AD-43 Part 4)."""
+        return [
+            (max(received_at + release_offset - now, 0.0), released_cores)
+            for release_offset, released_cores in heartbeat.cores_freeing_schedule
+            if received_at + release_offset > authoritative_received_at
+        ]
 
     def can_serve_immediately(self, cores_required: int) -> bool:
         """
@@ -124,10 +142,23 @@ class DatacenterCapacity:
         # ``can_serve_immediately`` caps: a requirement beyond the
         # datacenter waits exactly as one for all of it does, so with every
         # core free it waits for nothing.
-        cores_required = min(cores_required, self.total_cores)
+        return self._wait_for_capped_cores(min(cores_required, self.total_cores))
+
+    def _wait_for_capped_cores(self, cores_required: int) -> float:
+        """The wait for ``cores_required`` (at most every core): the later
+        of the release-schedule and drain bounds, none when they are free."""
         if self.available_cores >= cores_required:
             return 0.0
 
+        return max(
+            self._cores_free_after(cores_required),
+            (self.active_remaining_seconds + self.pending_duration_seconds)
+            / self.total_cores,
+        )
+
+    def _cores_free_after(self, cores_required: int) -> float:
+        """Seconds until the release schedule frees ``cores_required``
+        (AD-43 Part 4), or until its last release when it never does."""
         free_cores = self.available_cores
         cores_free_after = 0.0
         for release_offset, released_cores in self.release_schedule:
@@ -136,11 +167,7 @@ class DatacenterCapacity:
             if free_cores >= cores_required:
                 break
 
-        return max(
-            cores_free_after,
-            (self.active_remaining_seconds + self.pending_duration_seconds)
-            / self.total_cores,
-        )
+        return cores_free_after
 
     def is_stale(self, now: float, staleness_threshold_seconds: float) -> bool:
         """

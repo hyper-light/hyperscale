@@ -51,5 +51,7 @@ class JobLeadershipAnnouncement(Message):
         if self.leader_addr is not None:
             object.__setattr__(self, "leader_host", self.leader_addr[0])
             object.__setattr__(self, "leader_tcp_port", self.leader_addr[1])
-        if self.target_dc_count > 0 and self.term == 0:
+        # Chained comparison: target_dc_count > 0 and 0 == term, evaluated
+        # in that order.
+        if self.target_dc_count > 0 == self.term:
             object.__setattr__(self, "term", self.target_dc_count)

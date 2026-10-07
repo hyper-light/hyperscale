@@ -143,23 +143,19 @@ class AdaptiveEWMASelector:
         Returns:
             SelectionResult or None if no peers available
         """
-        config = self.power_of_two_config
-
         if self._rendezvous.peer_count == 0:
             return None
 
         # Get candidates
-        if config.use_rendezvous_ranking:
-            candidates = self._rendezvous.select_n(key, config.candidate_count)
-        else:
-            # Random selection mode
-            all_peers = self._rendezvous.peer_ids
-            sample_size = min(config.candidate_count, len(all_peers))
-            candidates = self._random.sample(all_peers, sample_size)
+        candidates = self._candidates_for(key)
 
         if not candidates:
             return None
 
+        return self._selection_among(candidates)
+
+    def _selection_among(self, candidates: list[str]) -> SelectionResult:
+        """The selection among non-empty ``candidates``: a lone one as-is, else load-balanced."""
         # Single candidate = no load balancing needed
         if len(candidates) == 1:
             latency = self._ewma.get_effective_latency(candidates[0])
@@ -170,7 +166,41 @@ class AdaptiveEWMASelector:
                 candidates_considered=1,
             )
 
+        return self._load_balanced_selection(candidates)
+
+    def _candidates_for(self, key: str) -> list[str]:
+        """The Power of Two Choices candidates for ``key``: rendezvous-ranked, or a random sample."""
+        config = self.power_of_two_config
+
+        if config.use_rendezvous_ranking:
+            return self._rendezvous.select_n(key, config.candidate_count)
+
+        # Random selection mode
+        all_peers = self._rendezvous.peer_ids
+        sample_size = min(config.candidate_count, len(all_peers))
+        return self._random.sample(all_peers, sample_size)
+
+    def _load_balanced_selection(self, candidates: list[str]) -> SelectionResult:
+        """The lowest-latency of several candidates, noting whether balancing moved off the primary."""
         # Find best candidate by effective latency
+        best_peer, best_latency = self._lowest_latency_candidate(candidates)
+
+        # Check if load balancing was actually needed
+        primary_latency = self._ewma.get_effective_latency(candidates[0])
+        was_load_balanced = (
+            best_peer != candidates[0]
+            or primary_latency > self.power_of_two_config.latency_threshold_ms
+        )
+
+        return SelectionResult(
+            peer_id=best_peer,  # type: ignore  # best_peer is guaranteed non-None
+            effective_latency_ms=best_latency,
+            was_load_balanced=was_load_balanced,
+            candidates_considered=len(candidates),
+        )
+
+    def _lowest_latency_candidate(self, candidates: list[str]) -> tuple[str | None, float]:
+        """The first candidate of strictly lowest effective latency, and that latency."""
         best_peer: str | None = None
         best_latency = float("inf")
 
@@ -180,19 +210,7 @@ class AdaptiveEWMASelector:
                 best_latency = latency
                 best_peer = peer_id
 
-        # Check if load balancing was actually needed
-        primary_latency = self._ewma.get_effective_latency(candidates[0])
-        was_load_balanced = (
-            best_peer != candidates[0]
-            or primary_latency > config.latency_threshold_ms
-        )
-
-        return SelectionResult(
-            peer_id=best_peer,  # type: ignore  # best_peer is guaranteed non-None
-            effective_latency_ms=best_latency,
-            was_load_balanced=was_load_balanced,
-            candidates_considered=len(candidates),
-        )
+        return best_peer, best_latency
 
     def select_with_filter(
         self,
@@ -220,7 +238,7 @@ class AdaptiveEWMASelector:
         )
 
         # Filter candidates
-        filtered = [p for p in candidates if filter_fn(p)]
+        filtered = list(filter(filter_fn, candidates))
 
         if not filtered:
             return None
@@ -229,14 +247,7 @@ class AdaptiveEWMASelector:
         candidates = filtered[: config.candidate_count]
 
         # Find best by latency
-        best_peer: str | None = None
-        best_latency = float("inf")
-
-        for peer_id in candidates:
-            latency = self._ewma.get_effective_latency(peer_id)
-            if latency < best_latency:
-                best_latency = latency
-                best_peer = peer_id
+        best_peer, best_latency = self._lowest_latency_candidate(candidates)
 
         return SelectionResult(
             peer_id=best_peer,  # type: ignore

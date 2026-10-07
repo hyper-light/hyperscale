@@ -103,14 +103,19 @@ class ObservedLatencyTracker:
         returns them."""
         current_time = self._clock.monotonic()
         async with self._lock:
-            stale_datacenter_ids = [
-                datacenter_id
-                for datacenter_id, state in self._latencies.items()
-                if state.is_stale(self._config.max_staleness_seconds, current_time)
-            ]
+            stale_datacenter_ids = self._stale_datacenter_ids(current_time)
             for datacenter_id in stale_datacenter_ids:
                 self._latencies.pop(datacenter_id, None)
         return stale_datacenter_ids
+
+    def _stale_datacenter_ids(self, current_time: float) -> list[str]:
+        """The datacenters whose observations are stale at ``current_time``
+        (AD-45); called under ``_lock``."""
+        return [
+            datacenter_id
+            for datacenter_id, state in self._latencies.items()
+            if state.is_stale(self._config.max_staleness_seconds, current_time)
+        ]
 
     async def remove_datacenter(self, datacenter_id: str) -> None:
         async with self._lock:

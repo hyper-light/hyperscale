@@ -58,11 +58,8 @@ class ProtocolVersion:
             return False
 
         # Feature is supported if our version >= required version
-        if self.major > required_version.major:
-            return True
-        if self.major < required_version.major:
-            return False
-        return self.minor >= required_version.minor
+        # (lexicographic: major first, then minor).
+        return (self.major, self.minor) >= (required_version.major, required_version.minor)
 
     def __str__(self) -> str:
         return f"{self.major}.{self.minor}"
@@ -107,7 +104,5 @@ def get_features_for_version(version: ProtocolVersion) -> set[str]:
     return {
         feature
         for feature, required in FEATURE_VERSIONS.items()
-        if version.major > required.major or (
-            version.major == required.major and version.minor >= required.minor
-        )
+        if (version.major, version.minor) >= (required.major, required.minor)
     }

@@ -100,6 +100,9 @@ class RoleValidator:
         (NodeRole.WORKER, NodeRole.MANAGER): "Results and heartbeats",
     }
 
+    # The role names an OU may carry (role-claim parsing below).
+    _node_role_values: ClassVar[frozenset[str]] = frozenset(role.value for role in NodeRole)
+
     def validate(
         self,
         source: CertificateClaims,
@@ -115,50 +118,79 @@ class RoleValidator:
         Returns:
             ValidationResult indicating if connection is allowed
         """
-        # Check cluster ID
-        if self.strict_mode:
-            if source.cluster_id != self.cluster_id:
-                return ValidationResult(
-                    allowed=False,
-                    reason=f"Source cluster mismatch: {source.cluster_id} != {self.cluster_id}",
-                    source_claims=source,
-                    target_claims=target,
-                )
-
-            if target.cluster_id != self.cluster_id:
-                return ValidationResult(
-                    allowed=False,
-                    reason=f"Target cluster mismatch: {target.cluster_id} != {self.cluster_id}",
-                    source_claims=source,
-                    target_claims=target,
-                )
-
-            # Check environment ID
-            if source.environment_id != self.environment_id:
-                return ValidationResult(
-                    allowed=False,
-                    reason=f"Source environment mismatch: {source.environment_id} != {self.environment_id}",
-                    source_claims=source,
-                    target_claims=target,
-                )
-
-            if target.environment_id != self.environment_id:
-                return ValidationResult(
-                    allowed=False,
-                    reason=f"Target environment mismatch: {target.environment_id} != {self.environment_id}",
-                    source_claims=source,
-                    target_claims=target,
-                )
-
-        # Check cross-environment (never allowed)
-        if source.environment_id != target.environment_id:
+        if (rejection_reason := self._connection_rejection_reason(source, target)) is not None:
             return ValidationResult(
                 allowed=False,
-                reason=f"Cross-environment connection not allowed: {source.environment_id} -> {target.environment_id}",
+                reason=rejection_reason,
                 source_claims=source,
                 target_claims=target,
             )
 
+        return self._role_permission_result(source, target)
+
+    def _connection_rejection_reason(
+        self,
+        source: CertificateClaims,
+        target: CertificateClaims,
+    ) -> str | None:
+        """Why the identity checks reject this connection, in check order:
+        strict cluster/environment match, then cross-environment (AD-28)."""
+        if (strict_reason := self._strict_mismatch_reason(source, target)) is not None:
+            return strict_reason
+
+        # Check cross-environment (never allowed)
+        if source.environment_id != target.environment_id:
+            return f"Cross-environment connection not allowed: {source.environment_id} -> {target.environment_id}"
+
+        return None
+
+    def _strict_mismatch_reason(
+        self,
+        source: CertificateClaims,
+        target: CertificateClaims,
+    ) -> str | None:
+        """In strict mode, the first cluster then environment mismatch of
+        either side against this validator's identity."""
+        if not self.strict_mode:
+            return None
+        return self._cluster_mismatch_reason(source, target) or self._environment_mismatch_reason(source, target)
+
+    def _cluster_mismatch_reason(
+        self,
+        source: CertificateClaims,
+        target: CertificateClaims,
+    ) -> str | None:
+        """The source-then-target cluster ID mismatch, if any."""
+        # Check cluster ID
+        if source.cluster_id != self.cluster_id:
+            return f"Source cluster mismatch: {source.cluster_id} != {self.cluster_id}"
+
+        if target.cluster_id != self.cluster_id:
+            return f"Target cluster mismatch: {target.cluster_id} != {self.cluster_id}"
+
+        return None
+
+    def _environment_mismatch_reason(
+        self,
+        source: CertificateClaims,
+        target: CertificateClaims,
+    ) -> str | None:
+        """The source-then-target environment ID mismatch, if any."""
+        # Check environment ID
+        if source.environment_id != self.environment_id:
+            return f"Source environment mismatch: {source.environment_id} != {self.environment_id}"
+
+        if target.environment_id != self.environment_id:
+            return f"Target environment mismatch: {target.environment_id} != {self.environment_id}"
+
+        return None
+
+    def _role_permission_result(
+        self,
+        source: CertificateClaims,
+        target: CertificateClaims,
+    ) -> ValidationResult:
+        """The AD-28 connection-matrix verdict for the two claims' roles."""
         # Check role-based permission
         connection_type = (source.role, target.role)
         if connection_type in self._allowed_connections:
@@ -236,26 +268,28 @@ class RoleValidator:
         Returns:
             ValidationResult indicating if claims are valid
         """
-        if self.strict_mode:
-            if claims.cluster_id != self.cluster_id:
-                return ValidationResult(
-                    allowed=False,
-                    reason=f"Cluster mismatch: {claims.cluster_id} != {self.cluster_id}",
-                    source_claims=claims,
-                )
-
-            if claims.environment_id != self.environment_id:
-                return ValidationResult(
-                    allowed=False,
-                    reason=f"Environment mismatch: {claims.environment_id} != {self.environment_id}",
-                    source_claims=claims,
-                )
+        if self.strict_mode and (mismatch_reason := self._claims_mismatch_reason(claims)) is not None:
+            return ValidationResult(
+                allowed=False,
+                reason=mismatch_reason,
+                source_claims=claims,
+            )
 
         return ValidationResult(
             allowed=True,
             reason="Claims valid",
             source_claims=claims,
         )
+
+    def _claims_mismatch_reason(self, claims: CertificateClaims) -> str | None:
+        """The cluster-then-environment mismatch of ``claims``, if any."""
+        if claims.cluster_id != self.cluster_id:
+            return f"Cluster mismatch: {claims.cluster_id} != {self.cluster_id}"
+
+        if claims.environment_id != self.environment_id:
+            return f"Environment mismatch: {claims.environment_id} != {self.environment_id}"
+
+        return None
 
     def extract_peer_claims(self, cert_der: bytes) -> CertificateClaims:
         """Parse a peer certificate under THIS validator's configured
@@ -327,52 +361,16 @@ class RoleValidator:
         try:
             cert = x509.load_der_x509_certificate(cert_der, default_backend())
 
-            cluster_id = default_cluster
-            try:
-                cn_attribute = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-                if cn_attribute:
-                    cluster_id = str(cn_attribute[0].value)
-                elif strict:
-                    parse_errors.append("CN (cluster_id) not found in certificate")
-            except Exception as cn_error:
-                parse_errors.append(f"Failed to extract CN: {cn_error}")
+            cluster_id = RoleValidator._read_cluster_id(cert, default_cluster, strict, parse_errors)
 
-            role: NodeRole | None = None
-            try:
-                ou_attribute = cert.subject.get_attributes_for_oid(
-                    NameOID.ORGANIZATIONAL_UNIT_NAME
-                )
-                if ou_attribute:
-                    role_str = str(ou_attribute[0].value).lower()
-                    if role_str in {r.value for r in NodeRole}:
-                        role = NodeRole(role_str)
-                    elif strict:
-                        parse_errors.append(f"Invalid role in OU: {role_str}")
-                elif strict:
-                    parse_errors.append("OU (role) not found in certificate")
-            except Exception as ou_error:
-                parse_errors.append(f"Failed to extract OU: {ou_error}")
-
-            if role is None:
-                role = NodeRole.CLIENT
+            role = RoleValidator._read_role(cert, strict, parse_errors)
 
             node_id = "unknown"
             datacenter_id = ""
             region_id = ""
 
             try:
-                san_extension = cert.extensions.get_extension_for_oid(
-                    ExtensionOID.SUBJECT_ALTERNATIVE_NAME
-                )
-                san_values = san_extension.value
-
-                for dns_name in san_values.get_values_for_type(x509.DNSName):
-                    if dns_name.startswith("node="):
-                        node_id = dns_name[5:]
-                    elif dns_name.startswith("dc="):
-                        datacenter_id = dns_name[3:]
-                    elif dns_name.startswith("region="):
-                        region_id = dns_name[7:]
+                node_id, datacenter_id, region_id = RoleValidator._identifiers_from_subject_alternative_names(cert)
             except x509.ExtensionNotFound:
                 pass
             except Exception as san_error:
@@ -380,9 +378,7 @@ class RoleValidator:
 
             environment_id = default_environment
             try:
-                custom_oid = x509.ObjectIdentifier("1.3.6.1.4.1.99999.1")
-                env_extension = cert.extensions.get_extension_for_oid(custom_oid)
-                environment_id = env_extension.value.value.decode("utf-8")
+                environment_id = RoleValidator._environment_id_from_extension(cert)
             except x509.ExtensionNotFound:
                 pass
             except Exception as env_error:
@@ -390,10 +386,7 @@ class RoleValidator:
                     f"Failed to parse environment extension: {env_error}"
                 )
 
-            if strict and parse_errors:
-                raise CertificateParseError(
-                    f"Certificate parse errors: {'; '.join(parse_errors)}"
-                )
+            RoleValidator._raise_on_strict_parse_errors(strict, parse_errors)
 
             return CertificateClaims(
                 cluster_id=cluster_id,
@@ -407,19 +400,164 @@ class RoleValidator:
         except CertificateParseError:
             raise
         except Exception as parse_error:
-            if strict:
-                raise CertificateParseError(
-                    f"Failed to parse certificate: {parse_error}",
-                    parse_error=parse_error,
-                )
-            return CertificateClaims(
-                cluster_id=default_cluster,
-                environment_id=default_environment,
-                role=NodeRole.CLIENT,
-                node_id="unknown",
-                datacenter_id="",
-                region_id="",
+            return RoleValidator._unparseable_certificate_claims(
+                parse_error,
+                default_cluster,
+                default_environment,
+                strict,
             )
+
+    @staticmethod
+    def _read_cluster_id(
+        cert: x509.Certificate,
+        default_cluster: str,
+        strict: bool,
+        parse_errors: list[str],
+    ) -> str:
+        """The cluster ID from the subject CN, else ``default_cluster``; a
+        failed read is recorded in ``parse_errors``."""
+        try:
+            cn_attribute = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+            return RoleValidator._cluster_id_from_common_name(cn_attribute, default_cluster, strict, parse_errors)
+        except Exception as cn_error:
+            parse_errors.append(f"Failed to extract CN: {cn_error}")
+            return default_cluster
+
+    @staticmethod
+    def _cluster_id_from_common_name(
+        cn_attribute: list[x509.NameAttribute],
+        default_cluster: str,
+        strict: bool,
+        parse_errors: list[str],
+    ) -> str:
+        """The first CN value; when absent, ``default_cluster`` (recorded as an error when strict)."""
+        if cn_attribute:
+            return str(cn_attribute[0].value)
+        if strict:
+            parse_errors.append("CN (cluster_id) not found in certificate")
+        return default_cluster
+
+    @staticmethod
+    def _read_role(
+        cert: x509.Certificate,
+        strict: bool,
+        parse_errors: list[str],
+    ) -> NodeRole:
+        """The role from the subject OU, else ``NodeRole.CLIENT``; a failed
+        read is recorded in ``parse_errors``."""
+        role: NodeRole | None = None
+        try:
+            ou_attribute = cert.subject.get_attributes_for_oid(
+                NameOID.ORGANIZATIONAL_UNIT_NAME
+            )
+            role = RoleValidator._role_from_organizational_unit(ou_attribute, strict, parse_errors)
+        except Exception as ou_error:
+            parse_errors.append(f"Failed to extract OU: {ou_error}")
+
+        return NodeRole.CLIENT if role is None else role
+
+    @staticmethod
+    def _role_from_organizational_unit(
+        ou_attribute: list[x509.NameAttribute],
+        strict: bool,
+        parse_errors: list[str],
+    ) -> NodeRole | None:
+        """The role named by the first OU value; None when absent or not a
+        role (each recorded as an error when strict)."""
+        if not ou_attribute:
+            RoleValidator._record_strict_parse_error(strict, parse_errors, "OU (role) not found in certificate")
+            return None
+
+        role_str = str(ou_attribute[0].value).lower()
+        if role_str in RoleValidator._node_role_values:
+            return NodeRole(role_str)
+
+        RoleValidator._record_strict_parse_error(strict, parse_errors, f"Invalid role in OU: {role_str}")
+        return None
+
+    @staticmethod
+    def _record_strict_parse_error(strict: bool, parse_errors: list[str], message: str) -> None:
+        """Record a missing or invalid claim -- an error only under strict parsing."""
+        if strict:
+            parse_errors.append(message)
+
+    @staticmethod
+    def _identifiers_from_subject_alternative_names(cert: x509.Certificate) -> tuple[str, str, str]:
+        """``(node_id, datacenter_id, region_id)`` from the SAN DNS entries.
+
+        Raises:
+            x509.ExtensionNotFound: the certificate has no SAN extension.
+        """
+        san_extension = cert.extensions.get_extension_for_oid(
+            ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+        )
+        san_values = san_extension.value
+
+        return RoleValidator._identifiers_from_dns_names(san_values.get_values_for_type(x509.DNSName))
+
+    @staticmethod
+    def _identifiers_from_dns_names(dns_names: list[str]) -> tuple[str, str, str]:
+        """``(node_id, datacenter_id, region_id)`` from ``node=``/``dc=``/``region=``
+        SAN entries; the last entry of each prefix wins."""
+        identifiers = {"node=": "unknown", "dc=": "", "region=": ""}
+
+        for dns_name in dns_names:
+            # The prefix through the first "=" ("" when there is none); the
+            # three prefixes are disjoint, so at most one ever matches.
+            prefix = dns_name[: dns_name.find("=") + 1]
+            if prefix in identifiers:
+                identifiers[prefix] = dns_name[len(prefix):]
+
+        return (identifiers["node="], identifiers["dc="], identifiers["region="])
+
+    @staticmethod
+    def _environment_id_from_extension(cert: x509.Certificate) -> str:
+        """The environment ID carried in the custom OID 1.3.6.1.4.1.99999.1 extension.
+
+        Raises:
+            x509.ExtensionNotFound: the certificate has no such extension.
+        """
+        custom_oid = x509.ObjectIdentifier("1.3.6.1.4.1.99999.1")
+        env_extension = cert.extensions.get_extension_for_oid(custom_oid)
+        return env_extension.value.value.decode("utf-8")
+
+    @staticmethod
+    def _raise_on_strict_parse_errors(strict: bool, parse_errors: list[str]) -> None:
+        """Under strict parsing, refuse a certificate any claim failed to parse from.
+
+        Raises:
+            CertificateParseError: ``strict`` and ``parse_errors`` is non-empty.
+        """
+        if strict and parse_errors:
+            raise CertificateParseError(
+                f"Certificate parse errors: {'; '.join(parse_errors)}"
+            )
+
+    @staticmethod
+    def _unparseable_certificate_claims(
+        parse_error: Exception,
+        default_cluster: str,
+        default_environment: str,
+        strict: bool,
+    ) -> CertificateClaims:
+        """Default CLIENT claims for an unparseable certificate (FIX.md 1.1).
+
+        Raises:
+            CertificateParseError: ``strict`` -- an unparseable certificate is rejected.
+        """
+        if strict:
+            raise CertificateParseError(
+                f"Failed to parse certificate: {parse_error}",
+                parse_error=parse_error,
+            )
+        return CertificateClaims(
+            cluster_id=default_cluster,
+            environment_id=default_environment,
+            role=NodeRole.CLIENT,
+            node_id="unknown",
+            datacenter_id="",
+            region_id="",
+        )
 
     @classmethod
     def get_connection_matrix(cls) -> dict[str, list[str]]:

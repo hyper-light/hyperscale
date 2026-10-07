@@ -3,6 +3,7 @@
 
 import ipaddress
 from dataclasses import dataclass, field
+from operator import attrgetter
 
 from .security_shared import _DEFAULT_CLOCK
 from .dns_security_event import DNSSecurityEvent
@@ -140,47 +141,87 @@ class DNSSecurityValidator:
             ip_addr = ipaddress.ip_address(resolved_ip)
         except ValueError:
             # Invalid IP format - this is a serious error
-            event = DNSSecurityEvent(
-                hostname=hostname,
-                violation_type=DNSSecurityViolation.IP_OUT_OF_RANGE,
-                resolved_ip=resolved_ip,
-                details=f"Invalid IP format: {resolved_ip}",
-            )
-            self._record_event(event)
-            return event
-
-        # Check CIDR ranges if configured
-        if self._parsed_networks:
-            in_allowed_range = any(
-                ip_addr in network for network in self._parsed_networks
-            )
-            if not in_allowed_range:
-                event = DNSSecurityEvent(
+            return self._recorded_event(
+                DNSSecurityEvent(
                     hostname=hostname,
                     violation_type=DNSSecurityViolation.IP_OUT_OF_RANGE,
                     resolved_ip=resolved_ip,
-                    details=f"IP {resolved_ip} not in allowed ranges: {self.allowed_cidrs}",
+                    details=f"Invalid IP format: {resolved_ip}",
                 )
-                self._record_event(event)
-                return event
+            )
+
+        # Check CIDR ranges if configured
+        if (range_event := self._range_violation(hostname, resolved_ip, ip_addr)) is not None:
+            return range_event
 
         # Check for DNS rebinding (private IP for public hostname)
-        if self.block_private_for_public:
-            if not self._is_internal_hostname(hostname):
-                is_private = any(
-                    ip_addr in network for network in self._private_networks
-                )
-                if is_private:
-                    event = DNSSecurityEvent(
-                        hostname=hostname,
-                        violation_type=DNSSecurityViolation.PRIVATE_IP_FOR_PUBLIC_HOST,
-                        resolved_ip=resolved_ip,
-                        details=f"Private IP {resolved_ip} returned for public hostname '{hostname}'",
-                    )
-                    self._record_event(event)
-                    return event
+        return self._rebinding_violation(hostname, resolved_ip, ip_addr)
 
-        return None
+    def _recorded_event(self, event: DNSSecurityEvent) -> DNSSecurityEvent:
+        """Record ``event`` for monitoring and hand it back."""
+        self._record_event(event)
+        return event
+
+    @staticmethod
+    def _in_any_network(
+        ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network],
+    ) -> bool:
+        """Whether ``ip_addr`` lies in any of ``networks``."""
+        return any(ip_addr in network for network in networks)
+
+    def _range_violation(
+        self,
+        hostname: str,
+        resolved_ip: str,
+        ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> DNSSecurityEvent | None:
+        """The recorded out-of-range event when allowed CIDRs are configured
+        and ``ip_addr`` lies in none of them."""
+        if not self._parsed_networks:
+            return None
+        if self._in_any_network(ip_addr, self._parsed_networks):
+            return None
+        return self._recorded_event(
+            DNSSecurityEvent(
+                hostname=hostname,
+                violation_type=DNSSecurityViolation.IP_OUT_OF_RANGE,
+                resolved_ip=resolved_ip,
+                details=f"IP {resolved_ip} not in allowed ranges: {self.allowed_cidrs}",
+            )
+        )
+
+    def _rebinding_violation(
+        self,
+        hostname: str,
+        resolved_ip: str,
+        ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> DNSSecurityEvent | None:
+        """The recorded rebinding event when private-for-public blocking is on
+        and a public hostname answered a private address."""
+        if not self.block_private_for_public:
+            return None
+        return self._public_host_private_address_violation(hostname, resolved_ip, ip_addr)
+
+    def _public_host_private_address_violation(
+        self,
+        hostname: str,
+        resolved_ip: str,
+        ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> DNSSecurityEvent | None:
+        """The recorded event for a non-internal ``hostname`` answering a private ``ip_addr``."""
+        if self._is_internal_hostname(hostname):
+            return None
+        if not self._in_any_network(ip_addr, self._private_networks):
+            return None
+        return self._recorded_event(
+            DNSSecurityEvent(
+                hostname=hostname,
+                violation_type=DNSSecurityViolation.PRIVATE_IP_FOR_PUBLIC_HOST,
+                resolved_ip=resolved_ip,
+                details=f"Private IP {resolved_ip} returned for public hostname '{hostname}'",
+            )
+        )
 
     def validate_answer(
         self,
@@ -201,24 +242,44 @@ class DNSSecurityValidator:
             The addresses that pass, and the violations found. An answer
             that is a rapid rotation passes no address.
         """
-        events = [
+        events = self._address_violations(hostname, resolved_ips)
+        accepted_ips = self._accepted_addresses(resolved_ips, events)
+        accepted_ips = self._anomaly_screened_addresses(hostname, resolved_ips, accepted_ips, events)
+
+        return accepted_ips, events
+
+    def _address_violations(self, hostname: str, resolved_ips: list[str]) -> list[DNSSecurityEvent]:
+        """Each address's range/rebinding violation, in answer order."""
+        return [
             event
             for resolved_ip in resolved_ips
             if (event := self._validate_address(hostname, resolved_ip)) is not None
         ]
-        rejected_ips = {event.resolved_ip for event in events}
-        accepted_ips = [
+
+    @staticmethod
+    def _accepted_addresses(resolved_ips: list[str], events: list[DNSSecurityEvent]) -> list[str]:
+        """The answer's addresses no violation names, in answer order."""
+        rejected_ips = set(map(attrgetter("resolved_ip"), events))
+        return [
             resolved_ip for resolved_ip in resolved_ips if resolved_ip not in rejected_ips
         ]
 
+    def _anomaly_screened_addresses(
+        self,
+        hostname: str,
+        resolved_ips: list[str],
+        accepted_ips: list[str],
+        events: list[DNSSecurityEvent],
+    ) -> list[str]:
+        """``accepted_ips``, or none when change detection flags the answer as
+        a rapid rotation (the anomaly is recorded and appended to ``events``)."""
         if self.detect_ip_changes and (
             anomaly := self._check_answer_anomaly(hostname, frozenset(resolved_ips))
         ) is not None:
             self._record_event(anomaly)
             events.append(anomaly)
-            accepted_ips = []
-
-        return accepted_ips, events
+            return []
+        return accepted_ips
 
     def validate_batch(
         self,
@@ -274,21 +335,42 @@ class DNSSecurityValidator:
         and rolling updates of a service produce, are not changes.
         """
         now = _DEFAULT_CLOCK.monotonic()
-        history = self._host_history.get(hostname)
-        if history is None:
-            history = HostHistory()
-            self._host_history[hostname] = history
+        history = self._host_history_for(hostname)
 
         # Check if tracking window expired
-        if now - history.window_start_time > self.ip_change_window_seconds:
-            history.change_count = 0
-            history.window_start_time = now
+        self._roll_change_window(history, now)
 
         previous_answer = history.last_answer
         history.last_answer = answer
         if not previous_answer or not previous_answer.isdisjoint(answer):
             return None
 
+        return self._record_disjoint_answer(hostname, history, answer, previous_answer, now)
+
+    def _host_history_for(self, hostname: str) -> HostHistory:
+        """The host's change history, created on its first answer."""
+        history = self._host_history.get(hostname)
+        if history is None:
+            history = HostHistory()
+            self._host_history[hostname] = history
+        return history
+
+    def _roll_change_window(self, history: HostHistory, now: float) -> None:
+        """Start a fresh change-tracking window once the current one expired."""
+        if now - history.window_start_time > self.ip_change_window_seconds:
+            history.change_count = 0
+            history.window_start_time = now
+
+    def _record_disjoint_answer(
+        self,
+        hostname: str,
+        history: HostHistory,
+        answer: frozenset[str],
+        previous_answer: frozenset[str],
+        now: float,
+    ) -> DNSSecurityEvent | None:
+        """Count a disjoint answer as a change; past the window's limit it is
+        a rapid-rotation event."""
         history.change_count += 1
         history.last_change_time = now
         if history.change_count <= self.max_ip_changes_per_window:
@@ -330,8 +412,12 @@ class DNSSecurityValidator:
         """
         events = self._security_events
         if violation_type:
-            events = [e for e in events if e.violation_type == violation_type]
+            events = self._events_of_type(violation_type)
         return list(reversed(events[-limit:]))
+
+    def _events_of_type(self, violation_type: DNSSecurityViolation) -> list[DNSSecurityEvent]:
+        """The recorded events of ``violation_type``, oldest first."""
+        return [e for e in self._security_events if e.violation_type == violation_type]
 
     def get_host_history(self, hostname: str) -> HostHistory | None:
         """Get IP history for a hostname."""

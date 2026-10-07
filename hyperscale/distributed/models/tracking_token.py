@@ -78,8 +78,8 @@ class TrackingToken:
         datacenter = parts[0]
         manager_id = parts[1]
         job_id = parts[2]
-        workflow_id = parts[3] if len(parts) > 3 else None
-        worker_id = parts[4] if len(parts) > 4 else None
+        # Absent workflow/worker levels pad to None.
+        workflow_id, worker_id = (parts[3:5] + [None, None])[:2]
 
         return cls(
             datacenter=datacenter,

@@ -145,6 +145,15 @@ class NegativeCache:
             Number of entries removed
         """
         now = _DEFAULT_CLOCK.monotonic()
+        to_remove = self._expired_hostnames(now)
+
+        for hostname in to_remove:
+            del self._entries[hostname]
+
+        return len(to_remove)
+
+    def _expired_hostnames(self, now: float) -> list[str]:
+        """Hostnames whose backoff TTL elapsed by ``now``."""
         to_remove = []
 
         for hostname, entry in self._entries.items():
@@ -152,10 +161,7 @@ class NegativeCache:
             if now - entry.cached_at > ttl:
                 to_remove.append(hostname)
 
-        for hostname in to_remove:
-            del self._entries[hostname]
-
-        return len(to_remove)
+        return to_remove
 
     def _compute_ttl(self, failure_count: int) -> float:
         """

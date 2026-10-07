@@ -207,10 +207,22 @@ class TDigest:
                 (centroid.mean, centroid.weight) for centroid in self._centroids
             ],
             "total_weight": self._total_weight,
-            "min": self._min if self._min != float("inf") else None,
-            "max": self._max if self._max != float("-inf") else None,
+            "min": self._bound_or_none(self._min, float("inf")),
+            "max": self._bound_or_none(self._max, float("-inf")),
         }
         return msgspec.msgpack.encode(payload)
+
+    @staticmethod
+    def _bound_or_none(bound: float, empty_sentinel: float) -> float | None:
+        """A min/max bound for the wire: None while it is still the empty
+        digest's infinite sentinel."""
+        return bound if bound != empty_sentinel else None
+
+    @staticmethod
+    def _bound_or_sentinel(bound: float | None, empty_sentinel: float) -> float:
+        """A min/max bound read off the wire: the empty digest's infinite
+        sentinel when it was sent as None."""
+        return bound if bound is not None else empty_sentinel
 
     @classmethod
     def from_bytes(cls, data: bytes, config: SLOConfig) -> "TDigest":
@@ -222,10 +234,6 @@ class TDigest:
             for mean, weight in parsed.get("centroids", [])
         ]
         digest._total_weight = parsed.get("total_weight", 0.0)
-        digest._min = (
-            parsed.get("min") if parsed.get("min") is not None else float("inf")
-        )
-        digest._max = (
-            parsed.get("max") if parsed.get("max") is not None else float("-inf")
-        )
+        digest._min = cls._bound_or_sentinel(parsed.get("min"), float("inf"))
+        digest._max = cls._bound_or_sentinel(parsed.get("max"), float("-inf"))
         return digest

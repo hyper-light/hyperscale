@@ -136,19 +136,7 @@ class DiscoveryService:
     def __post_init__(self) -> None:
         """Initialize internal components."""
         # DNS security validator (if any security settings are configured)
-        security_validator: DNSSecurityValidator | None = None
-        if (
-            self.config.dns_allowed_cidrs
-            or self.config.dns_block_private_for_public
-            or self.config.dns_detect_ip_changes
-        ):
-            security_validator = DNSSecurityValidator(
-                allowed_cidrs=self.config.dns_allowed_cidrs,
-                block_private_for_public=self.config.dns_block_private_for_public,
-                detect_ip_changes=self.config.dns_detect_ip_changes,
-                max_ip_changes_per_window=self.config.dns_max_ip_changes_per_window,
-                ip_change_window_seconds=self.config.dns_ip_change_window_seconds,
-            )
+        security_validator: DNSSecurityValidator | None = self._build_security_validator()
 
         # DNS resolver
         self._resolver = AsyncDNSResolver(
@@ -177,6 +165,37 @@ class DiscoveryService:
         )
 
         # Locality filter (only if locality is configured)
+        self._configure_locality()
+
+        # Metrics tracking
+        self._metrics = DiscoveryMetrics()
+
+        # Add static seeds as initial peers
+        for seed in self.config.static_seeds:
+            self._add_static_seed(seed)
+
+    def _dns_security_configured(self) -> bool:
+        """Whether any DNS security setting is configured."""
+        return bool(
+            self.config.dns_allowed_cidrs
+            or self.config.dns_block_private_for_public
+            or self.config.dns_detect_ip_changes
+        )
+
+    def _build_security_validator(self) -> DNSSecurityValidator | None:
+        """The DNS security validator the configured settings call for, if any."""
+        if not self._dns_security_configured():
+            return None
+        return DNSSecurityValidator(
+            allowed_cidrs=self.config.dns_allowed_cidrs,
+            block_private_for_public=self.config.dns_block_private_for_public,
+            detect_ip_changes=self.config.dns_detect_ip_changes,
+            max_ip_changes_per_window=self.config.dns_max_ip_changes_per_window,
+            ip_change_window_seconds=self.config.dns_ip_change_window_seconds,
+        )
+
+    def _configure_locality(self) -> None:
+        """Build the local locality and its filter when a datacenter or region is configured."""
         if self.config.datacenter_id or self.config.region_id:
             self._local_locality = LocalityInfo(
                 datacenter_id=self.config.datacenter_id,
@@ -188,13 +207,6 @@ class DiscoveryService:
                 global_fallback_enabled=True,
                 min_local_peers=self.config.min_peers_per_tier,
             )
-
-        # Metrics tracking
-        self._metrics = DiscoveryMetrics()
-
-        # Add static seeds as initial peers
-        for seed in self.config.static_seeds:
-            self._add_static_seed(seed)
 
     def _add_static_seed(self, seed: str) -> None:
         """
@@ -249,30 +261,7 @@ class DiscoveryService:
 
         try:
             for dns_name in self.config.dns_names:
-                try:
-                    result = await self._resolver.resolve(
-                        dns_name,
-                        port=self.config.default_port,
-                        force_refresh=force_refresh,
-                    )
-                    # Note: We don't have cache info from resolver, record as uncached query
-                    self._metrics.record_dns_query(cached=False)
-
-                    # Handle SRV records specially - each target may have a different port
-                    if result.srv_records:
-                        answered_peer_ids, added = self._add_peers_from_srv_records(result)
-                    else:
-                        # Standard A/AAAA record handling
-                        answered_peer_ids, added = self._add_peers_from_addresses(
-                            result.addresses,
-                            result.port or self.config.default_port,
-                        )
-                    discovered.extend(added)
-                    self._retire_unanswered_dns_peers(dns_name, answered_peer_ids)
-
-                except DNSError:
-                    self._metrics.record_dns_failure()
-                    # Continue with other DNS names
+                await self._discover_from_dns_name(dns_name, force_refresh, discovered)
 
             self._last_discovery = _DEFAULT_CLOCK.monotonic()
 
@@ -280,6 +269,43 @@ class DiscoveryService:
             self._discovery_in_progress = False
 
         return discovered
+
+    async def _discover_from_dns_name(
+        self,
+        dns_name: str,
+        force_refresh: bool,
+        discovered: list[PeerInfo],
+    ) -> None:
+        """Resolve one configured DNS name, adding the peers it answers to
+        ``discovered``; a failed lookup is counted and changes nothing else."""
+        try:
+            result = await self._resolver.resolve(
+                dns_name,
+                port=self.config.default_port,
+                force_refresh=force_refresh,
+            )
+            # Note: We don't have cache info from resolver, record as uncached query
+            self._metrics.record_dns_query(cached=False)
+
+            answered_peer_ids, added = self._add_peers_from_result(result)
+            discovered.extend(added)
+            self._retire_unanswered_dns_peers(dns_name, answered_peer_ids)
+
+        except DNSError:
+            self._metrics.record_dns_failure()
+            # Continue with other DNS names
+
+    def _add_peers_from_result(self, result: DNSResult) -> tuple[set[str], list[PeerInfo]]:
+        """Add the peers one DNS answer names: the answered ids, and the new peers."""
+        # Handle SRV records specially - each target may have a different port
+        if result.srv_records:
+            return self._add_peers_from_srv_records(result)
+
+        # Standard A/AAAA record handling
+        return self._add_peers_from_addresses(
+            result.addresses,
+            result.port or self.config.default_port,
+        )
 
     def _retire_unanswered_dns_peers(
         self,
@@ -334,14 +360,18 @@ class DiscoveryService:
                     cluster_id=self.config.cluster_id,
                     environment_id=self.config.environment_id,
                 )
-                self._peers[peer_id] = peer
-                self._selector.add_peer(peer_id, weight=1.0)
-                added.append(peer)
-
-                if self._on_peer_added is not None:
-                    self._on_peer_added(peer)
+                self._admit_new_peer(peer, 1.0, added)
 
         return answered_peer_ids, added
+
+    def _admit_new_peer(self, peer: PeerInfo, selector_weight: float, added: list[PeerInfo]) -> None:
+        """Track a newly discovered peer, add it to ``added`` and announce it."""
+        self._peers[peer.peer_id] = peer
+        self._selector.add_peer(peer.peer_id, weight=selector_weight)
+        added.append(peer)
+
+        if self._on_peer_added is not None:
+            self._on_peer_added(peer)
 
     def _add_peers_from_srv_records(
         self,
@@ -380,40 +410,45 @@ class DiscoveryService:
         # Since _do_resolve_srv resolves each target separately, we iterate
         # through srv_records to get the proper port for each target
         for srv_record in result.srv_records:
-            # The port comes from the SRV record
-            port = srv_record.port
-            target = srv_record.target
-
-            # Create peer using the target hostname (it will be resolved on connect)
-            # or we can use the already-resolved IPs if available
-            # For now, use the target hostname to preserve the SRV semantics
-            peer_id = f"srv-{target}-{port}"
-            answered_peer_ids.add(peer_id)
-
-            if peer_id not in self._peers:
-                # Calculate weight factor from SRV priority and weight
-                # Lower priority is better, higher weight is better
-                # Normalize to 0.1 - 1.0 range for selector weight
-                priority_factor = 1.0 / (1.0 + srv_record.priority)
-                weight_factor = (srv_record.weight + 1) / 100.0  # Normalize weight
-                selector_weight = max(0.1, min(1.0, priority_factor * weight_factor))
-
-                peer = PeerInfo(
-                    peer_id=peer_id,
-                    host=target,
-                    port=port,
-                    role="manager",  # Discovered peers are typically managers
-                    cluster_id=self.config.cluster_id,
-                    environment_id=self.config.environment_id,
-                )
-                self._peers[peer_id] = peer
-                self._selector.add_peer(peer_id, weight=selector_weight)
-                added.append(peer)
-
-                if self._on_peer_added is not None:
-                    self._on_peer_added(peer)
+            self._admit_srv_record(srv_record, answered_peer_ids, added)
 
         return answered_peer_ids, added
+
+    def _admit_srv_record(
+        self,
+        srv_record: SRVRecord,
+        answered_peer_ids: set[str],
+        added: list[PeerInfo],
+    ) -> None:
+        """Mark one SRV target answered, adding it as a peer (weighted by
+        priority and weight) when new."""
+        # The port comes from the SRV record
+        port = srv_record.port
+        target = srv_record.target
+
+        # Create peer using the target hostname (it will be resolved on connect)
+        # or we can use the already-resolved IPs if available
+        # For now, use the target hostname to preserve the SRV semantics
+        peer_id = f"srv-{target}-{port}"
+        answered_peer_ids.add(peer_id)
+
+        if peer_id not in self._peers:
+            # Calculate weight factor from SRV priority and weight
+            # Lower priority is better, higher weight is better
+            # Normalize to 0.1 - 1.0 range for selector weight
+            priority_factor = 1.0 / (1.0 + srv_record.priority)
+            weight_factor = (srv_record.weight + 1) / 100.0  # Normalize weight
+            selector_weight = max(0.1, min(1.0, priority_factor * weight_factor))
+
+            peer = PeerInfo(
+                peer_id=peer_id,
+                host=target,
+                port=port,
+                role="manager",  # Discovered peers are typically managers
+                cluster_id=self.config.cluster_id,
+                environment_id=self.config.environment_id,
+            )
+            self._admit_new_peer(peer, selector_weight, added)
 
     def add_peer(
         self,
@@ -501,14 +536,18 @@ class DiscoveryService:
         del self._peers[peer_id]
         self._selector.remove_peer(peer_id)
 
+        self._after_peer_removed(peer_id)
+
+        return True
+
+    def _after_peer_removed(self, peer_id: str) -> None:
+        """Drop a removed peer's locality cache entry and announce its removal."""
         # Invalidate locality cache for this peer
         if self._locality_filter is not None:
             self._locality_filter.invalidate_cache(peer_id)
 
         if self._on_peer_removed is not None:
             self._on_peer_removed(peer_id)
-
-        return True
 
     def select_peer(self, key: str) -> SelectionResult | None:
         """
@@ -537,29 +576,45 @@ class DiscoveryService:
             SelectionResult or None if no peers available
         """
         # If locality filter is configured, use locality-aware selection
-        if self._locality_filter is not None and len(self._peers) > 0:
-            peers_list = list(self._peers.values())
-            result_peer, tier = self._locality_filter.select_with_fallback(
-                peers_list,
-                selector=lambda ps: ps[0] if ps else None,  # Get first matching
-            )
-
-            if result_peer is not None and tier is not None:
-                # Use selector with filter for locality-preferred peers
-                preferred_tier = tier
-
-                def locality_filter_fn(peer_id: str) -> bool:
-                    return self._get_peer_tier(peer_id) == preferred_tier
-
-                selection = self._selector.select_with_filter(key, locality_filter_fn)
-                if selection is not None:
-                    self._metrics.record_selection(
-                        tier=preferred_tier,
-                        load_balanced=selection.was_load_balanced,
-                    )
-                    return selection
+        if self._locality_selection_enabled() and (selection := self._select_locality_preferred(key)) is not None:
+            return selection
 
         # Fall back to standard selection
+        return self._select_globally(key)
+
+    def _locality_selection_enabled(self) -> bool:
+        """Whether a locality filter is configured and there are peers to filter."""
+        return self._locality_filter is not None and len(self._peers) > 0
+
+    def _select_locality_preferred(self, key: str) -> SelectionResult | None:
+        """Select among the peers of the best locality tier that has any."""
+        peers_list = list(self._peers.values())
+        result_peer, tier = self._locality_filter.select_with_fallback(
+            peers_list,
+            selector=lambda ps: ps[0] if ps else None,  # Get first matching
+        )
+
+        if result_peer is None or tier is None:
+            return None
+
+        return self._select_in_tier(key, tier)
+
+    def _select_in_tier(self, key: str, preferred_tier: LocalityTier) -> SelectionResult | None:
+        """Select among ``preferred_tier``'s peers, recording the selection."""
+        # Use selector with filter for locality-preferred peers
+        def locality_filter_fn(peer_id: str) -> bool:
+            return self._get_peer_tier(peer_id) == preferred_tier
+
+        selection = self._selector.select_with_filter(key, locality_filter_fn)
+        if selection is not None:
+            self._metrics.record_selection(
+                tier=preferred_tier,
+                load_balanced=selection.was_load_balanced,
+            )
+        return selection
+
+    def _select_globally(self, key: str) -> SelectionResult | None:
+        """Power of Two Choices with EWMA over every peer, recording the selection."""
         result = self._selector.select(key)
         if result is not None:
             self._metrics.record_selection(
@@ -573,6 +628,10 @@ class DiscoveryService:
         if self._locality_filter is None or self._local_locality is None:
             return LocalityTier.GLOBAL
 
+        return self._known_peer_tier(peer_id)
+
+    def _known_peer_tier(self, peer_id: str) -> LocalityTier:
+        """The locality filter's tier for a known peer; GLOBAL for an unknown one."""
         peer = self._peers.get(peer_id)
         if peer is None:
             return LocalityTier.GLOBAL
@@ -629,43 +688,70 @@ class DiscoveryService:
         results: list[SelectionResult] = []
         used_peer_ids: set[str] = set()
 
+        self._append_primary_selection(key, results, used_peer_ids)
+
+        # Get backup peers from remaining healthy peers
+        if len(results) < count:
+            self._append_backup_peers(results, used_peer_ids, count)
+
+        return results
+
+    def _append_primary_selection(
+        self,
+        key: str,
+        results: list[SelectionResult],
+        used_peer_ids: set[str],
+    ) -> None:
+        """Append the primary selection for ``key``, if any, marking it used."""
         primary = self.select_peer(key)
         if primary is not None:
             results.append(primary)
             used_peer_ids.add(primary.peer_id)
 
-        # Get backup peers from remaining healthy peers
-        if len(results) < count:
-            healthy_peers = self.get_healthy_peers()
+    def _append_backup_peers(
+        self,
+        results: list[SelectionResult],
+        used_peer_ids: set[str],
+        count: int,
+    ) -> None:
+        """Fill ``results`` up to ``count`` with unused healthy peers, lowest latency first."""
+        healthy_peers = self.get_healthy_peers()
 
-            # Sort by latency for backup ordering
-            peer_latencies: list[tuple[str, float]] = []
-            for peer in healthy_peers:
-                if peer.peer_id not in used_peer_ids:
-                    effective_latency = self._selector.get_effective_latency(
-                        peer.peer_id
-                    )
-                    peer_latencies.append((peer.peer_id, effective_latency))
+        # Sort by latency for backup ordering
+        peer_latencies = self._unused_peer_latencies(healthy_peers, used_peer_ids)
 
-            # Sort by latency (ascending)
-            peer_latencies.sort(key=lambda pair: pair[1])
+        # Sort by latency (ascending)
+        peer_latencies.sort(key=lambda pair: pair[1])
 
-            # Add backup peers
-            for peer_id, latency in peer_latencies:
-                if len(results) >= count:
-                    break
+        # Add backup peers
+        for peer_id, latency in peer_latencies:
+            if len(results) >= count:
+                break
 
-                results.append(
-                    SelectionResult(
-                        peer_id=peer_id,
-                        effective_latency_ms=latency,
-                        was_load_balanced=False,
-                        candidates_considered=len(peer_latencies),
-                    )
+            results.append(
+                SelectionResult(
+                    peer_id=peer_id,
+                    effective_latency_ms=latency,
+                    was_load_balanced=False,
+                    candidates_considered=len(peer_latencies),
                 )
-                used_peer_ids.add(peer_id)
+            )
+            used_peer_ids.add(peer_id)
 
-        return results
+    def _unused_peer_latencies(
+        self,
+        healthy_peers: list[PeerInfo],
+        used_peer_ids: set[str],
+    ) -> list[tuple[str, float]]:
+        """``(peer_id, effective latency)`` of each healthy peer not yet used, in peer order."""
+        peer_latencies: list[tuple[str, float]] = []
+        for peer in healthy_peers:
+            if peer.peer_id not in used_peer_ids:
+                effective_latency = self._selector.get_effective_latency(
+                    peer.peer_id
+                )
+                peer_latencies.append((peer.peer_id, effective_latency))
+        return peer_latencies
 
     def record_success(self, peer_id: str, latency_ms: float) -> None:
         """
@@ -837,6 +923,13 @@ class DiscoveryService:
         self._on_peer_added = on_peer_added
         self._on_peer_removed = on_peer_removed
 
+    def _health_distribution(self) -> dict[str, int]:
+        """Peer count per health status (every status present, zero or more)."""
+        health_counts = {h.value: 0 for h in PeerHealth}
+        for peer in self._peers.values():
+            health_counts[peer.health.value] += 1
+        return health_counts
+
     def get_metrics_snapshot(self) -> dict:
         """
         Get a snapshot of discovery metrics.
@@ -844,9 +937,7 @@ class DiscoveryService:
         Returns:
             Dict with metric values
         """
-        health_counts = {h.value: 0 for h in PeerHealth}
-        for peer in self._peers.values():
-            health_counts[peer.health.value] += 1
+        health_counts = self._health_distribution()
 
         return {
             "peer_count": len(self._peers),

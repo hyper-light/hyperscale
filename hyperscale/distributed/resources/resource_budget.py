@@ -45,7 +45,9 @@ class ResourceBudget:
                     "thresholds must satisfy 0 < warning_threshold <= throttle_threshold <= kill_threshold",
                 ),
                 (
-                    not (self.warning_grace_seconds >= 0.0 and self.kill_grace_seconds >= 0.0),
+                    # A chained comparison short-circuits as `and` does: kill grace
+                    # is compared only once warning grace is non-negative.
+                    not self.warning_grace_seconds >= 0.0 <= self.kill_grace_seconds,
                     "grace periods must not be negative",
                 ),
             )

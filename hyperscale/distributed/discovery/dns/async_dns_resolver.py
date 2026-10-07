@@ -137,47 +137,66 @@ class AsyncDNSResolver:
         Raises:
             DNSError: If SRV query fails or returns no records
         """
-        if self._aiodns_resolver is None:
-            self._aiodns_resolver = aiodns.DNSResolver()
+        aiodns_resolver = self._ensure_aiodns_resolver()
 
         try:
             # Query SRV records using aiodns
             srv_results = await _DEFAULT_CLOCK.wait_for(
-                self._aiodns_resolver.query(service_name, "SRV"),
+                aiodns_resolver.query(service_name, "SRV"),
                 timeout=self.resolution_timeout_seconds,
             )
 
-            if not srv_results:
-                raise DNSError(service_name, "No SRV records returned")
+            return self._srv_records_from_answers(service_name, srv_results)
 
-            # Convert to our SRVRecord dataclass
-            records: list[SRVRecord] = []
-            for srv in srv_results:
-                # aiodns returns objects with priority, weight, port, host attributes
-                record = SRVRecord(
-                    priority=srv.priority,
-                    weight=srv.weight,
-                    port=srv.port,
-                    target=srv.host.rstrip("."),  # Remove trailing dot from FQDN
-                )
-                records.append(record)
+        except Exception as exc:
+            raise self._srv_query_error(service_name, exc)
 
-            # Sort by priority (ascending), then weight (descending)
-            # Lower priority values are preferred
-            # Higher weight values are preferred for same priority
-            records.sort(key=lambda r: (r.priority, -r.weight))
+    def _ensure_aiodns_resolver(self) -> aiodns.DNSResolver:
+        """The SRV resolver, created on first use (it may need a running loop)."""
+        if self._aiodns_resolver is None:
+            self._aiodns_resolver = aiodns.DNSResolver()
+        return self._aiodns_resolver
 
-            return records
+    @staticmethod
+    def _srv_records_from_answers(service_name: str, srv_results: list) -> list[SRVRecord]:
+        """Convert aiodns SRV answers into ``SRVRecord``s, preferred first.
 
-        except asyncio.TimeoutError:
-            raise DNSError(
+        Raises:
+            DNSError: no SRV answers were returned.
+        """
+        if not srv_results:
+            raise DNSError(service_name, "No SRV records returned")
+
+        # Convert to our SRVRecord dataclass
+        # aiodns returns objects with priority, weight, port, host attributes
+        records: list[SRVRecord] = [
+            SRVRecord(
+                priority=srv.priority,
+                weight=srv.weight,
+                port=srv.port,
+                target=srv.host.rstrip("."),  # Remove trailing dot from FQDN
+            )
+            for srv in srv_results
+        ]
+
+        # Sort by priority (ascending), then weight (descending)
+        # Lower priority values are preferred
+        # Higher weight values are preferred for same priority
+        records.sort(key=lambda r: (r.priority, -r.weight))
+
+        return records
+
+    def _srv_query_error(self, service_name: str, exc: Exception) -> DNSError:
+        """The ``DNSError`` an SRV query failure surfaces as, by failure kind
+        (timeout, resolver error, anything else -- in that precedence)."""
+        if isinstance(exc, asyncio.TimeoutError):
+            return DNSError(
                 service_name,
                 f"SRV resolution timeout ({self.resolution_timeout_seconds}s)",
             )
-        except aiodns.error.DNSError as exc:
-            raise DNSError(service_name, f"SRV query failed: {exc}")
-        except Exception as exc:
-            raise DNSError(service_name, f"Unexpected error during SRV query: {exc}")
+        if isinstance(exc, aiodns.error.DNSError):
+            return DNSError(service_name, f"SRV query failed: {exc}")
+        return DNSError(service_name, f"Unexpected error during SRV query: {exc}")
 
     async def resolve(
         self,
@@ -282,54 +301,11 @@ class AsyncDNSResolver:
         Returns:
             DNSResult with resolved addresses
         """
-        if self._resolution_semaphore is None:
-            self._resolution_semaphore = asyncio.Semaphore(
-                self.max_concurrent_resolutions
-            )
+        resolution_semaphore = self._ensure_resolution_semaphore()
 
-        async with self._resolution_semaphore:
+        async with resolution_semaphore:
             try:
-                # Use asyncio's getaddrinfo for async resolution
-                results = await _DEFAULT_CLOCK.wait_for(
-                    asyncio.get_running_loop().getaddrinfo(
-                        hostname,
-                        port or 0,
-                        family=socket.AF_UNSPEC,  # Both IPv4 and IPv6
-                        type=socket.SOCK_STREAM,
-                    ),
-                    timeout=self.resolution_timeout_seconds,
-                )
-
-                if not results:
-                    raise DNSError(hostname, "No addresses returned")
-
-                # Extract unique addresses
-                addresses: list[str] = []
-                seen: set[str] = set()
-
-                for family, type_, proto, canonname, sockaddr in results:
-                    # sockaddr is (host, port) for IPv4, (host, port, flow, scope) for IPv6
-                    addr = sockaddr[0]
-                    if addr not in seen:
-                        seen.add(addr)
-                        addresses.append(addr)
-
-                # Apply security validation if configured
-                if self.security_validator and self.security_validator.is_enabled:
-                    validated_addresses = self._validate_addresses(hostname, addresses)
-                    if not validated_addresses and self.reject_on_security_violation:
-                        raise DNSError(
-                            hostname,
-                            f"All resolved IPs failed security validation: {addresses}"
-                        )
-                    addresses = validated_addresses if validated_addresses else addresses
-
-                return DNSResult(
-                    hostname=hostname,
-                    addresses=addresses,
-                    port=port,
-                    ttl_seconds=self.default_ttl_seconds,
-                )
+                return await self._resolve_addresses(hostname, port)
 
             except asyncio.TimeoutError:
                 raise DNSError(
@@ -337,6 +313,86 @@ class AsyncDNSResolver:
                 )
             except socket.gaierror as exc:
                 raise DNSError(hostname, f"getaddrinfo failed: {exc}")
+
+    def _ensure_resolution_semaphore(self) -> asyncio.Semaphore:
+        """The resolution-concurrency semaphore, created on first use (it may
+        need a running loop)."""
+        if self._resolution_semaphore is None:
+            self._resolution_semaphore = asyncio.Semaphore(
+                self.max_concurrent_resolutions
+            )
+        return self._resolution_semaphore
+
+    async def _resolve_addresses(self, hostname: str, port: int | None) -> DNSResult:
+        """Look ``hostname`` up with getaddrinfo and build its security-filtered result.
+
+        Raises:
+            DNSError: no addresses, or every address failed security validation.
+        """
+        # Use asyncio's getaddrinfo for async resolution
+        results = await _DEFAULT_CLOCK.wait_for(
+            asyncio.get_running_loop().getaddrinfo(
+                hostname,
+                port or 0,
+                family=socket.AF_UNSPEC,  # Both IPv4 and IPv6
+                type=socket.SOCK_STREAM,
+            ),
+            timeout=self.resolution_timeout_seconds,
+        )
+
+        if not results:
+            raise DNSError(hostname, "No addresses returned")
+
+        # Extract unique addresses
+        addresses = self._unique_socket_addresses(results)
+
+        # Apply security validation if configured
+        addresses = self._security_filtered_addresses(hostname, addresses)
+
+        return DNSResult(
+            hostname=hostname,
+            addresses=addresses,
+            port=port,
+            ttl_seconds=self.default_ttl_seconds,
+        )
+
+    @staticmethod
+    def _unique_socket_addresses(results: list) -> list[str]:
+        """The distinct host addresses of getaddrinfo results, in answer order."""
+        addresses: list[str] = []
+        seen: set[str] = set()
+
+        for family, type_, proto, canonname, sockaddr in results:
+            # sockaddr is (host, port) for IPv4, (host, port, flow, scope) for IPv6
+            addr = sockaddr[0]
+            if addr not in seen:
+                seen.add(addr)
+                addresses.append(addr)
+
+        return addresses
+
+    def _security_filtered_addresses(self, hostname: str, addresses: list[str]) -> list[str]:
+        """``addresses`` after security validation, when a validator is configured and enabled."""
+        if self.security_validator and self.security_validator.is_enabled:
+            return self._checked_addresses(hostname, addresses)
+        return addresses
+
+    def _checked_addresses(self, hostname: str, addresses: list[str]) -> list[str]:
+        """The addresses passing validation; all of them when none pass and
+        violations are not rejected.
+
+        Raises:
+            DNSError: none pass and ``reject_on_security_violation`` is set.
+        """
+        validated_addresses = self._validate_addresses(hostname, addresses)
+        if validated_addresses:
+            return validated_addresses
+        if self.reject_on_security_violation:
+            raise DNSError(
+                hostname,
+                f"All resolved IPs failed security validation: {addresses}"
+            )
+        return addresses
 
     async def _do_resolve_srv(self, service_name: str) -> DNSResult:
         """
@@ -353,22 +409,44 @@ class AsyncDNSResolver:
         Returns:
             DNSResult with addresses from all SRV targets and the SRV records
         """
-        if self._resolution_semaphore is None:
-            self._resolution_semaphore = asyncio.Semaphore(
-                self.max_concurrent_resolutions
-            )
+        resolution_semaphore = self._ensure_resolution_semaphore()
 
         # One permit per lookup: the SRV query here, each target's address
         # lookup in ``_do_resolve``. Holding this one across those would
         # take a second permit per lookup -- with every permit held by an
         # SRV resolution, each would wait on the others forever.
-        async with self._resolution_semaphore:
+        async with resolution_semaphore:
             srv_records = await self.resolve_srv(service_name)
 
         if not srv_records:
             raise DNSError(service_name, "No SRV records found")
 
         # Now resolve each target to IP addresses
+        all_addresses, target_errors = await self._resolve_srv_targets(srv_records)
+
+        self._raise_when_no_target_answered(service_name, all_addresses, target_errors)
+
+        # Apply security validation if configured
+        all_addresses = self._security_filtered_addresses(service_name, all_addresses)
+
+        # Return result with both addresses and SRV records
+        # The port from the first (highest priority) SRV record is used
+        # (``srv_records`` is non-empty here: an empty answer raised above).
+        return DNSResult(
+            hostname=service_name,
+            addresses=all_addresses,
+            port=srv_records[0].port,
+            srv_records=srv_records,
+            ttl_seconds=self.default_ttl_seconds,
+            target_errors=target_errors,
+        )
+
+    async def _resolve_srv_targets(
+        self,
+        srv_records: list[SRVRecord],
+    ) -> tuple[list[str], list[DNSError]]:
+        """Resolve every SRV target in order: the distinct addresses found and
+        each target's failure."""
         all_addresses: list[str] = []
         seen_addresses: set[str] = set()
         target_errors: list[DNSError] = []
@@ -380,42 +458,39 @@ class AsyncDNSResolver:
                 target_result = await self._do_resolve(srv_record.target, srv_record.port)
 
                 # Collect unique addresses
-                for addr in target_result.addresses:
-                    if addr not in seen_addresses:
-                        seen_addresses.add(addr)
-                        all_addresses.append(addr)
+                self._append_unseen_addresses(target_result.addresses, seen_addresses, all_addresses)
 
             except DNSError as target_error:
                 # The other targets may answer; this failure travels
                 # with the result (or the error, if none answers).
                 target_errors.append(target_error)
 
+        return all_addresses, target_errors
+
+    @staticmethod
+    def _append_unseen_addresses(addresses: list[str], seen_addresses: set[str], all_addresses: list[str]) -> None:
+        """Append each address not yet in ``seen_addresses`` to ``all_addresses``, in order."""
+        for addr in addresses:
+            if addr not in seen_addresses:
+                seen_addresses.add(addr)
+                all_addresses.append(addr)
+
+    @staticmethod
+    def _raise_when_no_target_answered(
+        service_name: str,
+        all_addresses: list[str],
+        target_errors: list[DNSError],
+    ) -> None:
+        """Raise when no SRV target resolved, chained to every target's failure.
+
+        Raises:
+            DNSError: ``all_addresses`` is empty.
+        """
         if not all_addresses:
             raise DNSError(
                 service_name,
                 "All SRV target hostnames failed to resolve to IP addresses"
             ) from (ExceptionGroup("SRV target failures", target_errors) if target_errors else None)
-
-        # Apply security validation if configured
-        if self.security_validator and self.security_validator.is_enabled:
-            validated_addresses = self._validate_addresses(service_name, all_addresses)
-            if not validated_addresses and self.reject_on_security_violation:
-                raise DNSError(
-                    service_name,
-                    f"All resolved IPs failed security validation: {all_addresses}"
-                )
-            all_addresses = validated_addresses if validated_addresses else all_addresses
-
-        # Return result with both addresses and SRV records
-        # The port from the first (highest priority) SRV record is used
-        return DNSResult(
-            hostname=service_name,
-            addresses=all_addresses,
-            port=srv_records[0].port if srv_records else None,
-            srv_records=srv_records,
-            ttl_seconds=self.default_ttl_seconds,
-            target_errors=target_errors,
-        )
 
     async def resolve_many(
         self,
@@ -455,6 +530,10 @@ class AsyncDNSResolver:
             Cached DNSResult if available and not expired, None otherwise
         """
         cache_key = f"{hostname}:{port}" if port else hostname
+        return self._fresh_cached(cache_key)
+
+    def _fresh_cached(self, cache_key: str) -> DNSResult | None:
+        """The positive-cache entry under ``cache_key`` when present and unexpired."""
         cached = self._positive_cache.get(cache_key)
         if cached is not None and not cached.is_expired:
             return cached
@@ -499,11 +578,7 @@ class AsyncDNSResolver:
         now = _DEFAULT_CLOCK.monotonic()
 
         # Cleanup positive cache
-        positive_expired = [
-            key
-            for key, result in self._positive_cache.items()
-            if now - result.resolved_at > result.ttl_seconds
-        ]
+        positive_expired = self._expired_positive_keys(now)
         for key in positive_expired:
             del self._positive_cache[key]
 
@@ -511,6 +586,14 @@ class AsyncDNSResolver:
         negative_removed = self.negative_cache.cleanup_expired()
 
         return (len(positive_expired), negative_removed)
+
+    def _expired_positive_keys(self, now: float) -> list[str]:
+        """Positive-cache keys whose TTL elapsed by ``now``."""
+        return [
+            key
+            for key, result in self._positive_cache.items()
+            if now - result.resolved_at > result.ttl_seconds
+        ]
 
     @property
     def cache_stats(self) -> dict[str, int]:
@@ -562,11 +645,15 @@ class AsyncDNSResolver:
         valid_addresses, events = self.security_validator.validate_answer(
             hostname, addresses
         )
+        self._publish_security_events(events)
+
+        return valid_addresses
+
+    def _publish_security_events(self, events: list[DNSSecurityEvent]) -> None:
+        """Hand each security event to the ``on_security_event`` callback, if set."""
         if self._on_security_event:
             for event in events:
                 self._on_security_event(event)
-
-        return valid_addresses
 
     def get_security_events(
         self,

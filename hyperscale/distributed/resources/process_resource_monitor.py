@@ -90,11 +90,16 @@ class ProcessResourceMonitor:
             self._last_metrics = metrics
             return metrics
         except psutil.NoSuchProcess:
-            return (
-                self._last_metrics
-                if self._last_metrics is not None
-                else self._empty_metrics()
-            )
+            return self._last_or_empty_metrics()
+
+    def _last_or_empty_metrics(self) -> ResourceMetrics:
+        """The last successful sample, or empty metrics before any: what a
+        sample of a vanished process tree reports."""
+        return (
+            self._last_metrics
+            if self._last_metrics is not None
+            else self._empty_metrics()
+        )
 
     def _collect_processes(self) -> list[psutil.Process]:
         children = self._process.children(recursive=True)

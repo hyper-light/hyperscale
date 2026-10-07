@@ -50,6 +50,10 @@ class LocalityInfo:
         """
         if peer_dc and peer_dc == self.datacenter_id:
             return LocalityTier.SAME_DC
+        return self._region_or_global_tier(peer_region)
+
+    def _region_or_global_tier(self, peer_region: str) -> LocalityTier:
+        """SAME_REGION for a peer in this node's region, else GLOBAL."""
         if peer_region and peer_region == self.region_id:
             return LocalityTier.SAME_REGION
         return LocalityTier.GLOBAL
@@ -63,14 +67,20 @@ class LocalityInfo:
         return bool(self.region_id and self.region_id == other.region_id)
 
     def __str__(self) -> str:
-        parts = []
-        if self.datacenter_id:
-            parts.append(f"dc={self.datacenter_id}")
-        if self.region_id:
-            parts.append(f"region={self.region_id}")
-        if self.zone_id:
-            parts.append(f"zone={self.zone_id}")
+        parts = self._present_parts()
         return ", ".join(parts) if parts else "unknown"
+
+    def _present_parts(self) -> list[str]:
+        """``label=value`` for each set locality level, datacenter to zone."""
+        return [
+            f"{label}={value}"
+            for label, value in (
+                ("dc", self.datacenter_id),
+                ("region", self.region_id),
+                ("zone", self.zone_id),
+            )
+            if value
+        ]
 
 _REHOMED = (
     LocalityTier,

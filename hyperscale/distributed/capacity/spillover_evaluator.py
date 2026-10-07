@@ -57,6 +57,20 @@ class SpilloverEvaluator:
                 primary_wait=primary_wait,
             )
 
+        return self._evaluate_fresh_primary(
+            job_cores_required, primary_capacity, fallback_capacities, primary_rtt_ms, primary_wait
+        )
+
+    def _evaluate_fresh_primary(
+        self,
+        job_cores_required: int,
+        primary_capacity: DatacenterCapacity,
+        fallback_capacities: list[tuple[DatacenterCapacity, float]],
+        primary_rtt_ms: float,
+        primary_wait: float,
+    ) -> SpilloverDecision:
+        """Keep the job on a fresh primary that serves it now or soon
+        enough (AD-43), else weigh spilling it over."""
         if primary_capacity.can_serve_immediately(job_cores_required):
             return self._no_spillover(
                 reason="primary_has_capacity",
@@ -71,6 +85,20 @@ class SpilloverEvaluator:
                 primary_wait=primary_wait,
             )
 
+        return self._evaluate_spillover(
+            job_cores_required, primary_capacity, fallback_capacities, primary_rtt_ms, primary_wait
+        )
+
+    def _evaluate_spillover(
+        self,
+        job_cores_required: int,
+        primary_capacity: DatacenterCapacity,
+        fallback_capacities: list[tuple[DatacenterCapacity, float]],
+        primary_rtt_ms: float,
+        primary_wait: float,
+    ) -> SpilloverDecision:
+        """Spill over to the nearest fallback that can take the job now,
+        when it improves the primary's wait enough (AD-43)."""
         candidate = self._select_spillover_candidate(
             job_cores_required=job_cores_required,
             fallback_capacities=fallback_capacities,
@@ -126,23 +154,43 @@ class SpilloverEvaluator:
         best_candidate: tuple[DatacenterCapacity, float, float] | None = None
         best_score = float("inf")
         for capacity, rtt_ms in fallback_capacities:
-            if not (
-                capacity.available_cores
-                >= min(job_cores_required, capacity.total_cores)
-                >= primary_job_cores
-            ):
-                continue
-            if self._is_capacity_stale(capacity):
-                continue
-
-            latency_penalty = rtt_ms - primary_rtt_ms
-            if latency_penalty > self._config.max_latency_penalty_ms:
-                continue
-
+            latency_penalty = self._fallback_latency_penalty(
+                capacity, rtt_ms, job_cores_required, primary_rtt_ms, primary_job_cores
+            )
             if latency_penalty < best_score:
                 best_score = latency_penalty
                 best_candidate = (capacity, rtt_ms, latency_penalty)
         return best_candidate
+
+    def _fallback_latency_penalty(
+        self,
+        capacity: DatacenterCapacity,
+        rtt_ms: float,
+        job_cores_required: int,
+        primary_rtt_ms: float,
+        primary_job_cores: int,
+    ) -> float:
+        """A fallback's latency penalty over the primary; infinite -- never
+        selected -- when it cannot take the job or is too far (AD-43)."""
+        if not self._can_take_job(capacity, job_cores_required, primary_job_cores):
+            return float("inf")
+
+        latency_penalty = rtt_ms - primary_rtt_ms
+        return float("inf") if latency_penalty > self._config.max_latency_penalty_ms else latency_penalty
+
+    def _can_take_job(
+        self,
+        capacity: DatacenterCapacity,
+        job_cores_required: int,
+        primary_job_cores: int,
+    ) -> bool:
+        """A fresh fallback with every core the job would use there free
+        now, at least as many as the primary would give it."""
+        return (
+            capacity.available_cores
+            >= min(job_cores_required, capacity.total_cores)
+            >= primary_job_cores
+        ) and not self._is_capacity_stale(capacity)
 
     def _no_spillover(
         self,

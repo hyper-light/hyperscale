@@ -35,13 +35,8 @@ class WorkerListResponse(Message):
                 return None
 
             manager_id = parts[0].decode()
-            workers = []
-
-            for worker_bytes in parts[1:]:
-                if worker_bytes:
-                    worker_update = WorkerStateUpdate.from_bytes(worker_bytes)
-                    if worker_update:
-                        workers.append(worker_update)
+            # Skip empty segments, and segments that do not decode.
+            workers = list(filter(None, map(WorkerStateUpdate.from_bytes, filter(None, parts[1:]))))
 
             return cls(manager_id=manager_id, workers=workers)
         except (ValueError, UnicodeDecodeError):

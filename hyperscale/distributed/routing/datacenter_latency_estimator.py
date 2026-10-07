@@ -58,25 +58,10 @@ class DatacenterLatencyEstimator:
         prior_ms = self._latency_floor_ms
         evidence: list[tuple[str, float, float, float, float]] = []
         for datacenter_id in datacenter_ids:
-            rtt_ucb_ms = 0.0
-            quality = 0.0
-            if (
-                coordinates_are_evidence
-                and (coordinate := self._get_datacenter_coordinate(datacenter_id))
-                is not None
-                and (quality := self._coordinate_tracker.coordinate_quality(coordinate))
-                > 0.0
-            ):
-                rtt_ucb_ms = self._coordinate_tracker.estimate_rtt_ucb_ms(coordinate)
-                prior_ms = max(prior_ms, rtt_ucb_ms)
-
-            observed_ms, confidence = self._get_observed_latency(datacenter_id)
-            if confidence > 0.0:
-                prior_ms = max(prior_ms, observed_ms)
-
-            evidence.append(
-                (datacenter_id, rtt_ucb_ms, quality, observed_ms, confidence)
+            datacenter_evidence, prior_ms = self._datacenter_evidence(
+                datacenter_id, coordinates_are_evidence, prior_ms
             )
+            evidence.append(datacenter_evidence)
 
         return {
             datacenter_id: max(
@@ -87,3 +72,37 @@ class DatacenterLatencyEstimator:
             )
             for datacenter_id, rtt_ucb_ms, quality, observed_ms, confidence in evidence
         }
+
+    def _datacenter_evidence(
+        self,
+        datacenter_id: str,
+        coordinates_are_evidence: bool,
+        prior_ms: float,
+    ) -> tuple[tuple[str, float, float, float, float], float]:
+        """One datacenter's (id, rtt_ucb_ms, quality, observed_ms,
+        confidence) and the conservative prior raised by whatever of it is
+        evidence (AD-36 Part 2, AD-45)."""
+        coordinate = (
+            self._get_datacenter_coordinate(datacenter_id) if coordinates_are_evidence else None
+        )
+        rtt_ucb_ms, quality, prior_ms = self._coordinate_evidence(coordinate, prior_ms)
+
+        observed_ms, confidence = self._get_observed_latency(datacenter_id)
+        if confidence > 0.0:
+            prior_ms = max(prior_ms, observed_ms)
+
+        return (datacenter_id, rtt_ucb_ms, quality, observed_ms, confidence), prior_ms
+
+    def _coordinate_evidence(
+        self,
+        coordinate: NetworkCoordinate | None,
+        prior_ms: float,
+    ) -> tuple[float, float, float]:
+        """A coordinate's (rtt_ucb_ms, quality, prior_ms): its Vivaldi RTT
+        upper bound counts (AD-35) only when its quality is positive."""
+        if coordinate is None:
+            return 0.0, 0.0, prior_ms
+        if not (quality := self._coordinate_tracker.coordinate_quality(coordinate)) > 0.0:
+            return 0.0, quality, prior_ms
+        rtt_ucb_ms = self._coordinate_tracker.estimate_rtt_ucb_ms(coordinate)
+        return rtt_ucb_ms, quality, max(prior_ms, rtt_ucb_ms)

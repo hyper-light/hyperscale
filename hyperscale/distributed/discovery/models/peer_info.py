@@ -143,18 +143,21 @@ class PeerInfo:
 
     def _update_health(self) -> None:
         """Update health status based on metrics."""
+        self.health, self.health_weight = self._health_for_metrics()
+
+    def _health_for_metrics(self) -> tuple[PeerHealth, float]:
+        """``(health, selection weight)``: UNHEALTHY after three consecutive failures, else by error rate."""
         if self.consecutive_failures >= 3:
-            self.health = PeerHealth.UNHEALTHY
-            self.health_weight = 0.1
-        elif self.error_rate > 0.10:
-            self.health = PeerHealth.DEGRADED
-            self.health_weight = 0.5
-        elif self.error_rate > 0.05:
-            self.health = PeerHealth.DEGRADED
-            self.health_weight = 0.7
-        else:
-            self.health = PeerHealth.HEALTHY
-            self.health_weight = 1.0
+            return (PeerHealth.UNHEALTHY, 0.1)
+        return self._health_for_error_rate()
+
+    def _health_for_error_rate(self) -> tuple[PeerHealth, float]:
+        """``(health, selection weight)`` by error rate: DEGRADED past 5% (heavier past 10%), else HEALTHY."""
+        if self.error_rate > 0.10:
+            return (PeerHealth.DEGRADED, 0.5)
+        if self.error_rate > 0.05:
+            return (PeerHealth.DEGRADED, 0.7)
+        return (PeerHealth.HEALTHY, 1.0)
 
     def matches_locality(self, datacenter_id: str, region_id: str) -> tuple[bool, bool]:
         """
@@ -173,6 +176,10 @@ class PeerInfo:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, PeerInfo):
             return False
+        return self._same_identity(other)
+
+    def _same_identity(self, other: "PeerInfo") -> bool:
+        """Whether ``other`` has this peer's id, host and port."""
         return (
             self.peer_id == other.peer_id and
             self.host == other.host and

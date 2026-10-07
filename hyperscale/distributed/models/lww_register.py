@@ -87,9 +87,9 @@ class LWWRegister(Generic[ValueT]):
 
     def merge_in_place(self, other: LWWRegister[ValueT]) -> None:
         """Merge another LWWRegister into this one (mutating)."""
-        if other._timestamp > self._timestamp or (
-            other._timestamp == self._timestamp and other._node_id > self._node_id
-        ):
+        # Later timestamp wins; equal timestamps tie-break on node_id
+        # (lexicographic tuple order).
+        if (other._timestamp, other._node_id) > (self._timestamp, self._node_id):
             self._value = other._value
             self._timestamp = other._timestamp
             self._node_id = other._node_id
