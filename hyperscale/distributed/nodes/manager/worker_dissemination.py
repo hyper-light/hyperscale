@@ -429,11 +429,13 @@ class WorkerDisseminator:
         response: bytes | None,
         peer_addr: tuple[str, int],
     ) -> None:
-        """Decode a peer's non-empty worker-list reply and apply it (AD-48)."""
+        """Decode a peer's non-empty worker-list reply and apply it (AD-48).
+        ``list_workers`` answers with the model's ``dump``: decoded any other
+        way, every reply read as empty, and a manager that started after the
+        workers registered never learned one. A reply that does not decode
+        raises, for the request to report."""
         if response:
-            worker_list = WorkerListResponse.from_bytes(response)
-            if worker_list:
-                await self._apply_peer_worker_list(worker_list, peer_addr)
+            await self._apply_peer_worker_list(WorkerListResponse.load(response), peer_addr)
 
     async def _apply_peer_worker_list(
         self,
