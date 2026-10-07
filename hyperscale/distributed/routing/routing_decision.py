@@ -19,6 +19,9 @@ class RoutingDecision:
     ``scores`` holds every eligible datacenter's score, ``exclusions`` the
     reason each ineligible one was left out, and ``cooling_datacenters``
     those demoted for having recently failed this job's dispatch.
+    ``latency_budget_relaxed`` is True when fewer datacenters than the job
+    asked for met its dispatch latency budget, so it was placed nearest to
+    it (D-62).
     """
 
     job_id: str
@@ -28,3 +31,4 @@ class RoutingDecision:
     scores: dict[str, DatacenterRoutingScore]
     exclusions: dict[str, ExclusionReason]
     cooling_datacenters: frozenset[str]
+    latency_budget_relaxed: bool = False

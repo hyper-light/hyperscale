@@ -109,6 +109,7 @@ class GateDispatchCoordinator:
         datacenter_leader_failover_seconds: float,
         leader_heartbeat_interval_seconds: float,
         record_fallback_used: Callable[[str, str], None],
+        select_spillover_candidates: Callable[[JobSubmission, str, list[str]], list[str]],
     ) -> None:
         # Told which datacenters actually accepted a job (AD-44 best-effort
         # tracking starts from exactly those).
@@ -163,6 +164,10 @@ class GateDispatchCoordinator:
         self._room_refusals: dict[str, dict[str, float]] = {}
         # AD-36: counts each fallback a dispatch lands on, from -> to.
         self._record_fallback_used = record_fallback_used
+        # D-62: the fallbacks the job's placement policy lets AD-43
+        # spillover move a primary's share to (never one further over the
+        # job's dispatch latency budget than the primary).
+        self._select_spillover_candidates = select_spillover_candidates
         # AD-28: orders a datacenter's managers for dispatch (known leader
         # first, then rendezvous + EWMA) and learns from dispatch outcomes.
         self._manager_selector: DatacenterManagerSelector = manager_selector
@@ -371,6 +376,7 @@ class GateDispatchCoordinator:
             len(target_dcs),
             self._datacenter_preference(target_dcs),
             job_id=submission.job_id,
+            dispatch_latency_budget_ms=submission.dispatch_latency_budget_ms,
         )
 
         if await self._hold_or_fail_unplaceable_dispatch(submission, job, target_dcs, worst_health):
@@ -817,7 +823,7 @@ class GateDispatchCoordinator:
     ) -> None:
         """Dispatch to a primary datacenter, or the fallback it spills over
         to (AD-43); a failed dispatch falls back to the next fallback."""
-        target_dc = await self._spill_over_or_keep(job_id, datacenter, job_cores, fallback_queue)
+        target_dc = await self._spill_over_or_keep(submission, datacenter, job_cores, fallback_queue)
 
         success, _, accepting_manager = await self._try_dispatch_to_dc(
             job_id, target_dc, submission
@@ -832,22 +838,23 @@ class GateDispatchCoordinator:
 
     async def _spill_over_or_keep(
         self,
-        job_id: str,
+        submission: JobSubmission,
         datacenter: str,
         job_cores: int,
         fallback_queue: list[str],
     ) -> str:
         """The datacenter to dispatch to in a primary's place: the fallback
-        it spills over to (AD-43), else the primary."""
+        it spills over to (AD-43) among those its placement policy allows
+        (D-62), else the primary."""
         spillover_dc = await self._evaluate_spillover(
-            job_id=job_id,
+            job_id=submission.job_id,
             primary_dc=datacenter,
-            fallback_dcs=fallback_queue,
+            fallback_dcs=self._select_spillover_candidates(submission, datacenter, fallback_queue),
             job_cores_required=job_cores,
         )
 
         target_dc = spillover_dc if spillover_dc else datacenter
-        self._claim_spillover_datacenter(job_id, datacenter, spillover_dc, fallback_queue)
+        self._claim_spillover_datacenter(submission.job_id, datacenter, spillover_dc, fallback_queue)
         return target_dc
 
     def _claim_spillover_datacenter(

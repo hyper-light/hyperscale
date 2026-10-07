@@ -118,7 +118,7 @@ class GateJobFailoverCoordinator:
         get_node_id_short: Callable[[], str],
         is_running: Callable[[], bool],
         classify_datacenter_health: Callable[[str], str],
-        route_replacement: Callable[[str, set[str] | None, frozenset[str]], str | None],
+        route_replacement: Callable[[str, set[str] | None, frozenset[str], float], str | None],
         delivered_workflow_ids: Callable[[str, str], Awaitable[set[str]]],
         release_workflow_timeouts: Callable[[str, set[str]], Awaitable[None]],
         replicate_placement: Callable[
@@ -148,8 +148,9 @@ class GateJobFailoverCoordinator:
             classify_datacenter_health: A datacenter's health, as routing
                 classifies it
             route_replacement: The best eligible datacenter for a job,
-                within its placement constraint and outside the occupied
-                datacenters (None when there is none)
+                within its placement constraint, outside the occupied
+                datacenters and under its dispatch latency budget
+                (None when there is none)
             delivered_workflow_ids: The job's workflows a datacenter
                 delivered a result for, or whose results were aggregated
             release_workflow_timeouts: Stops the job's per-workflow result
@@ -437,6 +438,7 @@ class GateJobFailoverCoordinator:
             job_id,
             self._placement_constraint(submission),
             self._occupied_datacenters(target_dcs, released_datacenters, substitutions, lost_datacenter),
+            submission.dispatch_latency_budget_ms,
         )
         if replacement is None:
             await self._log_unplaceable(

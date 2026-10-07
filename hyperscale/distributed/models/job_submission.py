@@ -92,3 +92,9 @@ class JobSubmission(Message):
     # manager runs only these workflows -- and every workflow they depend
     # on, re-run for the context their dependents read.
     rerun_workflow_ids: list[str] = field(default_factory=list)
+    # D-62 latency budget: the most the p95 of a datacenter's workflow
+    # dispatch round trips (its D-5 digest) may be for the gate to place
+    # the job there, while enough datacenters meet it; when fewer do, the
+    # job is placed nearest to it. 0 sets none. Gates only: a gateless
+    # manager has its one datacenter.
+    dispatch_latency_budget_ms: float = 0.0

@@ -130,6 +130,7 @@ class ClientJobSubmitter:
         best_effort: bool = False,
         best_effort_min_dcs: int = 0,
         best_effort_deadline_seconds: float = 0.0,
+        dispatch_latency_budget_ms: float = 0.0,
     ) -> str:
         """
         Submit a job for execution.
@@ -152,6 +153,8 @@ class ClientJobSubmitter:
             best_effort: AD-44 complete before every DC reported
             best_effort_min_dcs: completed DCs that end the job (0 = gate default)
             best_effort_deadline_seconds: longest wait for DCs (0 = gate default)
+            dispatch_latency_budget_ms: D-62 most a DC's p95 dispatch round
+                trip may be for a gate to place the job there (0 = none)
 
         Returns:
             job_id: Unique identifier for the submitted job
@@ -198,6 +201,7 @@ class ClientJobSubmitter:
             best_effort=best_effort,
             best_effort_min_dcs=best_effort_min_dcs,
             best_effort_deadline_seconds=best_effort_deadline_seconds,
+            dispatch_latency_budget_ms=dispatch_latency_budget_ms,
         )
 
         # Initialize job tracking
@@ -331,6 +335,7 @@ class ClientJobSubmitter:
         best_effort: bool = False,
         best_effort_min_dcs: int = 0,
         best_effort_deadline_seconds: float = 0.0,
+        dispatch_latency_budget_ms: float = 0.0,
     ) -> JobSubmission:
         """
         Build JobSubmission message with protocol version.
@@ -377,6 +382,7 @@ class ClientJobSubmitter:
             best_effort=best_effort,
             best_effort_min_dcs=best_effort_min_dcs,
             best_effort_deadline_seconds=best_effort_deadline_seconds,
+            dispatch_latency_budget_ms=dispatch_latency_budget_ms,
         )
 
     async def _submit_with_retry(

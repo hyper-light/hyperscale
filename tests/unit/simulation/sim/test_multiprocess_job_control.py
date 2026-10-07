@@ -11,6 +11,12 @@ or by a configured job-class cap of one -- so B's first submission is
 refused with a retry hint, the manager never counts two jobs at once, and
 B is admitted once A ended. Both complete, and nothing stays counted.
 
+D-63 capacity reservation. Two of the worker's four cores are held back
+for the burst class. A long job of another class fills the shared two; the
+instant it is admitted, a burst job and an ordinary job of the same shape
+arrive. The burst job is admitted into the reserve at once, the ordinary
+one is refused with a hint and admitted only once the long job ended.
+
 D-67 noisy-job breaker. The worker refuses the first dispatches of
 ``SimNoisyWorkflow`` -- one more than a workflow's retry budget -- so the
 first noisy job fails with a refused retry, and the manager quarantines
@@ -503,3 +509,101 @@ def test_a_new_leader_keeps_the_quarantine_until_a_probe_recovers_it():
     assert len(admitted) == 1, decisions
     assert _finished(results["client-noisy-again"]) == [(0, "completed")], results["client-noisy-again"]
     assert _rows(new_leader_log, "quarantine")[-1][1] == (), new_leader_log
+
+
+# -- Capacity reservation (D-63) ---------------------------------------------
+#
+# Four registered cores, two reserved for SimBurstWorkflow: two shared. The
+# long job (two cores for 40s, 80 core-seconds) is admitted under a 60s
+# timeout (80 <= 2 x 60). A burst job and a ping job -- the same shape, four
+# core-seconds, under a 40s timeout -- then arrive together. The shared
+# cores hold 2 x 40 = 80, all the long job's: the ping job is refused
+# (84 > 80); the burst job's four core-seconds fit its reserve (4 <= 2 x 40)
+# and it is admitted. Without the reserve the ping job would fit
+# (84 <= 4 x 40).
+_BURST_CLASS = "SimBurstWorkflow"
+_LONG_CLASS = "SimLongWorkflow"
+_RESERVATION_WORKER_CORES = 4
+_RESERVED_BURST_CORES = 2
+_LONG_JOB_TIMEOUT_SECONDS = 60.0
+_ARRIVING_JOB_TIMEOUT_SECONDS = 40.0
+_RESERVATION_CEILING = 90.0
+
+
+def _run_reservation(seed: int = _SEED) -> dict:
+    coordinator = SimulationCoordinator(latency=_LATENCY, max_virtual_time=_RESERVATION_CEILING, seed=seed)
+    _add_manager_and_worker(
+        coordinator,
+        {"JOB_CLASS_RESERVED_CORES": f"{_BURST_CLASS}={_RESERVED_BURST_CORES}"},
+        _RESERVATION_WORKER_CORES,
+        0,
+    )
+    coordinator.add_process(
+        "client-long",
+        job_control_client_entry,
+        "sim-cli-l",
+        9500,
+        [_MANAGER_ADDRESS],
+        "long",
+        1,
+        _LONG_JOB_TIMEOUT_SECONDS,
+        _RESERVATION_CEILING,
+    )
+
+    def admit_burst_and_ordinary(admission_row: tuple) -> None:
+        for name, host, workflow_kind in (("client-burst", "sim-cli-b", "burst"), ("client-ping", "sim-cli-p", "ping")):
+            coordinator.schedule_admission(
+                name,
+                admission_row[-1] + _LATENCY,
+                job_control_client_entry,
+                host,
+                9500,
+                [_MANAGER_ADDRESS],
+                workflow_kind,
+                1,
+                _ARRIVING_JOB_TIMEOUT_SECONDS,
+                _RESERVATION_CEILING,
+            )
+
+    coordinator.schedule_on_event(
+        "manager",
+        lambda row: row[0] == "admission-admitted" and row[1] == _LONG_CLASS,
+        admit_burst_and_ordinary,
+    )
+    return coordinator.run()
+
+
+def test_a_burst_class_is_admitted_into_its_reserve_while_ordinary_jobs_are_refused():
+    results = _run_reservation()
+    manager_log = results["manager"]
+
+    decisions = [row for row in manager_log if row[0] in ("admission-admitted", "admission-refused")]
+    long_admitted_at = next(row[-1] for row in decisions if row[1] == _LONG_CLASS)
+    long_ended_at = next(at_time for *_rest, at_time in _rows(results["client-long"], "job-finished"))
+
+    # The burst job: admitted at its first submission, into the reserve,
+    # while the long job held every shared core.
+    burst_decisions = [row for row in decisions if row[1] == _BURST_CLASS]
+    assert [row[0] for row in burst_decisions] == ["admission-admitted"], decisions
+    assert long_admitted_at < burst_decisions[0][-1] < long_ended_at, (decisions, long_ended_at)
+
+    # The ordinary job of the same shape: refused by the work cap with a
+    # hint while the long job ran, admitted only after it ended.
+    ping_decisions = [row for row in decisions if row[1] == _PING_CLASS]
+    ping_refusals = [row for row in ping_decisions if row[0] == "admission-refused"]
+    ping_admitted_at = [row[-1] for row in ping_decisions if row[0] == "admission-admitted"]
+    assert ping_decisions[0][0] == "admission-refused", decisions
+    for _tag, _job_class, control, retry_after_seconds, refused_at in ping_refusals:
+        assert control == CONCURRENCY_CAP_CONTROL and retry_after_seconds > 0.0, ping_refusals
+        assert refused_at < ping_admitted_at[0], (ping_refusals, ping_admitted_at)
+    assert ping_refusals[0][-1] < long_ended_at, (ping_refusals, long_ended_at)
+    assert len(ping_admitted_at) == 1, decisions
+
+    # Every job ran once and completed; nothing stays counted.
+    for client in ("client-long", "client-burst", "client-ping"):
+        assert _finished(results[client]) == [(0, "completed")], results[client]
+    assert _rows(manager_log, "counted-jobs")[-1][1] == 0, manager_log
+
+
+def test_reservation_scenario_is_replay_deterministic():
+    assert _run_reservation() == _run_reservation()

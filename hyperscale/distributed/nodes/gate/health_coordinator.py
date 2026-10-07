@@ -740,7 +740,8 @@ class GateHealthCoordinator:
         probes), held at DEGRADED while a correlated failure or a partition
         makes an UNHEALTHY verdict suspect. Capacity is the datacenter's
         AD-43 aggregate. Managers are those the gate dispatches to; the
-        ones whose circuit is open are the circuit-breaker pressure.
+        ones whose circuit is open are the circuit-breaker pressure. The
+        dispatch latency is the D-5 digest's p95, once gradeable (D-62).
         """
         return [
             self._build_datacenter_candidate(datacenter_id)
@@ -771,7 +772,16 @@ class GateHealthCoordinator:
             ),
             health_severity_weight=status.health_severity_weight,
             slo_routing_factor=self._datacenter_routing_factor(datacenter_id),
+            dispatch_latency_p95_ms=self._graded_dispatch_latency_p95_ms(datacenter_id),
         )
+
+    def _graded_dispatch_latency_p95_ms(self, datacenter_id: str) -> float | None:
+        """D-62: the p95 of the datacenter's dispatch round trips (its D-5
+        digest), once it holds the samples AD-42 grades by; None before."""
+        observation = self._state.get_dc_latency_observation(datacenter_id)
+        if observation is None or observation.sample_count < self._latency_slo.min_sample_count:
+            return None
+        return observation.p95_ms
 
     def _datacenter_health_bucket(
         self,

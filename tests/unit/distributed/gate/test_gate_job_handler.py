@@ -1029,7 +1029,7 @@ class TestHandleSubmissionDatacenterSelection:
         selections: list[tuple[int, list[str] | None, str]] = []
         handler = create_mock_handler()
 
-        async def select_datacenters_with_fallback(count, listed, job_id):
+        async def select_datacenters_with_fallback(count, listed, job_id, dispatch_latency_budget_ms=0.0):
             selections.append((count, listed, job_id))
             return (["dc-east"], [], "healthy")
 

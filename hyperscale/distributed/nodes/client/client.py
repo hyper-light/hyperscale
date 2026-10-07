@@ -375,6 +375,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         best_effort: bool = False,
         best_effort_min_dcs: int = 0,
         best_effort_deadline_seconds: float = 0.0,
+        dispatch_latency_budget_ms: float = 0.0,
     ) -> str:
         """Submit a job for execution (delegates to ClientJobSubmitter).
 
@@ -408,6 +409,12 @@ class HyperscaleClient(MercurySyncBaseServer):
         of waiting for every datacenter; the rest are cancelled. 0 applies
         the gate's configured default for either.
 
+        D-62: ``dispatch_latency_budget_ms`` asks a gate to place the job
+        only in datacenters whose p95 workflow dispatch round trip (their
+        D-5 digest) is within it, while as many as the job asks for are;
+        when fewer are, the job is placed nearest to the budget. 0 (the
+        default) sets none; a gateless manager has its one datacenter.
+
         Jobs finished for longer than the configured retention are
         forgotten here, so a long-lived client's tracking stays bounded.
         """
@@ -432,6 +439,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             best_effort=best_effort,
             best_effort_min_dcs=best_effort_min_dcs,
             best_effort_deadline_seconds=best_effort_deadline_seconds,
+            dispatch_latency_budget_ms=dispatch_latency_budget_ms,
         )
 
     async def join_node(

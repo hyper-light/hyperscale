@@ -33,6 +33,7 @@ from hyperscale.distributed.nodes.gate.dispatch_coordinator import GateDispatchC
 from hyperscale.distributed.nodes.gate.server import GateServer
 from hyperscale.distributed.models.coordinates import VivaldiConfig
 from hyperscale.distributed.routing import (
+    ConstrainedPlacementPolicy,
     BlendedLatencyScorer,
     BlendedScoringConfig,
     DatacenterCandidate,
@@ -250,12 +251,14 @@ def make_router(
             make_candidate(NEAR_DATACENTER),
             make_candidate(UNPLACED_DATACENTER),
         ],
-        latency_estimator=DatacenterLatencyEstimator(
+        placement_policy=ConstrainedPlacementPolicy(
+            latency_estimator=DatacenterLatencyEstimator(
             coordinate_tracker=StubCoordinateTracker(),
             get_datacenter_coordinate=coordinates.get,
             get_observed_latency=lambda datacenter_id: observed.get(datacenter_id, (0.0, 0.0)),
         ),
-        scorer=RoutingScorer(ScoringConfig.from_env(Env())),
+            scorer=RoutingScorer(ScoringConfig.from_env(Env())),
+        ),
         dispatch_cooldowns=JobDispatchCooldowns(clock=SteppedClock(), cooldown_seconds=10.0),
     )
 

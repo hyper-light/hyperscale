@@ -16,6 +16,10 @@ class DatacenterCandidate:
     dispatch to and ``healthy_managers`` those whose circuit is not open;
     ``circuit_breaker_pressure`` is the open share. ``health_severity_weight``
     (AD-17 overload) and ``slo_routing_factor`` (AD-42) multiply the score.
+    ``dispatch_latency_p95_ms`` is the p95 of the datacenter's workflow
+    dispatch round trips (its D-5 digest, as its freshest manager heartbeat
+    carries it), None until that digest holds the samples AD-42 grades by
+    (``SLO_MIN_SAMPLE_COUNT``).
     """
 
     datacenter_id: str
@@ -28,3 +32,4 @@ class DatacenterCandidate:
     circuit_breaker_pressure: float
     health_severity_weight: float
     slo_routing_factor: float
+    dispatch_latency_p95_ms: float | None = None

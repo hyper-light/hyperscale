@@ -214,6 +214,9 @@ def make_coordinator(
         datacenter_leader_failover_seconds=derive_datacenter_leader_failover_seconds(GATE_SETTINGS),
         leader_heartbeat_interval_seconds=GATE_SETTINGS.LEADER_HEARTBEAT_INTERVAL,
         record_fallback_used=lambda from_datacenter, to_datacenter: None,
+        select_spillover_candidates=lambda job_submission, primary_datacenter, fallback_datacenters: (
+            fallback_datacenters
+        ),
     )
 
 

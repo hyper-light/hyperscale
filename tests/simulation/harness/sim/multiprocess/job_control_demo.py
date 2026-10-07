@@ -74,6 +74,19 @@ class SimLongWorkflow(Workflow):
         return {"status": "ok"}
 
 
+class SimBurstWorkflow(Workflow):
+    """``SimPingWorkflow``'s shape under another name: the bursty class a
+    datacenter holds cores back for (D-63)."""
+
+    vus = 2
+    duration = "2s"
+
+    @step()
+    async def burst_action(self) -> dict[str, str]:
+        await asyncio.sleep(0.5)
+        return {"status": "ok"}
+
+
 # The workflow classes travel by value, as a client's own workflows do:
 # the manager's restricted unpickler admits no test module by reference.
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -82,6 +95,7 @@ WORKFLOW_CLASSES: dict[str, type[Workflow]] = {
     "ping": SimPingWorkflow,
     "noisy": SimNoisyWorkflow,
     "long": SimLongWorkflow,
+    "burst": SimBurstWorkflow,
 }
 
 
@@ -172,11 +186,14 @@ def job_control_worker_entry(
     seed_manager_addresses,
     total_cores,
     refused_dispatches,
+    dispatch_answer_delay_seconds=0.0,
 ) -> None:
     """Worker child with ``WORKER_MAX_CORES`` = ``total_cores`` that
     refuses the first ``refused_dispatches`` dispatches of
     ``SimNoisyWorkflow`` (its start raises: the dispatch is answered
-    not-taken, as a worker that cannot load a workflow answers)."""
+    not-taken, as a worker that cannot load a workflow answers), and
+    answers every dispatch ``dispatch_answer_delay_seconds`` late -- a
+    datacenter whose dispatch latency digest (D-5) runs slow."""
     worker = WorkerServer(
         host,
         tcp_port,
@@ -201,6 +218,7 @@ def job_control_worker_entry(
             log.append(("noisy-dispatch-refused", noisy_refusals[0], round(context.loop.time(), 6)))
             raise RuntimeError(f"{SimNoisyWorkflow.__name__} cannot start on this worker")
         log.append(("dispatch-run", is_noisy, round(context.loop.time(), 6)))
+        await asyncio.sleep(dispatch_answer_delay_seconds)
         return await handle_dispatch_execution(dispatch, address, allocation_result)
 
     worker._handle_dispatch_execution = faulty_dispatch_execution
@@ -222,12 +240,14 @@ def job_control_client_entry(
     job_timeout_seconds,
     wait_timeout_seconds,
     target_tier="manager",
+    dispatch_latency_budget_ms=0.0,
 ) -> None:
     """Client child: submit ``job_count`` jobs of the ``workflow_kind``
     class (``WORKFLOW_CLASSES``), each once the one before ended, to the
     managers -- or, ``target_tier`` "gate", the gates -- at
-    ``target_tcp_addresses``. Also logs ``("job-ended-at", ordinal,
-    status, accepting host, t)``: the host that took the job."""
+    ``target_tcp_addresses``, under ``dispatch_latency_budget_ms`` (D-62;
+    0 sets none). Also logs ``("job-ended-at", ordinal, status,
+    accepting host, t)``: the host that took the job."""
     client = HyperscaleClient(
         host=host,
         port=port,
@@ -247,6 +267,7 @@ def job_control_client_entry(
                     workflows=[([], workflow_class())],
                     vus=2,
                     timeout_seconds=job_timeout_seconds,
+                    dispatch_latency_budget_ms=dispatch_latency_budget_ms,
                 )
             except Exception as submit_error:
                 log.append(("submit-rejected", ordinal, type(submit_error).__name__, round(context.loop.time(), 6)))
@@ -271,17 +292,23 @@ def job_control_gate_entry(
     udp_port,
     datacenter_managers,
     datacenter_manager_udp,
+    env_overrides=None,
 ) -> None:
-    """Gate child fronting ``datacenter_managers``. Logs ``("gate-job",
-    status, t)`` whenever the status of a job it holds changes -- one job
-    at a time in these scenarios -- ``("routed", primaries, fallbacks,
-    health, t)`` for every placement it selects, ``("held", t)`` each time
-    no datacenter had room for its job, and ``("gate-started", t)``."""
+    """Gate child fronting ``datacenter_managers``, with ``env_overrides``
+    applied. Logs ``("gate-job", status, t)`` whenever the status of a job
+    it holds changes -- one job at a time in these scenarios -- ``("routed",
+    primaries, fallbacks, health, t)`` for every placement it selects,
+    ``("held", t)`` each time no datacenter had room for its job,
+    ``("gate-started", t)``, ``("route-decision", primaries, fallbacks,
+    excluded datacenters, latency budget relaxed, t)`` for every decision
+    its router makes, and, on change, its routing view of each datacenter
+    (``("datacenter-view", ((datacenter, dispatch p95 ms or None,
+    available cores), ...), t)``)."""
     gate = GateServer(
         host,
         tcp_port,
         udp_port,
-        _env(),
+        _env(**(env_overrides or {})),
         datacenter_managers=datacenter_managers,
         datacenter_manager_udp=datacenter_manager_udp,
         **context.sim_kwargs(),
@@ -292,8 +319,10 @@ def job_control_gate_entry(
     select_datacenters = coordinator._select_datacenters
     hold_job_without_room = coordinator._hold_job_without_room
 
-    async def observed_selection(count, preferred, job_id):
-        primaries, fallbacks, health = await select_datacenters(count, preferred, job_id=job_id)
+    async def observed_selection(count, preferred, job_id, dispatch_latency_budget_ms=0.0):
+        primaries, fallbacks, health = await select_datacenters(
+            count, preferred, job_id=job_id, dispatch_latency_budget_ms=dispatch_latency_budget_ms
+        )
         log.append(("routed", tuple(primaries), tuple(fallbacks), health, round(context.loop.time(), 6)))
         return primaries, fallbacks, health
 
@@ -302,20 +331,57 @@ def job_control_gate_entry(
         await hold_job_without_room(job_id, room_refusals)
 
     coordinator._select_datacenters = observed_selection
+    route_job = gate._job_router.route_job
+
+    def observed_route_job(*args, **kwargs):
+        decision = route_job(*args, **kwargs)
+        log.append(
+            (
+                "route-decision",
+                tuple(decision.primary_datacenters),
+                tuple(decision.fallback_datacenters),
+                tuple(sorted(decision.exclusions)),
+                decision.latency_budget_relaxed,
+                round(context.loop.time(), 6),
+            )
+        )
+        return decision
+
+    gate._job_router.route_job = observed_route_job
     coordinator._hold_job_without_room = observed_hold
 
     async def run() -> None:
         await gate.start()
         log.append(("gate-started", round(context.loop.time(), 6)))
 
+    minimum_sample_count = gate.env.SLO_MIN_SAMPLE_COUNT
+
+    def graded_p95_ms(datacenter: str) -> float | None:
+        # Read-only: the digest as routing grades it, without classifying
+        # health (which records transitions) on the watch's schedule.
+        observation = gate._modular_state.get_dc_latency_observation(datacenter)
+        if observation is None or observation.sample_count < minimum_sample_count:
+            return None
+        return round(observation.p95_ms, 3)
+
+    def datacenter_view() -> tuple:
+        return tuple(
+            (datacenter, graded_p95_ms(datacenter), gate._capacity_aggregator.get_capacity(datacenter).available_cores)
+            for datacenter in sorted(gate._datacenter_managers)
+        )
+
     async def watch() -> None:
         last_statuses: tuple[str, ...] = ()
+        last_view: tuple = ()
         while True:
             statuses = tuple(sorted(job.status for job in gate._job_manager._jobs.values()))
             if statuses != last_statuses:
                 last_statuses = statuses
                 for status in statuses:
                     log.append(("gate-job", status, round(context.loop.time(), 6)))
+            if (view := datacenter_view()) != last_view:
+                last_view = view
+                log.append(("datacenter-view", view, round(context.loop.time(), 6)))
             await asyncio.sleep(WATCH_INTERVAL_SECONDS)
 
     context.loop.create_task(run())

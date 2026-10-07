@@ -419,6 +419,15 @@ class Env(BaseModel):
     # per-class cap -- the same work-over-timeout rule over the class's own
     # jobs -- never binds before the datacenter-wide one does.
     JOB_CLASS_CONCURRENCY_CAPS: StrictStr = ""
+    # D-63: cores held back per job class -- "<class>=<cores>" entries,
+    # comma-separated, classes named as above ("SpikeTest=8"). A reserved
+    # class's work fills its reserve (its cores over the new job's timeout)
+    # before the shared cores; every other class gets only the shared cores,
+    # the registered cores less every reserve. While the reserves outgrow
+    # the registered cores each shrinks to its share of them. Applies to the
+    # derived datacenter cap: refused beside JOB_CONCURRENCY_CAP_PER_DC,
+    # which counts jobs, not cores. Empty reserves nothing.
+    JOB_CLASS_RESERVED_CORES: StrictStr = ""
     MANAGER_PEER_SYNC_INTERVAL: StrictFloat = (
         10.0  # Seconds between re-registrations with peer managers that missed a rejoin
     )
@@ -1243,6 +1252,7 @@ class Env(BaseModel):
             "MAX_WORKERS_PER_MANAGER": int,
             "JOB_CONCURRENCY_CAP_PER_DC": int,
             "JOB_CLASS_CONCURRENCY_CAPS": str,
+            "JOB_CLASS_RESERVED_CORES": str,
             "MANAGER_PEER_SYNC_INTERVAL": float,
             "MANAGER_PEER_JOB_SYNC_INTERVAL": float,
             # Job cleanup settings

@@ -202,6 +202,7 @@ from hyperscale.distributed.discovery.security.role_validator import (
 )
 from hyperscale.distributed.routing import (
     BlendedScoringConfig,
+    ConstrainedPlacementPolicy,
     DatacenterCandidate,
     DatacenterLatencyEstimator,
     ObservedLatencyTracker,
@@ -955,6 +956,14 @@ class GateServer(HealthAwareServer):
             record_fallback_used=lambda from_datacenter, to_datacenter: self._job_router.record_fallback_used(
                 from_datacenter, to_datacenter
             ),
+            select_spillover_candidates=lambda submission, primary_datacenter, fallback_datacenters: (
+                self._job_router.spillover_candidates(
+                    submission.job_id,
+                    primary_datacenter,
+                    fallback_datacenters,
+                    submission.dispatch_latency_budget_ms,
+                )
+            ),
         )
 
         # AD-36 Part 13: a job's unfinished share moves off a datacenter it
@@ -981,13 +990,14 @@ class GateServer(HealthAwareServer):
                 self._health_coordinator.build_datacenter_candidates([datacenter])[0]
                 .health_bucket.lower()
             ),
-            route_replacement=lambda job_id, placement_constraint, occupied_datacenters: next(
+            route_replacement=lambda job_id, placement_constraint, occupied_datacenters, latency_budget_ms: next(
                 iter(
                     self._job_router.route_job(
                         job_id,
                         1,
                         placement_constraint,
                         occupied_datacenters=occupied_datacenters,
+                        dispatch_latency_budget_ms=latency_budget_ms,
                     ).primary_datacenters
                 ),
                 None,
@@ -1059,8 +1069,10 @@ class GateServer(HealthAwareServer):
         # circuit breaker's open-to-half-open interval.
         self._job_router = GateJobRouter(
             get_datacenter_candidates=self._get_datacenter_candidates_for_router,
-            latency_estimator=self._latency_estimator,
-            scorer=RoutingScorer(ScoringConfig.from_env(self.env)),
+            placement_policy=ConstrainedPlacementPolicy(
+                latency_estimator=self._latency_estimator,
+                scorer=RoutingScorer(ScoringConfig.from_env(self.env)),
+            ),
             dispatch_cooldowns=JobDispatchCooldowns(
                 clock=self._clock,
                 cooldown_seconds=self.env.CIRCUIT_BREAKER_HALF_OPEN_AFTER,
@@ -6144,9 +6156,11 @@ class GateServer(HealthAwareServer):
         count: int,
         preferred: list[str] | None,
         job_id: str,
+        dispatch_latency_budget_ms: float = 0.0,
     ) -> tuple[list[str], list[str], str]:
         """The datacenters to place a job in: its primaries, fallbacks and
-        the worst health bucket among the primaries.
+        the worst health bucket among the primaries, under the job's
+        dispatch latency budget when it set one (D-62).
 
         The AD-36 router decides alone. While a datacenter the job could
         use has not reported yet, a selection short of ``count`` is
@@ -6159,6 +6173,7 @@ class GateServer(HealthAwareServer):
             job_id,
             count,
             self._preferred_datacenter_set(preferred),
+            dispatch_latency_budget_ms=dispatch_latency_budget_ms,
         )
         if self._routing_short_of_initializing(decision, count, preferred):
             return ([], [], "initializing")
@@ -6198,7 +6213,8 @@ class GateServer(HealthAwareServer):
                     f"fallbacks={decision.fallback_datacenters}, "
                     f"scores={self._routing_scores(decision)}, "
                     f"excluded={self._routing_exclusions(decision)}, "
-                    f"cooling={sorted(decision.cooling_datacenters)})"
+                    f"cooling={sorted(decision.cooling_datacenters)}, "
+                    f"latency_budget_relaxed={decision.latency_budget_relaxed})"
                 ),
                 node_host=self._host,
                 node_port=self._tcp_port,

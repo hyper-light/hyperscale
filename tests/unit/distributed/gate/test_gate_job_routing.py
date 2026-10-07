@@ -33,6 +33,9 @@ from hyperscale.distributed.models import DatacenterStatus
 from hyperscale.distributed.models.coordinates import VivaldiConfig
 from hyperscale.distributed.nodes.gate.server import GateServer
 from hyperscale.distributed.routing import (
+    ConstrainedPlacementPolicy,
+    PlacementPlan,
+    PlacementRequest,
     DatacenterCandidate,
     DatacenterLatencyEstimator,
     ExclusionReason,
@@ -99,6 +102,7 @@ def candidate(
     total_managers: int = 1,
     healthy_managers: int = 1,
     circuit_breaker_pressure: float = 0.0,
+    dispatch_latency_p95_ms: float | None = None,
 ) -> DatacenterCandidate:
     return DatacenterCandidate(
         datacenter_id=datacenter_id,
@@ -111,6 +115,7 @@ def candidate(
         circuit_breaker_pressure=circuit_breaker_pressure,
         health_severity_weight=1.0,
         slo_routing_factor=1.0,
+        dispatch_latency_p95_ms=dispatch_latency_p95_ms,
     )
 
 
@@ -121,8 +126,10 @@ def make_router(
 ) -> GateJobRouter:
     return GateJobRouter(
         get_datacenter_candidates=lambda: candidates,
-        latency_estimator=make_estimator(coordinates or {}),
-        scorer=RoutingScorer(ScoringConfig.from_env(Env())),
+        placement_policy=ConstrainedPlacementPolicy(
+            latency_estimator=make_estimator(coordinates or {}),
+            scorer=RoutingScorer(ScoringConfig.from_env(Env())),
+        ),
         dispatch_cooldowns=JobDispatchCooldowns(
             clock=clock or SteppedClock(),
             cooldown_seconds=COOLDOWN_SECONDS,
@@ -567,3 +574,127 @@ def test_equivalent_datacenters_share_jobs_evenly() -> None:
     mean = sum(counts) / len(counts)
     standard_deviation = (sum((count - mean) ** 2 for count in counts) / len(counts)) ** 0.5
     assert standard_deviation / mean < 0.3, jobs_per_datacenter
+
+
+# ---------------------------------------------------------------------------
+# D-62 placement policy: dispatch latency budget, pluggability
+# ---------------------------------------------------------------------------
+
+LATENCY_BUDGET_MS = 100.0
+
+
+def test_a_latency_budget_keeps_the_job_off_a_datacenter_whose_p95_exceeds_it() -> None:
+    # dc-slow is AD-36's choice (idle, nearer) but answers dispatches over
+    # the budget; dc-fast is busier and farther but within it.
+    router = make_router(
+        [
+            candidate("dc-slow", dispatch_latency_p95_ms=LATENCY_BUDGET_MS * 3),
+            candidate("dc-fast", available_cores=2, dispatch_latency_p95_ms=LATENCY_BUDGET_MS / 2),
+        ],
+        coordinates={"dc-slow": coordinate(10.0), "dc-fast": coordinate(40.0)},
+    )
+
+    unbudgeted = router.route_job("job-1", 1, None)
+    budgeted = router.route_job("job-2", 1, None, dispatch_latency_budget_ms=LATENCY_BUDGET_MS)
+
+    assert unbudgeted.primary_datacenters == ["dc-slow"]
+    assert (budgeted.primary_datacenters, budgeted.fallback_datacenters) == (["dc-fast"], [])
+    assert budgeted.exclusions == {"dc-slow": ExclusionReason.OVER_DISPATCH_LATENCY_BUDGET}
+    assert not budgeted.latency_budget_relaxed
+    assert router.get_metrics()["exclusion:over_dispatch_latency_budget"] == 1
+
+
+def test_a_datacenter_without_a_gradeable_digest_meets_any_budget() -> None:
+    router = make_router(
+        [candidate("dc-unmeasured"), candidate("dc-slow", dispatch_latency_p95_ms=LATENCY_BUDGET_MS * 2)],
+        coordinates={"dc-unmeasured": coordinate(40.0), "dc-slow": coordinate(10.0)},
+    )
+
+    decision = router.route_job("job-1", 1, None, dispatch_latency_budget_ms=LATENCY_BUDGET_MS)
+
+    assert decision.primary_datacenters == ["dc-unmeasured"]
+
+
+def test_when_no_datacenter_meets_the_budget_the_job_goes_nearest_to_it() -> None:
+    # Both over; dc-near-budget is AD-36's last choice but the least over.
+    router = make_router(
+        [
+            candidate("dc-far-over", dispatch_latency_p95_ms=LATENCY_BUDGET_MS * 5),
+            candidate("dc-near-budget", available_cores=1, dispatch_latency_p95_ms=LATENCY_BUDGET_MS * 2),
+        ],
+        coordinates={"dc-far-over": coordinate(10.0), "dc-near-budget": coordinate(80.0)},
+    )
+
+    decision = router.route_job("job-1", 1, None, dispatch_latency_budget_ms=LATENCY_BUDGET_MS)
+
+    assert (decision.primary_datacenters, decision.fallback_datacenters) == (["dc-near-budget"], ["dc-far-over"])
+    assert decision.latency_budget_relaxed
+    assert decision.exclusions == {}
+
+
+def test_fewer_datacenters_within_the_budget_than_asked_for_fill_from_the_nearest_over() -> None:
+    router = make_router(
+        [
+            candidate("dc-within", dispatch_latency_p95_ms=LATENCY_BUDGET_MS / 2),
+            candidate("dc-far-over", dispatch_latency_p95_ms=LATENCY_BUDGET_MS * 5),
+            candidate("dc-near-over", dispatch_latency_p95_ms=LATENCY_BUDGET_MS * 2),
+        ],
+        coordinates={"dc-within": coordinate(50.0), "dc-far-over": coordinate(10.0), "dc-near-over": coordinate(80.0)},
+    )
+
+    decision = router.route_job("job-1", 2, None, dispatch_latency_budget_ms=LATENCY_BUDGET_MS)
+
+    assert decision.primary_datacenters == ["dc-within", "dc-near-over"]
+    assert decision.fallback_datacenters == ["dc-far-over"]
+    assert decision.latency_budget_relaxed
+
+
+def test_spillover_never_moves_a_share_further_over_the_budget_than_its_primary() -> None:
+    router = make_router(
+        [
+            candidate("dc-within", dispatch_latency_p95_ms=LATENCY_BUDGET_MS / 2),
+            candidate("dc-unmeasured"),
+            candidate("dc-near-over", dispatch_latency_p95_ms=LATENCY_BUDGET_MS * 2),
+            candidate("dc-far-over", dispatch_latency_p95_ms=LATENCY_BUDGET_MS * 5),
+        ]
+    )
+    fallbacks = ["dc-unmeasured", "dc-near-over", "dc-far-over"]
+
+    from_within = router.spillover_candidates("job-1", "dc-within", fallbacks, LATENCY_BUDGET_MS)
+    from_near_over = router.spillover_candidates(
+        "job-1", "dc-near-over", ["dc-within", "dc-far-over"], LATENCY_BUDGET_MS
+    )
+    unbudgeted = router.spillover_candidates("job-1", "dc-within", fallbacks, 0.0)
+
+    assert from_within == ["dc-unmeasured"]
+    assert from_near_over == ["dc-within"]
+    assert unbudgeted == fallbacks
+
+
+class ReversedPlacementPolicy:
+    """A policy of an operator's own: every candidate, in reverse order."""
+
+    def place(self, request: PlacementRequest, candidates: list[DatacenterCandidate]) -> PlacementPlan:
+        return PlacementPlan(ordered=candidates[::-1], scores={}, exclusions={}, latency_budget_relaxed=False)
+
+    def spillover_candidates(
+        self,
+        request: PlacementRequest,
+        primary_datacenter: str,
+        fallback_datacenters: list[str],
+        candidates: list[DatacenterCandidate],
+    ) -> list[str]:
+        return []
+
+
+def test_the_router_places_by_whatever_policy_it_is_given() -> None:
+    router = GateJobRouter(
+        get_datacenter_candidates=lambda: [candidate("dc-a"), candidate("dc-b"), candidate("dc-c")],
+        placement_policy=ReversedPlacementPolicy(),
+        dispatch_cooldowns=JobDispatchCooldowns(clock=SteppedClock(), cooldown_seconds=COOLDOWN_SECONDS),
+    )
+
+    decision = router.route_job("job-1", 2, None)
+
+    assert (decision.primary_datacenters, decision.fallback_datacenters) == (["dc-c", "dc-b"], ["dc-a"])
+    assert router.spillover_candidates("job-1", "dc-c", ["dc-a"], LATENCY_BUDGET_MS) == []

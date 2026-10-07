@@ -99,7 +99,8 @@ class JobAdmissionControl:
         """
         Args:
             env: The caps (``JOB_CONCURRENCY_CAP_PER_DC``,
-                ``JOB_CLASS_CONCURRENCY_CAPS``) and the retry-hint floor.
+                ``JOB_CLASS_CONCURRENCY_CAPS``), the D-63 core reserves
+                (``JOB_CLASS_RESERVED_CORES``) and the retry-hint floor.
             job_manager: The manager's jobs, read for unfinished jobs.
             is_submission_in_progress: Whether a submission of a job id is
                 being decided right now -- its job may not exist yet.

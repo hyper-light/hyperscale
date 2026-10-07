@@ -8,8 +8,8 @@
 - Idempotent submissions: client‑side request IDs + gate/manager dedupe cache. *Built (AD-40): gate cache, manager WAL-backed ledger, cross-gate key on `GateJobReplica`.*
 
 ## Routing & Placement
-- Policy‑driven placement: explicit constraints (region affinity, min capacity, cost, latency budget) with pluggable policy. *Partial: hard `datacenters=[...]` constraint, AD-43 spillover, AD-36 scoring and storage-aware exclusion exist; no pluggable policy object, no cost or latency-budget constraint.*
-- Pre‑warm pools: reserved workers for bursty tests; spillover logic to nearest DC. *Partial: spillover is built (AD-43); no reserved/pre-warmed worker pool.*
+- Policy‑driven placement: explicit constraints (region affinity, min capacity, cost, latency budget) with pluggable policy. *Built 2026-10-07 (D-62): the gate router asks a `PlacementPolicy` (`routing/placement_policy.py`); the gate's `ConstrainedPlacementPolicy` holds AD-36's excludes (storage via health), region affinity, scoring and ordering, plus a per-job `dispatch_latency_budget_ms` against each DC's D-5 dispatch-latency p95 (relaxed to nearest-first when too few DCs meet it); AD-43 spillover chooses only among the policy's spillover candidates. Min capacity is D-65 admission. Cost: doc-obsolete -- the system has no cost signal until an operator supplies one per DC.*
+- Pre‑warm pools: reserved workers for bursty tests; spillover logic to nearest DC. *Built 2026-10-07 (D-63): pre-warming is inherent (each worker spawns one executor per core at boot, keeps them across jobs, respawns a dead one); spillover is AD-43. Reservation: `JOB_CLASS_RESERVED_CORES` holds cores back per job class in the D-65 derived cap -- the class's work fills its reserve first, other classes get only the shared cores (`jobs/job_concurrency_caps.py`).*
 - Adaptive route learning: feed real test latency into gate routing (beyond RTT UCB). *Built (AD-45).*
 
 ## Execution Safety

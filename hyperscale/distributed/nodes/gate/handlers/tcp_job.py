@@ -865,6 +865,7 @@ class GateJobHandler:
                 submission.datacenter_count,
                 submission.datacenters if submission.datacenters else None,
                 job_id=submission.job_id,
+                dispatch_latency_budget_ms=submission.dispatch_latency_budget_ms,
             )
         )
 

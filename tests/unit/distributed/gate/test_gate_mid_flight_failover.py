@@ -209,7 +209,7 @@ async def leading_gate(
     # own); dc-c, then dc-d, the best datacenters the job is not in.
     if lost_datacenters:
         lose(gate, *lost_datacenters)
-    gate._job_failover_coordinator._route_replacement = lambda job_id, constraint, occupied: next(
+    gate._job_failover_coordinator._route_replacement = lambda job_id, constraint, occupied, latency_budget_ms: next(
         (datacenter for datacenter in ("dc-c", "dc-d") if datacenter not in occupied), None
     )
     return gate
@@ -437,14 +437,14 @@ async def test_a_lost_datacenter_that_delivered_every_workflow_is_no_longer_wait
 async def test_a_job_with_nowhere_to_go_waits_for_a_datacenter_to_take_it() -> None:
     async def scenario(gate: GateServer, transport: DatacenterTransport) -> None:
         coordinator = gate._job_failover_coordinator
-        coordinator._route_replacement = lambda job_id, constraint, occupied: None
+        coordinator._route_replacement = lambda job_id, constraint, occupied, latency_budget_ms: None
 
         await coordinator.check_jobs()
         await settle()
         held_while_unplaceable = gate._job_manager.get_target_dcs(JOB_ID)
 
         # A datacenter can take it on a later check.
-        coordinator._route_replacement = lambda job_id, constraint, occupied: next(
+        coordinator._route_replacement = lambda job_id, constraint, occupied, latency_budget_ms: next(
             (datacenter for datacenter in ("dc-c",) if datacenter not in occupied), None
         )
         await coordinator.check_jobs()
