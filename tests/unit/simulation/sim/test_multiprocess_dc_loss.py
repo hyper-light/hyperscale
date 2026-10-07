@@ -719,8 +719,6 @@ def test_slow_disk_execution_is_replay_deterministic():
 # Scenario 6: disk-full manager — loud dispatch-time failure
 # ---------------------------------------------------------------------------
 
-# Scenario 6b's arm: before the first job's dispatch-time writes.
-_DISK_FULL_ARM_AT = 2.86
 _DISK_FULL_BUDGET_BYTES = 1024
 
 
@@ -823,13 +821,12 @@ def test_disk_full_failure_is_replay_deterministic():
 # when it frees
 # ---------------------------------------------------------------------------
 
-# dc-west's disk fills before the first job's dispatch-time writes (as in
-# scenario 6) and frees at _DISK_FREED_AT. A second, UNPINNED job is
-# submitted while the disk is full.
+# dc-west's disk fills before the first job's dispatch-time writes, at
+# scenario 6's arm (derived from the fault-free twin -- a fixed 2.86 went
+# stale when the client's back-off moved its submission to 2.55), and
+# frees at _DISK_FREED_AT. A second, UNPINNED job is submitted while the
+# disk is full.
 _DISK_FREED_AT = 40.0
-_DISK_FULL_WINDOW_SCHEDULE = (
-    ("disk_full_window", _DISK_FULL_ARM_AT, _DISK_FULL_BUDGET_BYTES, _DISK_FREED_AT),
-)
 _SECOND_JOB_SUBMIT_AT = 15.0
 # The manager probes its storage on its dead-node check cadence and the
 # gate learns the outcome from the next manager heartbeat.
@@ -846,8 +843,11 @@ def _run_full_disk_then_freed() -> dict:
     coordinator = SimulationCoordinator(
         latency=_LATENCY, max_virtual_time=_LOSS_CEILING, seed=_SEED
     )
+    disk_full_window_schedule = (
+        ("disk_full_window", _disk_full_arm_at(), _DISK_FULL_BUDGET_BYTES, _DISK_FREED_AT),
+    )
     _add_multi_dc_topology(
-        coordinator, storage_schedule_by_dc={"dc-west": _DISK_FULL_WINDOW_SCHEDULE}
+        coordinator, storage_schedule_by_dc={"dc-west": disk_full_window_schedule}
     )
     _add_soak_client(coordinator, "client-a", "sim-cli-a", 120.0, pinned_datacenters=_JOB_PLACEMENT)
     _add_soak_client(coordinator, "client-b", "sim-cli-b", 120.0, submit_at=_SECOND_JOB_SUBMIT_AT)
