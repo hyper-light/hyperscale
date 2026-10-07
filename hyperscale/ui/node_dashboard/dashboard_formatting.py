@@ -52,6 +52,14 @@ def cluster_lines(membership: ClusterMembership, swim_lines: list[str]) -> list[
     ]
 
 
+def in_use_percent(total_cores: int, free_cores: int) -> float:
+    """The share of ``total_cores`` not free, in percent (0 with no cores)."""
+    if total_cores <= 0:
+        return 0.0
+
+    return (total_cores - free_cores) * 100.0 / total_cores
+
+
 def count_statuses(status_counts: Counter[str], statuses: tuple[str, ...]) -> int:
     """How many of the counted items are in any of ``statuses``."""
     return sum(map(status_counts.__getitem__, statuses))

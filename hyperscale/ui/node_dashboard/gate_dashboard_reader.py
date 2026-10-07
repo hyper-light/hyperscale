@@ -4,8 +4,10 @@ from hyperscale.distributed.models import DatacenterStatus
 from hyperscale.distributed.nodes import GateServer
 from hyperscale.ui.components.table.table_config import HeaderOptions
 
+from .counter_rates import CounterRates
 from .dashboard_formatting import cluster_lines, count_statuses
-from .models import NodeDashboardFrame, NodeDashboardLayout, TableRow
+from .job_outcome_tally import JobOutcomeTally
+from .models import NodeDashboardChart, NodeDashboardFrame, NodeDashboardLayout, TableRow
 from .node_identity_reader import NodeIdentityReader
 
 GATE_DASHBOARD_LAYOUT = NodeDashboardLayout(
@@ -16,7 +18,15 @@ GATE_DASHBOARD_LAYOUT = NodeDashboardLayout(
         "managers": HeaderOptions(default=0),
         "workers": HeaderOptions(default=0),
         "capacity": HeaderOptions(default=0),
+        "p95 ms": HeaderOptions(default="-", precision_format=".1f"),
     },
+    charts=(
+        NodeDashboardChart("admitted", "jobs admitted /s", "aquamarine_2"),
+        NodeDashboardChart("completed", "jobs completed /s", "aquamarine_2"),
+        NodeDashboardChart("failed", "jobs failed /s", "hot_pink_3"),
+        NodeDashboardChart("accepting", "DCs accepting", "royal_blue"),
+        NodeDashboardChart("dispatch_latency", "worst DC p95 ms", "hot_pink_3"),
+    ),
 )
 
 # DatacenterHealth values a gate routes new jobs to.
@@ -24,18 +34,52 @@ ACCEPTING_DATACENTER_HEALTH = ("healthy", "busy")
 # JobStatus values grouped as the dashboard counts them.
 PENDING_JOB_STATUSES = ("submitted", "queued", "dispatching")
 RUNNING_JOB_STATUSES = ("running", "completing")
+COMPLETED_JOB_STATUSES = ("completed",)
 FAILED_JOB_STATUSES = ("failed", "timeout")
 
 
-def datacenter_row(status: DatacenterStatus) -> TableRow:
-    """One datacenter's row in the gate's datacenter table."""
-    return {
+def datacenter_row(status: DatacenterStatus, dispatch_p95_by_datacenter: dict[str, float]) -> TableRow:
+    """One datacenter's row in the gate's datacenter table: its dispatch
+    round trip p95 (D-5) is left at the column's default until one of its
+    managers reports one."""
+    row: TableRow = {
         "datacenter": status.dc_id,
         "health": status.health,
         "managers": status.manager_count,
         "workers": status.worker_count,
         "capacity": status.available_capacity,
     }
+    if (dispatch_p95_ms := dispatch_p95_by_datacenter.get(status.dc_id)) is not None:
+        row["p95 ms"] = dispatch_p95_ms
+
+    return row
+
+
+def dispatch_p95_by_datacenter(gate: GateServer, datacenter_ids: list[str]) -> dict[str, float]:
+    """Each datacenter's dispatch round trip p95 over its AD-42 SLO windows
+    (D-5), from its freshest manager heartbeat with samples -- the value
+    the gate's health classification and routing read. A datacenter none
+    of whose managers has reported samples is left out."""
+    runtime_state = gate._modular_state
+    return {
+        datacenter_id: heartbeat.slo_p95_ms
+        for datacenter_id in datacenter_ids
+        if (heartbeat := runtime_state.get_dc_slo_heartbeat(datacenter_id)) is not None
+    }
+
+
+def outcome_counts(outcome_tally: JobOutcomeTally) -> dict[str, int]:
+    """The gate's cumulative job counters its rate charts plot."""
+    return {
+        "admitted": outcome_tally.admitted_total,
+        "completed": outcome_tally.completed_total,
+        "failed": outcome_tally.failed_total,
+    }
+
+
+def job_statuses(gate: GateServer) -> dict[str, str]:
+    """Each job the gate holds, by its status."""
+    return {job_id: job.status for job_id, job in gate._job_manager.items()}
 
 
 def sum_metrics_with_prefix(metrics: dict[str, int], prefix: str) -> int:
@@ -47,7 +91,10 @@ class GateDashboardReader:
     """Reads a gate's dashboard frame from its own state: the datacenters
     it routes to and their health, their managers, its jobs by status, its
     forwarding rate and routing decisions, its peer gates and the jobs it
-    leads.
+    leads -- and the values its charts plot: jobs admitted, completed and
+    failed (each per second since the last sample), the datacenters
+    accepting new jobs, and the worst datacenter's dispatch round trip p95
+    (D-5). Each datacenter's own p95 is in its table row.
 
     Every read is synchronous and local -- no await, no network -- and
     costs O(datacenter managers + jobs). A datacenter's health is the
@@ -60,11 +107,16 @@ class GateDashboardReader:
     def __init__(self, gate: GateServer) -> None:
         self._gate = gate
         self._identity = NodeIdentityReader(gate, "gate")
+        self._outcome_tally = JobOutcomeTally(COMPLETED_JOB_STATUSES, FAILED_JOB_STATUSES)
+        self._outcome_tally.advance(job_statuses(gate))
+        self._rates = CounterRates(outcome_counts(self._outcome_tally), gate._clock.monotonic())
 
     def read(self) -> NodeDashboardFrame:
         """Sample the gate's state into one dashboard frame."""
         gate = self._gate
+        sampled_at = gate._clock.monotonic()
         datacenter_statuses = self._datacenter_statuses()
+        dispatch_p95s = dispatch_p95_by_datacenter(gate, [status.dc_id for status in datacenter_statuses])
         return NodeDashboardFrame(
             identity_lines=self._identity.identity_lines(
                 gate._modular_state.get_gate_state().name.lower(),
@@ -73,8 +125,27 @@ class GateDashboardReader:
             cluster_lines=cluster_lines(gate._cluster_membership, self._identity.swim_lines()),
             summary_lines=self._datacenter_lines(datacenter_statuses),
             detail_lines=self._job_lines(),
-            table_rows=[datacenter_row(status) for status in datacenter_statuses],
+            table_rows=[datacenter_row(status, dispatch_p95s) for status in datacenter_statuses],
+            chart_values=self._chart_values(datacenter_statuses, dispatch_p95s, sampled_at),
+            sampled_at=sampled_at,
         )
+
+    def _chart_values(
+        self,
+        datacenter_statuses: list[DatacenterStatus],
+        dispatch_p95s: dict[str, float],
+        sampled_at: float,
+    ) -> list[float | None]:
+        self._outcome_tally.advance(job_statuses(self._gate))
+        rates = self._rates.advance(outcome_counts(self._outcome_tally), sampled_at)
+        health_counts = Counter(status.health for status in datacenter_statuses)
+        return [
+            rates["admitted"],
+            rates["completed"],
+            rates["failed"],
+            float(count_statuses(health_counts, ACCEPTING_DATACENTER_HEALTH)),
+            max(dispatch_p95s.values(), default=None),
+        ]
 
     def _datacenter_statuses(self) -> list[DatacenterStatus]:
         gate = self._gate

@@ -1,4 +1,5 @@
 import asyncio
+import math
 import sys
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Tuple, Union
@@ -100,9 +101,9 @@ class ScatterPlot:
             width=max(self._max_width, 1),
             height=max(self._max_height, 1),
             y_min=self._config.y_min,
-            y_max=int(round(y_max, 0)),
+            y_max=y_max,
             x_min=self._config.x_min,
-            x_max=int(round(x_max, 0)),
+            x_max=x_max,
             linesep="\n",
             X_label=self._config.x_axis_name,
             Y_label=self._config.y_axis_name,
@@ -178,9 +179,9 @@ class ScatterPlot:
                 width=self._corrected_width,
                 height=self._corrected_height,
                 y_min=self._config.y_min,
-                y_max=int(round(y_max, 0)),
+                y_max=y_max,
                 x_min=self._config.x_min,
-                x_max=int(round(x_max, 0)),
+                x_max=x_max,
                 linesep="\n",
                 X_label=self._config.x_axis_name,
                 Y_label=self._config.y_axis_name,
@@ -225,9 +226,9 @@ class ScatterPlot:
             width=self._corrected_width,
             height=self._corrected_height,
             y_min=self._config.y_min,
-            y_max=int(round(y_max, 0)),
+            y_max=y_max,
             x_min=self._config.x_min,
-            x_max=int(round(x_max, 0)),
+            x_max=x_max,
             linesep="\n",
             X_label=self._config.x_axis_name,
             Y_label=self._config.y_axis_name,
@@ -289,9 +290,13 @@ class ScatterPlot:
         if y_max <= self._config.y_min:
             y_max = self._config.y_min + 1
 
+        # The axes end at whole numbers, rounded up: plotille draws no point
+        # on or past an axis' maximum, and rounding to the nearest whole
+        # number could take the 1.1x headroom away for a largest value under
+        # 5 (1.1 x 4 rounds to 4), leaving every point at that value undrawn.
         return (
-            x_max,
-            y_max,
+            math.ceil(x_max),
+            math.ceil(y_max),
             x_vals,
             y_vals,
         )

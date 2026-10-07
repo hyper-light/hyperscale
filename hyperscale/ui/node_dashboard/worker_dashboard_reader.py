@@ -5,7 +5,8 @@ from hyperscale.distributed.models import WorkflowProgress
 from hyperscale.distributed.nodes import WorkerServer
 from hyperscale.ui.components.table.table_config import HeaderOptions
 
-from .models import NodeDashboardFrame, NodeDashboardLayout, TableRow
+from .dashboard_formatting import in_use_percent
+from .models import NodeDashboardChart, NodeDashboardFrame, NodeDashboardLayout, TableRow
 from .node_identity_reader import NodeIdentityReader
 
 WORKER_DASHBOARD_LAYOUT = NodeDashboardLayout(
@@ -18,6 +19,12 @@ WORKER_DASHBOARD_LAYOUT = NodeDashboardLayout(
         "rate": HeaderOptions(default=0, precision_format=".1f"),
         "cores": HeaderOptions(default=0),
     },
+    charts=(
+        NodeDashboardChart("active_workflows", "active workflows", "aquamarine_2"),
+        NodeDashboardChart("cores_busy", "cores busy %", "royal_blue"),
+        NodeDashboardChart("throughput", "throughput wf /s", "aquamarine_2"),
+        NodeDashboardChart("backpressure", "backpressure level", "hot_pink_3"),
+    ),
 )
 
 
@@ -65,7 +72,11 @@ def describe_heartbeat_age(last_heartbeat: float | None) -> str:
 class WorkerDashboardReader:
     """Reads a worker's dashboard frame from its own state: its cores, its
     running workflows with their progress and rates, the workflows that
-    have ended while the dashboard watched, and the manager it reports to.
+    have ended while the dashboard watched, and the manager it reports to
+    -- and the values its charts plot: its active workflows, the share of
+    its cores busy, the throughput it reports to its managers (completed
+    workflows per second, AD-19) and the highest backpressure level its
+    managers have signalled (AD-23: 0 none to 3 reject).
 
     The worker keeps no count of ended workflows, so the reader counts
     them itself: each workflow that leaves the worker's active set between
@@ -100,7 +111,19 @@ class WorkerDashboardReader:
             summary_lines=self._core_lines(),
             detail_lines=self._workflow_lines(running),
             table_rows=[workflow_row(progress) for progress in running],
+            chart_values=self._chart_values(running),
+            sampled_at=worker._clock.monotonic(),
         )
+
+    def _chart_values(self, running: list[WorkflowProgress]) -> list[float | None]:
+        worker = self._worker
+        core_allocator = worker._core_allocator
+        return [
+            float(len(running)),
+            in_use_percent(core_allocator.total_cores, core_allocator.available_cores),
+            worker._worker_state._throughput_last_value,
+            float(worker._backpressure_manager.get_max_backpressure_level()),
+        ]
 
     def _count_ended_workflows(self, active_workflows: dict[str, WorkflowProgress]) -> None:
         ended_workflow_ids = self._last_active_workflows.keys() - active_workflows.keys()

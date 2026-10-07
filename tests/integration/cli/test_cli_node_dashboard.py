@@ -10,6 +10,8 @@ E2E: the live dashboards of real `hyperscale run manager|worker` processes.
   cursor again before the process exits.
 - "full" mode with stdout a pipe renders nothing: the node logs to stderr
   as it always has (the existing CLI tests rely on it).
+- Every role's dashboard opens with the run UI's Hyperscale header and
+  plots its role's charts.
 """
 
 import asyncio
@@ -25,6 +27,8 @@ import time
 
 import pytest
 
+from hyperscale.ui.node_dashboard import GateDashboardReader, ManagerDashboardReader, WorkerDashboardReader
+from hyperscale.ui.node_dashboard.models import NodeDashboardLayout
 from tests.integration.cli.node_processes import (
     BOOT_MARKERS,
     BOOT_TIMEOUT_SECONDS,
@@ -53,8 +57,16 @@ WIDE_TERMINAL = {"COLUMNS": str(TERMINAL_COLUMNS), "LINES": str(TERMINAL_LINES)}
 # in "global".
 NODE_DATACENTER = "default"
 GATE_DATACENTER = "global"
+# A line of the Hyperscale header's art (hyperscale/ui/hyperscale_header.py).
+HEADER_ART_LINE = "//__ \\\\// //_// //_// // // //__  //    __// // //_//"
 HIDE_CURSOR = b"\x1b[?25l"
 SHOW_CURSOR = b"\x1b[?25h"
+
+
+def chart_titles(layout: NodeDashboardLayout) -> list[str]:
+    """How each of a role's charts titles its value axis in a frame (a
+    chart waiting for its first value names itself instead)."""
+    return [chart.title for chart in layout.charts]
 
 
 @pytest.fixture
@@ -119,6 +131,14 @@ async def test_ci_dashboards_show_the_cluster_and_keep_logs_out_of_the_frames(
         assert await worker.wait_for_output(f"primary {manager.address}", within=BOOT_TIMEOUT_SECONDS), (
             f"the worker's dashboard never showed its manager:\n{''.join(worker.lines[-30:])}"
         )
+        for node, layout in ((manager, ManagerDashboardReader.layout), (worker, WorkerDashboardReader.layout)):
+            assert await node.wait_for_output(HEADER_ART_LINE, within=BOOT_TIMEOUT_SECONDS), (
+                f"the {node.role}'s dashboard has no Hyperscale header:\n{''.join(node.lines[-30:])}"
+            )
+            for title in chart_titles(layout):
+                assert await node.wait_for_output(title, within=BOOT_TIMEOUT_SECONDS), (
+                    f"the {node.role}'s dashboard has no {title!r} chart:\n{''.join(node.lines[-30:])}"
+                )
 
         # The logs went to each node's log file, not into its frames.
         for node in nodes:
@@ -190,6 +210,14 @@ async def test_full_dashboard_on_a_terminal_restores_the_cursor_on_ctrl_c(
     try:
         assert await wait_for_bytes(collected, HIDE_CURSOR, within=BOOT_TIMEOUT_SECONDS)
         assert await wait_for_bytes(collected, b"CLUSTER standalone", within=BOOT_TIMEOUT_SECONDS), bytes(collected[-3000:])
+        assert await wait_for_bytes(collected, b"(dispatches /s) ^", within=BOOT_TIMEOUT_SECONDS), (
+            bytes(collected[-3000:])
+        )
+        assert await wait_for_bytes(collected, HEADER_ART_LINE.encode(), within=BOOT_TIMEOUT_SECONDS)
+        # The dashboard draws before the node finishes booting: interrupt
+        # only once the boot line has reached the log file, or a slow
+        # (cold) boot is cut short before it is ever written.
+        assert await wait_for_log(node_log(logs_directory, "manager", manager_start), BOOT_MARKERS["manager"])
 
         process.send_signal(signal.SIGINT)
         await asyncio.wait_for(process.wait(), timeout=SHUTDOWN_TIMEOUT_SECONDS)
@@ -198,7 +226,6 @@ async def test_full_dashboard_on_a_terminal_restores_the_cursor_on_ctrl_c(
         assert process.returncode == 0
         assert collected.rfind(SHOW_CURSOR) > collected.rfind(HIDE_CURSOR), "the cursor was left hidden"
         assert BOOT_MARKERS["manager"].encode() not in collected, "a log line tore the dashboard's frames"
-        assert await wait_for_log(node_log(logs_directory, "manager", manager_start), BOOT_MARKERS["manager"])
         assert await wait_for_no_survivors(run_marker) == []
     finally:
         asyncio.get_running_loop().remove_reader(master_descriptor)
@@ -247,6 +274,11 @@ async def test_the_gate_dashboard_shows_the_datacenter_its_manager_reports(
             f"the gate's dashboard never showed the manager's datacenter:\n{''.join(gate.lines[-30:])}"
         )
         assert await gate.wait_for_output("managers alive 1", within=BOOT_TIMEOUT_SECONDS)
+        assert await gate.wait_for_output(HEADER_ART_LINE, within=BOOT_TIMEOUT_SECONDS)
+        for title in chart_titles(GateDashboardReader.layout):
+            assert await gate.wait_for_output(title, within=BOOT_TIMEOUT_SECONDS), (
+                f"the gate's dashboard has no {title!r} chart:\n{''.join(gate.lines[-30:])}"
+            )
         assert await manager.wait_for_output("gates 1 healthy 1", within=BOOT_TIMEOUT_SECONDS), (
             f"the manager's dashboard never showed its gate:\n{''.join(manager.lines[-30:])}"
         )

@@ -12,8 +12,10 @@ from hyperscale.logging.hyperscale_logging_models import ServerError
 from hyperscale.ui.components.terminal import Terminal
 from hyperscale.ui.config.mode import TerminalDisplayMode
 
-from .models import NodeDashboardFrame, TableRow
+from .models import NodeDashboardChart, NodeDashboardFrame, TableRow
 from .node_dashboard_actions import (
+    update_node_dashboard_chart,
+    update_node_dashboard_chart_waiting,
     update_node_dashboard_cluster,
     update_node_dashboard_detail,
     update_node_dashboard_identity,
@@ -21,10 +23,16 @@ from .node_dashboard_actions import (
     update_node_dashboard_summary,
     update_node_dashboard_table,
 )
+from .node_dashboard_chart_series import ChartPoint, NodeDashboardChartSeries
 from .node_dashboard_config import NodeDashboardConfig
 from .node_dashboard_reader import NodeDashboardReader
 from .node_dashboard_sampling_stopped import NodeDashboardSamplingStopped
-from .node_dashboard_sections import generate_node_dashboard_sections
+from .node_dashboard_sections import (
+    chart_plot_name,
+    chart_waiting_name,
+    chart_waiting_text,
+    generate_node_dashboard_sections,
+)
 
 PanelContent = list[str] | list[TableRow] | str
 PanelPublisher = Callable[[PanelContent], Awaitable[object]]
@@ -56,6 +64,11 @@ class NodeDashboard:
     every exit path: ``stop`` cancels and awaits the sampling loop, stops
     the terminal (restoring the cursor), releases it, and closes the
     logger the dashboard was given (it owns it).
+
+    Its charts plot the last ``SLO_EVALUATION_WINDOW_SECONDS`` of samples
+    -- the horizon the cluster judges a node's latency over (AD-42), which
+    the latency charts' p95 digests span -- one point per sample, so a
+    chart holds at most that window over the sampling interval.
     """
 
     def __init__(
@@ -74,11 +87,19 @@ class NodeDashboard:
         self._config = config
         self._logger = logger
         self._status_line = f"ctrl-c stops the node | logs {log_path}"
+        window_seconds = env.SLO_EVALUATION_WINDOW_SECONDS
         self._terminal: Terminal | None = (
-            Terminal(generate_node_dashboard_sections(reader.layout, DISPLAY_MODES[terminal_mode]))
+            Terminal(generate_node_dashboard_sections(reader.layout, window_seconds, DISPLAY_MODES[terminal_mode]))
             if terminal_mode in DISPLAY_MODES
             else None
         )
+        self._sample_interval_seconds = max(
+            config.sample_interval_seconds,
+            self._terminal.refresh_interval if self._terminal is not None else 0.0,
+        )
+        self._chart_series = NodeDashboardChartSeries(window_seconds, self._sample_interval_seconds)
+        # The charts whose plot shows (the rest show they wait for a value).
+        self._plotted_charts: set[str] = set()
         self._task_runner: TaskRunner | None = None
         self._sampling_run: Run | None = None
         self._published: dict[str, PanelContent] = {}
@@ -110,10 +131,9 @@ class NodeDashboard:
         self._raise_if_sampling_failed()
 
     async def _sample_until_cancelled(self) -> None:
-        sample_interval_seconds = max(self._config.sample_interval_seconds, self._terminal.refresh_interval)
         while True:
             await self._sample_once()
-            await asyncio.sleep(sample_interval_seconds)
+            await asyncio.sleep(self._sample_interval_seconds)
 
     async def _sample_once(self) -> None:
         try:
@@ -136,6 +156,37 @@ class NodeDashboard:
         )
         for panel_name, publish, content in panels:
             await self._publish_changed(panel_name, publish, content)
+
+        await self._publish_charts(frame)
+
+    async def _publish_charts(self, frame: NodeDashboardFrame) -> None:
+        # Every sample moves each chart's points along its window, so each
+        # chart is published every sample.
+        chart_series = self._chart_series
+        chart_series.record(frame.sampled_at, frame.chart_values)
+        for chart_index, chart in enumerate(self._reader.layout.charts):
+            await self._publish_chart(chart, chart_series.points(chart_index))
+
+    async def _publish_chart(self, chart: NodeDashboardChart, points: list[ChartPoint]) -> None:
+        # A plot given no point keeps drawing its last points, so a chart
+        # whose window holds no value shows that it waits for one instead:
+        # a gap is never drawn as a zero, nor as stale points.
+        if (has_points := bool(points)) != (chart.name in self._plotted_charts):
+            await self._show_chart(chart, has_points)
+
+        if has_points:
+            await update_node_dashboard_chart(chart.name, points)
+
+    async def _show_chart(self, chart: NodeDashboardChart, has_points: bool) -> None:
+        self._plotted_charts.symmetric_difference_update((chart.name,))
+        if has_points:
+            await self._terminal.set_component_active(chart_plot_name(chart.name))
+            return
+
+        # A section redraws only a component with an update: the waiting
+        # line is republished so it replaces the plot's last frame.
+        await self._terminal.set_component_active(chart_waiting_name(chart.name))
+        await update_node_dashboard_chart_waiting(chart.name, chart_waiting_text(chart))
 
     async def _publish_changed(self, panel_name: str, publish: PanelPublisher, content: PanelContent) -> None:
         # Only changed panels are published: an unchanged sample costs no
