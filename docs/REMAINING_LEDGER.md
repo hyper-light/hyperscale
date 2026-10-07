@@ -37,18 +37,18 @@ D-83/84), and AD-44 late results / `RETRY_BUDGET_DEFAULT` (P-AD44-1, A3-G-50).
 1. **D-95: CLOSED.** `NodeWAL` used to cut at the first corrupt frame anywhere in the file. It now accepts only a torn tail and otherwise refuses to start with `WALUntrustworthyError` (AD-38 Part 3.2). The same change closed a length-field gap in `RaftStoreCodec`, which had silently truncated acknowledged records after a mid-file frame whose length was damaged.
 2. ~~**A2-G-266: the gate takeover replica (`GateJobReplica`) is not persisted before its prepare-ack.**~~ BUILT.
    Every prepare, commit, abort rollback and reap of a job's replica is written to the gate's Raft store (`KeyedStateRecord`, versioned, identity-stamped) before the ack that depends on it, and recovered at gate start before any replica RPC (`replication_coordinator.py` `recover_durable_replicas`). It stays a two-phase commit, not a Raft group: AD-40 key exclusivity spans jobs. `docs/architecture.md:148` corrected. Tests: `tests/unit/distributed/gate/test_gate_replica_durability.py`, `tests/unit/simulation/sim/test_multiprocess_gate_replica_durability.py`.
-3. **D-70 (new): the client ignores `JobAck.retry_after_seconds`.**
-   Gate shed and replication-quorum hints (Phase 3) never reach the backoff. `nodes/client/submission.py:401,442` uses a literal 0.5 s doubling; only `RateLimitResponse` hints are honored (`:523`). Size S.
+3. ~~**D-70: the client ignores `JobAck.retry_after_seconds`.**~~ BUILT (b56858c2, 10a82097).
+   `ClientJobSubmitter._backoff_before_retry` waits out every hinted refusal, the last one included, jittered upward; un-hinted refusals back off from the Env base. Tests: `tests/unit/distributed/client/test_client_retry_hints.py`, `test_multiprocess_rejection_storm.py`.
 4. **R-G59 / R-G63 / AD-27-1 / D-84: thin servers.**
    The files grew during the complexity splits: manager `server.py` 14,604 lines, gate 10,102, `HealthAwareServer` 7,601. Phase 8's move into composed domains has not started. Size L.
 5. **R-G60 / D-83: complexity ≤ 3.**
    About 1,567 functions are over the ceiling, 245 of them in `distributed/`. The ratchet holds the line. Size L.
-6. **AD-26-2: the H8 outcome posterior is learned and gossiped but never read.**
-   `alpha_budget()` has zero callers; the witness uses the fixed `alpha_system` (`health/progress_witness/throughput_witness.py:334`). The plan marks AD-26-2 done, but only H5/H6 are live. Size M.
+6. ~~**AD-26-2: the H8 outcome posterior is learned and gossiped but never read.**~~ BUILT (9b29a188).
+   `alpha_budget` weights H6's α by the class's failure posterior; a K-S test at that α confirms a BOCPD change point before a deny; the H6 witness is fed per-interval rates from progress reports. See the AD26-2 entry below.
 7. **P-AD44-1 / A3-G-50: late datacenter results are acked silently after the job completes.**
    There is no policy, no `LateDatacenterResult` log, and none of the AD-44 metrics or logs. `RETRY_BUDGET_DEFAULT` is 10 against the doc's 20; both are still under "Needs you". Size S.
-8. **AD-24-1: the nodes ignore Env `RATE_LIMIT_*` and `get_rate_limit_config()`.**
-   The limits come from `AdaptiveRateLimitConfig` defaults. This is on the plan's "Needs you" list and needs measurement against the storm SIM. Size M.
+8. ~~**AD-24-1: the nodes ignore Env `RATE_LIMIT_*` and `get_rate_limit_config()`.**~~ BUILT (864f4fda).
+   `AdaptiveRateLimitConfig.from_env` derives every limit from the node's Env (`reliability/rate_limit_derivation.py`); the hand-set `RateLimitConfig` and the unused client-side `CooperativeRateLimiter` are deleted (925b345c).
 9. **Unmeasured performance claims (P-AD52-3, A2-G-264/258/247, R-G3/35/39).**
    There is no `tests/benchmarks/` and no throughput/RSS, ingest, spike, AD-38 latency, AD-52 §16 or 5000× probe. AD-36's "< 10 s reroute" has no test (the DC-loss bound is 30 s). Size M.
 10. **D-42 / D-13: nightly CI and continuous invariants.**
@@ -67,7 +67,7 @@ Note: none of AD_1/7/9/11/16/24/28/32.md has changed since 2026-01 (git log), so
 - Closed: the H5 evaluator composes the H6 α with the class posterior via `HierarchicalAlphaTuner.alpha_budget(class, alpha_H6, floor, ceiling)` (p-value weighting, AD_26.md §H8a). The witness confirms a BOCPD change point with K-S at that level, fed each workflow's own progress rate (§H6 "Feed"). Outcomes count once per workflow (`AppliedOutcomeWindow`).
 - Proof: tests/unit/distributed/health/test_outcome_weighted_alpha.py (learned outcomes flip a decision) and test_throughput_witness_feed.py (a collapse is denied at the controlled α; false denials stay within that α). Both fail when the wiring or the feed is removed.
 
-#### AD24-1 — Rate-limit Env settings are dead; doc still describes token buckets — STILL PARTIAL — size M (limits pinned by the storm SIM; measure first)
+#### AD24-1 — Rate-limit Env settings are dead; doc still describes token buckets — CLOSED 2026-10-06 (864f4fda, 925b345c): limits derived from Env by `AdaptiveRateLimitConfig.from_env` (`reliability/rate_limit_derivation.py`); the dead fields, both getters, `RateLimitConfig` and the client-side `CooperativeRateLimiter` are deleted; AD_24.md rewritten
 - Doc: docs/architecture/AD_24.md:9-46 "token bucket rate limiting … `class TokenBucket`"; Env `RATE_LIMIT_DEFAULT_BUCKET_SIZE`/`REFILL_RATE`.
 - Exists: live server-authoritative per-op `SlidingWindowCounter` limiter with 429 + Retry-After (reliability/rate_limiting.py; wired manager/server.py:761, gate/server.py:448). `TokenBucket` deleted (plan Phase 6). Tests: tests/unit/distributed/reliability/test_rate_limiting*.py.
 - Missing: `Env.get_rate_limit_config()` (env/env.py:1560) and `get_rate_limit_retry_config()` (:1574) have zero callers. So `RATE_LIMIT_DEFAULT_BUCKET_SIZE`, `RATE_LIMIT_DEFAULT_REFILL_RATE`, `RATE_LIMIT_CLEANUP_INTERVAL`, `RATE_LIMIT_MAX_RETRIES`, `RATE_LIMIT_MAX_TOTAL_WAIT` and `RATE_LIMIT_BACKOFF_MULTIPLIER` (env.py:735-743) are unread, and the per-op table is `AdaptiveRateLimitConfig`'s built-in default. This is plan "Needs you" item "AD-24 limits", still open. The doc's token-bucket design is doc-obsolete, because the sliding window is the live algorithm.
@@ -94,7 +94,7 @@ Note: none of AD_1/7/9/11/16/24/28/32.md has changed since 2026-01 (git log), so
 
 ### New gaps found
 - Dead Env fields from AD-32: `OUTGOING_OVERFLOW_SIZE` and `OUTGOING_MAX_DESTINATIONS` (env/env.py:1035-1038) and `Env.get_outgoing_queue_config()` (:1788) have zero consumers since D10 chose semaphores. Delete them, or the "all settings are real Env fields" rule is violated. Size S.
-- Dead rate-limit Env surface (six fields + two getters, env.py:735-743, :1560-1590); see AD24-1.
+- (Closed) Dead rate-limit Env surface removed; see AD24-1.
 - `ManagerDiscoveryCoordinator` is a constructed-but-unfed object (built-but-unwired pattern), nodes/manager/discovery.py; see AD28-1.
 - The in-code docstrings of datacenters/datacenter_health_manager.py:8,179 contradict its own BUSY-on-zero-workers behaviour (:259).
 
@@ -511,7 +511,7 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - Exists: logger models in `hyperscale/logging/hyperscale_logging_models.py`; `cluster --metrics` on manager (`nodes/manager/server.py:14549`) and gate (`nodes/gate/server.py:9994`), client reader `nodes/client/client.py:664`.
 - Missing: one schema across roles — workers expose no `cluster_metrics`; manager's handler is membership-only (`server.py:14557` delegates to `_cluster_membership.handle_metrics`); no shared event contract module.
 
-#### D-70 — End-to-end backpressure: client honors gate shed hint — STILL PARTIAL — size S
+#### D-70 — End-to-end backpressure: client honors gate shed hint — CLOSED 2026-10-06 (b56858c2, 10a82097): every hinted refusal is waited out, the final one included
 - Doc: improvements.md:21 "client also adapts to gate backpressure."
 - Exists: gate shed returns `JobAck(retry_after_seconds=OVERLOAD_SAMPLE_INTERVAL_SECONDS)` (`nodes/gate/handlers/tcp_job.py:393-400`); client honors `RateLimitResponse.retry_after_seconds` (`nodes/client/submission.py:522-524`).
 - Missing: the client never reads `JobAck.retry_after_seconds` — a shed ack goes through `_rejection_outcome` (`submission.py:630`) and the retry loop sleeps its own exponential backoff from a literal `retry_base_delay = 0.5` (`submission.py:401`, `:433-444`). The gate's hint (and the replication-quorum hint) is dropped. NEW gap (Plan Phase 3 "Gate backpressure → client" built only the sending half).
@@ -571,7 +571,7 @@ Counts: old P/A 25/7 → Built 11 · Doc-obsolete 1 · Still Partial 15 · Still
 - D-94 SCENARIOS §9 adversarial messages — Built: replay `tests/unit/distributed/protocol/test_frame_replay_protection.py`; malformed pickle `tests/unit/distributed/messaging/test_restricted_unpickler_vopr.py`; mTLS claims `tests/unit/distributed/discovery/test_mtls_strict_claims.py`; oversized/malformed frames `tests/unit/distributed/protocol/test_frame_decoding_vopr.py`; wrong cluster `tests/unit/simulation/sim/test_cluster_mismatch_vopr.py`; versions (D-79).
 
 ### New gaps found
-- Client drops `JobAck.retry_after_seconds` (gate overload shed and replication-quorum hints) and backs off from a literal 0.5 s (`nodes/client/submission.py:401,630`) — see D-70.
+- (Closed) Client honors `JobAck.retry_after_seconds`; see D-70.
 - (Closed) Job `NodeWAL` mid-file corruption now refuses to start; see D-95.
 - Harness drops cleanup errors and a pending invariant violation when the test body already raised (`tests/simulation/harness/cluster_harness.py:166-170`) — see D-9.
 - Nightly CI `vopr` job runs only the default 4-seed sweep and never the soak (`.github/workflows/ci.yml:129`) — see D-42.
