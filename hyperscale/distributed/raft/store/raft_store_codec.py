@@ -19,6 +19,8 @@ from .models import (
     GroupCreatedRecord,
     GroupReleasedRecord,
     HardStateRecord,
+    KeyedStateRecord,
+    KeyedStateReleasedRecord,
     RaftStoreHeader,
     RecoveredRaftGroup,
     SnapshotRecord,
@@ -34,7 +36,14 @@ RaftStoreRecord = (
     | TruncateFromRecord
     | SnapshotRecord
     | GroupReleasedRecord
+    | KeyedStateRecord
+    | KeyedStateReleasedRecord
 )
+
+# A keyed state's latest record by (namespace, key): its state, or the
+# release that ended it -- kept so a lower version written after it
+# (writes reach the disk out of order) never revives it.
+RecoveredKeyedStates = dict[tuple[str, str], KeyedStateRecord | KeyedStateReleasedRecord]
 
 STORE_FORMAT_VERSION = 1
 FRAME_HEADER = struct.Struct(">II")
@@ -61,8 +70,11 @@ class RaftStoreCodec:
             frames += body
         return bytes(frames)
 
-    def replay(self, data: bytes, stamp: bytes) -> tuple[dict[str, RecoveredRaftGroup], int]:
-        """Each unreleased group's state, and how many leading bytes of
+    def replay(
+        self, data: bytes, stamp: bytes
+    ) -> tuple[dict[str, RecoveredRaftGroup], RecoveredKeyedStates, int]:
+        """Each unreleased group's state, each keyed state's latest record,
+        and how many leading bytes of
         ``data`` hold whole records -- fewer than ``len(data)`` only when
         the last frame was torn by a power loss (it was never fsynced, so
         never acknowledged). A zero-filled tail counts as torn: a file
@@ -74,15 +86,16 @@ class RaftStoreCodec:
                 breaks Raft's invariants.
         """
         groups: dict[str, RecoveredRaftGroup] = {}
+        states: RecoveredKeyedStates = {}
         offset = 0
         while (whole_record := self._read_whole_record(data, offset)) is not None:
             frame_end, record = whole_record
-            self._replay_record(groups, record, offset, stamp)
+            self._replay_record(groups, states, record, offset, stamp)
             offset = frame_end
         if offset == 0:
             # The header is written whole, before the identity, at creation.
             raise RaftStoreUntrustworthyError("the store's header is missing or damaged")
-        return groups, offset
+        return groups, states, offset
 
     def _read_whole_record(self, data: bytes, offset: int) -> tuple[int, RaftStoreRecord] | None:
         """The record framed at ``offset`` and the byte its frame ends at,
@@ -184,14 +197,43 @@ class RaftStoreCodec:
             ) from decode_error
 
     def _replay_record(
-        self, groups: dict[str, RecoveredRaftGroup], record: RaftStoreRecord, offset: int, stamp: bytes
+        self,
+        groups: dict[str, RecoveredRaftGroup],
+        states: RecoveredKeyedStates,
+        record: RaftStoreRecord,
+        offset: int,
+        stamp: bytes,
     ) -> None:
-        """Replays one record into ``groups``: the first must be this
-        identity's header, every later one a group record."""
+        """Replays one record into ``groups`` or ``states``: the first must
+        be this identity's header, every later one a group or keyed-state
+        record."""
         if offset == 0:
             self._check_header(record, stamp)
             return
+        if isinstance(record, (KeyedStateRecord, KeyedStateReleasedRecord)):
+            self._replay_keyed_state(states, record, offset)
+            return
         self._RECORD_REPLAYERS[type(record)](self, groups, record, offset)
+
+    @staticmethod
+    def _replay_keyed_state(
+        states: RecoveredKeyedStates,
+        record: KeyedStateRecord | KeyedStateReleasedRecord,
+        offset: int,
+    ) -> None:
+        """Keeps the key's highest version: a lower one reached the disk
+        after it (out of order) and is already superseded. A version is
+        written once, so a repeated one is not this store's writing."""
+        state_key = (record.namespace, record.key)
+        # Versions start at 1: a key not yet held stands at 0.
+        held_version = getattr(states.get(state_key), "version", 0)
+        if record.version == held_version:
+            raise RaftStoreUntrustworthyError(
+                f"keyed state {record.namespace}/{record.key} wrote version {record.version} twice, "
+                f"or version 0 (byte {offset})"
+            )
+        if record.version > held_version:
+            states[state_key] = record
 
     @staticmethod
     def _check_header(record: RaftStoreRecord, stamp: bytes) -> None:
@@ -353,11 +395,14 @@ class RaftStoreCodec:
         raise RaftStoreUntrustworthyError(f"a second header at byte {offset}")
 
     def materialize(
-        self, groups: dict[str, RecoveredRaftGroup], stamp: bytes
-    ) -> tuple[bytes, dict[str, int], dict[str, int]]:
-        """The store holding exactly ``groups`` -- header, then per group
-        (in id order) its hard state, snapshot and entries -- with each
-        group's bytes and, of those, its hard state's."""
+        self, groups: dict[str, RecoveredRaftGroup], states: RecoveredKeyedStates, stamp: bytes
+    ) -> tuple[bytes, dict[str, int], dict[str, int], dict[tuple[str, str], int]]:
+        """The store holding exactly ``groups`` and the held keyed states
+        -- header, then per group (in id order) its hard state, snapshot
+        and entries, then each held state (in key order) -- with each
+        group's bytes and, of those, its hard state's, and each held
+        state's bytes. A released state is dropped: no record of its key
+        is left for a later version to lose to."""
         frames = bytearray(self.encode_frames([RaftStoreHeader(stamp=stamp, format_version=STORE_FORMAT_VERSION)]))
         group_bytes: dict[str, int] = {}
         hard_state_bytes: dict[str, int] = {}
@@ -366,7 +411,20 @@ class RaftStoreCodec:
             frames += group_frames
             group_bytes[group_id] = len(group_frames)
             hard_state_bytes[group_id] = len(hard_state_frame)
-        return bytes(frames), group_bytes, hard_state_bytes
+        state_frames, state_bytes = self._materialize_states(states)
+        frames += state_frames
+        return bytes(frames), group_bytes, hard_state_bytes, state_bytes
+
+    def _materialize_states(self, states: RecoveredKeyedStates) -> tuple[bytes, dict[tuple[str, str], int]]:
+        """Each held keyed state's frame (in key order), and its bytes."""
+        frames = bytearray()
+        state_bytes: dict[tuple[str, str], int] = {}
+        for state_key in sorted(states):
+            if isinstance(held := states[state_key], KeyedStateRecord):
+                state_frame = self.encode_frames([held])
+                frames += state_frame
+                state_bytes[state_key] = len(state_frame)
+        return bytes(frames), state_bytes
 
     def _materialize_group(self, group_id: str, group: RecoveredRaftGroup) -> tuple[bytes, bytes]:
         """One group's frames -- created, hard state, snapshot (if any),

@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from typing import Protocol
 
-from .models import RecoveredRaftGroup
+from .models import KeyedStateRecord, KeyedStateReleasedRecord, RecoveredRaftGroup
 from .raft_store_codec import RaftStoreRecord
 
 
@@ -13,7 +13,9 @@ class RaftStorage(Protocol):
     ``participation`` is how many times this node has left a membership
     group for good; ``advance_participation`` makes the next one durable
     before the node takes part again. ``take_recovered_groups`` hands each
-    group the disk held to the coordinator that resumes it, once."""
+    group the disk held to the coordinator that resumes it, once;
+    ``take_recovered_states`` does the same for a namespace's keyed states
+    (consensus state kept beside the groups under the same identity)."""
 
     @property
     def durable(self) -> bool: ...
@@ -26,3 +28,5 @@ class RaftStorage(Protocol):
     async def advance_participation(self) -> int: ...
 
     def take_recovered_groups(self, belongs: Callable[[str], bool]) -> dict[str, RecoveredRaftGroup]: ...
+
+    def take_recovered_states(self, namespace: str) -> dict[str, KeyedStateRecord | KeyedStateReleasedRecord]: ...

@@ -2,6 +2,8 @@ from .entries_record import EntriesRecord as EntriesRecord
 from .group_created_record import GroupCreatedRecord as GroupCreatedRecord
 from .group_released_record import GroupReleasedRecord as GroupReleasedRecord
 from .hard_state_record import HardStateRecord as HardStateRecord
+from .keyed_state_record import KeyedStateRecord as KeyedStateRecord
+from .keyed_state_released_record import KeyedStateReleasedRecord as KeyedStateReleasedRecord
 from .raft_identity import RaftIdentity as RaftIdentity
 from .raft_store_header import RaftStoreHeader as RaftStoreHeader
 from .raft_store_recovery import RaftStoreRecovery as RaftStoreRecovery

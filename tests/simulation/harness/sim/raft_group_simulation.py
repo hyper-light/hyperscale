@@ -568,7 +568,7 @@ class RaftGroupSimulation:
         if identity_bytes is None or store_bytes is None:
             return None
         identity = msgspec.msgpack.decode(identity_bytes, type=RaftIdentity)
-        groups, _whole_length = self._codec.replay(store_bytes, identity.stamp)
+        groups, _states, _whole_length = self._codec.replay(store_bytes, identity.stamp)
         return identity.node_id_full, groups.get(JOB_ID, RecoveredRaftGroup())
 
     # ------------------------------------------------------------------

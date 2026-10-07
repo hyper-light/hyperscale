@@ -26,13 +26,21 @@ from hyperscale.logging.hyperscale_logging_models import (
 from .models import (
     GroupReleasedRecord,
     HardStateRecord,
+    KeyedStateRecord,
+    KeyedStateReleasedRecord,
     RaftIdentity,
     RaftStoreHeader,
     RaftStoreRecovery,
     RecoveredRaftGroup,
     SnapshotRecord,
 )
-from .raft_store_codec import FRAME_HEADER, STORE_FORMAT_VERSION, RaftStoreCodec, RaftStoreRecord
+from .raft_store_codec import (
+    FRAME_HEADER,
+    STORE_FORMAT_VERSION,
+    RaftStoreCodec,
+    RaftStoreRecord,
+    RecoveredKeyedStates,
+)
 from .raft_store_untrustworthy_error import RaftStoreUntrustworthyError
 
 IDENTITY_FORMAT_VERSION = 1
@@ -71,11 +79,13 @@ class RaftStore:
         "_identity",
         "_group_bytes",
         "_hard_state_bytes",
+        "_state_bytes",
         "_live_bytes",
         "_dead_bytes",
         "_compaction_token",
         "_closed",
         "_recovered_groups",
+        "_recovered_states",
     )
 
     def __init__(
@@ -118,12 +128,16 @@ class RaftStore:
         # entries are not subtracted) and exact after each.
         self._group_bytes: dict[str, int] = {}
         self._hard_state_bytes: dict[str, int] = {}
+        # Bytes of each held keyed state's latest record.
+        self._state_bytes: dict[tuple[str, str], int] = {}
         self._live_bytes = 0
         self._dead_bytes = 0
         self._compaction_token: str | None = None
         self._closed = False
         # Groups the disk held, until their coordinators take them.
         self._recovered_groups: dict[str, RecoveredRaftGroup] = {}
+        # Keyed states the disk held, until their owners take them.
+        self._recovered_states: RecoveredKeyedStates = {}
 
     @property
     def identity(self) -> RaftIdentity:
@@ -150,6 +164,23 @@ class RaftStore:
         """The recovered groups ``belongs`` claims, still held here."""
         return {group_id: group for group_id, group in self._recovered_groups.items() if belongs(group_id)}
 
+    def take_recovered_states(self, namespace: str) -> dict[str, KeyedStateRecord | KeyedStateReleasedRecord]:
+        """Each key of ``namespace`` the disk held -- its state, or the
+        release that ended it, whose version the owner's next write must
+        exceed -- handed over once."""
+        taken = self._claimed_recovered_states(namespace)
+        for key in taken:
+            del self._recovered_states[(namespace, key)]
+        return taken
+
+    def _claimed_recovered_states(self, namespace: str) -> dict[str, KeyedStateRecord | KeyedStateReleasedRecord]:
+        """The recovered keyed states of ``namespace``, still held here."""
+        return {
+            key: record
+            for (record_namespace, key), record in self._recovered_states.items()
+            if record_namespace == namespace
+        }
+
     @property
     def path(self) -> Path:
         return self._directory / STORE_FILE_NAME
@@ -163,11 +194,12 @@ class RaftStore:
         identity_path = self._directory / IDENTITY_FILE_NAME
         store_path = self.path
         await self._filesystem.mkdir(self._directory, parents=True, exist_ok=True)
-        groups, torn_bytes, set_aside_reason, resumed = await self._recover_or_make_identity(
+        groups, states, torn_bytes, set_aside_reason, resumed = await self._recover_or_make_identity(
             identity_path, store_path, fresh_node_id_full, is_this_node
         )
-        await self._start_writer(store_path, groups, resumed, torn_bytes)
+        await self._start_writer(store_path, groups, states, resumed, torn_bytes)
         self._recovered_groups = dict(groups)
+        self._recovered_states = dict(states)
         return RaftStoreRecovery(
             identity=self.identity,
             groups=groups,
@@ -181,12 +213,12 @@ class RaftStore:
         store_path: Path,
         fresh_node_id_full: str,
         is_this_node: Callable[[str], bool],
-    ) -> tuple[dict[str, RecoveredRaftGroup], int, str | None, bool]:
+    ) -> tuple[dict[str, RecoveredRaftGroup], RecoveredKeyedStates, int, str | None, bool]:
         """Resume what the disk holds, else make a new identity (P5-P6):
         the groups, torn bytes dropped, set-aside reason and whether it
         resumed."""
         recovered = await self._recover_existing(identity_path, store_path, fresh_node_id_full, is_this_node)
-        if not recovered[3]:
+        if not recovered[4]:
             await self._make_identity(identity_path, store_path, fresh_node_id_full)
         return recovered
 
@@ -196,7 +228,7 @@ class RaftStore:
         store_path: Path,
         fresh_node_id_full: str,
         is_this_node: Callable[[str], bool],
-    ) -> tuple[dict[str, RecoveredRaftGroup], int, str | None, bool]:
+    ) -> tuple[dict[str, RecoveredRaftGroup], RecoveredKeyedStates, int, str | None, bool]:
         """Resume (or set aside) the store files the disk holds; nothing
         is recovered from a disk holding neither."""
         identity_exists = await self._filesystem.exists(identity_path)
@@ -205,7 +237,7 @@ class RaftStore:
             return await self._resume_or_set_aside(
                 identity_path, store_path, identity_exists, store_exists, fresh_node_id_full, is_this_node
             )
-        return {}, 0, None, False
+        return {}, {}, 0, None, False
 
     async def _resume_or_set_aside(
         self,
@@ -215,19 +247,19 @@ class RaftStore:
         store_exists: bool,
         fresh_node_id_full: str,
         is_this_node: Callable[[str], bool],
-    ) -> tuple[dict[str, RecoveredRaftGroup], int, str | None, bool]:
+    ) -> tuple[dict[str, RecoveredRaftGroup], RecoveredKeyedStates, int, str | None, bool]:
         """Resume the store, or set an untrustworthy one aside (P5-P6)."""
         # The bytes each verdict below is drawn from.
         verdict_reads: dict[Path, bytes] = {}
         try:
-            groups, torn_bytes = await self._resume(
+            groups, states, torn_bytes = await self._resume(
                 identity_path, store_path, identity_exists, store_exists, fresh_node_id_full, is_this_node, verdict_reads
             )
         except RaftStoreUntrustworthyError as untrustworthy:
             set_aside_reason = str(untrustworthy)
             await self._set_aside(set_aside_reason, fresh_node_id_full, verdict_reads)
-            return {}, 0, set_aside_reason, False
-        return groups, torn_bytes, None, True
+            return {}, {}, 0, set_aside_reason, False
+        return groups, states, torn_bytes, None, True
 
     async def _resume(
         self,
@@ -238,14 +270,15 @@ class RaftStore:
         fresh_node_id_full: str,
         is_this_node: Callable[[str], bool],
         verdict_reads: dict[Path, bytes],
-    ) -> tuple[dict[str, RecoveredRaftGroup], int]:
-        """Adopt the disk's identity and replay its store: the groups and
-        the torn bytes cut. Raises RaftStoreUntrustworthyError."""
+    ) -> tuple[dict[str, RecoveredRaftGroup], RecoveredKeyedStates, int]:
+        """Adopt the disk's identity and replay its store: the groups, the
+        keyed states and the torn bytes cut. Raises
+        RaftStoreUntrustworthyError."""
         self._require_paired_files(identity_exists, store_exists)
         identity = await self._read_identity(identity_path, fresh_node_id_full, is_this_node, verdict_reads)
-        groups, torn_bytes = await self._replay_store(store_path, identity.stamp, verdict_reads)
+        groups, states, torn_bytes = await self._replay_store(store_path, identity.stamp, verdict_reads)
         self._identity = identity
-        return groups, torn_bytes
+        return groups, states, torn_bytes
 
     @staticmethod
     def _require_paired_files(identity_exists: bool, store_exists: bool) -> None:
@@ -289,17 +322,17 @@ class RaftStore:
         store_path: Path,
         stamp: bytes,
         verdict_reads: dict[Path, bytes],
-    ) -> tuple[dict[str, RecoveredRaftGroup], int]:
-        """Replay the store's groups, cutting a torn tail: the groups and
-        the bytes cut."""
+    ) -> tuple[dict[str, RecoveredRaftGroup], RecoveredKeyedStates, int]:
+        """Replay the store's groups and keyed states, cutting a torn
+        tail: the groups, the states and the bytes cut."""
         store_data = verdict_reads[store_path] = await self._filesystem.read_bytes(store_path)
-        groups, whole_length = self._codec.replay(store_data, stamp)
+        groups, states, whole_length = self._codec.replay(store_data, stamp)
         if (torn_bytes := len(store_data) - whole_length) > 0:
             # Only when a second read agrees: a flipped read must
             # never cut an acknowledged record.
             await require_stable_read(self._filesystem, store_path, store_data)
             await self._filesystem.truncate(store_path, whole_length)
-        return groups, torn_bytes
+        return groups, states, torn_bytes
 
     async def _make_identity(self, identity_path: Path, store_path: Path, fresh_node_id_full: str) -> None:
         """Make a new store and identity under a fresh stamp (P4)."""
@@ -322,12 +355,15 @@ class RaftStore:
         self,
         store_path: Path,
         groups: dict[str, RecoveredRaftGroup],
+        states: RecoveredKeyedStates,
         resumed: bool,
         torn_bytes: int,
     ) -> None:
         """Count the store's live and dead bytes, start its group-commit
         writer and log the open."""
-        live_store, self._group_bytes, self._hard_state_bytes = self._codec.materialize(groups, self.identity.stamp)
+        live_store, self._group_bytes, self._hard_state_bytes, self._state_bytes = self._codec.materialize(
+            groups, states, self.identity.stamp
+        )
         self._live_bytes = len(live_store)
         self._dead_bytes = await self._filesystem.file_size(store_path) - self._live_bytes
         self._writer = WALWriter(
@@ -360,8 +396,9 @@ class RaftStore:
             Exception: the write did not become durable (the device failed,
                 the writer refused it, or the store is closed).
         """
+        # None until open, and again from the moment close begins.
         writer = self._writer
-        if writer is None or self._closed:
+        if writer is None:
             raise RuntimeError("the Raft store is not open")
         frames = bytearray()
         record_sizes: list[int] = []
@@ -395,11 +432,28 @@ class RaftStore:
                     self._hard_state_bytes.pop(group_id, None)
                     self._dead_bytes += released + record_size
                     self._live_bytes -= released
+                case KeyedStateRecord() | KeyedStateReleasedRecord():
+                    self._account_keyed_state(record, record_size)
                 case _:
                     group_bytes[record.group_id] = group_bytes.get(record.group_id, 0) + record_size
                     self._live_bytes += record_size
         if self._dead_bytes > self._live_bytes and self._compaction_token is None:
             self._compaction_token = self._task_runner.run(self.compact, alias="raft-store-compaction").token
+
+    def _account_keyed_state(self, record: KeyedStateRecord | KeyedStateReleasedRecord, record_size: int) -> None:
+        """Count a keyed-state record's bytes: its latest record holds all
+        of a state, so the one it supersedes -- or, released, the state's
+        last one and the release itself -- is dead."""
+        state_key = (record.namespace, record.key)
+        superseded = self._state_bytes.pop(state_key, 0)
+        self._dead_bytes += superseded
+        self._live_bytes -= superseded
+        match record:
+            case KeyedStateRecord():
+                self._state_bytes[state_key] = record_size
+                self._live_bytes += record_size
+            case KeyedStateReleasedRecord():
+                self._dead_bytes += record_size
 
     async def compact(self) -> None:
         """Rewrite the store with only what its live groups need (P10):
@@ -407,12 +461,12 @@ class RaftStore:
         store as it was, logged; the next compaction retries."""
         writer = self._writer
         stamp = self.identity.stamp
-        rewritten: list[tuple[int, dict[str, int], dict[str, int]]] = []
+        rewritten: list[tuple[int, dict[str, int], dict[str, int], dict[tuple[str, str], int]]] = []
 
         def live_only(committed: bytes) -> bytes:
-            groups, _whole_length = self._codec.replay(committed, stamp)
-            data, group_bytes, hard_state_bytes = self._codec.materialize(groups, stamp)
-            rewritten.append((len(data), group_bytes, hard_state_bytes))
+            groups, states, _whole_length = self._codec.replay(committed, stamp)
+            data, group_bytes, hard_state_bytes, state_bytes = self._codec.materialize(groups, states, stamp)
+            rewritten.append((len(data), group_bytes, hard_state_bytes, state_bytes))
             return data
 
         try:
@@ -430,7 +484,7 @@ class RaftStore:
                     )
                 )
                 return
-            ((self._live_bytes, self._group_bytes, self._hard_state_bytes),) = rewritten
+            ((self._live_bytes, self._group_bytes, self._hard_state_bytes, self._state_bytes),) = rewritten
             self._dead_bytes = 0
             await self._logger.log(
                 RaftStoreCompacted(
@@ -464,9 +518,12 @@ class RaftStore:
         if self._closed:
             return
         self._closed = True
+        # No write is accepted from here on: one is refused once the
+        # writer is gone.
+        writer, self._writer = self._writer, None
         await self._cancel_compaction()
-        if self._writer is not None:
-            await self._writer.stop()
+        if writer is not None:
+            await writer.stop()
 
     async def _set_aside(self, reason: str, node_id_full: str, verdict_reads: dict[Path, bytes]) -> None:
         """Copy this store's files, unread beyond what proved it

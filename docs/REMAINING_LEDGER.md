@@ -35,8 +35,8 @@ D-83/84), and AD-44 late results / `RETRY_BUDGET_DEFAULT` (P-AD44-1, A3-G-50).
 ### The ten most important remaining items
 
 1. **D-95: CLOSED.** `NodeWAL` used to cut at the first corrupt frame anywhere in the file. It now accepts only a torn tail and otherwise refuses to start with `WALUntrustworthyError` (AD-38 Part 3.2). The same change closed a length-field gap in `RaftStoreCodec`, which had silently truncated acknowledged records after a mid-file frame whose length was damaged.
-2. **A2-G-266: the gate takeover replica (`GateJobReplica`) is not persisted before its prepare-ack.**
-   It is an in-memory two-phase commit (`nodes/gate/replication_coordinator.py:167`), so it survives only while a gate majority stays up. `docs/architecture.md:148` and principle 4 wrongly say "through Raft". Size M.
+2. ~~**A2-G-266: the gate takeover replica (`GateJobReplica`) is not persisted before its prepare-ack.**~~ BUILT.
+   Every prepare, commit, abort rollback and reap of a job's replica is written to the gate's Raft store (`KeyedStateRecord`, versioned, identity-stamped) before the ack that depends on it, and recovered at gate start before any replica RPC (`replication_coordinator.py` `recover_durable_replicas`). It stays a two-phase commit, not a Raft group: AD-40 key exclusivity spans jobs. `docs/architecture.md:148` corrected. Tests: `tests/unit/distributed/gate/test_gate_replica_durability.py`, `tests/unit/simulation/sim/test_multiprocess_gate_replica_durability.py`.
 3. **D-70 (new): the client ignores `JobAck.retry_after_seconds`.**
    Gate shed and replication-quorum hints (Phase 3) never reach the backoff. `nodes/client/submission.py:401,442` uses a literal 0.5 s doubling; only `RateLimitResponse` hints are honored (`:523`). Size S.
 4. **R-G59 / R-G63 / AD-27-1 / D-84: thin servers.**
@@ -227,7 +227,7 @@ Counts: old P/A 25/10 → Built 14 · Doc-obsolete 17 · Still Partial 4 · Stil
 - Exists: all three legs live (see G-255/G-259 below); WAL bound by checkpoint cut (`ledger/job_ledger.py:1138` → `ledger/wal/node_wal.py:478 discard_through`), tested `tests/unit/distributed/ledger/test_wal_reclamation.py` ("log bounded after quiesce").
 - Missing: the latency, recovery-time and throughput numbers are unmeasured — D16 calls for probe scripts the user runs; none exist in the tree (no probe/bench file tracked outside `helm/`). "Zero job loss under any single failure" has no single test asserting it across tiers.
 
-#### A2-G-266 — Gate job replica: "durable before PrepareAck" — STILL PARTIAL — size M
+#### A2-G-266 — Gate job replica: "durable before PrepareAck" — BUILT (see the top list, item 2)
 - Doc: VSR write safety "SINGLE WRITER … SEQUENCED … FENCED … DURABLE: persisted before PrepareAck". (VSR itself is doc-obsolete — `docs/architecture.md:23278`; the properties still apply to the gate's takeover replica.)
 - Exists: 2PC quorum `nodes/gate/replication_coordinator.py:167-330`; versions are `(fence_token, sequence)`, older epochs REJECTED (`:21-29`, `:921-926`); leader prepares its own vote first (`:194-198`); prepared reaper wired (`nodes/gate/server.py:9324` → `:1328`); tests `tests/unit/distributed/gate/test_gate_replica_versions.py`, `test_gate_reaps_expired_prepared_replicas.py`.
 - Missing: prepared and committed replicas are in-memory only (`_prepared`, `_committed_replicas`; no WAL/store write in `replication_coordinator.py`), so "durably replicated to a quorum" (comment at `nodes/gate/handlers/tcp_job.py:1017-1019`) holds only while a quorum of gates stays up. `docs/architecture.md:148` says "every takeover commits a `GateJobReplica` **through Raft**" — false: it is the 2PC above (`raft/` has no reference to `GateJobReplica`). Either persist/route the replica through the gate Raft group or correct both comment and doc.

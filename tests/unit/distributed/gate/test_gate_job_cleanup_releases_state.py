@@ -59,7 +59,7 @@ def make_gate(state: GateRuntimeState, job_manager: GateJobManager) -> GateServe
     gate._task_runner = SimpleNamespace(run=lambda *args, **kwargs: None)
     gate._windowed_stats = SimpleNamespace(cleanup_job_windows=None)
     gate._job_router = SimpleNamespace(cleanup_job_state=lambda job_id: None)
-    gate._replication_coordinator = SimpleNamespace(clear_for_job=lambda job_id: None)
+    gate._replication_coordinator = SimpleNamespace(clear_for_job=AsyncMock())
     gate._job_failover_coordinator = SimpleNamespace(forgotten_job_ids=[])
     gate._job_failover_coordinator.forget_job = gate._job_failover_coordinator.forgotten_job_ids.append
     return gate

@@ -56,11 +56,31 @@ the wire ack the gate handlers serialize back over TCP.
 Asyncio safety: all mutation paths go through a single
 ``asyncio.Lock`` so concurrent prepares for the same job from
 overlapping submissions cannot race the prepared/committed registries.
+
+Durability (A2-G-266): every change to a job's prepared, committed or
+rollback state is written to the node's Raft store -- the identity-stamped,
+group-committed store that keeps its Raft groups (D1) -- as the job's whole
+state, and no ack, commit or abort that depends on it answers before that
+write is durable. A gate that acked a prepare and crashed would otherwise
+forget its vote (two gates could then each count it for a different job
+under one idempotency key), and a whole-tier restart would lose every
+replica. The state is versioned, not locked across the write: writes of
+different jobs group-commit together, and the store keeps each job's
+highest version, so one that reaches the disk late never overwrites a newer
+one. ``recover_durable_replicas`` rebuilds the registries at start, before
+the gate answers any replica RPC.
+
+Why not the job's Raft group: an idempotency key binds one job across
+jobs (AD-40), which per-job groups cannot decide -- only quorum
+intersection of these prepares can; and the committed replica is what
+founds the job's group (its voters), so the group cannot carry it.
 """
 
 import asyncio
 import dataclasses
 from typing import TYPE_CHECKING, Awaitable, Callable
+
+import msgspec
 
 from hyperscale.distributed.models import (
     GateJobReplica,
@@ -78,8 +98,14 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
 )
 
+from hyperscale.distributed.raft.store.models import KeyedStateRecord, KeyedStateReleasedRecord
+from hyperscale.distributed.raft.store.raft_storage import RaftStorage
 from hyperscale.distributed.runtime import Clock
 
+from .models import GateJobReplicaDurableState, GateJobReplicaRollback
+
+# The namespace of a gate's job replica states in its Raft store.
+GATE_JOB_REPLICA_NAMESPACE = "gate_job_replica"
 
 
 if TYPE_CHECKING:
@@ -112,6 +138,10 @@ class GateJobReplicationCoordinator:
         "_peer_rpc_timeout_seconds",
         "_attempted_sequences",
         "_revision_locks",
+        "_storage",
+        "_durable_version",
+        "_state_encoder",
+        "_state_decoder",
     )
 
     def __init__(
@@ -126,6 +156,7 @@ class GateJobReplicationCoordinator:
         apply_committed: Callable[[GateJobReplica], Awaitable[None]],
         drop_committed: Callable[[str], Awaitable[None]],
         clock: Clock,
+        storage: RaftStorage,
         prepared_ttl_seconds: float = 30.0,
         quorum_timeout_seconds: float = 5.0,
         peer_rpc_timeout_seconds: float = 5.0,
@@ -143,11 +174,11 @@ class GateJobReplicationCoordinator:
         self._committed_sequence: dict[str, int] = {}
         self._committed_replicas: dict[str, GateJobReplica] = {}
         self._committed_by_leader_addr: dict[tuple[str, int], set[str]] = {}
-        # (job_id, fence_token, sequence) of a commit -> the replica it
+        # job_id -> (fence_token, sequence) of a commit -> the replica it
         # replaced, restored if the commit is aborted.
         self._commit_rollback_replicas: dict[
-            tuple[str, int, int],
-            GateJobReplica | None,
+            str,
+            dict[tuple[int, int], GateJobReplica | None],
         ] = {}
         self._commit_rollback_expires_at: dict[tuple[str, int, int], float] = {}
         self._prepared_expires_at: dict[str, float] = {}
@@ -159,6 +190,12 @@ class GateJobReplicationCoordinator:
         self._attempted_sequences: dict[str, int] = {}
         # One revision (or takeover) of a job's replica at a time.
         self._revision_locks: dict[str, asyncio.Lock] = {}
+        # Where each job's state is kept (the node's Raft store), and the
+        # version its next write takes -- above every version on disk.
+        self._storage = storage
+        self._durable_version = 0
+        self._state_encoder = msgspec.msgpack.Encoder()
+        self._state_decoder = msgspec.msgpack.Decoder(GateJobReplicaDurableState)
 
     # ------------------------------------------------------------------
     # Leader-side entry point
@@ -239,9 +276,12 @@ class GateJobReplicationCoordinator:
         """Drop the leader's own prepare of this replica, unless another
         prepare replaced it."""
         async with self._lock:
-            if self._prepared.get(replica.job_id) is replica:
-                self._prepared.pop(replica.job_id, None)
-                self._prepared_expires_at.pop(replica.job_id, None)
+            if self._prepared.get(replica.job_id) is not replica:
+                return
+            self._prepared.pop(replica.job_id, None)
+            self._prepared_expires_at.pop(replica.job_id, None)
+            record = self._durable_record_locked(replica.job_id)
+        await self._storage.write([record])
 
     async def _prepare_on_peers(
         self,
@@ -813,17 +853,31 @@ class GateJobReplicationCoordinator:
             committed one or no commit exists yet.
         """
         async with self._lock:
-            if (verdict := self._committed_verdict_locked(replica)) is not None:
-                return verdict
+            if (status := self._prepare_status_locked(replica)) is GateJobReplicaStatus.REJECTED:
+                return status
+            # A vote -- or a commit it answers for -- is durable before
+            # it is counted.
+            record = self._durable_record_locked(replica.job_id)
 
-            if self._prepare_refused_locked(replica):
-                return GateJobReplicaStatus.REJECTED
+        await self._storage.write([record])
+        return status
 
-            self._prepared[replica.job_id] = replica
-            self._prepared_expires_at[replica.job_id] = (
-                self._clock.monotonic() + self._prepared_ttl_seconds
-            )
-            return GateJobReplicaStatus.PREPARED
+    def _prepare_status_locked(self, replica: GateJobReplica) -> GateJobReplicaStatus:
+        """Under the lock: the committed replica's answer to the prepare,
+        else REJECTED when it is refused, else PREPARED -- held."""
+        if (verdict := self._committed_verdict_locked(replica)) is not None:
+            return verdict
+        if self._prepare_refused_locked(replica):
+            return GateJobReplicaStatus.REJECTED
+        return self._hold_prepare_locked(replica)
+
+    def _hold_prepare_locked(self, replica: GateJobReplica) -> GateJobReplicaStatus:
+        """Under the lock: hold the replica as this gate's prepare of its job."""
+        self._prepared[replica.job_id] = replica
+        self._prepared_expires_at[replica.job_id] = (
+            self._clock.monotonic() + self._prepared_ttl_seconds
+        )
+        return GateJobReplicaStatus.PREPARED
 
     def _committed_verdict_locked(self, replica: GateJobReplica) -> GateJobReplicaStatus | None:
         """Under the lock: the answer the job's committed replica gives a
@@ -888,14 +942,26 @@ class GateJobReplicationCoordinator:
         immediately by ``commit``.
         """
         async with self._lock:
-            if (verdict := self._committed_verdict_locked(replica)) is not None:
-                return verdict
+            if (status := self._commit_status_locked(replica)) is GateJobReplicaStatus.REJECTED:
+                return status
+            # ALREADY_COMMITTED answers for a commit whose own write may
+            # still be in flight: it is written again, so the answer
+            # waits on it being durable.
+            record = self._durable_record_locked(replica.job_id)
 
-            self._prepared.pop(replica.job_id, None)
-            self._prepared_expires_at.pop(replica.job_id, None)
-            self._record_committed_locked(replica, track_rollback=True)
+        await self._storage.write([record])
+        if status is GateJobReplicaStatus.COMMITTED:
+            await self._apply_committed(replica)
+        return status
 
-        await self._apply_committed(replica)
+    def _commit_status_locked(self, replica: GateJobReplica) -> GateJobReplicaStatus:
+        """Under the lock: the committed replica's answer to the commit,
+        else COMMITTED -- recorded, its rollback kept."""
+        if (verdict := self._committed_verdict_locked(replica)) is not None:
+            return verdict
+        self._prepared.pop(replica.job_id, None)
+        self._prepared_expires_at.pop(replica.job_id, None)
+        self._record_committed_locked(replica, track_rollback=True)
         return GateJobReplicaStatus.COMMITTED
 
     async def _drop_prepared_or_committed(
@@ -905,17 +971,22 @@ class GateJobReplicationCoordinator:
         an abort of one epoch's revision must not take down another
         epoch's at the same sequence."""
         async with self._lock:
-            if self._is_version(self._prepared.get(job_id), fence_token, sequence):
-                self._prepared.pop(job_id, None)
-                self._prepared_expires_at.pop(job_id, None)
-
+            self._drop_prepared_version_locked(job_id, fence_token, sequence)
             restore_replica, drop_committed = self._roll_back_committed_locked(
                 job_id, fence_token, sequence
             )
+            record = self._durable_record_locked(job_id)
 
+        await self._storage.write([record])
         await self._publish_rollback(job_id, restore_replica, drop_committed)
 
         return GateJobReplicaStatus.ABORTED
+
+    def _drop_prepared_version_locked(self, job_id: str, fence_token: int, sequence: int) -> None:
+        """Under the lock: drop the job's prepare when it is of exactly this version."""
+        if self._is_version(self._prepared.get(job_id), fence_token, sequence):
+            self._prepared.pop(job_id, None)
+            self._prepared_expires_at.pop(job_id, None)
 
     @staticmethod
     def _is_version(replica: GateJobReplica | None, fence_token: int, sequence: int) -> bool:
@@ -937,13 +1008,12 @@ class GateJobReplicationCoordinator:
         if not self._is_version(self._committed_replicas.get(job_id), fence_token, sequence):
             return None, False
 
-        rollback_key = (job_id, fence_token, sequence)
-        has_rollback_record = rollback_key in self._commit_rollback_replicas
-        previous_replica = self._commit_rollback_replicas.pop(
-            rollback_key,
-            None,
-        )
-        self._commit_rollback_expires_at.pop(rollback_key, None)
+        job_rollbacks = self._commit_rollback_replicas.get(job_id, {})
+        has_rollback_record = (fence_token, sequence) in job_rollbacks
+        previous_replica = job_rollbacks.pop((fence_token, sequence), None)
+        if not job_rollbacks:
+            self._commit_rollback_replicas.pop(job_id, None)
+        self._commit_rollback_expires_at.pop((job_id, fence_token, sequence), None)
         return self._restore_previous_commit_locked(job_id, has_rollback_record, previous_replica)
 
     def _restore_previous_commit_locked(
@@ -985,7 +1055,9 @@ class GateJobReplicationCoordinator:
         async with self._lock:
             if not self._record_repair_locked(replica):
                 return False
+            record = self._durable_record_locked(replica.job_id)
 
+        await self._storage.write([record])
         await self._apply_committed(replica)
         return True
 
@@ -1021,9 +1093,10 @@ class GateJobReplicationCoordinator:
         """Record a committed replica and update the leader-address index."""
         previous = self._committed_replicas.get(replica.job_id)
         if track_rollback:
-            rollback_key = (replica.job_id, replica.fence_token, replica.sequence)
-            self._commit_rollback_replicas.setdefault(rollback_key, previous)
-            self._commit_rollback_expires_at[rollback_key] = (
+            self._commit_rollback_replicas.setdefault(replica.job_id, {}).setdefault(
+                (replica.fence_token, replica.sequence), previous
+            )
+            self._commit_rollback_expires_at[(replica.job_id, replica.fence_token, replica.sequence)] = (
                 self._clock.monotonic() + self._prepared_ttl_seconds
             )
 
@@ -1074,11 +1147,13 @@ class GateJobReplicationCoordinator:
     async def _apply_committed_with_tracking(
         self, replica: GateJobReplica
     ) -> None:
-        """Apply locally and record the committed sequence under the lock."""
+        """Record the commit under the lock, durably, then apply it locally."""
         async with self._lock:
             self._prepared.pop(replica.job_id, None)
             self._prepared_expires_at.pop(replica.job_id, None)
             self._record_committed_locked(replica, track_rollback=False)
+            record = self._durable_record_locked(replica.job_id)
+        await self._storage.write([record])
         await self._apply_committed(replica)
 
     # ------------------------------------------------------------------
@@ -1336,7 +1411,10 @@ class GateJobReplicationCoordinator:
         now = self._clock.monotonic()
         async with self._lock:
             reaped = self._reap_expired_prepared_locked(now)
-            self._reap_expired_rollbacks_locked(now)
+            changed_job_ids = set(reaped) | self._reap_expired_rollbacks_locked(now)
+            records = [self._durable_record_locked(job_id) for job_id in sorted(changed_job_ids)]
+        if records:
+            await self._storage.write(records)
         return len(reaped)
 
     def _reap_expired_prepared_locked(self, now: float) -> list[str]:
@@ -1350,14 +1428,26 @@ class GateJobReplicationCoordinator:
                 reaped.append(job_id)
         return reaped
 
-    def _reap_expired_rollbacks_locked(self, now: float) -> None:
-        """Under the lock: drop the commit rollback records expired at ``now``."""
+    def _reap_expired_rollbacks_locked(self, now: float) -> set[str]:
+        """Under the lock: drop the commit rollback records expired at
+        ``now``; returns the jobs they were kept for."""
+        reaped_job_ids: set[str] = set()
         for rollback_key, expires_at in list(
             self._commit_rollback_expires_at.items()
         ):
             if expires_at <= now:
-                self._commit_rollback_replicas.pop(rollback_key, None)
+                job_id, fence_token, sequence = rollback_key
                 self._commit_rollback_expires_at.pop(rollback_key, None)
+                self._drop_rollback_locked(job_id, fence_token, sequence)
+                reaped_job_ids.add(job_id)
+        return reaped_job_ids
+
+    def _drop_rollback_locked(self, job_id: str, fence_token: int, sequence: int) -> None:
+        """Under the lock: forget one commit's rollback record."""
+        job_rollbacks = self._commit_rollback_replicas.get(job_id, {})
+        job_rollbacks.pop((fence_token, sequence), None)
+        if not job_rollbacks:
+            self._commit_rollback_replicas.pop(job_id, None)
 
     def has_committed(self, job_id: str) -> bool:
         return job_id in self._committed_sequence
@@ -1365,24 +1455,106 @@ class GateJobReplicationCoordinator:
     def get_committed_sequence(self, job_id: str) -> int | None:
         return self._committed_sequence.get(job_id)
 
-    def clear_for_job(self, job_id: str) -> None:
-        """Drop all replication state for ``job_id`` (terminal cleanup)."""
-        self._prepared.pop(job_id, None)
-        self._prepared_expires_at.pop(job_id, None)
-        self._attempted_sequences.pop(job_id, None)
-        self._revision_locks.pop(job_id, None)
-        for rollback_key in self._job_rollback_keys(job_id):
-            self._commit_rollback_replicas.pop(rollback_key, None)
-            self._commit_rollback_expires_at.pop(rollback_key, None)
-        self._drop_committed_locked(job_id)
+    async def clear_for_job(self, job_id: str) -> None:
+        """Drop all replication state for ``job_id`` (terminal cleanup),
+        here and in the Raft store."""
+        async with self._lock:
+            self._prepared.pop(job_id, None)
+            self._prepared_expires_at.pop(job_id, None)
+            self._attempted_sequences.pop(job_id, None)
+            self._revision_locks.pop(job_id, None)
+            for fence_token, sequence in self._commit_rollback_replicas.pop(job_id, {}):
+                self._commit_rollback_expires_at.pop((job_id, fence_token, sequence), None)
+            self._drop_committed_locked(job_id)
+            record = self._durable_record_locked(job_id)
+        await self._storage.write([record])
 
-    def _job_rollback_keys(self, job_id: str) -> list[tuple[str, int, int]]:
-        """The commit rollback records kept for the job's commits."""
-        return [
-            rollback_key
-            for rollback_key in self._commit_rollback_replicas
-            if rollback_key[0] == job_id
-        ]
+    # ------------------------------------------------------------------
+    # Durability (A2-G-266)
+    # ------------------------------------------------------------------
+
+    def _durable_record_locked(self, job_id: str) -> KeyedStateRecord | KeyedStateReleasedRecord:
+        """Under the lock: the job's whole state as its next store record,
+        at the next version -- its release once it holds nothing."""
+        self._durable_version += 1
+        if self._holds_nothing_locked(job_id):
+            return KeyedStateReleasedRecord(
+                namespace=GATE_JOB_REPLICA_NAMESPACE, key=job_id, version=self._durable_version
+            )
+        return KeyedStateRecord(
+            namespace=GATE_JOB_REPLICA_NAMESPACE,
+            key=job_id,
+            version=self._durable_version,
+            state=self._state_encoder.encode(self._durable_state_locked(job_id)),
+        )
+
+    def _holds_nothing_locked(self, job_id: str) -> bool:
+        """Under the lock: whether the job has no prepare, commit or rollback here."""
+        return (
+            job_id not in self._prepared
+            and job_id not in self._committed_replicas
+            and job_id not in self._commit_rollback_replicas
+        )
+
+    def _durable_state_locked(self, job_id: str) -> GateJobReplicaDurableState:
+        """Under the lock: the job's two-phase-commit state as it is kept."""
+        return GateJobReplicaDurableState(
+            prepared=self._prepared.get(job_id),
+            committed=self._committed_replicas.get(job_id),
+            rollbacks=[
+                GateJobReplicaRollback(fence_token=fence_token, sequence=sequence, previous=previous)
+                for (fence_token, sequence), previous in self._commit_rollback_replicas.get(job_id, {}).items()
+            ],
+            attempted_sequence=self._attempted_sequences.get(job_id, 0),
+        )
+
+    def recover_durable_replicas(self) -> list[str]:
+        """Rebuild the registries from the job states the Raft store held,
+        once, at start -- before this gate answers any replica RPC: its
+        prepare votes, commits and their rollbacks, and the sequences it
+        sent as leader. A recovered prepare or rollback is kept a full TTL
+        from now (this process's clock began at start). Returns the jobs
+        holding a committed replica, for ``apply_recovered_replicas``.
+
+        Raises:
+            msgspec.DecodeError: a state this build cannot read -- written
+                whole (its checksum held), in another format.
+        """
+        now = self._clock.monotonic()
+        for job_id, record in sorted(self._storage.take_recovered_states(GATE_JOB_REPLICA_NAMESPACE).items()):
+            self._durable_version = max(self._durable_version, record.version)
+            if isinstance(record, KeyedStateRecord):
+                self._restore_durable_state(job_id, self._state_decoder.decode(record.state), now)
+        return sorted(self._committed_replicas)
+
+    def _restore_durable_state(self, job_id: str, state: GateJobReplicaDurableState, now: float) -> None:
+        """Put one recovered job state back in the registries."""
+        if state.prepared is not None:
+            self._hold_prepare_locked(state.prepared)
+        if state.committed is not None:
+            self._record_committed_locked(state.committed, track_rollback=False)
+        self._restore_sequence_and_rollbacks(job_id, state, now)
+
+    def _restore_sequence_and_rollbacks(self, job_id: str, state: GateJobReplicaDurableState, now: float) -> None:
+        """Put a recovered job's attempted sequence and rollbacks back."""
+        self._attempted_sequences[job_id] = state.attempted_sequence
+        for rollback in state.rollbacks:
+            self._commit_rollback_replicas.setdefault(job_id, {})[(rollback.fence_token, rollback.sequence)] = (
+                rollback.previous
+            )
+            self._commit_rollback_expires_at[(job_id, rollback.fence_token, rollback.sequence)] = (
+                now + self._prepared_ttl_seconds
+            )
+
+    async def apply_recovered_replicas(self, job_ids: list[str]) -> None:
+        """Apply each recovered job's committed replica to the gate's state
+        -- the one committed now, which a commit since start may have
+        replaced."""
+        for job_id in job_ids:
+            async with self._lock:
+                replica = self._committed_replicas.get(job_id)
+            if replica is not None:
+                await self._apply_committed(replica)
 
     def get_committed_replica(self, job_id: str) -> GateJobReplica | None:
         return self._committed_replicas.get(job_id)

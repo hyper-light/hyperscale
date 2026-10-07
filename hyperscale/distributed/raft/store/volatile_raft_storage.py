@@ -1,6 +1,6 @@
 from collections.abc import Callable
 
-from .models import RecoveredRaftGroup
+from .models import KeyedStateRecord, KeyedStateReleasedRecord, RecoveredRaftGroup
 from .raft_store_codec import RaftStoreRecord
 
 
@@ -30,4 +30,7 @@ class VolatileRaftStorage:
         return self._participation
 
     def take_recovered_groups(self, belongs: Callable[[str], bool]) -> dict[str, RecoveredRaftGroup]:
+        return {}
+
+    def take_recovered_states(self, namespace: str) -> dict[str, KeyedStateRecord | KeyedStateReleasedRecord]:
         return {}

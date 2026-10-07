@@ -1065,6 +1065,9 @@ class GateServer(HealthAwareServer):
             send_tcp=self._send_tcp,
             apply_committed=self._apply_committed_replica,
             drop_committed=self._drop_committed_replica,
+            # The job replicas' 2PC state is kept beside the node's Raft
+            # groups, under the same identity (A2-G-266).
+            storage=self._raft_storage,
             prepared_ttl_seconds=float(self.env.GATE_SWIM_GLOBAL_MAX_TIMEOUT) * 2.0,
             quorum_timeout_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
             peer_rpc_timeout_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
@@ -1325,6 +1328,11 @@ class GateServer(HealthAwareServer):
 
         await self._open_durable_tier()
 
+        # The job replicas this gate prepared or committed before a
+        # restart (A2-G-266): back in the registries before it answers
+        # any replica RPC, applied once its Raft groups are resumed.
+        recovered_replica_job_ids = self._replication_coordinator.recover_durable_replicas()
+
         # Set node_id on trackers
         self._job_leadership_tracker.node_id = self._node_id.full
         self._job_leadership_tracker.node_addr = (self._host, self._tcp_port)
@@ -1393,6 +1401,7 @@ class GateServer(HealthAwareServer):
         # handlers answer now that requests are accepted) and clock offset
         # probing.
         await self._raft.start()
+        await self._replication_coordinator.apply_recovered_replicas(recovered_replica_job_ids)
         await self._cluster_membership.start()
         self._task_runner.run(self._clock_offset_prober.run, alias="clock_offset_prober")
 
@@ -9261,7 +9270,7 @@ class GateServer(HealthAwareServer):
 
         self._modular_state.cleanup_job_progress_tracking(job_id)
         await self._modular_state.cleanup_job_update_state(job_id)
-        self._replication_coordinator.clear_for_job(job_id)
+        await self._replication_coordinator.clear_for_job(job_id)
         self._job_failover_coordinator.forget_job(job_id)
 
     def _release_job_results_locked(self, job_id: str) -> dict[str, str] | None:

@@ -391,7 +391,7 @@ async def assert_set_aside(filesystem: SimFilesystem, original: dict[str, bytes]
         assert await filesystem.read_bytes(set_aside_directory / name) == content
     # The store holds only the new identity's.
     store_data = await filesystem.read_bytes(STORE_DIRECTORY / "store.wal")
-    assert RaftStoreCodec().replay(store_data, recovery.identity.stamp) == ({}, len(store_data))
+    assert RaftStoreCodec().replay(store_data, recovery.identity.stamp) == ({}, {}, len(store_data))
 
 
 async def original_files(filesystem: SimFilesystem) -> dict[str, bytes]:
@@ -562,7 +562,7 @@ async def test_compaction_keeps_live_groups_and_drops_released_ones() -> None:
 
     recovery, _logger = await reopen(filesystem)
     assert set(recovery.groups) == {"job-0"} and recovery.groups["job-0"].entries == [entry("job-0", 1, 1)]
-    live_size = len(RaftStoreCodec().materialize(recovery.groups, recovery.identity.stamp)[0])
+    live_size = len(RaftStoreCodec().materialize(recovery.groups, {}, recovery.identity.stamp)[0])
     # Dead bytes never exceed live ones by more than the records written
     # since the last compaction.
     assert size_after <= 2 * live_size + 200, (size_after, live_size)

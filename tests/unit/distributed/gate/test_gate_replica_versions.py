@@ -40,6 +40,7 @@ from hyperscale.distributed.models.gate_replication import GateJobReplicaAck
 from hyperscale.distributed.nodes.gate.replication_coordinator import (
     GateJobReplicationCoordinator,
 )
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.runtime import RealClock
 
 JOB_ID = "job-1"
@@ -98,6 +99,7 @@ class GateTier:
             apply_committed=apply_committed,
             drop_committed=drop_committed,
             clock=RealClock(),
+            storage=VolatileRaftStorage(),
         )
 
     def peers_of(self, gate_id: str) -> list[tuple[str, int]]:

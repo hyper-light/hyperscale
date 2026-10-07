@@ -16,6 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from hyperscale.distributed.models import GateJobReplica
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.nodes.gate.replication_coordinator import GateJobReplicationCoordinator
 from hyperscale.distributed.nodes.gate.server import GateServer
@@ -35,7 +37,25 @@ def make_coordinator() -> GateJobReplicationCoordinator:
         send_tcp=None,
         apply_committed=None,
         drop_committed=None,
+        storage=VolatileRaftStorage(),
         prepared_ttl_seconds=LONG_TTL_SECONDS,
+    )
+
+
+def make_replica(job_id: str) -> GateJobReplica:
+    return GateJobReplica(
+        job_id=job_id,
+        sequence=1,
+        fence_token=1,
+        leader_id="gate-a",
+        leader_addr=("10.0.0.1", 9000),
+        origin_gate_addr=("10.0.0.1", 9000),
+        callback_addr=None,
+        target_dcs=["dc-a"],
+        target_dc_count=1,
+        status_seed="SUBMITTED",
+        submitted_wall_time=0.0,
+        raft_voters=["gate-a", "gate-b"],
     )
 
 
@@ -60,16 +80,17 @@ class OnePassGate:
 @pytest.mark.asyncio
 async def test_the_cleanup_loop_reaps_expired_prepared_and_rollback_entries() -> None:
     coordinator = make_coordinator()
-    coordinator._prepared[EXPIRED_JOB] = object()
+    coordinator._prepared[EXPIRED_JOB] = make_replica(EXPIRED_JOB)
     coordinator._prepared_expires_at[EXPIRED_JOB] = 0.0
-    # Rollback records are keyed by the commit's exact version.
-    coordinator._commit_rollback_replicas[(EXPIRED_JOB, 1, 1)] = None
+    # Rollback records are keyed by the job and the commit's exact version.
+    coordinator._commit_rollback_replicas[EXPIRED_JOB] = {(1, 1): None}
     coordinator._commit_rollback_expires_at[(EXPIRED_JOB, 1, 1)] = 0.0
-    await coordinator._record_prepare(SimpleNamespace(job_id=LIVE_JOB, fence_token=1, sequence=1, idempotency_key=""))
+    await coordinator._record_prepare(make_replica(LIVE_JOB))
     one_pass = OnePassGate(coordinator)
 
     await GateServer._job_cleanup_loop(one_pass.gate)
 
     assert EXPIRED_JOB not in coordinator._prepared
-    assert (EXPIRED_JOB, 1, 1) not in coordinator._commit_rollback_replicas
+    assert EXPIRED_JOB not in coordinator._commit_rollback_replicas
+    assert (EXPIRED_JOB, 1, 1) not in coordinator._commit_rollback_expires_at
     assert LIVE_JOB in coordinator._prepared, "an unexpired prepare is kept"
