@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hyperscale.logging import Logger
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.gate.datacenter_manager_selector import (
@@ -38,7 +39,8 @@ def _selector(heartbeats: dict) -> DatacenterManagerSelector:
                 node_role="gate",
                 static_seeds=[],
                 allow_dynamic_registration=True,
-            )
+            ),
+            Logger(),
         ),
         get_manager_heartbeats=lambda datacenter_id: heartbeats.get(datacenter_id, {}),
     )

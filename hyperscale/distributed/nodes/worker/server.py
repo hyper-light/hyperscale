@@ -208,29 +208,6 @@ class WorkerServer(HealthAwareServer):
             logger=None,
         )
 
-        # AD-28: Enhanced DNS Discovery. A worker started without seed
-        # managers is a valid, first-class topology: it boots standalone
-        # and waits for an operator join request (``hyperscale join``)
-        # naming the manager to register with. DiscoveryConfig refuses
-        # an empty seed list unless dynamic registration is allowed, so
-        # fall back to it in that case (the same solo-node pattern
-        # ManagerDiscovery and GateServer use); managers learned at
-        # runtime are added through ``DiscoveryService.add_peer``.
-        static_seeds: list[str] = [
-            f"{host}:{port}" for host, port in self._seed_managers
-        ]
-        discovery_config = env.get_discovery_config(
-            node_role="worker",
-            static_seeds=static_seeds,
-            allow_dynamic_registration=not static_seeds,
-        )
-        self._discovery_service: DiscoveryService = DiscoveryService(discovery_config)
-
-        self._discovery_manager: WorkerDiscoveryManager = WorkerDiscoveryManager(
-            discovery_service=self._discovery_service,
-            logger=None,
-        )
-
         # New modular components. The Phase 6 SIM seams flow through the
         # lifecycle manager to the pool leader (``RemoteGraphManager`` ->
         # ``RemoteGraphController``) and the executor pool
@@ -403,6 +380,30 @@ class WorkerServer(HealthAwareServer):
             random_source=random_source,
             transport_factory=transport_factory,
             incarnation_storage_dir=incarnation_storage_dir,
+        )
+
+        # AD-28: Enhanced DNS Discovery. A worker started without seed
+        # managers is a valid, first-class topology: it boots standalone
+        # and waits for an operator join request (``hyperscale join``)
+        # naming the manager to register with. DiscoveryConfig refuses
+        # an empty seed list unless dynamic registration is allowed, so
+        # fall back to it in that case (the same solo-node pattern
+        # GateServer uses); managers learned at
+        # runtime are added through ``DiscoveryService.add_peer``. Built
+        # after the parent init, which creates the logger it reports to.
+        static_seeds: list[str] = [
+            f"{host}:{port}" for host, port in self._seed_managers
+        ]
+        discovery_config = env.get_discovery_config(
+            node_role="worker",
+            static_seeds=static_seeds,
+            allow_dynamic_registration=not static_seeds,
+        )
+        self._discovery_service: DiscoveryService = DiscoveryService(discovery_config, self._udp_logger)
+
+        self._discovery_manager: WorkerDiscoveryManager = WorkerDiscoveryManager(
+            discovery_service=self._discovery_service,
+            logger=self._udp_logger,
         )
 
         # Initialize components that need discovery service
@@ -586,7 +587,6 @@ class WorkerServer(HealthAwareServer):
         self._registry._logger = self._udp_logger
         self._backpressure_manager._logger = self._udp_logger
         self._health_integration._logger = self._udp_logger
-        self._discovery_manager._logger = self._udp_logger
         self._lifecycle_manager._logger = self._udp_logger
 
     @property

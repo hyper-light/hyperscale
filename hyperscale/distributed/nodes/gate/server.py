@@ -743,7 +743,8 @@ class GateServer(HealthAwareServer):
                     node_role="gate",
                     static_seeds=[],
                     allow_dynamic_registration=True,
-                )
+                ),
+                self._udp_logger,
             ),
             get_manager_heartbeats=self._modular_state.get_datacenter_manager_statuses,
         )
@@ -841,14 +842,14 @@ class GateServer(HealthAwareServer):
         # single-gate L3 deployments and the SIM scenarios — but
         # DiscoveryConfig refuses an empty seed list unless dynamic
         # registration is allowed, so fall back to it in that case
-        # (the same solo-node pattern ManagerDiscovery uses).
+        # (the same solo-node pattern the worker uses).
         peer_static_seeds = [f"{host}:{port}" for host, port in self._gate_peers]
         peer_discovery_config = env.get_discovery_config(
             node_role="gate",
             static_seeds=peer_static_seeds,
             allow_dynamic_registration=not peer_static_seeds,
         )
-        self._peer_discovery = DiscoveryService(peer_discovery_config)
+        self._peer_discovery = DiscoveryService(peer_discovery_config, self._udp_logger)
         for host, port in self._gate_peers:
             self._peer_discovery.add_peer(
                 peer_id=f"{host}:{port}",

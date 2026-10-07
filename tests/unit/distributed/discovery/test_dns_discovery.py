@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 
+from hyperscale.logging import Logger
 from hyperscale.distributed.discovery import (
     DiscoveryConfig,
     DiscoveryService,
@@ -311,7 +312,7 @@ def create_discovery_with_mock_resolver(
         datacenter_id=datacenter_id,
     )
 
-    service = DiscoveryService(config=config)
+    service = DiscoveryService(config=config, logger=Logger())
     # Inject mock resolver
     service._resolver = mock_resolver  # type: ignore
 

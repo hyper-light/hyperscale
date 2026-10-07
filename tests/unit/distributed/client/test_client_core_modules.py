@@ -19,6 +19,7 @@ from unittest.mock import Mock, AsyncMock
 
 import pytest
 
+from hyperscale.logging import Logger
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
@@ -36,7 +37,8 @@ def make_client_discovery() -> DiscoveryService:
             node_role="client",
             static_seeds=[],
             allow_dynamic_registration=True,
-        )
+        ),
+        Logger(),
     )
 
 

@@ -208,7 +208,8 @@ class HyperscaleClient(MercurySyncBaseServer):
                     node_role="client",
                     static_seeds=[],
                     allow_dynamic_registration=True,
-                )
+                ),
+                self._logger,
             ),
         )
         self._protocol = ClientProtocol(

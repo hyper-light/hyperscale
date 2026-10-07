@@ -137,6 +137,11 @@ class Terminal:
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
 
+        # Tasks the SIGWINCH and SIGINT handlers start, held until they end:
+        # the loop keeps only a weak reference to a task.
+        self._resize_tasks: set[asyncio.Task[None]] = set()
+        self._keyboard_interrupt_task: asyncio.Task[None] | None = None
+
         # Pre-encoded ANSI sequences for efficiency
         self._frame_prefix = b"\033[3J\033[H"
         self._frame_suffix = b"\n"
@@ -501,6 +506,7 @@ class Terminal:
         if self._dfl_sigmap:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
+            await self._cancel_resize_tasks()
 
         self._stop_run.set()
 
@@ -543,6 +549,7 @@ class Terminal:
         if self._dfl_sigmap:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
+            await self._cancel_resize_tasks()
 
         self._stop_run.set()
 
@@ -607,16 +614,34 @@ class Terminal:
         await asyncio.sleep(0)
 
     def _register_signal_handlers(self):
-        self._loop.add_signal_handler(
-            signal.SIGWINCH, lambda: asyncio.create_task(handle_resize(self))
-        )
+        self._loop.add_signal_handler(signal.SIGWINCH, self._on_resize_signal)
 
         # Store the original SIGINT handler so we can restore and re-raise
         self._dfl_sigmap[signal.SIGINT] = signal.getsignal(signal.SIGINT)
 
-        self._loop.add_signal_handler(
-            signal.SIGINT, lambda: asyncio.create_task(self._handle_keyboard_interrupt())
-        )
+        self._loop.add_signal_handler(signal.SIGINT, self._on_keyboard_interrupt_signal)
+
+    def _on_resize_signal(self) -> None:
+        """SIGWINCH: resize in a task the terminal holds until it ends, so
+        stop() and abort() can cancel it before it resumes the render loop."""
+        resize_task = self._loop.create_task(handle_resize(self))
+        self._resize_tasks.add(resize_task)
+        resize_task.add_done_callback(self._resize_tasks.discard)
+
+    def _on_keyboard_interrupt_signal(self) -> None:
+        """SIGINT: abort the terminal in a task it holds. A repeat while
+        that abort runs is ignored so it cannot interrupt the abort midway
+        (as ShutdownSignals does); the abort re-sends SIGINT when done."""
+        if self._keyboard_interrupt_task is None or self._keyboard_interrupt_task.done():
+            self._keyboard_interrupt_task = self._loop.create_task(self._handle_keyboard_interrupt())
+
+    async def _cancel_resize_tasks(self) -> None:
+        """Cancel and wait out the resizes still running: a resize resumes
+        the render loop, which stop() and abort() end."""
+        for resize_task in self._resize_tasks:
+            resize_task.cancel()
+
+        await asyncio.gather(*self._resize_tasks, return_exceptions=True)
 
     async def _handle_keyboard_interrupt(self):
         """Handle keyboard interrupt by aborting the terminal and re-sending SIGINT."""

@@ -54,7 +54,7 @@ D-83/84), and AD-44 late results / `RETRY_BUDGET_DEFAULT` (P-AD44-1, A3-G-50).
 10. **D-42 / D-13: nightly CI and continuous invariants.**
     The nightly `vopr` job runs the default 4-seed sweep and never the soak (`.github/workflows/ci.yml:129`). Only 2 of SCENARIOS §11's continuous invariants exist. Size M.
 
-Also notable, small: `ManagerDiscoveryCoordinator` is never fed (AD-28-1). `DiscoveryService` has no logger (R-G67). The raw-task lint covers only `distributed/` (R-G66). Doc banners are stale: architecture.md:21085 still says read consistency is "Not built", AD_52.md contradicts its own Status, and FIX.md still lists §1.1/§1.2 as open.
+Also notable, small (closed 2026-10-07): the unfed `ManagerDiscoveryCoordinator` was deleted (AD-28-1); `DiscoveryService` logs failed DNS lookups (R-G67); the raw-task lint covers all of `hyperscale/` (R-G66). Doc banners are stale: architecture.md:21085 still says read consistency is "Not built", AD_52.md contradicts its own Status, and FIX.md still lists §1.1/§1.2 as open.
 
 ## Ledger: AD-1–36
 Counts: old P/A 12/0 → Built 4 · Doc-obsolete 4 · Still Partial 4 · Still Absent 0
@@ -77,10 +77,10 @@ Note: none of AD_1/7/9/11/16/24/28/32.md has changed since 2026-01 (git log), so
 - Exists: coordinators/handlers under nodes/gate/ (dispatch, replication, health, job_failover, leadership, orphan_job, peer, stats coordinators; handlers/tcp_*.py; datacenter_manager_selector.py). The dead `GateCancellationCoordinator`, the `if coordinator … else inline` duplicates and `GateConfig` are gone (0 matches for `if self._.*coordinator` in gate/server.py).
 - Missing: gate/server.py is **10,102 lines** (it was 6,901 when graded; it grew through the complexity-ceiling function splits), still one god class (`GateServer`, gate/server.py:291). manager/server.py is 14,604 lines and swim/health_aware_server.py 7,601. This is plan Phase 8 (open).
 
-#### AD28-1 — Discovery: manager-side discovery services never populated — STILL PARTIAL — size S
+#### AD28-1 — Discovery: manager-side discovery services never populated — CLOSED (deleted, 2026-10-07) — size S
 - Doc: docs/architecture/AD_28.md 5-layer pipeline (DNS → security → locality → rendezvous/EWMA selection → pool).
 - Exists: selection is live on the gate's dispatch path (nodes/gate/server.py:739 `DatacenterManagerSelector`; nodes/gate/dispatch_coordinator.py:771 `ordered_managers`, :791/:823 record success/failure → `select_peers`) and on the client (nodes/client/targets.py:123-148). The pool and sticky binding were deleted per D4 (discovery/pool/ is empty). Tests: tests/unit/distributed/gate/test_datacenter_manager_selector.py, tests/unit/distributed/discovery/test_select_peers_fill.py.
-- Missing: the manager's `ManagerDiscoveryCoordinator` (nodes/manager/discovery.py:106-208) has `add_worker`, `add_peer_manager` and `record_worker_/peer_success|failure`, all with zero callers. Only `maintenance_loop` runs (manager/server.py:1397), decaying two empty `DiscoveryService`s. Either feed it (worker registration, peer join, dispatch latency) or delete the coordinator. Locality (`DiscoveryConfig.datacenter_id/region_id`, discovery/models/discovery_config.py:119-125) is honoured only where the config sets them; it was not verified per tier.
+- Closed: `ManagerDiscoveryCoordinator` (nodes/manager/discovery.py), its maintenance task and `ManagerConfig.discovery_failure_decay_interval_seconds` are deleted. No manager decision would read a ranked selection: dispatch allocates cores over every worker in the DC (jobs/worker_pool.py `_select_workers_for_allocation`: AD-17 buckets, then most unreserved cores, `excluded_worker_ids` for failures) and peer sync reaches every active peer (nodes/manager/sync.py `sync_state_from_manager_peers`). AD_28.md updated. `DISCOVERY_FAILURE_DECAY_INTERVAL` stays (gate and worker read it). Locality (`DiscoveryConfig.datacenter_id/region_id`, discovery/models/discovery_config.py:119-125) is honoured only where the config sets them; it was not verified per tier.
 
 ### Now Built / Doc-obsolete
 - AD1 Composition over inheritance — Doc-obsolete: plan D12 (the base-method overrides are deliberate template hooks). AD_1.md:9-21 still says "instead of overriding"; the doc fix is owed.
@@ -95,7 +95,7 @@ Note: none of AD_1/7/9/11/16/24/28/32.md has changed since 2026-01 (git log), so
 ### New gaps found
 - Dead Env fields from AD-32: `OUTGOING_OVERFLOW_SIZE` and `OUTGOING_MAX_DESTINATIONS` (env/env.py:1035-1038) and `Env.get_outgoing_queue_config()` (:1788) have zero consumers since D10 chose semaphores. Delete them, or the "all settings are real Env fields" rule is violated. Size S.
 - (Closed) Dead rate-limit Env surface removed; see AD24-1.
-- `ManagerDiscoveryCoordinator` is a constructed-but-unfed object (built-but-unwired pattern), nodes/manager/discovery.py; see AD28-1.
+- (Closed) `ManagerDiscoveryCoordinator` was a constructed-but-unfed object; deleted, see AD28-1.
 - The in-code docstrings of datacenters/datacenter_health_manager.py:8,179 contradict its own BUSY-on-zero-workers behaviour (:259).
 
 ## Ledger: AD-37–53 + delta absents
@@ -185,7 +185,7 @@ Counts: old P/A 25/0 → Built 13 · Doc-obsolete 7 · Still Partial 5 · Still 
 - A1-G-11 State-sync retries with exponential backoff — Built: `RetryConfig(max_attempts=retries+1, base=timeout/(2^r-1), FULL jitter)` (nodes/manager/sync.py:91-98) (Plan Phase 3 AD-11); test tests/unit/distributed/manager/test_state_sync_retries.py
 - A1-G-8 Optimistic core freeing from progress — Built (through worker-reported availability instead of manager arithmetic on `cores_completed`): `WorkerPool.update_worker_cores_from_progress` (jobs/worker_pool.py:1216), called from the progress and result paths at nodes/manager/server.py:8962 and :10113, versioned per dispatch (Plan Phase 3 G-8); test tests/unit/simulation/sim/test_worker_core_accounting.py
 - A1-G-18 Three-signal health with a >50% systemic eviction hold — Built: `is_systemic_failure` (health/systemic_failure.py:4) gates `_enforce_worker_deadlines` (nodes/manager/server.py:5237-5250); test tests/unit/distributed/manager/test_systemic_eviction_hold.py
-- A1-G-27 AD-28 discovery selection — Built: rendezvous ranking in client targets (nodes/client/targets.py:141-148 `select_peers`), worker `select_best_manager` → `select_peer_with_filter` (nodes/worker/discovery.py:39-59, wired nodes/worker/server.py:184), manager record_success/failure (nodes/manager/discovery.py); SRV deadlock fixed (Plan Phase 1 #5); test tests/unit/distributed/discovery/test_select_peers_fill.py. Pool, sticky binding and eviction→promotion are Doc-obsolete (D4: discovery/pool/ deleted; only `__pycache__` remains).
+- A1-G-27 AD-28 discovery selection — Built: rendezvous ranking in client targets (nodes/client/targets.py:141-148 `select_peers`), worker `select_best_manager` → `select_peer_with_filter` (nodes/worker/discovery.py:39-59, wired nodes/worker/server.py:184); SRV deadlock fixed (Plan Phase 1 #5); test tests/unit/distributed/discovery/test_select_peers_fill.py. Pool, sticky binding and eviction→promotion are Doc-obsolete (D4: discovery/pool/ deleted; only `__pycache__` remains).
 - A1-G-33 Per-destination client queue (AD-32) — Built (the D10 mechanism): per-destination semaphores bounded by `OUTGOING_QUEUE_SIZE`, taken before the node-wide slot and forgotten when the last request settles (server/server/mercury_sync_base_server.py:305-307, 1193-1309); RobustMessageQueue FIFO fixed (Plan Phase 1 #4); test tests/unit/simulation/sim/test_send_destination_isolation.py. The doc's throttle/batch/reject thresholds on outgoing sends are doc-obsolete.
 - A1-G-54 Quorum circuit breaker (3 failures/30 s, recover 10 s) — Built: `CIRCUIT_BREAKER_MAX_ERRORS=3/WINDOW=30.0/HALF_OPEN_AFTER=10.0` (env/env.py:236-238) feed the gate `_quorum_circuit` (nodes/gate/server.py:637-642); `QuorumCircuitOpenError` is raised and handled in gate submission (nodes/gate/handlers/tcp_job.py:466, :824); the manager's unused circuit was deleted (Plan Phase 3 G-55); test tests/unit/distributed/reliability/test_circuit_breaker_manager.py. Nit: the doc's `get_quorum_status` does not exist.
 - A1-G-55 Per-link retries and breakers on node-to-node links — Built: every breaker reads `CIRCUIT_BREAKER_*` (env.py:1481-1483 `get_circuit_breaker_config`; worker registry, manager worker circuits, gate `_peer_gate_circuit_breaker` nodes/gate/server.py:411, 6318, 6670, 7020); dead `_gate_circuit` deleted (Plan Phase 3 G-55). Gate DC dispatch retry is bounded by `derive_datacenter_leader_failover_seconds`, not 2×@0.3 s (Plan Phase 1 #3, deliberate). Test tests/unit/distributed/reliability/test_circuit_breaker_manager.py
@@ -395,15 +395,16 @@ Items: root-docs.md G-rows (R-G*) plus delta-partials/delta-changed-code finding
 - Exists: coordinators at nodes/gate/{dispatch,health,leadership,peer,stats,replication,orphan_job,job_failover}_coordinator.py, all constructed (gate/server.py:871-1072) and used; drifted inline fallbacks gone.
 - Missing: gate/server.py still holds business logic in 10,102 lines (e.g. result fencing gate/server.py:6127-6169, best-effort tracking :8097-8110); same Phase 8 move as R-G59.
 
-#### R-G66 — No raw tasks outside TaskRunner — STILL PARTIAL — size M
+#### R-G66 — No raw tasks outside TaskRunner — CLOSED (2026-10-07) — size M
 - Doc: AGENTS.md "We *never* create asyncio orphaned tasks or futures. Use the TaskRunner instead".
 - Exists: lint tests/simulation/lints/test_no_raw_asyncio_task.py — scope is hyperscale/distributed only (:72 `PRODUCTION_ROOT = ... "distributed"`).
-- Missing: raw `create_task`/`ensure_future` outside the lint's scope: ui/hyperscale_interface.py:79-80, ui/components/terminal/terminal.py:266,365,490,611,618, logging/streams/logger.py:422, logger_stream.py:640,1315, logging/queue/log_consumer.py:58, core/jobs (24 sites, peer-owned). Handles are stored (not orphans) but not TaskRunner; the two SIGWINCH/SIGINT lambdas (terminal.py:611,618) discard their task.
+- Closed: the lint scans all of `hyperscale/` (`PRODUCTION_ROOT = REPO_ROOT / "hyperscale"`); `hyperscale/core/jobs/` is a path exemption (peer-owned). Every other remaining site is a snapshot entry with a one-line reason in tests/simulation/lints/expected_asyncio_task_violations.py (each holds its handle; the logging layer sits below the TaskRunner, so it keeps raw tasks). The SIGWINCH/SIGINT lambdas are gone: terminal.py `_on_resize_signal` holds each resize in `_resize_tasks` (stop()/abort() cancel and await them via `_cancel_resize_tasks`), and `_on_keyboard_interrupt_signal` holds the abort in `_keyboard_interrupt_task`, ignoring a repeat while it runs. Test: tests/unit/ui/test_terminal_signal_tasks.py.
+- Found, engine-owned, not fixed: core/engines/client/playwright/mercury_sync_playwright_connection.py:153-154 `close()` calls `set_result(None)` on the tasks it just created; `Task.set_result` always raises RuntimeError.
 
-#### R-G67 — Structured async Logger everywhere — STILL PARTIAL — size S
+#### R-G67 — Structured async Logger everywhere — CLOSED (2026-10-07) — size S
 - Doc: AGENTS.md "We *always* use the Logger in hyperscale/Logger".
 - Exists: leases' prints are gone (lease subsystem removed); ping writes errors to stderr deliberately (commands/ping.py:414-416).
-- Missing: DiscoveryService has no logger — a failed DNS lookup is only counted (discovery/discovery_service.py:294-296 `except DNSError: self._metrics.record_dns_failure()`); plan :132 moved "DiscoveryService logger" to Phase 6 and Phase 6 did not do it.
+- Closed: `DiscoveryService` takes the owning node's Logger as a required constructor field (`logger`, no fallback) and logs a failed DNS lookup as `DiscoveryDnsLookupFailed` (hyperscale_logging_models.py) beside the metric. The gate and client pass their loggers; the worker builds its DiscoveryService after the parent init that creates `_udp_logger`. Test: tests/unit/distributed/discovery/test_dns_peer_retirement.py `test_a_failed_lookup_retires_nothing`.
 
 #### R-G69 — One class per file — STILL PARTIAL (was ABSENT) — size L
 - Doc: AGENTS.md "One class per file. Period." (D8: no exemptions).

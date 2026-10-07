@@ -11,6 +11,7 @@ These tests verify that the DiscoveryService correctly:
 
 import pytest
 
+from hyperscale.logging import Logger
 from hyperscale.distributed.discovery import (
     DiscoveryConfig,
     DiscoveryService,
@@ -31,7 +32,7 @@ class TestDiscoveryServiceBasics:
             static_seeds=["10.0.0.1:9000", "10.0.0.2:9000"],
         )
 
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         assert service.peer_count == 2
         assert service.has_peers is True
@@ -44,7 +45,7 @@ class TestDiscoveryServiceBasics:
             static_seeds=["10.0.0.1:9000"],
         )
 
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         assert service.local_locality is None
         assert service.peer_count == 1
@@ -59,7 +60,7 @@ class TestDiscoveryServiceBasics:
             region_id="us-east-1",
         )
 
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         assert service.local_locality is not None
         assert service.local_locality.datacenter_id == "us-east-1a"
@@ -76,7 +77,7 @@ class TestPeerManagement:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         peer = service.add_peer(
             peer_id="manager-1",
@@ -100,7 +101,7 @@ class TestPeerManagement:
             datacenter_id="us-east-1a",
             region_id="us-east-1",
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         peer = service.add_peer(
             peer_id="manager-1",
@@ -120,7 +121,7 @@ class TestPeerManagement:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
         assert service.peer_count == 2
@@ -137,7 +138,7 @@ class TestPeerManagement:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         removed = service.remove_peer("nonexistent")
         assert removed is False
@@ -149,7 +150,7 @@ class TestPeerManagement:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
 
@@ -167,7 +168,7 @@ class TestPeerManagement:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
 
@@ -181,7 +182,7 @@ class TestPeerManagement:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
         service.add_peer(peer_id="manager-2", host="10.0.1.2", port=9000)
@@ -200,7 +201,7 @@ class TestPeerSelection:
             environment_id="test",
             static_seeds=["10.0.0.1:9000", "10.0.0.2:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         result = service.select_peer("workflow-123")
 
@@ -216,7 +217,7 @@ class TestPeerSelection:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         # Remove the only peer
         service.clear()
@@ -231,7 +232,7 @@ class TestPeerSelection:
             environment_id="test",
             static_seeds=["10.0.0.1:9000", "10.0.0.2:9000", "10.0.0.3:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         # Same key should get same peer (deterministic rendezvous hash)
         results = [service.select_peer("workflow-123") for _ in range(5)]
@@ -246,7 +247,7 @@ class TestPeerSelection:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="healthy-1", host="10.0.1.1", port=9000)
         service.add_peer(peer_id="healthy-2", host="10.0.1.2", port=9000)
@@ -271,7 +272,7 @@ class TestFeedbackRecording:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
 
@@ -291,7 +292,7 @@ class TestFeedbackRecording:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
 
@@ -311,7 +312,7 @@ class TestFeedbackRecording:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
 
@@ -336,7 +337,7 @@ class TestHealthFiltering:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="healthy-1", host="10.0.1.1", port=9000)
         service.add_peer(peer_id="unhealthy-1", host="10.0.1.2", port=9000)
@@ -358,7 +359,7 @@ class TestHealthFiltering:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
 
@@ -383,7 +384,7 @@ class TestLocalityAwareSelection:
             datacenter_id="us-east-1a",
             region_id="us-east-1",
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         assert service.local_locality is not None
         assert service.local_locality.datacenter_id == "us-east-1a"
@@ -397,7 +398,7 @@ class TestLocalityAwareSelection:
             datacenter_id="us-east-1a",
             region_id="us-east-1",
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
 
@@ -424,7 +425,7 @@ class TestMetricsAndMaintenance:
             environment_id="test",
             static_seeds=["10.0.0.1:9000", "10.0.0.2:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         # Add and interact with peers
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
@@ -444,7 +445,7 @@ class TestMetricsAndMaintenance:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
 
@@ -462,7 +463,7 @@ class TestMetricsAndMaintenance:
             environment_id="test",
             static_seeds=["10.0.0.1:9000", "10.0.0.2:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         assert service.peer_count == 2
 
@@ -482,7 +483,7 @@ class TestCallbacks:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         added_peers: list[PeerInfo] = []
         service.set_callbacks(on_peer_added=lambda p: added_peers.append(p))
@@ -499,7 +500,7 @@ class TestCallbacks:
             environment_id="test",
             static_seeds=["10.0.0.1:9000"],
         )
-        service = DiscoveryService(config)
+        service = DiscoveryService(config, Logger())
 
         service.add_peer(peer_id="manager-1", host="10.0.1.1", port=9000)
 

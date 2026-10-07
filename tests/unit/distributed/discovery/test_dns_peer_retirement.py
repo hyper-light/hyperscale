@@ -7,12 +7,15 @@ service, and it kept selecting addresses no pod held anymore.
 
 * a peer whose address left its name's answer is retired;
 * an address another configured name still answers keeps its peer;
-* a failed lookup retires nothing (a DNS outage is not a departure);
+* a failed lookup retires nothing (a DNS outage is not a departure) and is
+  logged through the injected logger (R-G67);
 * the DNS-discovered addresses are those the names answer now.
 """
 
 import pytest
 
+from hyperscale.logging.hyperscale_logging_models import DiscoveryDnsLookupFailed
+from hyperscale.logging.models import Entry
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.discovery.dns.resolver import DNSError, DNSResult
 from hyperscale.distributed.env import Env
@@ -35,12 +38,22 @@ class ScriptedResolver:
         return DNSResult(hostname=hostname, addresses=list(addresses), port=port)
 
 
+class RecordingLogger:
+    """Keeps every entry logged to it."""
+
+    def __init__(self) -> None:
+        self.entries: list[Entry] = []
+
+    async def log(self, entry: Entry) -> None:
+        self.entries.append(entry)
+
+
 def make_service(dns_names: list[str]) -> tuple[DiscoveryService, ScriptedResolver]:
     config = Env(DISCOVERY_DNS_NAMES=",".join(dns_names), DISCOVERY_DEFAULT_PORT=PORT).get_discovery_config(
         node_role="worker",
         allow_dynamic_registration=True,
     )
-    service = DiscoveryService(config)
+    service = DiscoveryService(config, RecordingLogger())
     resolver = ScriptedResolver()
     service._resolver = resolver
     return service, resolver
@@ -85,3 +98,6 @@ async def test_a_failed_lookup_retires_nothing() -> None:
     await service.discover_peers()
 
     assert service.get_dns_peer_addresses() == [("10.0.0.1", PORT)]
+    failures = [entry for entry in service.logger.entries if isinstance(entry, DiscoveryDnsLookupFailed)]
+    assert [(failure.dns_name, failure.node_role) for failure in failures] == [(FIRST_NAME, "worker")]
+    assert FIRST_NAME in failures[0].error

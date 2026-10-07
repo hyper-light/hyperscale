@@ -1914,10 +1914,10 @@ its remaining domains into composed classes is plan Phase 8, not started.
 > `select_peer_with_filter`. The connection pool and sticky primary/backup
 > connections were deleted (plan decision D4, `discovery/pool/` removed): they
 > duplicated the transport's own connection cache. The bootstrap half is
-> AD-52's seed locators (D3). The manager's `ManagerDiscoveryCoordinator`
-> (`nodes/manager/discovery.py`) is constructed and its maintenance loop runs,
-> but nothing feeds it workers, peers or latencies, so its two
-> `DiscoveryService`s stay empty. Tests:
+> AD-52's seed locators (D3). Managers run no discovery selection: dispatch
+> allocates cores over every worker in the datacenter (AD-17 buckets in
+> `WorkerPool`) and peer sync reaches every active peer, so the unfed
+> `ManagerDiscoveryCoordinator` was deleted (2026-10-07). Tests:
 > `tests/unit/distributed/gate/test_datacenter_manager_selector.py`,
 > `tests/unit/distributed/discovery/test_select_peers_fill.py`.
 

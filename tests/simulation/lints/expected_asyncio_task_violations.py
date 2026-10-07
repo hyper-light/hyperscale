@@ -1,7 +1,9 @@
 """
-Phase 6b ratcheted snapshot — the set of production files under
-``hyperscale/distributed/`` that currently contain a direct call to
-``asyncio.create_task`` or ``asyncio.ensure_future``.
+Phase 6b ratcheted snapshot — the production files under ``hyperscale/``
+(outside the lint's ``EXEMPT_PATH_PREFIXES``) that contain a direct call
+to ``asyncio.create_task`` or ``asyncio.ensure_future``, each with the
+one-line reason it is exempt. Every entry stores and owns the task
+handle it creates (or is engine code, changed only as authorized).
 
 Why this lint
 -------------
@@ -34,17 +36,42 @@ These *are* the TaskRunner; their direct ``asyncio.ensure_future``
 calls are how the runner submits work to the loop, so they stay on
 the allowlist permanently.
 
+R-G66 (2026-10-07) widened the scan to all of ``hyperscale/``. The
+logging layer keeps raw tasks: ``hyperscale.logging`` is the base layer
+``hyperscale.distributed`` (and its TaskRunner) is built on, and a
+TaskRunner needs an ``Env`` and its own lifecycle, which no Logger has.
+
 Stored as Python (not a text snapshot) so the project's ``*.txt``
 gitignore rule doesn't accidentally hide it from version control.
 """
 
-EXPECTED_ASYNCIO_TASK_VIOLATIONS: frozenset[str] = frozenset(
-    {
-        # TaskRunner internals — permanent allowlist entries. These
-        # files implement the runner itself and submit work to the
-        # loop via ``asyncio.ensure_future`` by design.
-        "hyperscale/distributed/taskex/run.py",
-        "hyperscale/distributed/taskex/task_runner.py",
-        "hyperscale/distributed/taskex/task.py",
-    }
-)
+EXPECTED_ASYNCIO_TASK_VIOLATIONS: dict[str, str] = {
+    # TaskRunner internals — permanent entries: these files implement
+    # the runner itself and submit work to the loop by design.
+    "hyperscale/distributed/taskex/run.py": "TaskRunner internals: a Run holds the task it executes in _task",
+    "hyperscale/distributed/taskex/task_runner.py": "TaskRunner internals: the runner holds its _cleanup_task",
+    "hyperscale/distributed/taskex/task.py": "TaskRunner internals: a Task holds its scheduled runs in _schedules",
+    # Logging layer: below the TaskRunner (see above); each handle is held.
+    "hyperscale/logging/queue/log_consumer.py": "_pull_task held, cancelled and awaited by stop()/abort()",
+    "hyperscale/logging/streams/logger.py": "_watch_tasks[name] held, cancelled by stop_watch()/close()",
+    "hyperscale/logging/streams/logger_stream.py": (
+        "scheduled log tasks held in _scheduled_tasks (discarded when done); _batch_flush_task held"
+    ),
+    # Terminal UI: each handle is held and ended by stop()/abort().
+    "hyperscale/ui/hyperscale_interface.py": "_terminal_task/_spinner_task held, cancelled by stop()/abort()",
+    "hyperscale/ui/components/terminal/terminal.py": (
+        "_run_engine/_spin_thread held, awaited by stop() and cancelled by abort()"
+    ),
+    # Monitoring: one held task per workflow monitor.
+    "hyperscale/core/monitoring/base/monitor.py": (
+        "_background_monitors[run_id][workflow] held, stopped/aborted by the monitor"
+    ),
+    # Engines: changed only as authorized.
+    "hyperscale/core/engines/client/sftp/protocols/sftp.py": "parallel-read tasks held in _pending until consumed",
+    "hyperscale/core/engines/client/ssh/protocol/ssh/connection.py": (
+        "SSHConnection.create_task holds each task in _tasks, reaped by a done callback"
+    ),
+    "hyperscale/core/engines/client/playwright/mercury_sync_playwright_connection.py": (
+        "close() starts one close task per session; engine code, changed only as authorized"
+    ),
+}

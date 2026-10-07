@@ -1,7 +1,11 @@
 """
 Phase 6b guard test — forbids direct ``asyncio.create_task`` /
 ``asyncio.ensure_future`` calls in production code under
-``hyperscale/distributed/``.
+``hyperscale/`` (R-G66; it covered only ``hyperscale/distributed/``
+before).
+
+Paths under ``EXEMPT_PATH_PREFIXES`` are not scanned at all; every
+other exemption is one file in the snapshot with a one-line reason.
 
 The Phase 6 ``SimulationLoop`` guarantees deterministic task
 scheduling for callbacks registered through the loop it owns —
@@ -69,7 +73,16 @@ from tests.simulation.lints.expected_asyncio_task_violations import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-PRODUCTION_ROOT = REPO_ROOT / "hyperscale" / "distributed"
+PRODUCTION_ROOT = REPO_ROOT / "hyperscale"
+
+
+# Repo-relative path prefixes the lint does not scan, each with its reason.
+EXEMPT_PATH_PREFIXES: dict[str, str] = {
+    "hyperscale/core/jobs/": (
+        "owned by a peer session; its raw-task sites (its own TaskRunner, "
+        "the pool-leader protocols, the graph runners) migrate there"
+    ),
+}
 
 
 # Attributes on the ``asyncio`` module that are forbidden as
@@ -89,9 +102,12 @@ FORBIDDEN_FROM_IMPORT_NAMES: frozenset[str] = frozenset({
 
 
 def _iter_python_files(root: Path) -> Iterator[Path]:
-    """Yield every ``.py`` file under ``root`` excluding caches."""
+    """Yield every ``.py`` file under ``root`` excluding caches and the
+    exempt path prefixes."""
     for path in root.rglob("*.py"):
         if "__pycache__" in path.parts:
+            continue
+        if path.relative_to(REPO_ROOT).as_posix().startswith(tuple(EXEMPT_PATH_PREFIXES)):
             continue
         yield path
 

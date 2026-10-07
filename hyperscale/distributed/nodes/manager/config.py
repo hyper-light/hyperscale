@@ -106,9 +106,6 @@ class ManagerConfig:
     job_responsiveness_threshold_seconds: float = 30.0
     job_responsiveness_check_interval_seconds: float = 5.0
 
-    # Discovery failure decay (from env)
-    discovery_failure_decay_interval_seconds: float = 60.0
-
     # Stats window settings (from env)
     stats_window_size_ms: int = 1000
     stats_drift_tolerance_ms: int = 100
@@ -254,7 +251,6 @@ def create_manager_config_from_env(
         batch_push_interval_seconds=env.MANAGER_BATCH_PUSH_INTERVAL,
         job_responsiveness_threshold_seconds=env.JOB_RESPONSIVENESS_THRESHOLD,
         job_responsiveness_check_interval_seconds=env.JOB_RESPONSIVENESS_CHECK_INTERVAL,
-        discovery_failure_decay_interval_seconds=env.DISCOVERY_FAILURE_DECAY_INTERVAL,
         stats_window_size_ms=env.STATS_WINDOW_SIZE_MS,
         stats_drift_tolerance_ms=env.STATS_DRIFT_TOLERANCE_MS,
         stats_max_window_age_ms=env.STATS_MAX_WINDOW_AGE_MS,

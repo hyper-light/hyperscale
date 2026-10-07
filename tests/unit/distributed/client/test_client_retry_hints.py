@@ -101,7 +101,8 @@ def make_logger() -> Logger:
 
 def make_targets(env: Env, config: ClientConfig, state: ClientState) -> ClientTargetSelector:
     discovery = DiscoveryService(
-        env.get_discovery_config(node_role="client", static_seeds=[], allow_dynamic_registration=True)
+        env.get_discovery_config(node_role="client", static_seeds=[], allow_dynamic_registration=True),
+        Logger(),
     )
     return ClientTargetSelector(config, state, discovery)
 

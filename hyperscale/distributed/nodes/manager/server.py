@@ -238,7 +238,6 @@ from .version_skew import ManagerVersionSkewHandler
 from .capacity_reporter import ManagerCapacityReporter
 from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator
-from .discovery import ManagerDiscoveryCoordinator
 
 from .worker_dissemination import WorkerDisseminator
 from hyperscale.distributed.swim.gossip.worker_state_gossip_buffer import (
@@ -583,16 +582,6 @@ class ManagerServer(HealthAwareServer):
             cohort_size_fn=lambda: len(self._cluster_membership.cohort),
         )
 
-        # Discovery coordinator
-        self._discovery = ManagerDiscoveryCoordinator(
-            state=self._manager_state,
-            config=self._config,
-            logger=self._udp_logger,
-            node_id=self._node_id.short,
-            task_runner=self._task_runner,
-            env=self._env,
-        )
-
         # Load shedding (AD-22), at this node's OVERLOAD_* settings (the
         # AD-24 rate-limit window is derived from them)
         self._overload_detector = HybridOverloadDetector(self._env.get_overload_config())
@@ -911,7 +900,6 @@ class ManagerServer(HealthAwareServer):
         # Background tasks
         self._dead_node_reap_task: asyncio.Task | None = None
         self._orphan_scan_task: asyncio.Task | None = None
-        self._discovery_maintenance_task: asyncio.Task | None = None
         self._job_responsiveness_task: asyncio.Task | None = None
         self._stats_push_task: asyncio.Task | None = None
         self._windowed_stats_flush_task: asyncio.Task | None = None
@@ -1380,7 +1368,6 @@ class ManagerServer(HealthAwareServer):
         return [
             self._dead_node_reap_task,
             self._orphan_scan_task,
-            self._discovery_maintenance_task,
             self._job_responsiveness_task,
             self._stats_push_task,
             self._windowed_stats_flush_task,
@@ -1401,9 +1388,6 @@ class ManagerServer(HealthAwareServer):
         )
         self._orphan_scan_task = self._create_background_task(
             self._orphan_scan_loop(), "orphan_scan"
-        )
-        self._discovery_maintenance_task = self._create_background_task(
-            self._discovery.maintenance_loop(), "discovery_maintenance"
         )
         self._job_responsiveness_task = self._create_background_task(
             self._job_responsiveness_loop(), "job_responsiveness"

@@ -23,7 +23,6 @@ from .health import (
 from .leadership import ManagerLeadershipCoordinator
 from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator, ProgressState, BackpressureLevel
-from .discovery import ManagerDiscoveryCoordinator
 from .version_skew import ManagerVersionSkewHandler
 
 __all__ = [
@@ -43,7 +42,6 @@ __all__ = [
     "ManagerLeadershipCoordinator",
     "ManagerRaftIntegration",
     "ManagerStatsCoordinator",
-    "ManagerDiscoveryCoordinator",
     # AD-19 Progress State (Three-Signal Health)
     "ProgressState",
     # AD-23 Backpressure

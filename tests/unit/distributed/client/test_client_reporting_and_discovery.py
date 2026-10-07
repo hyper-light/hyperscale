@@ -48,7 +48,8 @@ def make_client_discovery() -> DiscoveryService:
             node_role="client",
             static_seeds=[],
             allow_dynamic_registration=True,
-        )
+        ),
+        Logger(),
     )
 
 

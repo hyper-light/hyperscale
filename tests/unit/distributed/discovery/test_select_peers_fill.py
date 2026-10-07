@@ -9,6 +9,7 @@ pinned for counts below, at and above the number of known peers.
 
 import pytest
 
+from hyperscale.logging import Logger
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.discovery.models.discovery_config import DiscoveryConfig
 
@@ -19,7 +20,8 @@ def _service_with_seeds(seed_count: int) -> DiscoveryService:
             cluster_id="test-cluster",
             environment_id="test",
             static_seeds=[f"10.0.0.{index}:9000" for index in range(1, seed_count + 1)],
-        )
+        ),
+        Logger(),
     )
 
 

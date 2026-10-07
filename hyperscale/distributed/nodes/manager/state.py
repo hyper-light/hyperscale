@@ -243,7 +243,6 @@ class ManagerState:
         # Background tasks
         self._dead_node_reap_task: asyncio.Task | None = None
         self._orphan_scan_task: asyncio.Task | None = None
-        self._discovery_maintenance_task: asyncio.Task | None = None
 
     def initialize_locks(self) -> None:
         self._core_allocation_lock = asyncio.Lock()

@@ -24,7 +24,7 @@ Usage:
         dns_names=["managers.hyperscale.local"],
         datacenter_id="us-east-1",
     )
-    service = DiscoveryService(config)
+    service = DiscoveryService(config, logger)
 
     # Discover peers from DNS
     await service.discover_peers()
@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import DiscoveryDnsLookupFailed
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -99,6 +101,9 @@ class DiscoveryService:
 
     config: DiscoveryConfig
     """Discovery configuration."""
+
+    logger: Logger
+    """The owning node's async logger; failed DNS lookups are reported to it."""
 
     _resolver: AsyncDNSResolver = field(init=False)
     """DNS resolver with caching."""
@@ -277,7 +282,8 @@ class DiscoveryService:
         discovered: list[PeerInfo],
     ) -> None:
         """Resolve one configured DNS name, adding the peers it answers to
-        ``discovered``; a failed lookup is counted and changes nothing else."""
+        ``discovered``; a failed lookup is counted and logged and changes
+        nothing else."""
         try:
             result = await self._resolver.resolve(
                 dns_name,
@@ -291,8 +297,17 @@ class DiscoveryService:
             discovered.extend(added)
             self._retire_unanswered_dns_peers(dns_name, answered_peer_ids)
 
-        except DNSError:
+        except DNSError as dns_error:
             self._metrics.record_dns_failure()
+            await self.logger.log(
+                DiscoveryDnsLookupFailed(
+                    message=f"Discovery DNS lookup for '{dns_name}' failed; known peers are kept",
+                    dns_name=dns_name,
+                    node_role=self.config.node_role,
+                    cluster_id=self.config.cluster_id,
+                    error=str(dns_error),
+                )
+            )
             # Continue with other DNS names
 
     def _add_peers_from_result(self, result: DNSResult) -> tuple[set[str], list[PeerInfo]]:

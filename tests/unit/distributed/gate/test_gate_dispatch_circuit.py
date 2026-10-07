@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.logging import Logger
 from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.env import Env
@@ -57,7 +58,8 @@ def make_manager_selector(state: GateRuntimeState) -> DatacenterManagerSelector:
                 node_role="gate",
                 static_seeds=[],
                 allow_dynamic_registration=True,
-            )
+            ),
+            Logger(),
         ),
         get_manager_heartbeats=state.get_datacenter_manager_statuses,
     )

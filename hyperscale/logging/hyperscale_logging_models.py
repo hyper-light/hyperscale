@@ -624,3 +624,15 @@ class StaleObservationsDecayed(Entry, kw_only=True):
 
     datacenter_ids: list[str]
     level: LogLevel = LogLevel.INFO
+
+
+class DiscoveryDnsLookupFailed(Entry, kw_only=True):
+    """AD-28: a configured discovery DNS name failed to resolve. The peers it
+    answered before are kept (a DNS outage is not a departure); the lookup is
+    retried on the next discovery pass."""
+
+    dns_name: str
+    node_role: str
+    cluster_id: str
+    error: str
+    level: LogLevel = LogLevel.WARN
