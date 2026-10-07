@@ -1,57 +1,45 @@
 # FIX.md (Fresh Deep Trace)
 
-Last updated: 2026-01-14
+Last updated: 2026-01-14 · **Status revised 2026-10-06:** both issues below are fixed; the current list of open items is `docs/REMAINING_LEDGER.md`.
 Scope: Full re-trace of `SCENARIOS.md` against current code paths (no cached findings).
 
-This file lists **current verified issues only**. All items below were confirmed by direct code reads.
+This file listed the issues verified on 2026-01-14. Both are now closed; the sections below keep the original finding and record the fix.
 
 ---
 
 ## Summary
 
-| Severity | Count | Status |
-|----------|-------|--------|
-| **High Priority** | 0 | 🟢 None found |
-| **Medium Priority** | 2 | 🟡 Should Fix |
-| **Low Priority** | 0 | 🟢 None found |
+| Severity | Count (2026-01-14) | Status (2026-10-06) |
+|----------|--------------------|---------------------|
+| **High Priority** | 0 | Not re-traced here; later high-severity defects (e.g. ASSESSMENT.md delta A1-A7) were found and fixed after this file was written |
+| **Medium Priority** | 2 | 🟢 Both fixed (§1.1, §1.2) |
+| **Low Priority** | 0 | — |
 
 ---
 
-## 1. Medium Priority Issues
+## 1. Medium Priority Issues (closed)
 
-### 1.1 mTLS Strict Mode Doesn’t Enforce Cert Parse Failures
+### 1.1 mTLS Strict Mode Doesn’t Enforce Cert Parse Failures — FIXED
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/manager/handlers/tcp_worker_registration.py` | 113-122 | `extract_claims_from_cert()` called without `strict=True` even when `mtls_strict_mode` is enabled |
-| `distributed/nodes/gate/handlers/tcp_manager.py` | 256-265 | Same issue for manager registration at gate |
-| `distributed/nodes/manager/server.py` | 3044-3052 | Same issue in `_validate_mtls_claims()` |
+Original finding (2026-01-14): `extract_claims_from_cert()` was called without `strict=True` at the manager's worker-registration handler, the gate's manager-registration handler and the manager's `_validate_mtls_claims()`, so with `mtls_strict_mode` enabled a certificate parse failure fell back to defaults and could pass validation (Scenario 41.23).
 
-**Why this matters:** Scenario 41.23 requires rejecting invalid or mismatched certificates. When `mtls_strict_mode` is enabled but `strict=True` is not passed, parse failures fall back to defaults and can pass validation.
+Fix: `RoleValidator.extract_peer_claims(cert_der)` (`distributed/discovery/security/role_validator.py:294-323`) parses with `strict=self.strict_mode`, the validator's own config-wired flag, so no call site has to thread it. Callers: `distributed/nodes/manager/server.py:8275` and `distributed/nodes/gate/handlers/tcp_manager.py:356` (the manager's worker-registration handler file no longer exists). Test: `tests/unit/distributed/discovery/test_mtls_strict_claims.py`.
 
-**Fix (actionable):**
-- Pass `strict=self._config.mtls_strict_mode` (or equivalent env flag) to `RoleValidator.extract_claims_from_cert()` in all call sites.
-- If strict mode is enabled, treat parse errors as validation failures.
+### 1.2 Timeout Tracker Accepts Stale Progress Reports — FIXED
 
-### 1.2 Timeout Tracker Accepts Stale Progress Reports
+Original finding (2026-01-14): `GateJobTimeoutTracker.record_progress()` stored `report.fence_token` without checking it against the datacenter's current fence, so stale reports from an old manager could delay timeout decisions (Scenario 11.1).
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/jobs/gates/gate_job_timeout_tracker.py` | 175-205 | `record_progress()` stores `report.fence_token` but never validates it against existing per‑DC fence token |
-
-**Why this matters:** Scenario 11.1 (timeout detection) can be skewed by stale progress reports from old managers, delaying timeout decisions after leadership transfer.
-
-**Fix (actionable):**
-- Reject `JobProgressReport` and `JobTimeoutReport` entries with `fence_token` older than `dc_fence_tokens[datacenter]`.
-- Only update `dc_last_progress` when the fence token is current.
+Fix: `record_progress`, `record_timeout` and `record_leader_transfer` first call `_admitted_report_info` (`distributed/jobs/gates/gate_job_timeout_tracker.py:184-198`), which drops a report from a datacenter the job no longer targets and rejects one whose fence token is superseded (`_reject_superseded_report`, `:139`) before `dc_last_progress` or any other state is written (`:200-215`). Test: `tests/unit/distributed/jobs/test_gate_job_timeout_tracker_fencing.py`.
 
 ---
 
 ## Notes (Verified Behaviors)
 
-- Federated health handles first‑probe ACK timeouts using `last_probe_sent`: `distributed/swim/health/federated_health_monitor.py:472`.
-- Probe error callbacks include fallback logging on handler failure: `distributed/swim/health/federated_health_monitor.py:447`.
-- Cross‑DC correlation callbacks include fallback logging when error handlers fail: `distributed/datacenters/cross_dc_correlation.py:1176`.
-- Lease cleanup loop includes fallback logging when error handlers fail: `distributed/leases/job_lease.py:281`.
-- Local reporter submission logs failures (best‑effort): `distributed/nodes/client/reporting.py:83`.
-- OOB health receive loop logs exceptions with socket context: `distributed/swim/health/out_of_band_health_channel.py:320`.
+Line numbers re-verified 2026-10-06.
+
+- Federated health handles first‑probe ACK timeouts using `last_probe_sent`: `distributed/swim/health/federated_health_monitor.py:517,662`.
+- Probe error callbacks fall back to logging when no callback is set or it fails: `distributed/swim/health/federated_health_monitor.py:468-471`.
+- Cross‑DC correlation callbacks route failures to `on_callback_error`, and a failing handler goes to stderr: `distributed/datacenters/cross_dc_correlation_detector.py:1050-1070`.
+- Lease cleanup: the job lease cleanup is a TaskRunner loop (`distributed/leases/job_lease_manager.py:189-195`, started at `distributed/nodes/gate/server.py:1557`); its error callback and expiry hook were removed on 2026-10-06 along with lease import/export (every lease is the local gate's own).
+- Local reporter submission logs failures (best‑effort, deadline-bounded): `distributed/nodes/client/reporting.py:109-120`.
+- OOB health receive loop logs exceptions with socket context: `distributed/swim/health/out_of_band_health_channel.py:361-373`.

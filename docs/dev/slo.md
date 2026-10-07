@@ -1,4 +1,7 @@
 SLO-Aware Health Routing Architecture
+
+> **As built (checked 2026-10-06).** The "What exists / What's missing" analysis below predates the build. The SLO pieces live in `hyperscale/distributed/slo/` (not `resources/slo/`): `TDigest` (`tdigest.py`), `TimeWindowedTDigest` (`time_windowed_digest.py`), `LatencySLO`, `SLOComplianceScore`, `SLOHealthClassifier` and `ResourceAwareSLOPredictor`. Gate datacenter health is the worse of the managers' view and SLO compliance (`SLOHealthClassifier`), and resource pressure enters through the predictor-adjusted SLO factor. The `LatencyDigestTracker` / `LatencyType` design below is **not** what was built: each manager keeps one `TimeWindowedTDigest` (`nodes/manager/state.py:239`) fed only by dispatch→response round trips (`record_dispatch_latency`, `:522`). There is no per-target keying and no E2E or network latency type; the comment at `state.py:234-238` gives the reason (a workflow's run time is its workload's design and says nothing about the datacenter), but no plan decision records the narrowing.
+
 Current State Analysis
 What exists:
 

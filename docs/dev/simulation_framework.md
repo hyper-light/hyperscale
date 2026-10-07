@@ -282,6 +282,11 @@ Rules:
 
 - Cleanup **never** raises out of `__aexit__`. Errors collect into a
   `CleanupReport` attached to the test failure.
+  *As built (2026-10-06): there is no `CleanupReport`.
+  `ClusterHarness.__aexit__` (`tests/simulation/harness/cluster_harness.py:159-170`)
+  collects the supervisor's `cleanup_errors` and raises them (or a pending
+  invariant violation) only when the test body passed; when the body already
+  raised, both are dropped rather than attached to the failure.*
 - All harness background tasks go through the project's `TaskRunner`
   (CLAUDE.md: "we never create asyncio orphaned tasks or futures").
 - **Step 8 is the critical one.** Leaked asyncio tasks across tests cause
@@ -321,6 +326,10 @@ async def test_election_under_partition(harness): ...
 
 The retry policy declares **what** is acceptable to retry, so true bugs are
 not masked under blanket `@flaky`.
+
+*As built (2026-10-06): not built. No `@scenario` decorator with
+`retries`/`retry_on` exists under `tests/simulation/`; SIM runs are
+seed-deterministic, so a retry would only mask a reproducible failure.*
 
 ## 9. Configuration variety
 
@@ -455,6 +464,15 @@ Initial L2/L3 catalog:
 The catalog is extensible per scenario: a scenario can register
 scenario-specific invariants in its `setup`.
 
+*As built (2026-10-06): `InvariantChecker` (`tests/simulation/harness/invariants.py`)
+polls every `invariant_poll_interval` (0.1 s). Of this catalog only
+`at_most_one_job_leader_per_job` (`invariants.py:246`) exists.
+`MonotonicFenceTokens`, `WorkerSubprocessAttribution`, `NoOrphanWorkflows`
+and `LeakedLocksBounded` are not implemented as continuous checks. Leader
+exclusivity, terminal agreement, execution counts, single-DC placement and
+DC-health convergence are checked post-hoc by the VOPR oracle
+(`tests/simulation/oracle/cluster_trace_oracle.py:191-695`).*
+
 ## 13. Liveness invariants
 
 Distinct mechanism. A `LivenessInvariant` carries a `progress_predicate`
@@ -476,6 +494,10 @@ Catches "deadlock that pretends to be slowness." Initial catalog:
   follower at least every `heartbeat_interval × 2`.
 - `BackpressureEventuallyClears` — once load drops, backpressure level
   returns to NONE within bounded time.
+
+*As built (2026-10-06): the one liveness invariant is
+`cluster_membership_progress` (`invariants.py:282`, 30 s staleness budget).
+None of the three above is implemented.*
 
 ## 14. Diagnostics
 

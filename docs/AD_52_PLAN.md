@@ -1,5 +1,24 @@
 # AD-52 Implementation Plan
 
+## Status (2026-10-06)
+
+This plan was written before the work. AD-52 is now built, mostly under names other than the ones planned below; `docs/architecture/AD_52.md` "Status" is the authoritative account. The item text below is kept as the original plan.
+
+- **Built.**
+  - Phase 0: the HLC is wired into Raft apply (`raft/raft_node.py`).
+  - Phase 1, under other names. Formation, join, leave, resize and mode are one `ClusterMembership` (`distributed/cluster/cluster_membership.py`), not separate `BootstrapCoordinator`/`JoinCoordinator` classes. Seed locators live in `commands/run/seed_locators.py`, not `cluster/seed_locators/`. Joint consensus and learners are `RaftNode.change_membership`/`reconcile_membership`. ReadIndex is `RaftNode.read_index`. Identity is the `RaftStore` identity stamp (plan D1). All of it is wired into managers and gates, and `hyperscale join|membership|remove|resize|cluster` is registered.
+  - Phase 2: phi accrual (gate→manager, plus SWIM probe budgeting), the watch (`handle_watch`), the soft-state cache (`ClusterViewCache` + `ClusterWatchFollower`), and tombstone eviction.
+  - Phase 3: drain, force-remove, freeze and read-only mode; Raft group commit (`raft/store/`); opt-in leader leases (`RAFT_LEADER_LEASES_ENABLED`, off by default); observability (`cluster_metrics`); determinism enforcement (lint `tests/simulation/lints/test_no_direct_time_random.py` plus byte-identical VOPR replay).
+  - Phase 4: worker join through locators, and routing through the cached view.
+  - Phase 5.1: the chaos harness is the membership and Raft VOPRs (`tests/unit/simulation/sim/test_cluster_membership_vopr.py`, `test_raft_membership_vopr.py`). The nightly `vopr` CI job runs `tests/simulation` at the default seed sweep, not a 24 h chaos run: `--sim-vopr-count` and `HYPERSCALE_SIM_SOAK` are not set yet.
+- **Not the design (Doc-obsolete).** Each is marked at its item below.
+  - Item 1.10 `ClusterRPCFence`: replaced by per-concern fencing.
+  - Item 2.7 `DatacenterCatalog`: there is no replicated DC catalog.
+  - Item 3.4 snapshot export/import.
+  - Item 3.6 pipelined AppendEntries: measured, and nothing fills a window.
+  - Item 4.3 `granted_at_cluster_epoch`.
+- **Open.** Item 5.2: no benchmark measures any §16 target, and `tests/benchmarks/` does not exist (REMAINING_WORK_PLAN D16, Phase 9 "Probes you run").
+
 ## Scope
 
 This plan implements AD-52 (Cluster Creation) end-to-end against the existing infrastructure surveyed below. Work is broken into atomic items grouped by phase. Each item names exact files to add / modify / remove, lists acceptance criteria, gives a brief usage example, and enumerates tests across eight categories (unit, integration, e2e, race condition, memory leak, deadlock, edge case, negative path).
@@ -650,6 +669,8 @@ membership = await consensus.linearizable_read(
 
 ## Item 1.10 — `ClusterRPCFence` header + protocol-boundary validation
 
+> **Not built (decided 2026-10).** AD_52.md Status, "Fencing (decided 2026-10)": fencing is per concern (the membership group keyed by its cluster uuid, formation and join by the cohort digest, Raft terms, per-job fence tokens). A per-RPC `cluster_uuid` check would fence running jobs at every refounding.
+
 **What**: Define the fence header `{cluster_uuid, membership_epoch, sender_node_id, sender_term}` and validate it at the TCP protocol boundary before any handler runs.
 
 **Why**: AD-52 §6. Stale or zombie nodes must not write into the wrong cluster generation, into a removed-member slot, or under an old term. depends-on: Item 1.6.
@@ -1099,6 +1120,8 @@ else:
 
 ## Item 2.7 — `DatacenterCatalog` (gate-only federation)
 
+> **Not built (decided 2026-10, REMAINING_WORK_PLAN Phase 4).** There is no replicated DC catalog. Each gate learns datacenters from configuration, `hyperscale join` and the watch. A datacenter whose watch answers with a different `cluster_uuid` is reset once and logged `DatacenterRegenerated` (AD_52.md §10, §17).
+
 **What**: Gate cluster's Raft state machine catalogs `DatacenterRegistration` entries. Each manager cluster's leader registers itself with the gate cluster on startup.
 
 **Why**: AD-52 §17. Multi-DC topology requires the gate cluster to know about manager DCs without joining them.
@@ -1232,6 +1255,8 @@ else:
 
 ## Item 3.4 — Snapshot export/import
 
+> **Not the design (AD_52.md §13).** It is not built.
+
 **What**: Operator can export current Raft state to a tarball; import into a freshly-launched cluster (which mints new `cluster_uuid` to prevent accidental fork).
 
 **Files**:
@@ -1270,6 +1295,8 @@ else:
 ---
 
 ## Item 3.6 — Pipelined AppendEntries
+
+> **Measured, not built (REMAINING_WORK_PLAN Phase 4).** A job's ledger commits its entries one at a time (`JobCommitSequencer`), so no group ever has two proposals to overlap. The per-peer coalescing outbox (`raft/raft_peer_outbox.py`) already overlaps groups. AD_52.md §16 records this.
 
 **What**: Leader sends `AppendEntries(N+1)` before `AppendEntries(N)` is acknowledged. Per-follower in-flight window.
 
@@ -1379,6 +1406,8 @@ else:
 
 ## Item 4.3 — AD-31 integration (job leadership uses cluster epoch)
 
+> **Not built (fencing decision, AD_52.md Status).** Job leadership is fenced by per-job fence tokens (plan D15). No `granted_at_cluster_epoch` field exists.
+
 **What**: `JobLeadershipTracker` records `granted_at_cluster_epoch` on every leadership grant. Workers and managers fence job leadership messages by both the AD-10 leadership term AND the cluster epoch.
 
 **Files**:
@@ -1469,6 +1498,8 @@ else:
 ---
 
 ## Item 5.2 — Performance benchmarks
+
+> **Open (2026-10-06).** Neither `tests/benchmarks/cluster/` nor any probe script measures a §16 target, and CI has no slowdown gate. REMAINING_WORK_PLAN D16 calls for probe scripts that the owner runs.
 
 **What**: Microbenchmarks confirming SLOs from AD-52 §16.
 

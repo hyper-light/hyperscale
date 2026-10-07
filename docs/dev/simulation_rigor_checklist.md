@@ -420,6 +420,10 @@ properties):
   cost scales with event count (0.25–0.5s watcher cadences dominate) —
   probe scenarios/minute first. Respect the 300s per-barrier wall deadman;
   never run concurrent heavy sims.
+- *Status 2026-10-06: built* — `tests/simulation/soak/test_soak.py`, an
+  1800-virtual-second horizon of sequential jobs with recurring faults,
+  opt-in via `HYPERSCALE_SIM_SOAK=1`. Nothing longer than 1800 virtual
+  seconds exists.
 
 **F2. Swarm scale (seed count, continuous) — (b) COVERABLE — P0**
 - Today: the default sweep is **4 seeds** (101–104), widened only manually
@@ -431,6 +435,13 @@ properties):
   corpora once they exist. Every failure is already a permanent reproducer
   (`--sim-replay=<seed>`); the missing piece is purely the standing job and
   a place to record failing seeds. Cheapest rigor purchase on this list.
+- *Status 2026-10-06: partial.* The standing job exists: the nightly
+  `vopr` job in `.github/workflows/ci.yml` (cron `0 7 * * *`, 180-minute
+  cap) runs `uv run pytest tests/simulation --ignore=tests/simulation/lints`
+  and uploads `tests/simulation/_artifacts/` for 14 days. It passes neither
+  `--sim-vopr-count` nor `HYPERSCALE_SIM_SOAK=1`, so it runs the default
+  4-seed sweep and skips the soak; failing seeds are kept only as those
+  14-day artifacts.
 
 **F3. Seed-randomized topology/workload parameters — (b) COVERABLE — P1**
 - Today: the VOPR topology is FIXED (manager + 2-core worker + client) and

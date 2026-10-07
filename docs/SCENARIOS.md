@@ -15,6 +15,11 @@ The phases referenced below are from
 scenarios need fault primitives that ship in later phases; those are
 flagged with `(Phase N)` in their headings.
 
+**Coverage status (checked 2026-10-06).** This is a taxonomy of what must be
+tested, not a list of what is. Where a section's coverage or the code's
+behavior is known, a *Status* line says what exists; the full regrade is
+`docs/REMAINING_LEDGER.md` (dev-docs ledger, D-90 to D-95).
+
 ---
 
 ## 1. Leadership / Election
@@ -133,6 +138,11 @@ Need `Clock` injection.
 - **VM pause.** Long sleep mid-RPC; on resume, all timers fire at once.
 - **Lease boundary races.** Lease expires *exactly* as heartbeat lands.
 
+*Status:* covered — forward/backward step at a lease boundary
+(`tests/unit/simulation/sim/test_multiprocess_lease_clock_step.py`), skew
+fencing (`test_multiprocess_clock_fence.py`), VM pause
+(`test_multiprocess_pause.py`). Monotonic drift is a documented skip.
+
 ## 6. Membership churn
 
 - **Registration storm.** 50 workers register within 1 s. Manager
@@ -171,6 +181,14 @@ Need `Clock` injection.
 - **Adversarial workflows.** Panic, infinite loop (timeout-killed),
   giant memory allocation (OOM-killed).
 
+*Status:* partial. Built: 100-job instant burst
+(`tests/unit/simulation/sim/test_multiprocess_fanout.py`), dependency chains
+and dispatch exhaustion (`test_multiprocess_workflow_lifecycle.py`), mid-flight
+cancel (`test_multiprocess_job_cancellation.py`), submit during a blackout
+(`test_multiprocess_l2_submission_blackout.py`), long-running with AD-26
+extension (`test_multiprocess_l2_extension.py`). Not built: sustained-rate and
+staggered-start scenarios, cross-DC dependency chains, adversarial workflows.
+
 ## 8. Resource pressure / pool fidelity
 
 - **CPU saturation.** Pump synthetic CPU. LHM rises. Leader steps down
@@ -186,7 +204,9 @@ Need `Clock` injection.
 
 ## 9. Adversarial messages
 
-- **Replay.** Resend an old message; `_replay_guard` drops.
+- **Replay.** Resend an old message; `ReplayGuard.validate_frame` drops
+  it (every TCP/UDP frame carries a Snowflake frame id inside the AES-GCM
+  body; duplicates are keyed on the nonce, 2026-10-06).
 - **Wrong cluster_id / environment_id.** `WorkerRegistration` rejected
   (AD-28).
 - **Wrong mTLS claims.** `RoleValidator.validate_claims` rejects.
@@ -198,6 +218,14 @@ Need `Clock` injection.
 - **Mixed protocol versions.** Older worker, newer manager. Capability
   negotiation does the right thing.
 
+*Status:* covered — replay `tests/unit/distributed/protocol/test_frame_replay_protection.py`;
+malformed pickle `tests/unit/distributed/messaging/test_restricted_unpickler_vopr.py`;
+mTLS claims `tests/unit/distributed/discovery/test_mtls_strict_claims.py`;
+oversized/malformed frames `tests/unit/distributed/protocol/test_frame_decoding_vopr.py`;
+wrong cluster `tests/unit/simulation/sim/test_cluster_mismatch_vopr.py`;
+versions `tests/unit/distributed/models/test_rolling_upgrade_wire_compatibility.py`
+(all 104 wire messages, both directions) and `tests/unit/distributed/protocol/test_version_skew*.py`.
+
 ## 10. Persistence / recovery
 
 - **Manager restart with WAL replay.** In-flight job state recovered.
@@ -208,11 +236,32 @@ Need `Clock` injection.
   threshold catches up via snapshot, not log.
 - **WAL corruption.** Detected at startup; node refuses to come up.
 
+*Status:* the first four are covered (`tests/unit/distributed/ledger/test_wal_reclamation.py`,
+`tests/unit/distributed/idempotency/test_manager_ledger_recovery.py`,
+`tests/unit/distributed/swim/test_incarnation_persistence_degraded.py`,
+`tests/unit/distributed/raft/test_raft_snapshot_install.py`). WAL corruption
+is met (2026-10-06, b75eb7ea): `NodeWAL` cuts only a torn tail (nothing
+written after the damaged frame) and refuses anything else, logging
+`WALUntrustworthy` and raising `WALUntrustworthyError` out of node start
+with the file left as found (`hyperscale/distributed/ledger/wal/node_wal.py`,
+AD-38 Part 3.2); the Raft store applies the same torn-last-frame rule and
+sets an untrustworthy disk aside (D1). Test:
+`tests/unit/distributed/ledger/wal/test_node_wal_damage_vopr.py`.
+
 ## 11. Continuous safety invariants
 
 These run every `invariant_poll_interval` (default 100 ms) for the entire
 lifetime of any scenario above. Any violation fails the scenario
 immediately, regardless of which fault path is being exercised.
+
+*Status:* the checker exists (`tests/simulation/harness/invariants.py`,
+poll interval `HarnessTimeouts.invariant_poll_interval = 0.1`), but only two
+continuous invariants are implemented: `at_most_one_job_leader_per_job`
+(`:246`) and the liveness check `cluster_membership_progress` (`:282`).
+Leader exclusivity, terminal reach and execution counts are checked
+post-hoc by the VOPR oracles (`tests/simulation/oracle/cluster_trace_oracle.py`),
+and core accounting post-hoc by `test_worker_core_accounting.py`. The rest
+of this list is not checked continuously.
 
 - **At most one leader per DC** at any moment.
 - **At most one job-leader per job** at any moment.

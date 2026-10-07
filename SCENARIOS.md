@@ -389,13 +389,9 @@ Gate <-> Manager Scenarios (Comprehensive)
 14.1 Job Leases
 - Lease acquisition - Verify _job_lease_manager grants lease
 - Lease renewal - Verify lease extended before expiry
-- Lease expiry - Verify on_lease_expired callback
-- Lease cleanup - Verify _lease_cleanup_loop removes expired
-14.2 Datacenter Leases
-- DC lease acquisition - Verify _dc_lease_manager grants lease
-- Lease transfer - Gate transfers lease to peer; verify LeaseTransfer handling
-- Lease transfer ack - Verify LeaseTransferAck
-- Fence token increment - Verify next_fence_token() on operations
+- Lease expiry - Verify an expired lease is dropped (the `on_lease_expired` hook was removed 2026-10-06: with lease import/export gone every lease is the local gate's own; gate orphan detection is SWIM gate failure)
+- Lease cleanup - Verify `JobLeaseManager.run_cleanup` (TaskRunner loop, `leases/job_lease_manager.py:189`) removes expired leases
+14.2 Datacenter Leases -- *removed 2026-10-06.* The datacenter lease subsystem (`DatacenterLeaseManager`, `LeaseTransfer`/`LeaseTransferAck`, the gate `lease_transfer` handler) was never acquired and is deleted; at-most-once DC dispatch comes from per-job gate leadership and fencing (`GateJobReplica`), AD-40 idempotency, and manager-side fencing. Scenarios for it no longer apply.
 ---
 15. Quorum & Consistency
 15.1 Quorum Checking
@@ -746,18 +742,13 @@ Manager <-> Worker Scenarios (Comprehensive)
 - Error reporting - Report partial cancellation
 ---
 15. Quorum Protocol
-15.1 Provision Quorum
-- Request provision - Manager requests quorum for workflow
-- Peer confirmation - Peers confirm resource reservation
-- Quorum achieved - Proceed with dispatch
-- Quorum failed - Reject dispatch
+*2026-10-05: the `Provision*` request/commit protocol was deleted (REMAINING_WORK_PLAN D5) -- nothing sent it. Per-dispatch quorum is the AD-3 job leader plus quorum replication of job state before each dispatch (`_replicate_job_state_for_dispatch`, `nodes/manager/server.py`). The scenarios below are restated for that path.*
+15.1 Dispatch Quorum
+- Job state replicated - Dispatch proceeds only after job state (context, layer version) reaches a quorum
+- Quorum failed - Dispatch refused, not sent
 15.2 Quorum Calculation
 - Quorum size - (peers + 1) // 2 + 1
-- Confirmation tracking - Track confirming nodes
 - Timeout handling - Don't wait forever for quorum
-15.3 Provision Cleanup
-- Clear pending - Remove from _pending_provisions
-- Clear confirmations - Remove from _provision_confirmations
 ---
 16. Stats & Metrics
 16.1 Dispatch Throughput
@@ -1376,7 +1367,7 @@ Race Conditions Under Load
 
 41.18 Rate Limiting and Version Skew (AD-24, AD-25)
 - Client rate limit exceeded - 429 with Retry-After returned
-- Server-side limit enforced - Per-client token bucket honored
+- Server-side limit enforced - Per-client, per-operation sliding-window limit honored (`SlidingWindowCounter`; the token bucket was deleted)
 - Mixed protocol versions - Feature negotiation uses min version
 - Unknown fields ignored - Forward compatibility maintained
 - Major version mismatch - Connection rejected
@@ -1424,11 +1415,11 @@ Race Conditions Under Load
 - Backoff under recovery - Avoids thundering herd
 
 41.25 Global Job Ledger Consistency (AD-38)
-- Cancellation beats completion - Conflict resolution honors cancel
+- Cancellation beats completion - A terminal state is final: replay and live apply refuse events for a terminal job (`JobEventApplier`); there is no merge, because each job's events are ordered by one Raft log
 - Higher fence token wins - Later operation dominates
 - HLC ordering - Causal sequence preserved across gates
 - Regional vs global durability - Workflow dispatch not blocked by ledger
-- Ledger repair - Merkle mismatch triggers anti-entropy
+- Ledger repair - A lagging replica catches up through Raft log repair and snapshot install (Merkle anti-entropy is not the design)
 
 41.26 Logger WAL Extensions (AD-39)
 - FSYNC batch overflow - Error surfaced in WAL mode

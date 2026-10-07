@@ -1,5 +1,7 @@
 # Refactor Plan: Gate/Manager/Worker Servers
 
+> **Status (checked 2026-10-06).** One class per file holds across `hyperscale/distributed` (lint `tests/simulation/lints/test_one_class_per_file.py`). Dataclass placement and `slots=True` are held by the ratchet `test_dataclass_conventions.py`; node config dataclasses (e.g. `nodes/client/config.py::ClientConfig`, `nodes/manager/config.py::ManagerConfig`, `nodes/worker/config.py::WorkerConfig`) still sit outside `models/`. Complexity: see the constraint below. **Lines of code grew, not shrank:** the complexity splits added methods in place, so `nodes/manager/server.py` is ~14,600 lines (10,810 in 2026-08), `nodes/gate/server.py` ~10,100 (6,901) and `swim/health_aware_server.py` ~7,600 (6,547); moving those domains into composed classes (REMAINING_WORK_PLAN Phase 8) has not started.
+
 ## Goals
 - Enforce one-class-per-file across gate/manager/worker/client code.
 - Group related logic into cohesive submodules with explicit boundaries.
@@ -14,7 +16,7 @@
 - Dataclasses must be defined in `models/` submodules and declared with `slots=True`.
 - Keep async patterns, TaskRunner usage, and logging patterns intact.
 - Avoid new architectural behavior changes while splitting files.
-- Maximum cyclic complexity of 5 for classes and 4 for functions.
+- ~~Maximum cyclic complexity of 5 for classes and 4 for functions.~~ Superseded (REMAINING_WORK_PLAN D7): the ceiling is **3** per function, as CLAUDE.md states, enforced by the ratchet `tests/simulation/lints/test_complexity_ceiling.py` (`COMPLEXITY_CEILING = 3`) against a snapshot of current violators (1,566 functions, 244 under `hyperscale/distributed`, as of 2026-10-06). Owner decision 2026-10-06 (path-heat rule): per-message hot paths -- transport send/receive, SWIM per-datagram, Raft per-heartbeat, state embedders -- stay inlined; the control plane decomposes to ≤ 3.
 - Examine AD-10 through AD-37 in architecture.md. DO NOT BREAK COMPLIANCE with any of these.
 - Once you have generated a file or refactored any function/method/tangible unit of code, generate a commit.
 

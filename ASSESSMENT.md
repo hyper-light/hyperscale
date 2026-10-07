@@ -1,5 +1,7 @@
 # Hyperscale — Project Assessment
 
+> **Superseded 2026-10-06.** This report is a historical snapshot (graded 2026-08-21, revised 2026-08-23). Its Partial/Absent rows were regraded against the current code in `docs/REMAINING_LEDGER.md` (Built / Doc-obsolete / Still Partial / Still Absent, with file:line receipts), and the work list is `docs/REMAINING_WORK_PLAN.md`. Many items below are closed since (e.g. F_FULLFSYNC, FIX.md §1.1/§1.2, AD-38 read consistency, the dormant manager coordinators); read the ledger before citing anything here.
+
 *Written 2026-08-21, the way an incoming tech lead would report after a first deep week. **Revised 2026-08-23** — see §0. Graded evidence only: every verdict below is "the doc's own acceptance bar vs. the code", never generic best practice. Receipts are `file:line`. Full graded ledgers (450 rows covering ~540 extracted promises, plus three delta re-verifications) live in `.scratch/assess-project/` — `promises/` (what the docs claim, quoted verbatim), `reality/` (what six code surveys found), `grades/` (the row-by-row verdicts with searches recorded).*
 
 **Headline verdicts: Built 263 · Partial 149 · Absent 37** (one N/A), as first graded. The revision moves a handful of rows in both directions — itemized in §0 rather than silently re-totalled, since only the changed areas were re-derived. Nothing graded was pure vaporware at the module level — the recurring failure mode is not "missing code" but **"built and never wired"**, followed by **"doc froze while code moved on."**

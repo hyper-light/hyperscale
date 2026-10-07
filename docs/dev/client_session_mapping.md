@@ -32,11 +32,11 @@ as `client_id:sequence:nonce`. `IdempotencyKeyGenerator` draws
 `sequence` from a monotone counter and a fresh 8-byte `nonce` per
 generator instance; the client constructs it with
 `client_id=f"{host}:{port}"`
-(`hyperscale/distributed/nodes/client/client.py`, ~line 205).
+(`hyperscale/distributed/nodes/client/client.py`, ~line 234).
 
 The load-bearing property is IDENTITY PER LOGICAL SUBMISSION, pinned at
 the submission builder (`hyperscale/distributed/nodes/client/
-submission.py`, ~line 308): one key is minted per logical `submit_job`
+submission.py`, ~line 367): one key is minted per logical `submit_job`
 call and the retry loop REUSES the same message across managers and
 leader redirects — a cross-manager retry of one call cannot duplicate
 the job, because every manager dedups on the same key.
@@ -60,7 +60,7 @@ order and the oracle that judges it landed in `57592233`.
 ## Reply cache ↔ manager idempotency ledger + durable JobLedger
 
 The manager's submission chokepoint
-(`hyperscale/distributed/nodes/manager/server.py`, ~lines 8705-8970)
+(`hyperscale/distributed/nodes/manager/server.py`, `job_submission` at ~line 11017; the ledger check at ~line 11535)
 implements the reply-cache contract:
 
 1. A duplicate key with a stored result returns the ORIGINAL serialized
@@ -72,8 +72,10 @@ implements the reply-cache contract:
    serialized response afterward.
 
 `hyperscale/distributed/idempotency/manager_ledger.py` persists every
-transition through the storage seam (`append_fsync`, length-prefixed
-frames) and replays the WAL on start, tolerating a torn tail — so the
+transition through the storage seam (`append_fsync`; since 2026-10-05 an
+`HSIL` format header and CRC-checked `[crc32][length][entry]` frames, an
+unrecognized file set aside) and replays the WAL on start up to the first
+torn or damaged frame, preserving the bytes after it — so the
 dedup window survives manager power loss. The disk_full VOPR events
 exercise exactly this surface: a manager that cannot persist the
 reservation must REJECT the submission loudly
