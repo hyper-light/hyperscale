@@ -36,7 +36,6 @@ from hyperscale.distributed.reliability.load_shedding import (
 from hyperscale.distributed.reliability.rate_limiting import (
     AdaptiveRateLimitConfig,
     ServerRateLimiter,
-    CooperativeRateLimiter,
 )
 from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
@@ -230,16 +229,6 @@ class TestResourceExhaustion:
         assert granted is False
         assert "exceeded" in reason.lower()
         assert tracker.is_exhausted is True
-
-    def test_cooperative_limiter_blocked_state(self):
-        """Test cooperative rate limiter blocked state."""
-        limiter = CooperativeRateLimiter()
-
-        # Block for 1 second
-        limiter.handle_rate_limit("operation", retry_after=1.0)
-
-        assert limiter.is_blocked("operation") is True
-        assert limiter.get_retry_after("operation") > 0.9
 
     @pytest.mark.asyncio
     async def test_sustained_load_shedding(self):
@@ -1067,27 +1056,6 @@ class TestRecoveryPatterns:
         response = manager.handle_extension_request(request, time.time() + 30)
         assert response.granted is True
 
-    def test_cooperative_limiter_clear_recovery(self):
-        """Test cooperative rate limiter recovery via clear."""
-        limiter = CooperativeRateLimiter()
-
-        # Block multiple operations
-        limiter.handle_rate_limit("op1", retry_after=10.0)
-        limiter.handle_rate_limit("op2", retry_after=10.0)
-
-        assert limiter.is_blocked("op1") is True
-        assert limiter.is_blocked("op2") is True
-
-        # Clear specific operation
-        limiter.clear("op1")
-        assert limiter.is_blocked("op1") is False
-        assert limiter.is_blocked("op2") is True
-
-        # Clear all
-        limiter.clear()
-        assert limiter.is_blocked("op2") is False
-
-
 # =============================================================================
 # Concurrent Access Safety Tests
 # =============================================================================
@@ -1163,25 +1131,6 @@ class TestClockSkewTimeBased:
 
         # Should still calculate correctly (even if result is in past)
         assert new_deadline == past_deadline + extension_seconds
-
-    def test_cooperative_limiter_retry_after_zero(self):
-        """Test cooperative limiter with zero retry_after."""
-        limiter = CooperativeRateLimiter()
-
-        limiter.handle_rate_limit("operation", retry_after=0.0)
-
-        # Should not be blocked (or minimally blocked)
-        assert limiter.get_retry_after("operation") <= 0.001
-
-    def test_cooperative_limiter_very_long_retry(self):
-        """Test cooperative limiter with very long retry_after."""
-        limiter = CooperativeRateLimiter()
-
-        # 1 hour retry
-        limiter.handle_rate_limit("operation", retry_after=3600.0)
-
-        assert limiter.is_blocked("operation") is True
-        assert limiter.get_retry_after("operation") > 3599.0
 
 # =============================================================================
 # Data Structure Invariant Tests
@@ -1460,23 +1409,6 @@ class TestBackpressurePropagation:
         assert result.allowed is False
         assert result.retry_after_seconds > 0
 
-    @pytest.mark.asyncio
-    async def test_cooperative_limiter_respects_backpressure(self):
-        """Test cooperative limiter properly waits on backpressure."""
-        limiter = CooperativeRateLimiter()
-
-        # Set up backpressure
-        limiter.handle_rate_limit("operation", retry_after=0.1)
-
-        start = time.monotonic()
-        wait_time = await limiter.wait_if_needed("operation")
-        elapsed = time.monotonic() - start
-
-        # Should have waited approximately the retry_after time
-        assert wait_time > 0.05
-        assert elapsed > 0.05
-
-
 # =============================================================================
 # Metric Cardinality Explosion Tests
 # =============================================================================
@@ -1696,19 +1628,6 @@ class TestIdempotency:
         manager.on_worker_removed("worker-1")
 
         assert manager.tracked_worker_count == 0
-
-    def test_cooperative_limiter_clear_idempotent(self):
-        """Test cooperative limiter clear is idempotent."""
-        limiter = CooperativeRateLimiter()
-
-        limiter.handle_rate_limit("op1", retry_after=10.0)
-
-        # Multiple clears
-        limiter.clear("op1")
-        limiter.clear("op1")
-        limiter.clear("op1")
-
-        assert limiter.is_blocked("op1") is False
 
 # =============================================================================
 # Edge Cases in Priority and State Transitions

@@ -12766,19 +12766,14 @@ their arithmetic are in `docs/architecture/AD_24.md` (2026-10-06).
 
 #### Client-Side Cooperation
 
-The `CooperativeRateLimiter` enables clients to respect server rate limits:
-
-```python
-limiter = CooperativeRateLimiter()
-
-# Before sending request
-await limiter.wait_if_needed("job_submit")
-
-# After receiving 429 response
-if response.status == 429:
-    retry_after = float(response.headers.get("Retry-After", 1.0))
-    limiter.handle_rate_limit("job_submit", retry_after)
-```
+The client honors the server's hint directly: `ClientJobSubmitter`
+(`hyperscale/distributed/nodes/client/submission.py`, `_backoff_before_retry`)
+waits out a refusal's `retry_after_seconds`, jittered upward so clients refused
+together do not return together, including after the last refused attempt
+before the failure is raised. An un-hinted transient refusal waits an
+exponential, equal-jittered back-off. (2026-10-06: the unused
+`CooperativeRateLimiter` and `execute_with_rate_limit_retry` helpers were
+deleted; no node or client called them.)
 
 #### Key Files
 

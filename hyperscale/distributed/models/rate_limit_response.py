@@ -17,7 +17,7 @@ class RateLimitResponse(Message):
     1. Client sends request via TCP
     2. Server checks rate limit for client_id (from addr) + operation
     3. If exceeded, returns RateLimitResponse with retry_after
-    4. Client waits and retries (using CooperativeRateLimiter)
+    4. Client waits out retry_after and retries (ClientJobSubmitter)
 
     Integration:
     - Gate: Rate limits job_submit, job_status, cancel, workflow_query

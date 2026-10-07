@@ -1169,7 +1169,6 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/distributed/reliability/hybrid_overload_detector.py::HybridOverloadDetector.record_latency': 5,
     'hyperscale/distributed/reliability/load_shedder.py::LoadShedder._overload_state': 6,
     'hyperscale/distributed/reliability/message_class.py::classify_handler': 5,
-    'hyperscale/distributed/reliability/rate_limiting.py::execute_with_rate_limit_retry': 12,
     'hyperscale/distributed/reliability/retry.py::calculate_jittered_delay': 5,
     'hyperscale/distributed/reliability/retry_executor.py::RetryExecutor.__init__': 4,
     'hyperscale/distributed/reliability/retry_executor.py::RetryExecutor.calculate_delay': 4,

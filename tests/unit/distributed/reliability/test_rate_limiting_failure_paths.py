@@ -19,19 +19,12 @@ import time
 from hyperscale.distributed.reliability import (
     AdaptiveRateLimitConfig,
     AdaptiveRateLimiter,
-    CooperativeRateLimiter,
     HybridOverloadDetector,
     OverloadConfig,
     OverloadState,
     RateLimitResult,
     ServerRateLimiter,
     SlidingWindowCounter,
-)
-from hyperscale.distributed.reliability.rate_limiting import (
-    RateLimitRetryConfig,
-    RateLimitRetryResult,
-    execute_with_rate_limit_retry,
-    is_rate_limit_response,
 )
 from hyperscale.distributed.reliability.load_shedding import RequestPriority
 from hyperscale.distributed.models import RateLimitResponse
@@ -338,198 +331,6 @@ class TestServerRateLimiterFailurePaths:
         assert result.allowed is False
 
 
-class TestCooperativeRateLimiterFailurePaths:
-    """Test failure paths in CooperativeRateLimiter."""
-
-    @pytest.mark.asyncio
-    async def test_wait_when_not_blocked(self) -> None:
-        """Test wait returns immediately when not blocked."""
-        limiter = CooperativeRateLimiter()
-
-        start = time.monotonic()
-        waited = await limiter.wait_if_needed("unblocked_op")
-        elapsed = time.monotonic() - start
-
-        assert waited == 0.0
-        assert elapsed < 0.01
-
-    @pytest.mark.asyncio
-    async def test_handle_rate_limit_with_zero(self) -> None:
-        """Test handling rate limit with zero retry_after."""
-        limiter = CooperativeRateLimiter()
-
-        limiter.handle_rate_limit("zero_op", retry_after=0.0)
-
-        assert limiter.is_blocked("zero_op") is False
-
-    @pytest.mark.asyncio
-    async def test_handle_rate_limit_with_negative(self) -> None:
-        """Test handling rate limit with negative retry_after."""
-        limiter = CooperativeRateLimiter()
-
-        limiter.handle_rate_limit("negative_op", retry_after=-1.0)
-
-        assert limiter.is_blocked("negative_op") is False
-
-    @pytest.mark.asyncio
-    async def test_concurrent_wait_same_operation(self) -> None:
-        """Test concurrent waits on same operation."""
-        limiter = CooperativeRateLimiter()
-
-        limiter.handle_rate_limit("concurrent_op", retry_after=0.1)
-
-        start = time.monotonic()
-        wait_times = await asyncio.gather(
-            *[limiter.wait_if_needed("concurrent_op") for _ in range(5)]
-        )
-        elapsed = time.monotonic() - start
-
-        assert elapsed < 0.2
-        assert all(w >= 0 for w in wait_times)
-
-    def test_get_retry_after_not_blocked(self) -> None:
-        """Test get_retry_after for unblocked operation."""
-        limiter = CooperativeRateLimiter()
-
-        remaining = limiter.get_retry_after("not_blocked")
-        assert remaining == 0.0
-
-    def test_handle_none_retry_after_uses_default(self) -> None:
-        """Test that None retry_after uses default backoff."""
-        limiter = CooperativeRateLimiter(default_backoff=2.5)
-
-        limiter.handle_rate_limit("default_op", retry_after=None)
-
-        remaining = limiter.get_retry_after("default_op")
-        assert remaining == pytest.approx(2.5, rel=0.1)
-
-
-class TestRateLimitRetryFailurePaths:
-    """Test failure paths in rate limit retry mechanism."""
-
-    @pytest.mark.asyncio
-    async def test_exhausted_retries(self) -> None:
-        """Test behavior when retries are exhausted."""
-        limiter = CooperativeRateLimiter()
-        config = RateLimitRetryConfig(max_retries=2, max_total_wait=10.0)
-
-        call_count = 0
-
-        async def always_rate_limited():
-            nonlocal call_count
-            call_count += 1
-            return RateLimitResponse(
-                operation="test",
-                retry_after_seconds=0.01,
-            ).dump()
-
-        result = await execute_with_rate_limit_retry(
-            always_rate_limited,
-            "test_op",
-            limiter,
-            config,
-        )
-
-        assert result.success is False
-        assert call_count == 3  # Initial + 2 retries
-
-    @pytest.mark.asyncio
-    async def test_max_total_wait_exceeded(self) -> None:
-        """Test behavior when max total wait time is exceeded."""
-        limiter = CooperativeRateLimiter()
-        config = RateLimitRetryConfig(max_retries=10, max_total_wait=0.1)
-
-        async def long_rate_limit():
-            return RateLimitResponse(
-                operation="test",
-                retry_after_seconds=1.0,
-            ).dump()
-
-        result = await execute_with_rate_limit_retry(
-            long_rate_limit,
-            "test_op",
-            limiter,
-            config,
-        )
-
-        assert result.success is False
-        assert (
-            "exceed" in result.final_error.lower()
-            or "max" in result.final_error.lower()
-        )
-
-    @pytest.mark.asyncio
-    async def test_operation_exception(self) -> None:
-        """Test handling of operation exception."""
-        limiter = CooperativeRateLimiter()
-
-        async def failing_operation():
-            raise ConnectionError("Network failure")
-
-        result = await execute_with_rate_limit_retry(
-            failing_operation,
-            "test_op",
-            limiter,
-        )
-
-        assert result.success is False
-        assert "Network failure" in result.final_error
-
-    @pytest.mark.asyncio
-    async def test_successful_operation_no_retries(self) -> None:
-        """Test successful operation without rate limiting."""
-        limiter = CooperativeRateLimiter()
-
-        async def successful_operation():
-            return b'{"status": "ok"}'
-
-        def not_rate_limited(data):
-            return False
-
-        result = await execute_with_rate_limit_retry(
-            successful_operation,
-            "test_op",
-            limiter,
-            response_parser=not_rate_limited,
-        )
-
-        assert result.success is True
-        assert result.retries == 0
-        assert result.total_wait_time == 0.0
-
-
-class TestRateLimitResponseDetection:
-    """Test rate limit response detection."""
-
-    def test_is_rate_limit_response_valid(self) -> None:
-        """Test detection of valid rate limit response."""
-        data = b'{"operation": "test", "retry_after_seconds": 1.0, "allowed": false}'
-
-        result = is_rate_limit_response(data)
-        assert result is True
-
-    def test_is_rate_limit_response_too_short(self) -> None:
-        """Test rejection of too-short data."""
-        data = b"short"
-
-        result = is_rate_limit_response(data)
-        assert result is False
-
-    def test_is_rate_limit_response_empty(self) -> None:
-        """Test rejection of empty data."""
-        data = b""
-
-        result = is_rate_limit_response(data)
-        assert result is False
-
-    def test_is_rate_limit_response_non_rate_limit(self) -> None:
-        """Test rejection of non-rate-limit response."""
-        data = b'{"job_id": "123", "status": "completed", "some_other_field": true}'
-
-        result = is_rate_limit_response(data)
-        assert result is False
-
-
 class TestAdaptiveRateLimitConfigEdgeCases:
     """Test edge cases in AdaptiveRateLimitConfig."""
 
@@ -598,32 +399,6 @@ class TestRateLimitRecovery:
         metrics_after = limiter.get_metrics()
         assert metrics_after["total_requests"] == 0
         assert metrics_after["rate_limited_requests"] == 0
-
-    @pytest.mark.asyncio
-    async def test_cooperative_limiter_recovery_after_block(self) -> None:
-        """Test cooperative limiter unblocks after time."""
-        limiter = CooperativeRateLimiter()
-
-        limiter.handle_rate_limit("recover_op", retry_after=0.1)
-        assert limiter.is_blocked("recover_op") is True
-
-        await asyncio.sleep(0.15)
-
-        assert limiter.is_blocked("recover_op") is False
-
-    @pytest.mark.asyncio
-    async def test_multiple_operations_independent(self) -> None:
-        """Test that rate limits on different operations are independent."""
-        limiter = CooperativeRateLimiter()
-
-        limiter.handle_rate_limit("blocked_op", retry_after=10.0)
-
-        assert limiter.is_blocked("blocked_op") is True
-        assert limiter.is_blocked("other_op") is False
-
-        waited = await limiter.wait_if_needed("other_op")
-        assert waited == 0.0
-
 
 class TestServerRateLimiterCheckEdgeCases:
     """Test edge cases for ServerRateLimiter.check() compatibility method."""
