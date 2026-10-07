@@ -51,7 +51,7 @@ SERVER_VERIFICATION_BY_SETTING: dict[bool, tuple[bool, ssl.VerifyMode]] = {
 def setup_client(
     client: T,
     vus: int,
-    pages: Optional[int] = None,
+    pages: int = 1,
     cert_path: Optional[str] = None,
     key_path: Optional[str] = None,
     reset_connections: bool = False,
