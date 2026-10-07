@@ -14,11 +14,13 @@ requests, and newly registered addresses back across the barrier.
 Wire protocol (tuples, ``multiprocessing``-picklable):
 
 - child -> coordinator, once after setup:
-  ``("READY", addresses, next_event_time, outbound, spawn_requests)``
+  ``("READY", addresses, next_event_time, outbound, spawn_requests,
+  new_result_rows)``
 - coordinator -> child:
   ``("GRANT", deadline, inbound, process_events)`` | ``("STOP",)``
 - child -> coordinator, per grant:
-  ``("REPORT", next_event_time, outbound, spawn_requests, new_addresses)``
+  ``("REPORT", next_event_time, outbound, spawn_requests, new_addresses,
+  new_result_rows)``
 - child -> coordinator, at shutdown: ``("RESULT", result)``
 
 where ``outbound`` items are ``(send_time, src_sockname, dst_addr,
@@ -34,6 +36,10 @@ the route map grows incrementally); and ``process_events`` items are
 ``(kill_time, process_id, exitcode)`` — fault-injected deaths, made
 visible to this process's exit-code snapshot at exactly ``kill_time``
 so the production pool-health polling observes them on virtual time.
+``new_result_rows`` are the rows the entry appended to its published
+result log since the previous barrier (``ResultRowCursor``) — what the
+coordinator's event-triggered faults (``schedule_on_event``) observe
+mid-run.
 """
 
 import asyncio
@@ -51,6 +57,7 @@ from tests.simulation.harness.sim.sim_system_resources import SimSystemResources
 from tests.simulation.harness.sim.simulation_loop import SimulationLoop
 from tests.simulation.harness.sim.virtual_clock import VirtualClock
 from .child_context import ChildContext, CrossProcessTransport
+from .result_row_cursor import ResultRowCursor
 
 
 def _audit_seam_bindings(virtual_clock, seeded_random, sim_filesystem) -> list:
@@ -156,6 +163,7 @@ def run_child_loop(
     # with the addresses this process hosts (the coordinator's routing
     # map) and any children the setup itself requested.
     next_event_time = loop.run_window(start_time)
+    result_row_cursor = ResultRowCursor()
     conn.send(
         (
             "READY",
@@ -163,6 +171,7 @@ def run_child_loop(
             next_event_time,
             transport.drain_outbound(),
             transport.drain_spawn_requests(),
+            result_row_cursor.drain(context.result),
         )
     )
 
@@ -224,6 +233,7 @@ def run_child_loop(
                     transport.drain_outbound(),
                     transport.drain_spawn_requests(),
                     transport.drain_new_addresses(),
+                    result_row_cursor.drain(context.result),
                 )
             )
     finally:

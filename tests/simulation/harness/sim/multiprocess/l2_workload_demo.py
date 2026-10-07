@@ -53,6 +53,11 @@ ids, snowflakes, or error text — so identical-seed runs compare equal:
   ``ClusterTraceOracle.check_workflow_execution`` consumes), sampled
   at 0.25s, plus the ``worker_entry``-compatible ``worker-started`` /
   ``manager-healthy`` / ``("workflows-active", count, t)`` milestones.
+* worker: ``("workflow-deadline-armed", name, armed_at, timeout)``
+  logged with a workflow's ``workflow-started`` row when the worker
+  armed its local execution deadline — ``armed_at`` is the EXACT
+  instant the stuck-workflow enforcement measures elapsed from (not
+  the 0.25s-quantized sample instant), so deadline bounds are exact.
 
 Lives in an importable module because ``spawn`` re-imports the child
 entries by module + qualname; the workflow classes are function-local
@@ -430,8 +435,8 @@ def dag_worker_entry(
                     )
                 )
 
-            named_active = {
-                workflow_name
+            workflow_ids_by_name = {
+                workflow_name: workflow_id
                 for workflow_id in worker._active_workflows
                 if (
                     workflow_name := (
@@ -442,6 +447,7 @@ def dag_worker_entry(
                 )
                 is not None
             }
+            named_active = set(workflow_ids_by_name)
             for workflow_name in sorted(named_active - last_named_active):
                 log.append(
                     (
@@ -450,6 +456,22 @@ def dag_worker_entry(
                         round(context.loop.time(), 6),
                     )
                 )
+                started_workflow_id = workflow_ids_by_name[workflow_name]
+                if (
+                    deadline_armed_at := worker._worker_state._workflow_start_times.get(
+                        started_workflow_id
+                    )
+                ) is not None:
+                    log.append(
+                        (
+                            "workflow-deadline-armed",
+                            workflow_name,
+                            round(deadline_armed_at, 6),
+                            worker._worker_state._workflow_timeout_seconds[
+                                started_workflow_id
+                            ],
+                        )
+                    )
             for workflow_name in sorted(last_named_active - named_active):
                 log.append(
                     (

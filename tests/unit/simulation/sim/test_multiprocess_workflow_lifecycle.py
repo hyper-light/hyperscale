@@ -47,6 +47,8 @@ the one job teardown releases its queue entries and dispatch loop with
 the job. Each scenario has a replay twin.
 """
 
+import pytest
+
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.job_dispatch_demo import (
     dispatch_client_entry,
@@ -71,12 +73,23 @@ _CLEAN_SEED = 23
 _CLEAN_CEILING = 40.0
 
 _RETRY_SEED = 23
+# The original seed first, then a sweep of schedules whose workflow
+# start times differ (probed 2026-10-06).
+_RETRY_SWEEP_SEEDS = (_RETRY_SEED, 1, 4, 9, 14)
 _RETRY_CEILING = 90.0
-# 0.25 after worker-a's activation (probed 7.5, 2026-10-04; 11.75 while a
-# lone manager waited out a full pre-vote and vote wait for a majority its
-# own vote already made); worker-b starts 13s after the loss, as before.
-_KILL_AT = 7.75
-_WORKER_B_START = _KILL_AT + 13.0
+_LATENCY = 0.01
+# Worker-a dies one coordinator latency after it reports the workflow
+# active -- an EVENT-TRIGGERED kill, mid-run under every schedule (the
+# ping workflow runs ~0.5-0.75s and its start moves with each seed's
+# startup/election timing: a kill pinned at virtual 7.75 found the job
+# already completed under other schedules). Worker-b is admitted 13s
+# after the loss, as before.
+_WORKER_B_JOIN_DELAY_SECONDS = 13.0
+_WORKER_A_PROCESS_IDS = (
+    "worker-a",
+    "executor-sim-wkr-a-9009",
+    "executor-sim-wkr-a-9011",
+)
 
 _DAG_SEED = 79
 _DAG_CEILING = 120.0
@@ -149,10 +162,38 @@ def _run_clean() -> dict:
     return coordinator.run()
 
 
-def _run_worker_loss() -> dict:
+def _is_workflow_activation(row: tuple) -> bool:
+    """A worker milestone showing a workflow active on it."""
+    return row[0] == "workflows-active" and row[1] > 0
+
+
+def _run_worker_loss(seed: int = _RETRY_SEED) -> tuple[dict, dict[str, float]]:
+    """Run the worker-loss scenario; returns its results and the fault
+    instants the activation trigger derived (``kill_at``,
+    ``worker_b_start``)."""
     coordinator = SimulationCoordinator(
-        latency=0.01, max_virtual_time=_RETRY_CEILING, seed=_RETRY_SEED
+        latency=_LATENCY, max_virtual_time=_RETRY_CEILING, seed=seed
     )
+    fault_instants: dict[str, float] = {}
+
+    def kill_worker_a_mid_run(activation_row: tuple) -> None:
+        kill_at = activation_row[2] + _LATENCY
+        worker_b_start = kill_at + _WORKER_B_JOIN_DELAY_SECONDS
+        fault_instants.update(kill_at=kill_at, worker_b_start=worker_b_start)
+        for process_id in _WORKER_A_PROCESS_IDS:
+            coordinator.schedule_kill(process_id, at_time=kill_at)
+        coordinator.schedule_admission(
+            "worker-b",
+            worker_b_start,
+            worker_entry,
+            "sim-wkr-b",
+            9000,
+            9001,
+            "sim-dc",
+            ("sim-mgr", 9000),
+            2,
+        )
+
     coordinator.add_process(
         "manager", lifecycle_manager_entry, "sim-mgr", 9000, 9001, "sim-dc"
     )
@@ -160,23 +201,12 @@ def _run_worker_loss() -> dict:
         "worker-a", worker_entry, "sim-wkr-a", 9000, 9001, "sim-dc", ("sim-mgr", 9000), 2
     )
     coordinator.add_process(
-        "worker-b",
-        worker_entry,
-        "sim-wkr-b",
-        9000,
-        9001,
-        "sim-dc",
-        ("sim-mgr", 9000),
-        2,
-        _WORKER_B_START,
-    )
-    coordinator.add_process(
         "client", dispatch_client_entry, "sim-cli", 9500, ("sim-mgr", 9000)
     )
-    coordinator.schedule_kill("worker-a", at_time=_KILL_AT)
-    coordinator.schedule_kill("executor-sim-wkr-a-9009", at_time=_KILL_AT)
-    coordinator.schedule_kill("executor-sim-wkr-a-9011", at_time=_KILL_AT)
-    return coordinator.run()
+    coordinator.schedule_on_event(
+        "worker-a", _is_workflow_activation, kill_worker_a_mid_run
+    )
+    return coordinator.run(), fault_instants
 
 
 def _build_dag() -> SimulationCoordinator:
@@ -405,8 +435,9 @@ def test_clean_lifecycle_is_replay_deterministic():
     assert _run_clean() == _run_clean()
 
 
-def test_a_workflow_lost_with_its_worker_takes_the_retry_chain_and_completes():
-    results = _run_worker_loss()
+@pytest.mark.parametrize("seed", _RETRY_SWEEP_SEEDS)
+def test_a_workflow_lost_with_its_worker_takes_the_retry_chain_and_completes(seed: int):
+    results, fault_instants = _run_worker_loss(seed)
     manager_log = results["manager"]
     oracle = WorkflowLifecycleOracle()
 
@@ -438,8 +469,8 @@ def test_a_workflow_lost_with_its_worker_takes_the_retry_chain_and_completes():
     ], entered
     # The failure follows the kill; the retry's dispatch waits for the
     # late worker.
-    assert history[chain_start][2] > _KILL_AT, history
-    assert history[chain_start + len(_RETRY_CHAIN)][2] > _WORKER_B_START, history
+    assert history[chain_start][2] > fault_instants["kill_at"], history
+    assert history[chain_start + len(_RETRY_CHAIN)][2] > fault_instants["worker_b_start"], history
 
 
 def test_worker_loss_lifecycle_is_replay_deterministic():

@@ -2202,7 +2202,60 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     # === Message Size Helpers ===
 
-    def _add_piggyback_safe(self, base_message: bytes) -> bytes:
+    def _membership_piggyback(self, base_message: bytes, buddy_entry: bytes) -> bytes:
+        """The membership gossip section for ``base_message``: ``buddy_entry``
+        first (its room reserved ahead of the gossip buffer's selection),
+        then the buffer's own updates, all within the UDP MTU."""
+        buddy_reservation = self._buddy_reservation(base_message, buddy_entry)
+        membership_piggyback = self._gossip_buffer.encode_piggyback_with_base(
+            base_message + buddy_reservation
+        )
+        if not buddy_reservation:
+            return membership_piggyback
+        if membership_piggyback:
+            return membership_piggyback + GossipBuffer.ENTRY_SEPARATOR + buddy_entry
+        return GossipBuffer.MEMBERSHIP_SEPARATOR + buddy_entry
+
+    @staticmethod
+    def _buddy_reservation(base_message: bytes, buddy_entry: bytes) -> bytes:
+        """The bytes ``buddy_entry`` adds to a membership section; empty when
+        there is none or it cannot fit beside ``base_message``."""
+        reservation = (
+            GossipBuffer.MEMBERSHIP_SEPARATOR + GossipBuffer.ENTRY_SEPARATOR + buddy_entry
+            if buddy_entry
+            else b""
+        )
+        return reservation if len(base_message) + len(reservation) <= MAX_UDP_PAYLOAD else b""
+
+    def _buddy_suspicion_entry(self, target: tuple[str, int], message: bytes) -> bytes:
+        """The suspicion a probe to ``target`` must carry, encoded; empty when
+        the message is no probe or ``target`` is not suspected here.
+
+        Lifeguard's buddy system (memberlist ``probeNode``): a member that
+        PROBES a node it suspects tells that node so on the probe itself.
+        Gossip alone can spend a suspicion's broadcasts on members that
+        already hold it — measured (gate peer isolation, seed 220): a
+        manager learned "gate-c suspect" from a cut peer at 13.356, burned
+        all 5 broadcasts by 14.28 on acks to other gates, probed gate-c at
+        17.42 and 20.48 without telling it, and committed it DEAD at 21.947
+        — a live, directly reachable gate that never got the chance to
+        refute (it learned only from the DEAD gossip at 24.8).
+        """
+        if not message.startswith(b"probe:"):
+            return b""
+        suspected_incarnation = self._hierarchical_detector.get_global_suspicion_incarnation(target)
+        if suspected_incarnation is None:
+            return b""
+        return PiggybackUpdate(
+            update_type="suspect",
+            node=target,
+            incarnation=suspected_incarnation,
+            timestamp=self._clock.monotonic(),
+            role=self._recorded_peer_role(target),
+            node_id=self._get_registered_node_id_for_addr(target),
+        ).to_bytes()
+
+    def _add_piggyback_safe(self, base_message: bytes, buddy_entry: bytes = b"") -> bytes:
         """
         Add piggybacked gossip updates to a message, respecting MTU limits.
 
@@ -2212,6 +2265,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Args:
             base_message: The core message to send.
+            buddy_entry: An encoded membership update that MUST ride this
+                message (the Lifeguard buddy-system suspicion, see
+                ``_buddy_suspicion_entry``); room is reserved for it ahead
+                of the gossip buffer's own selection.
 
         Returns:
             Message with piggybacked updates that fits within UDP MTU.
@@ -2221,10 +2278,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return base_message
 
         # Add membership gossip (format: #|mtype:incarnation:host:port...)
-        membership_piggyback = self._gossip_buffer.encode_piggyback_with_base(
-            base_message
+        message_with_membership = base_message + self._membership_piggyback(
+            base_message, buddy_entry
         )
-        message_with_membership = base_message + membership_piggyback
 
         # Calculate remaining space for health gossip
         remaining = MAX_UDP_PAYLOAD - len(message_with_membership)
@@ -2525,9 +2581,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         return stale_peer_ages
 
     def _should_refuse_leadership(self) -> bool:
-        return self._degradation.should_refuse_leadership() or any(
-            refuses() for refuses in self._leadership_refusals
-        )
+        return self._degradation.should_refuse_leadership() or self._should_relinquish_leadership()
+
+    def _should_relinquish_leadership(self) -> bool:
+        """Whether a role refusal holds: refused leadership is also given up.
+
+        Graceful degradation only keeps a node from becoming a NEW leader
+        (its load-driven hand-off is the LHM step-down); a role refusal
+        (clock fenced; a gate with no datacenter while a peer is ready,
+        AD-19) means the node cannot do a leader's work at all.
+        """
+        return any(refuses() for refuses in self._leadership_refusals)
 
     def _setup_leader_election(self) -> None:
         """Initialize leader election callbacks after server is started."""
@@ -2538,6 +2602,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self_addr=self._get_self_udp_addr(),
             on_error=self._handle_election_error,
             should_refuse_leadership=self._should_refuse_leadership,
+            should_relinquish_leadership=self._should_relinquish_leadership,
             task_runner=self._task_runner,
             on_election_started=self._on_election_started,
             on_heartbeat_sent=self._on_heartbeat_sent,
@@ -7272,7 +7337,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             raise ConnectionResetError("instance stopped; outbound SWIM send blocked")
 
         # Add piggyback data (membership + health gossip) to outgoing messages
-        message_with_piggyback = self._add_piggyback_safe(message)
+        message_with_piggyback = self._add_piggyback_safe(
+            message, self._buddy_suspicion_entry(addr, message)
+        )
 
         return (
             addr,

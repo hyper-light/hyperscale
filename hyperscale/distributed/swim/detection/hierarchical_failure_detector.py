@@ -1474,6 +1474,15 @@ class HierarchicalFailureDetector:
             return True
         return self._global_wheel.contains_sync(node)
 
+    def get_global_suspicion_incarnation(self, node: NodeAddress) -> int | None:
+        """The incarnation a live global suspicion of ``node`` accuses, else None.
+
+        Synchronous, like ``is_suspected_global``: it reads the timing
+        wheel directly, for SWIM send paths.
+        """
+        state = self._global_wheel.get_state_sync(node)
+        return state.incarnation if state else None
+
     def get_time_remaining_global(self, node: NodeAddress) -> float | None:
         """
         Get remaining timeout for global suspicion.

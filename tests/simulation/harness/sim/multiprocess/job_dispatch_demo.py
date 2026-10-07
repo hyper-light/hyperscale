@@ -32,8 +32,12 @@ _AUTH_SECRET = "sim-multiprocess-secret-00000000"
 
 
 class SimPingWorkflow(Workflow):
-    """Minimal deterministic test workflow: two VUs of a half-virtual-second
-    step for two virtual seconds."""
+    """Minimal deterministic ACTION workflow: ``ping_action`` returns a
+    ``dict[str, str]``, so it is an ACTION hook and the step graph runs
+    ONCE per VU -- each of the two VUs runs one half-virtual-second step
+    and the workflow completes (~0.5-0.75s of virtual time after start).
+    ``duration`` only caps each layer; it does not loop the step for two
+    virtual seconds."""
 
     vus = 2
     duration = "2s"

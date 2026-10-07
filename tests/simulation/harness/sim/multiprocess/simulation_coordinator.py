@@ -21,10 +21,12 @@ virtual time of the admitting barrier, so its clock — and therefore
 every message it sends — is coherent with the rest of the simulation.
 """
 
+import bisect
 import heapq
 import multiprocessing
 import os
 import random
+from typing import Callable
 
 from .child_runtime import run_child_loop
 
@@ -61,6 +63,17 @@ class SimulationCoordinator:
     production exit-code paths (``LocalServerPool.get_process_exitcodes``
     feeding the worker pool-health loop) observe the death exactly as
     they would a real subprocess exit.
+
+    Event-triggered faults: ``schedule_on_event(process_id, matches_event,
+    on_event)`` calls ``on_event(row)`` once, at the barrier after
+    ``process_id`` first appends a matching row to its published result
+    log, and ``on_event`` may schedule further faults (kills, restarts,
+    pauses, network rules) and admissions (``schedule_admission``) at
+    instants derived from the observed row — so a scenario strikes
+    relative to what the run DID (a workflow became active, a leader was
+    elected) instead of at a hardcoded instant that only one schedule
+    honors. Anything scheduled mid-run must land strictly after the
+    barrier it is scheduled at (the windows up to it already executed).
     """
 
     _KILLED_EXITCODE = -9  # SIGKILL, as ProcessPoolExecutor would report
@@ -120,6 +133,19 @@ class SimulationCoordinator:
         self._duplicate_rules: list[tuple] = []
         self._corrupt_rules: list[tuple] = []
         self._fault_random = random.Random((seed << 16) ^ 0x5EEDFA17)
+        # Event triggers (``schedule_on_event``) still waiting for their
+        # row: (process_id, matches_event, on_event), registration order.
+        self._armed_event_triggers: list[tuple] = []
+        # Every row a watched process reported, for the loud report of a
+        # trigger whose event never happened.
+        self._watched_rows: dict[str, list] = {}
+        # Mid-run admissions (``schedule_admission``): (at_time,
+        # process_id, entry, entry_args).
+        self._admission_schedule: list[tuple] = []
+        # The last window edge whose window the children executed; None
+        # until ``run`` grants one. Faults scheduled mid-run must land
+        # strictly after it.
+        self._executed_through_time: float | None = None
 
     def add_process(self, process_id, entry, *entry_args) -> None:
         """Register a child process present at simulation start.
@@ -138,6 +164,7 @@ class SimulationCoordinator:
         executor); it must exist when the kill fires — an unknown or
         already-dead victim raises rather than silently no-oping.
         """
+        self._reject_executed_instant(at_time)
         self._kill_schedule.append((at_time, process_id))
 
     def schedule_restart(
@@ -167,6 +194,7 @@ class SimulationCoordinator:
         its executor pool) raises — kill the children first or restart
         a leaf; cascade restart is deliberately unsupported.
         """
+        self._reject_executed_instant(at_time)
         self._restart_schedule.append(
             (at_time, process_id, down_seconds, fsync_reorder_seed)
         )
@@ -237,6 +265,7 @@ class SimulationCoordinator:
                 "pause resume_time must be strictly after at_time "
                 f"(got at_time={at_time}, resume_time={resume_time})"
             )
+        self._reject_executed_instant(at_time)
         self._pause_schedule.append((at_time, resume_time, process_id))
 
     def schedule_partition(
@@ -254,6 +283,7 @@ class SimulationCoordinator:
         ``bidirectional=False`` cuts only ``process_a -> process_b``
         (asymmetric loss, the one-way-drop scenario class).
         """
+        self._reject_executed_instant(at_time)
         self._partition_rules.append(
             (at_time, heal_time, process_a, process_b, bidirectional)
         )
@@ -277,6 +307,7 @@ class SimulationCoordinator:
         """
         if not 0.0 <= probability <= 1.0:
             raise ValueError("drop probability must be within [0.0, 1.0]")
+        self._reject_executed_instant(at_time)
         self._drop_rules.append((at_time, until_time, src, dst, probability))
 
     def schedule_delay(
@@ -296,6 +327,7 @@ class SimulationCoordinator:
         """
         if extra_seconds < 0.0 or jitter_seconds < 0.0:
             raise ValueError("delay and jitter must be non-negative")
+        self._reject_executed_instant(at_time)
         self._delay_rules.append(
             (at_time, until_time, src, dst, extra_seconds, jitter_seconds)
         )
@@ -316,6 +348,7 @@ class SimulationCoordinator:
         """
         if not 0.0 <= probability <= 1.0:
             raise ValueError("duplicate probability must be within [0.0, 1.0]")
+        self._reject_executed_instant(at_time)
         self._duplicate_rules.append(
             (at_time, until_time, src, dst, probability)
         )
@@ -353,9 +386,61 @@ class SimulationCoordinator:
         """
         if not 0.0 <= probability <= 1.0:
             raise ValueError("corrupt probability must be within [0.0, 1.0]")
+        self._reject_executed_instant(at_time)
         self._corrupt_rules.append(
             (at_time, until_time, src, dst, probability)
         )
+
+    def schedule_on_event(
+        self,
+        process_id,
+        matches_event: Callable[[tuple], bool],
+        on_event: Callable[[tuple], None],
+    ) -> None:
+        """Call ``on_event(row)`` once, for the FIRST row ``process_id``
+        appends to its published result log that ``matches_event``
+        accepts.
+
+        Rows reach the coordinator at the barrier after the window that
+        appended them, so ``on_event`` runs at that window's edge — the
+        row's own instant, since a sampler row is stamped with the
+        window's event time — before the next window is granted. It may
+        schedule faults and admissions; each must land strictly after
+        the current edge (``schedule_*`` raises otherwise), so derive
+        instants from the row's own timestamp plus a positive delay
+        (one coordinator latency is the earliest instant any reaction
+        could take effect). A trigger whose event never happens fails
+        the run LOUDLY at its end, naming the process and its rows —
+        a fault that silently never fired would leave the scenario
+        asserting a run it did not have.
+        """
+        self._armed_event_triggers.append((process_id, matches_event, on_event))
+        self._watched_rows.setdefault(process_id, [])
+
+    def schedule_admission(
+        self, process_id, at_time: float, entry, *entry_args
+    ) -> None:
+        """Admit ``process_id`` (``entry(ctx, *entry_args)``, exactly as
+        ``add_process``) at virtual ``at_time`` instead of at start.
+
+        The child joins at that window edge like any mid-run admission
+        (its ``SimulationLoop`` starts at ``at_time``) — the late-joiner
+        whose join instant an event trigger derives from the run.
+        """
+        self._reject_executed_instant(at_time)
+        self._admission_schedule.append((at_time, process_id, entry, entry_args))
+
+    def _reject_executed_instant(self, at_time: float) -> None:
+        """Refuse a fault or admission at an instant the run already executed."""
+        if (
+            self._executed_through_time is not None
+            and at_time <= self._executed_through_time
+        ):
+            raise ValueError(
+                f"cannot schedule at {at_time}: the run already executed "
+                f"through {self._executed_through_time} (schedule strictly "
+                "after the barrier the trigger fired at)"
+            )
 
     def run(self) -> dict:
         # Pin hash randomization for every spawned child. Python
@@ -422,12 +507,13 @@ class SimulationCoordinator:
             start_time=0.0,
         )
 
-        # Kills fire in (time, schedule order); stable sort keeps
-        # same-instant kills in the order the scenario declared them.
-        remaining_kills = sorted(self._kill_schedule, key=lambda kill: kill[0])
-        remaining_restarts = sorted(
-            self._restart_schedule, key=lambda restart: restart[0]
-        )
+        # Kills fire in (time, schedule order): ``_absorb_scheduled``
+        # inserts each entry after every same-instant entry before it,
+        # keeping same-instant kills in the order the scenario declared
+        # them — including entries an event trigger adds mid-run.
+        remaining_kills: list = []
+        remaining_restarts: list = []
+        remaining_admissions: list = []
         # (respawn_time, process_id, initial_disk) — restarts waiting
         # out their down window.
         pending_respawns: list = []
@@ -436,9 +522,8 @@ class SimulationCoordinator:
         # keyed (resume_time, arming order). Membership in the delivery
         # buffer map IS the paused set — the two buffer maps are
         # co-created and co-removed per victim.
-        remaining_pauses = sorted(
-            self._pause_schedule, key=lambda pause: pause[0]
-        )
+        remaining_pauses: list = []
+        absorbed_counts = [0, 0, 0, 0]
         pending_resumes: list = []
         resume_sequence = 0
         paused_delivery_buffers: dict = {}
@@ -446,6 +531,15 @@ class SimulationCoordinator:
 
         # Lockstep.
         while True:
+            self._absorb_scheduled(
+                absorbed_counts,
+                (
+                    (self._kill_schedule, remaining_kills),
+                    (self._restart_schedule, remaining_restarts),
+                    (self._pause_schedule, remaining_pauses),
+                    (self._admission_schedule, remaining_admissions),
+                ),
+            )
             # A frozen victim's next-event time is excluded from the
             # global minimum — time advances without it (its armed
             # resume below keeps the run alive until the thaw).
@@ -467,6 +561,8 @@ class SimulationCoordinator:
                 candidates.append(remaining_pauses[0][0])
             if pending_resumes:
                 candidates.append(pending_resumes[0][0])
+            if remaining_admissions:
+                candidates.append(remaining_admissions[0][0])
             if not candidates:
                 break
             target_time = min(candidates)
@@ -637,11 +733,13 @@ class SimulationCoordinator:
             # dropping: everything registered by time T is routable at T.
             spawn_requests: list = []
             outbound_batches: list = []
+            reported_rows: list = []
             for process_id, connection in granted:
-                tag, next_time, outbound, spawns, new_addresses = (
+                tag, next_time, outbound, spawns, new_addresses, new_rows = (
                     self._recv(connection, process_id, "window report")
                 )
                 assert tag == "REPORT", tag
+                reported_rows.append((process_id, new_rows))
                 next_times[process_id] = next_time
                 for address in new_addresses:
                     self._merge_address(address_to_process, address, process_id)
@@ -657,6 +755,12 @@ class SimulationCoordinator:
                         send_time, src, dst, data,
                     )
 
+            # The window through ``target_time`` has executed: triggers
+            # its rows fire may only schedule strictly after it.
+            self._executed_through_time = target_time
+            for process_id, new_rows in reported_rows:
+                self._observe_rows(process_id, new_rows)
+
             # Reboots due at this window edge join exactly like late
             # joiners — same admission path, plus the surviving disk.
             respawn_requests: list = []
@@ -668,6 +772,12 @@ class SimulationCoordinator:
                 respawn_requests.append(
                     (process_id, entry, entry_args, initial_disk)
                 )
+            # Scheduled late joiners due at this edge join the same way.
+            while remaining_admissions and remaining_admissions[0][0] <= target_time:
+                _admission_time, process_id, entry, entry_args = (
+                    remaining_admissions.pop(0)
+                )
+                respawn_requests.append((process_id, entry, entry_args))
 
             # Admit requested children at the barrier, starting their
             # virtual clocks at the window edge every report agreed on.
@@ -682,6 +792,8 @@ class SimulationCoordinator:
                 respawn_requests + spawn_requests,
                 start_time=target_time,
             )
+
+        self._raise_on_unfired_triggers()
 
         # Shutdown barrier: collect results.
         results: dict = {}
@@ -769,10 +881,11 @@ class SimulationCoordinator:
 
             next_batch: list = []
             for process_id, parent_connection in started:
-                tag, addresses, next_time, outbound, spawns = (
+                tag, addresses, next_time, outbound, spawns, new_rows = (
                     self._recv(parent_connection, process_id, "admission readiness")
                 )
                 assert tag == "READY", tag
+                self._observe_rows(process_id, new_rows)
                 next_times[process_id] = next_time
                 for address in addresses:
                     self._merge_address(address_to_process, address, process_id)
@@ -789,6 +902,49 @@ class SimulationCoordinator:
                 )
 
         return sequence
+
+    @staticmethod
+    def _absorb_scheduled(absorbed_counts: list, schedules: tuple) -> None:
+        """Move every newly scheduled entry into its time-ordered remaining
+        list (after same-instant entries — declaration order holds);
+        ``absorbed_counts[index]`` tracks how much of each schedule moved."""
+        for index, (schedule, remaining) in enumerate(schedules):
+            for scheduled in schedule[absorbed_counts[index] :]:
+                bisect.insort_right(remaining, scheduled, key=lambda entry: entry[0])
+            absorbed_counts[index] = len(schedule)
+
+    def _observe_rows(self, process_id, new_rows: list) -> None:
+        """Record a watched process's new rows and fire the armed triggers
+        each row matches, in row order."""
+        if process_id not in self._watched_rows:
+            return
+        self._watched_rows[process_id].extend(new_rows)
+        for row in new_rows:
+            self._fire_triggers_matching(process_id, row)
+
+    def _fire_triggers_matching(self, process_id, row: tuple) -> None:
+        """Disarm and fire every armed trigger on ``process_id`` that ``row`` matches."""
+        matched = [
+            trigger
+            for trigger in self._armed_event_triggers
+            if trigger[0] == process_id and trigger[1](row)
+        ]
+        for trigger in matched:
+            self._armed_event_triggers.remove(trigger)
+            trigger[2](row)
+
+    def _raise_on_unfired_triggers(self) -> None:
+        """Fail the run loudly when a trigger's event never happened."""
+        if self._armed_event_triggers:
+            raise RuntimeError(
+                "event-triggered faults never fired: "
+                + "; ".join(
+                    f"{process_id!r} never reported a row matching "
+                    f"{matches_event.__qualname__} "
+                    f"(rows: {self._watched_rows[process_id]})"
+                    for process_id, matches_event, _on_event in self._armed_event_triggers
+                )
+            )
 
     def _snapshot_and_stop_child(
         self,

@@ -77,6 +77,12 @@ class LocalLeaderElection:
     _get_lhm_score: Callable[[], int] | None = None
     _send_to_node: Callable[[tuple[str, int], bytes], None] | None = None
     _should_refuse_leadership: Callable[[], bool] | None = None  # Graceful degradation check
+    # Whether this node, while LEADING, can no longer do a leader's work
+    # and must hand leadership off (a role's leadership refusals: e.g. a
+    # gate with no reachable datacenter while a peer gate is ready, AD-19).
+    # Checked on every lead tick, so a leader elected before the refusal
+    # held (no peer was ready yet) does not keep the role it now refuses.
+    _should_relinquish_leadership: Callable[[], bool] | None = None
     
     # Error handler callback (set by owner)
     _on_error: Callable[[ElectionError], Awaitable[None]] | None = None
@@ -211,6 +217,7 @@ class LocalLeaderElection:
         send_to_node: Callable[[tuple[str, int], bytes], None] | None = None,
         on_error: Callable[[ElectionError], Awaitable[None]] | None = None,
         should_refuse_leadership: Callable[[], bool] | None = None,
+        should_relinquish_leadership: Callable[[], bool] | None = None,
         task_runner: TaskRunnerProtocol | None = None,
         on_election_started: Callable[[], None] | None = None,
         on_heartbeat_sent: Callable[[], None] | None = None,
@@ -225,6 +232,7 @@ class LocalLeaderElection:
         self._on_error = on_error
         self._send_to_node = send_to_node
         self._should_refuse_leadership = should_refuse_leadership
+        self._should_relinquish_leadership = should_relinquish_leadership
         self._task_runner = task_runner
         self._on_election_started = on_election_started
         self._on_heartbeat_sent = on_heartbeat_sent
@@ -279,10 +287,16 @@ class LocalLeaderElection:
         return self._should_refuse_leadership and self._should_refuse_leadership()
 
     def should_step_down(self) -> bool:
-        """Check if leader should step down due to high load."""
-        if not self.state.is_leader() or not self._get_lhm_score:
+        """Check if the leader should step down: its role refuses
+        leadership now (it cannot do a leader's work while a peer can),
+        or its load (LHM) warrants handing off."""
+        if not self.state.is_leader():
             return False
-        return self._lhm_warrants_step_down()
+        return self._relinquishes_leadership() or self._lhm_warrants_step_down()
+
+    def _relinquishes_leadership(self) -> bool:
+        """Whether this node's role asks it to hand leadership off."""
+        return self._should_relinquish_leadership is not None and self._should_relinquish_leadership()
 
     def _lhm_warrants_step_down(self) -> bool:
         """Whether this leader's LHM warrants stepping down to a healthier peer."""
@@ -291,7 +305,7 @@ class LocalLeaderElection:
         # recovers, blocking the submit path on a single-node cluster
         # for no benefit. The Lifeguard step-down dance only buys
         # availability when a healthier peer exists.
-        if self._is_sole_member():
+        if not self._get_lhm_score or self._is_sole_member():
             return False
         return self.eligibility.should_step_down(self._get_lhm_score())
 
@@ -427,7 +441,7 @@ class LocalLeaderElection:
         # Leader: check if we should step down
         if self.should_step_down():
             await self._log_debug(
-                f"step_down triggered (LHM-driven) "
+                f"step_down triggered (leadership refusal or LHM) "
                 f"term={self.state.current_term}"
             )
             await self._step_down()

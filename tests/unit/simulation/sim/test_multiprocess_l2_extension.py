@@ -78,6 +78,8 @@ Measured timelines (seed 73 baseline/blackout, seed 113 hard-timeout):
   terminates with the workflow).
 """
 
+import pytest
+
 from tests.simulation.harness.sim.multiprocess import SimulationCoordinator
 from tests.simulation.harness.sim.multiprocess.l2_extension_demo import (
     extension_watch_manager_entry,
@@ -95,6 +97,11 @@ _BASELINE_COMPLETION = 37.80582
 _BLACKOUT_START = 6.0
 _BLACKOUT_HEAL = 20.0
 _HARD_TIMEOUT_SEED = 113
+# The original measured seed first, then seeds whose schedules move the
+# dispatch instant off the worker sampler's 0.25s grid (73 is the
+# baseline topology's seed): the local-enforcement bound must hold at
+# the worker's EXACT deadline-arming instant under every schedule.
+_HARD_TIMEOUT_SWEEP_SEEDS = (_HARD_TIMEOUT_SEED, 73, 7, 211)
 _HARD_TIMEOUT_DURATION = 100.0
 _HARD_TIMEOUT_JOB_BUDGET = 20.0
 _HARD_TIMEOUT_CEILING = 200.0
@@ -175,9 +182,9 @@ def _run_extension_udp_blackout() -> dict:
     return coordinator.run()
 
 
-def _run_hard_timeout() -> dict:
+def _run_hard_timeout(seed: int = _HARD_TIMEOUT_SEED) -> dict:
     return _build_extension_topology(
-        seed=_HARD_TIMEOUT_SEED,
+        seed=seed,
         ceiling=_HARD_TIMEOUT_CEILING,
         workflow_duration_seconds=_HARD_TIMEOUT_DURATION,
         job_timeout_seconds=_HARD_TIMEOUT_JOB_BUDGET,
@@ -292,13 +299,19 @@ def test_udp_blackout_extension_freeze_is_replay_deterministic():
     assert _run_extension_udp_blackout() == _run_extension_udp_blackout()
 
 
-def test_hard_timeout_enforced_at_the_jobs_own_budget():
+@pytest.mark.parametrize("seed", _HARD_TIMEOUT_SWEEP_SEEDS)
+def test_hard_timeout_enforced_at_the_jobs_own_budget(seed: int):
     """The job's explicit budget is honored, and enforcement is REAL:
     no request ever carries progress, so the witness route grants none
     and neither the job's AD-34 budget nor the workflow's local deadline
     stretches (progress-backed only, user decision 2026-10-05) -- the
     worker's stuck-workflow loop cancels at dispatch + 20s, and the
-    executor hard-stop actually stops the in-flight run. Measured
+    executor hard-stop actually stops the in-flight run. The bound's
+    origin is the worker's EXACT deadline-arming instant (the
+    ``workflow-deadline-armed`` row), never the 0.25s-sampled
+    ``workflow-started`` row, which trails it (re-measured 2026-10-06,
+    seed 113: armed at 2.306327, sampled at 2.5, enforcement cancel at
+    22.314678 = armed + 20.008). Measured
     (2026-10-05): dispatch 1.5, the dispatch-time request denied
     ``no_advancement`` at 2.5, the worker's enforcement cancels on its
     tick after 21.5,
@@ -310,7 +323,7 @@ def test_hard_timeout_enforced_at_the_jobs_own_budget():
     cancellation repair it was the zombie pin -- the workflow ran its
     full 100s past its terminal.)
     """
-    results = _run_hard_timeout()
+    results = _run_hard_timeout(seed)
     manager_log = results["manager"]
     client_log = results["client"]
     worker_log = results["worker"]
@@ -325,7 +338,16 @@ def test_hard_timeout_enforced_at_the_jobs_own_budget():
     dispatch_rows = _rows(worker_log, "workflow-started")
     assert len(dispatch_rows) == 1, worker_log
     dispatch_time = dispatch_rows[0][2]
-    local_expiry = dispatch_time + _HARD_TIMEOUT_JOB_BUDGET
+    # The local deadline is armed at the worker's EXACT dispatch receipt
+    # with the job's own budget; the sampled ``workflow-started`` instant
+    # trails it by up to one 0.25s sampler period, so it is never the
+    # bound's origin.
+    armed_rows = _rows(worker_log, "workflow-deadline-armed")
+    assert len(armed_rows) == 1, worker_log
+    _, _, deadline_armed_at, armed_timeout_seconds = armed_rows[0]
+    assert armed_timeout_seconds == _HARD_TIMEOUT_JOB_BUDGET, worker_log
+    assert deadline_armed_at <= dispatch_time, worker_log
+    local_expiry = deadline_armed_at + _HARD_TIMEOUT_JOB_BUDGET
 
     finished = [entry for entry in client_log if entry[0] == "job-finished"]
     assert len(finished) == 1, client_log
