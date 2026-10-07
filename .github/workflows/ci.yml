@@ -59,6 +59,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel: --all-extras
+        # builds it from source, which needs krb5-config (libkrb5-dev).
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
       - name: Sync dependencies
         run: uv sync --all-extras --dev
       - name: Run ratchet lints
@@ -80,6 +84,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel: --all-extras
+        # builds it from source, which needs krb5-config (libkrb5-dev).
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
       - name: Sync dependencies
         run: uv sync --all-extras --dev
       - name: Run unit tests
@@ -96,6 +104,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel: --all-extras
+        # builds it from source, which needs krb5-config (libkrb5-dev).
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
       - name: Sync dependencies
         run: uv sync --all-extras --dev
       - name: Run multi-process SIM suite
@@ -137,6 +149,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel: --all-extras
+        # builds it from source, which needs krb5-config (libkrb5-dev).
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
       - name: Sync dependencies
         run: uv sync --all-extras --dev
       - name: Run VOPR and scenario suites
@@ -206,6 +222,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel: --all-extras
+        # builds it from source, which needs krb5-config (libkrb5-dev).
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
       - name: Sync dependencies
         run: uv sync --all-extras --dev
       - name: Restore failing-seed ledger
@@ -268,6 +288,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel: --all-extras
+        # builds it from source, which needs krb5-config (libkrb5-dev).
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
       - name: Sync dependencies
         run: uv sync --all-extras --dev
       - name: Run the shard
