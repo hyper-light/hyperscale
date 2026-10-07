@@ -1,4 +1,5 @@
 import asyncio
+import socket
 import ssl
 
 
@@ -15,7 +16,11 @@ def get_peer_certificate_der(transport: asyncio.Transport) -> bytes | None:
     if not is_ssl(transport):
         return None
 
-    ssl_object = transport.get_extra_info("ssl_object")
+    return _peer_certificate_from_ssl_object(transport.get_extra_info("ssl_object"))
+
+
+def _peer_certificate_from_ssl_object(ssl_object: ssl.SSLObject | None) -> bytes | None:
+    """The peer's DER certificate from a TLS session object, or None when unavailable."""
     if ssl_object is None:
         return None
 
@@ -31,18 +36,26 @@ def get_peer_certificate_der(transport: asyncio.Transport) -> bytes | None:
 def get_remote_addr(transport: asyncio.Transport) -> tuple[str, int] | None:
     socket_info = transport.get_extra_info("socket")
     if socket_info is not None:
-        try:
-            info = socket_info.getpeername()
-            return (str(info[0]), int(info[1])) if isinstance(info, tuple) else None
-        except OSError:  # pragma: no cover
-            # This case appears to inconsistently occur with uvloop
-            # bound to a unix domain socket.
-            return None
+        return _socket_peer_addr(socket_info)
 
-    info = transport.get_extra_info("peername")
-    if info is not None and isinstance(info, (list, tuple)) and len(info) == 2:
-        return (str(info[0]), int(info[1]))
-    return None
+    return _extra_info_addr(transport.get_extra_info("peername"))
+
+
+def _socket_peer_addr(socket_info: socket.socket) -> tuple[str, int] | None:
+    """The socket's (host, port) peer, or None for a non-IP peer or an unreadable one."""
+    try:
+        info = socket_info.getpeername()
+        return (str(info[0]), int(info[1])) if isinstance(info, tuple) else None
+    except OSError:  # pragma: no cover
+        # This case appears to inconsistently occur with uvloop
+        # bound to a unix domain socket.
+        return None
+
+
+def _extra_info_addr(info: object) -> tuple[str, int] | None:
+    """A (host, port) from a transport's peername/sockname extra info, else None."""
+    # isinstance rejects None, so no separate None check is needed.
+    return (str(info[0]), int(info[1])) if isinstance(info, (list, tuple)) and len(info) == 2 else None
 
 
 def get_local_addr(transport: asyncio.Transport) -> tuple[str, int] | None:
@@ -51,10 +64,7 @@ def get_local_addr(transport: asyncio.Transport) -> tuple[str, int] | None:
         info = socket_info.getsockname()
 
         return (str(info[0]), int(info[1])) if isinstance(info, tuple) else None
-    info = transport.get_extra_info("sockname")
-    if info is not None and isinstance(info, (list, tuple)) and len(info) == 2:
-        return (str(info[0]), int(info[1]))
-    return None
+    return _extra_info_addr(transport.get_extra_info("sockname"))
 
 
 def is_ssl(transport: asyncio.Transport) -> bool:

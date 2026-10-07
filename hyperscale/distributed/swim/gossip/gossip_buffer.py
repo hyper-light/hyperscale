@@ -3,6 +3,8 @@ Gossip buffer for SWIM membership update dissemination.
 """
 
 import heapq
+from itertools import compress, repeat
+from operator import attrgetter, lt, methodcaller, not_
 import math
 from dataclasses import dataclass, field
 from typing import Callable
@@ -369,10 +371,13 @@ class GossipBuffer:
         now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.stale_age_seconds
         
-        to_remove = []
-        for node, update in self.updates.items():
-            if update.timestamp < cutoff:
-                to_remove.append(node)
+        # Keys and values iterate in the same order, so compress selects the stale keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(lt, map(attrgetter("timestamp"), self.updates.values()), repeat(cutoff)),
+            )
+        )
         
         for node in to_remove:
             del self.updates[node]
@@ -387,10 +392,13 @@ class GossipBuffer:
         Returns:
             Number of completed updates removed.
         """
-        to_remove = []
-        for node, update in self.updates.items():
-            if not update.should_broadcast():
-                to_remove.append(node)
+        # Keys and values iterate in the same order, so compress selects the completed keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(not_, map(methodcaller("should_broadcast"), self.updates.values())),
+            )
+        )
         
         for node in to_remove:
             del self.updates[node]

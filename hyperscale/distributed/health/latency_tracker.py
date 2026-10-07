@@ -12,6 +12,8 @@ talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass
+from itertools import chain
+from operator import itemgetter
 from hyperscale.distributed.runtime import Clock, RealClock
 
 from .latency_config import LatencyConfig
@@ -80,8 +82,7 @@ class LatencyTracker:
             Average latency in ms, or None if no samples available.
         """
         all_latencies = [
-            lat for samples in self._samples.values()
-            for _, lat in samples
+            lat for _, lat in chain.from_iterable(self._samples.values())
         ]
         if not all_latencies:
             return None
@@ -110,7 +111,7 @@ class LatencyTracker:
             Dict mapping peer_id to average latency in ms.
         """
         return {
-            peer_id: sum(lat for _, lat in samples) / len(samples)
+            peer_id: sum(map(itemgetter(1), samples)) / len(samples)
             for peer_id, samples in self._samples.items()
             if samples
         }

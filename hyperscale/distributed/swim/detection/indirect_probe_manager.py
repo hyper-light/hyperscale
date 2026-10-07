@@ -3,6 +3,8 @@ Indirect probe management for SWIM protocol.
 """
 
 from dataclasses import dataclass, field
+from itertools import compress, repeat
+from operator import attrgetter, lt, methodcaller
 
 from hyperscale.distributed.runtime import Clock, RealClock
 from .pending_indirect_probe import PendingIndirectProbe
@@ -122,13 +124,12 @@ class IndirectProbeManager:
     
     def get_expired_probes(self) -> list[PendingIndirectProbe]:
         """Get all probes that have timed out without an ack."""
-        expired = []
-        to_remove = []
         # Snapshot to avoid dict mutation during iteration
-        for target, probe in list(self.pending_probes.items()):
-            if probe.is_expired():
-                expired.append(probe)
-                to_remove.append(target)
+        targets = list(self.pending_probes.keys())
+        probes = list(self.pending_probes.values())
+        expired_flags = list(map(methodcaller("is_expired"), probes))
+        expired = list(compress(probes, expired_flags))
+        to_remove = list(compress(targets, expired_flags))
         for target in to_remove:
             del self.pending_probes[target]
             self._expired_count += 1
@@ -154,11 +155,13 @@ class IndirectProbeManager:
         now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.probe_ttl
 
-        to_remove = []
         # Snapshot to avoid dict mutation during iteration
-        for target, probe in list(self.pending_probes.items()):
-            if probe.start_time < cutoff:
-                to_remove.append(target)
+        to_remove = list(
+            compress(
+                list(self.pending_probes.keys()),
+                map(lt, map(attrgetter("start_time"), list(self.pending_probes.values())), repeat(cutoff)),
+            )
+        )
 
         for target in to_remove:
             del self.pending_probes[target]
@@ -203,7 +206,7 @@ class IndirectProbeManager:
         Returns True if a warning was logged.
         Should be called periodically (e.g., from cleanup loop).
         """
-        if not self._logger or self._rejected_count == 0:
+        if self._capacity_warning_unneeded():
             return False
         
         try:
@@ -217,3 +220,7 @@ class IndirectProbeManager:
             return True
         except Exception:
             return False
+
+    def _capacity_warning_unneeded(self) -> bool:
+        """Whether no capacity warning applies: no logger, or no probe was rejected."""
+        return not self._logger or self._rejected_count == 0

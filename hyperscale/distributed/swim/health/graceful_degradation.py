@@ -208,17 +208,26 @@ class GracefulDegradation:
             self._level_entered_at = now
             self._level_changes += 1
             
-            if self._on_level_change:
-                try:
-                    self._on_level_change(old_level, new_level)
-                except Exception as e:
-                    await self._log_debug(
-                        f"Level change callback error "
-                        f"({old_level.name} -> {new_level.name}): "
-                        f"{type(e).__name__}: {e}"
-                    )
+            await self._notify_level_change(old_level, new_level, "Level change")
         
         return self._current_level
+
+    async def _notify_level_change(
+        self,
+        old_level: DegradationLevel,
+        new_level: DegradationLevel,
+        callback_label: str,
+    ) -> None:
+        """Invoke on_level_change, logging (labelled by ``callback_label``) a callback failure."""
+        if self._on_level_change:
+            try:
+                self._on_level_change(old_level, new_level)
+            except Exception as e:
+                await self._log_debug(
+                    f"{callback_label} callback error "
+                    f"({old_level.name} -> {new_level.name}): "
+                    f"{type(e).__name__}: {e}"
+                )
     
     def _calculate_level(self) -> DegradationLevel:
         """Calculate what degradation level we should be at."""
@@ -355,15 +364,7 @@ class GracefulDegradation:
             old_level = self._current_level
             self._current_level = level
             self._level_entered_at = _DEFAULT_CLOCK.monotonic()
-            if self._on_level_change:
-                try:
-                    self._on_level_change(old_level, level)
-                except Exception as e:
-                    await self._log_debug(
-                        f"Force level callback error "
-                        f"({old_level.name} -> {level.name}): "
-                        f"{type(e).__name__}: {e}"
-                    )
+            await self._notify_level_change(old_level, level, "Force level")
     
     async def reset(self) -> None:
         """Reset to normal operation."""

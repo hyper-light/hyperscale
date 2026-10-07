@@ -114,8 +114,7 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
 
     def connection_lost(self, exc: Exception | None):
         self.connections.discard(self)
-        if self.mode == 'client' and self.transport is not None:
-            self.conn.lose_client_tcp(self.transport)
+        self._release_client_transport()
 
         if self.flow is not None:
             self.flow.resume_writing()
@@ -125,6 +124,11 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
             # self._unset_keepalive_if_required()
 
         self.on_con_lost.set_result(True)
+
+    def _release_client_transport(self) -> None:
+        """Hand a dialed (client-mode) connection's transport back to its connection pool."""
+        if self.mode == 'client' and self.transport is not None:
+            self.conn.lose_client_tcp(self.transport)
 
     def _unset_keepalive_if_required(self) -> None:
         if self.timeout_keep_alive_task is not None:

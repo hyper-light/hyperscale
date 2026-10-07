@@ -17,6 +17,80 @@ from .error_category_stats_summary import ErrorCategoryStatsSummary
 from .error_stats import ErrorStats
 
 
+def _timeout_network_error(exception: BaseException, operation: str) -> SwimError:
+    """Wrap an asyncio timeout as a NetworkError."""
+    return NetworkError(
+        f"Timeout during {operation}",
+        cause=exception,
+        operation=operation,
+    )
+
+
+def _connection_network_error(exception: BaseException, operation: str) -> SwimError:
+    """Wrap a ConnectionError as a NetworkError."""
+    return NetworkError(
+        f"Connection error during {operation}",
+        cause=exception,
+        operation=operation,
+    )
+
+
+def _os_network_error(exception: BaseException, operation: str) -> SwimError:
+    """Wrap an OSError as a NetworkError."""
+    # OSError is the base class for many network errors:
+    # ConnectionRefusedError, BrokenPipeError, etc.
+    # Treat as TRANSIENT since network conditions can change
+    return NetworkError(
+        f"OS/socket error during {operation}: {exception}",
+        cause=exception,
+        operation=operation,
+    )
+
+
+def _value_protocol_error(exception: BaseException, operation: str) -> SwimError:
+    """Wrap a ValueError as a ProtocolError."""
+    return ProtocolError(
+        f"Value error during {operation}: {exception}",
+        cause=exception,
+        operation=operation,
+    )
+
+
+def _memory_resource_error(exception: BaseException, operation: str) -> SwimError:
+    """Wrap a MemoryError as a FATAL ResourceError."""
+    return ResourceError(
+        f"Memory error during {operation}",
+        severity=ErrorSeverity.FATAL,
+        cause=exception,
+    )
+
+
+# Checked in order: TimeoutError and ConnectionError subclass OSError, so
+# they must match before the OSError entry.
+_EXCEPTION_WRAPPERS: tuple[tuple[type[BaseException], Callable[[BaseException, str], SwimError]], ...] = (
+    (asyncio.TimeoutError, _timeout_network_error),
+    (ConnectionError, _connection_network_error),
+    (OSError, _os_network_error),
+    (ValueError, _value_protocol_error),
+    (MemoryError, _memory_resource_error),
+)
+
+
+def _wrap_exception(exception: BaseException, operation: str) -> SwimError:
+    """Convert a standard exception to its SwimError type (UnexpectedError when none matches)."""
+    for exception_type, build_error in _EXCEPTION_WRAPPERS:
+        if isinstance(exception, exception_type):
+            return build_error(exception, operation)
+    return UnexpectedError(exception, operation)
+
+
+# TRANSIENT = expected/normal, DEGRADED = warning; every other severity logs as ServerError.
+_SEVERITY_LOG_MODELS: dict[ErrorSeverity, type[ServerDebug] | type[ServerWarning]] = {
+    ErrorSeverity.TRANSIENT: ServerDebug,
+    ErrorSeverity.DEGRADED: ServerWarning,
+}
+
+
 @dataclass(slots=True)
 class ErrorHandler:
     """
@@ -136,18 +210,7 @@ class ErrorHandler:
             return
 
         # Capture traceback for debugging - get the last line of the traceback
-        tb_line = ""
-        if error.cause:
-            tb_lines = traceback.format_exception(
-                type(error.cause), error.cause, error.cause.__traceback__
-            )
-            if tb_lines:
-                # Get the last non-empty line (usually the actual error)
-                tb_line = (
-                    "".join(tb_lines[-3:]).strip()
-                    if len(tb_lines) >= 3
-                    else "".join(tb_lines).strip()
-                )
+        tb_line = self._traceback_tail(error)
 
         # Store last error with traceback for circuit breaker logging
         self._last_errors[error.category] = (error, tb_line)
@@ -159,13 +222,34 @@ class ErrorHandler:
         # TRANSIENT errors (like stale messages) are expected in async distributed
         # systems and should NOT trip the circuit breaker. They indicate normal
         # protocol operation (e.g., incarnation changes during refutation).
-        stats = self._get_stats(error.category)
-        if error.severity != ErrorSeverity.TRANSIENT:
-            stats.record_error()
+        stats = self._record_error_stats(error)
 
         # 3. Affect LHM based on error
         await self._update_lhm(error)
 
+        # 4-5. Circuit breaker recovery and fatal escalation
+        await self._escalate_error(error, stats)
+
+    def _traceback_tail(self, error: SwimError) -> str:
+        """The last lines of the error cause's traceback, or "" when the error has no cause."""
+        if not error.cause:
+            return ""
+        tb_lines = traceback.format_exception(
+            type(error.cause), error.cause, error.cause.__traceback__
+        )
+        # Get the last non-empty line (usually the actual error); with fewer
+        # than three lines the slice is the whole traceback.
+        return "".join(tb_lines[-3:]).strip()
+
+    def _record_error_stats(self, error: SwimError) -> ErrorStats:
+        """Count a non-TRANSIENT error toward its category's circuit breaker; return the stats."""
+        stats = self._get_stats(error.category)
+        if error.severity != ErrorSeverity.TRANSIENT:
+            stats.record_error()
+        return stats
+
+    async def _escalate_error(self, error: SwimError, stats: ErrorStats) -> None:
+        """Trigger recovery when the circuit opened, then escalate fatal errors."""
         # 4. Check circuit breaker and trigger recovery
         if stats.is_circuit_open:
             await self._log_circuit_open(error.category, stats)
@@ -193,53 +277,9 @@ class ErrorHandler:
             raise exception
 
         # Convert known exceptions to SwimError types
-        if isinstance(exception, SwimError):
-            await self.handle(exception)
-        elif isinstance(exception, asyncio.TimeoutError):
-            await self.handle(
-                NetworkError(
-                    f"Timeout during {operation}",
-                    cause=exception,
-                    operation=operation,
-                )
-            )
-        elif isinstance(exception, ConnectionError):
-            await self.handle(
-                NetworkError(
-                    f"Connection error during {operation}",
-                    cause=exception,
-                    operation=operation,
-                )
-            )
-        elif isinstance(exception, OSError):
-            # OSError is the base class for many network errors:
-            # ConnectionRefusedError, BrokenPipeError, etc.
-            # Treat as TRANSIENT since network conditions can change
-            await self.handle(
-                NetworkError(
-                    f"OS/socket error during {operation}: {exception}",
-                    cause=exception,
-                    operation=operation,
-                )
-            )
-        elif isinstance(exception, ValueError):
-            await self.handle(
-                ProtocolError(
-                    f"Value error during {operation}: {exception}",
-                    cause=exception,
-                    operation=operation,
-                )
-            )
-        elif isinstance(exception, MemoryError):
-            await self.handle(
-                ResourceError(
-                    f"Memory error during {operation}",
-                    severity=ErrorSeverity.FATAL,
-                    cause=exception,
-                )
-            )
-        else:
-            await self.handle(UnexpectedError(exception, operation))
+        await self.handle(
+            exception if isinstance(exception, SwimError) else _wrap_exception(exception, operation)
+        )
 
     def record_success(self, category: ErrorCategory) -> None:
         """Record a successful operation (helps circuit breaker recover)."""
@@ -309,45 +349,54 @@ class ErrorHandler:
         """Log error with structured context, using appropriate level based on severity."""
         if self.logger:
             try:
-                # Build structured message with error details
-                message = (
-                    f"[{error.__class__.__name__}] {error} "
-                    f"(category={error.category.name}, severity={error.severity.name}"
-                )
-                if error.context:
-                    message += f", context={error.context}"
-                message += ")"
-
-                # Select log model based on severity
-                # TRANSIENT = expected/normal, DEGRADED = warning, FATAL = error
-
-                log_kwargs = {
-                    "message": message,
-                    "node_id": self.node_id,
-                    "node_host": "",  # Not available at handler level
-                    "node_port": 0,
-                }
-
-                if error.severity == ErrorSeverity.TRANSIENT:
-                    log_model = ServerDebug(**log_kwargs)
-                elif error.severity == ErrorSeverity.DEGRADED:
-                    log_model = ServerWarning(**log_kwargs)
-                else:  # FATAL
-                    log_model = ServerError(**log_kwargs)
-
+                log_model = self._build_error_log_model(error)
                 await self.logger.log(log_model)
             except (ImportError, AttributeError, TypeError):
                 # Fallback to simple logging - if this also fails, silently ignore
                 # since logging errors shouldn't crash the application
-                try:
-                    await self.logger.log(str(error))
-                except Exception:
-                    self.log_write_failures += 1
+                await self._log_with_plain_fallback(error)
+
+    def _build_error_log_model(self, error: SwimError) -> ServerDebug | ServerWarning | ServerError:
+        """Build the structured log record for an error, its model chosen by severity."""
+        # Build structured message with error details
+        message = (
+            f"[{error.__class__.__name__}] {error} "
+            f"(category={error.category.name}, severity={error.severity.name}"
+        )
+        if error.context:
+            message += f", context={error.context}"
+        message += ")"
+
+        # Select log model based on severity
+        # TRANSIENT = expected/normal, DEGRADED = warning, FATAL = error
+
+        log_kwargs = {
+            "message": message,
+            "node_id": self.node_id,
+            "node_host": "",  # Not available at handler level
+            "node_port": 0,
+        }
+
+        # FATAL (and any other severity) logs as ServerError
+        return _SEVERITY_LOG_MODELS.get(error.severity, ServerError)(**log_kwargs)
+
+    async def _log_with_plain_fallback(self, loggable: object) -> None:
+        """Log ``str(loggable)`` after a structured log failed; count a failure of this too."""
+        try:
+            await self.logger.log(str(loggable))
+        except Exception:
+            self.log_write_failures += 1
 
     async def _log_circuit_open(
         self, category: ErrorCategory, stats: ErrorStats
     ) -> None:
         """Log circuit breaker opening with last error details."""
+        message = self._format_circuit_open_message(category, stats)
+
+        await self._log_server_error(message)
+
+    def _format_circuit_open_message(self, category: ErrorCategory, stats: ErrorStats) -> str:
+        """The circuit-open log line, with the category's last error and traceback when known."""
         message = (
             f"[CircuitBreakerOpen] Circuit breaker OPEN for {category.name}: "
             f"{stats.error_count} errors, rate={stats.error_rate:.2f}/s"
@@ -360,7 +409,10 @@ class ErrorHandler:
             message += f" | Last error: {error}"
             if tb_line:
                 message += f" | Traceback: {tb_line}"
+        return message
 
+    async def _log_server_error(self, message: str) -> None:
+        """Log ``message`` as a ServerError, falling back to a plain-string log."""
         if self.logger:
             try:
 
@@ -374,10 +426,7 @@ class ErrorHandler:
                 )
             except (ImportError, AttributeError, TypeError):
                 # Fallback to simple logging - if this also fails, silently ignore
-                try:
-                    await self.logger.log(message)
-                except Exception:
-                    self.log_write_failures += 1
+                await self._log_with_plain_fallback(message)
 
     async def _update_lhm(self, error: SwimError) -> None:
         """
@@ -401,29 +450,37 @@ class ErrorHandler:
             return
 
         # Only update LHM for errors that clearly indicate LOCAL node issues
-        event_type: str | None = None
+        event_type = self._lhm_event_type(error)
 
+        if event_type:
+            await self._apply_lhm_event(event_type)
+
+    @staticmethod
+    def _lhm_event_type(error: SwimError) -> str | None:
+        """The LHM event a FATAL or RESOURCE error raises; None for every other error."""
         if error.severity == ErrorSeverity.FATAL:
             # Fatal errors always affect health significantly
-            event_type = "event_loop_critical"
+            return "event_loop_critical"
 
-        elif error.category == ErrorCategory.RESOURCE:
+        if error.category == ErrorCategory.RESOURCE:
             # Resource exhaustion is a clear signal of local problems
-            event_type = "event_loop_lag"
+            return "event_loop_lag"
 
         # Note: We intentionally skip NETWORK, PROTOCOL, ELECTION, and TRANSIENT
         # errors here. They are either:
         # 1. Already handled by direct increase_failure_detector() calls
         # 2. Indicate remote node issues rather than local health problems
+        return None
 
-        if event_type:
-            try:
-                await self.increment_lhm(event_type)
-            except Exception as e:
-                # Log but don't let LHM updates cause more errors
-                await self._log_internal(
-                    f"LHM update failed for {event_type}: {type(e).__name__}: {e}"
-                )
+    async def _apply_lhm_event(self, event_type: str) -> None:
+        """Raise the Local Health Multiplier, logging (not propagating) a failed update."""
+        try:
+            await self.increment_lhm(event_type)
+        except Exception as e:
+            # Log but don't let LHM updates cause more errors
+            await self._log_internal(
+                f"LHM update failed for {event_type}: {type(e).__name__}: {e}"
+            )
 
     async def _trigger_recovery(self, category: ErrorCategory) -> None:
         """Trigger recovery action for a category."""

@@ -94,12 +94,16 @@ class WorkerHealthState:
 
         if actual_rate >= self.expected_completion_rate * self.config.normal_rate_threshold:
             return ProgressState.NORMAL
-        elif actual_rate >= self.expected_completion_rate * self.config.slow_rate_threshold:
+        return self._progress_below_normal(actual_rate)
+
+    def _progress_below_normal(self, actual_rate: float) -> ProgressState:
+        """Classify a rate under the normal threshold as SLOW, DEGRADED or
+        STUCK (AD-19 progress signal)."""
+        if actual_rate >= self.expected_completion_rate * self.config.slow_rate_threshold:
             return ProgressState.SLOW
-        elif actual_rate > 0:
+        if actual_rate > 0:
             return ProgressState.DEGRADED
-        else:
-            return ProgressState.STUCK
+        return ProgressState.STUCK
 
     def get_routing_decision(self) -> RoutingDecision:
         """
@@ -118,6 +122,11 @@ class WorkerHealthState:
         if progress == ProgressState.STUCK:
             return RoutingDecision.EVICT
 
+        return self._live_routing_decision(progress)
+
+    def _live_routing_decision(self, progress: ProgressState) -> RoutingDecision:
+        """Routing decision for a live, not-stuck node (AD-19 decision
+        matrix): DRAIN when not ready, INVESTIGATE when degraded, else ROUTE."""
         if not self.readiness:
             return RoutingDecision.DRAIN
 

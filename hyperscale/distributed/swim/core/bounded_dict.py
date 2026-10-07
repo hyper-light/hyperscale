@@ -171,16 +171,20 @@ class BoundedDict(Generic[K, V]):
         Returns:
             Number of entries removed.
         """
-        to_remove = [
-            key for key, value in self._data.items()
-            if predicate(key, value)
-        ]
-        
+        to_remove = self._matching_keys(predicate)
+
         for key in to_remove:
             del self[key]
         
         return len(to_remove)
     
+    def _matching_keys(self, predicate: Callable[[K, V], bool]) -> list[K]:
+        """Keys whose entry satisfies ``predicate`` (snapshot before removal)."""
+        return [
+            key for key, value in self._data.items()
+            if predicate(key, value)
+        ]
+
     def cleanup_older_than(self, max_age_seconds: float) -> int:
         """
         Remove entries older than max_age_seconds.

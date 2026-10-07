@@ -13,6 +13,7 @@ import asyncio
 from typing import TYPE_CHECKING, Callable, Awaitable
 from hyperscale.distributed.reliability.backpressure import BackpressureLevel, BackpressureSignal
 from hyperscale.distributed.ledger.durability_level import DurabilityLevel
+from hyperscale.distributed.ledger.wal.entry_state import TransitionResult
 from hyperscale.distributed.ledger.wal.wal_entry import WALEntry
 from hyperscale.distributed.runtime import Clock, RealClock
 
@@ -89,125 +90,172 @@ class CommitPipeline:
         required_level: DurabilityLevel,
         backpressure: BackpressureSignal | None = None,
     ) -> CommitResult:
-        level_achieved = DurabilityLevel.LOCAL
-
         if required_level == DurabilityLevel.LOCAL:
             return CommitResult(
                 entry=entry,
-                level_achieved=level_achieved,
+                level_achieved=DurabilityLevel.LOCAL,
                 backpressure=backpressure,
             )
 
+        level_achieved, regional_failure = await self._escalate_regional(entry, required_level, backpressure)
+        if regional_failure is not None:
+            return regional_failure
+
+        return await self._escalate_global(entry, required_level, level_achieved, backpressure)
+
+    async def _escalate_regional(
+        self,
+        entry: WALEntry,
+        required_level: DurabilityLevel,
+        backpressure: BackpressureSignal | None,
+    ) -> tuple[DurabilityLevel, CommitResult | None]:
+        """Reach REGIONAL when required: the level then held, and the
+        failed commit's result if the stage failed."""
         if required_level >= DurabilityLevel.REGIONAL:
-            if self._regional_replicator is None:
-                # An absent replicator cannot satisfy a durability
-                # requirement. ``_replicate_regional`` used to return
-                # True in this case, so the entry advanced to REGIONAL
-                # (and on to GLOBAL) and the CommitResult REPORTED
-                # cross-region durability while nothing had left this
-                # node — the caller's ack, its WAL state transition and
-                # its operator-facing level were all a lie. Report the
-                # level actually achieved (LOCAL) and name the cause.
-                return CommitResult(
-                    entry=entry,
-                    level_achieved=level_achieved,
-                    error=RuntimeError(
-                        "REGIONAL durability requested but no regional "
-                        "replicator is configured; entry is LOCAL-durable "
-                        "only"
-                    ),
-                    backpressure=backpressure,
-                )
-            try:
-                regional_success = await self._replicate_regional(entry)
-                if regional_success:
-                    transition_result = await self._wal.mark_regional(entry.lsn)
-                    if not transition_result.is_ok:
-                        return CommitResult(
-                            entry=entry,
-                            level_achieved=level_achieved,
-                            error=RuntimeError(
-                                f"WAL state transition failed: {transition_result.value}"
-                            ),
-                            backpressure=backpressure,
-                        )
-                    level_achieved = DurabilityLevel.REGIONAL
-                else:
-                    return CommitResult(
-                        entry=entry,
-                        level_achieved=level_achieved,
-                        error=RuntimeError("Regional replication failed"),
-                        backpressure=backpressure,
-                    )
-            except asyncio.TimeoutError:
-                return CommitResult(
-                    entry=entry,
-                    level_achieved=level_achieved,
-                    error=asyncio.TimeoutError("Regional replication timed out"),
-                    backpressure=backpressure,
-                )
-            except Exception as exc:
-                return CommitResult(
-                    entry=entry,
-                    level_achieved=level_achieved,
-                    error=exc,
-                    backpressure=backpressure,
-                )
+            return DurabilityLevel.REGIONAL, await self._commit_regional(entry, backpressure)
+        return DurabilityLevel.LOCAL, None
 
+    async def _commit_regional(
+        self,
+        entry: WALEntry,
+        backpressure: BackpressureSignal | None,
+    ) -> CommitResult | None:
+        """Replicate within the datacenter and mark the entry REGIONAL;
+        the failed commit's result, or None once REGIONAL is reached."""
+        if self._regional_replicator is None:
+            # An absent replicator cannot satisfy a durability
+            # requirement. ``_replicate_regional`` used to return
+            # True in this case, so the entry advanced to REGIONAL
+            # (and on to GLOBAL) and the CommitResult REPORTED
+            # cross-region durability while nothing had left this
+            # node — the caller's ack, its WAL state transition and
+            # its operator-facing level were all a lie. Report the
+            # level actually achieved (LOCAL) and name the cause.
+            return CommitResult(
+                entry=entry,
+                level_achieved=DurabilityLevel.LOCAL,
+                error=RuntimeError(
+                    "REGIONAL durability requested but no regional "
+                    "replicator is configured; entry is LOCAL-durable "
+                    "only"
+                ),
+                backpressure=backpressure,
+            )
+        return await self._replicate_stage(
+            entry,
+            DurabilityLevel.LOCAL,
+            backpressure,
+            lambda: self._replicate_regional(entry),
+            lambda: self._wal.mark_regional(entry.lsn),
+            "Regional",
+        )
+
+    async def _escalate_global(
+        self,
+        entry: WALEntry,
+        required_level: DurabilityLevel,
+        level_achieved: DurabilityLevel,
+        backpressure: BackpressureSignal | None,
+    ) -> CommitResult:
+        """Reach GLOBAL when required; the commit's result."""
         if required_level >= DurabilityLevel.GLOBAL:
-            if self._global_replicator is None:
-                # Same contract as the regional branch above.
-                return CommitResult(
-                    entry=entry,
-                    level_achieved=level_achieved,
-                    error=RuntimeError(
-                        "GLOBAL durability requested but no global "
-                        "replicator is configured; entry is "
-                        f"{level_achieved.name}-durable only"
-                    ),
-                    backpressure=backpressure,
-                )
-            try:
-                global_success = await self._replicate_global(entry)
-                if global_success:
-                    transition_result = await self._wal.mark_global(entry.lsn)
-                    if not transition_result.is_ok:
-                        return CommitResult(
-                            entry=entry,
-                            level_achieved=level_achieved,
-                            error=RuntimeError(
-                                f"WAL state transition failed: {transition_result.value}"
-                            ),
-                            backpressure=backpressure,
-                        )
-                    level_achieved = DurabilityLevel.GLOBAL
-                else:
-                    return CommitResult(
-                        entry=entry,
-                        level_achieved=level_achieved,
-                        error=RuntimeError("Global replication failed"),
-                        backpressure=backpressure,
-                    )
-            except asyncio.TimeoutError:
-                return CommitResult(
-                    entry=entry,
-                    level_achieved=level_achieved,
-                    error=asyncio.TimeoutError("Global replication timed out"),
-                    backpressure=backpressure,
-                )
-            except Exception as exc:
-                return CommitResult(
-                    entry=entry,
-                    level_achieved=level_achieved,
-                    error=exc,
-                    backpressure=backpressure,
-                )
-
+            return await self._commit_global(entry, level_achieved, backpressure)
         return CommitResult(
             entry=entry,
             level_achieved=level_achieved,
             backpressure=backpressure,
         )
+
+    async def _commit_global(
+        self,
+        entry: WALEntry,
+        level_achieved: DurabilityLevel,
+        backpressure: BackpressureSignal | None,
+    ) -> CommitResult:
+        """Commit to the global ledger and mark the entry GLOBAL."""
+        if self._global_replicator is None:
+            # Same contract as the regional branch above.
+            return CommitResult(
+                entry=entry,
+                level_achieved=level_achieved,
+                error=RuntimeError(
+                    "GLOBAL durability requested but no global "
+                    "replicator is configured; entry is "
+                    f"{level_achieved.name}-durable only"
+                ),
+                backpressure=backpressure,
+            )
+        global_failure = await self._replicate_stage(
+            entry,
+            level_achieved,
+            backpressure,
+            lambda: self._replicate_global(entry),
+            lambda: self._wal.mark_global(entry.lsn),
+            "Global",
+        )
+        return global_failure if global_failure is not None else CommitResult(
+            entry=entry,
+            level_achieved=DurabilityLevel.GLOBAL,
+            backpressure=backpressure,
+        )
+
+    async def _replicate_stage(
+        self,
+        entry: WALEntry,
+        level_achieved: DurabilityLevel,
+        backpressure: BackpressureSignal | None,
+        replicate: Callable[[], Awaitable[bool]],
+        mark: Callable[[], Awaitable[TransitionResult]],
+        stage_name: str,
+    ) -> CommitResult | None:
+        """Run one replication stage; a timeout or error fails the commit
+        at ``level_achieved``. None once the stage is reached."""
+        try:
+            return await self._replicate_and_mark(entry, level_achieved, backpressure, replicate, mark, stage_name)
+        except asyncio.TimeoutError:
+            return CommitResult(
+                entry=entry,
+                level_achieved=level_achieved,
+                error=asyncio.TimeoutError(f"{stage_name} replication timed out"),
+                backpressure=backpressure,
+            )
+        except Exception as exc:
+            return CommitResult(
+                entry=entry,
+                level_achieved=level_achieved,
+                error=exc,
+                backpressure=backpressure,
+            )
+
+    async def _replicate_and_mark(
+        self,
+        entry: WALEntry,
+        level_achieved: DurabilityLevel,
+        backpressure: BackpressureSignal | None,
+        replicate: Callable[[], Awaitable[bool]],
+        mark: Callable[[], Awaitable[TransitionResult]],
+        stage_name: str,
+    ) -> CommitResult | None:
+        """Replicate, then move the entry's WAL state; the failed commit's
+        result, or None when both succeed."""
+        if not await replicate():
+            return CommitResult(
+                entry=entry,
+                level_achieved=level_achieved,
+                error=RuntimeError(f"{stage_name} replication failed"),
+                backpressure=backpressure,
+            )
+        transition_result = await mark()
+        if not transition_result.is_ok:
+            return CommitResult(
+                entry=entry,
+                level_achieved=level_achieved,
+                error=RuntimeError(
+                    f"WAL state transition failed: {transition_result.value}"
+                ),
+                backpressure=backpressure,
+            )
+        return None
 
     async def _replicate_regional(self, entry: WALEntry) -> bool:
         # ``commit`` gates on configuration before calling this, so a

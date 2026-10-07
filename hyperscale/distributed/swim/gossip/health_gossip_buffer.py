@@ -23,6 +23,8 @@ talking and data written earlier keeps loading.
 """
 
 import heapq
+from itertools import compress
+from operator import methodcaller, not_
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable
@@ -363,11 +365,13 @@ class HealthGossipBuffer:
         Returns:
             Number of stale entries removed
         """
-        stale_nodes = [
-            node_id
-            for node_id, entry in self._entries.items()
-            if entry.is_stale(self.config.stale_age_seconds)
-        ]
+        # Keys and values iterate in the same order, so compress selects the stale keys.
+        stale_nodes = list(
+            compress(
+                self._entries.keys(),
+                map(methodcaller("is_stale", self.config.stale_age_seconds), self._entries.values()),
+            )
+        )
 
         for node_id in stale_nodes:
             del self._entries[node_id]
@@ -382,11 +386,13 @@ class HealthGossipBuffer:
         Returns:
             Number of completed entries removed
         """
-        complete_nodes = [
-            node_id
-            for node_id, entry in self._entries.items()
-            if not entry.should_broadcast()
-        ]
+        # Keys and values iterate in the same order, so compress selects the completed keys.
+        complete_nodes = list(
+            compress(
+                self._entries.keys(),
+                map(not_, map(methodcaller("should_broadcast"), self._entries.values())),
+            )
+        )
 
         for node_id in complete_nodes:
             del self._entries[node_id]

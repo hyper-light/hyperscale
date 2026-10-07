@@ -126,54 +126,68 @@ class IncarnationStore:
         """
         async with self._lock:
             if self._initialized:
-                return (
-                    self._current_record.incarnation
-                    if self._current_record
-                    else self.restart_incarnation_bump
-                )
+                return self._initialized_incarnation()
 
-            try:
-                await self.filesystem.mkdir(
-                    self.storage_directory, parents=True, exist_ok=True
-                )
-            except OSError as error:
-                await self._log_warning(
-                    f"Failed to create incarnation storage directory: {error}"
-                )
+            if not await self._ensure_storage_directory():
                 self._initialized = True
                 return self.restart_incarnation_bump
 
-            loaded_record = await self._load_from_disk()
-
-            if loaded_record:
-                # Bump incarnation on restart to ensure we're always fresh
-                new_incarnation = (
-                    loaded_record.incarnation + self.restart_incarnation_bump
-                )
-                self._current_record = IncarnationRecord(
-                    incarnation=new_incarnation,
-                    last_updated_at=_DEFAULT_CLOCK.time(),
-                    node_address=self.node_address,
-                )
-                await self._save_to_disk(self._current_record)
-                await self._log_debug(
-                    f"Loaded persisted incarnation {loaded_record.incarnation}, "
-                    f"starting at {new_incarnation}"
-                )
-            else:
-                # First time - start with restart_incarnation_bump
-                self._current_record = IncarnationRecord(
-                    incarnation=self.restart_incarnation_bump,
-                    last_updated_at=_DEFAULT_CLOCK.time(),
-                    node_address=self.node_address,
-                )
-                await self._save_to_disk(self._current_record)
-                await self._log_debug(
-                    f"No persisted incarnation found, starting at {self.restart_incarnation_bump}"
-                )
+            await self._start_current_record()
 
             self._initialized = True
             return self._current_record.incarnation
+
+    def _initialized_incarnation(self) -> int:
+        """The incarnation an already-initialized store reports: its record's, else the restart bump."""
+        return (
+            self._current_record.incarnation
+            if self._current_record
+            else self.restart_incarnation_bump
+        )
+
+    async def _ensure_storage_directory(self) -> bool:
+        """Create the storage directory; False (logged) when the filesystem refuses."""
+        try:
+            await self.filesystem.mkdir(
+                self.storage_directory, parents=True, exist_ok=True
+            )
+        except OSError as error:
+            await self._log_warning(
+                f"Failed to create incarnation storage directory: {error}"
+            )
+            return False
+        return True
+
+    async def _start_current_record(self) -> None:
+        """Set and persist the starting record: the persisted incarnation bumped, else the bump alone."""
+        loaded_record = await self._load_from_disk()
+
+        if loaded_record:
+            # Bump incarnation on restart to ensure we're always fresh
+            new_incarnation = (
+                loaded_record.incarnation + self.restart_incarnation_bump
+            )
+            self._current_record = IncarnationRecord(
+                incarnation=new_incarnation,
+                last_updated_at=_DEFAULT_CLOCK.time(),
+                node_address=self.node_address,
+            )
+            await self._save_to_disk(self._current_record)
+            await self._log_debug(
+                f"Loaded persisted incarnation {loaded_record.incarnation}, "
+                f"starting at {new_incarnation}"
+            )
+        else:
+            # First time - start with restart_incarnation_bump
+            self._current_record = IncarnationRecord(
+                incarnation=self.restart_incarnation_bump,
+                last_updated_at=_DEFAULT_CLOCK.time(),
+                node_address=self.node_address,
+            )
+            await self._save_to_disk(self._current_record)
+            await self._log_debug(
+                f"No persisted incarnation found, starting at {self.restart_incarnation_bump}"
+            )
 
     async def get_incarnation(self) -> int:
         """Get the current persisted incarnation."""
@@ -291,25 +305,7 @@ class IncarnationStore:
                 json.dumps(data).encode("utf-8"),
             )
         except OSError as error:
-            self._persist_failure_count += 1
-            if not self._persistence_degraded:
-                self._persistence_degraded = True
-                await self._log_error(
-                    f"Incarnation persistence DEGRADED: save of "
-                    f"incarnation {record.incarnation} failed "
-                    f"({type(error).__name__}: {error}); the live "
-                    "incarnation is now ahead of disk — a reboot in "
-                    "this state starts from a stale value and erodes "
-                    "the restart zombie-guard margin. Every accepted "
-                    "update retries; recovery will be logged."
-                )
-            else:
-                await self._log_warning(
-                    f"Incarnation save still failing "
-                    f"({type(error).__name__}); "
-                    f"{self._persist_failure_count} failures since "
-                    "degradation"
-                )
+            await self._record_persist_failure(record, error)
             return False
 
         if self._persistence_degraded:
@@ -320,6 +316,28 @@ class IncarnationStore:
                 f"{self._persist_failure_count} failed save(s)"
             )
         return True
+
+    async def _record_persist_failure(self, record: IncarnationRecord, error: OSError) -> None:
+        """Count a failed save; log the degraded transition at ERROR once, then each repeat as a warning."""
+        self._persist_failure_count += 1
+        if not self._persistence_degraded:
+            self._persistence_degraded = True
+            await self._log_error(
+                f"Incarnation persistence DEGRADED: save of "
+                f"incarnation {record.incarnation} failed "
+                f"({type(error).__name__}: {error}); the live "
+                "incarnation is now ahead of disk — a reboot in "
+                "this state starts from a stale value and erodes "
+                "the restart zombie-guard margin. Every accepted "
+                "update retries; recovery will be logged."
+            )
+        else:
+            await self._log_warning(
+                f"Incarnation save still failing "
+                f"({type(error).__name__}); "
+                f"{self._persist_failure_count} failures since "
+                "degradation"
+            )
 
     async def _log_debug(self, message: str) -> None:
         """Log a debug message."""

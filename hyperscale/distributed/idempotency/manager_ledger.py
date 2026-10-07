@@ -97,23 +97,29 @@ class ManagerIdempotencyLedger(Generic[T]):
     async def close(self) -> None:
         """Stop cleanup and close the ledger."""
         self._closed = True
-        cleanup_error: Exception | None = None
-        if self._cleanup_token:
-            try:
-                await self._task_runner.cancel(self._cleanup_token)
-            except Exception as exc:
-                cleanup_error = exc
-                await self._logger.log(
-                    IdempotencyError(
-                        message=f"Failed to cancel idempotency ledger cleanup: {exc}",
-                        component="manager-ledger",
-                    )
-                )
-            finally:
-                self._cleanup_token = None
+        cleanup_error = await self._cancel_cleanup()
 
         if cleanup_error:
             raise cleanup_error
+
+    async def _cancel_cleanup(self) -> Exception | None:
+        """Cancel the cleanup loop: the error its cancellation raised
+        (logged), or None."""
+        if not self._cleanup_token:
+            return None
+        try:
+            await self._task_runner.cancel(self._cleanup_token)
+        except Exception as exc:
+            await self._logger.log(
+                IdempotencyError(
+                    message=f"Failed to cancel idempotency ledger cleanup: {exc}",
+                    component="manager-ledger",
+                )
+            )
+            return exc
+        finally:
+            self._cleanup_token = None
+        return None
 
     async def check_or_reserve(
         self,
@@ -139,10 +145,7 @@ class ManagerIdempotencyLedger(Generic[T]):
             # from the gate's cache): a key evicted early is decided afresh,
             # as one that lapsed is. The WAL sheds it at the next compaction.
             while len(self._index) >= self._config.max_entries:
-                evicted_key, evicted_entry = next(iter(self._index.items()))
-                del self._index[evicted_key]
-                if self._job_to_key.get(evicted_entry.job_id) == evicted_key:
-                    del self._job_to_key[evicted_entry.job_id]
+                self._evict_oldest()
             self._index[key] = entry
             self._job_to_key[job_id] = key
 
@@ -199,8 +202,19 @@ class ManagerIdempotencyLedger(Generic[T]):
                 return
 
             self._index.pop(key)
-            if self._job_to_key.get(entry.job_id) == key:
-                self._job_to_key.pop(entry.job_id)
+            self._unmap_job_if_current(entry.job_id, key)
+
+    def _evict_oldest(self) -> None:
+        """Drop the oldest held entry (and its job mapping, if current)."""
+        evicted_key, evicted_entry = next(iter(self._index.items()))
+        del self._index[evicted_key]
+        self._unmap_job_if_current(evicted_entry.job_id, evicted_key)
+
+    def _unmap_job_if_current(self, job_id: str, key: IdempotencyKey) -> None:
+        """Unmap ``job_id`` when it still maps to ``key``: a job id maps to
+        its newest key, which an older key leaving must not unmap."""
+        if self._job_to_key.get(job_id) == key:
+            del self._job_to_key[job_id]
 
     def get_by_key(self, key: IdempotencyKey) -> IdempotencyLedgerEntry | None:
         """Get a ledger entry by idempotency key."""
@@ -222,31 +236,48 @@ class ManagerIdempotencyLedger(Generic[T]):
         try:
             await self._filesystem.append_fsync(self._wal_path, record)
         except OSError as storage_error:
-            # The device refused the append: cut the torn record back
-            # (replay stops at the first incomplete frame, so it would
-            # hide every later entry) and report the failure.
-            if await self._filesystem.exists(self._wal_path):
-                await self._filesystem.truncate(self._wal_path, self._committed_length)
-            if self._storage_health is not None:
-                self._storage_health.record_failure(storage_error, len(record))
+            await self._cut_back_failed_append(storage_error, len(record))
             raise
         self._committed_length += len(record)
         if self._storage_health is not None:
             self._storage_health.record_success(len(record))
 
+    async def _cut_back_failed_append(self, storage_error: OSError, attempted_bytes: int) -> None:
+        """Cut a refused append's torn record back and record the failure."""
+        # The device refused the append: cut the torn record back
+        # (replay stops at the first incomplete frame, so it would
+        # hide every later entry) and report the failure.
+        if await self._filesystem.exists(self._wal_path):
+            await self._filesystem.truncate(self._wal_path, self._committed_length)
+        if self._storage_health is not None:
+            self._storage_health.record_failure(storage_error, attempted_bytes)
+
     async def _replay_wal(self) -> None:
         header = IDEMPOTENCY_WAL_FORMAT.header
+        if (loaded := await self._load_wal(header)) is None:
+            return
+        data, frames = loaded
+        await self._recover_entries(header, data, frames)
+
+    async def _load_wal(self, header: bytes) -> tuple[bytes, bytes] | None:
+        """The WAL's bytes and its frames; None when the WAL starts empty
+        (absent, torn at its header, or set aside)."""
         if not await self._filesystem.exists(self._wal_path):
             await self._filesystem.append_fsync(self._wal_path, header)
             self._committed_length = len(header)
-            return
+            return None
 
         data = await self._filesystem.read_bytes(self._wal_path)
         if IDEMPOTENCY_WAL_FORMAT.is_torn_header(data):
             # A crash while the file was made, before any entry followed.
             await self._filesystem.atomic_write(self._wal_path, header)
             self._committed_length = len(header)
-            return
+            return None
+        return await self._decode_wal(data, header)
+
+    async def _decode_wal(self, data: bytes, header: bytes) -> tuple[bytes, bytes] | None:
+        """The WAL's bytes and frames; an unrecognized WAL is set aside
+        and restarted empty (None)."""
         try:
             frames = IDEMPOTENCY_WAL_FORMAT.decode(data)
         except UnrecognizedStorageFormatError as format_error:
@@ -256,43 +287,53 @@ class ManagerIdempotencyLedger(Generic[T]):
             )
             await self._filesystem.append_fsync(self._wal_path, header)
             self._committed_length = len(header)
-            return
+            return None
+        return data, frames
+
+    async def _recover_entries(self, header: bytes, data: bytes, frames: bytes) -> None:
+        """Index the WAL's intact entries, within the bound, and cut any
+        damaged tail."""
         entries, frames_length = self._parse_wal_entries(frames)
-        for entry in entries:
-            self._index[entry.idempotency_key] = entry
-            self._job_to_key[entry.job_id] = entry.idempotency_key
+        self._index_entries(entries)
         # The bound holds across a restart: a WAL not yet compacted after
         # evictions replays more entries than are kept.
         while len(self._index) > self._config.max_entries:
-            evicted_key, evicted_entry = next(iter(self._index.items()))
-            del self._index[evicted_key]
-            if self._job_to_key.get(evicted_entry.job_id) == evicted_key:
-                del self._job_to_key[evicted_entry.job_id]
+            self._evict_oldest()
 
         recovered_length = len(header) + frames_length
         self._committed_length = recovered_length
         if recovered_length < len(data):
-            # Cut what follows the last good entry, so entries appended
-            # from now on are not stranded behind it at the next replay --
-            # its bytes preserved beside the WAL, never destroyed, and
-            # only when a second read agrees (a flipped read must not cut
-            # good entries).
-            await require_stable_read(self._filesystem, self._wal_path, data)
-            preserved_path = await free_sibling_path(self._filesystem, self._wal_path, "discarded")
-            await self._filesystem.atomic_write(preserved_path, data[recovered_length:])
-            await self._filesystem.atomic_write(self._wal_path, data[:recovered_length])
-            await self._logger.log(
-                IdempotencyError(
-                    message=(
-                        f"Idempotency WAL has a torn tail or damaged entry at byte "
-                        f"{recovered_length} of {len(data)} -- recovered "
-                        f"{len(entries)} complete entries; the "
-                        f"{len(data) - recovered_length} bytes after them are preserved "
-                        f"at {preserved_path}"
-                    ),
-                    component="manager-ledger",
-                )
+            await self._preserve_damaged_tail(data, recovered_length, len(entries))
+
+    def _index_entries(self, entries: list[IdempotencyLedgerEntry]) -> None:
+        """Index replayed entries, the newest per key and per job winning."""
+        for entry in entries:
+            self._index[entry.idempotency_key] = entry
+            self._job_to_key[entry.job_id] = entry.idempotency_key
+
+    async def _preserve_damaged_tail(self, data: bytes, recovered_length: int, entry_count: int) -> None:
+        """Cut the WAL back to its last good entry, preserving the rest."""
+        # Cut what follows the last good entry, so entries appended
+        # from now on are not stranded behind it at the next replay --
+        # its bytes preserved beside the WAL, never destroyed, and
+        # only when a second read agrees (a flipped read must not cut
+        # good entries).
+        await require_stable_read(self._filesystem, self._wal_path, data)
+        preserved_path = await free_sibling_path(self._filesystem, self._wal_path, "discarded")
+        await self._filesystem.atomic_write(preserved_path, data[recovered_length:])
+        await self._filesystem.atomic_write(self._wal_path, data[:recovered_length])
+        await self._logger.log(
+            IdempotencyError(
+                message=(
+                    f"Idempotency WAL has a torn tail or damaged entry at byte "
+                    f"{recovered_length} of {len(data)} -- recovered "
+                    f"{entry_count} complete entries; the "
+                    f"{len(data) - recovered_length} bytes after them are preserved "
+                    f"at {preserved_path}"
+                ),
+                component="manager-ledger",
             )
+        )
 
     def _parse_wal_entries(self, frames: bytes) -> tuple[list[IdempotencyLedgerEntry], int]:
         """The entries in the bytes after the format header, up to the
@@ -307,18 +348,40 @@ class ManagerIdempotencyLedger(Generic[T]):
         entries: list[IdempotencyLedgerEntry] = []
         offset = 0
         while offset + FRAME_HEADER.size <= len(frames):
-            checksum, entry_length = FRAME_HEADER.unpack_from(frames, offset)
-            if (frame_end := offset + FRAME_HEADER.size + entry_length) > len(frames):
-                break
-            entry_bytes = frames[offset + FRAME_HEADER.size : frame_end]
-            if zlib.crc32(entry_bytes) != checksum:
-                break
-            try:
-                entries.append(IdempotencyLedgerEntry.from_bytes(entry_bytes))
-            except (struct.error, ValueError):
+            if (frame_end := self._parse_next_frame(frames, offset, entries)) is None:
                 break
             offset = frame_end
         return entries, offset
+
+    def _parse_next_frame(self, frames: bytes, offset: int, entries: list[IdempotencyLedgerEntry]) -> int | None:
+        """Append the intact entry framed at ``offset`` and return where
+        its frame ends; None at a torn or damaged frame."""
+        if (intact := self._intact_entry_bytes(frames, offset)) is None or not self._append_entry(
+            entries, intact[0]
+        ):
+            return None
+        return intact[1]
+
+    @staticmethod
+    def _intact_entry_bytes(frames: bytes, offset: int) -> tuple[bytes, int] | None:
+        """The entry bytes framed at ``offset`` and the frame's end, when
+        the frame is whole and its checksum holds."""
+        checksum, entry_length = FRAME_HEADER.unpack_from(frames, offset)
+        if (frame_end := offset + FRAME_HEADER.size + entry_length) > len(frames):
+            return None
+        entry_bytes = frames[offset + FRAME_HEADER.size : frame_end]
+        if zlib.crc32(entry_bytes) != checksum:
+            return None
+        return entry_bytes, frame_end
+
+    @staticmethod
+    def _append_entry(entries: list[IdempotencyLedgerEntry], entry_bytes: bytes) -> bool:
+        """Decode an entry onto ``entries``; whether it decoded."""
+        try:
+            entries.append(IdempotencyLedgerEntry.from_bytes(entry_bytes))
+        except (struct.error, ValueError):
+            return False
+        return True
 
     async def _cleanup_loop(self) -> None:
         while not self._closed:
@@ -328,52 +391,73 @@ class ManagerIdempotencyLedger(Generic[T]):
     async def _cleanup_expired(self) -> None:
         now = _DEFAULT_CLOCK.time()
         async with self._lock:
-            expired_entries = [
-                (key, entry)
-                for key, entry in self._index.items()
-                if self._is_expired(entry, now)
-            ]
+            self._drop_expired(now)
+            await self._compact_wal()
 
-            for key, entry in expired_entries:
-                self._index.pop(key, None)
-                # A job id maps to its newest key: an older key lapsing
-                # must not unmap a newer one.
-                if self._job_to_key.get(entry.job_id) == key:
-                    self._job_to_key.pop(entry.job_id)
+    def _drop_expired(self, now: float) -> None:
+        """Drop every entry expired at ``now`` (the caller holds the lock)."""
+        for key, entry in self._expired_entries(now):
+            self._index.pop(key, None)
+            # A job id maps to its newest key: an older key lapsing
+            # must not unmap a newer one.
+            self._unmap_job_if_current(entry.job_id, key)
 
-            # The WAL holds every entry ever appended -- each reservation
-            # and its outcome -- and expiry drops them from memory only, so
-            # it grew with every keyed submission for the manager's life
-            # and replay read all of it. Once the live entries fill no more
-            # than half of it, it is rewritten to them: the doubling bound,
-            # each byte rewritten paid for by a byte appended.
-            live_records = IDEMPOTENCY_WAL_FORMAT.header + b"".join(
-                FRAME_HEADER.pack(zlib.crc32(payload := entry.to_bytes()), len(payload)) + payload
-                for entry in self._index.values()
+    def _expired_entries(self, now: float) -> list[tuple[IdempotencyKey, IdempotencyLedgerEntry]]:
+        """The held entries expired at ``now``."""
+        return [
+            (key, entry)
+            for key, entry in self._index.items()
+            if self._is_expired(entry, now)
+        ]
+
+    async def _compact_wal(self) -> None:
+        """Rewrite the WAL to the live entries once they fill no more than
+        half of it (the caller holds the lock)."""
+        # The WAL holds every entry ever appended -- each reservation
+        # and its outcome -- and expiry drops them from memory only, so
+        # it grew with every keyed submission for the manager's life
+        # and replay read all of it. Once the live entries fill no more
+        # than half of it, it is rewritten to them: the doubling bound,
+        # each byte rewritten paid for by a byte appended.
+        live_records = self._live_records()
+        if self._committed_length <= 2 * len(live_records):
+            return
+        try:
+            await self._filesystem.atomic_write(self._wal_path, live_records)
+        except OSError as storage_error:
+            await self._report_failed_compaction(storage_error, live_records)
+            return
+        self._record_compaction(live_records)
+
+    def _live_records(self) -> bytes:
+        """The WAL rewritten to the held entries: header, then a frame each."""
+        return IDEMPOTENCY_WAL_FORMAT.header + b"".join(
+            FRAME_HEADER.pack(zlib.crc32(payload := entry.to_bytes()), len(payload)) + payload
+            for entry in self._index.values()
+        )
+
+    async def _report_failed_compaction(self, storage_error: OSError, live_records: bytes) -> None:
+        """Record and log a compaction the device refused."""
+        # The old WAL stands untouched (the rename never happened):
+        # compaction is retried at the next sweep.
+        if self._storage_health is not None:
+            self._storage_health.record_failure(storage_error, len(live_records))
+        await self._logger.log(
+            IdempotencyError(
+                message=(
+                    f"Idempotency WAL compaction to {len(live_records)} "
+                    f"of {self._committed_length} bytes failed: "
+                    f"{storage_error}"
+                ),
+                component="manager-ledger",
             )
-            if self._committed_length <= 2 * len(live_records):
-                return
-            try:
-                await self._filesystem.atomic_write(self._wal_path, live_records)
-            except OSError as storage_error:
-                # The old WAL stands untouched (the rename never happened):
-                # compaction is retried at the next sweep.
-                if self._storage_health is not None:
-                    self._storage_health.record_failure(storage_error, len(live_records))
-                await self._logger.log(
-                    IdempotencyError(
-                        message=(
-                            f"Idempotency WAL compaction to {len(live_records)} "
-                            f"of {self._committed_length} bytes failed: "
-                            f"{storage_error}"
-                        ),
-                        component="manager-ledger",
-                    )
-                )
-                return
-            self._committed_length = len(live_records)
-            if self._storage_health is not None:
-                self._storage_health.record_success(len(live_records))
+        )
+
+    def _record_compaction(self, live_records: bytes) -> None:
+        """Adopt a completed compaction's length and record its success."""
+        self._committed_length = len(live_records)
+        if self._storage_health is not None:
+            self._storage_health.record_success(len(live_records))
 
     def _is_expired(self, entry: IdempotencyLedgerEntry, now: float) -> bool:
         ttl = self._get_ttl_for_status(entry.status)

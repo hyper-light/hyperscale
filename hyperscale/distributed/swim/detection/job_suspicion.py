@@ -45,9 +45,13 @@ class JobSuspicion:
             return False
 
         self._logical_confirmation_count += 1
+        self._store_confirmer(from_node)
+        return True
+
+    def _store_confirmer(self, from_node: NodeAddress) -> None:
+        """Remember ``from_node`` while the confirmer set is under its memory bound."""
         if len(self.confirmers) < 1000:  # Bound memory
             self.confirmers.add(from_node)
-        return True
 
     @property
     def confirmation_count(self) -> int:

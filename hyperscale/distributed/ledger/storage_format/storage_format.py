@@ -45,15 +45,20 @@ class StorageFormat:
         return data[self.header_size :]
 
     def validate(self, data: bytes) -> None:
+        self._require_header_magic(data)
+        (version,) = _VERSION_STRUCT.unpack(data[4 : self.header_size])
+        if version != self._version:
+            raise UnrecognizedStorageFormatError(f"format version {version}, expected {self._version}")
+
+    def _require_header_magic(self, data: bytes) -> None:
+        """Refuse data shorter than the header or not opening with this
+        format's magic."""
         if len(data) < self.header_size:
             raise UnrecognizedStorageFormatError(
                 f"{len(data)} bytes, shorter than the {self.header_size}-byte format header"
             )
         if data[:4] != self._magic:
             raise UnrecognizedStorageFormatError(f"magic {data[:4]!r}, expected {self._magic!r}")
-        (version,) = _VERSION_STRUCT.unpack(data[4 : self.header_size])
-        if version != self._version:
-            raise UnrecognizedStorageFormatError(f"format version {version}, expected {self._version}")
 
     def is_torn_header(self, data: bytes) -> bool:
         """Whether ``data`` is a strict prefix of the header -- a crash

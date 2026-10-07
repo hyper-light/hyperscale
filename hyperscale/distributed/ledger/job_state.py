@@ -138,13 +138,18 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
                 for datacenter in self.assigned_datacenters
                 if datacenter != reassignment.lost_datacenter
             )
-            + (
-                (reassignment.replacement_datacenter,)
-                if reassignment.replacement_datacenter
-                else ()
-            ),
+            + self._replacement_datacenters(reassignment),
             datacenter_reassignments=(*self.datacenter_reassignments, reassignment),
             last_hlc=hlc,
+        )
+
+    @staticmethod
+    def _replacement_datacenters(reassignment: DatacenterReassignment) -> tuple[str, ...]:
+        """The replacement datacenter, when the reassignment names one."""
+        return (
+            (reassignment.replacement_datacenter,)
+            if reassignment.replacement_datacenter
+            else ()
         )
 
     def with_cancellation_acked(self, datacenter_id: str, hlc: HLCTimestamp) -> JobState:

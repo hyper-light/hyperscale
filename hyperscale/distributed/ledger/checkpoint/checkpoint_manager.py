@@ -73,8 +73,8 @@ class CheckpointManager:
         its LSN (written before names did) is older than any that does."""
         def recency(checkpoint_file: Path) -> tuple[int, int]:
             name_parts = Path(checkpoint_file).stem.split("_")
-            created_at_ms = int(name_parts[1]) if len(name_parts) >= 2 and name_parts[1].isdigit() else -1
-            local_lsn = int(name_parts[2]) if len(name_parts) == 3 and name_parts[2].isdigit() else -1
+            created_at_ms = CheckpointManager._named_created_at_ms(name_parts)
+            local_lsn = CheckpointManager._named_recency_lsn(name_parts)
             return (local_lsn, created_at_ms)
 
         return sorted(
@@ -83,6 +83,16 @@ class CheckpointManager:
             reverse=True,
         )
 
+    @staticmethod
+    def _named_created_at_ms(name_parts: list[str]) -> int:
+        """The creation time a checkpoint's name carries, or -1."""
+        return int(name_parts[1]) if len(name_parts) >= 2 and name_parts[1].isdigit() else -1
+
+    @staticmethod
+    def _named_recency_lsn(name_parts: list[str]) -> int:
+        """The LSN a checkpoint's name carries for ordering, or -1."""
+        return int(name_parts[2]) if len(name_parts) == 3 and name_parts[2].isdigit() else -1
+
     async def _load_latest(self) -> None:
         checkpoint_files = await self._newest_first()
 
@@ -90,14 +100,21 @@ class CheckpointManager:
         # loudly, and the next older one is tried.
         for checkpoint_file in checkpoint_files:
             data = await self._filesystem.read_bytes(checkpoint_file)
-            try:
-                self._latest_checkpoint = self._decode_checkpoint(data)
+            checkpoint, reason = self._decode_or_reason(data)
+            if reason is None:
+                self._latest_checkpoint = checkpoint
                 return
-            except UnrecognizedStorageFormatError as format_error:
-                reason = format_error.reason
-            except (ValueError, msgspec.DecodeError) as corruption:
-                reason = f"damaged checkpoint: {corruption}"
             await self._set_aside(checkpoint_file, data, reason)
+
+    @staticmethod
+    def _decode_or_reason(data: bytes) -> tuple[Checkpoint | None, str | None]:
+        """The decoded checkpoint, or why it cannot be used."""
+        try:
+            return CheckpointManager._decode_checkpoint(data), None
+        except UnrecognizedStorageFormatError as format_error:
+            return None, format_error.reason
+        except (ValueError, msgspec.DecodeError) as corruption:
+            return None, f"damaged checkpoint: {corruption}"
 
     async def _set_aside(self, path: Path, data: bytes, reason: str) -> None:
         """Preserve an unreadable checkpoint's bytes and free its path --
@@ -121,14 +138,19 @@ class CheckpointManager:
         stored_crc = struct.unpack(">I", data[format_end + 4 : format_end + 8])[0]
 
         payload = data[CHECKPOINT_HEADER_SIZE : CHECKPOINT_HEADER_SIZE + data_length]
+        CheckpointManager._require_intact_payload(payload, data_length, stored_crc)
+
+        return msgspec.msgpack.decode(payload, type=Checkpoint)
+
+    @staticmethod
+    def _require_intact_payload(payload: bytes, data_length: int, stored_crc: int) -> None:
+        """Refuse a payload shorter than its header says or failing its CRC."""
         if len(payload) < data_length:
             raise ValueError("Checkpoint file truncated")
 
         computed_crc = zlib.crc32(payload) & 0xFFFFFFFF
         if stored_crc != computed_crc:
             raise ValueError("Checkpoint CRC mismatch")
-
-        return msgspec.msgpack.decode(payload, type=Checkpoint)
 
     async def save(self, checkpoint: Checkpoint) -> Path:
         # The name carries the LSN the checkpoint holds through, so the
@@ -197,16 +219,23 @@ class CheckpointManager:
         replay from where it ends. A checkpoint whose name does not say
         (written before names carried it), or none at all, keeps the
         whole WAL: -1."""
-        lowest_local_lsn: int | None = None
+        local_lsns: list[int] = []
         for checkpoint_file in await self._filesystem.list_directory(
             self._checkpoint_dir, "checkpoint_*.bin"
         ):
-            name_parts = Path(checkpoint_file).stem.split("_")
-            if len(name_parts) != 3 or not name_parts[2].lstrip("-").isdigit():
+            if (local_lsn := self._named_local_lsn(checkpoint_file)) is None:
                 return -1
-            local_lsn = int(name_parts[2])
-            lowest_local_lsn = local_lsn if lowest_local_lsn is None else min(lowest_local_lsn, local_lsn)
-        return -1 if lowest_local_lsn is None else lowest_local_lsn
+            local_lsns.append(local_lsn)
+        return min(local_lsns, default=-1)
+
+    @staticmethod
+    def _named_local_lsn(checkpoint_file: Path) -> int | None:
+        """The LSN a checkpoint's name says it holds through, or None when
+        its name does not carry one."""
+        name_parts = Path(checkpoint_file).stem.split("_")
+        if len(name_parts) != 3 or not name_parts[2].lstrip("-").isdigit():
+            return None
+        return int(name_parts[2])
 
     async def _log_retention_error(
         self, checkpoint_file: Path, removal_error: OSError

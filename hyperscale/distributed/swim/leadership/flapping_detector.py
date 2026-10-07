@@ -188,19 +188,25 @@ class FlappingDetector:
         changes_in_window = self._count_changes_in_window(now)
         
         # Check thresholds
-        triggered_flapping = False
-        
+        return await self._apply_thresholds(changes_in_window, now)
+
+    async def _apply_thresholds(self, changes_in_window: int, now: float) -> bool:
+        """Act on the critical, then flapping threshold; True only when this change began flapping."""
         if changes_in_window >= self.critical_threshold:
             await self._handle_critical(changes_in_window)
-        elif changes_in_window >= self.max_changes_per_window:
-            triggered_flapping = await self._handle_flapping_detected(changes_in_window, now)
-        elif changes_in_window >= self.warning_threshold:
+            return False
+        if changes_in_window >= self.max_changes_per_window:
+            return await self._handle_flapping_detected(changes_in_window, now)
+        await self._apply_sub_flapping_thresholds(changes_in_window, now)
+        return False
+
+    async def _apply_sub_flapping_thresholds(self, changes_in_window: int, now: float) -> None:
+        """Below the flapping threshold: warn when near it, else check whether flapping resolved."""
+        if changes_in_window >= self.warning_threshold:
             await self._handle_warning(changes_in_window)
         elif self._is_flapping:
             # Check if flapping has resolved
             await self._check_flapping_resolved(now)
-        
-        return triggered_flapping
     
     def _count_changes_in_window(self, now: float) -> int:
         """Count leadership changes within the window."""
@@ -231,13 +237,17 @@ class FlappingDetector:
         # Escalate cooldown
         self._escalate_cooldown()
         
+        await self._notify_flapping_detected(count)
+        
+        return True
+
+    async def _notify_flapping_detected(self, count: int) -> None:
+        """Invoke on_flapping_detected with the escalated cooldown, logging a callback failure."""
         if self._on_flapping_detected:
             try:
                 self._on_flapping_detected(count, self._current_cooldown)
             except Exception as e:
                 await self._log_debug(f"Flapping detected callback failed: {type(e).__name__}: {e}")
-        
-        return True
     
     async def _handle_critical(self, count: int) -> None:
         """Handle critical flapping level."""
@@ -268,11 +278,15 @@ class FlappingDetector:
                 self._current_cooldown / self.cooldown_multiplier,
             )
             
-            if self._on_flapping_resolved:
-                try:
-                    self._on_flapping_resolved()
-                except Exception as e:
-                    await self._log_debug(f"Flapping resolved callback failed: {type(e).__name__}: {e}")
+            await self._notify_flapping_resolved()
+
+    async def _notify_flapping_resolved(self) -> None:
+        """Invoke on_flapping_resolved, logging a callback failure."""
+        if self._on_flapping_resolved:
+            try:
+                self._on_flapping_resolved()
+            except Exception as e:
+                await self._log_debug(f"Flapping resolved callback failed: {type(e).__name__}: {e}")
     
     def _escalate_cooldown(self) -> None:
         """Increase the cooldown period."""

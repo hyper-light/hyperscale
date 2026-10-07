@@ -26,6 +26,16 @@ from enum import Enum, auto
 from hyperscale.distributed.runtime import Clock, Random, RealClock, RealRandom
 
 from .errors import SwimError, ErrorCategory, ErrorSeverity, NetworkError
+from .retry_steps import (
+    clamp_delay_to_budget,
+    invoke_retry_callback,
+    last_error_or_none,
+    raise_exhausted,
+    record_bounded_error,
+    resolve_default,
+    should_stop_retrying,
+    sleep_before_retry,
+)
 from .retry_shared import _DEFAULT_RANDOM
 from .retry_decision import RetryDecision
 from .retry_policy import RetryPolicy
@@ -97,11 +107,10 @@ async def retry_with_backoff(
             on_retry=lambda a, e, d: logger.debug(f"Retry {a}: {e}, waiting {d:.2f}s"),
         )
     """
-    if policy is None:
-        policy = PROBE_RETRY_POLICY
+    policy = resolve_default(policy, PROBE_RETRY_POLICY)
 
-    active_clock = clock if clock is not None else _DEFAULT_CLOCK
-    active_random = random_source if random_source is not None else _DEFAULT_RANDOM
+    active_clock = resolve_default(clock, _DEFAULT_CLOCK)
+    active_random = resolve_default(random_source, _DEFAULT_RANDOM)
 
     start_time = active_clock.monotonic()
     last_error: Exception | None = None
@@ -110,54 +119,33 @@ async def retry_with_backoff(
         try:
             result = await fn()
 
-            if on_success:
-                callback_result = on_success(attempt + 1)
-                if asyncio.iscoroutine(callback_result):
-                    await callback_result
+            await invoke_retry_callback(on_success, attempt + 1)
 
             return result
 
         except Exception as e:
             last_error = e
 
-            # Check if we should retry
+            # Check if we should retry, if we're on the last attempt, and the budget
             decision = policy.should_retry(e)
-            if decision == RetryDecision.ABORT:
+            if should_stop_retrying(policy, decision, RetryDecision.ABORT, attempt, active_clock, start_time):
                 raise
 
-            # Check if we're on last attempt
-            if attempt == policy.max_attempts - 1:
-                raise
-
-            # Check budget
-            if policy.budget_seconds is not None:
-                elapsed = active_clock.monotonic() - start_time
-                if elapsed >= policy.budget_seconds:
-                    raise
-
-            # Calculate delay
-            delay = policy.get_delay(attempt, random_source=active_random)
-
-            # Check budget again with delay
-            if policy.budget_seconds is not None:
-                remaining = policy.budget_seconds - (active_clock.monotonic() - start_time)
-                if delay > remaining:
-                    delay = max(0, remaining)
+            # Calculate delay, then check budget again with delay
+            delay = clamp_delay_to_budget(
+                policy,
+                policy.get_delay(attempt, random_source=active_random),
+                active_clock,
+                start_time,
+            )
 
             # Callback before retry
-            if on_retry:
-                callback_result = on_retry(attempt + 1, e, delay)
-                if asyncio.iscoroutine(callback_result):
-                    await callback_result
+            await invoke_retry_callback(on_retry, attempt + 1, e, delay)
 
             # Wait before retry
-            if delay > 0 and decision != RetryDecision.IMMEDIATE:
-                await active_clock.sleep(delay)
-    
-    # Should not reach here, but just in case
-    if last_error:
-        raise last_error
-    raise RuntimeError("Retry loop exited unexpectedly")
+            await sleep_before_retry(active_clock, delay, decision, RetryDecision.IMMEDIATE)
+
+    raise_exhausted(last_error)
 
 
 async def retry_with_result(
@@ -187,11 +175,10 @@ async def retry_with_result(
             # Handle failure - result.last_error contains the exception
             pass
     """
-    if policy is None:
-        policy = PROBE_RETRY_POLICY
+    policy = resolve_default(policy, PROBE_RETRY_POLICY)
 
-    active_clock = clock if clock is not None else _DEFAULT_CLOCK
-    active_random = random_source if random_source is not None else _DEFAULT_RANDOM
+    active_clock = resolve_default(clock, _DEFAULT_CLOCK)
+    active_random = resolve_default(random_source, _DEFAULT_RANDOM)
 
     start_time = active_clock.monotonic()
     errors: list[Exception] = []
@@ -210,44 +197,27 @@ async def retry_with_result(
 
         except Exception as e:
             # Bound stored errors to prevent memory growth
-            if len(errors) >= max_stored_errors:
-                # Keep most recent errors by removing oldest
-                errors.pop(0)
-            errors.append(e)
+            record_bounded_error(errors, e, max_stored_errors)
 
-            # Check if we should retry
+            # Check if we should retry, if we're on the last attempt, and the budget
             decision = policy.should_retry(e)
-            if decision == RetryDecision.ABORT:
+            if should_stop_retrying(policy, decision, RetryDecision.ABORT, attempt, active_clock, start_time):
                 break
-
-            # Check if we're on last attempt
-            if attempt == policy.max_attempts - 1:
-                break
-
-            # Check budget
-            if policy.budget_seconds is not None:
-                elapsed = active_clock.monotonic() - start_time
-                if elapsed >= policy.budget_seconds:
-                    break
 
             # Calculate delay
             delay = policy.get_delay(attempt, random_source=active_random)
 
             # Callback before retry
-            if on_retry:
-                callback_result = on_retry(attempt + 1, e, delay)
-                if asyncio.iscoroutine(callback_result):
-                    await callback_result
+            await invoke_retry_callback(on_retry, attempt + 1, e, delay)
 
             # Wait before retry
-            if delay > 0 and decision != RetryDecision.IMMEDIATE:
-                await active_clock.sleep(delay)
+            await sleep_before_retry(active_clock, delay, decision, RetryDecision.IMMEDIATE)
 
     return RetryResult(
         success=False,
         attempts=len(errors),
         total_time=active_clock.monotonic() - start_time,
-        last_error=errors[-1] if errors else None,
+        last_error=last_error_or_none(errors),
         errors=errors,
     )
 

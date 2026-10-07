@@ -4,12 +4,19 @@
 from __future__ import annotations
 
 import math
+from functools import partial
+from operator import lt
 from typing import Sequence
 
 from .bocpd_shared import _predictive_params_from_suffstats
 from .bocpd_config import BOCPDConfig
 from .run_length_posterior import RunLengthPosterior
 from ._run_suff_stats import _RunSuffStats
+
+
+# ``-inf < value``: the entries that contribute to a logsumexp
+# (``exp(-inf)`` is 0), tested in C rather than a Python frame per entry.
+_ABOVE_NEGATIVE_INFINITY = partial(lt, -math.inf)
 
 
 def _student_t_log_pdf(
@@ -85,10 +92,31 @@ class BayesianOnlineChangePointDetector:
         """
         if self._mu_0 is None:
             self._mu_0 = x
-        cfg = self._config
         old_probs = self._posterior.probabilities
         old_stats = self._posterior.suffstats
 
+        log_predictive, new_stats_grow = self._predict_and_grow_runs(x, old_stats)
+        log_growth, log_change_total = self._log_growth_and_change(old_probs, log_predictive)
+        new_log_unnormalised, new_stats_full = self._assemble_truncated_posterior(
+            x, log_change_total, log_growth, new_stats_grow
+        )
+
+        # Step 7: normalise into a probability distribution
+        log_norm = _logsumexp(new_log_unnormalised)
+        new_probs = [math.exp(lp - log_norm) for lp in new_log_unnormalised]
+
+        self._posterior = RunLengthPosterior(
+            probabilities=new_probs, suffstats=new_stats_full
+        )
+        self._observation_count += 1
+        return self._posterior
+
+    def _predict_and_grow_runs(
+        self, x: float, old_stats: list[_RunSuffStats]
+    ) -> tuple[list[float], list[_RunSuffStats]]:
+        """Adams & MacKay 2007 Algorithm 1 steps 1-2: each existing run's
+        log predictive density at ``x``, and its stats grown by ``x``."""
+        cfg = self._config
         # Step 1: predictive probabilities under each existing run
         log_predictive: list[float] = []
         for stats in old_stats:
@@ -101,7 +129,15 @@ class BayesianOnlineChangePointDetector:
         new_stats_grow: list[_RunSuffStats] = [
             stats.update(x) for stats in old_stats
         ]
+        return log_predictive, new_stats_grow
 
+    def _log_growth_and_change(
+        self, old_probs: list[float], log_predictive: list[float]
+    ) -> tuple[list[float], float]:
+        """Adams & MacKay 2007 Algorithm 1 steps 3-4 under the constant
+        hazard ``1 / hazard_lambda``: the growth log-masses and the total
+        change-point log-mass."""
+        cfg = self._config
         # Step 3: growth probabilities (run length increases by 1)
         # P(r_t = r+1, x_1:t) = P(r_{t-1} = r, x_1:t-1)
         #                       * pi_t^(r) * (1 - H(r))
@@ -118,8 +154,18 @@ class BayesianOnlineChangePointDetector:
             math.log(max(p, cfg.epsilon)) + lp + math.log(hazard)
             for p, lp in zip(old_probs, log_predictive)
         ]
-        log_change_total = _logsumexp(log_change_terms)
+        return log_growth, _logsumexp(log_change_terms)
 
+    def _assemble_truncated_posterior(
+        self,
+        x: float,
+        log_change_total: float,
+        log_growth: list[float],
+        new_stats_grow: list[_RunSuffStats],
+    ) -> tuple[list[float], list[_RunSuffStats]]:
+        """Adams & MacKay 2007 Algorithm 1 steps 5-6: the unnormalised
+        posterior, run length 0 first, truncated at ``run_length_max``."""
+        cfg = self._config
         # Step 5: assemble new posterior with the 0-th entry being
         # the change-point case and entries 1..r+1 being the grown
         # run lengths
@@ -131,16 +177,7 @@ class BayesianOnlineChangePointDetector:
         if len(new_log_unnormalised) > cfg.run_length_max:
             new_log_unnormalised = new_log_unnormalised[: cfg.run_length_max]
             new_stats_full = new_stats_full[: cfg.run_length_max]
-
-        # Step 7: normalise into a probability distribution
-        log_norm = _logsumexp(new_log_unnormalised)
-        new_probs = [math.exp(lp - log_norm) for lp in new_log_unnormalised]
-
-        self._posterior = RunLengthPosterior(
-            probabilities=new_probs, suffstats=new_stats_full
-        )
-        self._observation_count += 1
-        return self._posterior
+        return new_log_unnormalised, new_stats_full
 
 
 def _logsumexp(values: Sequence[float]) -> float:
@@ -151,9 +188,15 @@ def _logsumexp(values: Sequence[float]) -> float:
     """
     if not values:
         return -math.inf
-    finite = [v for v in values if v > -math.inf]
+    finite = list(filter(_ABOVE_NEGATIVE_INFINITY, values))
     if not finite:
         return -math.inf
+    return _logsumexp_of_finite(finite)
+
+
+def _logsumexp_of_finite(finite: list[float]) -> float:
+    """``log(sum(exp(v)))`` of a non-empty list with no ``-inf`` entry,
+    shifted by its max for stability."""
     m = max(finite)
     total = sum(math.exp(v - m) for v in finite)
     if total <= 0.0:

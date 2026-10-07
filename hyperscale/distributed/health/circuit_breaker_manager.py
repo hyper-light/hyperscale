@@ -76,14 +76,14 @@ class CircuitBreakerManager:
         tripped by errors, or suspected by phi accrual. A half-open circuit
         admits a probe, so its manager still counts as usable -- the same
         rule dispatch applies (``is_circuit_open``)."""
-        return sum(
-            1
-            for manager_addr in manager_addrs
-            if self._is_peer_suspected(manager_addr)
-            or (
-                (circuit := self._circuits.get(manager_addr)) is not None
-                and circuit.circuit_state == CircuitState.OPEN
-            )
+        return sum(1 for manager_addr in manager_addrs if self._counts_as_open(manager_addr))
+
+    def _counts_as_open(self, manager_addr: tuple[str, int]) -> bool:
+        """Whether ``manager_addr`` counts OPEN for ``count_open_circuits``:
+        suspected by phi accrual (AD-52 section 8) or its circuit tripped."""
+        return self._is_peer_suspected(manager_addr) or (
+            (circuit := self._circuits.get(manager_addr)) is not None
+            and circuit.circuit_state == CircuitState.OPEN
         )
 
     def get_circuit_status(self, manager_addr: tuple[str, int]) -> dict | None:
@@ -118,18 +118,23 @@ class CircuitBreakerManager:
                 f"{addr[0]}:{addr[1]}": self.get_circuit_status(addr)
                 for addr in self._circuits.keys()
             },
-            # ``is_circuit_open`` is async; calling it here returned a
-            # COROUTINE (always truthy), so every known manager was
-            # reported open and every call leaked a "never awaited"
-            # warning. This is a sync method, so read the circuit state
-            # directly — exactly what the sibling ``get_circuit_status``
-            # above does.
-            "open_circuits": [
-                f"{addr[0]}:{addr[1]}"
-                for addr, circuit in self._circuits.items()
-                if circuit.circuit_state == CircuitState.OPEN
-            ],
+            "open_circuits": self._open_circuit_names(),
         }
+
+    def _open_circuit_names(self) -> list[str]:
+        """``host:port`` of every manager whose circuit is OPEN, for
+        ``get_all_circuit_status``."""
+        # ``is_circuit_open`` is async; calling it here returned a
+        # COROUTINE (always truthy), so every known manager was
+        # reported open and every call leaked a "never awaited"
+        # warning. This is a sync method, so read the circuit state
+        # directly — exactly what the sibling ``get_circuit_status``
+        # above does.
+        return [
+            f"{addr[0]}:{addr[1]}"
+            for addr, circuit in self._circuits.items()
+            if circuit.circuit_state == CircuitState.OPEN
+        ]
 
     def record_success(self, manager_addr: tuple[str, int]) -> None:
         circuit = self._circuits.get(manager_addr)

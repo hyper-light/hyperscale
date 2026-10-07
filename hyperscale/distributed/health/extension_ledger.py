@@ -171,16 +171,21 @@ class ExtensionLedger:
         entry = self._by_workflow_id.pop(workflow_id, None)
         if entry is None:
             return
-        worker_set = self._by_worker_id.get(entry.worker_id)
-        if worker_set is not None:
-            worker_set.discard(workflow_id)
-            if not worker_set:
-                self._by_worker_id.pop(entry.worker_id, None)
-        job_set = self._by_job_id.get(entry.job_id)
-        if job_set is not None:
-            job_set.discard(workflow_id)
-            if not job_set:
-                self._by_job_id.pop(entry.job_id, None)
+        self._discard_from_index(self._by_worker_id, entry.worker_id, workflow_id)
+        self._discard_from_index(self._by_job_id, entry.job_id, workflow_id)
+
+    @staticmethod
+    def _discard_from_index(
+        index: dict[str, set[str]], owner_id: str, workflow_id: str
+    ) -> None:
+        """Remove ``workflow_id`` from ``owner_id``'s set in a worker/job
+        index, dropping the set once empty so the index stays bounded."""
+        workflow_set = index.get(owner_id)
+        if workflow_set is None:
+            return
+        workflow_set.discard(workflow_id)
+        if not workflow_set:
+            index.pop(owner_id, None)
 
     def forget_worker(self, worker_id: str) -> int:
         """Cascade-drop every workflow owned by ``worker_id``.
@@ -228,16 +233,21 @@ class ExtensionLedger:
         Used by manager observability surfaces and the H8 outcome-
         feedback loop for "extensions in flight" filtering.
         """
-        result: list[str] = []
-        for entry in self._by_workflow_id.values():
-            if entry.last_decision is None:
-                continue
-            if entry.last_decision.decision != "granted":
-                continue
-            if entry.is_exhausted:
-                continue
-            result.append(entry.workflow_id)
-        return result
+        return [
+            entry.workflow_id
+            for entry in self._by_workflow_id.values()
+            if self._has_pending_extension(entry)
+        ]
+
+    @staticmethod
+    def _has_pending_extension(entry: ExtensionWorkflowEntry) -> bool:
+        """Whether the entry's latest decision was a grant and its AD-26
+        extension cap is not yet hit."""
+        return (
+            entry.last_decision is not None
+            and entry.last_decision.decision == "granted"
+            and not entry.is_exhausted
+        )
 
     def latest_progress_snapshot(
         self, workflow_id: str

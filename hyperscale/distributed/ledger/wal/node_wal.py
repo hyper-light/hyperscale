@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, AsyncIterator, Mapping
+from hyperscale.distributed.hlc.hlc_timestamp import HLCTimestamp
 from hyperscale.distributed.hlc.hybrid_logical_clock import HybridLogicalClock
 from hyperscale.distributed.reliability.robust_queue import QueuePutResult, QueueState
 from hyperscale.distributed.reliability.backpressure import BackpressureLevel, BackpressureSignal
@@ -128,17 +129,23 @@ class NodeWAL:
         )
 
         if await self._filesystem.exists(self._path):
-            data = await self._filesystem.read_bytes(self._path)
-            if await self._accept_existing_file(data):
-                recovered_count, recovered_length = self._recover(data)
-                if recovered_length < len(data):
-                    await self._discard_unrecoverable_tail(data, recovered_count, recovered_length)
+            await self._recover_existing_file()
 
         # A new WAL starts with its format header, before any entry.
         if not await self._filesystem.exists(self._path):
             await self._filesystem.append_fsync(self._path, WAL_FORMAT.header)
 
         await self._writer.start()
+
+    async def _recover_existing_file(self) -> None:
+        """Recover the WAL file on disk, cutting back any unrecoverable
+        tail (a file not accepted as this format recovers nothing)."""
+        data = await self._filesystem.read_bytes(self._path)
+        if not await self._accept_existing_file(data):
+            return
+        recovered_count, recovered_length = self._recover(data)
+        if recovered_length < len(data):
+            await self._discard_unrecoverable_tail(data, recovered_count, recovered_length)
 
     async def _accept_existing_file(self, data: bytes) -> bool:
         """Whether the file on disk is a WAL in this format to recover.
@@ -155,13 +162,20 @@ class NodeWAL:
         try:
             WAL_FORMAT.validate(data)
         except UnrecognizedStorageFormatError as format_error:
-            if self._logger is None:
-                raise
-            await set_aside_unrecognized(
-                self._filesystem, self._path, data, format_error.reason, self._logger
-            )
+            await self._set_aside_unrecognized_file(data, format_error)
             return False
         return True
+
+    async def _set_aside_unrecognized_file(
+        self, data: bytes, format_error: UnrecognizedStorageFormatError
+    ) -> None:
+        """Set an unrecognized file aside, loudly; with no logger to
+        report it through, re-raise the format error being handled."""
+        if self._logger is None:
+            raise
+        await set_aside_unrecognized(
+            self._filesystem, self._path, data, format_error.reason, self._logger
+        )
 
     async def _discard_unrecoverable_tail(
         self, data: bytes, recovered_count: int, recovered_length: int
@@ -200,11 +214,7 @@ class NodeWAL:
         next_lsn = max((entry.lsn + 1 for entry in recovered_entries), default=0)
         last_synced_lsn = recovered_entries[-1].lsn if recovered_entries else -1
 
-        for entry in recovered_entries:
-            self._clock.witness(entry.hlc)
-
-            if entry.state < WALEntryState.APPLIED:
-                self._pending_entries_internal[entry.lsn] = entry
+        self._adopt_recovered_entries(recovered_entries)
 
         self._status_snapshot = WALStatusSnapshot(
             next_lsn=next_lsn,
@@ -215,6 +225,15 @@ class NodeWAL:
         self._pending_snapshot = MappingProxyType(dict(self._pending_entries_internal))
         return len(recovered_entries), WAL_FORMAT.header_size + frames_length
 
+    def _adopt_recovered_entries(self, recovered_entries: list[WALEntry]) -> None:
+        """Witness every recovered entry's HLC and hold each one not yet
+        applied as pending."""
+        for entry in recovered_entries:
+            self._clock.witness(entry.hlc)
+
+            if entry.state < WALEntryState.APPLIED:
+                self._pending_entries_internal[entry.lsn] = entry
+
     @staticmethod
     def _parse_frames(frames: bytes) -> tuple[list[WALEntry], int]:
         """The entries in the bytes after the format header, up to the
@@ -223,32 +242,90 @@ class NodeWAL:
         entries: list[WALEntry] = []
         offset = 0
         while offset + HEADER_SIZE <= len(frames):
-            total_length = struct.unpack(">I", frames[offset + 4 : offset + 8])[0]
-            if total_length < HEADER_SIZE or offset + total_length > len(frames):
+            if (next_offset := NodeWAL._parse_next_frame(frames, offset, entries)) is None:
                 break
-            try:
-                entries.append(WALEntry.from_bytes(frames[offset : offset + total_length]))
-            except ValueError:
-                break
-            offset += total_length
+            offset = next_offset
         return entries, offset
+
+    @staticmethod
+    def _parse_next_frame(frames: bytes, offset: int, entries: list[WALEntry]) -> int | None:
+        """Append the whole, valid frame at ``offset`` to ``entries`` and
+        return the offset past it; None at a torn or corrupt frame."""
+        total_length = struct.unpack(">I", frames[offset + 4 : offset + 8])[0]
+        if NodeWAL._frame_is_torn(frames, offset, total_length) or not NodeWAL._append_frame(
+            entries, frames[offset : offset + total_length]
+        ):
+            return None
+        return offset + total_length
+
+    @staticmethod
+    def _frame_is_torn(frames: bytes, offset: int, total_length: int) -> bool:
+        """Whether the frame at ``offset`` claims an impossible length or
+        runs past the end of ``frames``."""
+        return total_length < HEADER_SIZE or offset + total_length > len(frames)
+
+    @staticmethod
+    def _append_frame(entries: list[WALEntry], frame: bytes) -> bool:
+        """Decode ``frame`` onto ``entries``; whether it decoded."""
+        try:
+            entries.append(WALEntry.from_bytes(frame))
+        except ValueError:
+            return False
+        return True
 
     async def append(
         self,
         event_type: JobEventType,
         payload: bytes,
     ) -> WALAppendResult:
-        if self._status_snapshot.closed:
-            raise RuntimeError("WAL is closed")
-
-        if self._writer.has_error:
-            raise RuntimeError(f"WAL writer failed: {self._writer.error}")
+        self._require_open_writer()
 
         loop = self._loop
         assert loop is not None
 
         hlc = self._clock.now()
 
+        entry, future, queue_result, lsn = await self._enqueue_entry(loop, hlc, event_type, payload)
+
+        try:
+            await future
+        except BaseException:
+            # The write failed (the writer rolled the log back): this
+            # entry was never durable, so it must not linger as pending.
+            # Its LSN stays consumed -- recovery tolerates the gap.
+            await self._forget_unwritten_entry(lsn)
+            raise
+
+        async with self._state_lock:
+            # Appenders of one batch resume in any order once it syncs; the
+            # watermark only ever rises.
+            self._status_snapshot = WALStatusSnapshot(
+                next_lsn=self._status_snapshot.next_lsn,
+                last_synced_lsn=max(self._status_snapshot.last_synced_lsn, lsn),
+                pending_count=self._status_snapshot.pending_count,
+                closed=False,
+            )
+
+        return WALAppendResult(entry=entry, queue_result=queue_result)
+
+    def _require_open_writer(self) -> None:
+        """Refuse an append to a closed WAL or one whose writer failed."""
+        if self._status_snapshot.closed:
+            raise RuntimeError("WAL is closed")
+
+        if self._writer.has_error:
+            raise RuntimeError(f"WAL writer failed: {self._writer.error}")
+
+    async def _enqueue_entry(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        hlc: HLCTimestamp,
+        event_type: JobEventType,
+        payload: bytes,
+    ) -> tuple[WALEntry, asyncio.Future[None], QueuePutResult, int]:
+        """Under the state lock, assign the next LSN and queue the entry's
+        write, holding it as pending: the entry, the write's future, the
+        queue's verdict and the LSN."""
         async with self._state_lock:
             lsn = self._status_snapshot.next_lsn
 
@@ -285,26 +362,7 @@ class NodeWAL:
                 dict(self._pending_entries_internal)
             )
 
-        try:
-            await future
-        except BaseException:
-            # The write failed (the writer rolled the log back): this
-            # entry was never durable, so it must not linger as pending.
-            # Its LSN stays consumed -- recovery tolerates the gap.
-            await self._forget_unwritten_entry(lsn)
-            raise
-
-        async with self._state_lock:
-            # Appenders of one batch resume in any order once it syncs; the
-            # watermark only ever rises.
-            self._status_snapshot = WALStatusSnapshot(
-                next_lsn=self._status_snapshot.next_lsn,
-                last_synced_lsn=max(self._status_snapshot.last_synced_lsn, lsn),
-                pending_count=self._status_snapshot.pending_count,
-                closed=False,
-            )
-
-        return WALAppendResult(entry=entry, queue_result=queue_result)
+        return entry, future, queue_result, lsn
 
     async def _forget_unwritten_entry(self, lsn: int) -> None:
         async with self._state_lock:
@@ -320,17 +378,31 @@ class NodeWAL:
                 dict(self._pending_entries_internal)
             )
 
+    @staticmethod
+    def _refuse_transition(entry: WALEntry | None, target_state: WALEntryState) -> TransitionResult | None:
+        """Why ``entry`` cannot move to ``target_state`` because it is
+        missing or already there or past it; None when neither."""
+        if entry is None:
+            return TransitionResult.ENTRY_NOT_FOUND
+        return NodeWAL._refuse_reached_state(entry.state, target_state)
+
+    @staticmethod
+    def _refuse_reached_state(state: WALEntryState, target_state: WALEntryState) -> TransitionResult | None:
+        """ALREADY_AT_STATE or ALREADY_PAST_STATE when ``state`` has
+        reached ``target_state``; None otherwise."""
+        if state == target_state:
+            return TransitionResult.ALREADY_AT_STATE
+
+        if state > target_state:
+            return TransitionResult.ALREADY_PAST_STATE
+
+        return None
+
     async def mark_regional(self, lsn: int) -> TransitionResult:
         async with self._state_lock:
             entry = self._pending_entries_internal.get(lsn)
-            if entry is None:
-                return TransitionResult.ENTRY_NOT_FOUND
-
-            if entry.state == WALEntryState.REGIONAL:
-                return TransitionResult.ALREADY_AT_STATE
-
-            if entry.state > WALEntryState.REGIONAL:
-                return TransitionResult.ALREADY_PAST_STATE
+            if (refusal := self._refuse_transition(entry, WALEntryState.REGIONAL)) is not None:
+                return refusal
 
             if entry.state != WALEntryState.PENDING:
                 return TransitionResult.INVALID_TRANSITION
@@ -347,14 +419,8 @@ class NodeWAL:
     async def mark_global(self, lsn: int) -> TransitionResult:
         async with self._state_lock:
             entry = self._pending_entries_internal.get(lsn)
-            if entry is None:
-                return TransitionResult.ENTRY_NOT_FOUND
-
-            if entry.state == WALEntryState.GLOBAL:
-                return TransitionResult.ALREADY_AT_STATE
-
-            if entry.state > WALEntryState.GLOBAL:
-                return TransitionResult.ALREADY_PAST_STATE
+            if (refusal := self._refuse_transition(entry, WALEntryState.GLOBAL)) is not None:
+                return refusal
 
             if entry.state > WALEntryState.REGIONAL:
                 return TransitionResult.INVALID_TRANSITION
@@ -369,14 +435,8 @@ class NodeWAL:
     async def mark_applied(self, lsn: int) -> TransitionResult:
         async with self._state_lock:
             entry = self._pending_entries_internal.get(lsn)
-            if entry is None:
-                return TransitionResult.ENTRY_NOT_FOUND
-
-            if entry.state == WALEntryState.APPLIED:
-                return TransitionResult.ALREADY_AT_STATE
-
-            if entry.state > WALEntryState.APPLIED:
-                return TransitionResult.ALREADY_PAST_STATE
+            if (refusal := self._refuse_transition(entry, WALEntryState.APPLIED)) is not None:
+                return refusal
 
             if entry.state > WALEntryState.GLOBAL:
                 return TransitionResult.INVALID_TRANSITION
@@ -395,14 +455,25 @@ class NodeWAL:
         held by the checkpoint it resumed from), and an entry never marked
         applied could never be compacted. Returns how many moved."""
         async with self._state_lock:
-            applied_count = 0
-            for lsn, entry in self._pending_entries_internal.items():
-                if lsn <= up_to_lsn and entry.state < WALEntryState.APPLIED:
-                    self._pending_entries_internal[lsn] = entry.with_state(WALEntryState.APPLIED)
-                    applied_count += 1
+            applied_count = self._apply_pending_through(up_to_lsn)
             if applied_count > 0:
                 self._pending_snapshot = MappingProxyType(dict(self._pending_entries_internal))
             return applied_count
+
+    def _apply_pending_through(self, up_to_lsn: int) -> int:
+        """Move every unapplied entry at or below ``up_to_lsn`` to APPLIED
+        (the caller holds the state lock); how many moved."""
+        applied_count = 0
+        for lsn, entry in self._pending_entries_internal.items():
+            if self._awaits_apply_through(lsn, entry, up_to_lsn):
+                self._pending_entries_internal[lsn] = entry.with_state(WALEntryState.APPLIED)
+                applied_count += 1
+        return applied_count
+
+    @staticmethod
+    def _awaits_apply_through(lsn: int, entry: WALEntry, up_to_lsn: int) -> bool:
+        """Whether ``entry`` is at or below ``up_to_lsn`` and not yet applied."""
+        return lsn <= up_to_lsn and entry.state < WALEntryState.APPLIED
 
     async def discard_through(self, lsn: int) -> int:
         """Drop every frame at or below ``lsn`` from the log file -- they
@@ -414,27 +485,56 @@ class NodeWAL:
         def drop_through(committed: bytes) -> bytes:
             frames = WAL_FORMAT.decode(committed)
             header_length = len(committed) - len(frames)
-            offset = 0
-            while offset + HEADER_SIZE <= len(frames):
-                frame_length, frame_lsn = struct.unpack(">IQ", frames[offset + 4 : offset + 16])
-                if frame_lsn > lsn or frame_length < HEADER_SIZE or offset + frame_length > len(frames):
-                    break
-                offset += frame_length
+            offset = NodeWAL._droppable_prefix_length(frames, lsn)
             if offset == 0:
                 return committed
             return committed[:header_length] + frames[offset:]
 
         return await self._writer.rewrite(drop_through)
 
+    @staticmethod
+    def _droppable_prefix_length(frames: bytes, lsn: int) -> int:
+        """How many leading bytes of ``frames`` are whole frames at or
+        below ``lsn``."""
+        offset = 0
+        while offset + HEADER_SIZE <= len(frames):
+            if (frame_length := NodeWAL._droppable_frame_length(frames, offset, lsn)) is None:
+                break
+            offset += frame_length
+        return offset
+
+    @staticmethod
+    def _droppable_frame_length(frames: bytes, offset: int, lsn: int) -> int | None:
+        """The length of the frame at ``offset`` when it is whole and at
+        or below ``lsn``; None where the cut ends."""
+        frame_length, frame_lsn = struct.unpack(">IQ", frames[offset + 4 : offset + 16])
+        if NodeWAL._frame_ends_cut(frame_length, frame_lsn, offset, len(frames), lsn):
+            return None
+        return frame_length
+
+    @staticmethod
+    def _frame_ends_cut(frame_length: int, frame_lsn: int, offset: int, frames_length: int, lsn: int) -> bool:
+        """Whether a frame is past ``lsn``, or torn: the cut stops before it."""
+        return frame_lsn > lsn or frame_length < HEADER_SIZE or offset + frame_length > frames_length
+
+    def _compactable_lsns(self, up_to_lsn: int) -> list[int]:
+        """The applied entries' LSNs at or below ``up_to_lsn`` (the caller
+        holds the state lock)."""
+        return [
+            lsn
+            for lsn, entry in list(self._pending_entries_internal.items())
+            if self._is_compactable(lsn, entry, up_to_lsn)
+        ]
+
+    @staticmethod
+    def _is_compactable(lsn: int, entry: WALEntry, up_to_lsn: int) -> bool:
+        """Whether ``entry`` is applied and at or below ``up_to_lsn``."""
+        return lsn <= up_to_lsn and entry.state == WALEntryState.APPLIED
+
     async def compact(self, up_to_lsn: int) -> int:
         async with self._state_lock:
-            compacted_count = 0
-            lsns_to_remove = []
-
-            for lsn, entry in list(self._pending_entries_internal.items()):
-                if lsn <= up_to_lsn and entry.state == WALEntryState.APPLIED:
-                    lsns_to_remove.append(lsn)
-                    compacted_count += 1
+            lsns_to_remove = self._compactable_lsns(up_to_lsn)
+            compacted_count = len(lsns_to_remove)
 
             for lsn in lsns_to_remove:
                 del self._pending_entries_internal[lsn]

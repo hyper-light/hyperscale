@@ -110,27 +110,21 @@ class HierarchicalAlphaBudget:
             # workflow we permit a relatively high per-test α.
             return self._config.alpha_workflow_ceiling
 
-        dc_share = (
-            active_in_dc / active_in_cluster
-            if active_in_cluster > 0
-            else 0.0
-        )
-        manager_share = (
-            active_on_manager / active_in_dc
-            if active_in_dc > 0
-            else 0.0
-        )
-        worker_share = (
-            active_on_worker / active_on_manager
-            if active_on_manager > 0
-            else 0.0
-        )
+        dc_share = _share(active_in_dc, active_in_cluster)
+        manager_share = _share(active_on_manager, active_in_dc)
+        worker_share = _share(active_on_worker, active_on_manager)
         workflow_share = 1.0 / active_on_worker
 
         alpha_dc = self.split_to_dc(dc_share)
         alpha_manager = self.split_to_manager(alpha_dc, manager_share)
         alpha_worker = self.split_to_worker(alpha_manager, worker_share)
         return self.split_to_workflow(alpha_worker, workflow_share)
+
+
+def _share(part: int, whole: int) -> float:
+    """``part / whole`` for an AD-26 H6 budget split, ``0.0`` when the
+    enclosing tier has no active workflows."""
+    return part / whole if whole > 0 else 0.0
 
 
 def _clamp_unit_interval(x: float) -> float:

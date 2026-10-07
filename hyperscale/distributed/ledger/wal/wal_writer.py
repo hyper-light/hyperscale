@@ -139,17 +139,22 @@ class WALWriter:
         return task
 
     def _handle_background_task_error(self, task: asyncio.Task, name: str) -> None:
-        if task.cancelled():
+        if task.cancelled() or (exception := task.exception()) is None:
             return
 
-        exception = task.exception()
-        if exception is None:
-            return
+        self._record_error(exception)
+        self._schedule_background_error_log(name, exception)
 
+    def _record_error(self, exception: BaseException) -> None:
+        """Count a failure and latch it as the writer's error unless an
+        earlier one is already latched."""
         self._metrics.total_errors += 1
         if self._error is None:
             self._error = exception
 
+    def _schedule_background_error_log(self, name: str, exception: BaseException) -> None:
+        """Log a background task's failure on the writer's loop (a done
+        callback cannot await the logger itself)."""
         if self._logger is not None and self._loop is not None:
             loop = self._loop
             self._loop.call_soon(
@@ -195,34 +200,41 @@ class WALWriter:
         except asyncio.QueueFull:
             pass
 
-        if self._writer_task is not None:
-            try:
-                await _DEFAULT_CLOCK.wait_for(self._writer_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                self._writer_task.cancel()
-                cancels_requested_before_wait = asyncio.current_task().cancelling()
-                try:
-                    await self._writer_task
-                except asyncio.CancelledError:
-                    # The task we cancelled ended; a cancel aimed at this task
-                    # while it waited goes on.
-                    if asyncio.current_task().cancelling() > cancels_requested_before_wait:
-                        raise
-            finally:
-                self._writer_task = None
-
-        if self._state_change_task is not None and not self._state_change_task.done():
-            self._state_change_task.cancel()
-            cancels_requested_before_wait = asyncio.current_task().cancelling()
-            try:
-                await self._state_change_task
-            except asyncio.CancelledError:
-                # The task we cancelled ended; a cancel aimed at this task
-                # while it waited goes on.
-                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
-                    raise
+        await self._stop_writer_task()
+        await self._cancel_state_change_task()
 
         await self._fail_pending_requests(RuntimeError("WAL writer stopped"))
+
+    async def _stop_writer_task(self) -> None:
+        """Let the writer task finish its drain, cancelling it after five
+        seconds; the task reference is dropped either way."""
+        if self._writer_task is None:
+            return
+        try:
+            await _DEFAULT_CLOCK.wait_for(self._writer_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            self._writer_task.cancel()
+            await self._await_cancelled_task(self._writer_task)
+        finally:
+            self._writer_task = None
+
+    async def _cancel_state_change_task(self) -> None:
+        """Cancel an unfinished state-change flush and wait for it to end."""
+        if self._state_change_task is not None and not self._state_change_task.done():
+            self._state_change_task.cancel()
+            await self._await_cancelled_task(self._state_change_task)
+
+    async def _await_cancelled_task(self, task: asyncio.Task[None]) -> None:
+        """Wait for a task this writer just cancelled, re-raising only a
+        cancel aimed at the caller while it waited."""
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
+        try:
+            await task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
 
     def submit(self, request: WriteRequest) -> QueuePutResult:
         if not self._running:
@@ -334,15 +346,23 @@ class WALWriter:
             return
 
         self._pending_state_change = (queue_state, backpressure)
+        self._ensure_state_change_flush()
 
+    def _ensure_state_change_flush(self) -> None:
+        """Start the state-change flush unless one is still running (it
+        picks up the newest pending change)."""
         if self._state_change_task is None or self._state_change_task.done():
             self._state_change_task = self._create_background_task(
                 self._flush_state_change_callback(),
                 f"wal-state-change-{self._path.name}",
             )
 
+    def _has_pending_state_change(self) -> bool:
+        """Whether a state change awaits delivery while the writer runs."""
+        return self._pending_state_change is not None and self._running
+
     async def _flush_state_change_callback(self) -> None:
-        while self._pending_state_change is not None and self._running:
+        while self._has_pending_state_change():
             callback = self._state_change_callback
             if callback is None:
                 return
@@ -350,20 +370,32 @@ class WALWriter:
             queue_state, backpressure = self._pending_state_change
             self._pending_state_change = None
 
-            try:
-                await callback(queue_state, backpressure)
-            except Exception as exc:
-                self._metrics.total_errors += 1
-                if self._error is None:
-                    self._error = exc
-                if self._logger is not None:
-                    await self._logger.log(
-                        WALError(
-                            message=f"State change callback failed: {exc}",
-                            path=str(self._path),
-                            error_type=type(exc).__name__,
-                        )
-                    )
+            await self._deliver_state_change(callback, queue_state, backpressure)
+
+    async def _deliver_state_change(
+        self,
+        callback: Callable[[QueueState, BackpressureSignal], Awaitable[None]],
+        queue_state: QueueState,
+        backpressure: BackpressureSignal,
+    ) -> None:
+        """Run the state-change callback; its failure is counted, latched
+        and logged."""
+        try:
+            await callback(queue_state, backpressure)
+        except Exception as exc:
+            self._record_error(exc)
+            await self._log_error("State change callback failed: ", exc)
+
+    async def _log_error(self, message_prefix: str, exception: BaseException) -> None:
+        """Log ``exception`` after ``message_prefix`` when a logger is set."""
+        if self._logger is not None:
+            await self._logger.log(
+                WALError(
+                    message=f"{message_prefix}{exception}",
+                    path=str(self._path),
+                    error_type=type(exception).__name__,
+                )
+            )
 
     async def _writer_loop(self) -> None:
         try:
@@ -482,6 +514,15 @@ class WALWriter:
     ) -> None:
         """Cut the log back to its committed length after a failed append
         and record the storage failure; a failed cut latches the writer."""
+        await self._truncate_to_committed_length(storage_error)
+        self._storage_failure = storage_error
+        if self._storage_health is not None:
+            self._storage_health.record_failure(storage_error, attempted_bytes)
+        await self._log_rolled_back_append(storage_error)
+
+    async def _truncate_to_committed_length(self, storage_error: OSError) -> None:
+        """Cut a torn tail back to the committed length; a failed cut
+        latches the writer and is raised from ``storage_error``."""
         try:
             # A device fault can strike before the append created the
             # file; then there is nothing to cut.
@@ -490,9 +531,9 @@ class WALWriter:
         except BaseException as truncate_error:
             self._error = truncate_error
             raise truncate_error from storage_error
-        self._storage_failure = storage_error
-        if self._storage_health is not None:
-            self._storage_health.record_failure(storage_error, attempted_bytes)
+
+    async def _log_rolled_back_append(self, storage_error: OSError) -> None:
+        """Log a failed append that was rolled back, when a logger is set."""
         if self._logger is not None:
             await self._logger.log(
                 WALError(
@@ -523,47 +564,64 @@ class WALWriter:
             return len(committed) - len(rewritten)
 
     async def _drain_remaining(self) -> None:
-        while not self._queue.empty():
-            try:
-                request = self._queue.get_nowait()
-                if request is not None:
-                    self._current_batch.add(request)
-            except asyncio.QueueEmpty:
-                break
+        self._drain_queue_into_batch()
 
         if len(self._current_batch) > 0:
             try:
                 await self._commit_batch()
             except BaseException as exc:
-                self._metrics.total_errors += 1
-                if self._error is None:
-                    self._error = exc
-                if self._logger is not None:
-                    await self._logger.log(
-                        WALError(
-                            message=f"Failed to drain WAL during shutdown: {exc}",
-                            path=str(self._path),
-                            error_type=type(exc).__name__,
-                        )
-                    )
-                for request in self._current_batch.requests:
-                    if not request.future.done():
-                        request.future.set_exception(exc)
-                self._current_batch.clear()
+                await self._fail_drained_batch(exc)
 
-    async def _fail_pending_requests(self, exception: BaseException) -> None:
-        for request in self._current_batch.requests:
-            if not request.future.done():
-                request.future.set_exception(exception)
-        self._current_batch.clear()
-
+    def _drain_queue_into_batch(self) -> None:
+        """Move every queued write into the current batch at shutdown."""
         while not self._queue.empty():
             try:
-                request = self._queue.get_nowait()
-                if request is not None and not request.future.done():
-                    request.future.set_exception(exception)
+                self._take_queued_into_batch()
             except asyncio.QueueEmpty:
                 break
+
+    def _take_queued_into_batch(self) -> None:
+        """Add the next queued write (not stop's sentinel) to the batch;
+        raises ``asyncio.QueueEmpty`` when none is queued."""
+        request = self._queue.get_nowait()
+        if request is not None:
+            self._current_batch.add(request)
+
+    async def _fail_drained_batch(self, exc: BaseException) -> None:
+        """Record, log and fail the shutdown drain's batch after its
+        commit raised."""
+        self._record_error(exc)
+        await self._log_error("Failed to drain WAL during shutdown: ", exc)
+        self._fail_requests(self._current_batch.requests, exc)
+        self._current_batch.clear()
+
+    @staticmethod
+    def _fail_requests(requests: list[WriteRequest], exception: BaseException) -> None:
+        """Fail every unresolved write in ``requests`` with ``exception``."""
+        for request in requests:
+            if not request.future.done():
+                request.future.set_exception(exception)
+
+    async def _fail_pending_requests(self, exception: BaseException) -> None:
+        self._fail_requests(self._current_batch.requests, exception)
+        self._current_batch.clear()
+
+        self._fail_queued_requests(exception)
+
+    def _fail_queued_requests(self, exception: BaseException) -> None:
+        """Fail every write still queued with ``exception``."""
+        while not self._queue.empty():
+            try:
+                self._fail_next_queued_request(exception)
+            except asyncio.QueueEmpty:
+                break
+
+    def _fail_next_queued_request(self, exception: BaseException) -> None:
+        """Fail the next queued write unless it is stop's sentinel or
+        already resolved; raises ``asyncio.QueueEmpty`` when none is queued."""
+        request = self._queue.get_nowait()
+        if request is not None and not request.future.done():
+            request.future.set_exception(exception)
 
 _REHOMED = (
     WALBackpressureError,

@@ -26,10 +26,18 @@ class CoordinateTracker:
         *,
         clock: Clock | None = None,
     ) -> None:
-        self._engine = engine or NetworkCoordinateEngine(config=config or VivaldiConfig())
+        self._engine = self._resolve_engine(engine, config)
         self._peers: dict[str, NetworkCoordinate] = {}
         self._peer_last_seen: dict[str, float] = {}
         self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
+
+    @staticmethod
+    def _resolve_engine(
+        engine: NetworkCoordinateEngine | None,
+        config: VivaldiConfig | None,
+    ) -> NetworkCoordinateEngine:
+        """The injected engine, or a new one built from ``config`` (default VivaldiConfig)."""
+        return engine or NetworkCoordinateEngine(config=config or VivaldiConfig())
 
     def get_coordinate(self) -> NetworkCoordinate:
         """Get the local node's coordinate."""
@@ -149,17 +157,21 @@ class CoordinateTracker:
             max_age_seconds = self._engine.get_config().coord_ttl_seconds
 
         now = self._clock.monotonic()
-        stale_peers = [
-            peer_id
-            for peer_id, last_seen in self._peer_last_seen.items()
-            if now - last_seen > max_age_seconds
-        ]
+        stale_peers = self._stale_peer_ids(now, max_age_seconds)
 
         for peer_id in stale_peers:
             self._peers.pop(peer_id, None)
             self._peer_last_seen.pop(peer_id, None)
 
         return len(stale_peers)
+
+    def _stale_peer_ids(self, now: float, max_age_seconds: float) -> list[str]:
+        """Peers last seen more than ``max_age_seconds`` before ``now`` (AD-35 Task 12.1.8)."""
+        return [
+            peer_id
+            for peer_id, last_seen in self._peer_last_seen.items()
+            if now - last_seen > max_age_seconds
+        ]
 
     def get_peer_count(self) -> int:
         """Get the number of tracked peer coordinates."""

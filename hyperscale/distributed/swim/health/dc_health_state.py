@@ -2,9 +2,19 @@
 ``hyperscale.distributed.swim.health.federated_health_monitor`` (see that module)."""
 
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from .cross_cluster_ack import CrossClusterAck
 from .dc_reachability import DCReachability
+
+# Reachability states that decide effective health on their own, before any reported health.
+_REACHABILITY_HEALTH: MappingProxyType[DCReachability, str] = MappingProxyType(
+    {
+        DCReachability.UNKNOWN: "UNKNOWN",
+        DCReachability.UNREACHABLE: "UNREACHABLE",
+        DCReachability.SUSPECTED: "SUSPECTED",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -39,12 +49,8 @@ class DCHealthState:
     @property
     def effective_health(self) -> str:
         """Combine reachability and reported health."""
-        if self.reachability == DCReachability.UNKNOWN:
-            return "UNKNOWN"
-        if self.reachability == DCReachability.UNREACHABLE:
-            return "UNREACHABLE"
-        if self.reachability == DCReachability.SUSPECTED:
-            return "SUSPECTED"
+        if (reachability_health := _REACHABILITY_HEALTH.get(self.reachability)) is not None:
+            return reachability_health
         if self.last_ack:
             return self.last_ack.dc_health
         return "UNKNOWN"

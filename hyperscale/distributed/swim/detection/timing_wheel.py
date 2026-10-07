@@ -136,11 +136,15 @@ class TimingWheel:
         # Schedule any entries that were added pre-start.
         now = self._clock.monotonic()
         for node, entry in self._entries.items():
-            if entry.timer_handle is None:
-                delay = max(0.0, entry.expiration_time - now)
-                entry.timer_handle = asyncio.get_event_loop().call_later(
-                    delay, self._fire_expiration, node
-                )
+            self._schedule_pending_entry(node, entry, now)
+
+    def _schedule_pending_entry(self, node: NodeAddress, entry: _Entry, now: float) -> None:
+        """Schedule an entry added before ``start`` (one with no timer yet) against its deadline."""
+        if entry.timer_handle is None:
+            delay = max(0.0, entry.expiration_time - now)
+            entry.timer_handle = asyncio.get_event_loop().call_later(
+                delay, self._fire_expiration, node
+            )
 
     async def stop(self) -> None:
         """Cancel all pending timers and drop tracking state."""
@@ -190,8 +194,7 @@ class TimingWheel:
         entry = self._entries.get(node)
         if entry is None:
             return False
-        if entry.timer_handle is not None:
-            entry.timer_handle.cancel()
+        self._cancel_entry_timer(entry)
         entry.expiration_time = new_expiration_time
         if self._running:
             delay = max(0.0, new_expiration_time - self._clock.monotonic())
@@ -223,21 +226,29 @@ class TimingWheel:
             return
         entry.timer_handle = None
         self._entries_expired += 1
+        self._invoke_on_expired(node, entry)
+
+    def _invoke_on_expired(self, node: NodeAddress, entry: _Entry) -> None:
+        """Run the on_expired callback for a fired entry, reporting its failure to on_error."""
         if self._on_expired is None:
             return
         try:
             self._on_expired(node, entry.state)
         except Exception as callback_error:
-            if self._on_error is not None:
-                try:
-                    self._on_error(
-                        f"on_expired callback failed for {node}",
-                        callback_error,
-                    )
-                except Exception:
-                    # The error hook itself failed: nowhere left to report
-                    # it but this wheel's stats.
-                    self._error_report_failures += 1
+            self._report_expired_callback_failure(node, callback_error)
+
+    def _report_expired_callback_failure(self, node: NodeAddress, callback_error: Exception) -> None:
+        """Hand an on_expired failure to on_error; count it when that hook fails too."""
+        if self._on_error is not None:
+            try:
+                self._on_error(
+                    f"on_expired callback failed for {node}",
+                    callback_error,
+                )
+            except Exception:
+                # The error hook itself failed: nowhere left to report
+                # it but this wheel's stats.
+                self._error_report_failures += 1
 
     async def clear(self) -> None:
         """Drop all entries (cancelling pending timers)."""
@@ -284,17 +295,26 @@ class TimingWheel:
             new_remaining = remaining * multiplier
             entry.expiration_time = now + new_remaining
 
-            if entry.timer_handle is not None:
-                entry.timer_handle.cancel()
-            if self._running:
-                entry.timer_handle = asyncio.get_event_loop().call_later(
-                    max(0.0, new_remaining),
-                    self._fire_expiration,
-                    node,
-                )
+            self._cancel_entry_timer(entry)
+            self._schedule_if_running(node, entry, new_remaining)
             adjusted += 1
 
         return adjusted
+
+    @staticmethod
+    def _cancel_entry_timer(entry: _Entry) -> None:
+        """Cancel ``entry``'s pending timer, if it has one."""
+        if entry.timer_handle is not None:
+            entry.timer_handle.cancel()
+
+    def _schedule_if_running(self, node: NodeAddress, entry: _Entry, new_remaining: float) -> None:
+        """Reschedule ``entry`` ``new_remaining`` seconds out (floored at 0) while the registry runs."""
+        if self._running:
+            entry.timer_handle = asyncio.get_event_loop().call_later(
+                max(0.0, new_remaining),
+                self._fire_expiration,
+                node,
+            )
 
     # =========================================================================
     # Synchronous Accessors (for hot-path checks without async overhead)

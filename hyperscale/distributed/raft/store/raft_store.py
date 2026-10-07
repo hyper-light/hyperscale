@@ -141,10 +141,14 @@ class RaftStore:
 
     def take_recovered_groups(self, belongs: Callable[[str], bool]) -> dict[str, RecoveredRaftGroup]:
         """The recovered groups ``belongs`` claims, handed over once."""
-        taken = {group_id: group for group_id, group in self._recovered_groups.items() if belongs(group_id)}
+        taken = self._claimed_recovered_groups(belongs)
         for group_id in taken:
             del self._recovered_groups[group_id]
         return taken
+
+    def _claimed_recovered_groups(self, belongs: Callable[[str], bool]) -> dict[str, RecoveredRaftGroup]:
+        """The recovered groups ``belongs`` claims, still held here."""
+        return {group_id: group for group_id, group in self._recovered_groups.items() if belongs(group_id)}
 
     @property
     def path(self) -> Path:
@@ -159,62 +163,170 @@ class RaftStore:
         identity_path = self._directory / IDENTITY_FILE_NAME
         store_path = self.path
         await self._filesystem.mkdir(self._directory, parents=True, exist_ok=True)
+        groups, torn_bytes, set_aside_reason, resumed = await self._recover_or_make_identity(
+            identity_path, store_path, fresh_node_id_full, is_this_node
+        )
+        await self._start_writer(store_path, groups, resumed, torn_bytes)
+        self._recovered_groups = dict(groups)
+        return RaftStoreRecovery(
+            identity=self.identity,
+            groups=groups,
+            resumed=resumed,
+            set_aside_reason=set_aside_reason,
+        )
+
+    async def _recover_or_make_identity(
+        self,
+        identity_path: Path,
+        store_path: Path,
+        fresh_node_id_full: str,
+        is_this_node: Callable[[str], bool],
+    ) -> tuple[dict[str, RecoveredRaftGroup], int, str | None, bool]:
+        """Resume what the disk holds, else make a new identity (P5-P6):
+        the groups, torn bytes dropped, set-aside reason and whether it
+        resumed."""
+        recovered = await self._recover_existing(identity_path, store_path, fresh_node_id_full, is_this_node)
+        if not recovered[3]:
+            await self._make_identity(identity_path, store_path, fresh_node_id_full)
+        return recovered
+
+    async def _recover_existing(
+        self,
+        identity_path: Path,
+        store_path: Path,
+        fresh_node_id_full: str,
+        is_this_node: Callable[[str], bool],
+    ) -> tuple[dict[str, RecoveredRaftGroup], int, str | None, bool]:
+        """Resume (or set aside) the store files the disk holds; nothing
+        is recovered from a disk holding neither."""
         identity_exists = await self._filesystem.exists(identity_path)
         store_exists = await self._filesystem.exists(store_path)
-        groups: dict[str, RecoveredRaftGroup] = {}
+        if identity_exists or store_exists:
+            return await self._resume_or_set_aside(
+                identity_path, store_path, identity_exists, store_exists, fresh_node_id_full, is_this_node
+            )
+        return {}, 0, None, False
+
+    async def _resume_or_set_aside(
+        self,
+        identity_path: Path,
+        store_path: Path,
+        identity_exists: bool,
+        store_exists: bool,
+        fresh_node_id_full: str,
+        is_this_node: Callable[[str], bool],
+    ) -> tuple[dict[str, RecoveredRaftGroup], int, str | None, bool]:
+        """Resume the store, or set an untrustworthy one aside (P5-P6)."""
         # The bytes each verdict below is drawn from.
         verdict_reads: dict[Path, bytes] = {}
-        set_aside_reason: str | None = None
-        torn_bytes = 0
-        resumed = False
-        if identity_exists or store_exists:
-            try:
-                if not identity_exists:
-                    raise RaftStoreUntrustworthyError("a store without its identity")
-                if not store_exists:
-                    raise RaftStoreUntrustworthyError("an identity without its store")
-                verdict_reads[identity_path] = await self._filesystem.read_bytes(identity_path)
-                try:
-                    identity = msgspec.msgpack.decode(verdict_reads[identity_path], type=RaftIdentity)
-                except msgspec.DecodeError as decode_error:
-                    raise RaftStoreUntrustworthyError(f"the identity does not decode: {decode_error}") from decode_error
-                if identity.format_version != IDENTITY_FORMAT_VERSION:
-                    raise RaftStoreUntrustworthyError(
-                        f"the identity is format {identity.format_version}; this build reads {IDENTITY_FORMAT_VERSION}"
-                    )
-                if not is_this_node(identity.node_id_full):
-                    raise RaftStoreUntrustworthyError(
-                        f"the identity {identity.node_id_full} is not this node ({fresh_node_id_full})"
-                    )
-                store_data = verdict_reads[store_path] = await self._filesystem.read_bytes(store_path)
-                groups, whole_length = self._codec.replay(store_data, identity.stamp)
-                if (torn_bytes := len(store_data) - whole_length) > 0:
-                    # Only when a second read agrees: a flipped read must
-                    # never cut an acknowledged record.
-                    await require_stable_read(self._filesystem, store_path, store_data)
-                    await self._filesystem.truncate(store_path, whole_length)
-                self._identity = identity
-                resumed = True
-            except RaftStoreUntrustworthyError as untrustworthy:
-                set_aside_reason = str(untrustworthy)
-                await self._set_aside(set_aside_reason, fresh_node_id_full, verdict_reads)
-                groups = {}
-        if not resumed:
-            stamp = self._random_source.randrange(0, 1 << STAMP_BITS).to_bytes(STAMP_BITS // 8, "big")
-            # The store is made first: a crash before the identity leaves a
-            # store without one, which the next start sets aside.
-            await self._filesystem.atomic_write(
-                store_path,
-                self._codec.encode_frames([RaftStoreHeader(stamp=stamp, format_version=STORE_FORMAT_VERSION)]),
+        try:
+            groups, torn_bytes = await self._resume(
+                identity_path, store_path, identity_exists, store_exists, fresh_node_id_full, is_this_node, verdict_reads
             )
-            self._identity = RaftIdentity(
-                format_version=IDENTITY_FORMAT_VERSION,
-                node_id_full=fresh_node_id_full,
-                participation=0,
-                stamp=stamp,
-            )
-            await self._filesystem.atomic_write(identity_path, msgspec.msgpack.encode(self._identity))
+        except RaftStoreUntrustworthyError as untrustworthy:
+            set_aside_reason = str(untrustworthy)
+            await self._set_aside(set_aside_reason, fresh_node_id_full, verdict_reads)
+            return {}, 0, set_aside_reason, False
+        return groups, torn_bytes, None, True
 
+    async def _resume(
+        self,
+        identity_path: Path,
+        store_path: Path,
+        identity_exists: bool,
+        store_exists: bool,
+        fresh_node_id_full: str,
+        is_this_node: Callable[[str], bool],
+        verdict_reads: dict[Path, bytes],
+    ) -> tuple[dict[str, RecoveredRaftGroup], int]:
+        """Adopt the disk's identity and replay its store: the groups and
+        the torn bytes cut. Raises RaftStoreUntrustworthyError."""
+        self._require_paired_files(identity_exists, store_exists)
+        identity = await self._read_identity(identity_path, fresh_node_id_full, is_this_node, verdict_reads)
+        groups, torn_bytes = await self._replay_store(store_path, identity.stamp, verdict_reads)
+        self._identity = identity
+        return groups, torn_bytes
+
+    @staticmethod
+    def _require_paired_files(identity_exists: bool, store_exists: bool) -> None:
+        """An identity and its store exist together or not at all (P4)."""
+        if not identity_exists:
+            raise RaftStoreUntrustworthyError("a store without its identity")
+        if not store_exists:
+            raise RaftStoreUntrustworthyError("an identity without its store")
+
+    async def _read_identity(
+        self,
+        identity_path: Path,
+        fresh_node_id_full: str,
+        is_this_node: Callable[[str], bool],
+        verdict_reads: dict[Path, bytes],
+    ) -> RaftIdentity:
+        """The disk's identity, refused unless it decodes, is this build's
+        format and is this node's."""
+        verdict_reads[identity_path] = await self._filesystem.read_bytes(identity_path)
+        identity = self._decode_identity(verdict_reads[identity_path])
+        if identity.format_version != IDENTITY_FORMAT_VERSION:
+            raise RaftStoreUntrustworthyError(
+                f"the identity is format {identity.format_version}; this build reads {IDENTITY_FORMAT_VERSION}"
+            )
+        if not is_this_node(identity.node_id_full):
+            raise RaftStoreUntrustworthyError(
+                f"the identity {identity.node_id_full} is not this node ({fresh_node_id_full})"
+            )
+        return identity
+
+    @staticmethod
+    def _decode_identity(identity_data: bytes) -> RaftIdentity:
+        """Decode an identity; one that does not decode is untrustworthy."""
+        try:
+            return msgspec.msgpack.decode(identity_data, type=RaftIdentity)
+        except msgspec.DecodeError as decode_error:
+            raise RaftStoreUntrustworthyError(f"the identity does not decode: {decode_error}") from decode_error
+
+    async def _replay_store(
+        self,
+        store_path: Path,
+        stamp: bytes,
+        verdict_reads: dict[Path, bytes],
+    ) -> tuple[dict[str, RecoveredRaftGroup], int]:
+        """Replay the store's groups, cutting a torn tail: the groups and
+        the bytes cut."""
+        store_data = verdict_reads[store_path] = await self._filesystem.read_bytes(store_path)
+        groups, whole_length = self._codec.replay(store_data, stamp)
+        if (torn_bytes := len(store_data) - whole_length) > 0:
+            # Only when a second read agrees: a flipped read must
+            # never cut an acknowledged record.
+            await require_stable_read(self._filesystem, store_path, store_data)
+            await self._filesystem.truncate(store_path, whole_length)
+        return groups, torn_bytes
+
+    async def _make_identity(self, identity_path: Path, store_path: Path, fresh_node_id_full: str) -> None:
+        """Make a new store and identity under a fresh stamp (P4)."""
+        stamp = self._random_source.randrange(0, 1 << STAMP_BITS).to_bytes(STAMP_BITS // 8, "big")
+        # The store is made first: a crash before the identity leaves a
+        # store without one, which the next start sets aside.
+        await self._filesystem.atomic_write(
+            store_path,
+            self._codec.encode_frames([RaftStoreHeader(stamp=stamp, format_version=STORE_FORMAT_VERSION)]),
+        )
+        self._identity = RaftIdentity(
+            format_version=IDENTITY_FORMAT_VERSION,
+            node_id_full=fresh_node_id_full,
+            participation=0,
+            stamp=stamp,
+        )
+        await self._filesystem.atomic_write(identity_path, msgspec.msgpack.encode(self._identity))
+
+    async def _start_writer(
+        self,
+        store_path: Path,
+        groups: dict[str, RecoveredRaftGroup],
+        resumed: bool,
+        torn_bytes: int,
+    ) -> None:
+        """Count the store's live and dead bytes, start its group-commit
+        writer and log the open."""
         live_store, self._group_bytes, self._hard_state_bytes = self._codec.materialize(groups, self.identity.stamp)
         self._live_bytes = len(live_store)
         self._dead_bytes = await self._filesystem.file_size(store_path) - self._live_bytes
@@ -239,13 +351,6 @@ class RaftStore:
                 groups_recovered=len(groups),
                 torn_bytes_dropped=torn_bytes,
             )
-        )
-        self._recovered_groups = dict(groups)
-        return RaftStoreRecovery(
-            identity=self.identity,
-            groups=groups,
-            resumed=resumed,
-            set_aside_reason=set_aside_reason,
         )
 
     async def write(self, records: list[RaftStoreRecord]) -> None:
@@ -359,8 +464,7 @@ class RaftStore:
         if self._closed:
             return
         self._closed = True
-        if (compaction_token := self._compaction_token) is not None:
-            await self._task_runner.cancel(compaction_token)
+        await self._cancel_compaction()
         if self._writer is not None:
             await self._writer.stop()
 
@@ -369,30 +473,17 @@ class RaftStore:
         untrustworthy, to a dated directory beside it; remove them here
         (the identity first, so a crash midway leaves a store without an
         identity -- set aside again); keep only the newest set-asides."""
-        # The verdict stands only if what it was drawn from reads the same
-        # again: one drawn from a flipped read must not set an intact store
-        # aside.
-        for verdict_path, verdict_content in verdict_reads.items():
-            await require_stable_read(self._filesystem, verdict_path, verdict_content)
-        held_files = await self._filesystem.list_directory(self._directory)
-        held_contents = {held_file: await self._filesystem.read_bytes(held_file) for held_file in held_files}
+        await self._require_stable_verdict(verdict_reads)
+        held_files, held_contents = await self._read_held_files()
         parent = self._directory.parent
         prefix = f"{self._directory.name}{SET_ASIDE_SUFFIX}"
-        set_asides = sorted(
-            (int(directory.name.removeprefix(prefix)), directory)
-            for directory in await self._filesystem.list_subdirectories(parent)
-            if directory.name.startswith(prefix) and directory.name.removeprefix(prefix).isdigit()
-        )
-        # Dated by wall time, but always after every earlier set-aside: a
-        # clock stepped back across restarts must not merge two of them.
-        set_aside_at = max(int(self._clock.time() * 1000), set_asides[-1][0] + 1 if set_asides else 0)
+        set_asides = await self._existing_set_asides(parent, prefix)
+        set_aside_at = self._next_set_aside_at(set_asides)
         set_aside_directory = parent / f"{prefix}{set_aside_at}"
         set_asides.append((set_aside_at, set_aside_directory))
         await self._filesystem.mkdir(set_aside_directory, parents=True, exist_ok=True)
-        for held_file, content in held_contents.items():
-            await self._filesystem.atomic_write(set_aside_directory / held_file.name, content)
-        for held_file in sorted(held_files, key=lambda held: held.name != IDENTITY_FILE_NAME):
-            await self._filesystem.remove(held_file)
+        await self._copy_held_files(set_aside_directory, held_contents)
+        await self._remove_held_files(held_files)
         await self._logger.log(
             RaftStoreSetAside(
                 message=f"Raft store set aside to {set_aside_directory}: {reason}",
@@ -402,7 +493,60 @@ class RaftStore:
                 reason=reason,
             )
         )
+        await self._prune_set_asides(set_asides)
+
+    async def _require_stable_verdict(self, verdict_reads: dict[Path, bytes]) -> None:
+        """Re-read every file a set-aside verdict was drawn from."""
+        # The verdict stands only if what it was drawn from reads the same
+        # again: one drawn from a flipped read must not set an intact store
+        # aside.
+        for verdict_path, verdict_content in verdict_reads.items():
+            await require_stable_read(self._filesystem, verdict_path, verdict_content)
+
+    async def _read_held_files(self) -> tuple[list[Path], dict[Path, bytes]]:
+        """The store directory's files and each one's bytes."""
+        held_files = await self._filesystem.list_directory(self._directory)
+        held_contents = {held_file: await self._filesystem.read_bytes(held_file) for held_file in held_files}
+        return held_files, held_contents
+
+    @staticmethod
+    def _is_set_aside_directory(directory: Path, prefix: str) -> bool:
+        """Whether ``directory`` is a dated set-aside of this store."""
+        return directory.name.startswith(prefix) and directory.name.removeprefix(prefix).isdigit()
+
+    async def _existing_set_asides(self, parent: Path, prefix: str) -> list[tuple[int, Path]]:
+        """This store's earlier set-asides, oldest first, with their dates."""
+        return sorted(
+            (int(directory.name.removeprefix(prefix)), directory)
+            for directory in await self._filesystem.list_subdirectories(parent)
+            if self._is_set_aside_directory(directory, prefix)
+        )
+
+    def _next_set_aside_at(self, set_asides: list[tuple[int, Path]]) -> int:
+        """The new set-aside's date in wall milliseconds."""
+        # Dated by wall time, but always after every earlier set-aside: a
+        # clock stepped back across restarts must not merge two of them.
+        return max(int(self._clock.time() * 1000), set_asides[-1][0] + 1 if set_asides else 0)
+
+    async def _copy_held_files(self, set_aside_directory: Path, held_contents: dict[Path, bytes]) -> None:
+        """Write each held file's bytes into the set-aside directory."""
+        for held_file, content in held_contents.items():
+            await self._filesystem.atomic_write(set_aside_directory / held_file.name, content)
+
+    async def _remove_held_files(self, held_files: list[Path]) -> None:
+        """Remove the held files, the identity first: a crash midway leaves
+        a store without an identity, set aside again."""
+        for held_file in sorted(held_files, key=lambda held: held.name != IDENTITY_FILE_NAME):
+            await self._filesystem.remove(held_file)
+
+    async def _prune_set_asides(self, set_asides: list[tuple[int, Path]]) -> None:
+        """Remove all but the newest ``set_aside_retained`` set-asides."""
         for _set_aside_at, superseded in set_asides[: max(0, len(set_asides) - self._set_aside_retained)]:
             for superseded_file in await self._filesystem.list_directory(superseded):
                 await self._filesystem.remove(superseded_file)
             await self._filesystem.remove_directory(superseded)
+
+    async def _cancel_compaction(self) -> None:
+        """Cancel a compaction under way (it is atomic)."""
+        if (compaction_token := self._compaction_token) is not None:
+            await self._task_runner.cancel(compaction_token)

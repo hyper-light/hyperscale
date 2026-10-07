@@ -109,32 +109,30 @@ class ThroughputWitness:
         """
         if self._streams.pop((worker_id, workflow_id), None) is None:
             return
-        if (workers := self._workers_by_workflow.get(workflow_id)) is not None:
-            workers.discard(worker_id)
-            if not workers:
-                del self._workers_by_workflow[workflow_id]
-        if (workflows := self._workflows_by_worker.get(worker_id)) is not None:
-            workflows.discard(workflow_id)
-            if not workflows:
-                del self._workflows_by_worker[worker_id]
+        self._discard_from_index(self._workers_by_workflow, workflow_id, worker_id)
+        self._discard_from_index(self._workflows_by_worker, worker_id, workflow_id)
 
     def forget_workflow(self, workflow_id: str) -> None:
         """Drop every stream of a workflow that has ended."""
         for worker_id in self._workers_by_workflow.pop(workflow_id, set()):
             self._streams.pop((worker_id, workflow_id), None)
-            if (workflows := self._workflows_by_worker.get(worker_id)) is not None:
-                workflows.discard(workflow_id)
-                if not workflows:
-                    del self._workflows_by_worker[worker_id]
+            self._discard_from_index(self._workflows_by_worker, worker_id, workflow_id)
 
     def forget_worker(self, worker_id: str) -> None:
         """Drop every stream of a worker that has left."""
         for workflow_id in self._workflows_by_worker.pop(worker_id, set()):
             self._streams.pop((worker_id, workflow_id), None)
-            if (workers := self._workers_by_workflow.get(workflow_id)) is not None:
-                workers.discard(worker_id)
-                if not workers:
-                    del self._workers_by_workflow[workflow_id]
+            self._discard_from_index(self._workers_by_workflow, workflow_id, worker_id)
+
+    @staticmethod
+    def _discard_from_index(index: dict[str, set[str]], key: str, member: str) -> None:
+        """Remove ``member`` from ``index[key]``, deleting the key once its
+        set empties so the stream indices stay bounded."""
+        if (members := index.get(key)) is None:
+            return
+        members.discard(member)
+        if not members:
+            del index[key]
 
     @property
     def stream_count(self) -> int:
@@ -208,8 +206,6 @@ class ThroughputWitness:
 
         kind = self._classify_verdict(
             stream=stream,
-            change_p=change_p,
-            alpha_workflow=alpha_workflow,
             predictive_mean_before=predictive_mean_before,
             predictive_mean_after=predictive_mean_after,
         )
@@ -231,8 +227,6 @@ class ThroughputWitness:
     def _classify_verdict(
         self,
         stream: _StreamState,
-        change_p: float,
-        alpha_workflow: float,
         predictive_mean_before: float,
         predictive_mean_after: float,
     ) -> WitnessVerdictKind:
@@ -250,17 +244,19 @@ class ThroughputWitness:
 
         Decision rule:
 
-        * cold-start → ``COLD_START`` until enough samples accumulate.
-        * MAP run length is far below the observation count *and*
-          ``change_p`` exceeds either ``alpha_workflow`` or
-          ``2 × hazard_rate`` (whichever is larger) → a real regime
-          change has occurred. Sign of the predictive-mean shift
-          determines DOWN vs UP.
-        * Otherwise → ``STATIONARY``.
+        * cold-start → ``COLD_START`` until enough samples accumulate
+          (this also keeps the arithmetically inevitable MAP = 0 of the
+          first observations from producing a verdict);
+        * a fresh MAP run length (see ``_is_fresh_run``) → a regime
+          change; the sign of the predictive-mean shift picks DOWN or UP;
+        * otherwise → ``STATIONARY``.
 
-        The ``hazard_rate`` floor on the α threshold prevents the
-        natural BOCPD hazard-rate floor from triggering spurious
-        verdicts under any α-budget allocation.
+        ``P(r_t = 0)`` does not gate the verdict: it sits at the hazard
+        floor through a real step change, so gating on it suppressed every
+        true regime change (measured 2026-10-06: the drop and surge tests
+        in tests/unit/distributed/health/test_progress_witness.py fail with
+        the gate). It is still reported on the verdict, with the
+        workflow's α, for observability.
         """
         if (
             stream.detector.observation_count
@@ -268,37 +264,37 @@ class ThroughputWitness:
         ):
             return WitnessVerdictKind.COLD_START
 
-        hazard_rate = 1.0 / self._config.bocpd.hazard_lambda
-        effective_alpha = max(alpha_workflow, 2.0 * hazard_rate)
-
         map_run_length = stream.detector.posterior.maximum_a_posteriori_run_length()
-        # A "fresh" MAP — small relative to total observations seen —
-        # signals that the most-likely run started recently. We
-        # require both a fresh MAP AND a non-trivial change-point
-        # probability so that an early-stream MAP=0 (which is
-        # arithmetically inevitable on the first observation) doesn't
-        # cause a verdict during the cold-start tail.
         observation_count = stream.detector.observation_count
+        if not self._is_fresh_run(map_run_length, observation_count):
+            return WitnessVerdictKind.STATIONARY
+
+        return self._regime_change_direction(predictive_mean_before, predictive_mean_after)
+
+    @staticmethod
+    def _is_fresh_run(map_run_length: int, observation_count: int) -> bool:
+        """Whether the BOCPD MAP run length is small relative to the samples
+        seen -- the robust change signal (Adams-MacKay 2007 §3)."""
+        # A "fresh" MAP — small relative to total observations seen —
+        # signals that the most-likely run started recently.
         # ``map_freshness_ratio`` of 0.25 means: MAP at <= 25% of the
         # samples seen so far. Picked so 40 stationary observations
         # followed by 10 step-change observations naturally crosses
         # the threshold (MAP drops from ~40 toward ~5–10 → ratio
         # ~0.1–0.2 of the 50 total).
         map_freshness_ratio = 0.25
-        is_fresh_run = (
+        return (
             observation_count > 0
             and map_run_length
             <= max(2, int(observation_count * map_freshness_ratio))
         )
 
-        if not is_fresh_run and change_p <= effective_alpha:
-            return WitnessVerdictKind.STATIONARY
-
-        if not is_fresh_run:
-            # change_p > effective_alpha but no fresh MAP: noisy
-            # blip, not a sustained regime change. Stay quiet.
-            return WitnessVerdictKind.STATIONARY
-
+    @staticmethod
+    def _regime_change_direction(
+        predictive_mean_before: float, predictive_mean_after: float
+    ) -> WitnessVerdictKind:
+        """The verdict for a fresh MAP: DOWN when the predictive mean fell,
+        else UP."""
         # Fresh MAP — a sustained recent change-point. Consult the
         # direction of the predictive-mean shift.
         if predictive_mean_after < predictive_mean_before:
@@ -319,16 +315,28 @@ class ThroughputWitness:
         if history_len < 32:
             return
 
-        head = list(stream.history)[: history_len // 2]
-        tail = list(stream.history)[history_len // 2 :]
-        if not head or not tail:
-            return
+        if self._head_differs_from_tail(stream.history, history_len):
+            self._drop_history_head(stream.history, history_len // 2)
 
+    def _head_differs_from_tail(self, history: Deque[float], history_len: int) -> bool:
+        """Whether the K-S test rejects stationarity between the history's
+        older and newer halves."""
+        head = list(history)[: history_len // 2]
+        tail = list(history)[history_len // 2 :]
+        if not head or not tail:
+            return False
+        return self._ks_rejects_stationarity(head, tail)
+
+    def _ks_rejects_stationarity(self, head: list[float], tail: list[float]) -> bool:
+        """Run the two-sample K-S test at ``ks_alpha_override`` or
+        ``alpha.alpha_system`` and report a rejection."""
         result: KSResult = TwoSampleKolmogorovSmirnov.test(head, tail)
         ks_alpha = self._config.ks_alpha_override or self._config.alpha.alpha_system
-        if result.is_stationary(ks_alpha):
-            return
+        return not result.is_stationary(ks_alpha)
 
+    @staticmethod
+    def _drop_history_head(history: Deque[float], head_length: int) -> None:
+        """Discard the non-stationary head of a stream's history."""
         # Non-stationary — discard the head from the rolling history
         # so future K-S tests have a chance to see a stationary view
         # and so the BOCPD detector's prior reflects the most recent
@@ -336,8 +344,8 @@ class ThroughputWitness:
         # state without re-running it; instead we let the detector's
         # built-in change-point machinery converge naturally on the
         # narrower data.
-        for _ in range(history_len // 2):
-            stream.history.popleft()
+        for _ in range(head_length):
+            history.popleft()
 
 _REHOMED = (
     WitnessVerdictKind,

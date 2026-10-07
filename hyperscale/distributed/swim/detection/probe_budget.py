@@ -6,6 +6,7 @@ puts on detection time, stand.
 """
 
 import math
+from itertools import filterfalse
 
 from hyperscale.distributed.health.phi_accrual_config import PhiAccrualConfig
 from hyperscale.distributed.health.phi_accrual_detector import PhiAccrualDetector
@@ -105,17 +106,26 @@ class SwimProbeBudget:
         period."""
         if members is not self._synced_members:
             self._sync_members(members)
-        chosen: MemberAddress | None = None
-        for member in members:
-            if member in self._extra_probed_this_cycle:
-                continue
-            if (detector := self._detectors.get(member)) is not None and detector.phi(now) >= self._threshold:
-                chosen = member
-                break
+        chosen = self._first_due_member(members, now)
         if chosen is not None:
             self._extra_probed_this_cycle.add(chosen)
             self._extra_probes += 1
         return chosen
+
+    def _first_due_member(self, members: tuple[MemberAddress, ...], now: float) -> MemberAddress | None:
+        """The first member, in round-robin order, due an extra probe this period, or None."""
+        for member in members:
+            if self._is_due_for_extra_probe(member, now):
+                return member
+        return None
+
+    def _is_due_for_extra_probe(self, member: MemberAddress, now: float) -> bool:
+        """Whether ``member`` is still eligible this cycle and its phi reached the learned threshold."""
+        return (
+            member not in self._extra_probed_this_cycle
+            and (detector := self._detectors.get(member)) is not None
+            and detector.phi(now) >= self._threshold
+        )
 
     def record_extra_probe_outcome(self, answered_directly: bool) -> None:
         """How the extra probe went: answered directly, a false alarm; not,
@@ -142,10 +152,15 @@ class SwimProbeBudget:
         this node once per its cycle and answers this node's probe once per
         this node's, two messages per N periods."""
         current = set(members)
-        for departed in [member for member in self._detectors if member not in current]:
+        for departed in list(filterfalse(current.__contains__, self._detectors)):
             del self._detectors[departed]
             self._extra_probed_this_cycle.discard(departed)
         estimate = self._protocol_period_seconds * max(1, len(members)) / 2.0
+        self._add_member_detectors(members, estimate)
+        self._synced_members = members
+
+    def _add_member_detectors(self, members: tuple[MemberAddress, ...], estimate: float) -> None:
+        """Give each newly probed member a phi detector whose first interval is ``estimate``."""
         for member in members:
             if member not in self._detectors:
                 self._detectors[member] = PhiAccrualDetector(
@@ -160,7 +175,6 @@ class SwimProbeBudget:
                         first_heartbeat_estimate_seconds=estimate,
                     )
                 )
-        self._synced_members = members
 
     @property
     def threshold(self) -> float:

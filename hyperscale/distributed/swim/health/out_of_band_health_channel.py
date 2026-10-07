@@ -31,6 +31,8 @@ talking and data written earlier keeps loading.
 import asyncio
 import socket
 from dataclasses import dataclass, field
+from itertools import compress, filterfalse, repeat
+from operator import gt, methodcaller, sub
 from typing import Callable
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 from hyperscale.distributed.runtime import Clock, RealClock
@@ -165,26 +167,33 @@ class OutOfBandHealthChannel:
         self._running = False
 
         if self._receive_task:
-            self._receive_task.cancel()
-            cancels_requested_before_wait = asyncio.current_task().cancelling()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                # The task we cancelled ended; a cancel aimed at this task
-                # while it waited goes on.
-                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
-                    raise
+            await self._cancel_and_await_receive_task()
             self._receive_task = None
 
         # Cancel pending probes
-        for future in self._pending_probes.values():
-            if not future.done():
-                future.cancel()
+        for future in filterfalse(methodcaller("done"), self._pending_probes.values()):
+            future.cancel()
         self._pending_probes.clear()
 
+        self._close_socket()
+
+    def _close_socket(self) -> None:
+        """Close and drop the channel socket, if one is open."""
         if self._socket:
             self._socket.close()
             self._socket = None
+
+    async def _cancel_and_await_receive_task(self) -> None:
+        """Cancel the receive task and wait for it, re-raising a cancel aimed at the caller meanwhile."""
+        self._receive_task.cancel()
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
+        try:
+            await self._receive_task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
 
     async def probe(self, target: tuple[str, int]) -> OOBProbeResult:
         """
@@ -196,23 +205,14 @@ class OutOfBandHealthChannel:
         Returns:
             OOBProbeResult with success/failure and latency
         """
-        if not self._running or not self._socket:
+        # Channel-running and rate limiting checks
+        if (refusal := self._probe_refusal(target)) is not None:
             return OOBProbeResult(
                 target=target,
                 success=False,
                 is_overloaded=False,
                 latency_ms=0.0,
-                error="OOB channel not running",
-            )
-
-        # Rate limiting checks
-        if not self._check_rate_limit(target):
-            return OOBProbeResult(
-                target=target,
-                success=False,
-                is_overloaded=False,
-                latency_ms=0.0,
-                error="Rate limited",
+                error=refusal,
             )
 
         # Create future for response
@@ -221,6 +221,29 @@ class OutOfBandHealthChannel:
 
         start_time = _DEFAULT_CLOCK.monotonic()
 
+        return await self._send_probe_and_await_reply(target, future, start_time)
+
+    def _probe_refusal(self, target: tuple[str, int]) -> str | None:
+        """Why a probe to ``target`` cannot be sent now (channel down, rate limited), or None."""
+        if self._channel_closed():
+            return "OOB channel not running"
+
+        # Rate limiting checks
+        if not self._check_rate_limit(target):
+            return "Rate limited"
+        return None
+
+    def _channel_closed(self) -> bool:
+        """Whether the channel is stopped or has no socket."""
+        return not self._running or not self._socket
+
+    async def _send_probe_and_await_reply(
+        self,
+        target: tuple[str, int],
+        future: asyncio.Future,
+        start_time: float,
+    ) -> OOBProbeResult:
+        """Send the probe and await its reply; failures become results, and the pending entry always goes."""
         try:
             # Send probe
             message = OOB_PROBE + f"{self.host}:{self.port}".encode()
@@ -233,42 +256,7 @@ class OutOfBandHealthChannel:
             self._last_probe_time[target] = _DEFAULT_CLOCK.monotonic()
 
             # Wait for response
-            try:
-                response = await _DEFAULT_CLOCK.wait_for(
-                    future,
-                    timeout=self.config.probe_timeout_seconds,
-                )
-
-                latency = (_DEFAULT_CLOCK.monotonic() - start_time) * 1000
-                is_overloaded = response == OOB_NACK
-
-                return OOBProbeResult(
-                    target=target,
-                    success=True,
-                    is_overloaded=is_overloaded,
-                    latency_ms=latency,
-                )
-
-            except asyncio.TimeoutError:
-                self._timeouts += 1
-                return OOBProbeResult(
-                    target=target,
-                    success=False,
-                    is_overloaded=False,
-                    latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
-                    error="Timeout",
-                )
-
-            except asyncio.CancelledError:
-                # Probe was cancelled (e.g., during shutdown)
-                # Return graceful failure instead of propagating
-                return OOBProbeResult(
-                    target=target,
-                    success=False,
-                    is_overloaded=False,
-                    latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
-                    error="Cancelled",
-                )
+            return await self._await_probe_reply(target, future, start_time)
 
         except asyncio.CancelledError:
             # Cancelled during send - graceful failure
@@ -291,6 +279,50 @@ class OutOfBandHealthChannel:
 
         finally:
             self._pending_probes.pop(target, None)
+
+    async def _await_probe_reply(
+        self,
+        target: tuple[str, int],
+        future: asyncio.Future,
+        start_time: float,
+    ) -> OOBProbeResult:
+        """Await the ACK/NACK for a sent probe; a timeout or cancel is a failed result."""
+        try:
+            response = await _DEFAULT_CLOCK.wait_for(
+                future,
+                timeout=self.config.probe_timeout_seconds,
+            )
+
+            latency = (_DEFAULT_CLOCK.monotonic() - start_time) * 1000
+            is_overloaded = response == OOB_NACK
+
+            return OOBProbeResult(
+                target=target,
+                success=True,
+                is_overloaded=is_overloaded,
+                latency_ms=latency,
+            )
+
+        except asyncio.TimeoutError:
+            self._timeouts += 1
+            return OOBProbeResult(
+                target=target,
+                success=False,
+                is_overloaded=False,
+                latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
+                error="Timeout",
+            )
+
+        except asyncio.CancelledError:
+            # Probe was cancelled (e.g., during shutdown)
+            # Return graceful failure instead of propagating
+            return OOBProbeResult(
+                target=target,
+                success=False,
+                is_overloaded=False,
+                latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
+                error="Cancelled",
+            )
 
     async def _receive_loop(self) -> None:
         """Receive loop for OOB messages."""
@@ -422,11 +454,13 @@ class OutOfBandHealthChannel:
             Number of entries removed
         """
         now = _DEFAULT_CLOCK.monotonic()
-        stale = [
-            target
-            for target, last_time in self._last_probe_time.items()
-            if now - last_time > max_age_seconds
-        ]
+        # Keys and values iterate in the same order, so compress selects the stale targets.
+        stale = list(
+            compress(
+                self._last_probe_time.keys(),
+                map(gt, map(sub, repeat(now), self._last_probe_time.values()), repeat(max_age_seconds)),
+            )
+        )
 
         for target in stale:
             del self._last_probe_time[target]

@@ -6,6 +6,8 @@ managers using the same O(log n) piggyback strategy as membership gossip.
 """
 
 import heapq
+from itertools import compress, repeat
+from operator import attrgetter, lt, methodcaller, not_
 import math
 from dataclasses import dataclass, field
 from typing import Callable
@@ -238,11 +240,13 @@ class WorkerStateGossipBuffer:
         now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.stale_age_seconds
 
-        to_remove = [
-            worker_id
-            for worker_id, update in self.updates.items()
-            if update.timestamp < cutoff
-        ]
+        # Keys and values iterate in the same order, so compress selects the stale keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(lt, map(attrgetter("timestamp"), self.updates.values()), repeat(cutoff)),
+            )
+        )
 
         for worker_id in to_remove:
             del self.updates[worker_id]
@@ -251,11 +255,13 @@ class WorkerStateGossipBuffer:
         return len(to_remove)
 
     def cleanup_broadcast_complete(self) -> int:
-        to_remove = [
-            worker_id
-            for worker_id, update in self.updates.items()
-            if not update.should_broadcast()
-        ]
+        # Keys and values iterate in the same order, so compress selects the completed keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(not_, map(methodcaller("should_broadcast"), self.updates.values())),
+            )
+        )
 
         for worker_id in to_remove:
             del self.updates[worker_id]

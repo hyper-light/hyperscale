@@ -43,10 +43,18 @@ class NodeId:
 
     def __post_init__(self):
         """Validate node ID components."""
+        self._validate_placement()
+        self._validate_endpoint()
+
+    def _validate_placement(self) -> None:
+        """Reject an empty datacenter or a priority outside 0-99."""
         if not self.datacenter:
             raise ValueError("datacenter cannot be empty")
         if not 0 <= self.priority <= 99:
             raise ValueError("priority must be between 0 and 99")
+
+    def _validate_endpoint(self) -> None:
+        """Reject an empty host or a port outside 0-65535."""
         if not self.host:
             raise ValueError("host cannot be empty")
         if not 0 <= self.port <= 65535:

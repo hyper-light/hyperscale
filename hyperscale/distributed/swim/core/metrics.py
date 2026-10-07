@@ -174,26 +174,34 @@ class Metrics:
         Returns the number of saturated counters.
         Should be called periodically (e.g., from cleanup loop).
         """
-        if not self._logger or not self._saturated_counters:
+        if self._saturation_warning_suppressed():
             return 0
-        
+
         # Take a snapshot (list() is atomic under GIL)
         saturated = list(self._saturated_counters)
-        
+
         if saturated:
-            try:
-                await self._logger.log(ServerDebug(
-                    message=f"[Metrics] Counters saturated at MAX_COUNTER_VALUE: {', '.join(saturated)}",
-                    node_host=self._node_host,
-                    node_port=self._node_port,
-                    node_id=self._node_id,
-                ))
-            except Exception:
-                # The logger itself failed: nowhere left to report it but
-                # these stats.
-                self._log_write_failures += 1
-        
+            await self._log_saturated_counters(saturated)
+
         return len(saturated)
+
+    def _saturation_warning_suppressed(self) -> bool:
+        """True when there is no logger or no counter has saturated."""
+        return not self._logger or not self._saturated_counters
+
+    async def _log_saturated_counters(self, saturated: list[str]) -> None:
+        """Log the saturated counter names, counting a failed log write."""
+        try:
+            await self._logger.log(ServerDebug(
+                message=f"[Metrics] Counters saturated at MAX_COUNTER_VALUE: {', '.join(saturated)}",
+                node_host=self._node_host,
+                node_port=self._node_port,
+                node_id=self._node_id,
+            ))
+        except Exception:
+            # The logger itself failed: nowhere left to report it but
+            # these stats.
+            self._log_write_failures += 1
     
     def uptime(self) -> float:
         """Get uptime in seconds."""
@@ -253,6 +261,10 @@ class Metrics:
             },
         }
     
+    def _is_public_int_counter(self, name: str) -> bool:
+        """True for a public attribute holding an int (a counter ``reset`` zeroes)."""
+        return not name.startswith('_') and isinstance(getattr(self, name), int)
+
     def reset(self) -> None:
         """
         Reset all counters to zero.
@@ -261,7 +273,7 @@ class Metrics:
         (e.g., during shutdown or initialization).
         """
         for name in dir(self):
-            if not name.startswith('_') and isinstance(getattr(self, name), int):
+            if self._is_public_int_counter(name):
                 setattr(self, name, 0)
         self._start_time = _DEFAULT_CLOCK.monotonic()
         self._saturated_counters.clear()

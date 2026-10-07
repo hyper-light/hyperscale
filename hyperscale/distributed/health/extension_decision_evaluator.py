@@ -16,6 +16,13 @@ from .extension_witness_evidence import ExtensionWitnessEvidence
 
 _DEFAULT_CLOCK: Clock = RealClock()
 
+# Progress counters ``_counter_regression_message`` reports, in report order.
+_PROGRESS_COUNTER_NAMES: tuple[str, ...] = (
+    "cores_completed",
+    "step_transitions",
+    "actions_completed",
+)
+
 
 class ExtensionDecisionEvaluator:
     """Orchestrates the AD-26 H5 multi-witness extension decision.
@@ -95,6 +102,44 @@ class ExtensionDecisionEvaluator:
         """
         now = self._now()
 
+        if (
+            worker_denial := self._worker_witness_denial(
+                tracker, now, snapshot, last_snapshot, throughput, overload_state
+            )
+        ) is not None:
+            return worker_denial
+
+        if (
+            progress_denial := self._progress_witness_denial(
+                tracker, now, snapshot, last_snapshot, throughput, overload_state
+            )
+        ) is not None:
+            return progress_denial
+
+        return self._throughput_witness_decision(
+            tracker=tracker,
+            now=now,
+            snapshot=snapshot,
+            last_snapshot=last_snapshot,
+            throughput=throughput,
+            overload_state=overload_state,
+            active_in_cluster=active_in_cluster,
+            active_in_dc=active_in_dc,
+            active_on_manager=active_on_manager,
+            active_on_worker=active_on_worker,
+        )
+
+    def _worker_witness_denial(
+        self,
+        tracker: ExtensionTracker,
+        now: float,
+        snapshot: WorkflowProgressSnapshot,
+        last_snapshot: WorkflowProgressSnapshot | None,
+        throughput: float,
+        overload_state: str,
+    ) -> ExtensionDecision | None:
+        """Witnesses 1-3 (AD-26 H5 worker-level): the denial of the first
+        one that fails, or ``None`` when all three pass."""
         # Witness 1 — worker-level: max-extensions cap (existing AD-26)
         if tracker.is_exhausted:
             return self._deny(
@@ -113,16 +158,34 @@ class ExtensionDecisionEvaluator:
                 witness_mean_after=0.0,
             )
 
-        # Witness 2 — worker-level: rate-limit
-        seconds_since_last = (
-            now - tracker.last_extension_time
-            if tracker.extension_count > 0
-            else float("inf")
-        )
         if (
-            tracker.extension_count > 0
-            and seconds_since_last < self._config.min_between_extensions_seconds
-        ):
+            rate_limit_denial := self._rate_limit_denial(
+                tracker, now, snapshot, last_snapshot, throughput, overload_state
+            )
+        ) is not None:
+            return rate_limit_denial
+
+        return self._overload_state_denial(
+            tracker, now, snapshot, last_snapshot, throughput, overload_state
+        )
+
+    def _rate_limit_denial(
+        self,
+        tracker: ExtensionTracker,
+        now: float,
+        snapshot: WorkflowProgressSnapshot,
+        last_snapshot: WorkflowProgressSnapshot | None,
+        throughput: float,
+        overload_state: str,
+    ) -> ExtensionDecision | None:
+        """Witness 2 (AD-26 H5): deny an extension requested sooner than
+        ``min_between_extensions_seconds`` after the previous grant; a
+        worker with no prior extension always passes."""
+        # Witness 2 — worker-level: rate-limit
+        if not tracker.extension_count > 0:
+            return None
+        seconds_since_last = now - tracker.last_extension_time
+        if seconds_since_last < self._config.min_between_extensions_seconds:
             return self._deny(
                 tracker,
                 ExtensionDenialCode.RATE_LIMITED,
@@ -142,7 +205,19 @@ class ExtensionDecisionEvaluator:
                 witness_mean_before=0.0,
                 witness_mean_after=0.0,
             )
+        return None
 
+    def _overload_state_denial(
+        self,
+        tracker: ExtensionTracker,
+        now: float,
+        snapshot: WorkflowProgressSnapshot,
+        last_snapshot: WorkflowProgressSnapshot | None,
+        throughput: float,
+        overload_state: str,
+    ) -> ExtensionDecision | None:
+        """Witness 3 (AD-26 H5, AD-19 overload state): deny a worker that
+        reports itself overloaded."""
         # Witness 3 — worker-level: overload-state guard
         if overload_state == "overloaded":
             return self._deny(
@@ -160,14 +235,35 @@ class ExtensionDecisionEvaluator:
                 witness_mean_before=0.0,
                 witness_mean_after=0.0,
             )
+        return None
 
-        # Witness 4 — workflow-level: progress monotonicity (H3)
-        baseline = last_snapshot if last_snapshot is not None else (
+    @staticmethod
+    def _progress_baseline(
+        snapshot: WorkflowProgressSnapshot,
+        last_snapshot: WorkflowProgressSnapshot | None,
+    ) -> WorkflowProgressSnapshot:
+        """The snapshot witness 4 (H3) compares against: the last accepted
+        one, or the zero-progress baseline on a first request."""
+        return last_snapshot if last_snapshot is not None else (
             WorkflowProgressSnapshot.initial(
                 workflow_id=snapshot.workflow_id,
                 cores_total=snapshot.cores_total,
             )
         )
+
+    def _progress_witness_denial(
+        self,
+        tracker: ExtensionTracker,
+        now: float,
+        snapshot: WorkflowProgressSnapshot,
+        last_snapshot: WorkflowProgressSnapshot | None,
+        throughput: float,
+        overload_state: str,
+    ) -> ExtensionDecision | None:
+        """Witness 4 (AD-26 H3 progress monotonicity): deny when a counter
+        regressed or none advanced, else ``None``."""
+        # Witness 4 — workflow-level: progress monotonicity (H3)
+        baseline = self._progress_baseline(snapshot, last_snapshot)
         all_non_regressed = snapshot.all_non_regressed(baseline)
         any_advanced = snapshot.any_advanced(baseline)
 
@@ -213,7 +309,24 @@ class ExtensionDecisionEvaluator:
                 progress_all_non_regressed=True,
                 progress_any_advanced=False,
             )
+        return None
 
+    def _throughput_witness_decision(
+        self,
+        *,
+        tracker: ExtensionTracker,
+        now: float,
+        snapshot: WorkflowProgressSnapshot,
+        last_snapshot: WorkflowProgressSnapshot | None,
+        throughput: float,
+        overload_state: str,
+        active_in_cluster: int,
+        active_in_dc: int,
+        active_on_manager: int,
+        active_on_worker: int,
+    ) -> ExtensionDecision:
+        """Witness 5 (AD-26 H6 BOCPD): deny on a downward throughput regime
+        change, otherwise grant the geometric-decay extension."""
         # Witness 5 — workflow-level: throughput witness (H6 BOCPD)
         verdict = self._throughput_witness.observe(
             worker_id=tracker.worker_id,
@@ -408,20 +521,10 @@ class ExtensionDecisionEvaluator:
         current: WorkflowProgressSnapshot,
         baseline: WorkflowProgressSnapshot,
     ) -> str:
-        regressions: list[str] = []
-        if current.cores_completed < baseline.cores_completed:
-            regressions.append(
-                f"cores_completed {baseline.cores_completed} -> "
-                f"{current.cores_completed}"
-            )
-        if current.step_transitions < baseline.step_transitions:
-            regressions.append(
-                f"step_transitions {baseline.step_transitions} -> "
-                f"{current.step_transitions}"
-            )
-        if current.actions_completed < baseline.actions_completed:
-            regressions.append(
-                f"actions_completed {baseline.actions_completed} -> "
-                f"{current.actions_completed}"
-            )
+        regressions: list[str] = [
+            f"{counter_name} {getattr(baseline, counter_name)} -> "
+            f"{getattr(current, counter_name)}"
+            for counter_name in _PROGRESS_COUNTER_NAMES
+            if getattr(current, counter_name) < getattr(baseline, counter_name)
+        ]
         return "Counter regression: " + "; ".join(regressions)

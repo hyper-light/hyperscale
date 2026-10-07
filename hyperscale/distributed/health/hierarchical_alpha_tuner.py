@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import chain
+from operator import attrgetter
 from typing import Iterator
 from hyperscale.distributed.health.extension_outcome import ExtensionOutcomeEvent
 
@@ -106,22 +108,27 @@ class HierarchicalAlphaTuner:
         if cutoff <= 0.0:
             return
 
+        self._evict_oldest_if_stale(cutoff)
+
+    def _evict_oldest_if_stale(self, cutoff: float) -> None:
+        """Drop the least-recently-updated posterior when it lags the
+        newest by at least ``cutoff`` seconds (H8 staleness gate)."""
         # Find the oldest posterior that's also past the staleness
         # cutoff relative to the newest. If no candidate qualifies,
         # we keep all entries — accuracy beats memory headroom.
-        oldest_at: float | None = None
-        oldest_class: str | None = None
-        newest_at = 0.0
-        for posterior in self._posteriors.values():
-            if posterior.last_outcome_at > newest_at:
-                newest_at = posterior.last_outcome_at
-            if oldest_at is None or posterior.last_outcome_at < oldest_at:
-                oldest_at = posterior.last_outcome_at
-                oldest_class = posterior.workflow_class
-
-        if oldest_class is None or oldest_at is None:
+        # ``min``/``max`` keep the first extreme in iteration order and
+        # compare exactly as the former single-pass scan did.
+        oldest_posterior = min(
+            self._posteriors.values(),
+            key=attrgetter("last_outcome_at"),
+            default=None,
+        )
+        if oldest_posterior is None:
             return
-        if newest_at - oldest_at < cutoff:
+        newest_at = max(
+            chain((0.0,), map(attrgetter("last_outcome_at"), self._posteriors.values()))
+        )
+        if newest_at - oldest_posterior.last_outcome_at < cutoff:
             return
 
-        self._posteriors.pop(oldest_class, None)
+        self._posteriors.pop(oldest_posterior.workflow_class, None)

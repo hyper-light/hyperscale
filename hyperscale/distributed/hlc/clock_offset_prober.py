@@ -87,8 +87,7 @@ class ClockOffsetProber:
     async def probe_round(self) -> ClockFenceVerdict:
         """Probe every current peer once, then re-evaluate the fence."""
         peers = dict(self._peers())
-        for departed_peer in self._monitor.measured_peers - peers.keys():
-            self._monitor.forget(departed_peer)
+        self._forget_departed_peers(peers)
         await asyncio.gather(*(self._probe(peer_id, address) for peer_id, address in peers.items()))
 
         was_fenced = self._monitor.is_fenced
@@ -97,6 +96,11 @@ class ClockOffsetProber:
             await self._report_transition(verdict)
             await self._on_fence_change(verdict)
         return verdict
+
+    def _forget_departed_peers(self, peers: dict[str, PeerAddress]) -> None:
+        """Drop the measurements of peers no longer in the membership."""
+        for departed_peer in self._monitor.measured_peers - peers.keys():
+            self._monitor.forget(departed_peer)
 
     async def _probe(self, peer_id: str, address: PeerAddress) -> None:
         request = ClockOffsetProbe(prober_id=self._node_id).dump()

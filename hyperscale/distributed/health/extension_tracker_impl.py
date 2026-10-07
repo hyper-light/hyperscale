@@ -111,38 +111,77 @@ class ExtensionTracker:
         """
         # Check max extensions
         if self.extension_count >= self.max_extensions:
-            # Track exhaustion time for grace period
-            if self.exhaustion_time is None:
-                self.exhaustion_time = _DEFAULT_CLOCK.monotonic()
-            return (
-                False,
-                0.0,
-                f"Maximum extensions ({self.max_extensions}) exceeded",
-                False,
-            )
+            return self._deny_exhausted()
 
         # Check for progress since last extension
         # AD-26 Issue 4: Prioritize absolute metrics when available
-        if self.extension_count > 0:
-            # Use absolute metrics if both current and last values are available
-            if completed_items is not None and self.last_completed_items is not None:
-                # Strict increase required for absolute metrics
-                if completed_items <= self.last_completed_items:
-                    return (
-                        False,
-                        0.0,
-                        f"No progress since last extension (completed_items={completed_items}, last={self.last_completed_items})",
-                        False,
-                    )
-            # Fall back to relative progress if absolute metrics not available
-            elif current_progress <= self.last_progress:
-                return (
-                    False,
-                    0.0,
-                    f"No progress since last extension (current={current_progress}, last={self.last_progress})",
-                    False,
-                )
+        if (progress_denial := self._progress_denial(current_progress, completed_items)) is not None:
+            return progress_denial
 
+        return self._grant_extension(current_progress, completed_items)
+
+    def _deny_exhausted(self) -> tuple[bool, float, str | None, bool]:
+        """Deny past ``max_extensions``, starting the AD-26 grace period
+        clock on the first such denial."""
+        # Track exhaustion time for grace period
+        if self.exhaustion_time is None:
+            self.exhaustion_time = _DEFAULT_CLOCK.monotonic()
+        return (
+            False,
+            0.0,
+            f"Maximum extensions ({self.max_extensions}) exceeded",
+            False,
+        )
+
+    def _progress_denial(
+        self,
+        current_progress: float,
+        completed_items: int | None,
+    ) -> tuple[bool, float, str | None, bool] | None:
+        """The denial when no progress was made since the last extension
+        (AD-26 Issue 4), or ``None``; a first extension needs no progress."""
+        if not self.extension_count > 0:
+            return None
+        # Use absolute metrics if both current and last values are available
+        if self._has_absolute_progress_metrics(completed_items):
+            return self._absolute_progress_denial(completed_items)
+        # Fall back to relative progress if absolute metrics not available
+        return self._relative_progress_denial(current_progress)
+
+    def _has_absolute_progress_metrics(self, completed_items: int | None) -> bool:
+        """Whether both this request and the last grant carry the absolute
+        ``completed_items`` metric (AD-26 Issue 4)."""
+        return completed_items is not None and self.last_completed_items is not None
+
+    def _absolute_progress_denial(self, completed_items: int) -> tuple[bool, float, str | None, bool] | None:
+        """Deny unless ``completed_items`` strictly increased (AD-26 Issue 4)."""
+        # Strict increase required for absolute metrics
+        if completed_items <= self.last_completed_items:
+            return (
+                False,
+                0.0,
+                f"No progress since last extension (completed_items={completed_items}, last={self.last_completed_items})",
+                False,
+            )
+        return None
+
+    def _relative_progress_denial(self, current_progress: float) -> tuple[bool, float, str | None, bool] | None:
+        """Deny unless the relative ``current_progress`` increased."""
+        if current_progress <= self.last_progress:
+            return (
+                False,
+                0.0,
+                f"No progress since last extension (current={current_progress}, last={self.last_progress})",
+                False,
+            )
+        return None
+
+    def _grant_extension(
+        self,
+        current_progress: float,
+        completed_items: int | None,
+    ) -> tuple[bool, float, str | None, bool]:
+        """Grant the AD-26 line 32 decayed extension and record it."""
         # Calculate extension grant with logarithmic decay per AD-26
         # line 32: grant = max(min_grant, base / 2^extension_count)
         # where extension_count is the *pre-grant* count (n = 0 for the
@@ -161,12 +200,18 @@ class ExtensionTracker:
         self.last_extension_time = _DEFAULT_CLOCK.monotonic()
 
         # Check if we should send a warning about impending exhaustion
+        is_warning = self._mark_exhaustion_warning()
+
+        return (True, grant, None, is_warning)
+
+    def _mark_exhaustion_warning(self) -> bool:
+        """Whether this grant crosses the AD-26 exhaustion-warning threshold
+        for the first time; marks the warning sent when it does."""
         remaining = self.get_remaining_extensions()
         is_warning = remaining <= self.warning_threshold and not self.warning_sent
         if is_warning:
             self.warning_sent = True
-
-        return (True, grant, None, is_warning)
+        return is_warning
 
     def reset(self) -> None:
         """
@@ -213,9 +258,7 @@ class ExtensionTracker:
         self.total_extended += grant_seconds
         self.last_extension_time = _DEFAULT_CLOCK.monotonic()
         # Track exhaustion warning, matching the existing semantics.
-        remaining = self.get_remaining_extensions()
-        if remaining <= self.warning_threshold and not self.warning_sent:
-            self.warning_sent = True
+        self._mark_exhaustion_warning()
 
     def commit_deny(self, code: str) -> None:
         """Apply the state mutation for a denied extension.

@@ -38,13 +38,9 @@ class RunLengthPosterior:
         """
         if not self.probabilities:
             return 0
-        max_idx = 0
-        max_p = self.probabilities[0]
-        for idx, p in enumerate(self.probabilities):
-            if p > max_p:
-                max_idx = idx
-                max_p = p
-        return max_idx
+        # ``max`` keeps the first index on ties and replaces only on a
+        # strictly greater probability, as the former scan did.
+        return max(range(len(self.probabilities)), key=self.probabilities.__getitem__)
 
     def expected_predictive_mean(
         self, config: BOCPDConfig, mu_0: float

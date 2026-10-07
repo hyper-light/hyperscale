@@ -52,6 +52,10 @@ class ErrorStats:
         if self.error_threshold is not None:
             object.__setattr__(self, "max_errors", self.error_threshold)
 
+        self._bound_timestamps()
+
+    def _bound_timestamps(self) -> None:
+        """Rebuild the timestamps deque bounded to ``max_timestamps`` (prevents memory growth)."""
         # Create bounded deque if not already bounded
         if (
             not hasattr(self._timestamps, "maxlen")

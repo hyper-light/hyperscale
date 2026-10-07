@@ -128,6 +128,31 @@ class _ModuleDefaults(NamedTuple):
     monotonic_source: object | None = None
 
 
+# Every attribute a module's snapshot is taken for (``snapshot_defaults``).
+_SNAPSHOT_ATTRIBUTE_NAMES = (
+    "_DEFAULT_CLOCK",
+    "_DEFAULT_RANDOM",
+    "_DEFAULT_FILESYSTEM",
+    "_DEFAULT_TIME_SOURCE",
+    "_DEFAULT_MONOTONIC_SOURCE",
+)
+
+
+def _matches_production_prefix(name: str, prefix: str) -> bool:
+    """Whether module ``name`` is ``prefix`` or a submodule of it."""
+    return name == prefix or name.startswith(prefix + ".")
+
+
+def _is_production_module_name(name: str) -> bool:
+    """Whether module ``name`` falls under any production prefix."""
+    return any(_matches_production_prefix(name, prefix) for prefix in _PRODUCTION_PREFIXES)
+
+
+def _is_loaded_production_module(name: str, mod: object) -> bool:
+    """Whether a ``sys.modules`` entry is a loaded production module."""
+    return mod is not None and _is_production_module_name(name)
+
+
 def _iter_production_modules() -> list[tuple[str, object]]:
     """Return ``(module_name, module_object)`` for every loaded module
     under the production prefixes. ``sys.modules`` mutates during
@@ -135,17 +160,42 @@ def _iter_production_modules() -> list[tuple[str, object]]:
     snapshot the keys before iterating so the walk is stable.
     """
     snapshot = list(sys.modules.items())
-    return [
-        (name, mod)
-        for name, mod in snapshot
-        if (
-            mod is not None
-            and any(
-                name == prefix or name.startswith(prefix + ".")
-                for prefix in _PRODUCTION_PREFIXES
-            )
-        )
-    ]
+    return [(name, mod) for name, mod in snapshot if _is_loaded_production_module(name, mod)]
+
+
+def _clock_bindings(clock: Clock | None) -> tuple[tuple[str, object, bool], ...]:
+    """The clock axis's ``(attribute, value, counts_as_rebind)`` bindings,
+    none when no clock is given."""
+    if clock is None:
+        return ()
+    return (
+        ("_DEFAULT_CLOCK", clock, True),
+        # Snowflake-style wall readings follow the clock axis: the
+        # virtual clock's ``time`` models the wall (including the
+        # skew knob), and the realtime default stays untouched in
+        # REAL mode.
+        ("_DEFAULT_TIME_SOURCE", clock.time, True),
+        ("_DEFAULT_MONOTONIC_SOURCE", clock.monotonic, True),
+    )
+
+
+def _given_bindings(
+    bindings: tuple[tuple[str, object, bool], ...],
+) -> list[tuple[str, object, bool]]:
+    """The bindings whose value was given (a None value leaves that axis
+    unchanged, and its attribute is never probed)."""
+    return [binding for binding in bindings if binding[1] is not None]
+
+
+def _rebind_module(module: object, bindings: list[tuple[str, object, bool]]) -> bool:
+    """Rebind each binding's attribute ``module`` defines, in order;
+    whether any rebind that counts as one happened."""
+    rebound = False
+    for attribute_name, value, counts_as_rebind in bindings:
+        if hasattr(module, attribute_name):
+            setattr(module, attribute_name, value)
+            rebound |= counts_as_rebind
+    return rebound
 
 
 def swap_defaults(
@@ -167,35 +217,21 @@ def swap_defaults(
     this list to catch coverage gaps (a forgotten module would
     silently keep using the real clock).
     """
-    touched: list[str] = []
-    for name, mod in _iter_production_modules():
-        rebound = False
-        if clock is not None and hasattr(mod, "_DEFAULT_CLOCK"):
-            setattr(mod, "_DEFAULT_CLOCK", clock)
-            rebound = True
-        if clock is not None and hasattr(mod, "_DEFAULT_TIME_SOURCE"):
-            # Snowflake-style wall readings follow the clock axis: the
-            # virtual clock's ``time`` models the wall (including the
-            # skew knob), and the realtime default stays untouched in
-            # REAL mode.
-            setattr(mod, "_DEFAULT_TIME_SOURCE", clock.time)
-            rebound = True
-        if clock is not None and hasattr(mod, "_DEFAULT_MONOTONIC_SOURCE"):
-            setattr(mod, "_DEFAULT_MONOTONIC_SOURCE", clock.monotonic)
-            rebound = True
-        if random_source is not None and hasattr(mod, "_DEFAULT_RANDOM"):
-            setattr(mod, "_DEFAULT_RANDOM", random_source)
-            rebound = True
-        if filesystem is not None and hasattr(mod, "_DEFAULT_FILESYSTEM"):
-            setattr(mod, "_DEFAULT_FILESYSTEM", filesystem)
-        if system_resources is not None and hasattr(
-            mod, "_DEFAULT_SYSTEM_RESOURCES"
-        ):
-            setattr(mod, "_DEFAULT_SYSTEM_RESOURCES", system_resources)
-            rebound = True
-        if rebound:
-            touched.append(name)
-    return touched
+    bindings = _given_bindings(
+        (
+            *_clock_bindings(clock),
+            ("_DEFAULT_RANDOM", random_source, True),
+            # A filesystem rebind alone does not mark the module touched.
+            ("_DEFAULT_FILESYSTEM", filesystem, False),
+            ("_DEFAULT_SYSTEM_RESOURCES", system_resources, True),
+        )
+    )
+    return [name for name, mod in _iter_production_modules() if _rebind_module(mod, bindings)]
+
+
+def _holds_snapshotted_default(mod: object) -> bool:
+    """Whether ``mod`` defines any default ``snapshot_defaults`` captures."""
+    return any(hasattr(mod, attribute_name) for attribute_name in _SNAPSHOT_ATTRIBUTE_NAMES)
 
 
 def snapshot_defaults() -> list[_ModuleDefaults]:
@@ -220,14 +256,22 @@ def snapshot_defaults() -> list[_ModuleDefaults]:
             monotonic_source=getattr(mod, "_DEFAULT_MONOTONIC_SOURCE", None),
         )
         for name, mod in _iter_production_modules()
-        if (
-            hasattr(mod, "_DEFAULT_CLOCK")
-            or hasattr(mod, "_DEFAULT_RANDOM")
-            or hasattr(mod, "_DEFAULT_FILESYSTEM")
-            or hasattr(mod, "_DEFAULT_TIME_SOURCE")
-            or hasattr(mod, "_DEFAULT_MONOTONIC_SOURCE")
-        )
+        if _holds_snapshotted_default(mod)
     ]
+
+
+def _entry_bindings(entry: _ModuleDefaults) -> list[tuple[str, object, bool]]:
+    """A snapshot entry's captured bindings, in restore order."""
+    return _given_bindings(
+        (
+            ("_DEFAULT_CLOCK", entry.clock, True),
+            ("_DEFAULT_RANDOM", entry.random_source, True),
+            ("_DEFAULT_TIME_SOURCE", entry.time_source, True),
+            ("_DEFAULT_MONOTONIC_SOURCE", entry.monotonic_source, True),
+            ("_DEFAULT_FILESYSTEM", entry.filesystem, True),
+            ("_DEFAULT_SYSTEM_RESOURCES", entry.system_resources, True),
+        )
+    )
 
 
 def restore_defaults(snapshot: list[_ModuleDefaults]) -> None:
@@ -246,25 +290,4 @@ def restore_defaults(snapshot: list[_ModuleDefaults]) -> None:
         mod = sys.modules.get(entry.module_name)
         if mod is None:
             continue
-        if entry.clock is not None and hasattr(mod, "_DEFAULT_CLOCK"):
-            setattr(mod, "_DEFAULT_CLOCK", entry.clock)
-        if entry.random_source is not None and hasattr(mod, "_DEFAULT_RANDOM"):
-            setattr(mod, "_DEFAULT_RANDOM", entry.random_source)
-        if entry.time_source is not None and hasattr(
-            mod, "_DEFAULT_TIME_SOURCE"
-        ):
-            setattr(mod, "_DEFAULT_TIME_SOURCE", entry.time_source)
-        if entry.monotonic_source is not None and hasattr(
-            mod, "_DEFAULT_MONOTONIC_SOURCE"
-        ):
-            setattr(mod, "_DEFAULT_MONOTONIC_SOURCE", entry.monotonic_source)
-        if entry.filesystem is not None and hasattr(
-            mod, "_DEFAULT_FILESYSTEM"
-        ):
-            setattr(mod, "_DEFAULT_FILESYSTEM", entry.filesystem)
-        if entry.system_resources is not None and hasattr(
-            mod, "_DEFAULT_SYSTEM_RESOURCES"
-        ):
-            setattr(
-                mod, "_DEFAULT_SYSTEM_RESOURCES", entry.system_resources
-            )
+        _rebind_module(mod, _entry_bindings(entry))

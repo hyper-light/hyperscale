@@ -72,10 +72,18 @@ class AuditLog:
             details=details,
         )
         self._events.append(event)
-        
+
+        self._count_total_event()
+
+        self._count_dropped_event(at_capacity)
+
+    def _count_total_event(self) -> None:
+        """Count a recorded event, saturating at ``MAX_COUNTER_VALUE``."""
         if self._total_events < self.MAX_COUNTER_VALUE:
             self._total_events += 1
-        
+
+    def _count_dropped_event(self, at_capacity: bool) -> None:
+        """Count an event the full deque pushed out, saturating at ``MAX_COUNTER_VALUE``."""
         if at_capacity and self._events_dropped < self.MAX_COUNTER_VALUE:
             self._events_dropped += 1
     
@@ -91,7 +99,8 @@ class AuditLog:
     ) -> list[AuditEvent]:
         """Get recent events for a specific node."""
         node_events = [e for e in self._events if e.node == node]
-        return node_events[-count:] if len(node_events) > count else node_events
+        # The slice is the whole list whenever it holds no more than ``count``.
+        return node_events[-count:]
     
     def get_events_by_type(
         self,
@@ -100,7 +109,8 @@ class AuditLog:
     ) -> list[AuditEvent]:
         """Get recent events of a specific type."""
         type_events = [e for e in self._events if e.event_type == event_type]
-        return type_events[-count:] if len(type_events) > count else type_events
+        # The slice is the whole list whenever it holds no more than ``count``.
+        return type_events[-count:]
     
     def get_events_since(self, since: float) -> list[AuditEvent]:
         """Get events since a timestamp."""
@@ -132,9 +142,9 @@ class AuditLog:
         Returns True if a warning was logged.
         Should be called periodically (e.g., from cleanup loop).
         """
-        if not self._logger or self._events_dropped == 0:
+        if self._capacity_warning_suppressed():
             return False
-        
+
         try:
             await self._logger.log(ServerDebug(
                 message=f"[AuditLog] Events dropped due to capacity: {self._events_dropped} "
@@ -147,6 +157,10 @@ class AuditLog:
         except Exception:
             return False
     
+    def _capacity_warning_suppressed(self) -> bool:
+        """True when there is no logger or no event has been dropped."""
+        return not self._logger or self._events_dropped == 0
+
     def clear(self) -> None:
         """Clear the audit log."""
         self._events.clear()

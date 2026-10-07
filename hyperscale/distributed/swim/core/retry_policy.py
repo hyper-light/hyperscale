@@ -70,18 +70,24 @@ class RetryPolicy:
     def should_retry(self, error: SwimError | Exception) -> RetryDecision:
         """Determine if an error should trigger a retry."""
         if isinstance(error, SwimError):
-            if error.category not in self.retryable_categories:
-                return RetryDecision.ABORT
-            if error.severity not in self.retryable_severities:
-                return RetryDecision.ABORT
-            return RetryDecision.RETRY
-        
+            return self._swim_error_decision(error)
+        return self._standard_error_decision(error)
+
+    def _swim_error_decision(self, error: SwimError) -> RetryDecision:
+        """Retry a SwimError only when both its category and severity are retryable."""
+        if error.category not in self.retryable_categories or error.severity not in self.retryable_severities:
+            return RetryDecision.ABORT
+        return RetryDecision.RETRY
+
+    @staticmethod
+    def _standard_error_decision(error: Exception) -> RetryDecision:
+        """Classify a non-SwimError: transport errors retry, programming errors abort."""
         # Standard exceptions
         if isinstance(error, (asyncio.TimeoutError, ConnectionError, OSError)):
             return RetryDecision.RETRY
         if isinstance(error, (ValueError, TypeError, AttributeError)):
             return RetryDecision.ABORT  # Likely a bug, don't retry
-        
+
         return RetryDecision.RETRY  # Default to retry for unknown
     
     def get_delay(

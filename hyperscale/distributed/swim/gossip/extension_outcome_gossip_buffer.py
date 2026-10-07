@@ -21,6 +21,8 @@ talking and data written earlier keeps loading.
 from __future__ import annotations
 
 import heapq
+from itertools import compress, repeat
+from operator import attrgetter, lt, methodcaller, not_
 import math
 from dataclasses import dataclass, field
 from typing import Callable
@@ -231,22 +233,26 @@ class ExtensionOutcomeGossipBuffer:
         now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.stale_age_seconds
 
-        to_remove = [
-            event_id
-            for event_id, update in self.updates.items()
-            if update.timestamp < cutoff
-        ]
+        # Keys and values iterate in the same order, so compress selects the stale keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(lt, map(attrgetter("timestamp"), self.updates.values()), repeat(cutoff)),
+            )
+        )
         for event_id in to_remove:
             del self.updates[event_id]
             self._stale_removed_count += 1
         return len(to_remove)
 
     def cleanup_broadcast_complete(self) -> int:
-        to_remove = [
-            event_id
-            for event_id, update in self.updates.items()
-            if not update.should_broadcast()
-        ]
+        # Keys and values iterate in the same order, so compress selects the completed keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(not_, map(methodcaller("should_broadcast"), self.updates.values())),
+            )
+        )
         for event_id in to_remove:
             del self.updates[event_id]
         return len(to_remove)

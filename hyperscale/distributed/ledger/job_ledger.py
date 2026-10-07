@@ -299,31 +299,7 @@ class JobLedger:
     async def _recover(self) -> None:
         checkpoint = self._checkpoint_manager.latest
 
-        if checkpoint is not None:
-            for job_id, job_dict in checkpoint.job_states.items():
-                self._jobs_internal[job_id] = JobState.from_dict(job_id, job_dict)
-
-            # Compaction dropped the JOB_CREATED entries replay would
-            # advance the fence counter from; resume above everything the
-            # checkpoint knows about (its own counter, or — for a
-            # checkpoint predating that field — its jobs' tokens).
-            self._next_fence_token = max(
-                self._next_fence_token,
-                checkpoint.next_fence_token,
-                *(job.fence_token + 1 for job in self._jobs_internal.values()),
-            )
-
-            self._clock.witness(checkpoint.hlc)
-            self._wal.restore_durability_watermarks(
-                regional_lsn=checkpoint.regional_lsn,
-                global_lsn=checkpoint.global_lsn,
-            )
-            # The log may hold nothing past the checkpoint (it dropped what
-            # the checkpoint covers): numbering resumes after it.
-            self._wal.restore_checkpointed_lsn(checkpoint.local_lsn)
-            start_lsn = checkpoint.local_lsn + 1
-        else:
-            start_lsn = 0
+        start_lsn = self._resume_from_checkpoint(checkpoint) if checkpoint is not None else 0
 
         async for entry in self._wal.iter_from(start_lsn):
             self._apply_entry(entry)
@@ -333,6 +309,32 @@ class JobLedger:
 
         await self._archive_terminal_jobs()
         self._publish_snapshot()
+
+    def _resume_from_checkpoint(self, checkpoint: Checkpoint) -> int:
+        """Restore the checkpoint's jobs, fence counter, clock and WAL
+        watermarks: the LSN replay resumes from."""
+        for job_id, job_dict in checkpoint.job_states.items():
+            self._jobs_internal[job_id] = JobState.from_dict(job_id, job_dict)
+
+        # Compaction dropped the JOB_CREATED entries replay would
+        # advance the fence counter from; resume above everything the
+        # checkpoint knows about (its own counter, or — for a
+        # checkpoint predating that field — its jobs' tokens).
+        self._next_fence_token = max(
+            self._next_fence_token,
+            checkpoint.next_fence_token,
+            *(job.fence_token + 1 for job in self._jobs_internal.values()),
+        )
+
+        self._clock.witness(checkpoint.hlc)
+        self._wal.restore_durability_watermarks(
+            regional_lsn=checkpoint.regional_lsn,
+            global_lsn=checkpoint.global_lsn,
+        )
+        # The log may hold nothing past the checkpoint (it dropped what
+        # the checkpoint covers): numbering resumes after it.
+        self._wal.restore_checkpointed_lsn(checkpoint.local_lsn)
+        return checkpoint.local_lsn + 1
 
     async def _archive_terminal_jobs(self) -> None:
         """Recovery's terminal sweep. Archive writes are ISOLATED here
@@ -344,13 +346,20 @@ class JobLedger:
         terminal_job_ids: list[str] = []
 
         for job_id, job_state in self._jobs_internal.items():
-            if job_state.is_terminal:
-                await self._archive_job_isolated(job_state)
-                self._completed_cache.put(job_id, job_state)
-                terminal_job_ids.append(job_id)
+            await self._archive_if_terminal(job_id, job_state, terminal_job_ids)
 
         for job_id in terminal_job_ids:
             del self._jobs_internal[job_id]
+
+    async def _archive_if_terminal(
+        self, job_id: str, job_state: JobState, terminal_job_ids: list[str]
+    ) -> None:
+        """Archive and cache a terminal job, noting it for removal from the
+        active jobs."""
+        if job_state.is_terminal:
+            await self._archive_job_isolated(job_state)
+            self._completed_cache.put(job_id, job_state)
+            terminal_job_ids.append(job_id)
 
     @property
     def pending_archive_count(self) -> int:
@@ -385,24 +394,29 @@ class JobLedger:
         try:
             await self._archive_store.write_if_absent(terminal_job)
         except Exception as archive_error:
-            already_parked = terminal_job.job_id in self._pending_archive_jobs
-            self._pending_archive_jobs[terminal_job.job_id] = terminal_job
-            if not already_parked and (
-                len(self._pending_archive_jobs) > PENDING_ARCHIVE_LIMIT
-            ):
-                evicted_job_id = next(iter(self._pending_archive_jobs))
-                del self._pending_archive_jobs[evicted_job_id]
-                await self._log_archive_error(
-                    evicted_job_id, "PendingArchiveOverflow"
-                )
-            await self._log_archive_error(
-                terminal_job.job_id, type(archive_error).__name__
-            )
+            await self._park_failed_archive(terminal_job, archive_error)
             return False
 
         if self._pending_archive_jobs.pop(terminal_job.job_id, None) is not None:
             await self._log_archive_healed(terminal_job.job_id)
         return True
+
+    async def _park_failed_archive(self, terminal_job: JobState, archive_error: Exception) -> None:
+        """Park a terminal job whose archive write failed, evicting the
+        oldest parked record past PENDING_ARCHIVE_LIMIT, and log it."""
+        already_parked = terminal_job.job_id in self._pending_archive_jobs
+        self._pending_archive_jobs[terminal_job.job_id] = terminal_job
+        if not already_parked and (
+            len(self._pending_archive_jobs) > PENDING_ARCHIVE_LIMIT
+        ):
+            evicted_job_id = next(iter(self._pending_archive_jobs))
+            del self._pending_archive_jobs[evicted_job_id]
+            await self._log_archive_error(
+                evicted_job_id, "PendingArchiveOverflow"
+            )
+        await self._log_archive_error(
+            terminal_job.job_id, type(archive_error).__name__
+        )
 
     async def _heal_pending_archive_jobs(self) -> None:
         """Retry every parked archive record, oldest first — called
@@ -410,11 +424,16 @@ class JobLedger:
         just-landed record). Stops at the first failure: the disk is
         still bad and the rest would only churn."""
         for job_id in list(self._pending_archive_jobs):
-            parked_job = self._pending_archive_jobs.get(job_id)
-            if parked_job is None:
-                continue
-            if not await self._archive_job_isolated(parked_job):
+            if not await self._heal_parked_archive(job_id):
                 return
+
+    async def _heal_parked_archive(self, job_id: str) -> bool:
+        """Retry one parked archive record; False when the write failed
+        again (a record no longer parked counts as healed)."""
+        parked_job = self._pending_archive_jobs.get(job_id)
+        if parked_job is None:
+            return True
+        return await self._archive_job_isolated(parked_job)
 
     async def _log_archive_error(self, job_id: str, error_type: str) -> None:
         if self._logger is not None:
@@ -634,6 +653,16 @@ class JobLedger:
 
         return await self._commit_in_turn(job_id, append_result, durability, commit_turn)
 
+    @staticmethod
+    def _is_absent_or_terminal(job: JobState | None) -> bool:
+        """Whether no live job is held: absent, or already ended."""
+        return job is None or job.is_terminal
+
+    def _cannot_acknowledge_cancellation(self, job: JobState | None) -> bool:
+        """Whether ``job`` cannot take a cancellation ack: absent, ended,
+        or never asked to cancel."""
+        return self._is_absent_or_terminal(job) or not job.is_cancelled
+
     async def report_progress(
         self,
         job_id: str,
@@ -652,7 +681,7 @@ class JobLedger:
 
         async with self._lock:
             job = self._jobs_internal.get(job_id)
-            if job is None or job.is_terminal:
+            if self._is_absent_or_terminal(job):
                 return None
 
             if (job.completed_count, job.failed_count) == (completed_count, failed_count):
@@ -692,7 +721,7 @@ class JobLedger:
 
         async with self._lock:
             job = self._jobs_internal.get(job_id)
-            if job is None or job.is_terminal or not job.is_cancelled:
+            if self._cannot_acknowledge_cancellation(job):
                 return None
 
             if datacenter_id in job.cancellation_acked_datacenters:
@@ -854,7 +883,7 @@ class JobLedger:
 
         async with self._lock:
             job = self._jobs_internal.get(job_id)
-            if job is None or job.is_terminal:
+            if self._is_absent_or_terminal(job):
                 return None
 
             hlc = self._clock.now()
@@ -864,12 +893,7 @@ class JobLedger:
             # contract: the fsync'd append is replayed on recovery either
             # way, so gating this on replication only splits live state
             # from recovered state.
-            terminal_job = job.with_completion(
-                final_status=final_status,
-                total_completed=job.completed_count if total_completed is None else total_completed,
-                total_failed=job.failed_count if total_failed is None else total_failed,
-                hlc=hlc,
-            )
+            terminal_job = self._terminal_state(job, final_status, total_completed, total_failed, hlc)
 
             # Reads flip to the terminal the instant it is durable:
             # the cache/snapshot transition must neither wait on nor
@@ -885,6 +909,23 @@ class JobLedger:
             commit_turn = self._commit_sequencer.reserve(job_id)
 
         return await self._commit_in_turn(job_id, append_result, durability, commit_turn)
+
+    @staticmethod
+    def _terminal_state(
+        job: JobState,
+        final_status: str,
+        total_completed: int | None,
+        total_failed: int | None,
+        hlc: HLCTimestamp,
+    ) -> JobState:
+        """``job`` ended at ``final_status``; totals of None keep the
+        record's own tallies."""
+        return job.with_completion(
+            final_status=final_status,
+            total_completed=job.completed_count if total_completed is None else total_completed,
+            total_failed=job.failed_count if total_failed is None else total_failed,
+            hlc=hlc,
+        )
 
     async def _append(
         self,
@@ -950,7 +991,7 @@ class JobLedger:
         or that has ended."""
         async with self._lock:
             job = self._jobs_internal.get(job_id)
-            if job is None or job.is_terminal:
+            if self._is_absent_or_terminal(job):
                 return None
 
             hlc = self._clock.now()
@@ -990,9 +1031,7 @@ class JobLedger:
         completed). Returns the number of events adopted.
         """
         async with self._lock:
-            if not history or job_id in self._jobs_internal:
-                return 0
-            if self._completed_cache.get(job_id) is not None:
+            if self._adopts_nothing(job_id, history):
                 return 0
 
             for event_type, payload in history:
@@ -1006,6 +1045,15 @@ class JobLedger:
             await self._archive_terminal_jobs()
             self._publish_snapshot()
             return len(history)
+
+    def _adopts_nothing(self, job_id: str, history: Sequence[tuple[JobEventType, bytes]]) -> bool:
+        """Whether the history is empty or the job is already held, live
+        or completed (the caller holds the lock)."""
+        return (
+            not history
+            or job_id in self._jobs_internal
+            or self._completed_cache.get(job_id) is not None
+        )
 
     def get_job(self, job_id: str) -> JobState | None:
         """``job_id``'s state as this node's own ledger holds it: active,
@@ -1021,19 +1069,27 @@ class JobLedger:
     async def get_archived_job(self, job_id: str) -> JobState | None:
         cached_job = self._completed_cache.get(job_id)
         if cached_job is not None:
-            if job_id in self._pending_archive_jobs:
-                # Targeted heal: the caller is reading exactly the
-                # terminal whose archive record is still owed.
-                await self._archive_job_isolated(cached_job)
-            return cached_job
+            return await self._serve_cached_terminal(job_id, cached_job)
 
         archived_job = await self._archive_store.read(job_id)
         if archived_job is not None:
-            async with self._lock:
-                if self._completed_cache.get(job_id) is None:
-                    self._completed_cache.put(job_id, archived_job)
+            await self._cache_archived_job(job_id, archived_job)
 
         return archived_job
+
+    async def _serve_cached_terminal(self, job_id: str, cached_job: JobState) -> JobState:
+        """A cached terminal, healing its archive record when still owed."""
+        if job_id in self._pending_archive_jobs:
+            # Targeted heal: the caller is reading exactly the
+            # terminal whose archive record is still owed.
+            await self._archive_job_isolated(cached_job)
+        return cached_job
+
+    async def _cache_archived_job(self, job_id: str, archived_job: JobState) -> None:
+        """Cache a terminal read back from the archive unless one is cached."""
+        async with self._lock:
+            if self._completed_cache.get(job_id) is None:
+                self._completed_cache.put(job_id, archived_job)
 
     def get_all_jobs(self) -> Mapping[str, JobState]:
         return self._jobs_snapshot
@@ -1042,11 +1098,7 @@ class JobLedger:
         async with self._lock:
             hlc = self._clock.now()
 
-            job_states = {
-                job_id: job.to_dict()
-                for job_id, job in self._jobs_internal.items()
-                if not job.is_terminal
-            }
+            job_states = self._active_job_states()
             # A terminal job whose archive record is still owed rides the
             # checkpoint: its WAL entries fall at or below this checkpoint,
             # so replay no longer reaches them, and recovery's terminal
@@ -1087,6 +1139,15 @@ class JobLedger:
             self._last_checkpoint_at = _DEFAULT_CLOCK.time()
 
             return path
+
+    def _active_job_states(self) -> dict[str, dict]:
+        """Every non-terminal job's state as a checkpoint holds it (the
+        caller holds the lock)."""
+        return {
+            job_id: job.to_dict()
+            for job_id, job in self._jobs_internal.items()
+            if not job.is_terminal
+        }
 
     def _checkpoint_is_due(self) -> bool:
         """The AD-38 compaction trigger: pending WAL entries past 2x

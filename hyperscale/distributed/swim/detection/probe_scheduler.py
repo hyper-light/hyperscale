@@ -9,6 +9,8 @@ Uses a lockless copy-on-write pattern for high performance:
 
 import asyncio
 from dataclasses import dataclass, field
+from functools import partial
+from operator import ne
 
 from hyperscale.distributed.runtime import Random, RealRandom
 
@@ -78,12 +80,7 @@ class ProbeScheduler:
 
         Lockless: Creates new immutable tuple and swaps atomically.
         """
-        for member in members:
-            if not isinstance(member, tuple) or len(member) != 2:
-                raise TypeError(
-                    f"ProbeScheduler.update_members: every member must be "
-                    f"tuple[str, int], got {type(member).__name__}: {member!r}"
-                )
+        self._require_member_addresses(members)
         new_set = frozenset(members)
         
         # No change - skip
@@ -106,6 +103,20 @@ class ProbeScheduler:
         
         # Reset index to start fresh with new membership
         self._probe_index = 0
+
+    @staticmethod
+    def _is_member_address(member: tuple[str, int]) -> bool:
+        """Whether ``member`` has the tuple[str, int] address shape."""
+        return isinstance(member, tuple) and len(member) == 2
+
+    def _require_member_addresses(self, members: list[tuple[str, int]]) -> None:
+        """Raise TypeError on the first member that is not an address tuple."""
+        for member in members:
+            if not self._is_member_address(member):
+                raise TypeError(
+                    f"ProbeScheduler.update_members: every member must be "
+                    f"tuple[str, int], got {type(member).__name__}: {member!r}"
+                )
     
     def get_next_target(self) -> tuple[str, int] | None:
         """
@@ -128,7 +139,7 @@ class ProbeScheduler:
         self._probe_index = idx + 1
         
         # Check if we completed a cycle (for reshuffling)
-        if idx > 0 and idx % length == 0:
+        if self._completes_cycle(idx, length):
             self._cycles_completed += 1
             # Reshuffle for unpredictability on next update
             # We don't reshuffle inline to avoid races
@@ -136,6 +147,11 @@ class ProbeScheduler:
         # Use modulo to handle wraparound
         effective_idx = idx % length
         return members[effective_idx]
+
+    @staticmethod
+    def _completes_cycle(index: int, length: int) -> bool:
+        """Whether probe ``index`` starts a new pass, i.e. a full cycle just completed."""
+        return index > 0 and index % length == 0
     
     def remove_member(self, member: tuple[str, int]) -> None:
         """
@@ -147,7 +163,7 @@ class ProbeScheduler:
             return
         
         # Create new tuple without this member
-        new_members = tuple(m for m in self._members if m != member)
+        new_members = tuple(filter(partial(ne, member), self._members))
         new_set = self._member_set - {member}
         
         # Atomic swap
@@ -161,7 +177,7 @@ class ProbeScheduler:
 
         Lockless: Creates new tuple with the member at random position.
         """
-        if not isinstance(member, tuple) or len(member) != 2:
+        if not self._is_member_address(member):
             raise TypeError(
                 f"ProbeScheduler.add_member: member must be tuple[str, int], "
                 f"got {type(member).__name__}: {member!r}"
@@ -173,11 +189,7 @@ class ProbeScheduler:
         # is inclusive of both ends, so the seam-mirrored equivalent is
         # ``randrange(0, n + 1)`` (allowing insertion at the tail).
         new_list = list(self._members)
-        if new_list:
-            insert_idx = _DEFAULT_RANDOM.randrange(0, len(new_list) + 1)
-            new_list.insert(insert_idx, member)
-        else:
-            new_list.append(member)
+        self._insert_at_random_position(new_list, member)
         
         new_members = tuple(new_list)
         new_set = self._member_set | {member}
@@ -186,6 +198,15 @@ class ProbeScheduler:
         self._member_set = new_set
         self._members = new_members
         self._last_cycle_length = len(new_members)
+    
+    @staticmethod
+    def _insert_at_random_position(new_list: list[tuple[str, int]], member: tuple[str, int]) -> None:
+        """Insert ``member`` at a seeded random position; an empty list appends without a draw."""
+        if new_list:
+            insert_idx = _DEFAULT_RANDOM.randrange(0, len(new_list) + 1)
+            new_list.insert(insert_idx, member)
+        else:
+            new_list.append(member)
     
     def get_probe_cycle_time(self) -> float:
         """

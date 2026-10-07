@@ -6,9 +6,10 @@ handlers and the actual HealthAwareServer implementation.
 """
 
 import asyncio
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, TypeVar
 
+from hyperscale.distributed.swim.core.protocols import TaskRunnerProtocol
 from hyperscale.distributed.swim.core.types import (
     UpdateType,
 )
@@ -441,17 +442,34 @@ class ServerAdapter:
             return
         task_runner = getattr(self._server, "_task_runner", None)
         for callback in callbacks:
-            try:
-                callback(node)
-            except Exception as callback_error:
-                if task_runner is not None and hasattr(
-                    self._server, "handle_exception"
-                ):
-                    task_runner.run(
-                        self._server.handle_exception,
-                        callback_error,
-                        "on_node_join_callback (join_handler)",
-                    )
+            self._invoke_join_callback(callback, node, task_runner)
+
+    def _invoke_join_callback(
+        self,
+        callback: Callable[[tuple[str, int]], None],
+        node: tuple[str, int],
+        task_runner: TaskRunnerProtocol | None,
+    ) -> None:
+        """Run one join callback; its failure goes to the server's handle_exception."""
+        try:
+            callback(node)
+        except Exception as callback_error:
+            self._report_join_callback_error(callback_error, task_runner)
+
+    def _report_join_callback_error(
+        self,
+        callback_error: Exception,
+        task_runner: TaskRunnerProtocol | None,
+    ) -> None:
+        """Hand a join-callback failure to the server's handle_exception via its task runner, when both exist."""
+        if task_runner is not None and hasattr(
+            self._server, "handle_exception"
+        ):
+            task_runner.run(
+                self._server.handle_exception,
+                callback_error,
+                "on_node_join_callback (join_handler)",
+            )
 
     def notify_node_dead(
         self,

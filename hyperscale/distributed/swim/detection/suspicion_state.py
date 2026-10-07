@@ -91,12 +91,16 @@ class SuspicionState:
         self._logical_confirmation_count += 1
         
         # Only store if under limit
+        self._store_confirmer(from_node)
+        
+        return True
+
+    def _store_confirmer(self, from_node: tuple[str, int]) -> None:
+        """Store ``from_node`` under the max_confirmers bound, else count the drop."""
         if len(self.confirmers) < self.max_confirmers:
             self.confirmers.add(from_node)
         else:
             self._confirmations_dropped += 1
-        
-        return True
     
     @property
     def confirmation_count(self) -> int:
@@ -122,9 +126,7 @@ class SuspicionState:
         bounded confirmation target.
         """
         c = self.confirmation_count
-        confirmation_target = self.required_confirmations
-        if confirmation_target is None:
-            confirmation_target = self.n_members
+        confirmation_target = self._confirmation_target()
         k = max(0, confirmation_target)
 
         if k <= 0:
@@ -137,6 +139,13 @@ class SuspicionState:
         timeout = self.max_timeout - (self.max_timeout - self.min_timeout) * log_factor
         
         return max(self.min_timeout, timeout)
+
+    def _confirmation_target(self) -> int:
+        """The Lifeguard confirmation target K: required_confirmations, else the member count."""
+        confirmation_target = self.required_confirmations
+        if confirmation_target is None:
+            confirmation_target = self.n_members
+        return confirmation_target
     
     def time_remaining(self) -> float:
         """Calculate time remaining before suspicion expires."""

@@ -5,6 +5,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 from collections import deque
+from itertools import filterfalse
+from operator import methodcaller
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol, TaskRunnerProtocol
 
@@ -161,21 +163,33 @@ class EventLoopHealthMonitor:
     async def stop(self) -> None:
         """Stop the health monitor."""
         self._running = False
-        if self._monitor_task and not self._monitor_task.done():
-            self._monitor_task.cancel()
-            cancels_requested_before_wait = asyncio.current_task().cancelling()
-            try:
-                await self._monitor_task
-            except asyncio.CancelledError:
-                # The task we cancelled ended; a cancel aimed at this task
-                # while it waited goes on.
-                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
-                    raise
+        if self._monitor_task_is_live():
+            await self._cancel_and_await_monitor_task()
         self._monitor_task = None
 
         # Cancel-and-await any pending callback tasks; merely cancelling
         # leaves them alive when callers inspect asyncio.all_tasks().
-        pending = [t for t in self._pending_callback_tasks if not t.done()]
+        await self._cancel_pending_callback_tasks()
+
+    def _monitor_task_is_live(self) -> bool:
+        """Whether a monitor task exists and has not finished."""
+        return self._monitor_task is not None and not self._monitor_task.done()
+
+    async def _cancel_and_await_monitor_task(self) -> None:
+        """Cancel the monitor task and wait for it, re-raising a cancel aimed at the caller meanwhile."""
+        self._monitor_task.cancel()
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
+        try:
+            await self._monitor_task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
+
+    async def _cancel_pending_callback_tasks(self) -> None:
+        """Cancel every unfinished callback task, await them all, and forget the set."""
+        pending = list(filterfalse(methodcaller("done"), self._pending_callback_tasks))
         for task in pending:
             task.cancel()
         if pending:
@@ -185,15 +199,21 @@ class EventLoopHealthMonitor:
     async def _monitor_loop(self) -> None:
         """Main monitoring loop."""
         while self._running:
-            try:
-                sample = await self._take_sample()
-                await self._process_sample(sample)
-                await _DEFAULT_CLOCK.sleep(self.sample_interval)
-            except asyncio.CancelledError:
+            if not await self._run_monitor_pass():
                 break
-            except Exception:
-                # Don't let monitoring errors crash the node
-                await _DEFAULT_CLOCK.sleep(self.sample_interval)
+
+    async def _run_monitor_pass(self) -> bool:
+        """Take, process and pace one sample; False when cancelled (the loop ends)."""
+        try:
+            sample = await self._take_sample()
+            await self._process_sample(sample)
+            await _DEFAULT_CLOCK.sleep(self.sample_interval)
+        except asyncio.CancelledError:
+            return False
+        except Exception:
+            # Don't let monitoring errors crash the node
+            await _DEFAULT_CLOCK.sleep(self.sample_interval)
+        return True
     
     async def _take_sample(self) -> HealthSample:
         """Take a single health measurement."""
@@ -219,10 +239,7 @@ class EventLoopHealthMonitor:
         self._total_samples += 1
         
         # Notify of sample (await if callback is async)
-        if self._on_sample:
-            result = self._on_sample(sample)
-            if result is not None:
-                await result
+        await self._notify_sample(sample)
         
         # Check for lag
         is_lagging = sample.lag_ratio > self.lag_threshold
@@ -232,6 +249,26 @@ class EventLoopHealthMonitor:
         # every observation so degradation thresholds and recovery
         # debouncing work the same as before. The callback fires below
         # are gated on *state transitions*, not raw samples.
+        self._record_sample_counters(is_critical, is_lagging)
+
+        # State transitions — only fire LHM callbacks on the OK→degraded
+        # and degraded→OK edges. The previous implementation fired
+        # ``on_lag_detected`` on every lagging sample, which (with a
+        # default 100 ms sample interval) pumped LHM at up to 10/s
+        # under any sustained lag. Per the Lifeguard paper LHM
+        # responds to *events*, not raw measurements; the consecutive
+        # debouncing already in place gives us the correct edges.
+        await self._apply_state_transition(sample, is_critical)
+
+    async def _notify_sample(self, sample: HealthSample) -> None:
+        """Hand ``sample`` to on_sample, awaiting the result when the callback is async."""
+        if self._on_sample:
+            result = self._on_sample(sample)
+            if result is not None:
+                await result
+
+    def _record_sample_counters(self, is_critical: bool, is_lagging: bool) -> None:
+        """Count the sample by severity and advance the consecutive lag/OK run-lengths."""
         if is_critical:
             self._total_critical_samples += 1
             self._consecutive_lag_count = min(
@@ -250,28 +287,35 @@ class EventLoopHealthMonitor:
             )
             self._consecutive_lag_count = 0
 
-        # State transitions — only fire LHM callbacks on the OK→degraded
-        # and degraded→OK edges. The previous implementation fired
-        # ``on_lag_detected`` on every lagging sample, which (with a
-        # default 100 ms sample interval) pumped LHM at up to 10/s
-        # under any sustained lag. Per the Lifeguard paper LHM
-        # responds to *events*, not raw measurements; the consecutive
-        # debouncing already in place gives us the correct edges.
+    async def _apply_state_transition(self, sample: HealthSample, is_critical: bool) -> None:
+        """Fire the LHM callbacks on the OK->degraded and degraded->OK edges only (Lifeguard)."""
         was_degraded = self._is_degraded
-        if not was_degraded and self._consecutive_lag_count >= self.lag_count_to_degrade:
-            self._is_degraded = True
-            self._degraded_transitions += 1
-            if is_critical:
-                await self._trigger_callback(
-                    self._on_critical_lag, sample.lag_ratio
-                )
-            else:
-                await self._trigger_callback(
-                    self._on_lag_detected, sample.lag_ratio
-                )
-        elif was_degraded and self._consecutive_ok_count >= self.ok_count_to_recover:
+        if self._should_degrade(was_degraded):
+            await self._enter_degraded(sample, is_critical)
+        elif self._should_recover(was_degraded):
             self._is_degraded = False
             await self._trigger_callback(self._on_recovered)
+
+    def _should_degrade(self, was_degraded: bool) -> bool:
+        """Whether enough consecutive lagging samples move an OK loop to degraded."""
+        return not was_degraded and self._consecutive_lag_count >= self.lag_count_to_degrade
+
+    def _should_recover(self, was_degraded: bool) -> bool:
+        """Whether enough consecutive OK samples move a degraded loop back to OK."""
+        return was_degraded and self._consecutive_ok_count >= self.ok_count_to_recover
+
+    async def _enter_degraded(self, sample: HealthSample, is_critical: bool) -> None:
+        """Mark the loop degraded and fire the critical- or plain-lag callback."""
+        self._is_degraded = True
+        self._degraded_transitions += 1
+        if is_critical:
+            await self._trigger_callback(
+                self._on_critical_lag, sample.lag_ratio
+            )
+        else:
+            await self._trigger_callback(
+                self._on_lag_detected, sample.lag_ratio
+            )
     
     async def _trigger_callback(
         self,
@@ -298,11 +342,16 @@ class EventLoopHealthMonitor:
 
         try:
             result = callback(*args)
-            if asyncio.iscoroutine(result):
-                await result
+            await self._await_if_coroutine(result)
         except Exception as e:
             await self._log_debug(f"Callback error: {type(e).__name__}: {e}")
     
+    @staticmethod
+    async def _await_if_coroutine(result: Awaitable[None] | None) -> None:
+        """Await a coroutine callback result; a sync callback's result needs nothing."""
+        if asyncio.iscoroutine(result):
+            await result
+
     @property
     def is_degraded(self) -> bool:
         """True if the event loop is in a degraded state."""

@@ -73,13 +73,21 @@ class ClockOffsetMonitor:
     def forget(self, peer_id: str) -> None:
         self._bounds.pop(peer_id, None)
 
+    def _bounds_measured_since(self, oldest_counted: float) -> dict[str, ClockOffsetBounds]:
+        """The held measurements taken at or after ``oldest_counted``."""
+        return {
+            peer_id: bounds for peer_id, bounds in self._bounds.items() if bounds.measured_at >= oldest_counted
+        }
+
+    def _count_peers_beyond(self) -> int:
+        """How many measured peers are certainly beyond the threshold."""
+        return sum(bounds.certainly_beyond(self._threshold_ms) for bounds in self._bounds.values())
+
     def refresh(self) -> ClockFenceVerdict:
         """Drop expired measurements and re-evaluate the fence."""
         oldest_counted = self._clock.monotonic() - self._sample_ttl_seconds
-        self._bounds = {
-            peer_id: bounds for peer_id, bounds in self._bounds.items() if bounds.measured_at >= oldest_counted
-        }
-        peers_beyond = sum(bounds.certainly_beyond(self._threshold_ms) for bounds in self._bounds.values())
+        self._bounds = self._bounds_measured_since(oldest_counted)
+        peers_beyond = self._count_peers_beyond()
         hlc_lead_ms = self._hlc.current.wall_ms - self._hlc.physical_ms()
         quorum = self._cluster_size() // 2 + 1
         self._verdict = ClockFenceVerdict(

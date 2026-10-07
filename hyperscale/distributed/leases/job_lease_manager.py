@@ -60,8 +60,7 @@ class JobLeaseManager:
         new one under the job's next fence token. Every lease here is this
         gate's own -- none is imported from another gate -- so acquisition
         never meets another holder."""
-        if duration is None:
-            duration = self._default_duration
+        duration = self._resolve_duration(duration)
 
         async with self._lock:
             if (existing := self._leases.get(job_id)) is not None and existing.is_active():
@@ -82,23 +81,30 @@ class JobLeaseManager:
             return lease
 
     async def renew(self, job_id: str, duration: float | None = None) -> bool:
-        if duration is None:
-            duration = self._default_duration
+        duration = self._resolve_duration(duration)
 
         async with self._lock:
             lease = self._leases.get(job_id)
 
-            if lease is None:
-                return False
-
-            if lease.owner_node != self._node_id:
-                return False
-
-            if lease.is_expired():
+            if not self._is_renewable(lease):
                 return False
 
             lease.extend(duration)
             return True
+
+    def _resolve_duration(self, duration: float | None) -> float:
+        """The given lease duration, or the default."""
+        if duration is None:
+            duration = self._default_duration
+        return duration
+
+    def _is_renewable(self, lease: JobLease | None) -> bool:
+        """Whether ``lease`` exists, is this node's, and has not expired."""
+        return (
+            lease is not None
+            and lease.owner_node == self._node_id
+            and not lease.is_expired()
+        )
 
     async def release(self, job_id: str) -> bool:
         async with self._lock:
@@ -138,8 +144,12 @@ class JobLeaseManager:
             return [
                 job_id
                 for job_id, lease in self._leases.items()
-                if lease.owner_node == self._node_id and lease.is_active()
+                if self._owns_active_lease(lease)
             ]
+
+    def _owns_active_lease(self, lease: JobLease) -> bool:
+        """Whether ``lease`` is this node's and still active."""
+        return lease.owner_node == self._node_id and lease.is_active()
 
     async def cleanup_expired(self) -> list[JobLease]:
         expired: list[JobLease] = []
@@ -147,12 +157,17 @@ class JobLeaseManager:
 
         async with self._lock:
             for job_id, lease in list(self._leases.items()):
-                if self._forget_if_ended_before(job_id, lease, now - self._released_retention_seconds):
-                    continue
-                if self._mark_if_expired(lease):
-                    expired.append(lease)
+                self._sweep_lease(job_id, lease, now, expired)
 
         return expired
+
+    def _sweep_lease(self, job_id: str, lease: JobLease, now: float, expired: list[JobLease]) -> None:
+        """Forget a lease that ended past the retention, else mark it
+        EXPIRED (collected) once past its expiry (the caller holds the lock)."""
+        if self._forget_if_ended_before(job_id, lease, now - self._released_retention_seconds):
+            return
+        if self._mark_if_expired(lease):
+            expired.append(lease)
 
     def _forget_if_ended_before(self, job_id: str, lease: JobLease, cutoff: float) -> bool:
         """Forget a lease that ended -- released, or expired -- before

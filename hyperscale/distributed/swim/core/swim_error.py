@@ -45,17 +45,20 @@ class SwimError(Exception):
     
     def __str__(self) -> str:
         ctx = f" {self.context}" if self.context else ""
-        cause = ""
-        if self.cause:
-            # Include type name for better debugging, especially when str(cause) is empty
-            cause_str = str(self.cause)
-            cause_type = type(self.cause).__name__
-            if cause_str:
-                cause = f" (caused by {cause_type}: {cause_str})"
-            else:
-                cause = f" (caused by {cause_type})"
+        cause = self._cause_suffix()
         return f"[{self.category.name}/{self.severity.name}] {self.message}{ctx}{cause}"
     
+    def _cause_suffix(self) -> str:
+        """The " (caused by ...)" suffix of ``__str__``, or "" when there is no cause."""
+        if not self.cause:
+            return ""
+        # Include type name for better debugging, especially when str(cause) is empty
+        cause_str = str(self.cause)
+        cause_type = type(self.cause).__name__
+        if cause_str:
+            return f" (caused by {cause_type}: {cause_str})"
+        return f" (caused by {cause_type})"
+
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("

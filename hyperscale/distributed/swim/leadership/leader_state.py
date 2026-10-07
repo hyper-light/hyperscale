@@ -207,10 +207,14 @@ class LeaderState:
         self.votes_received.clear()
         self.abort_pre_vote()
 
-        if not was_leader and self._on_become_leader:
-            self._on_become_leader()
+        self._announce_became_leader(was_leader)
 
         return True
+
+    def _announce_became_leader(self, was_leader: bool) -> None:
+        """Invoke on_become_leader on a follower/candidate -> leader transition only."""
+        if not was_leader and self._on_become_leader:
+            self._on_become_leader()
     
     def become_follower(self, term: int, leader: tuple[str, int] | None = None) -> None:
         """Transition to follower state."""
@@ -227,9 +231,21 @@ class LeaderState:
             self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
             self.abort_pre_vote()
         
+        self._announce_lost_leadership(was_leader)
+        
+        self._announce_leader_change(leader, old_leader)
+
+    def _announce_lost_leadership(self, was_leader: bool) -> None:
+        """Invoke on_lose_leadership when this node was the leader."""
         if was_leader and self._on_lose_leadership:
             self._on_lose_leadership()
-        
+
+    def _announce_leader_change(
+        self,
+        leader: tuple[str, int] | None,
+        old_leader: tuple[str, int] | None,
+    ) -> None:
+        """Invoke on_leader_change when the known leader differs from ``old_leader``."""
         if leader != old_leader and self._on_leader_change:
             self._on_leader_change(leader)
     
@@ -357,18 +373,13 @@ class LeaderState:
         3. Candidate's LHM is acceptable
         """
         # Don't grant if candidate's term is too low
-        if term < self.current_term:
-            return False
-        
         # Don't grant if we have a healthy leader
-        if self.is_lease_valid():
-            return False
-        
         # Don't grant if candidate is unhealthy
-        if candidate_lhm > max_leader_lhm:
-            return False
-        
-        return True
+        return (
+            term >= self.current_term
+            and not self.is_lease_valid()
+            and candidate_lhm <= max_leader_lhm
+        )
     
     # Fencing token methods
     def get_fencing_token(self) -> int:
@@ -414,6 +425,15 @@ class LeaderState:
         """
         if other_term > self.current_term:
             return True
+        return self._loses_same_term_tiebreak(other_addr, other_term, self_addr)
+
+    def _loses_same_term_tiebreak(
+        self,
+        other_addr: tuple[str, int],
+        other_term: int,
+        self_addr: tuple[str, int],
+    ) -> bool:
+        """Whether, as a same-term leader, this node loses the lower-address tiebreak."""
         if other_term == self.current_term and self.role == 'leader':
             # Same term, both leaders - use address as tiebreaker
             # Lower address wins
@@ -430,21 +450,31 @@ class LeaderState:
         Returns:
             Dict with cleanup stats.
         """
-        votes_cleared = len(self.votes_received)
-        pre_votes_cleared = len(self.pre_votes_received)
-        
         # Only clear if not in an active election
-        if self.role != 'candidate':
-            self.votes_received.clear()
-        
-        if not self.pre_voting_in_progress:
-            self.pre_votes_received.clear()
+        votes_cleared = self._clear_votes_unless_campaigning()
+        pre_votes_cleared = self._clear_pre_votes_unless_pre_voting()
         
         return {
-            'votes_cleared': votes_cleared if self.role != 'candidate' else 0,
-            'pre_votes_cleared': pre_votes_cleared if not self.pre_voting_in_progress else 0,
+            'votes_cleared': votes_cleared,
+            'pre_votes_cleared': pre_votes_cleared,
             'votes_dropped': self._votes_dropped,
         }
+
+    def _clear_votes_unless_campaigning(self) -> int:
+        """Clear received votes outside a candidacy; the number cleared (0 while a candidate)."""
+        votes_cleared = len(self.votes_received)
+        if self.role != 'candidate':
+            self.votes_received.clear()
+            return votes_cleared
+        return 0
+
+    def _clear_pre_votes_unless_pre_voting(self) -> int:
+        """Clear received pre-votes outside a pre-vote phase; the number cleared (0 while pre-voting)."""
+        pre_votes_cleared = len(self.pre_votes_received)
+        if not self.pre_voting_in_progress:
+            self.pre_votes_received.clear()
+            return pre_votes_cleared
+        return 0
     
     def get_memory_stats(self) -> dict[str, int]:
         """Get memory-related statistics for monitoring."""

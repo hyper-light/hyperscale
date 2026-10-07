@@ -262,8 +262,6 @@ EXPECTED_DATACLASS_VIOLATIONS: dict[str, int] = {
     'hyperscale/distributed/swim/leadership/leader_state.py::LeaderState': 1,
     'hyperscale/distributed/swim/leadership/leadership_change.py::LeadershipChange': 1,
     'hyperscale/distributed/swim/leadership/local_leader_election.py::LocalLeaderElection': 1,
-    'hyperscale/distributed/swim/retry_policy.py::RetryPolicy': 1,
-    'hyperscale/distributed/swim/retry_result.py::RetryResult': 1,
     'hyperscale/distributed/swim/roles/confirmation_result.py::ConfirmationResult': 2,
     'hyperscale/distributed/swim/roles/confirmation_strategy.py::RoleBasedConfirmationStrategy': 1,
     'hyperscale/distributed/swim/roles/unconfirmed_peer_state.py::UnconfirmedPeerState': 1,

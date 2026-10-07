@@ -123,12 +123,7 @@ class WorkerHealthManager:
         # logic decides in production.
         self._throughput_witness: ThroughputWitness | None = throughput_witness
         self._decision_evaluator: ExtensionDecisionEvaluator | None = (
-            ExtensionDecisionEvaluator(
-                throughput_witness=throughput_witness,
-                config=decision_config,
-            )
-            if throughput_witness is not None
-            else None
+            self._build_decision_evaluator(throughput_witness, decision_config)
         )
 
         # Phase H7 — local authoritative ledger of every extension
@@ -144,6 +139,22 @@ class WorkerHealthManager:
         # via ``alpha_budget(class, floor, ceiling)``.
         self._alpha_tuner: HierarchicalAlphaTuner = HierarchicalAlphaTuner(
             HierarchicalAlphaTunerConfig()
+        )
+
+    @staticmethod
+    def _build_decision_evaluator(
+        throughput_witness: ThroughputWitness | None,
+        decision_config: ExtensionDecisionConfig | None,
+    ) -> ExtensionDecisionEvaluator | None:
+        """The AD-26 H5 multi-witness evaluator, or ``None`` (legacy path)
+        when no throughput witness is wired in."""
+        return (
+            ExtensionDecisionEvaluator(
+                throughput_witness=throughput_witness,
+                config=decision_config,
+            )
+            if throughput_witness is not None
+            else None
         )
 
     def _get_tracker(self, worker_id: str) -> ExtensionTracker:
@@ -261,43 +272,15 @@ class WorkerHealthManager:
         if self._decision_evaluator is None:
             # Legacy single-witness path; preserve behavior for callers
             # that didn't wire a throughput witness.
-            response = self.handle_extension_request(request, current_deadline)
-            # Synthesize a minimal ExtensionDecision matching the
-            # legacy outcome so the caller's H7/H8 hooks see a
-            # consistent shape.
-            tracker = self._get_tracker(request.worker_id)
-            evidence = ExtensionWitnessEvidence(
-                progress_meaningful=response.granted,
-                progress_all_non_regressed=response.granted,
-                progress_any_advanced=response.granted,
-                throughput_verdict_kind=WitnessVerdictKind.COLD_START,
-                throughput_change_point_probability=0.0,
-                throughput_alpha_workflow=0.0,
-                throughput_predictive_mean_before=0.0,
-                throughput_predictive_mean_after=0.0,
-                overload_state=overload_state,
-                seconds_since_last_extension=0.0,
-                extension_count_pre_decision=tracker.extension_count,
-            )
-            decision = ExtensionDecision(
-                granted=response.granted,
-                extension_seconds=response.extension_seconds,
-                denial_reason_code=ExtensionDenialCode(
-                    response.denial_reason_code or "none"
-                ),
-                denial_message=response.denial_reason,
-                evidence=evidence,
-                is_exhaustion_warning=response.is_exhaustion_warning,
-            )
-            event = self._record_decision_event(
-                job_id=job_id,
-                worker_id=request.worker_id,
-                decision=decision,
+            return self._handle_legacy_witness_request(
+                request=request,
+                current_deadline=current_deadline,
                 snapshot=snapshot,
+                overload_state=overload_state,
+                job_id=job_id,
                 fence_token=fence_token,
                 leader_term=leader_term,
             )
-            return response, decision, event
 
         tracker = self._get_tracker(request.worker_id)
         decision = self._decision_evaluator.decide(
@@ -313,6 +296,86 @@ class WorkerHealthManager:
         )
 
         # Commit tracker state mutation.
+        response = self._commit_witnessed_decision(
+            tracker, request, current_deadline, decision
+        )
+
+        event = self._record_decision_event(
+            job_id=job_id,
+            worker_id=request.worker_id,
+            decision=decision,
+            snapshot=snapshot,
+            fence_token=fence_token,
+            leader_term=leader_term,
+        )
+        return response, decision, event
+
+    def _handle_legacy_witness_request(
+        self,
+        *,
+        request: HealthcheckExtensionRequest,
+        current_deadline: float,
+        snapshot: WorkflowProgressSnapshot,
+        overload_state: str,
+        job_id: str,
+        fence_token: int,
+        leader_term: int,
+    ) -> tuple[
+        HealthcheckExtensionResponse,
+        ExtensionDecision,
+        ExtensionDecisionEvent,
+    ]:
+        """AD-26 legacy single-witness path of
+        ``handle_extension_request_with_witnesses``, used when no throughput
+        witness is wired: decide via ``handle_extension_request`` and record
+        a synthesized decision so H7/H8 hooks see a consistent shape."""
+        response = self.handle_extension_request(request, current_deadline)
+        # Synthesize a minimal ExtensionDecision matching the
+        # legacy outcome so the caller's H7/H8 hooks see a
+        # consistent shape.
+        tracker = self._get_tracker(request.worker_id)
+        evidence = ExtensionWitnessEvidence(
+            progress_meaningful=response.granted,
+            progress_all_non_regressed=response.granted,
+            progress_any_advanced=response.granted,
+            throughput_verdict_kind=WitnessVerdictKind.COLD_START,
+            throughput_change_point_probability=0.0,
+            throughput_alpha_workflow=0.0,
+            throughput_predictive_mean_before=0.0,
+            throughput_predictive_mean_after=0.0,
+            overload_state=overload_state,
+            seconds_since_last_extension=0.0,
+            extension_count_pre_decision=tracker.extension_count,
+        )
+        decision = ExtensionDecision(
+            granted=response.granted,
+            extension_seconds=response.extension_seconds,
+            denial_reason_code=ExtensionDenialCode(
+                response.denial_reason_code or "none"
+            ),
+            denial_message=response.denial_reason,
+            evidence=evidence,
+            is_exhaustion_warning=response.is_exhaustion_warning,
+        )
+        event = self._record_decision_event(
+            job_id=job_id,
+            worker_id=request.worker_id,
+            decision=decision,
+            snapshot=snapshot,
+            fence_token=fence_token,
+            leader_term=leader_term,
+        )
+        return response, decision, event
+
+    def _commit_witnessed_decision(
+        self,
+        tracker: ExtensionTracker,
+        request: HealthcheckExtensionRequest,
+        current_deadline: float,
+        decision: ExtensionDecision,
+    ) -> HealthcheckExtensionResponse:
+        """Commit an AD-26 H5 decision to the tracker and failure counts
+        and build the worker's wire response."""
         if decision.granted:
             tracker.commit_grant(
                 grant_seconds=decision.extension_seconds,
@@ -349,16 +412,7 @@ class WorkerHealthManager:
                 in_grace_period=tracker.is_in_grace_period,
                 denial_reason_code=decision.denial_reason_code.value,
             )
-
-        event = self._record_decision_event(
-            job_id=job_id,
-            worker_id=request.worker_id,
-            decision=decision,
-            snapshot=snapshot,
-            fence_token=fence_token,
-            leader_term=leader_term,
-        )
-        return response, decision, event
+        return response
 
     def _record_decision_event(
         self,
@@ -447,10 +501,7 @@ class WorkerHealthManager:
         equal-or-lower leader_term return the existing event
         unchanged. Higher-leader-term outcomes supersede.
         """
-        entry = self._ledger.get_workflow_entry(workflow_id)
-        granted_count = entry.extension_count if entry is not None else 0
-        denied_count = entry.denial_count if entry is not None else 0
-        total_extended = entry.cumulative_extended if entry is not None else 0.0
+        granted_count, denied_count, total_extended = self._ledger_totals(workflow_id)
 
         event = ExtensionOutcomeEvent(
             job_id=job_id,
@@ -468,6 +519,14 @@ class WorkerHealthManager:
         )
         self._apply_outcome_locally(event)
         return event
+
+    def _ledger_totals(self, workflow_id: str) -> tuple[int, int, float]:
+        """Granted count, denied count and cumulative extended seconds the
+        H7 ledger holds for ``workflow_id`` (zeros when it holds none)."""
+        entry = self._ledger.get_workflow_entry(workflow_id)
+        if entry is None:
+            return 0, 0, 0.0
+        return entry.extension_count, entry.denial_count, entry.cumulative_extended
 
     def ingest_remote_outcome_event(
         self, event: ExtensionOutcomeEvent
@@ -557,8 +616,7 @@ class WorkerHealthManager:
         Returns the number of events replayed.
         """
         replayed = 0
-        if state.alpha_tuner_snapshot:
-            self._alpha_tuner.restore(list(state.alpha_tuner_snapshot.values()))
+        self._restore_alpha_tuner_snapshot(state)
         for decision_event in state.last_extension_decisions.values():
             self._ledger.record(decision_event)
             replayed += 1
@@ -566,6 +624,12 @@ class WorkerHealthManager:
             self._ledger.record_outcome(outcome_event)
             replayed += 1
         return replayed
+
+    def _restore_alpha_tuner_snapshot(self, state: "TimeoutTrackingState") -> None:
+        """Restore the H8 tuner from the previous leader's persisted
+        snapshot, when it left one (AD-34 leader transfer)."""
+        if state.alpha_tuner_snapshot:
+            self._alpha_tuner.restore(list(state.alpha_tuner_snapshot.values()))
 
     def _snapshot_alpha_tuner(self) -> dict[str, bytes]:
         return {
@@ -654,8 +718,7 @@ class WorkerHealthManager:
                 f"Worker exhausted {failures} extension requests without progress",
             )
 
-        tracker = self._trackers.get(worker_id)
-        if tracker and tracker.should_evict:
+        if self._tracker_should_evict(worker_id):
             # Extensions exhausted AND grace period expired
             return (
                 True,
@@ -664,6 +727,14 @@ class WorkerHealthManager:
             )
 
         return (False, None)
+
+    def _tracker_should_evict(self, worker_id: str) -> bool:
+        """Whether the worker's tracker has exhausted its extensions and
+        its AD-26 grace period."""
+        tracker = self._trackers.get(worker_id)
+        if tracker is None:
+            return False
+        return tracker.should_evict
 
     def get_worker_extension_state(self, worker_id: str) -> dict:
         """

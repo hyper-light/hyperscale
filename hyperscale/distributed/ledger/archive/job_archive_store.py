@@ -91,16 +91,23 @@ class JobArchiveStore:
             return None
 
         data = await self._filesystem.read_bytes(archive_path)
-        try:
-            return JobState.from_dict(job_id, msgspec.msgpack.decode(ARCHIVE_FORMAT.decode(data)))
-        except UnrecognizedStorageFormatError as format_error:
-            reason = format_error.reason
-        except (msgspec.DecodeError, ValueError, KeyError, TypeError) as corruption:
-            reason = f"damaged archive record: {corruption!r}"
+        job_state, reason = self._decode_record(job_id, data)
+        if reason is None:
+            return job_state
         # Set aside, the path is free: the job reads as unarchived, and
         # the next archival of it (recovery's terminal sweep) lands.
         await self._set_aside(archive_path, data, reason)
         return None
+
+    @staticmethod
+    def _decode_record(job_id: str, data: bytes) -> tuple[JobState | None, str | None]:
+        """The archived job, or why its record cannot be read."""
+        try:
+            return JobState.from_dict(job_id, msgspec.msgpack.decode(ARCHIVE_FORMAT.decode(data))), None
+        except UnrecognizedStorageFormatError as format_error:
+            return None, format_error.reason
+        except (msgspec.DecodeError, ValueError, KeyError, TypeError) as corruption:
+            return None, f"damaged archive record: {corruption!r}"
 
     async def _set_aside(self, path: Path, data: bytes, reason: str) -> None:
         """Preserve an unreadable record's bytes and free its path -- or,
@@ -139,35 +146,85 @@ class JobArchiveStore:
         for region_dir in await self._filesystem.list_subdirectories(
             self._archive_dir
         ):
-            for shard_dir in await self._filesystem.list_subdirectories(
-                region_dir
-            ):
-                try:
-                    shard_timestamp = int(shard_dir.name) * 1000
-                except ValueError:
-                    continue
+            removed_count += await self._cleanup_region(
+                region_dir, max_age_ms, current_time_ms, removal_errors
+            )
 
-                if current_time_ms - shard_timestamp <= max_age_ms:
-                    continue
+        self._raise_removal_errors(removed_count, removal_errors)
+        return removed_count
 
-                for archive_file in await self._filesystem.list_directory(
-                    shard_dir, "*"
-                ):
-                    try:
-                        await self._filesystem.remove(archive_file)
-                        removed_count += 1
-                    except OSError as removal_error:
-                        removal_errors.append(removal_error)
+    async def _cleanup_region(
+        self,
+        region_dir: Path,
+        max_age_ms: int,
+        current_time_ms: int,
+        removal_errors: list[OSError],
+    ) -> int:
+        """Sweep one region's expired shards: how many files went."""
+        removed_count = 0
+        for shard_dir in await self._filesystem.list_subdirectories(
+            region_dir
+        ):
+            removed_count += await self._cleanup_shard(
+                shard_dir, max_age_ms, current_time_ms, removal_errors
+            )
+        return removed_count
 
-                try:
-                    await self._filesystem.remove_directory(shard_dir)
-                except OSError as removal_error:
-                    removal_errors.append(removal_error)
+    async def _cleanup_shard(
+        self,
+        shard_dir: Path,
+        max_age_ms: int,
+        current_time_ms: int,
+        removal_errors: list[OSError],
+    ) -> int:
+        """Remove an expired shard's files and then the shard itself; a
+        directory not named by a shard timestamp is left alone."""
+        if not self._shard_expired(shard_dir, max_age_ms, current_time_ms):
+            return 0
 
+        removed_count = await self._remove_shard_files(shard_dir, removal_errors)
+
+        try:
+            await self._filesystem.remove_directory(shard_dir)
+        except OSError as removal_error:
+            removal_errors.append(removal_error)
+        return removed_count
+
+    @staticmethod
+    def _shard_expired(shard_dir: Path, max_age_ms: int, current_time_ms: int) -> bool:
+        """Whether a shard directory is named by a timestamp older than
+        ``max_age_ms``."""
+        try:
+            shard_timestamp = int(shard_dir.name) * 1000
+        except ValueError:
+            return False
+
+        return not current_time_ms - shard_timestamp <= max_age_ms
+
+    async def _remove_shard_files(self, shard_dir: Path, removal_errors: list[OSError]) -> int:
+        """Remove every file in a shard, collecting failures: how many went."""
+        removed_count = 0
+        for archive_file in await self._filesystem.list_directory(
+            shard_dir, "*"
+        ):
+            removed_count += await self._remove_archive_file(archive_file, removal_errors)
+        return removed_count
+
+    async def _remove_archive_file(self, archive_file: Path, removal_errors: list[OSError]) -> int:
+        """Remove one archive file: 1 when it went, 0 when its failure was
+        collected."""
+        try:
+            await self._filesystem.remove(archive_file)
+            return 1
+        except OSError as removal_error:
+            removal_errors.append(removal_error)
+            return 0
+
+    @staticmethod
+    def _raise_removal_errors(removed_count: int, removal_errors: list[OSError]) -> None:
+        """Raise every collected removal failure together."""
         if removal_errors:
             raise ExceptionGroup(
                 f"archive cleanup removed {removed_count} files but failed {len(removal_errors)} removals",
                 removal_errors,
             )
-        return removed_count
-

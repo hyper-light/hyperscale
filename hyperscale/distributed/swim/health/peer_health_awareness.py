@@ -26,6 +26,9 @@ talking and data written earlier keeps loading.
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+from itertools import compress
+from operator import attrgetter, methodcaller
+from types import MappingProxyType
 from typing import Callable
 from hyperscale.distributed.health.tracker import HealthPiggyback
 from hyperscale.distributed.runtime import Clock, RealClock
@@ -35,6 +38,37 @@ from .peer_load_level import _OVERLOAD_STATE_TO_LEVEL
 from .peer_health_awareness_config import PeerHealthAwarenessConfig
 from .peer_health_info import PeerHealthInfo
 from .peer_load_level import PeerLoadLevel
+
+
+def _unadapted_timeout_multiplier(config: PeerHealthAwarenessConfig) -> float:
+    """The multiplier for a HEALTHY or UNKNOWN peer: no timeout adaptation."""
+    return 1.0
+
+
+def _not_accepting_work(peer_info: PeerHealthInfo) -> bool:
+    """Whether the peer reported it is not accepting work."""
+    return not peer_info.accepting_work
+
+
+# Load levels that stretch timeouts, each read from its configured multiplier.
+_LOAD_LEVEL_TIMEOUT_MULTIPLIER: MappingProxyType[PeerLoadLevel, Callable[[PeerHealthAwarenessConfig], float]] = (
+    MappingProxyType(
+        {
+            PeerLoadLevel.OVERLOADED: attrgetter("timeout_multiplier_overloaded"),
+            PeerLoadLevel.STRESSED: attrgetter("timeout_multiplier_stressed"),
+            PeerLoadLevel.BUSY: attrgetter("timeout_multiplier_busy"),
+        }
+    )
+)
+
+# Share of normal gossip piggybacked to a peer at each reduced load level.
+_LOAD_LEVEL_GOSSIP_REDUCTION: MappingProxyType[PeerLoadLevel, float] = MappingProxyType(
+    {
+        PeerLoadLevel.OVERLOADED: 0.25,  # Only 25% of normal gossip
+        PeerLoadLevel.STRESSED: 0.50,  # Only 50% of normal gossip
+        PeerLoadLevel.BUSY: 0.75,  # 75% of normal gossip
+    }
+)
 
 
 @dataclass(slots=True)
@@ -177,14 +211,9 @@ class PeerHealthAwareness:
         if not peer_info:
             return 1.0
 
-        if peer_info.load_level == PeerLoadLevel.OVERLOADED:
-            return self.config.timeout_multiplier_overloaded
-        if peer_info.load_level == PeerLoadLevel.STRESSED:
-            return self.config.timeout_multiplier_stressed
-        if peer_info.load_level == PeerLoadLevel.BUSY:
-            return self.config.timeout_multiplier_busy
-
-        return 1.0
+        return _LOAD_LEVEL_TIMEOUT_MULTIPLIER.get(
+            peer_info.load_level, _unadapted_timeout_multiplier
+        )(self.config)
 
     def get_probe_timeout(self, node_id: str, base_timeout: float) -> float:
         """
@@ -247,46 +276,35 @@ class PeerHealthAwareness:
             return 1.0
 
         # Reduce gossip based on load
-        if peer_info.load_level == PeerLoadLevel.OVERLOADED:
-            return 0.25  # Only 25% of normal gossip
-        elif peer_info.load_level == PeerLoadLevel.STRESSED:
-            return 0.50  # Only 50% of normal gossip
-        elif peer_info.load_level == PeerLoadLevel.BUSY:
-            return 0.75  # 75% of normal gossip
-
-        return 1.0
+        return _LOAD_LEVEL_GOSSIP_REDUCTION.get(peer_info.load_level, 1.0)
 
     def get_healthy_peers(self) -> list[str]:
         """Get list of peers in healthy state."""
-        return [
-            node_id
-            for node_id, peer_info in self._peers.items()
-            if peer_info.is_healthy and not peer_info.is_stale(self.config.stale_threshold_seconds)
-        ]
+        return self._fresh_peers_matching(attrgetter("is_healthy"))
 
     def get_stressed_peers(self) -> list[str]:
         """Get list of peers in stressed or overloaded state."""
-        return [
-            node_id
-            for node_id, peer_info in self._peers.items()
-            if peer_info.is_stressed and not peer_info.is_stale(self.config.stale_threshold_seconds)
-        ]
+        return self._fresh_peers_matching(attrgetter("is_stressed"))
 
     def get_overloaded_peers(self) -> list[str]:
         """Get list of peers in overloaded state."""
-        return [
-            node_id
-            for node_id, peer_info in self._peers.items()
-            if peer_info.is_overloaded and not peer_info.is_stale(self.config.stale_threshold_seconds)
-        ]
+        return self._fresh_peers_matching(attrgetter("is_overloaded"))
 
     def get_peers_not_accepting_work(self) -> list[str]:
         """Get list of peers not accepting work."""
+        return self._fresh_peers_matching(_not_accepting_work)
+
+    def _fresh_peers_matching(self, predicate: Callable[[PeerHealthInfo], bool]) -> list[str]:
+        """Node ids of non-stale peers whose info satisfies ``predicate``."""
         return [
             node_id
             for node_id, peer_info in self._peers.items()
-            if not peer_info.accepting_work and not peer_info.is_stale(self.config.stale_threshold_seconds)
+            if self._is_fresh_match(peer_info, predicate)
         ]
+
+    def _is_fresh_match(self, peer_info: PeerHealthInfo, predicate: Callable[[PeerHealthInfo], bool]) -> bool:
+        """Whether ``peer_info`` satisfies ``predicate`` and is not stale (staleness checked only on a match)."""
+        return predicate(peer_info) and not peer_info.is_stale(self.config.stale_threshold_seconds)
 
     def filter_proxy_candidates(self, candidates: list[str]) -> list[str]:
         """
@@ -301,11 +319,7 @@ class PeerHealthAwareness:
         if not self.config.enable_proxy_avoidance:
             return candidates
 
-        return [
-            node_id
-            for node_id in candidates
-            if self.should_use_as_proxy(node_id)
-        ]
+        return list(filter(self.should_use_as_proxy, candidates))
 
     def rank_by_health(self, node_ids: list[str]) -> list[str]:
         """
@@ -349,11 +363,13 @@ class PeerHealthAwareness:
         Returns:
             Number of entries removed
         """
-        stale_nodes = [
-            node_id
-            for node_id, peer_info in self._peers.items()
-            if peer_info.is_stale(self.config.stale_threshold_seconds)
-        ]
+        # Keys and values iterate in the same order, so compress selects the stale peers.
+        stale_nodes = list(
+            compress(
+                self._peers.keys(),
+                map(methodcaller("is_stale", self.config.stale_threshold_seconds), self._peers.values()),
+            )
+        )
 
         for node_id in stale_nodes:
             del self._peers[node_id]

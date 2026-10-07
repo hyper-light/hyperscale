@@ -1,5 +1,6 @@
 import asyncio
 import pathlib
+from types import MappingProxyType
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import (
     Awaitable,
@@ -58,22 +59,16 @@ class Task(Generic[T]):
         self.trigger: Literal["MANUAL", "ON_START"] = trigger
         self.repeat: Literal["NEVER", "ALWAYS"] | int = repeat
 
-        self.schedule: int | float | None = None
-        if schedule:
-            self.schedule = TimeParser(schedule).time
+        self.schedule: int | float | None = self._parse_duration(schedule)
 
-        self.timeout: int | float | None = None
-        if isinstance(timeout, str):
-            self.timeout = TimeParser(timeout).time
+        self.timeout: int | float | None = self._parse_timeout(timeout)
 
         # The finished runs retained (and the runs allowed at once); unset,
         # the task's default. Left None, every retention sweep raised on
         # ``len(...) > None`` and no run was ever released.
         self.keep: int = keep if keep is not None else 10
 
-        self.max_age: float | None = None
-        if max_age:
-            self.max_age = TimeParser(max_age).time
+        self.max_age: float | None = self._parse_duration(max_age)
 
         self.keep_policy = keep_policy
 
@@ -90,6 +85,21 @@ class Task(Generic[T]):
         self._sem = asyncio.Semaphore(self.keep)
         self._executor = executor
         self._executor_semaphore = semaphore
+
+    @staticmethod
+    def _parse_duration(duration: str | None) -> int | float | None:
+        """A duration string in seconds; None when none is given."""
+        if duration:
+            return TimeParser(duration).time
+        return None
+
+    @staticmethod
+    def _parse_timeout(timeout: int | float | str | None) -> int | float | None:
+        """A timeout string in seconds; any timeout not given as a string
+        leaves the task without one."""
+        if isinstance(timeout, str):
+            return TimeParser(timeout).time
+        return None
 
     @property
     def status(self):
@@ -142,51 +152,44 @@ class Task(Generic[T]):
             schedule.cancel()
 
     async def shutdown(self):
-        # Snapshots: schedules remove themselves as they end.
-        for schedule_id, schedule in list(self._schedules.items()):
-            self._schedule_running_statuses[schedule_id] = False
-            if not schedule.done():
-                schedule.cancel()
+        self._cancel_all_schedules()
 
         for run in list(self._runs.values()):
             await run.cancel()
 
     def abort(self):
+        self._cancel_all_schedules()
+
+        for run in list(self._runs.values()):
+            run.abort()
+
+    def _cancel_all_schedules(self) -> None:
+        """Stop every schedule's flag and cancel each one still running."""
         # Snapshots: schedules remove themselves as they end.
         for schedule_id, schedule in list(self._schedules.items()):
             self._schedule_running_statuses[schedule_id] = False
             if not schedule.done():
                 schedule.cancel()
 
-        for run in list(self._runs.values()):
-            run.abort()
-
     async def cleanup(self):
-        match self.keep_policy:
-            case "COUNT":
-                await self._execute_count_policy()
-
-            case "AGE":
-                await self._execute_age_policy()
-
-            case "COUNT_AND_AGE":
-                await self._execute_age_policy()
-                await self._execute_count_policy()
-
-            case _:
-                pass
+        for retention_step in self._RETENTION_STEPS.get(self.keep_policy, ()):
+            await retention_step(self)
 
     async def _execute_count_policy(self):
         # Release finished runs beyond the newest ``keep``. Retention never
         # cancels a run still working: the old policy cancelled the OLDEST
         # ``keep`` runs, live ones included.
-        finished_run_ids = sorted(
+        finished_run_ids = self._finished_run_ids()
+        for run_id in finished_run_ids[: max(0, len(finished_run_ids) - self.keep)]:
+            del self._runs[run_id]
+
+    def _finished_run_ids(self) -> list[int]:
+        """The finished runs' ids, oldest first."""
+        return sorted(
             run_id
             for run_id, run in self._runs.items()
             if run.status in FINISHED_RUN_STATUSES
         )
-        for run_id in finished_run_ids[: max(0, len(finished_run_ids) - self.keep)]:
-            del self._runs[run_id]
 
     async def _execute_age_policy(self):
         # Release finished runs older than ``max_age``; a run's own timeout,
@@ -194,12 +197,30 @@ class Task(Generic[T]):
         if self.max_age is None:
             return
         current_time = _DEFAULT_CLOCK.monotonic()
-        for run_id in [
+        for run_id in self._expired_run_ids(current_time):
+            del self._runs[run_id]
+
+    def _expired_run_ids(self, current_time: float) -> list[int]:
+        """The finished runs older than ``max_age`` at ``current_time``."""
+        return [
             run_id
             for run_id, run in self._runs.items()
-            if run.status in FINISHED_RUN_STATUSES and current_time - run.start > self.max_age
-        ]:
-            del self._runs[run_id]
+            if self._finished_before(run, current_time)
+        ]
+
+    def _finished_before(self, run: Run[T], current_time: float) -> bool:
+        """Whether ``run`` finished and started more than ``max_age`` ago."""
+        return run.status in FINISHED_RUN_STATUSES and current_time - run.start > self.max_age
+
+    # The retention steps each ``keep_policy`` runs, in order; an unknown
+    # policy runs none.
+    _RETENTION_STEPS = MappingProxyType(
+        {
+            "COUNT": (_execute_count_policy,),
+            "AGE": (_execute_age_policy,),
+            "COUNT_AND_AGE": (_execute_age_policy, _execute_count_policy),
+        }
+    )
 
     def run_shell(
         self,
@@ -273,6 +294,36 @@ class Task(Generic[T]):
         for schedule_id in list(self._schedule_running_statuses):
             self._schedule_running_statuses[schedule_id] = False
 
+    def _resolve_run_id(self, run_id: int | None) -> int:
+        """The given run id, or a fresh one."""
+        if run_id is None:
+            run_id = self.generate_id()
+        return run_id
+
+    def _resolve_timeout(self, timeout: int | float | None) -> int | float | None:
+        """The given timeout, or the task's own."""
+        if timeout is None:
+            timeout = self.timeout
+        return timeout
+
+    def _initial_remaining_runs(self) -> int | None:
+        """How many runs a schedule makes: None when it repeats always."""
+        return None if self.repeat == "ALWAYS" else self.repeat
+
+    def _schedule_continues(self, schedule_id: int, remaining_runs: int | None):
+        """Whether schedule ``schedule_id`` is still flagged to run and has
+        runs left."""
+        return self._schedule_running_statuses.get(schedule_id, False) and (
+            remaining_runs is None or remaining_runs > 0
+        )
+
+    @staticmethod
+    def _consume_run(remaining_runs: int | None) -> int | None:
+        """The runs left after one more, for a bounded schedule."""
+        if remaining_runs is not None:
+            remaining_runs -= 1
+        return remaining_runs
+
     def run_schedule(
         self,
         *args,
@@ -280,11 +331,8 @@ class Task(Generic[T]):
         timeout: Optional[int | float] = None,
         **kwargs,
     ):
-        if run_id is None:
-            run_id = self.generate_id()
-
-        if timeout is None:
-            timeout = self.timeout
+        run_id = self._resolve_run_id(run_id)
+        timeout = self._resolve_timeout(timeout)
 
         if self._schedules.get(run_id) is None:
             self._schedule_running_statuses[run_id] = True
@@ -316,11 +364,8 @@ class Task(Generic[T]):
         timeout: Optional[int | float] = None,
         poll_interval: int | float = 0.5,
     ):
-        if run_id is None:
-            run_id = self.generate_id()
-
-        if timeout is None:
-            timeout = self.timeout
+        run_id = self._resolve_run_id(run_id)
+        timeout = self._resolve_timeout(timeout)
 
         if self._schedules.get(run_id) is None:
             self._schedule_running_statuses[run_id] = True
@@ -365,15 +410,12 @@ class Task(Generic[T]):
         interval passed. Cancelled, it cancels the run in flight; ending
         any way, it releases its future and flag.
         """
-        remaining_runs = None if self.repeat == "ALWAYS" else self.repeat
+        remaining_runs = self._initial_remaining_runs()
         try:
-            while self._schedule_running_statuses.get(schedule_id, False) and (
-                remaining_runs is None or remaining_runs > 0
-            ):
+            while self._schedule_continues(schedule_id, remaining_runs):
                 self._runs[run.run_id] = run
                 run.execute(*args, **kwargs)
-                if remaining_runs is not None:
-                    remaining_runs -= 1
+                remaining_runs = self._consume_run(remaining_runs)
 
                 await _DEFAULT_CLOCK.sleep(self.schedule)
                 run = Run(
@@ -405,11 +447,9 @@ class Task(Generic[T]):
         poll_interval: int | float = 0.5,
     ):
         """``_run_schedule`` for a shell command."""
-        remaining_runs = None if self.repeat == "ALWAYS" else self.repeat
+        remaining_runs = self._initial_remaining_runs()
         try:
-            while self._schedule_running_statuses.get(schedule_id, False) and (
-                remaining_runs is None or remaining_runs > 0
-            ):
+            while self._schedule_continues(schedule_id, remaining_runs):
                 self._runs[run.run_id] = run
                 run.execute_shell(
                     *args,
@@ -418,8 +458,7 @@ class Task(Generic[T]):
                     shell=shell,
                     poll_interval=poll_interval,
                 )
-                if remaining_runs is not None:
-                    remaining_runs -= 1
+                remaining_runs = self._consume_run(remaining_runs)
 
                 await _DEFAULT_CLOCK.sleep(self.schedule)
                 run = Run(

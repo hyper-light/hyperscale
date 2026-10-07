@@ -69,16 +69,9 @@ class TaskRunner:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._run_cleanup: bool = False
 
-        self._executor: ThreadPoolExecutor | ProcessPoolExecutor | None = None
-        if executor_type == "thread":
-            self._executor = ThreadPoolExecutor(
-                max_workers=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
-            )
-
-        elif executor_type == 'process':
-            self._executor = ProcessPoolExecutor(
-                max_workers=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
-            )
+        self._executor: ThreadPoolExecutor | ProcessPoolExecutor | None = self._create_executor(
+            executor_type, config
+        )
 
         self._executor_semaphore = asyncio.Semaphore(
             value=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
@@ -87,6 +80,24 @@ class TaskRunner:
 
         # Skip list - tasks in this set will not be run or scheduled
         self._skipped_tasks: set[str] = set()
+
+    @staticmethod
+    def _create_executor(
+        executor_type: Literal['thread', 'process', 'disabled'],
+        config: Env,
+    ) -> ThreadPoolExecutor | ProcessPoolExecutor | None:
+        """The pool ``executor_type`` names, or None when disabled."""
+        if executor_type == "thread":
+            return ThreadPoolExecutor(
+                max_workers=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
+            )
+
+        if executor_type == 'process':
+            return ProcessPoolExecutor(
+                max_workers=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
+            )
+
+        return None
 
     def all_tasks(self):
         # Snapshot to avoid dict mutation during iteration
@@ -228,23 +239,69 @@ class TaskRunner:
         max_age: str | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
     ):
-        if self._cleanup_task is None:
-            self.start_cleanup()
+        self._ensure_cleanup_started()
 
-        command_name = alias
-        if command_name is None:
-            command_name = command
+        command_name = command if alias is None else alias
 
         # Check if task is skipped - return None without running
         if command_name in self._skipped_tasks:
             return None
 
+        timeout = self._parse_timeout(timeout)
+        args = self._quote_shell_args(args, shell)
+
+        task = self._get_or_create_shell_task(
+            command_name,
+            command,
+            schedule=schedule,
+            trigger=trigger,
+            repeat=repeat,
+            keep=keep,
+            max_age=max_age,
+            keep_policy=keep_policy,
+        )
+
+        return self._start_shell_task(
+            task,
+            args,
+            env=env,
+            cwd=cwd,
+            shell=shell,
+            run_id=run_id,
+            timeout=timeout,
+        )
+
+    def _ensure_cleanup_started(self) -> None:
+        """Start the retention sweep on first use."""
+        if self._cleanup_task is None:
+            self.start_cleanup()
+
+    @staticmethod
+    def _parse_timeout(timeout: str | int | float | None) -> int | float | None:
+        """A timeout given as a duration string, in seconds."""
         if isinstance(timeout, str):
             timeout = TimeParser(timeout).time
+        return timeout
 
+    @staticmethod
+    def _quote_shell_args(args: tuple[str, ...], shell: bool) -> tuple[str, ...] | list[str]:
+        """Shell-quote each argument when the command runs through a shell."""
         if shell:
             args = [shlex.quote(arg) for arg in args]
+        return args
 
+    def _get_or_create_shell_task(
+        self,
+        command_name: str,
+        command: str,
+        schedule: str | None,
+        trigger: Literal["MANUAL", "ON_START"],
+        repeat: Literal["NEVER", "ALWAYS"] | int,
+        keep: int | None,
+        max_age: str | None,
+        keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"],
+    ) -> Task[object]:
+        """The shell task registered as ``command_name``, made on first use."""
         task = self.tasks.get(command_name)
         if task is None:
             task = Task(
@@ -264,7 +321,22 @@ class TaskRunner:
 
             self.tasks[command_name] = task
 
-        if task and task.repeat == "NEVER":
+        return task
+
+    def _start_shell_task(
+        self,
+        task: Task[object],
+        args: tuple[str, ...] | list[str],
+        env: dict[str, str] | None,
+        cwd: str | None,
+        shell: bool,
+        run_id: int | None,
+        timeout: int | float | None,
+    ):
+        """Run ``task`` once, or start its schedule; a repeating task
+        without a schedule starts nothing. (A Task is always truthy, so
+        the former ``task and`` guards never decided anything.)"""
+        if task.repeat == "NEVER":
             return task.run_shell(
                 *args,
                 env=env,
@@ -275,7 +347,7 @@ class TaskRunner:
                 poll_interval=self._cleanup_interval,
             )
 
-        elif task and task.schedule:
+        if task.schedule:
             return task.run_shell_schedule(
                 *args,
                 env=env,
@@ -337,17 +409,23 @@ class TaskRunner:
             RunStatus.FAILED,
             RunStatus.CANCELLED,
         ]:
-            if timeout is not None:
-                elapsed = asyncio.get_event_loop().time() - start_time
-                if elapsed >= timeout:
-                    raise asyncio.TimeoutError(
-                        f"Timeout waiting for task {token} after {timeout}s"
-                    )
+            self._raise_if_wait_timed_out(token, timeout, start_time)
 
             await _DEFAULT_CLOCK.sleep(self._cleanup_interval)
             update = await self.tasks[task_name].get_run_update(run_id)
 
         return await self.tasks[task_name].complete(run_id)
+
+    @staticmethod
+    def _raise_if_wait_timed_out(token: str, timeout: float | None, start_time: float) -> None:
+        """Raise ``asyncio.TimeoutError`` once a bounded wait has run
+        ``timeout`` seconds since ``start_time``."""
+        if timeout is not None:
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed >= timeout:
+                raise asyncio.TimeoutError(
+                    f"Timeout waiting for task {token} after {timeout}s"
+                )
 
     async def get_task_update(self, token: str):
         task_name, run_id = token.rsplit(":", maxsplit=1)
@@ -402,9 +480,7 @@ class TaskRunner:
             await task.shutdown()
 
     async def shutdown(self):
-        # Snapshot to avoid dict mutation during iteration
-        for task in list(self.tasks.values()):
-            await task.shutdown()
+        await self._shutdown_tasks()
 
         self._run_cleanup = False
 
@@ -412,7 +488,7 @@ class TaskRunner:
         # control once via `_DEFAULT_CLOCK.sleep(0)` after cancel, which is not
         # enough — the cancelled task may still be alive when shutdown
         # returns and surfaces as a leaked asyncio task.
-        if self._cleanup_task is not None and not self._cleanup_task.done():
+        if self._cleanup_task_started_and_unfinished():
             self._cleanup_task.cancel()
             cancels_requested_before_wait = asyncio.current_task().cancelling()
             try:
@@ -420,8 +496,7 @@ class TaskRunner:
             except asyncio.CancelledError:
                 # The task we cancelled ended; a cancel aimed at this task
                 # while it waited goes on.
-                if asyncio.current_task().cancelling() > cancels_requested_before_wait:
-                    raise
+                self._reraise_if_cancel_aimed_at_caller(cancels_requested_before_wait)
             except Exception:
                 pass
 
@@ -432,14 +507,29 @@ class TaskRunner:
             except Exception:
                 pass
 
-    def abort(self):
+    async def _shutdown_tasks(self) -> None:
+        """Shut every task down."""
         # Snapshot to avoid dict mutation during iteration
         for task in list(self.tasks.values()):
-            task.abort()
+            await task.shutdown()
+
+    def _cleanup_task_started_and_unfinished(self) -> bool:
+        """Whether the retention sweep was started and has not ended."""
+        return self._cleanup_task is not None and not self._cleanup_task.done()
+
+    @staticmethod
+    def _reraise_if_cancel_aimed_at_caller(cancels_requested_before_wait: int) -> None:
+        """Re-raise the CancelledError being handled when the current task
+        was itself cancelled since ``cancels_requested_before_wait``."""
+        if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+            raise
+
+    def abort(self):
+        self._abort_tasks()
 
         self._run_cleanup = False
 
-        if self._cleanup_task and not self._cleanup_task.done():
+        if self._cleanup_task_unfinished():
             try:
                 self._cleanup_task.cancel()
             except Exception:
@@ -452,6 +542,16 @@ class TaskRunner:
             except Exception:
                 pass
 
+    def _abort_tasks(self) -> None:
+        """Abort every task."""
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
+            task.abort()
+
+    def _cleanup_task_unfinished(self) -> bool:
+        """Whether a retention sweep was started and has not ended."""
+        return bool(self._cleanup_task and not self._cleanup_task.done())
+
     async def _cleanup(self):
         while self._run_cleanup:
             await self._cleanup_scheduled_tasks()
@@ -463,9 +563,15 @@ class TaskRunner:
         cleanup_errors: list[Exception] = []
         # Snapshot to avoid dict mutation during iteration
         for task in list(self.tasks.values()):
-            try:
-                await task.cleanup()
-            except Exception as cleanup_error:
-                cleanup_errors.append(cleanup_error)
+            await self._sweep_task(task, cleanup_errors)
         if cleanup_errors:
             raise ExceptionGroup("task retention sweep failed", cleanup_errors)
+
+    @staticmethod
+    async def _sweep_task(task: Task[object], cleanup_errors: list[Exception]) -> None:
+        """Run one task's retention sweep, collecting its failure so the
+        rest of the sweep still runs."""
+        try:
+            await task.cleanup()
+        except Exception as cleanup_error:
+            cleanup_errors.append(cleanup_error)

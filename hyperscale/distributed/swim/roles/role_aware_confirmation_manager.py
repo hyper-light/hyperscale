@@ -168,36 +168,60 @@ class RoleAwareConfirmationManager:
     ) -> ConfirmationResult | None:
         """Process a single unconfirmed peer."""
         strategy = get_strategy_for_role(state.role)
-        effective_timeout = self._calculate_effective_timeout(strategy)
-        elapsed = now - state.discovered_at
 
         # Check if past passive timeout
-        if elapsed >= effective_timeout:
-            if strategy.enable_proactive_confirmation:
-                # Check if we've exhausted proactive attempts
-                if state.confirmation_attempts_made >= strategy.confirmation_attempts:
-                    return await self._remove_peer(
-                        peer_id,
-                        state,
-                        "exhausted_proactive_attempts",
-                    )
-            else:
-                # Passive-only strategy (workers): remove immediately
-                return await self._remove_peer(
-                    peer_id,
-                    state,
-                    "passive_timeout_expired",
-                )
+        if removal_reason := self._expired_removal_reason(state, strategy, now):
+            return await self._remove_peer(
+                peer_id,
+                state,
+                removal_reason,
+            )
 
         # Check if due for proactive attempt
-        if (
-            strategy.enable_proactive_confirmation
-            and state.next_attempt_at is not None
-            and now >= state.next_attempt_at
-        ):
+        if self._proactive_attempt_due(state, strategy, now):
             return await self._attempt_proactive_confirmation(peer_id, state, strategy, now)
 
         return None
+
+    def _expired_removal_reason(
+        self,
+        state: UnconfirmedPeerState,
+        strategy: RoleBasedConfirmationStrategy,
+        now: float,
+    ) -> str | None:
+        """The removal reason for a peer past its passive timeout (AD-35 Task 12.5.5), else None."""
+        effective_timeout = self._calculate_effective_timeout(strategy)
+        elapsed = now - state.discovered_at
+        if elapsed >= effective_timeout:
+            return self._passive_timeout_removal_reason(state, strategy)
+        return None
+
+    @staticmethod
+    def _passive_timeout_removal_reason(
+        state: UnconfirmedPeerState,
+        strategy: RoleBasedConfirmationStrategy,
+    ) -> str | None:
+        """Why a timed-out peer goes: passive-only roles at once, proactive ones once attempts run out."""
+        if not strategy.enable_proactive_confirmation:
+            # Passive-only strategy (workers): remove immediately
+            return "passive_timeout_expired"
+        # Check if we've exhausted proactive attempts
+        if state.confirmation_attempts_made >= strategy.confirmation_attempts:
+            return "exhausted_proactive_attempts"
+        return None
+
+    @staticmethod
+    def _proactive_attempt_due(
+        state: UnconfirmedPeerState,
+        strategy: RoleBasedConfirmationStrategy,
+        now: float,
+    ) -> bool:
+        """True when a proactive strategy's next scheduled attempt time has arrived."""
+        return (
+            strategy.enable_proactive_confirmation
+            and state.next_attempt_at is not None
+            and now >= state.next_attempt_at
+        )
 
     async def _attempt_proactive_confirmation(
         self,
@@ -225,21 +249,45 @@ class RoleAwareConfirmationManager:
             if peer_id not in self._unconfirmed_peers:
                 return None
 
-            state.confirmation_attempts_made += 1
-            state.last_attempt_at = now
-
-            # Schedule next attempt if not exhausted
-            if state.confirmation_attempts_made < strategy.confirmation_attempts:
-                state.next_attempt_at = now + strategy.attempt_interval_seconds
-            else:
-                state.next_attempt_at = None  # No more attempts
+            self._record_proactive_attempt(state, strategy, now)
 
         # Send ping if callback is configured
+        if await self._ping_succeeded(peer_id, state):
+            return await self._confirm_peer_internal(peer_id, state)
+
+        return await self._remove_if_exhausted(peer_id, state, strategy)
+
+    @staticmethod
+    def _record_proactive_attempt(
+        state: UnconfirmedPeerState,
+        strategy: RoleBasedConfirmationStrategy,
+        now: float,
+    ) -> None:
+        """Count an attempt and schedule the next one unless exhausted (caller holds the lock)."""
+        state.confirmation_attempts_made += 1
+        state.last_attempt_at = now
+
+        # Schedule next attempt if not exhausted
+        if state.confirmation_attempts_made < strategy.confirmation_attempts:
+            state.next_attempt_at = now + strategy.attempt_interval_seconds
+        else:
+            state.next_attempt_at = None  # No more attempts
+
+    async def _ping_succeeded(self, peer_id: str, state: UnconfirmedPeerState) -> bool:
+        """Ping the peer when a ping callback is configured; True when it answered."""
         # ``send_ping`` answers False for a ping that went unanswered; one
         # that raises reaches the caller, which reports it.
         if self._send_ping and await self._send_ping(peer_id, state.peer_address):
-            return await self._confirm_peer_internal(peer_id, state)
+            return True
+        return False
 
+    async def _remove_if_exhausted(
+        self,
+        peer_id: str,
+        state: UnconfirmedPeerState,
+        strategy: RoleBasedConfirmationStrategy,
+    ) -> ConfirmationResult | None:
+        """Remove the peer once its proactive attempts are exhausted; None while attempts remain."""
         # Check if exhausted attempts
         if state.confirmation_attempts_made >= strategy.confirmation_attempts:
             return await self._remove_peer(

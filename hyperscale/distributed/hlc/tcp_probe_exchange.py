@@ -11,6 +11,11 @@ CLOCK_OFFSET_PROBE_ACTION = "clock_offset_probe"
 PeerAddress = tuple[str, int]
 
 
+def _is_empty_reply(reply: object) -> bool:
+    """Whether a probe reply carries no bytes to decode."""
+    return not isinstance(reply, bytes) or not reply
+
+
 def tcp_probe_exchange(
     send_tcp: SendTcp,
 ) -> Callable[[PeerAddress, bytes], Awaitable[bytes]]:
@@ -26,7 +31,7 @@ def tcp_probe_exchange(
         reply, _ = await send_tcp(address, CLOCK_OFFSET_PROBE_ACTION, request)
         if isinstance(reply, Exception):
             raise ClockOffsetProbeError(f"no reply: {reply!r}") from reply
-        if not isinstance(reply, bytes) or not reply:
+        if _is_empty_reply(reply):
             raise ClockOffsetProbeError(f"no reply: {reply!r}")
         return reply
 
