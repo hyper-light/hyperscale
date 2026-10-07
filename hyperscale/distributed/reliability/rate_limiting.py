@@ -29,7 +29,6 @@ from .server_rate_limiter import HANDLER_RATE_LIMIT_OPERATIONS
 from .adaptive_rate_limit_config import AdaptiveRateLimitConfig
 from .adaptive_rate_limiter import AdaptiveRateLimiter
 from .cooperative_rate_limiter import CooperativeRateLimiter
-from .rate_limit_config import RateLimitConfig
 from .rate_limit_result import RateLimitResult
 from .rate_limit_retry_config import RateLimitRetryConfig
 from .rate_limit_retry_result import RateLimitRetryResult
@@ -246,7 +245,6 @@ _REHOMED = (
     SlidingWindowCounter,
     AdaptiveRateLimitConfig,
     AdaptiveRateLimiter,
-    RateLimitConfig,
     RateLimitResult,
     ServerRateLimiter,
     CooperativeRateLimiter,

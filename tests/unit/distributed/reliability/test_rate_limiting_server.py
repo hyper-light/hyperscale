@@ -14,15 +14,12 @@ This tests the rate limiting infrastructure defined in AD-24.
 
 import asyncio
 import sys
-import os
 import time
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from hyperscale.distributed.reliability import (
-    RateLimitConfig,
     RateLimitResult,
+    AdaptiveRateLimitConfig,
     ServerRateLimiter,
     CooperativeRateLimiter,
     execute_with_rate_limit_retry,
@@ -36,48 +33,13 @@ async def run_test():
 
     try:
         # ==============================================================
-        # TEST 1: RateLimitConfig per-operation limits
-        # ==============================================================
-        print("[1/7] Testing RateLimitConfig per-operation limits...")
-        print("-" * 50)
-
-        config = RateLimitConfig(
-            default_bucket_size=100,
-            default_refill_rate=10.0,
-            operation_limits={
-                "job_submit": (50, 5.0),
-                "stats_update": (500, 50.0),
-            }
-        )
-
-        # Check operation limits
-        size, rate = config.get_limits("job_submit")
-        assert size == 50 and rate == 5.0, f"job_submit should be (50, 5.0), got ({size}, {rate})"
-        print(f"  ✓ job_submit limits: bucket={size}, rate={rate}/s")
-
-        size, rate = config.get_limits("stats_update")
-        assert size == 500 and rate == 50.0, f"stats_update should be (500, 50.0), got ({size}, {rate})"
-        print(f"  ✓ stats_update limits: bucket={size}, rate={rate}/s")
-
-        # Unknown operation should use defaults
-        size, rate = config.get_limits("unknown_operation")
-        assert size == 100 and rate == 10.0, f"unknown should use defaults, got ({size}, {rate})"
-        print(f"  ✓ Unknown operation uses defaults: bucket={size}, rate={rate}/s")
-
-        print()
-
-        # ==============================================================
         # TEST 2: ServerRateLimiter per-client buckets
         # ==============================================================
         print("[2/7] Testing ServerRateLimiter per-client buckets...")
         print("-" * 50)
 
-        config = RateLimitConfig(
-            operation_limits={
-                "test_op": (5, 10.0),  # 5 requests, 10/s refill
-            }
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"test_op": (5, 0.5), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Client 1 makes requests
         for i in range(5):
@@ -112,13 +74,8 @@ async def run_test():
         print("[3/7] Testing ServerRateLimiter client stats and reset...")
         print("-" * 50)
 
-        config = RateLimitConfig(
-            operation_limits={
-                "op_a": (10, 10.0),
-                "op_b": (20, 10.0),
-            }
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"op_a": (10, 1.0), "op_b": (20, 2.0), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Use different operations
         limiter.check_rate_limit("client-1", "op_a")
@@ -231,12 +188,8 @@ async def run_test():
         print("[6/7] Testing ServerRateLimiter async check with wait...")
         print("-" * 50)
 
-        config = RateLimitConfig(
-            operation_limits={
-                "test_op": (2, 10.0),  # 2 requests, 10/s refill
-            }
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"test_op": (2, 0.2), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Exhaust bucket
         limiter.check_rate_limit("client-1", "test_op")
@@ -334,7 +287,6 @@ async def run_test():
         print("TEST RESULT: ✓ ALL TESTS PASSED")
         print()
         print("  Rate limiting infrastructure verified:")
-        print("  - RateLimitConfig per-operation limits")
         print("  - ServerRateLimiter per-client buckets")
         print("  - ServerRateLimiter client stats and reset")
         print("  - ServerRateLimiter inactive client cleanup")

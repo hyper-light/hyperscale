@@ -43,9 +43,37 @@ async def admit_burst(
     ]
 
 
+# Finite budgets, distinct per operation, over a window no test outlives:
+# what is pinned here is which budget a handler draws from, not its size
+# (the derived sizes are pinned by test_rate_limit_derivation).
+BUDGET_WINDOW_SECONDS = 600.0
+TEST_OPERATION_BUDGETS = {
+    operation: budget
+    for budget, operation in enumerate(
+        sorted({*HANDLER_RATE_LIMIT_OPERATIONS.values(), "default"}),
+        start=3,
+    )
+}
+
+
+def budgeted_limits() -> AdaptiveRateLimitConfig:
+    return AdaptiveRateLimitConfig(
+        default_max_requests=TEST_OPERATION_BUDGETS["default"],
+        default_window_size=BUDGET_WINDOW_SECONDS,
+        operation_limits={
+            operation: (budget, BUDGET_WINDOW_SECONDS)
+            for operation, budget in TEST_OPERATION_BUDGETS.items()
+        },
+    )
+
+
+def budgeted_limiter() -> ServerRateLimiter:
+    return ServerRateLimiter(adaptive_config=budgeted_limits())
+
+
 def operation_budget(handler_name: str) -> int:
     operation = HANDLER_RATE_LIMIT_OPERATIONS.get(handler_name, handler_name)
-    max_requests, _window_seconds = AdaptiveRateLimitConfig().get_operation_limits(operation)
+    max_requests, _window_seconds = budgeted_limits().get_operation_limits(operation)
     return max_requests
 
 
@@ -62,7 +90,7 @@ def operation_budget(handler_name: str) -> int:
     ],
 )
 async def test_control_handlers_are_never_refused(handler_name: str) -> None:
-    limiter = ServerRateLimiter()
+    limiter = budgeted_limiter()
     burst = 10 * operation_budget(handler_name)
 
     admissions = await admit_burst(limiter, WORKER_PEER, handler_name, burst)
@@ -72,7 +100,7 @@ async def test_control_handlers_are_never_refused(handler_name: str) -> None:
 
 @pytest.mark.asyncio
 async def test_progress_burst_does_not_consume_final_result_budget() -> None:
-    limiter = ServerRateLimiter()
+    limiter = budgeted_limiter()
     progress_budget = operation_budget("workflow_progress")
 
     progress_admissions = await admit_burst(
@@ -90,7 +118,7 @@ async def test_progress_burst_does_not_consume_final_result_budget() -> None:
 
 @pytest.mark.asyncio
 async def test_one_peer_burst_does_not_consume_another_peers_budget() -> None:
-    limiter = ServerRateLimiter()
+    limiter = budgeted_limiter()
     progress_budget = operation_budget("workflow_progress")
 
     await admit_burst(limiter, WORKER_PEER, "workflow_progress", progress_budget + 1)
@@ -110,9 +138,9 @@ async def test_mapped_handlers_draw_their_operation_budget(
     handler_name: str,
     operation: str,
 ) -> None:
-    limiter = ServerRateLimiter()
+    limiter = budgeted_limiter()
     budget = operation_budget(handler_name)
-    assert budget == AdaptiveRateLimitConfig().get_operation_limits(operation)[0]
+    assert budget == budgeted_limits().get_operation_limits(operation)[0]
 
     admissions = await admit_burst(limiter, WORKER_PEER, handler_name, budget + 1)
 
@@ -122,7 +150,7 @@ async def test_mapped_handlers_draw_their_operation_budget(
 
 @pytest.mark.asyncio
 async def test_refusal_carries_retry_after() -> None:
-    limiter = ServerRateLimiter()
+    limiter = budgeted_limiter()
     budget = operation_budget("workflow_progress")
     priority = classify_handler_to_priority("workflow_progress")
 
@@ -135,8 +163,8 @@ async def test_refusal_carries_retry_after() -> None:
 
 @pytest.mark.asyncio
 async def test_unmapped_handler_has_its_own_default_budget() -> None:
-    limiter = ServerRateLimiter()
-    default_budget = AdaptiveRateLimitConfig().default_max_requests
+    limiter = budgeted_limiter()
+    default_budget = budgeted_limits().default_max_requests
 
     first_handler = await admit_burst(
         limiter, WORKER_PEER, "workflow_query", default_budget + 1

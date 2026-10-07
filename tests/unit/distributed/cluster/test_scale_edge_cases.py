@@ -34,7 +34,7 @@ from hyperscale.distributed.reliability.load_shedding import (
     RequestPriority,
 )
 from hyperscale.distributed.reliability.rate_limiting import (
-    RateLimitConfig,
+    AdaptiveRateLimitConfig,
     ServerRateLimiter,
     CooperativeRateLimiter,
 )
@@ -83,7 +83,7 @@ class TestMemoryLeakPrevention:
     @pytest.mark.asyncio
     async def test_rate_limiter_client_cleanup(self):
         """Verify inactive clients are cleaned up."""
-        limiter = ServerRateLimiter(inactive_cleanup_seconds=0.1)
+        limiter = ServerRateLimiter(adaptive_config=AdaptiveRateLimitConfig(inactive_cleanup_seconds=0.1))
 
         # Create many clients
         for i in range(1000):
@@ -189,11 +189,8 @@ class TestResourceExhaustion:
     @pytest.mark.asyncio
     async def test_rate_limiter_sustained_overload(self):
         """Test rate limiter under sustained overload."""
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=1.0,  # 1 token/sec
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Burst of 100 requests
         allowed = 0
@@ -526,11 +523,8 @@ class TestThunderingHerdBurst:
     @pytest.mark.asyncio
     async def test_burst_traffic_rate_limiting(self):
         """Test rate limiter handles burst traffic correctly."""
-        config = RateLimitConfig(
-            default_bucket_size=100,
-            default_refill_rate=10.0,
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Simulate burst from many clients simultaneously
         burst_results = []
@@ -549,11 +543,8 @@ class TestThunderingHerdBurst:
     @pytest.mark.asyncio
     async def test_sustained_burst_depletion(self):
         """Test sustained burst depletes token buckets."""
-        config = RateLimitConfig(
-            default_bucket_size=50,
-            default_refill_rate=1.0,  # Slow refill
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=50, default_window_size=50.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (50, 50.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Single client, sustained burst
         results = []
@@ -601,7 +592,7 @@ class TestThunderingHerdBurst:
     async def test_concurrent_rate_limit_checks(self):
         """Test concurrent rate limit checks are handled correctly."""
         limiter = ServerRateLimiter(
-            RateLimitConfig(default_bucket_size=100, default_refill_rate=10.0)
+            adaptive_config=AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (100, 10.0)})
         )
 
         async def check_rate_limit(client_id: str) -> bool:
@@ -699,11 +690,8 @@ class TestStarvationFairness:
     @pytest.mark.asyncio
     async def test_rate_limiter_per_client_fairness(self):
         """Test rate limiter provides per-client fairness."""
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=1.0,
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Client 1 exhausts their limit
         for _ in range(20):
@@ -717,15 +705,8 @@ class TestStarvationFairness:
     @pytest.mark.asyncio
     async def test_per_operation_fairness(self):
         """Test different operations have independent limits."""
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=1.0,
-            operation_limits={
-                "high_rate_op": (100, 10.0),
-                "low_rate_op": (5, 0.5),
-            },
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=10.0, operation_limits={"high_rate_op": (100, 10.0), "low_rate_op": (5, 10.0), "default": (10, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Exhaust low_rate_op
         for _ in range(10):
@@ -980,7 +961,7 @@ class TestLongRunningStability:
     @pytest.mark.asyncio
     async def test_rate_limiter_long_running_cleanup(self):
         """Test rate limiter cleanup over long running period."""
-        limiter = ServerRateLimiter(inactive_cleanup_seconds=0.05)
+        limiter = ServerRateLimiter(adaptive_config=AdaptiveRateLimitConfig(inactive_cleanup_seconds=0.05))
 
         # Create and abandon clients over time
         for batch in range(10):
@@ -1136,7 +1117,7 @@ class TestConcurrentAccessSafety:
     async def test_concurrent_rate_limit_checks(self):
         """Test concurrent rate limit checks are handled safely."""
         limiter = ServerRateLimiter(
-            RateLimitConfig(default_bucket_size=1000, default_refill_rate=100.0)
+            adaptive_config=AdaptiveRateLimitConfig(default_max_requests=1000, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (1000, 10.0)})
         )
 
         async def check_limits():
@@ -1285,8 +1266,8 @@ class TestDataStructureInvariants:
     @pytest.mark.asyncio
     async def test_rate_limiter_metrics_consistency(self):
         """Test rate limiter metrics are internally consistent."""
-        config = RateLimitConfig(default_bucket_size=10, default_refill_rate=1.0)
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Make many requests
         for i in range(100):
@@ -1310,8 +1291,8 @@ class TestPartialFailureSplitBrain:
     @pytest.mark.asyncio
     async def test_rate_limiter_client_isolation(self):
         """Test rate limiting isolation between clients."""
-        config = RateLimitConfig(default_bucket_size=5, default_refill_rate=0.1)
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=5, default_window_size=50.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (5, 50.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Exhaust client-1
         for _ in range(10):
@@ -1345,8 +1326,8 @@ class TestPartialFailureSplitBrain:
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
 
-        rate_config = RateLimitConfig(default_bucket_size=5, default_refill_rate=0.1)
-        rate_limiter = ServerRateLimiter(rate_config)
+        rate_config = AdaptiveRateLimitConfig(default_max_requests=5, default_window_size=50.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (5, 50.0)})
+        rate_limiter = ServerRateLimiter(adaptive_config=rate_config)
 
         # Shedder healthy
         detector.record_latency(50.0)
@@ -1467,8 +1448,8 @@ class TestBackpressurePropagation:
     @pytest.mark.asyncio
     async def test_rate_limit_backpressure_signal(self):
         """Test rate limit response provides useful backpressure signal."""
-        config = RateLimitConfig(default_bucket_size=5, default_refill_rate=1.0)
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=5, default_window_size=5.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (5, 5.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Exhaust bucket
         for _ in range(5):
@@ -1507,7 +1488,7 @@ class TestMetricCardinalityExplosion:
     @pytest.mark.asyncio
     async def test_rate_limiter_many_unique_clients(self):
         """Test rate limiter with many unique client IDs."""
-        limiter = ServerRateLimiter(inactive_cleanup_seconds=60.0)
+        limiter = ServerRateLimiter(adaptive_config=AdaptiveRateLimitConfig(inactive_cleanup_seconds=60.0))
 
         # Create many unique clients (simulating high cardinality)
         for i in range(10000):
@@ -1962,8 +1943,8 @@ class TestGracefulDegradation:
     @pytest.mark.asyncio
     async def test_rate_limiter_graceful_under_burst(self):
         """Test rate limiter degrades gracefully under burst."""
-        config = RateLimitConfig(default_bucket_size=100, default_refill_rate=10.0)
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Large burst
         results = []

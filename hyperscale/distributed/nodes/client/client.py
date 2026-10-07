@@ -190,13 +190,13 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._config = self._build_client_config(env, host, port, managers, gates)
         self._state = ClientState()
 
-        # Rate limiter for inbound windowed-stats pushes (AD-24); named apart
-        # from the base server's transport limiter (``_rate_limiter``), which
+        # Rate limiter for inbound windowed-stats pushes (AD-24, operation
+        # "stats_update", derived from this client's Env); named apart from
+        # the base server's transport limiter (``_rate_limiter``), which
         # admits every inbound TCP request
-        # Uses AdaptiveRateLimiter with operation limits: (300, 10.0) = 30/s
         self._progress_rate_limiter = AdaptiveRateLimiter(
             overload_detector=HybridOverloadDetector(),
-            config=AdaptiveRateLimitConfig(),
+            config=AdaptiveRateLimitConfig.from_env(env, self._tcp_server_state.max_connections),
         )
 
         # Initialize all modules with dependency injection

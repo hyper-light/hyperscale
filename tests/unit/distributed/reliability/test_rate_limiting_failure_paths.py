@@ -23,7 +23,6 @@ from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     OverloadConfig,
     OverloadState,
-    RateLimitConfig,
     RateLimitResult,
     ServerRateLimiter,
     SlidingWindowCounter,
@@ -221,7 +220,7 @@ class TestServerRateLimiterFailurePaths:
     @pytest.mark.asyncio
     async def test_many_clients_memory_growth(self) -> None:
         """Test memory behavior with many clients."""
-        limiter = ServerRateLimiter(inactive_cleanup_seconds=0.1)
+        limiter = ServerRateLimiter(adaptive_config=AdaptiveRateLimitConfig(inactive_cleanup_seconds=0.1))
 
         # Create many clients
         for i in range(1000):
@@ -243,7 +242,7 @@ class TestServerRateLimiterFailurePaths:
     @pytest.mark.asyncio
     async def test_cleanup_preserves_active_clients(self) -> None:
         """Test cleanup preserves recently active clients."""
-        limiter = ServerRateLimiter(inactive_cleanup_seconds=1.0)
+        limiter = ServerRateLimiter(adaptive_config=AdaptiveRateLimitConfig(inactive_cleanup_seconds=1.0))
 
         await limiter.check_rate_limit("active-client", "job_submit")
         await limiter.check_rate_limit("inactive-client", "job_submit")
@@ -261,8 +260,8 @@ class TestServerRateLimiterFailurePaths:
     @pytest.mark.asyncio
     async def test_rapid_requests_from_single_client(self) -> None:
         """Test rapid requests exhaust counter."""
-        config = RateLimitConfig(operation_limits={"test": (10, 1.0)})
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"test": (10, 10.0), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         allowed_count = 0
         for _ in range(20):
@@ -277,8 +276,8 @@ class TestServerRateLimiterFailurePaths:
     @pytest.mark.asyncio
     async def test_reset_client_restores_capacity(self) -> None:
         """Test reset_client restores capacity."""
-        config = RateLimitConfig(operation_limits={"test": (5, 1.0)})
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"test": (5, 5.0), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Exhaust
         for _ in range(5):
@@ -311,8 +310,8 @@ class TestServerRateLimiterFailurePaths:
     @pytest.mark.asyncio
     async def test_async_rate_limit_with_wait(self) -> None:
         """Test async rate limit with waiting."""
-        config = RateLimitConfig(operation_limits={"test": (10, 100.0)})
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"test": (10, 0.1), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         for _ in range(10):
             await limiter.check_rate_limit("async-client", "test")
@@ -326,8 +325,8 @@ class TestServerRateLimiterFailurePaths:
     @pytest.mark.asyncio
     async def test_async_rate_limit_timeout(self) -> None:
         """Test async rate limit timing out."""
-        config = RateLimitConfig(operation_limits={"test": (10, 1.0)})
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"test": (10, 10.0), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         for _ in range(10):
             await limiter.check_rate_limit("timeout-client", "test")
@@ -531,41 +530,6 @@ class TestRateLimitResponseDetection:
         assert result is False
 
 
-class TestRateLimitConfigEdgeCases:
-    """Test edge cases in RateLimitConfig."""
-
-    def test_custom_default_limits(self) -> None:
-        """Test custom default limits."""
-        config = RateLimitConfig(
-            default_bucket_size=50,
-            default_refill_rate=5.0,
-        )
-
-        size, rate = config.get_limits("unknown_operation")
-        assert size == 50
-        assert rate == 5.0
-
-    def test_override_standard_operation(self) -> None:
-        """Test overriding standard operation limits."""
-        config = RateLimitConfig(
-            operation_limits={
-                "job_submit": (1000, 100.0),
-            }
-        )
-
-        size, rate = config.get_limits("job_submit")
-        assert size == 1000
-        assert rate == 100.0
-
-    def test_empty_operation_limits(self) -> None:
-        """Test with empty operation limits."""
-        config = RateLimitConfig(operation_limits={})
-
-        size, rate = config.get_limits("any_operation")
-        assert size == 100
-        assert rate == 10.0
-
-
 class TestAdaptiveRateLimitConfigEdgeCases:
     """Test edge cases in AdaptiveRateLimitConfig."""
 
@@ -583,7 +547,6 @@ class TestAdaptiveRateLimitConfigEdgeCases:
         """Test with very high limits."""
         config = AdaptiveRateLimitConfig(
             stressed_requests_per_window=1000000,
-            overloaded_requests_per_window=100000,
         )
 
         assert config.stressed_requests_per_window == 1000000
@@ -592,7 +555,6 @@ class TestAdaptiveRateLimitConfigEdgeCases:
         """Test with zero limits (should effectively block all)."""
         config = AdaptiveRateLimitConfig(
             stressed_requests_per_window=0,
-            overloaded_requests_per_window=0,
         )
 
         assert config.stressed_requests_per_window == 0
@@ -604,10 +566,8 @@ class TestRateLimitRecovery:
     @pytest.mark.asyncio
     async def test_recovery_after_window_rotation(self) -> None:
         """Test recovery after window rotates."""
-        config = RateLimitConfig(
-            operation_limits={"test": (10, 100.0)}  # Use standard limits
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"test": (10, 0.1), "default": (100, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         # Exhaust
         for _ in range(10):
@@ -698,11 +658,8 @@ class TestServerRateLimiterCheckEdgeCases:
     @pytest.mark.asyncio
     async def test_check_rapid_fire_same_address(self) -> None:
         """Test rapid-fire requests from same address."""
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=1.0,
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 10.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
         addr = ("192.168.1.1", 8080)
 
         allowed_count = 0
@@ -715,11 +672,8 @@ class TestServerRateLimiterCheckEdgeCases:
     @pytest.mark.asyncio
     async def test_check_recovery_after_time(self) -> None:
         """Test that check() allows requests again after time passes."""
-        config = RateLimitConfig(
-            default_bucket_size=2,
-            default_refill_rate=100.0,
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=2, default_window_size=0.05, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (2, 0.05)})
+        limiter = ServerRateLimiter(adaptive_config=config)
         addr = ("192.168.1.1", 8080)
 
         await limiter.check(addr)
@@ -747,12 +701,8 @@ class TestServerRateLimiterCheckEdgeCases:
     @pytest.mark.asyncio
     async def test_check_does_not_interfere_with_other_operations(self) -> None:
         """Test that check() using 'default' doesn't affect other operations."""
-        config = RateLimitConfig(
-            default_bucket_size=2,
-            default_refill_rate=1.0,
-            operation_limits={"custom_op": (10, 1.0)},
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=2, default_window_size=2.0, operation_limits={"custom_op": (10, 10.0), "default": (2, 2.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
         addr = ("192.168.1.1", 8080)
         client_id = "192.168.1.1:8080"
 
@@ -766,7 +716,7 @@ class TestServerRateLimiterCheckEdgeCases:
     @pytest.mark.asyncio
     async def test_check_cleanup_affects_check_clients(self) -> None:
         """Test that cleanup_inactive_clients() cleans up clients created via check()."""
-        limiter = ServerRateLimiter(inactive_cleanup_seconds=0.05)
+        limiter = ServerRateLimiter(adaptive_config=AdaptiveRateLimitConfig(inactive_cleanup_seconds=0.05))
 
         for i in range(5):
             addr = (f"192.168.1.{i}", 8080)
@@ -783,11 +733,8 @@ class TestServerRateLimiterCheckEdgeCases:
     @pytest.mark.asyncio
     async def test_check_reset_client_affects_check_counter(self) -> None:
         """Test that reset_client() restores capacity for clients created via check()."""
-        config = RateLimitConfig(
-            default_bucket_size=3,
-            default_refill_rate=1.0,
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=3, default_window_size=3.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (3, 3.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
         addr = ("192.168.1.1", 8080)
         client_id = "192.168.1.1:8080"
 
@@ -805,11 +752,8 @@ class TestServerRateLimiterCheckEdgeCases:
         """Test that RateLimitExceeded exception has correct message format."""
         from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
 
-        config = RateLimitConfig(
-            default_bucket_size=1,
-            default_refill_rate=1.0,
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=1, default_window_size=1.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (1, 1.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
         addr = ("10.20.30.40", 12345)
 
         await limiter.check(addr)
@@ -824,11 +768,8 @@ class TestServerRateLimiterCheckEdgeCases:
     @pytest.mark.asyncio
     async def test_check_multiple_concurrent_addresses(self) -> None:
         """Test check() with many different addresses concurrently."""
-        config = RateLimitConfig(
-            default_bucket_size=5,
-            default_refill_rate=1.0,
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=5, default_window_size=5.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (5, 5.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         for i in range(100):
             addr = (f"10.0.0.{i}", 8080 + i)
@@ -839,11 +780,8 @@ class TestServerRateLimiterCheckEdgeCases:
     @pytest.mark.asyncio
     async def test_check_returns_false_not_none(self) -> None:
         """Test that check() returns False (not None) when rate limited."""
-        config = RateLimitConfig(
-            default_bucket_size=1,
-            default_refill_rate=1.0,
-        )
-        limiter = ServerRateLimiter(config=config)
+        config = AdaptiveRateLimitConfig(default_max_requests=1, default_window_size=1.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (1, 1.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
         addr = ("192.168.1.1", 8080)
 
         await limiter.check(addr)

@@ -2,7 +2,17 @@
 ``hyperscale.distributed.reliability.rate_limiting`` (see that module)."""
 
 from dataclasses import dataclass, field
+
+from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.reliability.priority import RequestPriority
+
+from .rate_limit_derivation import (
+    configured_or_unbounded,
+    derive_max_tracked_clients,
+    derive_operation_limits,
+    derive_rate_limit_window_seconds,
+    derive_stressed_max_requests,
+)
 
 
 @dataclass(slots=True)
@@ -21,53 +31,36 @@ class AdaptiveRateLimitConfig:
     CRITICAL=0, HIGH=1, NORMAL=2, LOW=3
     """
 
-    # Window configuration for SlidingWindowCounter
-    window_size_seconds: float = 60.0
+    # Every limit below is derived from the protocol rate it bounds
+    # (``rate_limit_derivation``, docs/architecture/AD_24.md). Nodes build
+    # their config from their Env (``from_env``); a config built bare takes
+    # the derivations of the Env defaults.
 
-    # Default per-operation limits when system is HEALTHY
-    # Operations not in operation_limits use these defaults
-    default_max_requests: int = 100
-    default_window_size: float = 10.0  # seconds
+    # Window of the per-client STRESSED counters
+    window_size_seconds: float = field(default_factory=lambda: derive_rate_limit_window_seconds(Env()))
+
+    # Limit and window of an operation not in operation_limits
+    default_max_requests: int = field(
+        default_factory=lambda: configured_or_unbounded(Env().RATE_LIMIT_DEFAULT_MAX_REQUESTS)
+    )
+    default_window_size: float = field(default_factory=lambda: derive_rate_limit_window_seconds(Env()))
 
     # Per-operation limits: operation_name -> (max_requests, window_size_seconds)
     # These apply when system is HEALTHY or BUSY
-    operation_limits: dict[str, tuple[int, float]] = field(
-        default_factory=lambda: {
-            # High-frequency operations get larger limits
-            "stats_update": (500, 10.0),
-            "heartbeat": (200, 10.0),
-            "progress_update": (300, 10.0),
-            # Standard operations
-            "job_submit": (50, 10.0),
-            "job_status": (100, 10.0),
-            "workflow_dispatch": (100, 10.0),
-            # Infrequent operations
-            "cancel": (20, 10.0),
-            "reconnect": (10, 10.0),
-            # Default for simple check() API
-            "default": (100, 10.0),
-        }
-    )
+    operation_limits: dict[str, tuple[int, float]] = field(default_factory=lambda: derive_operation_limits(Env()))
 
-    # Per-client limits when system is stressed (applied on top of operation limits)
-    # These are applied per-client across all operations
-    stressed_requests_per_window: int = 100
-    overloaded_requests_per_window: int = 10
+    # Per-client budget across all operations while STRESSED
+    stressed_requests_per_window: int = field(default_factory=lambda: derive_stressed_max_requests(Env()))
 
-    # Fair share calculation
-    # When stressed, each client gets: global_limit / active_clients
-    # This is the minimum guaranteed share even with many clients
-    min_fair_share: int = 10
+    # Maximum clients to track before evicting the least recently active
+    max_tracked_clients: int = field(default_factory=lambda: derive_max_tracked_clients(Env(), None))
 
-    # Maximum clients to track before cleanup
-    max_tracked_clients: int = 10000
-
-    # Inactive client cleanup interval
-    inactive_cleanup_seconds: float = 300.0  # 5 minutes
+    # Seconds a client may stay inactive before cleanup removes its counters
+    inactive_cleanup_seconds: float = field(default_factory=lambda: Env().RATE_LIMIT_CLIENT_IDLE_TIMEOUT)
     # A request refused for an overloaded node may come back once the node's
     # load is next sampled (``OVERLOAD_SAMPLE_INTERVAL_SECONDS``): no sooner
     # can its state change.
-    overload_retry_after_seconds: float = 1.0
+    overload_retry_after_seconds: float = field(default_factory=lambda: Env().OVERLOAD_SAMPLE_INTERVAL_SECONDS)
 
     # Priority thresholds for each overload state
     # Requests with priority <= threshold are allowed (lower = higher priority)
@@ -84,6 +77,22 @@ class AdaptiveRateLimitConfig:
     async_retry_increment_factor: float = (
         0.1  # Fraction of window size per retry iteration
     )
+
+    @classmethod
+    def from_env(cls, env: Env, accepted_connection_cap: int | None) -> "AdaptiveRateLimitConfig":
+        """The limits ``env`` derives, for a node whose TCP server holds at
+        most ``accepted_connection_cap`` connections at once (None: no cap)."""
+        default_max_requests, default_window_size = (operation_limits := derive_operation_limits(env))["default"]
+        return cls(
+            window_size_seconds=derive_rate_limit_window_seconds(env),
+            default_max_requests=default_max_requests,
+            default_window_size=default_window_size,
+            operation_limits=operation_limits,
+            stressed_requests_per_window=derive_stressed_max_requests(env),
+            max_tracked_clients=derive_max_tracked_clients(env, accepted_connection_cap),
+            inactive_cleanup_seconds=env.RATE_LIMIT_CLIENT_IDLE_TIMEOUT,
+            overload_retry_after_seconds=env.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
+        )
 
     def get_operation_limits(self, operation: str) -> tuple[int, float]:
         """Get max_requests and window_size for an operation."""

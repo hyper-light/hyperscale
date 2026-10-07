@@ -49,7 +49,6 @@ from hyperscale.distributed.reliability.rate_limiting import (
     AdaptiveRateLimitConfig as AdaptiveRateLimitConfig,
     AdaptiveRateLimiter as AdaptiveRateLimiter,
     ServerRateLimiter as ServerRateLimiter,
-    RateLimitConfig as RateLimitConfig,
     RateLimitResult as RateLimitResult,
     CooperativeRateLimiter as CooperativeRateLimiter,
     # Retry-after helpers

@@ -165,6 +165,7 @@ from hyperscale.distributed.monitoring import ProcessResourceMonitor, ResourceMe
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     LoadShedder,
+    AdaptiveRateLimitConfig,
     ServerRateLimiter,
     BackpressureSignal,
 )
@@ -425,8 +426,9 @@ class GateServer(HealthAwareServer):
             sample_max_count=30,
         )
 
-        # Load shedding (AD-22)
-        self._overload_detector = HybridOverloadDetector()
+        # Load shedding (AD-22), at this node's OVERLOAD_* settings (the
+        # AD-24 rate-limit window is derived from them)
+        self._overload_detector = HybridOverloadDetector(env.get_overload_config())
         self._resource_monitor = ProcessResourceMonitor()
         self._last_resource_metrics: ResourceMetrics | None = None
         self._gate_health_state: str = "healthy"
@@ -445,10 +447,9 @@ class GateServer(HealthAwareServer):
         # Health-gated (AD-24): limits tighten with the overload state the
         # node's resource sampler settles on.
         self._rate_limiter = ServerRateLimiter(
-            inactive_cleanup_seconds=env.RATE_LIMIT_CLIENT_IDLE_TIMEOUT,
+            adaptive_config=AdaptiveRateLimitConfig.from_env(env, self._tcp_server_state.max_connections),
             overload_detector=self._overload_detector,
             detector_sampled_externally=True,
-            overload_retry_after_seconds=env.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
         )
 
         # Protocol version (AD-25)

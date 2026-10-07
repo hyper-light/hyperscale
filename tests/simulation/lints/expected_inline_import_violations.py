@@ -19,8 +19,6 @@ EXPECTED_INLINE_IMPORT_VIOLATIONS: dict[str, int] = {
     'hyperscale/distributed/env/env.py::Env.get_discovery_config': 1,
     'hyperscale/distributed/env/env.py::Env.get_extension_tracker_config': 1,
     'hyperscale/distributed/env/env.py::Env.get_overload_config': 1,
-    'hyperscale/distributed/env/env.py::Env.get_rate_limit_config': 1,
-    'hyperscale/distributed/env/env.py::Env.get_rate_limit_retry_config': 1,
     'hyperscale/distributed/env/env.py::Env.get_reliability_config': 1,
     'hyperscale/distributed/env/env.py::Env.get_worker_health_manager_config': 1,
     'hyperscale/distributed/reliability/rate_limiting.py::execute_with_rate_limit_retry': 1,

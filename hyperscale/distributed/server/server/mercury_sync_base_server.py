@@ -74,7 +74,7 @@ from hyperscale.distributed.server.protocol import (
 )
 from hyperscale.distributed.server.protocol.security import MessageSizeError
 from hyperscale.distributed.server.protocol.server_state import ServerState
-from hyperscale.distributed.reliability import ServerRateLimiter
+from hyperscale.distributed.reliability import AdaptiveRateLimitConfig, ServerRateLimiter
 from hyperscale.distributed.reliability.load_shedding import (
     classify_handler_to_priority,
 )
@@ -271,7 +271,11 @@ class MercurySyncBaseServer(Generic[T]):
         # Security utilities
         self._replay_guard = ReplayGuard()
         self._client_replay_guard = ReplayGuard()
-        self._rate_limiter = ServerRateLimiter()
+        # AD-24: limits derived from this node's Env; tracked clients bounded
+        # by the connections its TCP server holds at once
+        self._rate_limiter = ServerRateLimiter(
+            adaptive_config=AdaptiveRateLimitConfig.from_env(env, self._tcp_server_state.max_connections),
+        )
         self._secure_random = secrets.SystemRandom()  # Cryptographically secure RNG
 
         # Drop counters for silent drop monitoring

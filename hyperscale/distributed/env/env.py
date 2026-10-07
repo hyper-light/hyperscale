@@ -711,7 +711,6 @@ class Env(BaseModel):
     OVERLOAD_CURRENT_WINDOW: StrictInt = 10  # Samples for current average
     OVERLOAD_TREND_WINDOW: StrictInt = 20  # Samples for trend calculation
     OVERLOAD_MIN_SAMPLES: StrictInt = 3  # Minimum samples before delta detection
-    OVERLOAD_TREND_THRESHOLD: StrictFloat = 0.1  # Rising trend threshold
     # Delta thresholds (% above baseline): busy / stressed / overloaded
     OVERLOAD_DELTA_BUSY: StrictFloat = 0.2  # 20% above baseline
     OVERLOAD_DELTA_STRESSED: StrictFloat = 0.5  # 50% above baseline
@@ -732,15 +731,37 @@ class Env(BaseModel):
     # ==========================================================================
     # Rate Limiting Settings (AD-24)
     # ==========================================================================
-    RATE_LIMIT_DEFAULT_BUCKET_SIZE: StrictInt = 100  # Default token bucket size
-    RATE_LIMIT_DEFAULT_REFILL_RATE: StrictFloat = 10.0  # Tokens per second
     RATE_LIMIT_CLIENT_IDLE_TIMEOUT: StrictFloat = (
         300.0  # Cleanup idle clients after 5min
     )
-    RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = 60.0  # Run cleanup every minute
-    RATE_LIMIT_MAX_RETRIES: StrictInt = 3  # Max retry attempts when rate limited
-    RATE_LIMIT_MAX_TOTAL_WAIT: StrictFloat = 60.0  # Max total wait time for retries
-    RATE_LIMIT_BACKOFF_MULTIPLIER: StrictFloat = 1.5  # Backoff multiplier for retries
+    # Per-client limits, each derived when unset (None) from the protocol
+    # rate it bounds -- the derivations, with their arithmetic, are in
+    # hyperscale/distributed/reliability/rate_limit_derivation.py and
+    # docs/architecture/AD_24.md. Every count spans RATE_LIMIT_WINDOW_SECONDS
+    # (derived: OVERLOAD_CURRENT_WINDOW x OVERLOAD_SAMPLE_INTERVAL_SECONDS)
+    # and is twice the protocol's maximum per span (the sliding-window
+    # counter's estimate bound).
+    RATE_LIMIT_WINDOW_SECONDS: StrictFloat | None = None
+    # MANAGER_HEARTBEAT_INTERVAL sends per span
+    RATE_LIMIT_HEARTBEAT_MAX_REQUESTS: StrictInt | None = None
+    # One per running workflow (<= worker cores) per WORKER_PROGRESS_FLUSH_INTERVAL
+    RATE_LIMIT_PROGRESS_UPDATE_MAX_REQUESTS: StrictInt | None = None
+    # Request-driven operations: the protocol bounds neither their rate nor
+    # their concurrency, so unset they are unbounded (floods of them are
+    # shed by the STRESSED budget and OVERLOADED shedding); set, a policy.
+    RATE_LIMIT_STATS_UPDATE_MAX_REQUESTS: StrictInt | None = None
+    RATE_LIMIT_JOB_SUBMIT_MAX_REQUESTS: StrictInt | None = None
+    RATE_LIMIT_JOB_STATUS_MAX_REQUESTS: StrictInt | None = None
+    RATE_LIMIT_WORKFLOW_DISPATCH_MAX_REQUESTS: StrictInt | None = None
+    RATE_LIMIT_CANCEL_MAX_REQUESTS: StrictInt | None = None
+    RATE_LIMIT_RECONNECT_MAX_REQUESTS: StrictInt | None = None
+    RATE_LIMIT_DEFAULT_MAX_REQUESTS: StrictInt | None = None
+    # A client's budget across all operations while the node is STRESSED:
+    # its most active legitimate peer's AD-37-throttled traffic per span
+    RATE_LIMIT_STRESSED_MAX_REQUESTS: StrictInt | None = None
+    # Clients tracked before the least recently active is evicted: two per
+    # connection the TCP server holds at once
+    RATE_LIMIT_MAX_TRACKED_CLIENTS: StrictInt | None = None
 
     # ==========================================================================
     # Recovery and Thundering Herd Prevention Settings
@@ -1242,7 +1263,6 @@ class Env(BaseModel):
             "OVERLOAD_CURRENT_WINDOW": int,
             "OVERLOAD_TREND_WINDOW": int,
             "OVERLOAD_MIN_SAMPLES": int,
-            "OVERLOAD_TREND_THRESHOLD": float,
             "OVERLOAD_DELTA_BUSY": float,
             "OVERLOAD_DELTA_STRESSED": float,
             "OVERLOAD_DELTA_OVERLOADED": float,
@@ -1257,13 +1277,19 @@ class Env(BaseModel):
             "OVERLOAD_MEMORY_OVERLOADED": float,
             # Health probe settings (AD-19)
             # Rate limiting settings (AD-24)
-            "RATE_LIMIT_DEFAULT_BUCKET_SIZE": int,
-            "RATE_LIMIT_DEFAULT_REFILL_RATE": float,
             "RATE_LIMIT_CLIENT_IDLE_TIMEOUT": float,
-            "RATE_LIMIT_CLEANUP_INTERVAL": float,
-            "RATE_LIMIT_MAX_RETRIES": int,
-            "RATE_LIMIT_MAX_TOTAL_WAIT": float,
-            "RATE_LIMIT_BACKOFF_MULTIPLIER": float,
+            "RATE_LIMIT_WINDOW_SECONDS": float,
+            "RATE_LIMIT_HEARTBEAT_MAX_REQUESTS": int,
+            "RATE_LIMIT_PROGRESS_UPDATE_MAX_REQUESTS": int,
+            "RATE_LIMIT_STATS_UPDATE_MAX_REQUESTS": int,
+            "RATE_LIMIT_JOB_SUBMIT_MAX_REQUESTS": int,
+            "RATE_LIMIT_JOB_STATUS_MAX_REQUESTS": int,
+            "RATE_LIMIT_WORKFLOW_DISPATCH_MAX_REQUESTS": int,
+            "RATE_LIMIT_CANCEL_MAX_REQUESTS": int,
+            "RATE_LIMIT_RECONNECT_MAX_REQUESTS": int,
+            "RATE_LIMIT_DEFAULT_MAX_REQUESTS": int,
+            "RATE_LIMIT_STRESSED_MAX_REQUESTS": int,
+            "RATE_LIMIT_MAX_TRACKED_CLIENTS": int,
             # Healthcheck extension settings (AD-26)
             "EXTENSION_BASE_DEADLINE": float,
             "EXTENSION_MIN_GRANT": float,
@@ -1534,7 +1560,6 @@ class Env(BaseModel):
             current_window=self.OVERLOAD_CURRENT_WINDOW,
             trend_window=self.OVERLOAD_TREND_WINDOW,
             min_samples=self.OVERLOAD_MIN_SAMPLES,
-            trend_threshold=self.OVERLOAD_TREND_THRESHOLD,
             delta_thresholds=(
                 self.OVERLOAD_DELTA_BUSY,
                 self.OVERLOAD_DELTA_STRESSED,
@@ -1555,36 +1580,6 @@ class Env(BaseModel):
                 self.OVERLOAD_MEMORY_STRESSED,
                 self.OVERLOAD_MEMORY_OVERLOADED,
             ),
-        )
-
-    def get_rate_limit_config(self):
-        """
-        Get rate limiting configuration (AD-24).
-
-        Creates a RateLimitConfig with default bucket settings.
-        Per-operation limits can be customized after creation.
-        """
-        from hyperscale.distributed.reliability.rate_limiting import RateLimitConfig
-
-        return RateLimitConfig(
-            default_bucket_size=self.RATE_LIMIT_DEFAULT_BUCKET_SIZE,
-            default_refill_rate=self.RATE_LIMIT_DEFAULT_REFILL_RATE,
-        )
-
-    def get_rate_limit_retry_config(self):
-        """
-        Get rate limit retry configuration (AD-24).
-
-        Controls how clients retry after being rate limited.
-        """
-        from hyperscale.distributed.reliability.rate_limiting import (
-            RateLimitRetryConfig,
-        )
-
-        return RateLimitRetryConfig(
-            max_retries=self.RATE_LIMIT_MAX_RETRIES,
-            max_total_wait=self.RATE_LIMIT_MAX_TOTAL_WAIT,
-            backoff_multiplier=self.RATE_LIMIT_BACKOFF_MULTIPLIER,
         )
 
     def get_reliability_config(self):

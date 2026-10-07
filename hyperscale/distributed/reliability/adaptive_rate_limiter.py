@@ -264,7 +264,7 @@ class AdaptiveRateLimiter:
         tokens: int,
     ) -> "RateLimitResult":
         """Check and update per-client stress counter."""
-        counter = await self._get_or_create_stress_counter(client_id, state)
+        counter = await self._get_or_create_stress_counter(client_id)
         acquired, wait_time = counter.try_acquire(tokens)
 
         if acquired:
@@ -315,19 +315,17 @@ class AdaptiveRateLimiter:
     async def _get_or_create_stress_counter(
         self,
         client_id: str,
-        state: OverloadState,
     ) -> SlidingWindowCounter:
-        """Get or create a stress counter for the client based on current state."""
+        """Get or create the client's STRESSED budget counter."""
         async with self._counter_creation_lock:
             if client_id not in self._client_stress_counters:
-                if state == OverloadState.STRESSED:
-                    max_requests = self._config.stressed_requests_per_window
-                else:
-                    max_requests = self._config.overloaded_requests_per_window
-
+                # Bounded as the operation counters are: an OVERLOADED node
+                # refuses before counting, so only STRESSED clients get here.
+                if len(self._client_stress_counters) >= self._config.max_tracked_clients:
+                    await self._evict_oldest_client()
                 self._client_stress_counters[client_id] = SlidingWindowCounter(
                     window_size_seconds=self._config.window_size_seconds,
-                    max_requests=max_requests,
+                    max_requests=self._config.stressed_requests_per_window,
                 )
 
             return self._client_stress_counters[client_id]

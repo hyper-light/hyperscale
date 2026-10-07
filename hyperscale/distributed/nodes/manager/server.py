@@ -112,6 +112,7 @@ from hyperscale.distributed.models.worker_state import (
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     RetryBudgetManager,
+    AdaptiveRateLimitConfig,
     ServerRateLimiter,
     StatsBuffer,
     StatsBufferConfig,
@@ -594,8 +595,9 @@ class ManagerServer(HealthAwareServer):
             env=self._env,
         )
 
-        # Load shedding (AD-22)
-        self._overload_detector = HybridOverloadDetector()
+        # Load shedding (AD-22), at this node's OVERLOAD_* settings (the
+        # AD-24 rate-limit window is derived from them)
+        self._overload_detector = HybridOverloadDetector(self._env.get_overload_config())
         self._resource_monitor = ProcessResourceMonitor()
         self._last_resource_metrics: "ResourceMetrics | None" = None
         self._manager_health_state: str = "healthy"
@@ -758,10 +760,9 @@ class ManagerServer(HealthAwareServer):
         # Health-gated (AD-24): limits tighten with the overload state the
         # node's resource sampler settles on.
         self._rate_limiter = ServerRateLimiter(
-            inactive_cleanup_seconds=self._env.RATE_LIMIT_CLIENT_IDLE_TIMEOUT,
+            adaptive_config=AdaptiveRateLimitConfig.from_env(self._env, self._tcp_server_state.max_connections),
             overload_detector=self._overload_detector,
             detector_sampled_externally=True,
-            overload_retry_after_seconds=self._env.OVERLOAD_SAMPLE_INTERVAL_SECONDS,
         )
 
         # AD-20 cancellation protocol (the server's cancel handlers delegate)

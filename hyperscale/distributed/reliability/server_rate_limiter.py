@@ -6,19 +6,20 @@ from hyperscale.distributed.reliability.priority import RequestPriority
 
 from .adaptive_rate_limit_config import AdaptiveRateLimitConfig
 from .adaptive_rate_limiter import AdaptiveRateLimiter
-from .rate_limit_config import RateLimitConfig
 from .rate_limit_result import RateLimitResult
 
 # The AD-24 operation whose per-client budget a transport request draws
-# from, by TCP handler. A handler not listed draws from a budget named for
-# itself (the default limits), so no handler's volume consumes another's.
+# from, by TCP handler: the handlers whose protocol rate the operation's
+# limit is derived from (``rate_limit_derivation``). A handler not listed
+# draws from a budget named for itself (the default limit), so no
+# handler's volume consumes another's.
 HANDLER_RATE_LIMIT_OPERATIONS: dict[str, str] = {
+    # One per running workflow per worker flush pass
     "workflow_progress": "progress_update",
-    "receive_job_progress": "progress_update",
-    "receive_job_progress_report": "progress_update",
-    "worker_heartbeat": "heartbeat",
+    # One per peer per MANAGER_HEARTBEAT_INTERVAL
     "manager_status_update": "heartbeat",
     "manager_resource_gossip": "heartbeat",
+    # One per running (job, workflow) per STATS_PUSH_INTERVAL_MS
     "windowed_stats_push": "stats_update",
 }
 
@@ -57,53 +58,17 @@ class ServerRateLimiter:
 
     def __init__(
         self,
-        config: RateLimitConfig | None = None,
-        inactive_cleanup_seconds: float = 300.0,  # 5 minutes
-        overload_detector: HybridOverloadDetector | None = None,
         adaptive_config: AdaptiveRateLimitConfig | None = None,
+        overload_detector: HybridOverloadDetector | None = None,
         detector_sampled_externally: bool = False,
-        overload_retry_after_seconds: float = 1.0,
     ):
-        self._inactive_cleanup_seconds = inactive_cleanup_seconds
-
-        # Create adaptive config, merging with RateLimitConfig if provided
-        if adaptive_config is None:
-            adaptive_config = AdaptiveRateLimitConfig(
-                inactive_cleanup_seconds=inactive_cleanup_seconds,
-                overload_retry_after_seconds=overload_retry_after_seconds,
-            )
-            # Merge operation limits from RateLimitConfig if provided
-            if config is not None:
-                # Convert (bucket_size, refill_rate) to (max_requests, window_size)
-                min_window = config.min_window_size_seconds
-                operation_limits = {}
-                for operation, (
-                    bucket_size,
-                    refill_rate,
-                ) in config.operation_limits.items():
-                    window_size = bucket_size / refill_rate if refill_rate > 0 else 10.0
-                    operation_limits[operation] = (
-                        bucket_size,
-                        max(min_window, window_size),
-                    )
-                # Add default
-                default_window = (
-                    config.default_bucket_size / config.default_refill_rate
-                    if config.default_refill_rate > 0
-                    else 10.0
-                )
-                operation_limits["default"] = (
-                    config.default_bucket_size,
-                    max(min_window, default_window),
-                )
-                adaptive_config.operation_limits = operation_limits
-                adaptive_config.default_max_requests = config.default_bucket_size
-                adaptive_config.default_window_size = max(min_window, default_window)
-
+        """``adaptive_config``: the limits, built from the node's Env by
+        ``AdaptiveRateLimitConfig.from_env``; None takes the derivations of
+        the Env defaults."""
         # Internal adaptive rate limiter
         self._adaptive = AdaptiveRateLimiter(
             overload_detector=overload_detector,
-            config=adaptive_config,
+            config=adaptive_config or AdaptiveRateLimitConfig(),
             detector_sampled_externally=detector_sampled_externally,
         )
 

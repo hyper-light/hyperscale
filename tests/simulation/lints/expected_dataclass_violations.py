@@ -154,7 +154,6 @@ EXPECTED_DATACLASS_VIOLATIONS: dict[str, int] = {
     'hyperscale/distributed/reliability/overload_config.py::OverloadConfig': 1,
     'hyperscale/distributed/reliability/queue_metrics.py::QueueMetrics': 1,
     'hyperscale/distributed/reliability/queue_put_result.py::QueuePutResult': 1,
-    'hyperscale/distributed/reliability/rate_limit_config.py::RateLimitConfig': 1,
     'hyperscale/distributed/reliability/rate_limit_result.py::RateLimitResult': 1,
     'hyperscale/distributed/reliability/reliability_config.py::ReliabilityConfig': 1,
     'hyperscale/distributed/reliability/retry_budget_state.py::RetryBudgetState': 1,

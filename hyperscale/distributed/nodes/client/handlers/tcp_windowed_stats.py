@@ -39,12 +39,12 @@ class WindowedStatsPushHandler:
             b'ok' on success, b'rate_limited' if throttled, b'error' on failure
         """
         try:
-            # Rate limiting: operation "progress_update" has limits of (300, 10.0) = 30/s
+            # Rate limiting (AD-24): a windowed stats push is a "stats_update"
             if self._rate_limiter:
                 client_id = f"{addr[0]}:{addr[1]}"
                 result = await self._rate_limiter.check(
                     client_id=client_id,
-                    operation="progress_update",
+                    operation="stats_update",
                     priority=RequestPriority.NORMAL,
                 )
                 if not result.allowed:

@@ -34,8 +34,8 @@ from hyperscale.distributed.reliability.load_shedding import (
 )
 from hyperscale.distributed.reliability.rate_limiting import (
     SlidingWindowCounter,
+    AdaptiveRateLimitConfig,
     ServerRateLimiter,
-    RateLimitConfig,
 )
 from hyperscale.distributed.reliability.backpressure import (
     StatsBuffer,
@@ -359,11 +359,8 @@ class TestServerRateLimiterConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_rate_limit_checks_per_client(self):
         """Rate limits should be enforced per-client under concurrency."""
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=10.0,
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=1.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 1.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         results_by_client: dict[str, list[bool]] = {"client_a": [], "client_b": []}
         lock = asyncio.Lock()
@@ -390,12 +387,9 @@ class TestServerRateLimiterConcurrency:
     @pytest.mark.asyncio
     async def test_cleanup_under_concurrent_access(self):
         """Counter cleanup should not cause errors during concurrent access."""
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=10.0,
-        )
-        # Use short cleanup interval via constructor parameter
-        limiter = ServerRateLimiter(config, inactive_cleanup_seconds=0.1)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=1.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 1.0)}, inactive_cleanup_seconds=0.1)
+        # Short cleanup interval
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         errors = []
 
@@ -429,11 +423,8 @@ class TestServerRateLimiterConcurrency:
         This validates that ServerRateLimiter's async API properly uses
         the SlidingWindowCounter's lock-based serialization for waiting coroutines.
         """
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=0.001,  # Very slow refill for deterministic behavior
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=10000.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 10000.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         success_count = 0
         failure_count = 0
@@ -468,11 +459,8 @@ class TestServerRateLimiterConcurrency:
 
         This tests the compatibility API used by TCP/UDP protocols.
         """
-        config = RateLimitConfig(
-            default_bucket_size=5,
-            default_refill_rate=0.001,  # Very slow refill for deterministic behavior
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=5, default_window_size=5000.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (5, 5000.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         results_by_addr: dict[str, list[bool]] = {}
         lock = asyncio.Lock()
@@ -771,7 +759,7 @@ class TestCrossComponentConcurrency:
         # Set up full stack
         detector = HybridOverloadDetector()
         shedder = LoadShedder(detector)
-        rate_limiter = ServerRateLimiter(RateLimitConfig())
+        rate_limiter = ServerRateLimiter(adaptive_config=AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (100, 10.0)}))
         stats_buffer = StatsBuffer()
 
         errors = []
