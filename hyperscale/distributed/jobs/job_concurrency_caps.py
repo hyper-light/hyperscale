@@ -15,11 +15,16 @@ Caps, in the order they are checked:
   fit the registered cores over the new job's timeout (the derivation is
   on the Env fields). A job class with no configured cap is held by this
   rule alone: the same rule over the class's own jobs never binds first.
+  The rule bounds contention between jobs, so it never refuses a job on a
+  datacenter with no unfinished jobs: a job whose own work alone exceeds
+  its timeout's capacity would otherwise be refused forever, though it
+  runs exactly as it would uncapped and meets its own deadline.
 
 Retry hints. A count cap frees a slot when one of the jobs it counts ends,
 so the hint is the soonest any of them is expected to end. The work rule
-is over by ``excess`` core-seconds, which the datacenter's cores, fully
-busy, retire in ``excess / C`` seconds. Neither hint is shorter than
+is over by ``excess`` core-seconds, of which only the unfinished jobs'
+share can retire before the job is admitted: the hint is
+``min(excess, unfinished work) / C`` seconds, the cores fully busy. Neither hint is shorter than
 ``OVERLOAD_SAMPLE_INTERVAL_SECONDS``, the hint every other refusal of a
 submission for load carries and the client's base back-off.
 """
@@ -145,12 +150,16 @@ class JobConcurrencyCaps:
         timeout_seconds: float,
     ) -> JobAdmissionRefusal | None:
         """Refuse a job whose work, after the unfinished jobs', its
-        datacenter's registered cores cannot do within its timeout."""
-        admitted_core_seconds = candidate.core_seconds + sum(record.core_seconds for record in unfinished)
+        datacenter's registered cores cannot do within its timeout -- never
+        on a datacenter with no unfinished jobs, where waiting cannot help."""
+        unfinished_core_seconds = sum(record.core_seconds for record in unfinished)
+        admitted_core_seconds = candidate.core_seconds + unfinished_core_seconds
         capacity_core_seconds = registered_cores * timeout_seconds
-        if admitted_core_seconds <= capacity_core_seconds:
+        # Only the unfinished jobs' share of the excess is contention: with
+        # none unfinished, or the work fitting, there is nothing to wait out.
+        contended_core_seconds = min(admitted_core_seconds - capacity_core_seconds, unfinished_core_seconds)
+        if contended_core_seconds <= 0.0:
             return None
-        excess_core_seconds = admitted_core_seconds - capacity_core_seconds
         return JobAdmissionRefusal(
             control=CONCURRENCY_CAP_CONTROL,
             reason=(
@@ -160,6 +169,6 @@ class JobConcurrencyCaps:
             ),
             retry_after_seconds=max(
                 self._minimum_retry_after_seconds,
-                excess_core_seconds / max(1, registered_cores),
+                contended_core_seconds / max(1, registered_cores),
             ),
         )
