@@ -53,6 +53,9 @@ class MercurySyncPlaywrightConnection:
         self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.results: List[PlaywrightResult] = []
         self._active: Deque[Tuple[BrowserSession, BrowserPage]] = deque()
+        # Session closes scheduled by the synchronous close(): held until
+        # each finishes, since the event loop keeps only weak references.
+        self._closing_sessions: set[asyncio.Task] = set()
 
     async def open_page(self):
         await self._semaphore.acquire()
@@ -150,5 +153,15 @@ class MercurySyncPlaywrightConnection:
                 for session in self.sessions
             ]
 
+            # A task never accepts set_result (InvalidStateError): each close
+            # instead stays owned here until it finishes.
             for abort_future in abort_futures:
-                abort_future.set_result(None)
+                self._closing_sessions.add(abort_future)
+                abort_future.add_done_callback(self._release_closed_session)
+
+    def _release_closed_session(self, close_task: asyncio.Task) -> None:
+        """Drop a finished session close and retrieve its outcome, so a
+        failed close is never reported as an unretrieved task exception."""
+        self._closing_sessions.discard(close_task)
+        if not close_task.cancelled():
+            close_task.exception()

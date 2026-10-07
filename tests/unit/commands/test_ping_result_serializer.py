@@ -321,19 +321,10 @@ def test_an_smtp_response_writes_the_last_reply() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "engine bug awaiting the owner's OK: smtp_response.py declares "
-        "`last_smtp_code: int | None = None,` (stray comma -> default (None,)). "
-        "Strict: this starts failing once the comma is fixed, so remove the marker then."
-    ),
-)
 def test_an_smtp_response_without_a_reply_writes_a_null_status() -> None:
-    """Fails until SMTPResponse's ``last_smtp_code: int | None = None,``
-    (hyperscale/core/engines/client/smtp/models/smtp/smtp_response.py)
-    loses its trailing comma: the default is the tuple ``(None,)``, written
-    as ``[null]``."""
+    """An SMTP response that got no reply serializes a null status: its
+    ``last_smtp_code`` defaults to None (a stray trailing comma once made
+    the default the tuple ``(None,)``, written as ``[null]``)."""
     response = SMTPResponse(
         recipients=["probe@example.test"],
         sender="ping@example.test",
