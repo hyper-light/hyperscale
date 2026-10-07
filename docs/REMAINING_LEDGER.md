@@ -54,7 +54,7 @@ D-83/84), and AD-44 late results / `RETRY_BUDGET_DEFAULT` (P-AD44-1, A3-G-50).
 10. **D-42 / D-13: nightly CI and continuous invariants.**
     The nightly `vopr` job runs the default 4-seed sweep and never the soak (`.github/workflows/ci.yml:129`). Only 2 of SCENARIOS §11's continuous invariants exist. Size M.
 
-Also notable, small: `ManagerDiscoveryCoordinator` is never fed (AD-28-1). `DiscoveryService` has no logger (R-G67). The raw-task lint covers only `distributed/` (R-G66). `cluster_cookie.py:174` uses raw `os.fsync`, so it gets no F_FULLFSYNC and no directory sync. Doc banners are stale: architecture.md:21085 still says read consistency is "Not built", AD_52.md contradicts its own Status, and FIX.md still lists §1.1/§1.2 as open.
+Also notable, small: `ManagerDiscoveryCoordinator` is never fed (AD-28-1). `DiscoveryService` has no logger (R-G67). The raw-task lint covers only `distributed/` (R-G66). Doc banners are stale: architecture.md:21085 still says read consistency is "Not built", AD_52.md contradicts its own Status, and FIX.md still lists §1.1/§1.2 as open.
 
 ## Ledger: AD-1–36
 Counts: old P/A 12/0 → Built 4 · Doc-obsolete 4 · Still Partial 4 · Still Absent 0
@@ -146,7 +146,7 @@ P-AUDIT-1, P-COMPLIANCE-1, P-AD52-1/2/3, P-AD52PLAN-2/3) plus the 11 rows of
 - Doc contradiction, architecture.md:21085 Part 8 "**Not built (2026-10).** Reads are not leveled" — false since plan D2 (`ReadConsistency` EVENTUAL/SESSION/BOUNDED_STALENESS/STRONG; `tests/unit/distributed/manager/test_job_status_consistency.py`). Size S.
 - Doc contradiction inside AD_52.md: Status says leader leases and the §10 soft-state cache are built and "every section of this AD is built", but the §9 paragraph (AD_52.md Status, ~line 190) still says "section 10, which is not built" and the §11 paragraph (~line 205) "Leader leases are not built"; §2 (:624) and the flag appendix (:1559) still promise `--max-seed-candidates`, which the Status calls unbuilt (a fixed `--cohort-size` cohort is never sampled). Size S.
 - `GatePeerCoordinator.on_peer_confirmed` dead duplicate (see P-COMPLIANCE-1). Size S.
-- `commands/run/cluster_cookie.py:174` syncs the cookie with raw `os.fsync` (no F_FULLFSYNC on macOS, no directory sync after `os.link`), bypassing the `RealFilesystem._sync_durably` path every other durable write uses. Size S.
+- (Closed, b56858c2) The cluster cookie syncs through `RealFilesystem` (F_FULLFSYNC on darwin) and fsyncs its directory after `os.link`.
 
 ## Ledger: architecture.md §1
 Counts: old P/A 25/0 → Built 13 · Doc-obsolete 7 · Still Partial 5 · Still Absent 0
@@ -318,7 +318,7 @@ Counts: old P/A 28/7 → Built 18 · Doc-obsolete 15 · Still Partial 2 · Still
 - A3-G-14 BufferPool/DoubleBuffer, A3-G-15 single-writer buffer, A3-G-16 `WriteStatus` enum, A3-G-18 SingleReaderBuffer, A3-G-19 ReaderPool/IndexedReader — Doc-obsolete: WAL buffer layer superseded by the ledger WAL stack (plan header; Phase 9 doc sweep "buffer layer"). The single writer is the ledger `WALWriter` queue + one drain task.
 
 ### New gaps found
-- `hyperscale/commands/run/cluster_cookie.py:174` calls raw `os.fsync`, bypassing the Filesystem seam and so `F_FULLFSYNC` on darwin; the cookie can be lost on power failure after creation (S).
+- (Closed, b56858c2) The cluster cookie syncs through `RealFilesystem` (F_FULLFSYNC on darwin) and fsyncs its directory after `os.link`.
 - `IdempotencyReservedEvent`/`IdempotencyCommittedEvent` (`distributed/idempotency/idempotency_reserved_event.py`, `idempotency_committed_event.py`, re-exported in `idempotency/__init__.py:4`) are still dead: no producer or consumer outside the package. Delete them (S).
 - Cross-gate idempotency check is a linear scan of every committed and prepared replica per prepare (`replication_coordinator.py:869-871`). AD-40 requires "O(1) dedup"; a key→job index is missing (S).
 - architecture.md §3 sketches for AD-41 (~:34794 `cpu_pressure > 0.95`), AD-42 Part 9 `resource_factor` (~:35741-35842), and AD-42 dissemination are stale against AD_41.md and the code; they belong in the Phase 9 doc sweep.
