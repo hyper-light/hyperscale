@@ -39,9 +39,9 @@ async def cluster(
     confirming with a quorum that it still leads, so nothing committed
     before the command ran is missing.
 
-    @param node The host:port (TCP) of any manager or gate of the cluster
+    @param node The host:port (TCP) of any manager or gate of the cluster (with --metrics, a worker too)
     @param watch Keep watching: print each membership change as it commits, until Ctrl-C
-    @param metrics Print the node's own membership metrics, in Prometheus text format
+    @param metrics Print the node's own metrics (a gate's, manager's or worker's), in Prometheus text format
     @param host The local address this command listens on for the reply
     @param port The local TCP port this command listens on for the reply
     @param timeout How long to wait (defaults to the cluster's standard TCP timeout plus a formation interval)
@@ -152,59 +152,18 @@ async def _watch(client: HyperscaleClient, node_addr: tuple[str, int], env: Hype
 
 def _prometheus_text(reply: ClusterMetricsReply) -> str:
     """The node's metrics in the Prometheus text exposition format (AD-52
-    section 18 names), labelled with its member id."""
+    section 18 names), labelled with its member id: the telemetry every
+    role shares (D-68), and -- from a member of a cluster (a gate or a
+    manager; a worker holds no membership) -- its membership."""
     member = reply.member_id.replace('"', "")
     lines = [
-        "# TYPE cluster_membership_size gauge",
-        f'cluster_membership_size{{member="{member}",status="voter"}} {reply.voters}',
-        f'cluster_membership_size{{member="{member}",status="learner"}} {reply.learners}',
-        "# TYPE cluster_membership_holders gauge",
-        f'cluster_membership_holders{{member="{member}"}} {reply.holders}',
-        "# TYPE cluster_size gauge",
-        f'cluster_size{{member="{member}"}} {reply.cohort_size}',
-        "# TYPE cluster_info gauge",
-        f'cluster_info{{member="{member}",cluster_uuid="{reply.cluster_uuid or ""}",'
-        f'formation="{reply.formation}",mode="{reply.mode or ""}",leader="{str(reply.is_leader).lower()}"}} 1',
-        "# TYPE cluster_raft_term gauge",
-        f'cluster_raft_term{{member="{member}"}} {reply.raft.get("term", 0)}',
-        "# TYPE cluster_raft_commit_index gauge",
-        f'cluster_raft_commit_index{{member="{member}"}} {reply.raft.get("commit_index", 0)}',
-        "# TYPE cluster_raft_applied_index gauge",
-        f'cluster_raft_applied_index{{member="{member}"}} {reply.raft.get("applied_index", 0)}',
-        "# TYPE cluster_raft_leader_election_total counter",
-        f'cluster_raft_leader_election_total{{member="{member}",outcome="started"}} {reply.raft.get("elections_started", 0)}',
-        f'cluster_raft_leader_election_total{{member="{member}",outcome="won"}} {reply.raft.get("elections_won", 0)}',
-        "# TYPE cluster_raft_proposal_total counter",
-        f'cluster_raft_proposal_total{{member="{member}",outcome="committed"}} {reply.raft.get("proposals_committed", 0)}',
-        f'cluster_raft_proposal_total{{member="{member}",outcome="failed"}} {reply.raft.get("proposals_failed", 0)}',
-        "# TYPE cluster_raft_snapshot_send_total counter",
-        f'cluster_raft_snapshot_send_total{{member="{member}"}} {reply.raft.get("snapshots_sent", 0)}',
-        "# TYPE cluster_raft_snapshot_receive_total counter",
-        f'cluster_raft_snapshot_receive_total{{member="{member}"}} {reply.raft.get("snapshots_installed", 0)}',
-        "# TYPE cluster_raft_lease_read_total counter",
-        f'cluster_raft_lease_read_total{{member="{member}"}} {reply.raft.get("lease_reads", 0)}',
-        "# TYPE cluster_raft_apply_lag_entries gauge",
         *(
-            f'cluster_raft_apply_lag_entries{{member="{member}",follower_id="{follower}"}} {lag}'
-            for follower, lag in sorted(reply.follower_lag.items())
+            _membership_state_lines(member, reply)
+            + _membership_change_lines(member, reply)
+            + _membership_activity_lines(member, reply)
+            if reply.formation
+            else ()
         ),
-        "# TYPE cluster_membership_change_total counter",
-        *(
-            f'cluster_membership_change_total{{member="{member}",type="{change_type}"}} {count}'
-            for change_type, count in sorted(reply.changes_applied.items())
-        ),
-        "# TYPE cluster_bootstrap_founding_total counter",
-        f'cluster_bootstrap_founding_total{{member="{member}"}} {reply.foundings_proposed}',
-        "# TYPE cluster_groups_left_total counter",
-        f'cluster_groups_left_total{{member="{member}"}} {reply.groups_left}',
-        "# TYPE cluster_operator_request_total counter",
-        *(
-            f'cluster_operator_request_total{{member="{member}",request="{key.split(":")[0]}",'
-            f'stage="{key.split(":")[1]}"}} {count}'
-            for key, count in sorted(reply.operator_requests.items())
-        ),
-        "# TYPE cluster_watch_streams_open gauge",
-        f'cluster_watch_streams_open{{member="{member}"}} {reply.open_watches}',
         # AD-36 routing counters (gates only).
         *(
             line
@@ -274,8 +233,136 @@ def _prometheus_text(reply: ClusterMetricsReply) -> str:
             )
         ),
         *_ad44_metric_lines(member, reply),
+        *_node_metric_lines(member, reply),
     ]
     return "\n".join(lines) + "\n"
+
+
+def _membership_state_lines(member: str, reply: ClusterMetricsReply) -> list[str]:
+    """The membership as the member applied it, and its Raft group's term,
+    indexes and counters (AD-52 section 18)."""
+    return [
+        "# TYPE cluster_membership_size gauge",
+        f'cluster_membership_size{{member="{member}",status="voter"}} {reply.voters}',
+        f'cluster_membership_size{{member="{member}",status="learner"}} {reply.learners}',
+        "# TYPE cluster_membership_holders gauge",
+        f'cluster_membership_holders{{member="{member}"}} {reply.holders}',
+        "# TYPE cluster_size gauge",
+        f'cluster_size{{member="{member}"}} {reply.cohort_size}',
+        "# TYPE cluster_info gauge",
+        f'cluster_info{{member="{member}",cluster_uuid="{reply.cluster_uuid or ""}",'
+        f'formation="{reply.formation}",mode="{reply.mode or ""}",leader="{str(reply.is_leader).lower()}"}} 1',
+        "# TYPE cluster_raft_term gauge",
+        f'cluster_raft_term{{member="{member}"}} {reply.raft.get("term", 0)}',
+        "# TYPE cluster_raft_commit_index gauge",
+        f'cluster_raft_commit_index{{member="{member}"}} {reply.raft.get("commit_index", 0)}',
+        "# TYPE cluster_raft_applied_index gauge",
+        f'cluster_raft_applied_index{{member="{member}"}} {reply.raft.get("applied_index", 0)}',
+        "# TYPE cluster_raft_leader_election_total counter",
+        f'cluster_raft_leader_election_total{{member="{member}",outcome="started"}} {reply.raft.get("elections_started", 0)}',
+        f'cluster_raft_leader_election_total{{member="{member}",outcome="won"}} {reply.raft.get("elections_won", 0)}',
+        "# TYPE cluster_raft_proposal_total counter",
+        f'cluster_raft_proposal_total{{member="{member}",outcome="committed"}} {reply.raft.get("proposals_committed", 0)}',
+        f'cluster_raft_proposal_total{{member="{member}",outcome="failed"}} {reply.raft.get("proposals_failed", 0)}',
+        "# TYPE cluster_raft_snapshot_send_total counter",
+        f'cluster_raft_snapshot_send_total{{member="{member}"}} {reply.raft.get("snapshots_sent", 0)}',
+        "# TYPE cluster_raft_snapshot_receive_total counter",
+        f'cluster_raft_snapshot_receive_total{{member="{member}"}} {reply.raft.get("snapshots_installed", 0)}',
+        "# TYPE cluster_raft_lease_read_total counter",
+        f'cluster_raft_lease_read_total{{member="{member}"}} {reply.raft.get("lease_reads", 0)}',
+    ]
+
+
+def _membership_change_lines(member: str, reply: ClusterMetricsReply) -> list[str]:
+    """Each follower's replication lag while the member leads, and the
+    membership changes it applied by kind (AD-52 section 18)."""
+    return [
+        "# TYPE cluster_raft_apply_lag_entries gauge",
+        *(
+            f'cluster_raft_apply_lag_entries{{member="{member}",follower_id="{follower}"}} {lag}'
+            for follower, lag in sorted(reply.follower_lag.items())
+        ),
+        "# TYPE cluster_membership_change_total counter",
+        *(
+            f'cluster_membership_change_total{{member="{member}",type="{change_type}"}} {count}'
+            for change_type, count in sorted(reply.changes_applied.items())
+        ),
+    ]
+
+
+def _membership_activity_lines(member: str, reply: ClusterMetricsReply) -> list[str]:
+    """The foundings the member proposed, groups it left, operator requests
+    and watches it holds open (AD-52 section 18)."""
+    return [
+        "# TYPE cluster_bootstrap_founding_total counter",
+        f'cluster_bootstrap_founding_total{{member="{member}"}} {reply.foundings_proposed}',
+        "# TYPE cluster_groups_left_total counter",
+        f'cluster_groups_left_total{{member="{member}"}} {reply.groups_left}',
+        "# TYPE cluster_operator_request_total counter",
+        *(
+            f'cluster_operator_request_total{{member="{member}",request="{key.split(":")[0]}",'
+            f'stage="{key.split(":")[1]}"}} {count}'
+            for key, count in sorted(reply.operator_requests.items())
+        ),
+        "# TYPE cluster_watch_streams_open gauge",
+        f'cluster_watch_streams_open{{member="{member}"}} {reply.open_watches}',
+    ]
+
+
+# D-68 sections keyed by worker or datacenter: (metric name, field) pairs.
+_DISPATCH_LATENCY_METRICS = (
+    ("dispatch_latency_p50_ms", "p50_ms"),
+    ("dispatch_latency_p95_ms", "p95_ms"),
+    ("dispatch_latency_p99_ms", "p99_ms"),
+    ("dispatch_latency_sample_count", "sample_count"),
+)
+_SLO_METRICS = (
+    ("slo_latency_p50_ms", "p50_ms"),
+    ("slo_latency_p95_ms", "p95_ms"),
+    ("slo_latency_p99_ms", "p99_ms"),
+    ("slo_sample_count", "sample_count"),
+    ("slo_compliance_score", "compliance_score"),
+    ("slo_routing_factor", "routing_factor"),
+)
+
+
+def _node_metric_lines(member: str, reply: ClusterMetricsReply) -> list[str]:
+    """The telemetry every role shares (D-68): its role and state, capacity,
+    workload and resources, a manager's dispatch throughput, outcomes and
+    per-worker round trips, and the AD-42 latency SLO per datacenter."""
+    metric_specs = (
+        ("node_capacity", "gauge", "kind", reply.capacity),
+        ("node_workload", "gauge", "kind", reply.workload),
+        ("node_resource_percent", "gauge", "resource", reply.resources),
+        ("dispatch_throughput_per_second", "gauge", "kind", reply.dispatch_throughput),
+        ("dispatch_outcomes_total", "counter", "outcome", reply.dispatch_outcomes),
+    )
+    return [
+        "# TYPE node_info gauge",
+        f'node_info{{member="{member}",role="{reply.role}",state="{reply.node_state}"}} 1',
+        *(line for metric_spec in metric_specs for line in _labelled_metric_lines(member, *metric_spec)),
+        *_keyed_field_lines(member, "worker_id", _DISPATCH_LATENCY_METRICS, reply.dispatch_latency),
+        *_keyed_field_lines(member, "dc_id", _SLO_METRICS, reply.slo),
+    ]
+
+
+def _keyed_field_lines(
+    member: str,
+    label_name: str,
+    metric_fields: tuple[tuple[str, str], ...],
+    values: dict[str, dict[str, float]],
+) -> list[str]:
+    """A gauge per (metric, field) pair, a sample per key carrying the field."""
+    return [
+        line
+        for metric_name, field_name in metric_fields
+        for line in _labelled_metric_lines(member, metric_name, "gauge", label_name, _field_by_key(values, field_name))
+    ]
+
+
+def _field_by_key(values: dict[str, dict[str, float]], field_name: str) -> dict[str, float]:
+    """``field_name``'s value under each key whose fields carry it."""
+    return {key: fields[field_name] for key, fields in values.items() if field_name in fields}
 
 
 def _ad44_metric_lines(member: str, reply: ClusterMetricsReply) -> list[str]:

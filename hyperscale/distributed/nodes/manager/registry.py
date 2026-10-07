@@ -17,6 +17,7 @@ from hyperscale.distributed.swim.core import ErrorStats, CircuitState
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug
 
 from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.slo import TimeWindowedTDigest
 
 
 _DEFAULT_CLOCK: Clock = RealClock()
@@ -101,6 +102,12 @@ class ManagerRegistry:
         # obligation (two-sided deregistration).
         self._state.clear_eviction_notice(worker_id)
 
+        # D-5: the worker's own dispatch round-trip digest; a
+        # re-registration keeps the history it has.
+        self._state._worker_dispatch_latency_digests.setdefault(
+            worker_id, TimeWindowedTDigest(config=self._state._slo_config)
+        )
+
         # Initialize circuit breaker for this worker
         if worker_id not in self._state._worker_circuits:
             self._state._worker_circuits[worker_id] = ErrorStats(
@@ -149,6 +156,7 @@ class ManagerRegistry:
         self._state._worker_unhealthy_since.pop(worker_id, None)
         self._state._worker_health_states.pop(worker_id, None)
         self._state._worker_latency_samples.pop(worker_id, None)
+        self._state._worker_dispatch_latency_digests.pop(worker_id, None)
         self._state._dispatch_semaphores.pop(worker_id, None)
 
         progress_keys_to_remove = self._worker_progress_keys(worker_id)

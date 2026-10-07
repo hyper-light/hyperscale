@@ -28,7 +28,7 @@ def make_state() -> tuple[ManagerState, SLOConfig]:
 def test_samples_land_in_the_window_of_the_managers_time() -> None:
     state, _ = make_state()
     for latency_ms in LATENCIES_MS:
-        state.record_dispatch_latency(latency_ms, RECORDED_AT)
+        state.record_dispatch_latency("worker-1", latency_ms, RECORDED_AT)
 
     observation = state.get_dispatch_latency_observation(RECORDED_AT)
 
@@ -41,7 +41,7 @@ def test_samples_land_in_the_window_of_the_managers_time() -> None:
 def test_windows_aged_out_at_the_managers_time_summarize_as_empty() -> None:
     state, slo_config = make_state()
     for latency_ms in LATENCIES_MS:
-        state.record_dispatch_latency(latency_ms, RECORDED_AT)
+        state.record_dispatch_latency("worker-1", latency_ms, RECORDED_AT)
     retention_seconds = slo_config.window_duration_seconds * (slo_config.max_windows + 1)
 
     aged_out_at = RECORDED_AT + retention_seconds

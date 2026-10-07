@@ -63,7 +63,7 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/commands/cli/inspect_wrapped.py::assemble_exanded_args': 5,
     'hyperscale/commands/cli/inspect_wrapped.py::inspect_wrapped': 15,
     'hyperscale/commands/cli/inspect_wrapped.py::is_context_arg': 5,
-    'hyperscale/commands/cluster.py::_prometheus_text': 23,
+    'hyperscale/commands/cluster.py::_prometheus_text': 19,
     'hyperscale/commands/cluster.py::_watch': 8,
     'hyperscale/commands/cluster.py::cluster': 9,
     'hyperscale/commands/job/cancel.py::cancel': 15,

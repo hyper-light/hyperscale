@@ -417,6 +417,11 @@ class GateRuntimeState:
         )
         return 1.0 if freshest is None else freshest.slo_routing_factor
 
+    def get_dc_slo_heartbeat(self, datacenter_id: str) -> ManagerHeartbeat | None:
+        """AD-42: the datacenter's manager heartbeat with the freshest latency
+        SLO among those reporting samples, or None when none has."""
+        return self._freshest_slo_heartbeat(self._datacenter_manager_status.get(datacenter_id, {}).values())
+
     @staticmethod
     def _freshest_slo_heartbeat(
         heartbeats: Iterable[ManagerHeartbeat],

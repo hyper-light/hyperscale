@@ -18,7 +18,7 @@
 - Circuit‑breaker for noisy jobs: auto‑throttle or quarantine high‑impact tests. *Not built: breakers are per peer; the closest thing is AD-41 throttling a workflow over its own budget.*
 
 ## Progress & Metrics
-- Unified telemetry schema: single event contract for client/gate/manager/worker. *Partial: logger models in `hyperscale/logging/hyperscale_logging_models.py`; `cluster --metrics` on manager and gate only; no shared schema across roles.*
+- Unified telemetry schema: single event contract for client/gate/manager/worker. *Built (2026-10-07, D-68): every role answers `cluster_metrics` with one `ClusterMetricsReply` -- role and state, capacity, workload, resources, a manager's dispatch throughput, outcomes and per-worker dispatch round trips, the AD-42 latency SLO per datacenter (a manager's own, a gate's view of each) -- read by `HyperscaleClient.cluster_metrics` and printed by `hyperscale cluster --metrics` for a gate, manager or worker. Structured events stay the Logger's models (`hyperscale/logging/hyperscale_logging_models.py`), one module for every role.*
 - SLO‑aware health: gate routing reacts to latency percentile SLOs, not only throughput. *Built: gate DC health is the worse of the managers' view and SLO compliance (`SLOHealthClassifier`).*
 - Backpressure propagation end‑to‑end: client also adapts to gate backpressure. *Built 2026-10-06: a refusal carrying `retry_after_seconds` (gate shed, replication quorum, rate limit) is waited out, never below the hint (`nodes/client/submission.py:435-453`); without a hint the base delay is `ClientConfig.retry_base_delay_seconds` = `OVERLOAD_SAMPLE_INTERVAL_SECONDS`.*
 

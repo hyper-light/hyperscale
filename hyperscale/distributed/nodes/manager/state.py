@@ -239,6 +239,11 @@ class ManagerState:
         self._dispatch_latency_digest: TimeWindowedTDigest = TimeWindowedTDigest(
             config=slo_config
         )
+        # The same samples per worker (D-5), for the metrics surface: which
+        # worker is slow to answer. Opened when a worker registers, closed
+        # when it unregisters; a sample for a worker no longer registered
+        # counts only toward the datacenter digest.
+        self._worker_dispatch_latency_digests: dict[str, TimeWindowedTDigest] = {}
 
         # Background tasks
         self._dead_node_reap_task: asyncio.Task | None = None
@@ -421,6 +426,7 @@ class ManagerState:
     def remove_worker_state(self, worker_id: str) -> None:
         """Remove all state associated with a dead worker to prevent memory leaks."""
         self._worker_latency_samples.pop(worker_id, None)
+        self._worker_dispatch_latency_digests.pop(worker_id, None)
         self._worker_circuits.pop(worker_id, None)
         self._worker_unhealthy_since.pop(worker_id, None)
         self._worker_deadlines.pop(worker_id, None)
@@ -518,8 +524,21 @@ class ManagerState:
             "pending_cancellation_count": len(self._cancellation_pending_workflows),
         }
 
-    def record_dispatch_latency(self, latency_ms: float, now: float) -> None:
+    def record_dispatch_latency(self, worker_id: str, latency_ms: float, now: float) -> None:
+        """Record one dispatch round trip to ``worker_id``: the datacenter's
+        AD-42 sample, and the worker's own while it is registered."""
         self._dispatch_latency_digest.add(latency_ms, now)
+        if (worker_digest := self._worker_dispatch_latency_digests.get(worker_id)) is not None:
+            worker_digest.add(latency_ms, now)
+
+    def get_worker_dispatch_latency_observations(self, now: float) -> dict[str, "LatencyObservation"]:
+        """Each registered worker's dispatch round-trip percentiles over the
+        SLO windows recent at ``now``; a worker with none recent is left out."""
+        return {
+            worker_id: observation
+            for worker_id, worker_digest in self._worker_dispatch_latency_digests.items()
+            if (observation := worker_digest.get_recent_observation(target_id=worker_id, now=now)) is not None
+        }
 
     def get_dispatch_latency_observation(self, now: float) -> "LatencyObservation | None":
         return self._dispatch_latency_digest.get_recent_observation(

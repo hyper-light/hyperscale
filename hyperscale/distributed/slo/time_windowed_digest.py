@@ -20,10 +20,6 @@ class TimeWindowedTDigest:
         self._windows: dict[float, TDigest] = {}
         self._window_order: list[float] = []
 
-    def _window_start_for_timestamp(self, timestamp: float) -> float:
-        bucket_index = int(timestamp / self._window_duration_seconds)
-        return bucket_index * self._window_duration_seconds
-
     def _window_end(self, window_start: float) -> float:
         return window_start + self._window_duration_seconds
 
@@ -48,11 +44,22 @@ class TimeWindowedTDigest:
             self._windows.pop(oldest_start, None)
 
     def add(self, value: float, timestamp: float, weight: float = 1.0) -> None:
-        """Add a value to the time window ``timestamp`` falls in."""
-        window_start = self._window_start_for_timestamp(timestamp)
-        self._register_window(window_start)
-        self._windows[window_start].add(value, weight)
-        self._prune_windows(timestamp)
+        """Add a value to the time window ``timestamp`` falls in.
+
+        Windows are pruned when a new one opens, not on every add: the
+        window cap keeps at most ``max_windows`` digests, and
+        ``get_recent_observation`` prunes by age before it reads, so a
+        window that ages out between openings is never observed. A sample
+        older than every retained window is dropped, as pruning after the
+        add dropped it.
+        """
+        window_start = int(timestamp / self._window_duration_seconds) * self._window_duration_seconds
+        if (window_digest := self._windows.get(window_start)) is None:
+            self._register_window(window_start)
+            self._prune_windows(timestamp)
+            window_digest = self._windows.get(window_start)
+        if window_digest is not None:
+            window_digest.add(value, weight)
 
     def add_batch(self, values: list[float], timestamp: float) -> None:
         """Add multiple values into the same time window."""

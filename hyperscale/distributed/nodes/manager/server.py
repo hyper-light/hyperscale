@@ -17,6 +17,7 @@ from hyperscale.core.graph.workflow import Workflow
 from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
 from hyperscale.distributed.cluster.cluster_membership import ClusterMembership
 from hyperscale.distributed.cluster.models import ClusterLeaveReply, ClusterMetricsReply
+from hyperscale.distributed.cluster.telemetry_sections import latency_section, slo_section
 from hyperscale.distributed.jobs.logical_id_generator import LogicalIdGenerator
 from hyperscale.distributed.cluster.joined_peer import JoinedPeer
 from hyperscale.distributed.cluster.joined_peer_store import JoinedPeerStore
@@ -14577,13 +14578,47 @@ class ManagerServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """This node's metrics of its cluster's membership (AD-52 section
-        18), with its AD-44 retry-budget counters per job."""
+        18), with its AD-44 retry-budget counters per job and its own
+        telemetry in the schema every role shares (D-68)."""
         if not (membership_metrics := await self._cluster_membership.handle_metrics(data)):
             return membership_metrics
         reply = ClusterMetricsReply.load(membership_metrics)
         reply.retry_budget_consumed = self._retry_budget_manager.consumed_by_job()
         reply.retry_budget_exhausted = self._retry_budget_manager.exhausted_by_job()
+        self._add_manager_telemetry(reply)
         return reply.dump()
+
+    def _add_manager_telemetry(self, reply: ClusterMetricsReply) -> None:
+        """D-68: what this manager's heartbeat tells its gates (state,
+        capacity, workload, AD-19 throughput, its datacenter's AD-42 SLO),
+        its dispatch sends by outcome, and each worker's dispatch round
+        trips (D-5)."""
+        heartbeat = self._build_manager_heartbeat()
+        reply.role = "manager"
+        reply.node_state = heartbeat.state
+        reply.capacity = {
+            "total_cores": heartbeat.total_cores,
+            "available_cores": heartbeat.available_cores,
+            "workers": heartbeat.worker_count,
+            "healthy_workers": heartbeat.healthy_worker_count,
+        }
+        reply.workload = {
+            "active_jobs": heartbeat.active_jobs,
+            "active_workflows": heartbeat.active_workflows,
+            "pending_workflows": heartbeat.pending_workflow_count,
+        }
+        reply.dispatch_throughput = {
+            "observed": heartbeat.health_throughput,
+            "expected": heartbeat.health_expected_throughput,
+        }
+        reply.dispatch_outcomes = self._dispatch.dispatch_outcome_counts()
+        reply.dispatch_latency = {
+            worker_id: latency_section(observation)
+            for worker_id, observation in self._manager_state.get_worker_dispatch_latency_observations(
+                self._clock.monotonic()
+            ).items()
+        }
+        reply.slo = {heartbeat.datacenter: slo_section(heartbeat)}
 
     @tcp.receive()
     async def cluster_leave(

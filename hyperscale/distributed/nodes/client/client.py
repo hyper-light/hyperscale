@@ -663,8 +663,9 @@ class HyperscaleClient(MercurySyncBaseServer):
         )
 
     async def cluster_metrics(self, node_addr: tuple[str, int], timeout: float) -> ClusterMetricsReply:
-        """The node's own metrics of its cluster's membership (AD-52 section
-        18).
+        """The node's own metrics (AD-52 section 18): a manager's or gate's
+        membership, and every role's telemetry in the one schema all roles
+        share (D-68) -- a worker's too.
 
         Raises:
             ClusterJoinError: the node was unreachable or did not answer
@@ -680,7 +681,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             response,
             ClusterMetricsReply,
             f"metrics reply from {node_addr[0]}:{node_addr[1]} "
-            "(only managers and gates hold cluster membership)",
+            "(gates, managers and workers answer)",
         )
 
     async def wait_for_job(

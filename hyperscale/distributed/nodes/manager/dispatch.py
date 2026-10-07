@@ -31,6 +31,15 @@ READINESS_REJECTION_MARKERS = (
     "cores",
 )
 
+# The outcomes a send can have (WITHHELD is the dispatcher's, never sent).
+SENT_DISPATCH_OUTCOMES = (
+    DispatchOutcome.ACCEPTED,
+    DispatchOutcome.NOT_READY,
+    DispatchOutcome.UNROUTABLE,
+    DispatchOutcome.UNREACHABLE,
+    DispatchOutcome.REJECTED,
+)
+
 
 class ManagerDispatchCoordinator:
     """Sends workflow dispatches to workers (the WorkflowDispatcher's
@@ -39,10 +48,11 @@ class ManagerDispatchCoordinator:
     down), or a transport failure.
 
     Every dispatch's round trip to its worker's answer is the datacenter's
-    AD-42 latency sample (dispatch -> response). A dispatch the worker
-    never answered counts at the timeout it waited, the least its latency
-    was: dropping it would report a DC whose workers stop answering as
-    fast."""
+    AD-42 latency sample (dispatch -> response), and the worker's own (D-5).
+    A dispatch the worker never answered counts at the timeout it waited,
+    the least its latency was: dropping it would report a DC whose workers
+    stop answering as fast. Each send's outcome is counted for the metrics
+    surface (D-68)."""
 
     def __init__(
         self,
@@ -56,7 +66,7 @@ class ManagerDispatchCoordinator:
         node_id: str,
         dispatch_timeout_seconds: float,
         clock: Clock,
-        record_dispatch_latency: Callable[[float, float], None],
+        record_dispatch_latency: Callable[[str, float, float], None],
     ) -> None:
         self._registry = registry
         self._worker_pool = worker_pool
@@ -69,6 +79,7 @@ class ManagerDispatchCoordinator:
         self._dispatch_timeout_seconds = dispatch_timeout_seconds
         self._clock = clock
         self._record_dispatch_latency = record_dispatch_latency
+        self._dispatch_outcome_counts: dict[DispatchOutcome, int] = dict.fromkeys(SENT_DISPATCH_OUTCOMES, 0)
 
     async def send_workflow_dispatch(
         self, worker_id: str, dispatch: WorkflowDispatch
@@ -83,6 +94,7 @@ class ManagerDispatchCoordinator:
         registration = self._registry.get_worker(worker_id)
         if registration is None:
             await self._purge_stale_worker(worker_id)
+            self._dispatch_outcome_counts[DispatchOutcome.UNROUTABLE] += 1
             return DispatchOutcome.UNROUTABLE, f"worker {worker_id} is no longer registered"
         self._default_job_leader_addr(dispatch)
         dispatched_at = self._clock.monotonic()
@@ -94,12 +106,19 @@ class ManagerDispatchCoordinator:
                 timeout=self._dispatch_timeout_seconds,
             )
         except Exception as error:
+            self._dispatch_outcome_counts[DispatchOutcome.UNREACHABLE] += 1
             return await self._fail_dispatch_unreachable(worker_id, error)
 
         answered_at = self._clock.monotonic()
-        self._record_response_latency(response, dispatched_at, answered_at)
+        self._record_response_latency(worker_id, response, dispatched_at, answered_at)
 
-        return await self._classify_dispatch_response(worker_id, response)
+        outcome, detail = await self._classify_dispatch_response(worker_id, response)
+        self._dispatch_outcome_counts[outcome] += 1
+        return outcome, detail
+
+    def dispatch_outcome_counts(self) -> dict[str, int]:
+        """Dispatch sends by outcome (``DispatchOutcome`` value) since this manager started."""
+        return {outcome.value: count for outcome, count in self._dispatch_outcome_counts.items()}
 
     def _default_job_leader_addr(self, dispatch: WorkflowDispatch) -> None:
         """Name this manager as the job leader when the dispatch names none."""
@@ -130,15 +149,16 @@ class ManagerDispatchCoordinator:
 
     def _record_response_latency(
         self,
+        worker_id: str,
         response: bytes | Exception | None,
         dispatched_at: float,
         answered_at: float,
     ) -> None:
         """Sample the round-trip for an answer, or the full timeout for a timed-out send."""
         if self._is_answered_dispatch(response):
-            self._record_dispatch_latency((answered_at - dispatched_at) * 1000.0, answered_at)
+            self._record_dispatch_latency(worker_id, (answered_at - dispatched_at) * 1000.0, answered_at)
         elif isinstance(response, TimeoutError):
-            self._record_dispatch_latency(self._dispatch_timeout_seconds * 1000.0, answered_at)
+            self._record_dispatch_latency(worker_id, self._dispatch_timeout_seconds * 1000.0, answered_at)
 
     async def _classify_dispatch_response(
         self,

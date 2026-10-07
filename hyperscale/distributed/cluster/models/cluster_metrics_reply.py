@@ -26,7 +26,30 @@ class ClusterMetricsReply(Message):
     completions by reason (``best_effort_completions``), the completion
     ratio of each best-effort job it still holds
     (``best_effort_completion_ratio``) and its late datacenter results by
-    outcome (``best_effort_late_results``: ``logged`` / ``updated``)."""
+    outcome (``best_effort_late_results``: ``logged`` / ``updated``).
+
+    D-68, the telemetry every role answers with in this one schema -- a
+    worker too, which holds no membership (``formation`` empty, every
+    membership field at its default):
+
+    * ``role``: ``gate``, ``manager`` or ``worker`` (empty from a node
+      older than this schema); ``node_state``: its lifecycle state, the
+      value its heartbeats carry.
+    * ``capacity``: ``total_cores`` and ``available_cores`` (a manager's
+      over its healthy workers, plus ``workers`` and ``healthy_workers``).
+    * ``workload``: ``active_jobs`` (gate, manager), ``active_workflows``
+      and ``pending_workflows`` (manager, worker).
+    * ``resources``: a worker's ``cpu_percent`` and ``memory_percent``.
+    * ``dispatch_throughput``: a manager's AD-19 dispatches per second,
+      ``observed`` and ``expected``; ``dispatch_outcomes``: its dispatch
+      sends by outcome (``DispatchOutcome`` values) since it started.
+    * ``dispatch_latency``: a manager's AD-42 dispatch round trips per
+      worker (``p50_ms``, ``p95_ms``, ``p99_ms``, ``sample_count``) over
+      the SLO windows.
+    * ``slo``: AD-42 latency SLO per datacenter (``p50_ms``, ``p95_ms``,
+      ``p99_ms``, ``sample_count``, ``compliance_score``,
+      ``routing_factor``): a manager's own, a gate's view of each
+      datacenter (what its health classification and routing read)."""
 
     member_id: str
     formation: str
@@ -52,3 +75,12 @@ class ClusterMetricsReply(Message):
     best_effort_completions: dict[str, int] = field(default_factory=dict)
     best_effort_completion_ratio: dict[str, float] = field(default_factory=dict)
     best_effort_late_results: dict[str, int] = field(default_factory=dict)
+    role: str = ""
+    node_state: str = ""
+    capacity: dict[str, int] = field(default_factory=dict)
+    workload: dict[str, int] = field(default_factory=dict)
+    resources: dict[str, float] = field(default_factory=dict)
+    dispatch_throughput: dict[str, float] = field(default_factory=dict)
+    dispatch_outcomes: dict[str, int] = field(default_factory=dict)
+    dispatch_latency: dict[str, dict[str, float]] = field(default_factory=dict)
+    slo: dict[str, dict[str, float]] = field(default_factory=dict)

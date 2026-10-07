@@ -67,6 +67,7 @@ from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
 from hyperscale.distributed.cluster.cluster_membership import ClusterMembership
 from hyperscale.distributed.cluster.cluster_view_cache import ClusterViewCache
 from hyperscale.distributed.cluster.models import ClusterLeaveReply, ClusterMetricsReply
+from hyperscale.distributed.cluster.telemetry_sections import slo_section
 from hyperscale.distributed.cluster.cluster_watch_follower import ClusterWatchFollower
 from hyperscale.distributed.cluster.models.cluster_view import ClusterView
 from hyperscale.distributed.jobs.logical_id_generator import LogicalIdGenerator
@@ -10351,12 +10352,14 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """This node's metrics of its cluster's membership (AD-52 section
-        18), with its AD-45 route learning per datacenter."""
+        18), with its AD-45 route learning per datacenter and its own
+        telemetry in the schema every role shares (D-68)."""
         if not self._accepting_requests:
             return b""
         if not (membership_metrics := await self._cluster_membership.handle_metrics(data)):
             return membership_metrics
         reply = ClusterMetricsReply.load(membership_metrics)
+        self._add_gate_telemetry(reply)
         self._add_route_learning_metrics(reply)
         reply.routing = self._job_router.get_metrics()
         self._add_datacenter_watch_metrics(reply)
@@ -10364,6 +10367,20 @@ class GateServer(HealthAwareServer):
         reply.best_effort_completion_ratio = self._best_effort_metrics.completion_ratio_by_job()
         reply.best_effort_late_results = self._best_effort_metrics.late_results_by_outcome()
         return reply.dump()
+
+    def _add_gate_telemetry(self, reply: ClusterMetricsReply) -> None:
+        """D-68: this gate's state, the jobs it holds, and each datacenter's
+        AD-42 latency SLO as its health classification and routing read it
+        (the freshest manager heartbeat with samples; a datacenter none has
+        reported for is left out)."""
+        reply.role = "gate"
+        reply.node_state = self._modular_state.get_gate_state().value
+        reply.workload = {"active_jobs": self._job_manager.job_count()}
+        reply.slo = {
+            datacenter_id: slo_section(heartbeat)
+            for datacenter_id in self._datacenter_managers
+            if (heartbeat := self._modular_state.get_dc_slo_heartbeat(datacenter_id)) is not None
+        }
 
     def _add_route_learning_metrics(self, reply: ClusterMetricsReply) -> None:
         """Add each datacenter's observed and blended latency, confidence and samples (AD-45)."""

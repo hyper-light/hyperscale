@@ -10,6 +10,7 @@ import asyncio
 from hyperscale.distributed.cluster import ClusterJoinError
 from hyperscale.distributed.cluster.cluster_view_cache import ClusterViewCache
 from hyperscale.distributed.cluster.cluster_watch_follower import ClusterWatchFollower
+from hyperscale.distributed.cluster.models import ClusterMetricsReply
 from hyperscale.distributed.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed.swim.health.graceful_degradation import DegradationLevel
 from hyperscale.distributed.env import Env
@@ -2693,6 +2694,29 @@ class WorkerServer(HealthAwareServer):
     ) -> bytes:
         """Handle state sync request."""
         return await self._sync_handler.handle(addr, data, clock_time)
+
+    @tcp.receive()
+    async def cluster_metrics(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        """This worker's telemetry in the metrics schema every role shares
+        (D-68), from the heartbeat it sends its managers: state, cores,
+        active and queued workflows, CPU and memory. A worker holds no
+        cluster membership, so those fields stay at their defaults."""
+        heartbeat = self._get_heartbeat()
+        return ClusterMetricsReply(
+            member_id=f"{self._node_id.full}@{self._host}:{self._tcp_port}",
+            formation="",
+            is_leader=False,
+            role="worker",
+            node_state=heartbeat.state,
+            capacity={"total_cores": heartbeat.total_cores, "available_cores": heartbeat.available_cores},
+            workload={
+                "active_workflows": len(heartbeat.active_workflows),
+                "pending_workflows": heartbeat.queue_depth,
+            },
+            resources={"cpu_percent": heartbeat.cpu_percent, "memory_percent": heartbeat.memory_percent},
+        ).dump()
 
     @tcp.receive()
     async def workflow_status_query(

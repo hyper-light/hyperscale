@@ -27,6 +27,10 @@ ran a load test read as violating its SLO:
 * an answered dispatch records its round trip;
 * a dispatch never answered records the timeout it waited;
 * a refused one (no wait, no answer) records nothing.
+
+Each sample names the worker it timed (D-5: the manager keeps the samples
+per worker too), and each send's outcome is counted for the metrics
+surface (D-68): every send counted once, under the outcome it returned.
 """
 
 from types import SimpleNamespace
@@ -100,9 +104,9 @@ def make_coordinator(send_result, known_worker: bool = True, latencies: list | N
         node_id="manager-a",
         dispatch_timeout_seconds=DISPATCH_TIMEOUT_SECONDS,
         clock=SteppingClock(),
-        record_dispatch_latency=lambda latency_ms, now: (latencies if latencies is not None else []).append(
-            (latency_ms, now)
-        ),
+        record_dispatch_latency=lambda worker_id, latency_ms, now: (
+            latencies if latencies is not None else []
+        ).append((worker_id, latency_ms, now)),
     )
     return coordinator, pool, stats, send_tcp
 
@@ -179,33 +183,60 @@ async def test_a_worker_the_registry_does_not_know_is_purged() -> None:
 
 @pytest.mark.asyncio
 async def test_an_answered_dispatch_records_its_round_trip() -> None:
-    latencies: list[tuple[float, float]] = []
+    latencies: list[tuple[str, float, float]] = []
     coordinator, _pool, _stats, _send = make_coordinator(ack(False, "duplicate workflow"), latencies=latencies)
 
     await coordinator.send_workflow_dispatch(WORKER, dispatch())
 
-    ((latency_ms, recorded_at),) = latencies
+    ((timed_worker, latency_ms, recorded_at),) = latencies
+    assert timed_worker == WORKER
     assert latency_ms == pytest.approx(ROUND_TRIP_SECONDS * 1000.0)
     assert recorded_at == DISPATCHED_AT + ROUND_TRIP_SECONDS
 
 
 @pytest.mark.asyncio
 async def test_a_dispatch_never_answered_records_the_timeout_it_waited() -> None:
-    latencies: list[tuple[float, float]] = []
+    latencies: list[tuple[str, float, float]] = []
     coordinator, pool, _stats, _send = make_coordinator((TimeoutError(), 0), latencies=latencies)
 
     outcome, _detail = await coordinator.send_workflow_dispatch(WORKER, dispatch())
     assert outcome == DispatchOutcome.UNREACHABLE
 
-    assert latencies == [(DISPATCH_TIMEOUT_SECONDS * 1000.0, DISPATCHED_AT + ROUND_TRIP_SECONDS)]
+    assert latencies == [(WORKER, DISPATCH_TIMEOUT_SECONDS * 1000.0, DISPATCHED_AT + ROUND_TRIP_SECONDS)]
     assert pool.calls[0][:2] == ("transport", WORKER)
 
 
 @pytest.mark.asyncio
 async def test_a_refused_dispatch_records_no_latency() -> None:
-    latencies: list[tuple[float, float]] = []
+    latencies: list[tuple[str, float, float]] = []
     coordinator, _pool, _stats, _send = make_coordinator((ConnectionRefusedError("refused"), 0), latencies=latencies)
 
     await coordinator.send_workflow_dispatch(WORKER, dispatch())
 
     assert latencies == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("send_result", "known_worker", "expected_outcome"),
+    [
+        (ack(True), True, DispatchOutcome.ACCEPTED),
+        (ack(False, "Worker is draining"), True, DispatchOutcome.NOT_READY),
+        (ack(False, "duplicate workflow"), True, DispatchOutcome.REJECTED),
+        ((None, 0), True, DispatchOutcome.UNREACHABLE),
+        ((ConnectionError("refused"), 0), True, DispatchOutcome.UNREACHABLE),
+        (ConnectionError("raised"), True, DispatchOutcome.UNREACHABLE),
+        (ack(True), False, DispatchOutcome.UNROUTABLE),
+    ],
+)
+async def test_each_send_is_counted_once_under_its_outcome(send_result, known_worker, expected_outcome) -> None:
+    coordinator, _pool, _stats, _send = make_coordinator(send_result, known_worker=known_worker)
+    assert set(coordinator.dispatch_outcome_counts().values()) == {0}
+
+    outcome, _detail = await coordinator.send_workflow_dispatch(WORKER, dispatch())
+
+    assert outcome == expected_outcome
+    counts = coordinator.dispatch_outcome_counts()
+    assert counts.pop(expected_outcome.value) == 1
+    assert set(counts.values()) == {0}
+    assert DispatchOutcome.WITHHELD.value not in counts
