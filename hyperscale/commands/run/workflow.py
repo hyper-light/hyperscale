@@ -40,7 +40,14 @@ from hyperscale.commands.cli import (
 
 from .node_address import parse_node_address
 from .models import RunOutcome
-from .shared import get_default_workers, get_default_config, node_env, node_log_path, resolve_auth_secret
+from .shared import (
+    get_default_workers,
+    get_default_config,
+    node_env,
+    node_log_path,
+    requested_output_mode,
+    resolve_auth_secret,
+)
 
 TestWorkflows = list[tuple[list[str], Workflow]]
 RunCall = Callable[[], Awaitable[RunOutcome]]
@@ -50,7 +57,7 @@ FAILED_EXIT_STATUS = 1
 RUN_LOG_ROLE = "run"
 
 
-@command(shortnames={"host": "H"})
+@command(shortnames={"host": "H", "output_mode": "o"})
 async def workflow(
     path: ImportType[Workflow],
     config: JsonFile[HyperscaleConfig] = get_default_config,
@@ -58,6 +65,7 @@ async def workflow(
     workers: int = get_default_workers,
     name: str = "default",
     quiet: bool = False,
+    output_mode: AssertSet[TerminalMode] | None = None,
     gates: list[str] = [],
     managers: list[str] = [],
     host: str = "127.0.0.1",
@@ -73,6 +81,7 @@ async def workflow(
     @param workers The number of parallel threads/processes to use (local runs)
     @param name The name of the test
     @param quiet If specified, all GUI output will be disabled
+    @param output_mode The terminal output mode -- full, ci-safe, ci or disabled -- overriding the config's terminal_mode (full still falls back to ci-safe where it cannot draw)
     @param gates The TCP host:port of the cluster's gates to run the test through
     @param managers The TCP host:port of one datacenter's managers to run the test on directly
     @param host The address the cluster pushes the run's progress to (cluster runs; it listens on the config's server port)
@@ -90,7 +99,7 @@ async def workflow(
 
     # The full UI where stdout can show it, otherwise CI-safe lines; an
     # explicitly configured mode, and --quiet, win.
-    selection = await select_run_terminal_mode(config.data.terminal_mode, quiet, test_workflows)
+    selection = await select_run_terminal_mode(requested_output_mode(output_mode, config), quiet, test_workflows)
     run_call = (
         await cluster_run_call(
             name, workflows, selection.mode, config.data, log_level.data, gates, managers, host, acm_secret

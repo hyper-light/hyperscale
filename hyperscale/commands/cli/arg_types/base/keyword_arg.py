@@ -142,14 +142,23 @@ class KeywordArg(Generic[T]):
         self.default = default
         self.group = group
         self.arg_type: KeywordArgType = arg_type
+        # A choice type inside a union (``AssertSet[...] | None``) shows its
+        # choices, as it does on its own, rather than the bare "AssertSet".
         self._data_type = [
-            subtype_type.__name__ if hasattr(subtype_type, "__name__") else subtype_type
-            for subtype_type in base_type
+            display_name for subtype_type in base_type for display_name in self._display_names(subtype_type)
         ]
 
         self.description = description
 
         self.consumed_next_positions_count = 1 if arg_type == "keyword" else 0
+
+    def _display_names(self, subtype_type: object) -> list[object]:
+        """How one member of an option's type reads in help: a complex type
+        (a choice set, an import, ...) as the types or values it reduces to,
+        anything else by its name."""
+        if get_origin(subtype_type) in self.complex_types:
+            return [_type_display_name(member) for member in reduce_pattern_type(subtype_type)]
+        return [_type_display_name(subtype_type)]
 
     @property
     def data_type(self):
@@ -298,3 +307,7 @@ def is_unsupported_keyword_arg(arg: str, keyword_args: dict[str, KeywordArg]):
     return (arg.startswith("--") or arg.startswith("-")) and arg.replace(
         "-", ""
     ) not in keyword_args
+
+
+def _type_display_name(subtype_type: object) -> object:
+    return subtype_type.__name__ if hasattr(subtype_type, "__name__") else subtype_type

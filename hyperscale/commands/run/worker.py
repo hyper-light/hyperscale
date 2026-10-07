@@ -5,6 +5,7 @@ from hyperscale.distributed.nodes import WorkerServer
 from hyperscale.core.engines.client.time_parser import TimeParser
 
 from hyperscale.core.jobs.models import HyperscaleConfig
+from hyperscale.core.jobs.models.hyperscale_config import TerminalMode
 from hyperscale.logging import Logger, LoggingConfig, LogLevelName
 from hyperscale.ui.node_dashboard import (
     NodeDashboard,
@@ -22,13 +23,14 @@ from .shared import (
     node_env,
     node_log_path,
     node_terminal_mode,
+    requested_output_mode,
     resolve_auth_secret,
 )
 
 
 @command(
     display_help_on_error=False,
-    shortnames={"host": "H"},
+    shortnames={"host": "H", "output_mode": "o"},
 )
 async def worker(
     host: str = "127.0.0.1",
@@ -43,6 +45,7 @@ async def worker(
     log_level: AssertSet[LogLevelName] = "fatal",
     managers: list[str] = [],
     quiet: bool = False,
+    output_mode: AssertSet[TerminalMode] | None = None,
 ):
     """
     Run a Hyperscale worker. It registers with the managers given by
@@ -60,6 +63,7 @@ async def worker(
     @param log_level The log level to use
     @param managers The TCP host:port of the managers this worker registers with
     @param quiet If specified, the live node dashboard is disabled
+    @param output_mode The terminal output mode -- full, ci-safe, ci or disabled -- overriding the config's terminal_mode (full still falls back to ci-safe where it cannot draw)
     """
 
     logging_config = LoggingConfig()
@@ -96,7 +100,7 @@ async def worker(
         else [parse_node_address(manager) for manager in managers]
     )
 
-    terminal_selection = await node_terminal_mode(config.data.terminal_mode, quiet, WorkerDashboardReader.layout)
+    terminal_selection = await node_terminal_mode(requested_output_mode(output_mode, config), quiet, WorkerDashboardReader.layout)
     terminal_mode = terminal_selection.mode
     log_path = node_log_path(config.data.logs_directory, "worker", datacenter, host, tcp_port)
 

@@ -407,3 +407,55 @@ async def test_the_gate_dashboard_shows_the_datacenter_its_manager_reports(
         await stop_all(nodes, signal.SIGINT, whole_group=False)
     finally:
         await kill_remaining(nodes)
+
+
+# --output-mode overrides the config's terminal_mode: on a terminal that
+# could show the full dashboard, ci-safe still writes summary lines; piped,
+# disabled writes nothing at all.
+OUTPUT_MODE_CASES = {
+    "ci-safe on a capable terminal": (["--output-mode", "ci-safe"], (TERMINAL_COLUMNS, TERMINAL_LINES)),
+    "disabled piped (short flag)": (["-o", "disabled"], None),
+}
+
+
+@pytest.mark.parametrize("case", list(OUTPUT_MODE_CASES))
+async def test_the_output_mode_flag_overrides_the_configured_mode(
+    case: str, run_marker: str, tmp_path: pathlib.Path
+) -> None:
+    flag_arguments, stdout_terminal = OUTPUT_MODE_CASES[case]
+    config_path, logs_directory = write_config(tmp_path, "full")
+    (manager_start,) = reserve_port_blocks([NODE_BLOCK])
+    manager = ManagerOutput(stdout_terminal)
+    await manager.start(
+        capable_terminal_environment(**{RUN_MARKER_ENVAR: run_marker}),
+        [
+            "--tcp-port", str(manager_start), "--udp-port", str(manager_start + 1),
+            "--boot-timeout", f"{int(BOOT_TIMEOUT_SECONDS)}s",
+            "--shutdown-timeout", f"{int(SHUTDOWN_TIMEOUT_SECONDS)}s",
+            "--log-level", "info",
+            "--data-directory", str(tmp_path / "data"),
+            "--config", str(config_path),
+            *flag_arguments,
+        ],
+    )
+    try:
+        if flag_arguments[-1] == "ci-safe":
+            # The dashboard writes its lines and the node's logs go to its log file.
+            assert await wait_for_log(node_log(logs_directory, "manager", manager_start), BOOT_MARKERS["manager"])
+            assert await wait_for_bytes(manager.collected, b"WORKERS 0 unhealthy 0", within=BOOT_TIMEOUT_SECONDS)
+        else:
+            # No dashboard: the node logs to stderr, which shares the pipe.
+            assert await wait_for_bytes(manager.collected, BOOT_MARKERS["manager"].encode(), within=BOOT_TIMEOUT_SECONDS)
+
+        manager.process.send_signal(signal.SIGINT)
+        await asyncio.wait_for(manager.process.wait(), timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        await asyncio.wait_for(manager.closed.wait(), timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        assert manager.process.returncode == 0
+
+        if flag_arguments[-1] == "ci-safe":
+            assert ESCAPE not in manager.collected, bytes(manager.collected)
+            assert all(line.startswith("up ") for line in summary_lines(manager.collected))
+        else:
+            assert not any(line.startswith("up ") for line in summary_lines(manager.collected)), bytes(manager.collected)
+    finally:
+        await manager.close()

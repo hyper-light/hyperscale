@@ -9,6 +9,7 @@ import sys
 import psutil
 
 
+from hyperscale.commands.cli import AssertSet, JsonFile
 from hyperscale.core.jobs.models import HyperscaleConfig, TerminalMode
 from hyperscale.distributed.env import Env, load_env
 from hyperscale.distributed.ledger.storage_health import StorageHealth
@@ -249,3 +250,11 @@ async def opened_raft_store(
         await store.close()
         await task_runner.shutdown()
         filesystem.shutdown(wait=True)
+
+
+def requested_output_mode(output_mode: AssertSet[TerminalMode] | None, config: JsonFile[HyperscaleConfig]) -> TerminalMode:
+    """The terminal output mode a run command was asked for: --output-mode
+    when given, else the config's terminal_mode (default "full"). The CLI
+    passes an unparsed option as an AssertSet with no data, not None."""
+    requested = getattr(output_mode, "data", None)
+    return requested if requested is not None else config.data.terminal_mode

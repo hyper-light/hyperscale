@@ -5,6 +5,7 @@ from hyperscale.distributed.nodes import ManagerServer
 from hyperscale.core.engines.client.time_parser import TimeParser
 
 from hyperscale.core.jobs.models import HyperscaleConfig
+from hyperscale.core.jobs.models.hyperscale_config import TerminalMode
 from hyperscale.logging import Logger, LoggingConfig, LogLevelName
 from hyperscale.ui.node_dashboard import (
     ManagerDashboardReader,
@@ -23,6 +24,7 @@ from .shared import (
     node_env,
     node_log_path,
     node_terminal_mode,
+    requested_output_mode,
     resolve_auth_secret,
 )
 
@@ -31,6 +33,8 @@ from .shared import (
     display_help_on_error=False,
     shortnames={
         "host": "H",
+        "output_mode": "o",
+        "cohort_size": "C",
         "managers": "m",
         "manager_udp": "M",
         "gates": "g",
@@ -57,6 +61,7 @@ async def manager(
     config: JsonFile[HyperscaleConfig] = get_default_config,
     log_level: AssertSet[LogLevelName] = "fatal",
     quiet: bool = False,
+    output_mode: AssertSet[TerminalMode] | None = None,
 ):
     """
     Run a Hyperscale manager. Its datacenter's managers form one election
@@ -81,6 +86,7 @@ async def manager(
     @param config A path to a valid .hyperscale.json config file
     @param log_level The log level to use
     @param quiet If specified, the live node dashboard is disabled
+    @param output_mode The terminal output mode -- full, ci-safe, ci or disabled -- overriding the config's terminal_mode (full still falls back to ci-safe where it cannot draw)
     """
     logging_config = LoggingConfig()
     logging_config.update(
@@ -132,7 +138,7 @@ async def manager(
     start_timeout_sec = TimeParser(boot_timeout).time
     shutdown_timeout_sec = TimeParser(shutdown_timeout).time
 
-    terminal_selection = await node_terminal_mode(config.data.terminal_mode, quiet, ManagerDashboardReader.layout)
+    terminal_selection = await node_terminal_mode(requested_output_mode(output_mode, config), quiet, ManagerDashboardReader.layout)
     terminal_mode = terminal_selection.mode
     log_path = node_log_path(config.data.logs_directory, "manager", datacenter, host, tcp_port)
 
