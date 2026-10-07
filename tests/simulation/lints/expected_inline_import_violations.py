@@ -1,7 +1,6 @@
 """Imports inside functions, per function, today (test_no_inline_imports)."""
 
 EXPECTED_INLINE_IMPORT_VIOLATIONS: dict[str, int] = {
-    'hyperscale/commands/ping.py::http': 1,
     'hyperscale/core/engines/client/sftp/protocols/sftp.py::_lookup_gid': 1,
     'hyperscale/core/engines/client/sftp/protocols/sftp.py::_lookup_group': 1,
     'hyperscale/core/engines/client/sftp/protocols/sftp.py::_lookup_uid': 1,

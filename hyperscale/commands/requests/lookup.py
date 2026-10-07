@@ -36,7 +36,7 @@ async def lookup_url(
             )
 
         if as_smtp:
-            await url_data.lookup_smtp()
+            await url_data.lookup_smtp(url_data.full, asyncio.get_running_loop())
 
         else:
             await url_data.lookup()

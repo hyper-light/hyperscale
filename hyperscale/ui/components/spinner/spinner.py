@@ -99,13 +99,13 @@ class Spinner:
         pass
 
     async def stop(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()
 
         await self.ok()
 
     async def abort(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()
 
         await self.fail()

@@ -182,20 +182,29 @@ class ProgressBar:
         pass
 
     async def stop(self):
+        # A bar that never rendered has no lock and no concurrent updater:
+        # its final status is set directly.
+        if self._update_lock is None:
+            self._set_final_status()
+            return
+
         if self._update_lock.locked():
             self._update_lock.release()
 
         await self._update_lock.acquire()
-        if self._last_completed >= self._total:
-            self._bar_status = ProgressBarStatus.COMPLETE
-
-        else:
-            self._bar_status = ProgressBarStatus.FAILED
-
+        self._set_final_status()
         self._update_lock.release()
 
+    def _set_final_status(self) -> None:
+        """COMPLETE when every step finished, else FAILED."""
+        self._bar_status = (
+            ProgressBarStatus.COMPLETE
+            if self._last_completed >= self._total
+            else ProgressBarStatus.FAILED
+        )
+
     async def abort(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()
 
         await self._update_lock.acquire()

@@ -147,9 +147,9 @@ class Text:
         pass
 
     async def stop(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()
 
     async def abort(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()

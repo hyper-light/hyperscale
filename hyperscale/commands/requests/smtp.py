@@ -10,6 +10,8 @@ from .terminal_ui import (
     create_ping_ui,
     colorize_smtp,
 )
+from .ping_result_output import PingResultOutput
+from .ping_result_serializer import PingResultSerializer
 
 async def make_smtp_request(
     url: str,
@@ -41,6 +43,9 @@ async def make_smtp_request(
     if len(auth_data) < 2:
         auth_data = None
 
+    result_serializer = PingResultSerializer('smtp', url, 'SEND')
+    result_output = PingResultOutput(output_file, result_serializer)
+
     try:
         if quiet is False:
             await terminal.render(
@@ -60,6 +65,8 @@ async def make_smtp_request(
             email=email,
             auth=auth_data,
         )
+
+        await result_output.record(result_serializer.from_smtp_response, response)
 
         if quiet is False:
 
@@ -126,6 +133,7 @@ async def make_smtp_request(
             await terminal.stop()
 
     except Exception as err:
+        await result_output.record_failure(err)
         error_message = str(err)
         if str(err) == "":
             error_message = "Encountered unknown error"
@@ -133,3 +141,5 @@ async def make_smtp_request(
         if quiet is False:
             await update_text(error_message)
             await terminal.stop()
+
+    result_output.raise_on_write_failure()

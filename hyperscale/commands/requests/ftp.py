@@ -10,6 +10,8 @@ from .terminal_ui import (
     create_ping_ui,
     colorize_ftp_or_scp_or_sftp,
 )
+from .ping_result_output import PingResultOutput
+from .ping_result_serializer import PingResultSerializer
 
 
 async def make_ftp_request(
@@ -34,6 +36,9 @@ async def make_ftp_request(
         override_status_colorizer=colorize_ftp_or_scp_or_sftp
     )
 
+    result_serializer = PingResultSerializer('ftp', url, 'PWD')
+    result_output = PingResultOutput(output_file, result_serializer)
+
     try:
         if quiet is False:
             await terminal.render(
@@ -47,6 +52,8 @@ async def make_ftp_request(
             secure_connection=secure_connection,
             timeout=timeout,
         )
+
+        await result_output.record(result_serializer.from_ftp_response, response)
 
         if quiet is False:
 
@@ -70,23 +77,23 @@ async def make_ftp_request(
                 response_text = "Encountered unknown error."
 
 
-        updates = [
-            update_status(response_status),
-            update_text(response_text),
-            update_elapsed(elapsed),
-            update_params({}, {}),
-        ]
+            updates = [
+                update_status(response_status),
+                update_text(response_text),
+                update_elapsed(elapsed),
+                update_params({}, {}),
+            ]
 
-        await asyncio.sleep(0.5)
-        await asyncio.gather(*updates)
+            await asyncio.sleep(0.5)
+            await asyncio.gather(*updates)
 
-        if wait:
-            loop = asyncio.get_event_loop()
+            if wait:
+                loop = asyncio.get_event_loop()
 
-            await loop.create_future()
+                await loop.create_future()
 
-        await asyncio.sleep(0.5)
-        await terminal.stop()
+            await asyncio.sleep(0.5)
+            await terminal.stop()
 
     except (
         KeyboardInterrupt,
@@ -97,6 +104,7 @@ async def make_ftp_request(
             await terminal.stop()
 
     except Exception as err:
+        await result_output.record_failure(err)
         error_message = str(err)
         if str(err) == "":
             error_message = "Encountered unknown error"
@@ -104,3 +112,5 @@ async def make_ftp_request(
         if quiet is False:
             await update_text(error_message)
             await terminal.stop()
+
+    result_output.raise_on_write_failure()

@@ -19,6 +19,8 @@ from .terminal_ui import (
     create_ping_ui,
     map_status_to_error,
 )
+from .ping_result_output import PingResultOutput
+from .ping_result_serializer import PingResultSerializer
 
 
 class GraphQLQuery(BaseModel):
@@ -58,7 +60,6 @@ async def make_graphqlh2_request(
     verify_tls: bool = True,
 ):
     
-    graphql_data = GraphQLQuery(**data)
     
     timeouts = Timeouts(request_timeout=timeout)
     graphqlh2 = MercurySyncGraphQLHTTP2Connection(
@@ -71,12 +72,17 @@ async def make_graphqlh2_request(
         method,
     )
 
+    result_serializer = PingResultSerializer('graphqlh2', url, method.upper())
+    result_output = PingResultOutput(output_file, result_serializer)
+
     try:
         if quiet is False:
             await terminal.render(
                 horizontal_padding=4,
                 vertical_padding=1
             )
+
+        graphql_data = GraphQLQuery(**data)
 
         match method:
             case "query":
@@ -108,6 +114,8 @@ async def make_graphqlh2_request(
                     timeout=timeout,
                     redirects=redirects,
                 )
+
+        await result_output.record(result_serializer.from_multiplexed_http_response, response)
 
         if quiet is False:
             response_text = response.reason
@@ -173,6 +181,7 @@ async def make_graphqlh2_request(
             await terminal.stop()
 
     except Exception as err:
+        await result_output.record_failure(err)
         error_message = str(err)
         if str(err) == "":
             error_message = "Encountered unknown error"
@@ -180,3 +189,5 @@ async def make_graphqlh2_request(
         if quiet is False:
             await update_text(error_message)
             await terminal.stop()
+
+    result_output.raise_on_write_failure()
