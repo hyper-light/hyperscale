@@ -5311,11 +5311,13 @@ class GateServer(HealthAwareServer):
     def _get_datacenter_coordinate(self, datacenter_id: str) -> NetworkCoordinate | None:
         """The Vivaldi coordinate a datacenter is reached at: that of its
         most authoritative manager (the leader, while its heartbeat is
-        fresh). Coordinates are learned per manager node."""
+        fresh). SWIM learns coordinates per UDP peer, keyed
+        ``"host:port"`` (``_process_vivaldi_piggyback``), so the manager's
+        is read under the UDP address its heartbeat names."""
         heartbeat, _, _ = self._health_coordinator.get_best_manager_heartbeat(datacenter_id)
-        if heartbeat is None:
+        if heartbeat is None or not heartbeat.udp_host:
             return None
-        return self._coordinate_tracker.get_peer_coordinate(heartbeat.node_id)
+        return self._coordinate_tracker.get_peer_coordinate(f"{heartbeat.udp_host}:{heartbeat.udp_port}")
 
     async def _handle_gate_peer_failure(
         self,
@@ -9844,6 +9846,7 @@ class GateServer(HealthAwareServer):
         # Before its heartbeat is dropped: it names the manager's UDP address.
         self._forget_learned_manager_addresses(manager_addr)
         await self._modular_state.remove_manager(manager_addr)
+        self._dc_health_manager.remove_manager(manager_addr)
         self._manager_selector.forget_manager(manager_addr)
         await self._clear_manager_backpressure(manager_addr)
         await self._circuit_breaker_manager.remove_circuit(manager_addr)

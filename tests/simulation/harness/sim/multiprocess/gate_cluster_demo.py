@@ -57,6 +57,9 @@ def gate_tier_entry(
     * ``("dc-health", dc_id, health, t)`` on every classification
       change, per datacenter (dc ids walked in sorted order so the
       poll sequence is replay-stable).
+    * ``("dc-coordinate", dc_id, known, t)`` whenever whether the gate
+      knows the datacenter's Vivaldi coordinate (AD-35, the AD-36
+      latency input) changes.
     * ``("gate-peers", count, t)`` on every discovered-active-peer-count
       change — the gate-cluster-formation signal
       (``_modular_state.get_active_peer_count()``), recorded only when
@@ -85,6 +88,9 @@ def gate_tier_entry(
         last_health: dict[str, str | None] = {
             datacenter_id: None for datacenter_id in datacenter_ids
         }
+        last_coordinate_known: dict[str, bool | None] = {
+            datacenter_id: None for datacenter_id in datacenter_ids
+        }
         while True:
             for datacenter_id in datacenter_ids:
                 health = gate._classify_datacenter_health(datacenter_id).health
@@ -95,6 +101,17 @@ def gate_tier_entry(
                             "dc-health",
                             datacenter_id,
                             health,
+                            round(context.loop.time(), 6),
+                        )
+                    )
+                coordinate_known = gate._get_datacenter_coordinate(datacenter_id) is not None
+                if coordinate_known != last_coordinate_known[datacenter_id]:
+                    last_coordinate_known[datacenter_id] = coordinate_known
+                    log.append(
+                        (
+                            "dc-coordinate",
+                            datacenter_id,
+                            coordinate_known,
                             round(context.loop.time(), 6),
                         )
                     )

@@ -94,6 +94,11 @@ class DatacenterHealthManager:
 
         self._dc_manager_info: dict[str, dict[tuple[str, int], CachedManagerInfo]] = {}
         self._known_datacenters: set[str] = set()
+        # Datacenters some manager has ever reported from. Bounded by the
+        # datacenter set, and kept when their managers are forgotten: a
+        # datacenter whose managers all went silent and were reaped lost
+        # them (UNHEALTHY); it is not warming up (INITIALIZING).
+        self._datacenters_heard_from: set[str] = set()
         self._previous_health_states: dict[str, str] = {}
         self._pending_transitions: list[tuple[str, str, str]] = []
 
@@ -116,6 +121,7 @@ class DatacenterHealthManager:
             heartbeat: The received heartbeat message.
         """
         self._known_datacenters.add(dc_id)
+        self._datacenters_heard_from.add(dc_id)
 
         if dc_id not in self._dc_manager_info:
             self._dc_manager_info[dc_id] = {}
@@ -149,11 +155,14 @@ class DatacenterHealthManager:
         if manager_addr in dc_managers:
             dc_managers[manager_addr].is_alive = False
 
-    def remove_manager(self, dc_id: str, manager_addr: tuple[str, int]) -> None:
-        """Remove a manager from tracking."""
-        dc_managers = self._dc_manager_info.get(dc_id, {})
-        dc_managers.pop(manager_addr, None)
-        self._manager_detectors.pop((dc_id, manager_addr), None)
+    def remove_manager(self, manager_addr: tuple[str, int]) -> None:
+        """Forget a departed manager in every datacenter it reported in: its
+        cached heartbeat (so it no longer counts toward a datacenter's
+        managers) and its phi detector. A manager that returns is
+        re-learned from its next heartbeat."""
+        for dc_id, dc_managers in self._dc_manager_info.items():
+            dc_managers.pop(manager_addr, None)
+            self._manager_detectors.pop((dc_id, manager_addr), None)
 
     def add_datacenter(self, dc_id: str) -> None:
         """Add a datacenter to tracking (even if no managers yet)."""
@@ -202,8 +211,9 @@ class DatacenterHealthManager:
         # UNHEALTHY made warmup indistinguishable from outage — gates
         # accepted jobs and insta-failed them during the first seconds
         # of a cluster's life. Heartbeats that existed and went stale
-        # still classify UNHEALTHY below (real loss).
-        if not self._dc_manager_info.get(dc_id):
+        # still classify UNHEALTHY below (real loss), as do those of
+        # managers since forgotten (``remove_manager``).
+        if dc_id not in self._datacenters_heard_from:
             return self._build_initializing_status(dc_id)
 
         return self._classify_reporting_datacenter(

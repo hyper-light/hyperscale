@@ -160,8 +160,9 @@ class ManagerVersionSkewHandler:
         client_version: ProtocolVersion,
         client_capabilities: str,
     ) -> str | None:
-        """A submitting client's negotiated features, comma-joined -- or None
-        when its major version is incompatible (AD-25: reject)."""
+        """A submitting client's or registering worker's negotiated features,
+        comma-joined -- or None when its major version is incompatible
+        (AD-25: reject)."""
         if client_version.major != self.protocol_version.major:
             return None
         client_features = set(client_capabilities.split(",")) if client_capabilities else set()

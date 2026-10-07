@@ -26,7 +26,7 @@ from hyperscale.distributed.models import (
     NodeInfo,
     RegistrationResponse,
 )
-from hyperscale.distributed.protocol.version import NodeCapabilities, ProtocolVersion
+from hyperscale.distributed.protocol.version import CURRENT_PROTOCOL_VERSION, NodeCapabilities, ProtocolVersion
 from hyperscale.distributed.swim.core import CircuitState
 
 
@@ -755,3 +755,67 @@ class TestWorkerRegistrationHandlerEdgeCases:
         ack = ManagerToWorkerRegistrationAck.load(result)
         assert ack.accepted is True
         assert ack.worker_id == "worker-🚀-id"
+
+
+class TestWorkerRegistrationHandlerVersionSkew:
+    """AD-25 on the worker's side of registration: a manager of another
+    MAJOR protocol version is refused even when it accepted the worker
+    (an older manager may not check), and the negotiated features are the
+    ones both sides name."""
+
+    @staticmethod
+    def make_handler() -> WorkerRegistrationHandler:
+        registry = WorkerRegistry(
+            None,
+            forget_manager_backpressure=lambda manager_id: None,
+            circuit_breaker_config=Env().get_circuit_breaker_config(),
+            select_manager=_select_lowest_id,
+        )
+        return WorkerRegistrationHandler(registry=registry, discovery_service=MockDiscoveryService())
+
+    @staticmethod
+    async def process(handler: WorkerRegistrationHandler, response: RegistrationResponse) -> tuple[bool, str | None]:
+        return await handler.process_registration_response(
+            data=response.dump(),
+            node_host="localhost",
+            node_port=8000,
+            node_id_short="wkr",
+            add_unconfirmed_peer=AsyncMock(),
+            add_to_probe_scheduler=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_accepting_manager_of_another_major_version_is_refused(self) -> None:
+        handler = self.make_handler()
+        response = RegistrationResponse(
+            accepted=True,
+            manager_id="mgr-1",
+            healthy_managers=[],
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major + 1,
+            protocol_version_minor=0,
+            capabilities="cancellation",
+        )
+
+        assert await self.process(handler, response) == (False, None)
+        assert handler.negotiated_capabilities is None
+        assert handler._registry._primary_manager_id is None
+
+    @pytest.mark.asyncio
+    async def test_the_negotiated_features_are_those_both_sides_name(self) -> None:
+        handler = self.make_handler()
+        response = RegistrationResponse(
+            accepted=True,
+            manager_id="mgr-1",
+            healthy_managers=[],
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor + 1,
+            capabilities="cancellation,heartbeat,feature_from_a_newer_minor",
+        )
+
+        assert await self.process(handler, response) == (True, "mgr-1")
+        negotiated = handler.negotiated_capabilities
+        assert negotiated.compatible is True
+        assert negotiated.common_features == {"cancellation", "heartbeat"}
+        assert negotiated.remote_version == ProtocolVersion(
+            CURRENT_PROTOCOL_VERSION.major, CURRENT_PROTOCOL_VERSION.minor + 1
+        )

@@ -20,6 +20,7 @@ from hyperscale.distributed.protocol.version import (
     NegotiatedCapabilities,
     NodeCapabilities,
     ProtocolVersion,
+    get_features_for_version,
 )
 from hyperscale.distributed.reliability import (
     RetryConfig,
@@ -268,6 +269,13 @@ class WorkerRegistrationHandler:
             await self._log_registration_rejected(response, node_host, node_port, node_id_short)
             return (False, None)
 
+        # AD-25: a manager of another MAJOR protocol version is refused,
+        # whether or not it checked this worker's (an older one may not).
+        manager_version = ProtocolVersion(response.protocol_version_major, response.protocol_version_minor)
+        if not CURRENT_PROTOCOL_VERSION.is_compatible_with(manager_version):
+            await self._log_incompatible_manager(manager_version, node_host, node_port, node_id_short)
+            return (False, None)
+
         # The responder is direct evidence for its own address; the
         # rest of its manager list is hearsay.
         self._confirm_responder(response)
@@ -305,6 +313,27 @@ class WorkerRegistrationHandler:
                     message=(
                         "Manager rejected worker registration: "
                         f"{response.error or 'no error provided'}"
+                    ),
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                )
+            )
+
+    async def _log_incompatible_manager(
+        self,
+        manager_version: ProtocolVersion,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log a manager refused for its incompatible MAJOR protocol version (AD-25)."""
+        if self._logger:
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        f"Refused manager registration: incompatible protocol version {manager_version} "
+                        f"(ours: {CURRENT_PROTOCOL_VERSION})"
                     ),
                     node_host=node_host,
                     node_port=node_port,
@@ -355,24 +384,26 @@ class WorkerRegistrationHandler:
         return primary_manager_id
 
     def _store_negotiated_capabilities(self, response: RegistrationResponse) -> None:
-        """Record the protocol version and features negotiated with the manager (AD-25)."""
+        """Record the protocol version and features negotiated with the manager
+        (AD-25): the features both sides name -- the manager's list
+        intersected with this worker's own, so a newer manager's features
+        this worker lacks are ignored."""
         manager_version = ProtocolVersion(
             response.protocol_version_major,
             response.protocol_version_minor,
         )
 
-        negotiated_features = (
+        manager_features = (
             set(response.capabilities.split(","))
             if response.capabilities
             else set()
         )
-        negotiated_features.discard("")
 
         self._negotiated_capabilities = NegotiatedCapabilities(
             local_version=CURRENT_PROTOCOL_VERSION,
             remote_version=manager_version,
-            common_features=negotiated_features,
-            compatible=True,
+            common_features=manager_features & get_features_for_version(CURRENT_PROTOCOL_VERSION),
+            compatible=CURRENT_PROTOCOL_VERSION.is_compatible_with(manager_version),
         )
 
     async def process_manager_registration(

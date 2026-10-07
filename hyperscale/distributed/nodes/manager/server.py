@@ -8365,8 +8365,10 @@ class ManagerServer(HealthAwareServer):
         *,
         accepted: bool,
         error: str | None = None,
+        capabilities: str = "",
     ) -> RegistrationResponse:
-        """Build a worker registration response with the current manager view."""
+        """Build a worker registration response with the current manager view
+        and the features negotiated with the worker (AD-25)."""
         healthy_managers = self._manager_state.get_active_known_manager_peers()
         healthy_managers.append(
             ManagerInfo(
@@ -8387,6 +8389,7 @@ class ManagerServer(HealthAwareServer):
             error=error,
             protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
             protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            capabilities=capabilities,
         )
 
     @tcp.receive()
@@ -8399,13 +8402,17 @@ class ManagerServer(HealthAwareServer):
         """Handle worker registration."""
         try:
             registration = WorkerRegistration.load(data)
+            negotiated_capabilities = self._version_skew.negotiate_with_client(
+                ProtocolVersion(registration.protocol_version_major, registration.protocol_version_minor),
+                registration.capabilities,
+            )
 
             (
                 worker_udp_addr,
                 is_same_worker_registration,
                 needs_fresh_liveness,
                 refusal,
-            ) = await self._screen_worker_registration(addr, registration)
+            ) = await self._screen_worker_registration(addr, registration, negotiated_capabilities)
             if refusal is not None:
                 return refusal
 
@@ -8416,7 +8423,10 @@ class ManagerServer(HealthAwareServer):
                 needs_fresh_liveness,
             )
 
-            response = self._build_worker_registration_response(accepted=True)
+            response = self._build_worker_registration_response(
+                accepted=True,
+                capabilities=negotiated_capabilities,
+            )
 
             return response.dump()
 
@@ -8446,6 +8456,7 @@ class ManagerServer(HealthAwareServer):
         self,
         addr: tuple[str, int],
         registration: WorkerRegistration,
+        negotiated_capabilities: str | None,
     ) -> tuple[tuple[str, int] | None, bool, bool, bytes | None]:
         """
         Decide whether a worker's registration may be admitted.
@@ -8454,8 +8465,11 @@ class ManagerServer(HealthAwareServer):
         already known at that address, whether that re-registration needed
         fresh SWIM liveness, and the refusal to send back -- None when the
         registration is admitted. A refused registration's other fields are
-        not used.
+        not used. A worker of another MAJOR protocol version -- no
+        capability set was negotiated with it -- is refused first (AD-25).
         """
+        if negotiated_capabilities is None:
+            return None, False, False, await self._worker_protocol_refusal(registration)
         if (refusal := await self._worker_registration_admission_refusal(addr, registration)) is not None:
             return None, False, False, refusal
         worker_udp_addr, is_new_worker, is_same_worker_registration = self._worker_registration_identity(
@@ -8485,6 +8499,22 @@ class ManagerServer(HealthAwareServer):
         if mtls_error:
             return self._worker_registration_refusal_response(mtls_error)
         return None
+
+    async def _worker_protocol_refusal(self, registration: WorkerRegistration) -> bytes:
+        """Refuse, and log, a worker whose MAJOR protocol version differs from this manager's (AD-25)."""
+        worker_version = f"{registration.protocol_version_major}.{registration.protocol_version_minor}"
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Worker {registration.node.node_id} rejected: incompatible protocol version "
+                    f"{worker_version} (ours: {CURRENT_PROTOCOL_VERSION})"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return self._worker_registration_refusal_response(f"Incompatible protocol version: {worker_version}")
 
     async def _worker_isolation_refusal(self, registration: WorkerRegistration) -> bytes | None:
         """Refuse, and log, a worker whose cluster id or environment id differs from this manager's; else None."""

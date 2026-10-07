@@ -22,6 +22,7 @@ staleness bound instead of decaying across it.
 * with adaptive routing disabled the gate offers no observed evidence.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,8 @@ from hyperscale.distributed.nodes.gate.config import derive_datacenter_leader_fa
 from hyperscale.distributed.nodes.gate.dispatch_coordinator import GateDispatchCoordinator
 from hyperscale.distributed.nodes.gate.server import GateServer
 from hyperscale.distributed.models.coordinates import VivaldiConfig
+from hyperscale.distributed.models.network_coordinate import NetworkCoordinate
+from hyperscale.distributed.swim.coordinates.coordinate_tracker import CoordinateTracker
 from hyperscale.distributed.routing import (
     ConstrainedPlacementPolicy,
     BlendedLatencyScorer,
@@ -292,20 +295,84 @@ def test_the_blended_latency_decides_the_route() -> None:
     assert by_observation.route_job("job-1", 1, None).primary_datacenters == [UNPLACED_DATACENTER]
 
 
-def test_a_datacenter_is_reached_at_its_most_authoritative_managers_coordinate() -> None:
-    manager_coordinate = SimpleNamespace(rtt_ms=NEAR_RTT_MS)
+MANAGER_LEADER_UDP = ("10.0.0.5", 9001)
+MANAGER_FOLLOWER_UDP = ("10.0.0.6", 9001)
+
+
+def manager_coordinate_payload(first_component: float) -> bytes:
+    """A manager's Vivaldi piggyback, as SWIM carries it after ``#|v``."""
+    dimensions = VivaldiConfig().dimensions
+    coordinate = NetworkCoordinate(
+        vec=[first_component] + [0.0] * (dimensions - 1),
+        height=0.1,
+        adjustment=0.0,
+        error=0.5,
+        sample_count=3,
+    )
+    return json.dumps(coordinate.to_dict()).encode()
+
+
+def gate_learning_coordinates(best_heartbeat_by_datacenter: dict) -> GateServer:
+    """A gate whose SWIM layer learns coordinates through its real intake
+    (``_process_vivaldi_piggyback`` into its own ``CoordinateTracker``)."""
     gate = object.__new__(GateServer)
-    gate._coordinate_tracker = SimpleNamespace(get_peer_coordinate={"manager-leader": manager_coordinate}.get)
+    gate._vivaldi_config = VivaldiConfig()
+    gate._coordinate_tracker = CoordinateTracker(config=gate._vivaldi_config)
+    gate._pending_probe_start = {}
+    gate._clock = SteppedClock()
     gate._health_coordinator = SimpleNamespace(
-        get_best_manager_heartbeat=lambda datacenter_id: (
-            (SimpleNamespace(node_id="manager-leader"), 1, 1)
-            if datacenter_id == NEAR_DATACENTER
-            else (None, 0, 0)
+        get_best_manager_heartbeat=lambda datacenter_id: best_heartbeat_by_datacenter.get(
+            datacenter_id, (None, 0, 0)
         )
     )
+    return gate
 
-    assert gate._get_datacenter_coordinate(NEAR_DATACENTER) is manager_coordinate
+
+def manager_heartbeat(node_id: str, udp_address: tuple[str, int]) -> SimpleNamespace:
+    return SimpleNamespace(node_id=node_id, udp_host=udp_address[0], udp_port=udp_address[1])
+
+
+@pytest.mark.asyncio
+async def test_a_datacenter_is_reached_at_its_most_authoritative_managers_coordinate() -> None:
+    """SWIM records a manager's coordinate under the UDP address it came
+    from; the gate reads the datacenter's coordinate under the UDP address
+    its best manager's heartbeat names. Keyed by node id, the lookup never
+    found one and AD-36 routed without Vivaldi."""
+    gate = gate_learning_coordinates(
+        {NEAR_DATACENTER: (manager_heartbeat("manager-leader", MANAGER_LEADER_UDP), 2, 2)}
+    )
+
+    await gate._process_vivaldi_piggyback(manager_coordinate_payload(7.0), MANAGER_LEADER_UDP)
+    await gate._process_vivaldi_piggyback(manager_coordinate_payload(-3.0), MANAGER_FOLLOWER_UDP)
+
+    near_coordinate = gate._get_datacenter_coordinate(NEAR_DATACENTER)
+    assert near_coordinate is not None
+    assert near_coordinate.vec[0] == 7.0
     assert gate._get_datacenter_coordinate(UNPLACED_DATACENTER) is None
+
+
+@pytest.mark.asyncio
+async def test_an_ack_measured_coordinate_is_read_under_the_same_key() -> None:
+    """An ack to the gate's own probe takes the RTT-measuring branch
+    (``update_peer_coordinate``); it lands under the same key."""
+    gate = gate_learning_coordinates(
+        {NEAR_DATACENTER: (manager_heartbeat("manager-leader", MANAGER_LEADER_UDP), 1, 1)}
+    )
+    gate._pending_probe_start[MANAGER_LEADER_UDP] = gate._clock.monotonic() - 0.02
+
+    await gate._process_vivaldi_piggyback(manager_coordinate_payload(4.0), MANAGER_LEADER_UDP)
+
+    assert gate._get_datacenter_coordinate(NEAR_DATACENTER) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_heartbeat_naming_no_udp_address_has_no_coordinate() -> None:
+    gate = gate_learning_coordinates(
+        {NEAR_DATACENTER: (manager_heartbeat("manager-leader", ("", 0)), 1, 1)}
+    )
+    await gate._process_vivaldi_piggyback(manager_coordinate_payload(7.0), MANAGER_LEADER_UDP)
+
+    assert gate._get_datacenter_coordinate(NEAR_DATACENTER) is None
 
 
 @pytest.mark.asyncio

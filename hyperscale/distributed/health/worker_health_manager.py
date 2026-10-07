@@ -574,11 +574,20 @@ class WorkerHealthManager:
         whether this was it. A workflow never seen as an extension
         request locally still informs its class's posterior: the
         tuner needs only the outcome kind and progress fraction.
+
+        A workflow that COMPLETED ends its worker's extension cycle
+        (AD-26: "reset extension tracker when worker completes
+        successfully"): the worker's tracker and failure count reset, so
+        its grants are budgeted per cycle, not over its lifetime. Only
+        the first copy resets: a late gossip repeat must not wipe grants
+        made since.
         """
         self._ledger.record_outcome(event)
         if not self._applied_outcomes.admit(event.workflow_id, self._clock.monotonic()):
             return False
         self._alpha_tuner.apply_outcome(event)
+        if event.outcome_kind == ExtensionOutcomeKind.COMPLETED:
+            self.on_worker_healthy(event.worker_id)
         return True
 
     @property

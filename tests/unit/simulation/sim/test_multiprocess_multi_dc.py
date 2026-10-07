@@ -106,6 +106,16 @@ def test_job_completes_across_multi_dc_topology():
     }
     assert final_health == {"dc-east": "healthy", "dc-west": "healthy"}, gate_log
 
+    # AD-35 -> AD-36: the gate learns each datacenter's Vivaldi
+    # coordinate from its manager's SWIM traffic and keeps it, so the
+    # router's latency estimate has the coordinate input. Looked up under
+    # the manager's node id (SWIM keys coordinates by UDP address), it
+    # never found one.
+    final_coordinate_known = {
+        entry[1]: entry[2] for entry in gate_log if entry[0] == "dc-coordinate"
+    }
+    assert final_coordinate_known == {"dc-east": True, "dc-west": True}, gate_log
+
     # Same invariant from the managers' side: no fault was injected, so
     # neither manager may lose its worker at any point in the run.
     for manager_name in ("manager-dc-east", "manager-dc-west"):
