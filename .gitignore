@@ -24,3 +24,6 @@ dev.yaml
 *.lock
 .DS_Store
 .scratch/
+
+# Generated cluster secrets (docker/cluster/compose.yml)
+docker/cluster/.env

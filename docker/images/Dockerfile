@@ -51,7 +51,8 @@ COPY pyproject.toml /opt/uv-tools/hyperscale/pyproject.toml
 RUN groupadd --gid ${USER_GID} ${USERNAME} \
     && useradd --uid ${USER_UID} --gid ${USER_GID} --create-home ${USERNAME} \
     && mkdir /tests \
-    && chown -R ${USERNAME}:${USER_GID} /tests
+    && chown -R ${USERNAME}:${USER_GID} /tests \
+    && install -d -o ${USER_UID} -g ${USER_GID} /var/lib/hyperscale
 
 WORKDIR /tests
 

@@ -1,0 +1,5 @@
+{
+    "logs_directory": "/var/lib/hyperscale",
+    "server_port": 8790,
+    "terminal_mode": "full"
+}
