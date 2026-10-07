@@ -40,6 +40,9 @@ class ClientJobResult:
     # reported, and the datacenters it stopped waiting for
     completion_reason: str = ""
     unreported_datacenters: list[str] = field(default_factory=list)
+    # False while late datacenter results may still update the result
+    # (AD-44 late-result ``update`` policy).
+    is_final: bool = True
     # Reporter results (populated as reporters complete)
     reporter_results: dict[str, ClientReporterResult] = field(
         default_factory=dict

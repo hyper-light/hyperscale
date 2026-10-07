@@ -45,8 +45,7 @@ D-83/84), and AD-44 late results / `RETRY_BUDGET_DEFAULT` (P-AD44-1, A3-G-50).
    About 1,567 functions are over the ceiling, 245 of them in `distributed/`. The ratchet holds the line. Size L.
 6. ~~**AD-26-2: the H8 outcome posterior is learned and gossiped but never read.**~~ BUILT (9b29a188).
    `alpha_budget` weights H6's α by the class's failure posterior; a K-S test at that α confirms a BOCPD change point before a deny; the H6 witness is fed per-interval rates from progress reports. See the AD26-2 entry below.
-7. **P-AD44-1 / A3-G-50: late datacenter results are acked silently after the job completes.**
-   There is no policy, no `LateDatacenterResult` log, and none of the AD-44 metrics or logs. `RETRY_BUDGET_DEFAULT` is 10 against the doc's 20; both are still under "Needs you". Size S.
+7. **P-AD44-1 / A3-G-50: CLOSED.** Late DC results follow `BEST_EFFORT_LATE_RESULT_POLICY` (`log` default: `LateDatacenterResult`, not aggregated; `update`: provisional release, straggler fold and re-push, AD-38 terminal once at window close). The four AD-44 metrics and three log models exist; `RETRY_BUDGET_DEFAULT` stays 10, decided on evidence (AD_44.md Part 6).
 8. ~~**AD-24-1: the nodes ignore Env `RATE_LIMIT_*` and `get_rate_limit_config()`.**~~ BUILT (864f4fda).
    `AdaptiveRateLimitConfig.from_env` derives every limit from the node's Env (`reliability/rate_limit_derivation.py`); the hand-set `RateLimitConfig` and the unused client-side `CooperativeRateLimiter` are deleted (925b345c).
 9. **Unmeasured performance claims (P-AD52-3, A2-G-264/258/247, R-G3/35/39).**
@@ -112,10 +111,10 @@ P-AUDIT-1, P-COMPLIANCE-1, P-AD52-1/2/3, P-AD52PLAN-2/3) plus the 11 rows of
 - Exists: every mechanism the targets measure (ClusterMembership, `RaftNode.read_index`, `handle_watch` at `hyperscale/distributed/cluster/cluster_membership.py:1856`); phi accrual measured once in the AD text (8.7s/22s).
 - Missing: no benchmark/probe for any §16 row — `tests/benchmarks/` does not exist, no probe script names a §16 metric (REMAINING_WORK_PLAN Phase 9 "Probes you run … AD-52 §16 benchmarks" still open). Rest of PLAN-3 is built or doc-obsolete (below); the plan's "24h chaos nightly" (PLAN 5.1) is the `vopr` job in `.github/workflows/ci.yml:112-129` (180 min cap) with `--sim-vopr-count`/`HYPERSCALE_SIM_SOAK` still untuned (plan Phase 3 "Remaining").
 
-#### P-AD44-1 — Retry-budget default and late-DC-result policy — STILL PARTIAL — size S
-- Doc: AD_44.md:126 `RETRY_BUDGET_DEFAULT: int = 20`; AD_44.md:95-99 "Late DC Results … Result logged but not aggregated (default) OR: Job result updated with late DC data (configurable)".
-- Exists: wire fields `retry_budget`, `retry_budget_per_workflow`, `best_effort`, `best_effort_min_dcs`, `best_effort_deadline_seconds` (`models/job_submission.py:79-89`), client kwargs (`nodes/client/submission.py:125-194`), dispatcher uses `submission.retry_budget` (`jobs/workflow_dispatcher.py:209`), `BestEffortManager` built at `nodes/gate/server.py:865`, applied :8103-8155; tests `tests/unit/simulation/sim/test_multiprocess_best_effort.py`, `tests/unit/distributed/gate/test_gate_best_effort_result_order.py`. Late pushes are acked without re-aggregation (`nodes/gate/server.py:488-498`, `_finalized_workflow_results`).
-- Missing: `env.py:534` `RETRY_BUDGET_DEFAULT = 10` vs doc 20 (plan "Needs you": measure, then decide); late DC results are neither logged as such nor configurable to update the job result (no `LateDatacenterResult` anywhere in `hyperscale/`).
+#### P-AD44-1 — Retry-budget default and late-DC-result policy — BUILT (2026-10-06)
+- Late results: `BEST_EFFORT_LATE_RESULT_POLICY` (`env/env.py`, `reliability/late_result_policy.py`); gate `_is_late_datacenter_result` / `_log_late_datacenter_result` (log), `_release_provisional_result` / `_fold_straggler_result` (update); AD_44.md "Late DC Results".
+- `RETRY_BUDGET_DEFAULT = 10` kept on merit (SRE/Finagle/Envoy floors, sweep over `RetryBudgetManager`); reasoning in the Env comment and AD_44.md Part 6.
+- Tests: `tests/unit/simulation/sim/test_multiprocess_best_effort_late_results.py`, `tests/unit/distributed/reliability/test_ad44_late_results_and_observability.py`.
 
 #### P-COMPLIANCE-1 — Gate compliance report "no action items" — STILL PARTIAL — size S
 - Doc: gate AD compliance report (2026-01-13) "fully compliant / Action Items: None".
@@ -281,10 +280,8 @@ Counts: old P/A 28/7 → Built 18 · Doc-obsolete 15 · Still Partial 2 · Still
 - Exists: `batch_max_size` constructor param (`hyperscale/logging/streams/logger_stream.py:110`); FSYNC_BATCH timer (`:1290-1295`). The `enable_coalescing`/per-path WALWriter half is Doc-obsolete (see A3-G-6).
 - Missing: `self._batch_timeout_ms: int = 10` is hardcoded (`logger_stream.py:179`), not a constructor/config parameter.
 
-#### A3-G-50 — AD-44 best-effort: late-result policy and observability — STILL PARTIAL — size S
-- Doc: AD_44.md "Late DC Results … Result logged but not aggregated (default) OR: Job result updated with late DC data (configurable)", `BEST_EFFORT_LATE_RESULT_POLICY`; Part 7 metrics `retry_budget_consumed_total`, `retry_budget_exhausted_total`, `best_effort_completions_total{reason}`, `best_effort_completion_ratio`; logs `RetryBudgetExhausted`, `BestEffortCompletion`, `LateDatacenterResult`.
-- Exists: best-effort is wired end to end — `BestEffortManager` built `nodes/gate/server.py:865`, deadline loop `:1388`, tracking `:8097-8110`, takeover resume `:8112-8127`, completion on policy `:8292`, cleanup `:9254`; tests `tests/unit/distributed/gate/test_gate_best_effort_result_order.py`, `tests/unit/simulation/sim/test_multiprocess_best_effort.py`.
-- Missing: a DC result arriving after the claimed completion is dropped silently by `_claim_job_completion` (`gate/server.py:3849-3855`) — no `LateDatacenterResult` log, no update-result option, no `BEST_EFFORT_LATE_RESULT_POLICY` Env field (grep zero). None of the four AD-44 metrics or the two other log models exist (grep zero). Plan "Needs you" still lists the late-result policy (P-AD44-1) as undecided.
+#### A3-G-50 — AD-44 best-effort: late-result policy and observability — BUILT (2026-10-06)
+- Late-result policy as P-AD44-1. Metrics `retry_budget_consumed_total`, `retry_budget_exhausted_total` (manager), `best_effort_completions_total{reason}`, `best_effort_completion_ratio{job_id}`, `best_effort_late_results_total{outcome}` (gate) via `ClusterMetricsReply` / `hyperscale cluster --metrics`; logs `RetryBudgetExhausted` (`RetryBudgetManager.check_and_consume`), `BestEffortCompletion`, `LateDatacenterResult` (gate). AD_44.md Part 7.
 
 ### Now Built / Doc-obsolete
 - A3-G-12 F_FULLFSYNC on darwin — Built: `hyperscale/core/runtime/real_filesystem.py:37-49,179-191` (`_sync_durably`, ENOTSUP-family fallback to fsync), used by `fsync`/`write_flush`/`append_fsync`/`atomic_write`; test `tests/unit/core/test_real_filesystem_durable_sync.py`.

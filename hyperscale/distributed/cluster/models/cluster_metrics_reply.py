@@ -18,7 +18,15 @@ class ClusterMetricsReply(Message):
     AD-36 routing counters (``routing``, ``GateJobRouter.get_metrics``);
     and its AD-52 section 10 watch of each datacenter's managers
     (``datacenter_watches``): the view's staleness in seconds, whether the
-    watch is disconnected (1.0) or not (0.0), and the index it applied."""
+    watch is disconnected (1.0) or not (0.0), and the index it applied.
+
+    AD-44: a manager adds, per job whose retry budget it holds, the retries
+    consumed (``retry_budget_consumed``) and those refused for a spent
+    budget (``retry_budget_exhausted``); a gate adds its best-effort
+    completions by reason (``best_effort_completions``), the completion
+    ratio of each best-effort job it still holds
+    (``best_effort_completion_ratio``) and its late datacenter results by
+    outcome (``best_effort_late_results``: ``logged`` / ``updated``)."""
 
     member_id: str
     formation: str
@@ -39,3 +47,8 @@ class ClusterMetricsReply(Message):
     route_learning: dict[str, dict[str, float]] = field(default_factory=dict)
     routing: dict[str, int] = field(default_factory=dict)
     datacenter_watches: dict[str, dict[str, float]] = field(default_factory=dict)
+    retry_budget_consumed: dict[str, int] = field(default_factory=dict)
+    retry_budget_exhausted: dict[str, int] = field(default_factory=dict)
+    best_effort_completions: dict[str, int] = field(default_factory=dict)
+    best_effort_completion_ratio: dict[str, float] = field(default_factory=dict)
+    best_effort_late_results: dict[str, int] = field(default_factory=dict)

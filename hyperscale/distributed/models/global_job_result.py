@@ -44,3 +44,8 @@ class GlobalJobResult(Message):
     # was lost (counted in the totals; the replacement's final result is
     # among the per-datacenter results).
     datacenter_substitutions: list[DatacenterSubstitution] = field(default_factory=list)
+    # AD-44 late-result ``update`` policy: False while the unreported
+    # datacenters still run and their results may update this one (the
+    # gate pushes it again as each reports, and a last time, final, when
+    # all reported or the job's best-effort deadline passed).
+    is_final: bool = True

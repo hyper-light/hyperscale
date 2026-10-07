@@ -15,6 +15,7 @@ workflow against a local server that counts its open connections.
 """
 
 import asyncio
+import pathlib
 
 import pytest
 
@@ -26,6 +27,14 @@ from hyperscale.testing import URL, HTTPResponse
 VUS = 5
 DURATION_SECONDS = 2.0
 HTTP_OK = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok"
+
+
+@pytest.fixture(autouse=True)
+def log_under_tmp_path(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner logs to files under the working directory when no logging
+    directory reaches its logger's context: this test's own tmp_path, never
+    the working tree."""
+    monkeypatch.chdir(tmp_path)
 
 
 class ConnectionCountingServer:

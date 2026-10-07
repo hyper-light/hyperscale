@@ -273,5 +273,35 @@ def _prometheus_text(reply: ClusterMetricsReply) -> str:
                 ),
             )
         ),
+        *_ad44_metric_lines(member, reply),
     ]
     return "\n".join(lines) + "\n"
+
+
+def _ad44_metric_lines(member: str, reply: ClusterMetricsReply) -> list[str]:
+    """The AD-44 metrics: retry budgets (managers, per job holding a budget)
+    and best-effort completion (gates)."""
+    metric_specs = (
+        ("retry_budget_consumed_total", "counter", "job_id", reply.retry_budget_consumed),
+        ("retry_budget_exhausted_total", "counter", "job_id", reply.retry_budget_exhausted),
+        ("best_effort_completions_total", "counter", "reason", reply.best_effort_completions),
+        ("best_effort_completion_ratio", "gauge", "job_id", reply.best_effort_completion_ratio),
+        ("best_effort_late_results_total", "counter", "outcome", reply.best_effort_late_results),
+    )
+    return [line for metric_spec in metric_specs for line in _labelled_metric_lines(member, *metric_spec)]
+
+
+def _labelled_metric_lines(
+    member: str,
+    metric_name: str,
+    metric_type: str,
+    label_name: str,
+    values: dict[str, int] | dict[str, float],
+) -> list[str]:
+    """One metric's type line and a sample per label value; nothing when it has no samples."""
+    if not values:
+        return []
+    return [f"# TYPE {metric_name} {metric_type}"] + [
+        f'{metric_name}{{member="{member}",{label_name}="{label_value}"}} {value}'
+        for label_value, value in sorted(values.items())
+    ]

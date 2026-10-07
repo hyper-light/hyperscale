@@ -531,6 +531,22 @@ class Env(BaseModel):
     # AD-44: Retry Budget Configuration
     RETRY_BUDGET_MAX: StrictInt = 50
     RETRY_BUDGET_PER_WORKFLOW_MAX: StrictInt = 5
+    # A job's total workflow retries (re-dispatches after a failed dispatch
+    # or a lost worker) when it names none. With the per-workflow cap of 3
+    # retries (the SRE book's per-request limit is of that order: a request
+    # that "has already failed three times" is not retried, "Handling
+    # Overload"), a job of W workflows adds at most min(budget, 3W)
+    # dispatches in a storm; the job budget binds from W >= 4. 10 is the
+    # absolute floor established retry budgets keep for small callers
+    # (Finagle RetryBudget: 20% of requests "on top of 10 retries per
+    # second"; Envoy retry_budget: min_retry_concurrency 3) -- hyperscale
+    # jobs are small callers (a handful of workflows). It lets a job of up
+    # to 10 workflows survive the loss of a worker running all of them; 20
+    # (the original design figure, given no rationale) doubles the
+    # per-job storm bound and only changes outcomes for jobs of 4+
+    # workflows losing workers 3 times, 6+ twice or 11+ once (sweep over
+    # RetryBudgetManager, AD_44.md Part 6). A larger job names its own
+    # ``retry_budget`` at submission (up to RETRY_BUDGET_MAX).
     RETRY_BUDGET_DEFAULT: StrictInt = 10
     RETRY_BUDGET_PER_WORKFLOW_DEFAULT: StrictInt = 3
 
@@ -539,6 +555,16 @@ class Env(BaseModel):
     BEST_EFFORT_DEADLINE_DEFAULT: StrictFloat = 300.0
     BEST_EFFORT_MIN_DCS_DEFAULT: StrictInt = 1
     BEST_EFFORT_DEADLINE_CHECK_INTERVAL: StrictFloat = 5.0
+    # What a datacenter result that arrives after its best-effort job
+    # completed does (AD-44 "Late DC Results"). "log": it is logged
+    # (LateDatacenterResult) and not aggregated -- the job ends at once and
+    # its unreported datacenters are cancelled. "update": a job completed
+    # by reaching its min_dcs hands the client that result at once, lets
+    # the unreported datacenters run on, folds each one's result into the
+    # job result and pushes it again, and records the job's durable
+    # terminal (AD-38) once every datacenter reported or the job's
+    # best-effort deadline passed -- the bound the job itself declared.
+    BEST_EFFORT_LATE_RESULT_POLICY: Literal["log", "update"] = "log"
 
     # AD-45: Adaptive Route Learning. The EWMA weight of each new observed
     # latency sample: a datacenter's time to accept a dispatch is a round
@@ -1227,6 +1253,7 @@ class Env(BaseModel):
             "BEST_EFFORT_DEADLINE_DEFAULT": float,
             "BEST_EFFORT_MIN_DCS_DEFAULT": int,
             "BEST_EFFORT_DEADLINE_CHECK_INTERVAL": float,
+            "BEST_EFFORT_LATE_RESULT_POLICY": str,
             # Gate settings
             "GATE_JOB_CLEANUP_INTERVAL": float,
             "GATE_RATE_LIMIT_CLEANUP_INTERVAL": float,
@@ -1580,23 +1607,6 @@ class Env(BaseModel):
                 self.OVERLOAD_MEMORY_STRESSED,
                 self.OVERLOAD_MEMORY_OVERLOADED,
             ),
-        )
-
-    def get_reliability_config(self):
-        """Get retry budget and best-effort configuration (AD-44)."""
-        from hyperscale.distributed.reliability.reliability_config import (
-            ReliabilityConfig,
-        )
-
-        return ReliabilityConfig(
-            retry_budget_max=self.RETRY_BUDGET_MAX,
-            retry_budget_per_workflow_max=self.RETRY_BUDGET_PER_WORKFLOW_MAX,
-            retry_budget_default=self.RETRY_BUDGET_DEFAULT,
-            retry_budget_per_workflow_default=self.RETRY_BUDGET_PER_WORKFLOW_DEFAULT,
-            best_effort_deadline_max=self.BEST_EFFORT_DEADLINE_MAX,
-            best_effort_deadline_default=self.BEST_EFFORT_DEADLINE_DEFAULT,
-            best_effort_min_dcs_default=self.BEST_EFFORT_MIN_DCS_DEFAULT,
-            best_effort_deadline_check_interval=self.BEST_EFFORT_DEADLINE_CHECK_INTERVAL,
         )
 
     def get_worker_health_manager_config(self):

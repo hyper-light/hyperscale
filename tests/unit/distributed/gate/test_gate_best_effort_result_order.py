@@ -52,7 +52,7 @@ def make_gate(events: list[str]) -> GateServer:
     gate._finalize_terminal_job = finalize_terminal_job
     gate._handle_update_by_tier = lambda *args: events.append("tier-update")
     gate._job_manager = SimpleNamespace(lock_job=lock_job, get_job=lambda job_id: None)
-    gate._best_effort_manager = SimpleNamespace(cleanup=best_effort_cleanup)
+    gate._best_effort_manager = SimpleNamespace(cleanup=best_effort_cleanup, has_state=lambda job_id: False)
     gate._task_runner = SimpleNamespace(run=run)
     gate._dispatch_to_reporters = SimpleNamespace(__name__="_dispatch_to_reporters")
     gate._abandon_unreported_datacenters = SimpleNamespace(__name__="_abandon_unreported_datacenters")

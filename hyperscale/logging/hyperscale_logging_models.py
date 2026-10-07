@@ -636,3 +636,49 @@ class DiscoveryDnsLookupFailed(Entry, kw_only=True):
     cluster_id: str
     error: str
     level: LogLevel = LogLevel.WARN
+
+
+class RetryBudgetExhausted(Entry, kw_only=True):
+    """AD-44: a workflow's retry was refused -- its job's retry budget
+    (``scope`` ``job``) or its own per-workflow cap (``workflow``) is spent,
+    ``consumed`` of ``budget`` -- so the workflow fails for good."""
+
+    node_id: str
+    datacenter: str
+    job_id: str
+    workflow_id: str
+    scope: str
+    consumed: int
+    budget: int
+    level: LogLevel = LogLevel.WARN
+
+
+class BestEffortCompletion(Entry, kw_only=True):
+    """AD-44: a best-effort job completed on its policy (``reason``) with
+    the datacenters that reported, ``completion_ratio`` of its targets;
+    ``unreported_datacenters`` never reported. ``final`` is False for a
+    result the late-result ``update`` policy may still update."""
+
+    node_id: str
+    job_id: str
+    reason: str
+    success: bool
+    completion_ratio: float
+    unreported_datacenters: list[str]
+    final: bool
+    level: LogLevel = LogLevel.INFO
+
+
+class LateDatacenterResult(Entry, kw_only=True):
+    """AD-44: a datacenter's final result arrived after its job completed.
+    ``outcome`` is ``logged`` (not aggregated: the job result stands) or
+    ``updated`` (folded into the job result, which went to the client
+    again)."""
+
+    node_id: str
+    job_id: str
+    datacenter_id: str
+    datacenter_status: str
+    job_status: str
+    outcome: str
+    level: LogLevel = LogLevel.WARN

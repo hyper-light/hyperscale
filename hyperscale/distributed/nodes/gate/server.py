@@ -223,6 +223,8 @@ from hyperscale.distributed.capacity import (
     SpilloverEvaluator,
 )
 from hyperscale.distributed.reliability.best_effort_manager import BestEffortManager
+from hyperscale.distributed.reliability.best_effort_metrics import BEST_EFFORT_REASON_PREFIX, BestEffortMetrics
+from hyperscale.distributed.reliability.models import BestEffortDecision
 from hyperscale.distributed.reliability.reliability_config import (
     create_reliability_config_from_env,
 )
@@ -234,6 +236,8 @@ from hyperscale.distributed.slo.resource_aware_predictor import (
 )
 from hyperscale.logging import LogLevel
 from hyperscale.logging.hyperscale_logging_models import (
+    BestEffortCompletion,
+    LateDatacenterResult,
     ClusterWatchConnectivityChanged,
     DatacenterRegenerated,
     ServerInfo,
@@ -870,6 +874,7 @@ class GateServer(HealthAwareServer):
             clock=self._clock,
             completion_handler=self._complete_best_effort_job,
         )
+        self._best_effort_metrics = BestEffortMetrics()
         self._stats_coordinator = GateStatsCoordinator(
             clock=self._clock,
             client_push_timeout_seconds=self._tcp_timeout_short,
@@ -1403,6 +1408,7 @@ class GateServer(HealthAwareServer):
         # probing.
         await self._raft.start()
         await self._replication_coordinator.apply_recovered_replicas(recovered_replica_job_ids)
+        await self._restore_provisional_releases(recovered_replica_job_ids)
         await self._cluster_membership.start()
         self._task_runner.run(self._clock_offset_prober.run, alias="clock_offset_prober")
 
@@ -3772,12 +3778,23 @@ class GateServer(HealthAwareServer):
             )
 
     async def _complete_job(self, job_id: str, result: object) -> bool:
-        """Complete a job and notify client."""
+        """Complete a job and notify client. A datacenter's result for a
+        best-effort job whose result went out provisionally (AD-44 late-result
+        ``update`` policy) updates that result instead."""
         if not isinstance(result, JobFinalResult):
             return False
 
+        apply_final_result = (
+            self._fold_straggler_result
+            if self._best_effort_manager.is_released(job_id)
+            else self._complete_with_final_result
+        )
+        return await apply_final_result(job_id, result)
+
+    async def _complete_with_final_result(self, job_id: str, result: JobFinalResult) -> bool:
+        """Record a datacenter's final result; finish the job once it completes it."""
         async with self._job_manager.lock_job(job_id):
-            previous_status = await self._completable_job_status_locked(job_id)
+            previous_status = await self._completable_job_status_locked(job_id, result)
 
         if previous_status is None:
             return False
@@ -3787,7 +3804,7 @@ class GateServer(HealthAwareServer):
 
         return True
 
-    async def _completable_job_status_locked(self, job_id: str) -> str | None:
+    async def _completable_job_status_locked(self, job_id: str, result: JobFinalResult) -> str | None:
         """The job's status when a final result may complete it; None (after logging) for an unknown or ended job."""
         job = self._job_manager.get_job(job_id)
         if not job:
@@ -3816,21 +3833,44 @@ class GateServer(HealthAwareServer):
             )
             return None
 
-        if await self._ignores_duplicate_final_result(job_id, job):
+        if await self._ignores_duplicate_final_result(job_id, job, result):
             return None
 
         return job.status
 
-    async def _ignores_duplicate_final_result(self, job_id: str, job: GlobalJobStatus) -> bool:
-        """True (after logging) when the job is already terminal: the final result is a duplicate."""
+    async def _ignores_duplicate_final_result(
+        self,
+        job_id: str,
+        job: GlobalJobStatus,
+        result: JobFinalResult,
+    ) -> bool:
+        """True (after logging) when the job is already terminal: the final
+        result is a duplicate, or a late datacenter's (AD-44), not aggregated."""
         terminal_statuses = {
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
             JobStatus.CANCELLED.value,
             JobStatus.TIMEOUT.value,
         }
-        if job.status not in terminal_statuses:
+        # A provisionally released job (AD-44 ``update``) has not ended: a
+        # result that raced its release still counts toward completing it.
+        if job.status not in terminal_statuses or self._best_effort_manager.is_released(job_id):
             return False
+
+        await self._log_final_result_for_ended_job(job_id, job, result)
+        return True
+
+    async def _log_final_result_for_ended_job(
+        self,
+        job_id: str,
+        job: GlobalJobStatus,
+        result: JobFinalResult,
+    ) -> None:
+        """Log a final result for an ended job: a late datacenter's (AD-44
+        ``LateDatacenterResult``), or a duplicate."""
+        if self._is_late_datacenter_result(job_id, job, result):
+            await self._log_late_datacenter_result(result, job.status, "logged")
+            return
 
         await self._udp_logger.log(
             ServerDebug(
@@ -3843,7 +3883,40 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-        return True
+
+    def _is_late_datacenter_result(self, job_id: str, job: GlobalJobStatus, result: JobFinalResult) -> bool:
+        """A target datacenter's first final result for a job that ended
+        without it -- not a cancellation's confirmation (AD-44)."""
+        return (
+            job.status != JobStatus.CANCELLED.value
+            and result.datacenter in self._job_manager.get_target_dcs(job_id)
+            and result.datacenter not in self._job_manager.get_all_dc_results(job_id)
+        )
+
+    async def _log_late_datacenter_result(
+        self,
+        result: JobFinalResult,
+        job_status: str,
+        outcome: str,
+    ) -> None:
+        """Count and log a datacenter result that arrived after its job
+        completed: ``logged`` (not aggregated) or ``updated`` (AD-44)."""
+        self._best_effort_metrics.record_late_result(outcome)
+        await self._udp_logger.log(
+            LateDatacenterResult(
+                message=(
+                    f"Late final result of job {result.job_id[:8]}... from DC "
+                    f"{result.datacenter} (status={result.status}): {outcome}"
+                ),
+                node_id=self._node_id.short,
+                job_id=result.job_id,
+                datacenter_id=result.datacenter,
+                datacenter_status=result.status,
+                job_status=job_status,
+                outcome=outcome,
+                level=LogLevel.INFO if outcome == "updated" else LogLevel.WARN,
+            )
+        )
 
     async def _finish_claimed_completion(
         self,
@@ -3851,11 +3924,263 @@ class GateServer(HealthAwareServer):
         previous_status: str,
         global_result: GlobalJobResult | None,
     ) -> None:
-        """Finish the job with its global result, once, when the result completes it."""
-        if global_result and await self._claim_job_completion(job_id):
+        """Finish the job with its global result, once, when the result
+        completes it -- or, for a provisional best-effort result (AD-44
+        ``update`` policy), hand it out while the job runs on."""
+        if global_result is None:
+            return
+        finish = self._finish_final_completion if global_result.is_final else self._release_provisional_result
+        await finish(job_id, previous_status, global_result)
+
+    async def _finish_final_completion(
+        self,
+        job_id: str,
+        previous_status: str,
+        global_result: GlobalJobResult,
+    ) -> None:
+        """Finish the job with its final global result, once."""
+        if await self._claim_job_completion(job_id):
             await self._finish_job_with_global_result(
                 job_id, previous_status, global_result
             )
+
+    async def _release_provisional_result(
+        self,
+        job_id: str,
+        previous_status: str,
+        global_result: GlobalJobResult,
+    ) -> None:
+        """AD-44 ``update`` policy: the job reached its ``min_dcs`` -- the
+        client gets its result now, while its unreported datacenters run on.
+        Its durable terminal (AD-38), reporters and the cancellation of
+        datacenters still unreported wait until every datacenter reported
+        or its deadline passed (``_finish_job_with_global_result``)."""
+        await self._release_results_before_partial_completion(job_id, global_result)
+        await self._publish_provisional_result(job_id, global_result)
+        self._handle_update_by_tier(job_id, previous_status, global_result.status, None)
+        await self._log_best_effort_completion(job_id, global_result, self._best_effort_metrics.record_completion)
+
+    async def _publish_provisional_result(self, job_id: str, global_result: GlobalJobResult) -> None:
+        """Hold and push a provisional result -- once it is committed in the
+        job's replica, so a gate leading the job after a restart or a
+        takeover holds every datacenter result the client received -- and
+        never after the job completed for good (its final result
+        supersedes it)."""
+        if not await self._replicate_provisional_result(job_id, global_result):
+            await self._log_provisional_result_withheld(job_id)
+            return
+
+        async with self._job_manager.lock_job(job_id):
+            if job_id in self._job_completion_claimed:
+                return
+            self._apply_global_result_to_job_locked(job_id, global_result)
+
+        await self._push_global_job_result(global_result)
+
+    async def _replicate_provisional_result(self, job_id: str, global_result: GlobalJobResult) -> bool:
+        """Commit the provisional result and the job's deadline (wall
+        clock) in its replica, durably on a quorum of gates (A2-G-266);
+        False when no quorum committed it."""
+        provisional_payload = global_result.dump()
+        deadline_wall_time = self._clock.time() + self._best_effort_manager.remaining_seconds(job_id)
+        return await self._replication_coordinator.revise_committed_replica(
+            job_id,
+            lambda committed: self._with_provisional_result(
+                committed, global_result, provisional_payload, deadline_wall_time
+            ),
+            peer_addrs=list(self._modular_state.get_active_peers_list()),
+            quorum_size=self._quorum_size(),
+        )
+
+    def _with_provisional_result(
+        self,
+        committed: GateJobReplica,
+        global_result: GlobalJobResult,
+        provisional_payload: bytes,
+        deadline_wall_time: float,
+    ) -> GateJobReplica | None:
+        """The replica holding this provisional result; None when it holds
+        one with more datacenters already (revisions may commit out of the
+        order their results were built in -- results only grow)."""
+        if self._provisional_datacenter_count(committed) > len(global_result.per_datacenter_results):
+            return None
+        return dataclasses.replace(
+            committed,
+            provisional_result=provisional_payload,
+            provisional_deadline_wall_time=deadline_wall_time,
+        )
+
+    @staticmethod
+    def _provisional_datacenter_count(replica: GateJobReplica) -> int:
+        """Datacenter results in the replica's provisional result (0 without one)."""
+        if not replica.provisional_result:
+            return 0
+        return len(GlobalJobResult.load(replica.provisional_result).per_datacenter_results)
+
+    async def _log_provisional_result_withheld(self, job_id: str) -> None:
+        """A provisional result no quorum committed is not handed out: the
+        job's result reaches the client when its window closes."""
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"Provisional result of job {job_id[:8]}... not pushed: no quorum "
+                    "of gates committed it; the final result follows when its window closes"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _restore_provisional_releases(self, job_ids: list[str]) -> None:
+        """After a restart: resume the provisional window (AD-44 ``update``)
+        of each recovered job this gate leads."""
+        for job_id in job_ids:
+            await self._restore_provisional_release(job_id)
+
+    async def _restore_provisional_release(self, job_id: str) -> None:
+        """Resume a job's provisional window from its committed replica when
+        this gate leads it: the datacenter results the client received are
+        the job's again, its deadline is the one it had."""
+        replica = self._replication_coordinator.get_committed_replica(job_id)
+        if not self._resumes_provisional_release(job_id, replica):
+            return
+        provisional_result = GlobalJobResult.load(replica.provisional_result)
+        await self._best_effort_manager.restore_release(
+            job_id,
+            set(replica.target_dcs),
+            self._restored_datacenter_outcomes(job_id, provisional_result),
+            provisional_result.completion_reason.removeprefix(BEST_EFFORT_REASON_PREFIX),
+            replica.provisional_deadline_wall_time - self._clock.time(),
+        )
+        async with self._job_manager.lock_job(job_id):
+            self._apply_global_result_to_job_locked(job_id, provisional_result)
+
+    def _resumes_provisional_release(self, job_id: str, replica: GateJobReplica | None) -> bool:
+        """The replica holds a provisional result of a job this gate leads and does not track yet."""
+        return self._holds_provisional_result(replica) and self._leads_untracked_job(job_id)
+
+    @staticmethod
+    def _holds_provisional_result(replica: GateJobReplica | None) -> bool:
+        """The replica holds a provisional result (AD-44 ``update``)."""
+        return replica is not None and bool(replica.provisional_result)
+
+    def _leads_untracked_job(self, job_id: str) -> bool:
+        """This gate leads the job and tracks no best-effort state for it."""
+        return self._job_leadership_tracker.is_leader(job_id) and not self._best_effort_manager.has_state(job_id)
+
+    def _restored_datacenter_outcomes(self, job_id: str, provisional_result: GlobalJobResult) -> dict[str, bool]:
+        """Hold each datacenter result of the provisional result as the
+        job's again; each datacenter's outcome (True: completed)."""
+        for datacenter_result in provisional_result.per_datacenter_results:
+            self._job_manager.set_dc_result(job_id, datacenter_result.datacenter, datacenter_result)
+        return {
+            datacenter_result.datacenter: self._normalize_final_status(datacenter_result.status)
+            == JobStatus.COMPLETED.value
+            for datacenter_result in provisional_result.per_datacenter_results
+        }
+
+    async def _fold_straggler_result(self, job_id: str, result: JobFinalResult) -> bool:
+        """AD-44 ``update`` policy: a datacenter's result for a job whose
+        result went out provisionally is folded into the job result, which
+        goes to the client again -- for good once every datacenter reported."""
+        async with self._job_manager.lock_job(job_id):
+            folded_result = await self._fold_straggler_result_locked(result)
+
+        if folded_result is None:
+            return False
+
+        await self._log_late_datacenter_result(result, folded_result.status, "updated")
+        publish = self._finish_final_completion if folded_result.is_final else self._publish_straggler_update
+        await publish(job_id, folded_result.status, folded_result)
+        return True
+
+    async def _fold_straggler_result_locked(self, result: JobFinalResult) -> GlobalJobResult | None:
+        """Store a straggler's result and rebuild the job result from every
+        datacenter's; None for a result that is not a new straggler's.
+
+        Caller holds the job's lock."""
+        target_dcs = set(self._job_manager.get_target_dcs(result.job_id))
+        if await self._rejects_straggler_result(result, target_dcs):
+            return None
+
+        self._job_manager.set_dc_result(result.job_id, result.datacenter, result)
+        decision = await self._best_effort_manager.record_result(
+            result.job_id,
+            result.datacenter,
+            self._normalize_final_status(result.status) == JobStatus.COMPLETED.value,
+        )
+        if decision is None:
+            return None
+        return self._build_best_effort_global_result(
+            result.job_id,
+            self._job_manager.get_all_dc_results(result.job_id),
+            decision.reason,
+            decision.success,
+            is_final=decision.should_complete,
+        )
+
+    async def _rejects_straggler_result(self, result: JobFinalResult, target_dcs: set[str]) -> bool:
+        """True for a result of a job no longer held, a repeat of a
+        datacenter that reported, or (after logging) a datacenter the job
+        moved off."""
+        if not self._job_manager.has_job(result.job_id) or result.datacenter in self._job_manager.get_all_dc_results(
+            result.job_id
+        ):
+            return True
+        return await self._drops_final_result_from_unexpected_dc(result, target_dcs)
+
+    async def _publish_straggler_update(
+        self,
+        job_id: str,
+        previous_status: str,
+        global_result: GlobalJobResult,
+    ) -> None:
+        """Push a released job's updated, still provisional, result and move its ratio."""
+        await self._publish_provisional_result(job_id, global_result)
+        self._best_effort_metrics.record_ratio(
+            job_id,
+            global_result.completion_reason,
+            self._best_effort_manager.completion_ratio(job_id),
+        )
+
+    async def _log_best_effort_completion(
+        self,
+        job_id: str,
+        global_result: GlobalJobResult,
+        record_metric: Callable[[str, str, float], None],
+    ) -> None:
+        """Record (``record_metric``) and log a best-effort job's result
+        going out (AD-44 ``BestEffortCompletion``)."""
+        completion_ratio = self._best_effort_manager.completion_ratio(job_id)
+        record_metric(job_id, global_result.completion_reason, completion_ratio)
+        await self._udp_logger.log(
+            BestEffortCompletion(
+                message=(
+                    f"Best-effort job {job_id[:8]}... completed "
+                    f"({global_result.completion_reason}, final={global_result.is_final})"
+                ),
+                node_id=self._node_id.short,
+                job_id=job_id,
+                reason=global_result.completion_reason,
+                success=global_result.status == JobStatus.COMPLETED.value,
+                completion_ratio=completion_ratio,
+                unreported_datacenters=list(global_result.unreported_datacenters),
+                final=global_result.is_final,
+            )
+        )
+
+    async def _record_best_effort_completion(self, job_id: str, global_result: GlobalJobResult) -> None:
+        """A best-effort job completes for good: count it (unless its result
+        went out provisionally before, already counted) and log it."""
+        if not self._best_effort_manager.has_state(job_id):
+            return
+        record_metric = (
+            self._best_effort_metrics.record_ratio
+            if self._best_effort_manager.is_released(job_id)
+            else self._best_effort_metrics.record_completion
+        )
+        await self._log_best_effort_completion(job_id, global_result, record_metric)
 
     async def _claim_job_completion(self, job_id: str) -> bool:
         """Claim the right to finish ``job_id``; True for exactly one caller."""
@@ -3902,6 +4227,7 @@ class GateServer(HealthAwareServer):
             global_result,
         )
 
+        await self._record_best_effort_completion(job_id, global_result)
         await self._best_effort_manager.cleanup(job_id)
         self._abandon_unreported_in_background(job_id, global_result)
 
@@ -5281,6 +5607,7 @@ class GateServer(HealthAwareServer):
         submission = self._modular_state._job_submissions.get(job_id)
 
         await self._adopt_replicated_ledger_history(job_id, old_leader_id, next_fence_token)
+        await self._restore_provisional_release(job_id)
         await self._resume_best_effort_tracking(job_id, submission, target_dcs)
         await self._resume_takeover_timeout_tracking(job_id, replica, submission, target_dcs)
         self._task_runner.run(
@@ -8144,12 +8471,14 @@ class GateServer(HealthAwareServer):
         per_dc_results: dict[str, JobFinalResult],
         reason: str,
         success: bool,
+        is_final: bool = True,
     ) -> GlobalJobResult:
         """AD-44: the result of a best-effort job from the datacenters that
         reported. It is COMPLETED when the policy judged it a success --
         even with a failed datacenter among them -- and FAILED otherwise;
         datacenters that never reported are listed, not counted as
-        timeouts."""
+        timeouts. ``is_final`` is False for a result that late datacenter
+        results may still update (``update`` policy)."""
         reported_result = self._build_global_job_result(
             job_id, per_dc_results, set(per_dc_results)
         )
@@ -8165,38 +8494,42 @@ class GateServer(HealthAwareServer):
             status=JobStatus.COMPLETED.value if success else JobStatus.FAILED.value,
             completion_reason=f"best_effort: {reason}",
             unreported_datacenters=unreported,
+            is_final=is_final,
         )
 
     async def _complete_best_effort_job(
         self,
         job_id: str,
-        reason: str,
-        success: bool,
+        decision: BestEffortDecision,
     ) -> None:
-        """AD-44 deadline: complete a best-effort job with what reported."""
+        """AD-44 deadline: complete a best-effort job with what reported --
+        for good, or (``update`` policy) provisionally."""
         async with self._job_manager.lock_job(job_id):
             job = self._job_manager.get_job(job_id)
             if self._best_effort_completion_settled(job_id, job):
                 await self._best_effort_manager.cleanup(job_id)
                 return
-            self._job_completion_claimed.add(job_id)
             previous_status = job.status
-            global_result = self._build_best_effort_global_result(
+            global_result = self._best_effort_final_result(
                 job_id,
                 self._job_manager.get_all_dc_results(job_id),
-                reason,
-                success,
+                decision,
             )
 
-        await self._finish_job_with_global_result(job_id, previous_status, global_result)
+        await self._finish_claimed_completion(job_id, previous_status, global_result)
 
     def _best_effort_completion_settled(self, job_id: str, job: GlobalJobStatus | None) -> bool:
-        """True when the job is gone, already terminal, or its completion is claimed (AD-44)."""
+        """True when the job is gone, its completion is claimed, or it ended
+        other than by a provisional release (AD-44)."""
         return (
             job is None
-            or JobStatusOrder().is_terminal(job.status)
             or job_id in self._job_completion_claimed
+            or self._ended_unreleased(job_id, job)
         )
+
+    def _ended_unreleased(self, job_id: str, job: GlobalJobStatus) -> bool:
+        """The job is terminal and not held open by a provisional release (AD-44 ``update`` policy)."""
+        return JobStatusOrder().is_terminal(job.status) and not self._best_effort_manager.is_released(job_id)
 
     async def _abandon_unreported_datacenters(
         self,
@@ -8284,7 +8617,9 @@ class GateServer(HealthAwareServer):
         """Store the DC's final result; decide completion unless the global result was sent already."""
         self._job_manager.set_dc_result(result.job_id, result.datacenter, result)
 
-        if result.job_id in self._job_global_result_sent:
+        # A job whose result went out provisionally (AD-44 ``update``) still
+        # decides: this result may be the one that completes it for good.
+        if result.job_id in self._job_global_result_sent and not self._best_effort_manager.is_released(result.job_id):
             return None, None, target_dcs
 
         return await self._decide_job_final_result_locked(result, target_dcs)
@@ -8317,14 +8652,18 @@ class GateServer(HealthAwareServer):
         self,
         job_id: str,
         per_dc_results: dict[str, JobFinalResult],
-        decision: tuple[bool, str, bool],
+        decision: BestEffortDecision,
     ) -> GlobalJobResult | None:
-        """The best-effort job's global result when its policy completes it, else None (AD-44)."""
-        should_complete, reason, success = decision
-        if not should_complete:
+        """The best-effort job's global result when its policy completes it
+        (provisionally, under the ``update`` policy), else None (AD-44)."""
+        if not decision.should_complete:
             return None
         return self._build_best_effort_global_result(
-            job_id, per_dc_results, reason, success
+            job_id,
+            per_dc_results,
+            decision.reason,
+            decision.success,
+            is_final=not decision.provisional,
         )
 
     def _awaits_remaining_final_results(
@@ -9239,8 +9578,10 @@ class GateServer(HealthAwareServer):
         status_order: JobStatusOrder,
         now: float,
     ) -> bool:
-        """True for a terminal job retained past the max age since it ended."""
-        if not status_order.is_terminal(job.status):
+        """True for a terminal job retained past the max age since it ended
+        -- never while a provisional best-effort release holds it open (its
+        durable terminal is still owed, AD-44)."""
+        if not status_order.is_terminal(job.status) or self._best_effort_manager.is_released(job_id):
             return False
         # Retained for the max age after it ended -- measured from when
         # this gate first found it terminal, however it ended (here, or
@@ -9263,6 +9604,7 @@ class GateServer(HealthAwareServer):
         self._modular_state.clear_job(job_id)
         self._job_leadership_tracker.release_leadership(job_id)
         await self._best_effort_manager.cleanup(job_id)
+        self._best_effort_metrics.forget_job(job_id)
 
         self._job_stats_crdt.pop(job_id, None)
 
@@ -10018,6 +10360,9 @@ class GateServer(HealthAwareServer):
         self._add_route_learning_metrics(reply)
         reply.routing = self._job_router.get_metrics()
         self._add_datacenter_watch_metrics(reply)
+        reply.best_effort_completions = self._best_effort_metrics.completions_by_reason()
+        reply.best_effort_completion_ratio = self._best_effort_metrics.completion_ratio_by_job()
+        reply.best_effort_late_results = self._best_effort_metrics.late_results_by_outcome()
         return reply.dump()
 
     def _add_route_learning_metrics(self, reply: ClusterMetricsReply) -> None:

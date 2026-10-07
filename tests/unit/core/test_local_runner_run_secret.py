@@ -22,6 +22,7 @@ from hyperscale.core.jobs.models import Env
 from hyperscale.core.jobs.protocols.encryption import AESGCMFernet, EncryptionError
 from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow, step
+from hyperscale.reporting.json import JSONConfig
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.testing import URL, HTTPResponse
 
@@ -76,7 +77,7 @@ def spawnable_sys_path(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def make_workflow(target: str) -> Workflow:
+def make_workflow(target: str, results_directory: pathlib.Path) -> Workflow:
     async def hit(self, url: URL = target) -> HTTPResponse:
         return await self.client.http.get(url)
 
@@ -88,6 +89,12 @@ def make_workflow(target: str) -> Workflow:
             "duration": "1s",
             "timeout": "30s",
             "hit": step()(hit),
+            # The default JSON reporter's paths are fixed at import, under
+            # the working directory: the test's results go to its tmp_path.
+            "reporting": JSONConfig(
+                workflow_results_filepath=str(results_directory / "workflow_results.json"),
+                step_results_filepath=str(results_directory / "step_results.json"),
+            ),
         },
     )
     return workflow_class()
@@ -159,7 +166,7 @@ async def test_unconfigured_runner_runs_a_workflow_with_its_own_workers(
     target_port = free_port(socket.SOCK_STREAM)
     target = CountingTarget()
     target_server = await asyncio.start_server(target.answer_http, HOST, target_port)
-    workflow = make_workflow(f"http://{HOST}:{target_port}/")
+    workflow = make_workflow(f"http://{HOST}:{target_port}/", tmp_path)
     # Spawned workers receive the workflow by value, as `hyperscale run
     # workflow` sends it.
     cloudpickle.register_pickle_by_value(sys.modules[__name__])

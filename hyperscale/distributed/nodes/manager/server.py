@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Iterable, NoReturn
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
 from hyperscale.distributed.cluster.cluster_membership import ClusterMembership
-from hyperscale.distributed.cluster.models import ClusterLeaveReply
+from hyperscale.distributed.cluster.models import ClusterLeaveReply, ClusterMetricsReply
 from hyperscale.distributed.jobs.logical_id_generator import LogicalIdGenerator
 from hyperscale.distributed.cluster.joined_peer import JoinedPeer
 from hyperscale.distributed.cluster.joined_peer_store import JoinedPeerStore
@@ -532,7 +532,10 @@ class ManagerServer(HealthAwareServer):
         # Every job's AD-44 retry budget: a failed dispatch and a lost
         # worker charge the same per-workflow budget.
         self._retry_budget_manager = RetryBudgetManager(
-            config=create_reliability_config_from_env(self.env)
+            config=create_reliability_config_from_env(self.env),
+            logger=self._udp_logger,
+            node_id=self._node_id.full,
+            datacenter=self._node_id.datacenter,
         )
         # A workflow moving along its lifecycle is its job's progress (AD-34).
         self._job_manager.workflow_lifecycle.register_observer(
@@ -14574,8 +14577,13 @@ class ManagerServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """This node's metrics of its cluster's membership (AD-52 section
-        18)."""
-        return await self._cluster_membership.handle_metrics(data)
+        18), with its AD-44 retry-budget counters per job."""
+        if not (membership_metrics := await self._cluster_membership.handle_metrics(data)):
+            return membership_metrics
+        reply = ClusterMetricsReply.load(membership_metrics)
+        reply.retry_budget_consumed = self._retry_budget_manager.consumed_by_job()
+        reply.retry_budget_exhausted = self._retry_budget_manager.exhausted_by_job()
+        return reply.dump()
 
     @tcp.receive()
     async def cluster_leave(

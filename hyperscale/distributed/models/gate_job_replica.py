@@ -73,3 +73,12 @@ class GateJobReplica(Message):
     # a retry of the submission at any gate, even after its accepting gate
     # died, is answered for this job instead of admitting a second one.
     idempotency_key: str = ""
+    # AD-44 late-result ``update`` policy: the latest result the job's
+    # leader handed its client provisionally (a serialized
+    # ``GlobalJobResult``, empty when none went out), committed here before
+    # it was pushed, and the wall-clock instant its best-effort window
+    # closes. A gate that leads the job after a restart or a takeover
+    # resumes the window from them, so the job's final result holds every
+    # datacenter result the client already received.
+    provisional_result: bytes = b""
+    provisional_deadline_wall_time: float = 0.0

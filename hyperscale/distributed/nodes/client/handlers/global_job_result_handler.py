@@ -260,7 +260,11 @@ class GlobalJobResultHandler:
         )
 
     def _apply_global_result(self, job: ClientJobResult, result: GlobalJobResult) -> None:
-        """Update the job with the aggregated result, then signal its results and completion."""
+        """Update the job with the aggregated result, then signal its results
+        and completion. A provisional result older than the one held is
+        skipped (AD-44 late-result ``update`` policy: pushes may cross)."""
+        if self._is_stale_provisional(job, result):
+            return
         # Update job with aggregated result
         job.status = result.status
         job.total_completed = result.total_completed
@@ -275,9 +279,22 @@ class GlobalJobResultHandler:
         job.aggregated = result.aggregated
         job.completion_reason = result.completion_reason
         job.unreported_datacenters = list(result.unreported_datacenters)
+        job.is_final = result.is_final
 
         # Signal results complete and job completion
         self._signal_job_complete(result.job_id)
+
+    def _is_stale_provisional(self, job: ClientJobResult, result: GlobalJobResult) -> bool:
+        """A provisional result after the final one, or holding fewer
+        datacenters' results than the one held."""
+        if result.is_final:
+            return False
+        return self._holds_final_result(job) or len(result.per_datacenter_results) < len(job.per_datacenter_results)
+
+    @staticmethod
+    def _holds_final_result(job: ClientJobResult) -> bool:
+        """The job holds a final global result (only global results carry per-datacenter results)."""
+        return job.is_final and bool(job.per_datacenter_results)
 
     def _signal_job_complete(self, job_id: str) -> None:
         """Set the job's results event, then its completion event."""

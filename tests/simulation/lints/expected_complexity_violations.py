@@ -1159,8 +1159,6 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/distributed/reliability/adaptive_rate_limiter.py::AdaptiveRateLimiter.cleanup_inactive_clients': 4,
     'hyperscale/distributed/reliability/adaptive_rate_limiter.py::AdaptiveRateLimiter.reset_client': 4,
     'hyperscale/distributed/reliability/backpressure_signal.py::BackpressureSignal.from_level': 4,
-    'hyperscale/distributed/reliability/best_effort_manager.py::BestEffortManager.check_all_completions': 4,
-    'hyperscale/distributed/reliability/best_effort_state.py::BestEffortState.check_completion': 5,
     'hyperscale/distributed/reliability/hybrid_overload_detector.py::HybridOverloadDetector._calculate_trend': 5,
     'hyperscale/distributed/reliability/hybrid_overload_detector.py::HybridOverloadDetector._get_absolute_state': 5,
     'hyperscale/distributed/reliability/hybrid_overload_detector.py::HybridOverloadDetector._get_delta_state': 14,

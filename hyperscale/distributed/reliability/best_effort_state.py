@@ -20,6 +20,13 @@ class BestEffortState:
     target_dcs: set[str]
     dcs_completed: set[str] = field(default_factory=set)
     dcs_failed: set[str] = field(default_factory=set)
+    # Under the ``update`` late-result policy: the job's result went out
+    # provisionally on reaching ``min_dcs``; it now completes only when
+    # every datacenter reported or the deadline passed.
+    released: bool = False
+    # The reason it was released for -- the reason its standing result
+    # gives until it completes for good.
+    release_reason: str = ""
 
     def record_dc_result(self, dc_id: str, success: bool) -> None:
         """Record result from a datacenter."""
@@ -38,15 +45,28 @@ class BestEffortState:
         Returns:
             (should_complete, reason, is_success)
         """
-        all_reported = (self.dcs_completed | self.dcs_failed) == self.target_dcs
-        if all_reported:
-            success = len(self.dcs_completed) > 0
-            return True, "all_dcs_reported", success
+        if self.all_reported():
+            return True, "all_dcs_reported", len(self.dcs_completed) > 0
 
         if not self.enabled:
             return False, "waiting_for_all_dcs", False
 
-        if len(self.dcs_completed) >= self.min_dcs:
+        return self._check_partial_completion(now)
+
+    def all_reported(self) -> bool:
+        """Every target datacenter reported."""
+        return (self.dcs_completed | self.dcs_failed) == self.target_dcs
+
+    def awaits_stragglers(self, now: float) -> bool:
+        """True while a result handed out now could still be updated: not
+        yet released, some datacenter unreported, the deadline ahead."""
+        return not self.released and now < self.deadline and not self.all_reported()
+
+    def _check_partial_completion(self, now: float) -> tuple[bool, str, bool]:
+        """Completion before every datacenter reported: ``min_dcs``
+        completed (judged once -- not again after a provisional release),
+        or the deadline passed."""
+        if self._reaches_min_dcs():
             return (
                 True,
                 f"min_dcs_reached ({len(self.dcs_completed)}/{self.min_dcs})",
@@ -54,14 +74,28 @@ class BestEffortState:
             )
 
         if now >= self.deadline:
-            success = len(self.dcs_completed) > 0
             return (
                 True,
                 f"deadline_expired (completed: {len(self.dcs_completed)})",
-                success,
+                len(self.dcs_completed) > 0,
             )
 
-        return False, "waiting", False
+        return self._waiting()
+
+    def _waiting(self) -> tuple[bool, str, bool]:
+        """No completion yet; a released job's standing result keeps the
+        reason and success it was released with."""
+        return (False, self.release_reason, True) if self.released else (False, "waiting", False)
+
+    def mark_released(self, provisional: bool, reason: str) -> None:
+        """Record a provisional release (``update`` policy) for ``reason``."""
+        if provisional:
+            self.released = True
+            self.release_reason = reason
+
+    def _reaches_min_dcs(self) -> bool:
+        """``min_dcs`` completed and the job not already released on it."""
+        return not self.released and len(self.dcs_completed) >= self.min_dcs
 
     def get_completion_ratio(self) -> float:
         """Get ratio of completed DCs."""

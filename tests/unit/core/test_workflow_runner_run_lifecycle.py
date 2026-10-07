@@ -19,6 +19,7 @@ runner with real workflows (load workflows against a local HTTP server).
 """
 
 import asyncio
+import pathlib
 from types import MethodType
 
 import pytest
@@ -52,6 +53,14 @@ RUNNER_STATE = (
     "_run_controls",
 )
 MONITOR_STATE = ("active", "_running_monitors", "_background_monitors", "_locked_runs")
+
+
+@pytest.fixture(autouse=True)
+def log_under_tmp_path(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner logs to files under the working directory when no logging
+    directory reaches its logger's context: this test's own tmp_path, never
+    the working tree."""
+    monkeypatch.chdir(tmp_path)
 
 
 class LocalTarget:

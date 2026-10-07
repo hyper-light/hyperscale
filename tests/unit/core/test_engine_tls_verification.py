@@ -38,6 +38,7 @@ from hyperscale.core.engines.client.http import MercurySyncHTTPConnection
 from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow, step
+from hyperscale.reporting.json import JSONConfig
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.testing import URL, HTTPResponse
 
@@ -160,11 +161,22 @@ async def test_the_http_engine_reaches_a_self_signed_server_when_told_not_to_ver
     assert target.requests_answered == 1
 
 
-def make_workflow(target: str, verify_tls: bool | None) -> Workflow:
+def make_workflow(target: str, verify_tls: bool | None, results_directory: pathlib.Path) -> Workflow:
     async def hit(self, url: URL = target) -> HTTPResponse:
         return await self.client.http.get(url)
 
-    attributes: dict[str, object] = {"vus": WORKER_COUNT, "duration": "1s", "timeout": "30s", "hit": step()(hit)}
+    attributes: dict[str, object] = {
+        "vus": WORKER_COUNT,
+        "duration": "1s",
+        "timeout": "30s",
+        "hit": step()(hit),
+        # The default JSON reporter's paths are fixed at import, under the
+        # working directory: a test's results go to its own tmp_path.
+        "reporting": JSONConfig(
+            workflow_results_filepath=str(results_directory / "workflow_results.json"),
+            step_results_filepath=str(results_directory / "step_results.json"),
+        ),
+    }
     if verify_tls is not None:
         attributes["verify_tls"] = verify_tls
     return type("TlsTargetWorkflow", (Workflow,), attributes)()
@@ -196,7 +208,7 @@ async def test_a_workflow_decides_whether_its_clients_verify_the_target(
     LoggingConfig().update(log_directory=str(tmp_path), log_level="error")
     server, target, port = await start_https_target(tmp_path)
     try:
-        workflow_stats = await run_workflow_against(make_workflow(f"https://{HOST}:{port}/", verify_tls))
+        workflow_stats = await run_workflow_against(make_workflow(f"https://{HOST}:{port}/", verify_tls, tmp_path))
     finally:
         server.close()
         await server.wait_closed()

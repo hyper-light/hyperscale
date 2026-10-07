@@ -154,7 +154,10 @@ class WorkflowDispatcher:
             self._retry_budget_manager = retry_budget_manager
         else:
             self._retry_budget_manager = RetryBudgetManager(
-                config=create_reliability_config_from_env(self._env)
+                config=create_reliability_config_from_env(self._env),
+                logger=self._logger,
+                node_id=manager_id,
+                datacenter=datacenter,
             )
 
         # Pending workflows waiting for dependencies/cores
