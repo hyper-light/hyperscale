@@ -55,7 +55,7 @@ def test_a_sync_issues_a_full_sync_where_it_exists(monkeypatch: pytest.MonkeyPat
     fcntl_module = RecordingFcntl()
     fsynced = install(monkeypatch, FULL_SYNC_COMMAND, fcntl_module)
 
-    RealFilesystem._sync_durably(DESCRIPTOR)
+    RealFilesystem.sync_durably(DESCRIPTOR)
 
     assert fcntl_module.calls == [(DESCRIPTOR, FULL_SYNC_COMMAND)]
     assert fsynced == []
@@ -68,7 +68,7 @@ def test_a_filesystem_without_full_sync_is_fsynced(
 ) -> None:
     fsynced = install(monkeypatch, FULL_SYNC_COMMAND, RecordingFcntl(failure_errno=unsupported_errno))
 
-    RealFilesystem._sync_durably(DESCRIPTOR)
+    RealFilesystem.sync_durably(DESCRIPTOR)
 
     assert fsynced == [DESCRIPTOR]
 
@@ -77,7 +77,7 @@ def test_a_failed_full_sync_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     fsynced = install(monkeypatch, FULL_SYNC_COMMAND, RecordingFcntl(failure_errno=errno.EIO))
 
     with pytest.raises(OSError) as raised:
-        RealFilesystem._sync_durably(DESCRIPTOR)
+        RealFilesystem.sync_durably(DESCRIPTOR)
 
     assert raised.value.errno == errno.EIO
     assert fsynced == []
@@ -87,7 +87,7 @@ def test_elsewhere_a_sync_is_fsync(monkeypatch: pytest.MonkeyPatch) -> None:
     fcntl_module = RecordingFcntl()
     fsynced = install(monkeypatch, None, fcntl_module)
 
-    RealFilesystem._sync_durably(DESCRIPTOR)
+    RealFilesystem.sync_durably(DESCRIPTOR)
 
     assert fsynced == [DESCRIPTOR]
     assert fcntl_module.calls == []

@@ -1041,7 +1041,7 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/core/monitoring/base/monitor.py::BaseMonitor.stop_background_monitor': 4,
     'hyperscale/core/monitoring/cpu/monitor.py::CPUMonitor.update_monitor': 5,
     'hyperscale/core/monitoring/memory/monitor.py::MemoryMonitor.update_monitor': 5,
-    'hyperscale/core/runtime/real_filesystem.py::RealFilesystem._sync_durably': 4,
+    'hyperscale/core/runtime/real_filesystem.py::RealFilesystem.sync_durably': 4,
     'hyperscale/core/runtime/real_filesystem.py::RealFilesystem._write_flush_sync': 4,
     'hyperscale/core/runtime/real_system_resources.py::RealSystemResources.cpu_count': 4,
     'hyperscale/core/snowflake/snowflake_generator.py::SnowflakeGenerator.generate': 4,

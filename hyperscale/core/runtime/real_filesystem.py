@@ -118,13 +118,13 @@ class RealFilesystem:
         )
 
     async def fsync(self, handle: RealFileHandle) -> None:
-        await self._run(self._sync_durably, handle.fileno())
+        await self._run(self.sync_durably, handle.fileno())
 
     async def file_size(self, path: str | Path) -> int:
         return await self._run(os.path.getsize, path)
 
     async def fsync_directory(self, path: str | Path) -> None:
-        await self._run(self._fsync_directory_sync, path)
+        await self._run(self.fsync_directory_sync, path)
 
     async def append_fsync(self, path: str | Path, data: bytes) -> None:
         await self._run(self._append_fsync_sync, path, data)
@@ -176,11 +176,13 @@ class RealFilesystem:
     # -- single-executor-job sync sequences ------------------------------
 
     @staticmethod
-    def _sync_durably(descriptor: int) -> None:
+    def sync_durably(descriptor: int) -> None:
         """Flush the descriptor's data and metadata to permanent storage:
         F_FULLFSYNC on macOS (fsync only reaches the drive's cache there),
         falling back to fsync on a filesystem that cannot honor it; fsync
-        elsewhere."""
+        elsewhere. Blocking: code already running off the event loop (the
+        cluster cookie) calls it directly; everything else goes through the
+        async operations above."""
         if _FULL_SYNC_COMMAND is not None:
             try:
                 fcntl.fcntl(descriptor, _FULL_SYNC_COMMAND)
@@ -198,7 +200,7 @@ class RealFilesystem:
         if flush or fsync:
             file.flush()
         if fsync:
-            cls._sync_durably(file.fileno())
+            cls.sync_durably(file.fileno())
         return written
 
     @staticmethod
@@ -216,10 +218,11 @@ class RealFilesystem:
         )
 
     @classmethod
-    def _fsync_directory_sync(cls, path: str | Path) -> None:
+    def fsync_directory_sync(cls, path: str | Path) -> None:
+        """Durably sync a directory's entries (see ``sync_durably``). Blocking."""
         directory_descriptor = os.open(path, os.O_RDONLY)
         try:
-            cls._sync_durably(directory_descriptor)
+            cls.sync_durably(directory_descriptor)
         finally:
             os.close(directory_descriptor)
 
@@ -237,7 +240,7 @@ class RealFilesystem:
                 if written == 0:
                     raise OSError(errno.EIO, "append made no progress", str(path))
                 remaining = remaining[written:]
-            cls._sync_durably(descriptor)
+            cls.sync_durably(descriptor)
         finally:
             os.close(descriptor)
 
@@ -246,7 +249,7 @@ class RealFilesystem:
         descriptor = os.open(path, os.O_WRONLY)
         try:
             os.ftruncate(descriptor, length)
-            cls._sync_durably(descriptor)
+            cls.sync_durably(descriptor)
         finally:
             os.close(descriptor)
 
@@ -262,7 +265,7 @@ class RealFilesystem:
             with os.fdopen(temp_descriptor, "wb") as temp_file:
                 temp_file.write(data)
                 temp_file.flush()
-                cls._sync_durably(temp_file.fileno())
+                cls.sync_durably(temp_file.fileno())
             os.rename(temp_name, destination)
         except BaseException:
             # The temp file must never linger on a failed write — but
@@ -272,4 +275,4 @@ class RealFilesystem:
             except FileNotFoundError:
                 pass
             raise
-        cls._fsync_directory_sync(destination.parent)
+        cls.fsync_directory_sync(destination.parent)

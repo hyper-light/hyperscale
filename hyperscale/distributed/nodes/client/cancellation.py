@@ -138,7 +138,6 @@ class ClientCancellationManager:
         reason: str = "",
         max_redirects: int = 3,
         max_retries: int = 3,
-        retry_base_delay: float = 0.5,
         timeout: float = 10.0,
     ) -> JobCancelResponse:
         """
@@ -186,8 +185,6 @@ class ClientCancellationManager:
                 single attempt sequence (per AD-20).
             max_retries: Maximum retries against alternate targets for
                 transient errors.
-            retry_base_delay: Base delay for exponential backoff
-                (seconds).
             timeout: Request timeout in seconds.
 
         Returns:
@@ -223,7 +220,7 @@ class ClientCancellationManager:
                 job_id,
                 reason,
                 max_redirects,
-                retry_base_delay,
+                self._config.retry_base_delay_seconds,
                 timeout,
             )
         except BaseException:

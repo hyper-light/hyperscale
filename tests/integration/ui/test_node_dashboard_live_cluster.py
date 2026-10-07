@@ -38,7 +38,7 @@ __all__ = ["roomy_terminal"]
 
 async def test_a_registering_worker_shows_on_the_manager_dashboard(tmp_path: pathlib.Path) -> None:
     manager_port, worker_port = reserve_port_blocks([2, 2 + worker_port_span(WORKER_CORES)])
-    env = dashboard_env()
+    env = dashboard_env(tmp_path)
     manager = await start_manager(env, manager_port)
     worker = new_worker(env, worker_port, manager_port)
     try:
@@ -66,7 +66,7 @@ async def test_a_registering_worker_shows_on_the_manager_dashboard(tmp_path: pat
 
 async def test_the_worker_dashboard_shows_its_manager_and_counts_ended_workflows(tmp_path: pathlib.Path) -> None:
     manager_port, worker_port = reserve_port_blocks([2, 2 + worker_port_span(WORKER_CORES)])
-    env = dashboard_env()
+    env = dashboard_env(tmp_path)
     manager = await start_manager(env, manager_port)
     worker = new_worker(env, worker_port, manager_port)
     try:

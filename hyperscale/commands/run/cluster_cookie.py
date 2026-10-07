@@ -4,6 +4,8 @@ import pathlib
 import secrets
 import stat
 
+from hyperscale.core.runtime.real_filesystem import RealFilesystem
+
 from .cluster_cookie_unavailable_error import ClusterCookieUnavailableError
 
 
@@ -171,11 +173,18 @@ class ClusterCookie:
             with os.fdopen(staging_descriptor, "wb") as staging_file:
                 staging_file.write(secret.encode("ascii"))
                 staging_file.flush()
-                os.fsync(staging_file.fileno())
+                RealFilesystem.sync_durably(staging_file.fileno())
 
             os.link(staging_path, self._cookie_path)
         finally:
             staging_path.unlink()
+
+        # The published link (and the staging file's removal) are directory
+        # entries: sync the directory so a crash cannot lose the cookie the
+        # commands of this boot already share. Windows has no directory
+        # descriptor to sync (NTFS journals its metadata itself).
+        if os.name != "nt":
+            RealFilesystem.fsync_directory_sync(self._cookie_path.parent)
 
         return secret
 

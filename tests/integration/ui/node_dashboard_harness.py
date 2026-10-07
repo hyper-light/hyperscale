@@ -90,8 +90,14 @@ def roomy_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LINES", "60")
 
 
-def dashboard_env() -> Env:
-    return Env(MERCURY_SYNC_AUTH_SECRET="node-dashboard-test-secret")
+def dashboard_env(node_directory: pathlib.Path) -> Env:
+    """The nodes' Env. A manager given no WAL data directory keeps its
+    idempotency WAL in its logs directory, so that is the test's own
+    directory, never the working directory."""
+    return Env(
+        MERCURY_SYNC_AUTH_SECRET="node-dashboard-test-secret",
+        MERCURY_SYNC_LOGS_DIRECTORY=str(node_directory),
+    )
 
 
 def ci_dashboard(reader: ManagerDashboardReader | WorkerDashboardReader, node: ManagerServer | WorkerServer, env: Env, log_path: pathlib.Path) -> NodeDashboard:

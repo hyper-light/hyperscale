@@ -719,7 +719,6 @@ class HyperscaleClient(MercurySyncBaseServer):
         reason: str = "",
         max_redirects: int = 3,
         max_retries: int = 3,
-        retry_base_delay: float = 0.5,
         timeout: float = 10.0,
     ) -> JobCancelResponse:
         """Cancel a running job (delegates to ClientCancellationManager)."""
@@ -728,7 +727,6 @@ class HyperscaleClient(MercurySyncBaseServer):
             reason=reason,
             max_redirects=max_redirects,
             max_retries=max_retries,
-            retry_base_delay=retry_base_delay,
             timeout=timeout,
         )
 

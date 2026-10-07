@@ -20,6 +20,7 @@ import pytest
 from hyperscale.commands.run.cluster_cookie import ClusterCookie
 from hyperscale.commands.run.cluster_cookie_unavailable_error import ClusterCookieUnavailableError
 from hyperscale.commands.run.shared import resolve_auth_secret
+from hyperscale.core.runtime.real_filesystem import RealFilesystem
 
 AUTH_SECRET_ENVAR = "MERCURY_SYNC_AUTH_SECRET"
 FLAG_SECRET = "cluster-cookie-flag-secret-0123456789"
@@ -66,6 +67,31 @@ async def test_cookie_is_created_owner_only_under_the_configuration_directory(
     assert len(secret) == COOKIE_SECRET_LENGTH
     if os.name != "nt":
         assert stat.S_IMODE(cookie_path.stat().st_mode) == OWNER_ONLY_MODE
+
+
+async def test_the_cookie_and_its_directory_are_synced_durably(
+    configuration_directory: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cookie's bytes and its directory entry go through the filesystem
+    seam's durable sync (F_FULLFSYNC on macOS), not a bare fsync."""
+    synced_inodes: list[tuple[int, bool]] = []
+    durable_sync = RealFilesystem.sync_durably
+
+    def recording_sync(descriptor: int) -> None:
+        descriptor_status = os.fstat(descriptor)
+        synced_inodes.append((descriptor_status.st_ino, stat.S_ISDIR(descriptor_status.st_mode)))
+        durable_sync(descriptor)
+
+    monkeypatch.setattr(RealFilesystem, "sync_durably", staticmethod(recording_sync))
+
+    await ClusterCookie.secret_for_current_user()
+
+    cookie_path = cookie_path_in(configuration_directory)
+    expected_syncs = [(cookie_path.stat().st_ino, False)]
+    if os.name != "nt":
+        expected_syncs.append((cookie_path.parent.stat().st_ino, True))
+    assert synced_inodes == expected_syncs
 
 
 async def test_cookie_is_reused_on_the_second_resolution(configuration_directory: pathlib.Path) -> None:

@@ -74,7 +74,7 @@ async def test_a_failing_sample_is_logged_and_shown_and_sampling_goes_on(tmp_pat
 
 async def failing_sample_is_logged_and_shown(tmp_path: pathlib.Path) -> None:
     (manager_port,) = reserve_port_blocks([2])
-    env = dashboard_env()
+    env = dashboard_env(tmp_path)
     # Constructed, never started: the dashboard needs only its identity.
     manager = ManagerServer(host="127.0.0.1", tcp_port=manager_port, udp_port=manager_port + 1, env=env, dc_id="DC-DASH")
     log_path = tmp_path / "logs" / "manager.log"
@@ -121,7 +121,7 @@ async def show_failing_samples(reader: FailingReader, manager: ManagerServer, en
 
 async def test_ctrl_c_stops_the_node_and_leaves_nothing_of_the_dashboard(tmp_path: pathlib.Path) -> None:
     (manager_port,) = reserve_port_blocks([2])
-    env = dashboard_env()
+    env = dashboard_env(tmp_path)
     manager = ManagerServer(host="127.0.0.1", tcp_port=manager_port, udp_port=manager_port + 1, env=env, dc_id="DC-DASH")
     subscribers_before = len(Terminal._updates.updates.get(IDENTITY_CHANNEL, []))
     dashboard = ci_dashboard(ManagerDashboardReader(manager), manager, env, tmp_path / "manager.log")
@@ -149,6 +149,9 @@ async def test_ctrl_c_stops_the_node_and_leaves_nothing_of_the_dashboard(tmp_pat
     )
     assert signal.getsignal(signal.SIGWINCH) == signal.SIG_DFL, "the terminal's resize handler outlived it"
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    # The manager's idempotency WAL lives in the node's own directory, never
+    # in the working directory the tests run from.
+    assert list(tmp_path.glob("manager-idempotency-*.wal")) != []
 
 
 async def test_node_terminal_modes() -> None:
@@ -162,7 +165,7 @@ async def test_node_terminal_modes() -> None:
 
 async def test_a_disabled_dashboard_renders_nothing_and_redirects_nothing(tmp_path: pathlib.Path) -> None:
     (manager_port,) = reserve_port_blocks([2])
-    env = dashboard_env()
+    env = dashboard_env(tmp_path)
     manager = ManagerServer(host="127.0.0.1", tcp_port=manager_port, udp_port=manager_port + 1, env=env, dc_id="DC-DASH")
     log_path = tmp_path / "manager.log"
     dashboard = NodeDashboard(

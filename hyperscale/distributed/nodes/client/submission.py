@@ -398,7 +398,6 @@ class ClientJobSubmitter:
         last_error = None
         max_retries = self._config.submission_max_retries
         max_redirects = self._config.submission_max_redirects_per_attempt
-        retry_base_delay = 0.5
 
         for retry in range(max_retries + 1):
             # Try each target in ranked order, cycling through on retries
@@ -406,7 +405,7 @@ class ClientJobSubmitter:
             target = all_targets[target_idx]
 
             # Submit with leader redirect handling
-            redirect_result = await self._submit_with_redirects(
+            redirect_result, retry_after_seconds = await self._submit_with_redirects(
                 job_id, target, submission, max_redirects
             )
 
@@ -417,7 +416,7 @@ class ClientJobSubmitter:
             # Transient error - retry
             last_error = redirect_result
 
-            await self._backoff_before_retry(retry, max_retries, last_error, retry_base_delay)
+            await self._backoff_before_retry(retry, max_retries, retry_after_seconds)
 
         # All retries exhausted
         raise RuntimeError(f"Job submission failed after {max_retries} retries: {last_error}")
@@ -429,19 +428,30 @@ class ClientJobSubmitter:
             raise RuntimeError("No managers or gates configured")
         return all_targets
 
-    @staticmethod
     async def _backoff_before_retry(
+        self,
         retry: int,
         max_retries: int,
-        last_error: str | None,
-        retry_base_delay: float,
+        retry_after_seconds: float,
     ) -> None:
-        """Sleep an exponential, jittered backoff before the next retry (AD-21)."""
-        # Exponential backoff before retry with jitter (AD-21)
-        if retry < max_retries and last_error:
-            base_delay = retry_base_delay * (2**retry)
-            delay = base_delay * (0.5 + _DEFAULT_RANDOM.random())  # Add 0-100% jitter
-            await _DEFAULT_CLOCK.sleep(delay)
+        """
+        Sleep before the next retry (AD-21, AD-24).
+
+        A refusal that carried the server's ``retry_after_seconds`` hint
+        waits the hint plus up to one more hint of jitter -- never less,
+        since the server will refuse again until then, while the jitter
+        keeps clients refused together from returning together. An
+        un-hinted transient refusal waits an exponential, equal-jittered
+        back-off from the configured base. Every transient failure backs
+        off, including one whose error text is empty (a bare timeout).
+        """
+        if retry >= max_retries:
+            return
+        if retry_after_seconds > 0.0:
+            await _DEFAULT_CLOCK.sleep(retry_after_seconds * (1.0 + _DEFAULT_RANDOM.random()))
+            return
+        base_delay = self._config.retry_base_delay_seconds * (2**retry)
+        await _DEFAULT_CLOCK.sleep(base_delay * (0.5 + _DEFAULT_RANDOM.random()))
 
     async def _submit_with_redirects(
         self,
@@ -449,7 +459,7 @@ class ClientJobSubmitter:
         target: tuple[str, int],
         submission: JobSubmission,
         max_redirects: int,
-    ) -> str:
+    ) -> tuple[str, float]:
         """
         Submit to target with leader redirect handling.
 
@@ -460,7 +470,9 @@ class ClientJobSubmitter:
             max_redirects: Maximum redirects to follow
 
         Returns:
-            "success", "permanent_failure", or error message (transient)
+            "success", "permanent_failure", or error message (transient),
+            with the refusing server's retry hint in seconds (0.0 when it
+            gave none).
 
         Redirect-context preservation: when a manager responds
         ``JobAck(accepted=False, leader_addr=X)`` we follow the
@@ -484,7 +496,7 @@ class ClientJobSubmitter:
         redirects = 0
         redirect_history: list[str] = []
         while redirects <= max_redirects:
-            final_outcome, redirect_target = await self._submit_hop(
+            final_outcome, redirect_target, retry_after_seconds = await self._submit_hop(
                 job_id,
                 target,
                 submission,
@@ -492,11 +504,11 @@ class ClientJobSubmitter:
                 redirects < max_redirects,
             )
             if redirect_target is None:
-                return final_outcome
+                return (final_outcome, retry_after_seconds)
             target = redirect_target
             redirects += 1
 
-        return _prepend_redirect_history(redirect_history, "max_redirects_exceeded")
+        return (_prepend_redirect_history(redirect_history, "max_redirects_exceeded"), 0.0)
 
     async def _submit_hop(
         self,
@@ -505,8 +517,8 @@ class ClientJobSubmitter:
         submission: JobSubmission,
         redirect_history: list[str],
         may_redirect: bool,
-    ) -> tuple[str | None, tuple[str, int] | None]:
-        """Send the submission to one target: its final outcome, or the leader to redirect to."""
+    ) -> tuple[str | None, tuple[str, int] | None, float]:
+        """Send the submission to one target: its final outcome or the leader to redirect to, and its retry hint."""
         sent_at = _DEFAULT_CLOCK.monotonic()
         response, _ = await self._send_tcp(
             target,
@@ -517,20 +529,23 @@ class ClientJobSubmitter:
 
         if isinstance(response, Exception):
             self._targets.record_target_failure(target)
-            return (_prepend_redirect_history(redirect_history, str(response)), None)
+            return (_prepend_redirect_history(redirect_history, str(response)), None, 0.0)
 
+        # A rate-limited (AD-32) or shed/quorum-refused (AD-24) submission
+        # carries the server's retry hint; the retry loop waits it out.
         if (rate_limit_response := self._rate_limit_response(response)) is not None:
-            await _DEFAULT_CLOCK.sleep(rate_limit_response.retry_after_seconds)
-            return (rate_limit_response.error, None)  # Transient error
+            return (rate_limit_response.error, None, rate_limit_response.retry_after_seconds)
 
-        return self._ack_outcome(
+        ack = JobAck.load(response)
+        final_outcome, redirect_target = self._ack_outcome(
             job_id,
             target,
-            JobAck.load(response),
+            ack,
             sent_at,
             redirect_history,
             may_redirect,
         )
+        return (final_outcome, redirect_target, ack.retry_after_seconds)
 
     @staticmethod
     def _rate_limit_response(response: bytes) -> RateLimitResponse | None:
@@ -629,8 +644,11 @@ class ClientJobSubmitter:
 
     def _rejection_outcome(self, ack: JobAck, redirect_history: list[str]) -> str:
         """A transient rejection's error with the redirect trail; a permanent rejection raises."""
-        # Check if this is a transient error that should be retried
-        if ack.error and self._is_transient_error(ack.error):
+        # A refusal carrying a retry hint is retryable by the JobAck
+        # contract (e.g. the gate's "gate_replication_quorum_unavailable",
+        # which names no transient-vocabulary marker); otherwise the
+        # error text classifies it.
+        if ack.error and self._is_retryable_rejection(ack):
             return _prepend_redirect_history(redirect_history, ack.error)
 
         self._raise_permanent_rejection(ack, redirect_history)
@@ -647,15 +665,11 @@ class ClientJobSubmitter:
             raise RuntimeError(f"Job rejected: {trail}; {ack.error}")
         raise RuntimeError(f"Job rejected: {ack.error}")
 
-    def _is_transient_error(self, error: str) -> bool:
+    @staticmethod
+    def _is_retryable_rejection(ack: JobAck) -> bool:
         """
-        Check if an error is transient and should be retried.
-
-        Args:
-            error: Error message
-
-        Returns:
-            True if error matches TRANSIENT_ERRORS patterns
+        Whether a rejected ack (with an error) should be retried: it
+        carries a retry hint, or its error matches TRANSIENT_ERRORS.
         """
-        error_lower = error.lower()
-        return any(te in error_lower for te in TRANSIENT_ERRORS)
+        error_lower = ack.error.lower()
+        return ack.retry_after_seconds > 0.0 or any(te in error_lower for te in TRANSIENT_ERRORS)
