@@ -308,7 +308,7 @@ Rules for every move: behavior-preserving; public messages and actions unchanged
 
 ### Phase 9 — tests, probes, documents
 
-- **Tests:** ✅ done (2026-10-05) except rolling upgrade, which waits on the wire-evolution decision. Each suite is seeded and mutation-checked, and together they found and fixed 19 real bugs:
+- **Tests:** ✅ done (2026-10-05) including rolling upgrade (AD-25, 2026-10-06). Each suite is seeded and mutation-checked, and together they found and fixed 19 real bugs:
   - **Adversarial input:**
     - `RestrictedUnpickler` was bypassable through dotted names under pickle protocol 4+ (`logging` + `os.system`). Fixed in both copies.
     - A TCP reply with no separators raised `ValueError` out of its task.
@@ -347,7 +347,12 @@ Rules for every move: behavior-preserving; public messages and actions unchanged
 
 ## Needs you
 
-- **Wire evolution for `Message` dataclasses** (found 2026-10-05). Adding a field to a slotted `Message` dataclass breaks mixed-version clusters both ways: measured on 3.12/3.13/3.14, old reads new → AttributeError; new reads old → field unset, AttributeError on read. Today any new message field is a breaking change for rolling upgrades (AD-25). A fix is a `Message`-level `__getstate__`/`__setstate__` keyed by field name that fills defaults and drops unknown fields. That changes the pickled state format once, so it needs your call on the cutover.
+- **✅ Wire evolution for `Message` dataclasses: implemented 2026-10-06.**
+  - **Reading an older sender:** a field the sender lacked reads as its default (`Message.__getattr__`: it runs only when normal lookup fails, so set fields cost nothing). The default is stored on first read.
+  - **Reading a newer sender:** unknown fields land in the instance `__dict__` and are never read.
+  - **Breaking changes stay loud:** a new field without a default raises, naming the field, when it is read.
+  - **Pickle format unchanged:** state is already by-name (`(__dict__, slot dict)`), so there is no cutover.
+  - **Test:** `tests/unit/distributed/models/test_rolling_upgrade_wire_compatibility.py` covers every wire message (104), both directions plus the breaking-change case. 289 pass; removing the default-fill fails 89.
 - **✅ Datacenter leases: decided and removed 2026-10-06.** They were built but never acquired. `DatacenterLeaseManager`, `DatacenterLease`, `LeaseTransfer`/`LeaseTransferAck`, the gate's `lease_transfer` handler and its DC-lease state and snapshot fields are deleted. architecture.md principle 4 now names what gives at-most-once DC semantics: per-job gate leadership and fencing tokens (Raft-committed `GateJobReplica`), AD-40 idempotency, and manager-side fencing.
 - **✅ Unpickler and by-value workflows: decided 2026-10-06.** Running a workflow means running the submitter's code, so the trust boundary is the authenticated frame, not the unpickler: every frame is AES-GCM-authenticated under the cluster secret (refused when weak; per-user cookie or per-run secret by default) and replay-checked (frame id + nonce, 2026-10-06). The `RestrictedUnpickler` stays as defense in depth for non-workflow payloads. This is the model cloudpickle-based schedulers use; documented in `docs/architecture.md` security section.
 - **AD-24 limits:** the nodes don't use Env's `RATE_LIMIT_*` bucket settings or `get_rate_limit_config()`; the per-operation table is `AdaptiveRateLimitConfig`'s built-in default. Unify them through Env? That changes limits the storm SIM pins, so it needs measurement.
