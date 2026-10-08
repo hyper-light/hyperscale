@@ -5961,7 +5961,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # Duplicates are completely normal in gossip - debug log only, no error handler
             self._task_runner.run(
                 self._udp_logger.log,
-                ServerInfo(
+                ServerDebug(
                     message=f"[DUPLICATE] {node[0]}:{node[1]} incarnation={incarnation} status={status.decode()} "
                     f"(current: incarnation={current_incarnation} status={current_status})",
                     node_host=self._host,

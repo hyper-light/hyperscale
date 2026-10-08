@@ -89,6 +89,7 @@ from hyperscale.core.utils.cancel_and_release_task import cancel_and_release_tas
 from hyperscale.logging import Logger
 from hyperscale.logging.config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import (
+    ServerDebug,
     ServerError,
     ServerWarning,
     SilentDropStats,
@@ -2202,7 +2203,7 @@ class MercurySyncBaseServer(Generic[T]):
             if self._udp_recv_arrived_count % 100 == 0:
                 tracker = self._udp_in_flight_tracker
                 await self._udp_logger.log(
-                    ServerError(
+                    ServerDebug(
                         message=(
                             f"[UDP-PROCESS-ARRIVED] handler=receive "
                             f"total={self._udp_recv_arrived_count} "
