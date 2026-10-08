@@ -69,6 +69,8 @@ def make_manager(
     )
     manager._aggregate_job_progress = lambda job: (7, 1, 2.5)
     manager._leases = SimpleNamespace(is_job_leader=lambda job_id: leads_job, get_fence_token=lambda job_id: 4)
+    # A leader names itself in its live answer (``leader_node_id``).
+    manager._node_id = SimpleNamespace(full="manager-under-test")
     manager._manager_state = SimpleNamespace(
         get_job_leader_view=lambda job_id: leader_view,
         get_job_leader_addr=lambda job_id: LEADER_ADDR,

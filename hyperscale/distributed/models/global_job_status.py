@@ -36,3 +36,8 @@ class GlobalJobStatus(Message):
     # a SESSION read carries back (0.0: no versioned view, e.g. a terminal
     # record).
     view_time: float = 0.0
+    # The answering manager's node id when it leads the job, else empty: a
+    # restarted manager hands a job it recovered only to the manager that
+    # took it over -- never to one holding a replica of it, which would
+    # leave the job with no leader at all.
+    leader_node_id: str = ""
