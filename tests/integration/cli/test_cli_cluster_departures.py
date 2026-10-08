@@ -2,11 +2,18 @@
 E2E: managers leaving their cluster's membership (AD-52 section 13), real
 processes.
 
-Three `hyperscale run manager` processes form one datacenter's membership
-group. Asserts:
+Five `hyperscale run manager` processes form one datacenter's membership
+group. Five, so that a quorum (AD-3: a majority of the configured cohort,
+three) is still live after one member is removed and another drains: the
+drained address's release is then answered by a leader. With three, the
+lone survivor can never elect or commit -- by design -- and the last check
+asked a group with no leader.
+
+Asserts:
 
 1. `hyperscale remove` of a member that still answers is refused: a live
-   member would only claim its address again.
+   member would only claim its address again. (The refusal names the
+   member as the group's own leader when it leads.)
 2. A manager SIGKILLed for good is removed by `hyperscale remove` without
    waiting out the tombstone retention (minutes) -- once the survivors have
    a leader, if it led them.
@@ -45,8 +52,11 @@ from tests.integration.cli.node_processes import (
 )
 
 ENV = Env(MERCURY_SYNC_AUTH_SECRET=CLI_TEST_AUTH_SECRET)
+# Why removing a live member is refused: it still answers at its address,
+# or -- asked of the group's leader about itself -- it is the leader, alive.
+LIVE_MEMBER_REFUSALS = ("still answers", "which is alive")
 DATACENTER = "dc-departures"
-COHORT_SIZE = 3
+COHORT_SIZE = 5
 CLIENT_BLOCK = 2  # `hyperscale remove` client tcp + its udp (port + 1)
 _MANAGER_CONFIG = create_manager_config_from_env(LOCALHOST, 1, 2, ENV)
 # A dead leader is noticed within the CheckQuorum window and replaced by
@@ -81,7 +91,7 @@ async def test_members_leave_by_removal_and_by_drain(run_marker: str) -> None:
         )
         for start in manager_starts
     ]
-    surviving, draining, killed = managers
+    surviving, draining, killed, *_others = managers
 
     try:
         await boot(*managers)
@@ -91,7 +101,7 @@ async def test_members_leave_by_removal_and_by_drain(run_marker: str) -> None:
             ), f"manager {manager.address} never formed its membership"
 
         returncode, output = await run_remove(surviving.address, draining.address, first_client)
-        assert returncode == 1 and "still answers" in output, output
+        assert returncode == 1 and any(refusal in output for refusal in LIVE_MEMBER_REFUSALS), output
 
         returncode, output = await run_membership_mode(surviving.address, "frozen", mode_client)
         assert returncode == 0 and "cluster mode frozen" in output, output
