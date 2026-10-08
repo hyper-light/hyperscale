@@ -10,114 +10,31 @@ Key features:
 - Adaptive poll intervals based on time remaining
 - LHM-aware polling (back off when under load)
 - No task creation/cancellation on confirmation (state update only)
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 import math
-import time
 from dataclasses import dataclass, field
+from itertools import compress, repeat
+from operator import eq, itemgetter
 from typing import Callable
-
+from hyperscale.distributed.protocol.time_quantum import TIME_REMAINDER_EPSILON_SECONDS
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+from hyperscale.logging.hyperscale_logging_models import ServerError
 
 from .suspicion_state import SuspicionState
-
-
-# Type aliases
-NodeAddress = tuple[str, int]
-JobId = str
-
-
-@dataclass
-class JobSuspicionConfig:
-    """Configuration for job-layer suspicion management."""
-
-    # Adaptive polling intervals (ms)
-    poll_interval_far_ms: int = 1000  # > 5s remaining
-    poll_interval_medium_ms: int = 250  # 1-5s remaining
-    poll_interval_near_ms: int = 50  # < 1s remaining
-
-    # Thresholds for interval selection (seconds)
-    far_threshold_s: float = 5.0
-    near_threshold_s: float = 1.0
-
-    # LHM integration
-    max_lhm_backoff_multiplier: float = 3.0  # Max slowdown under load
-
-    # Resource limits
-    max_suspicions_per_job: int = 1000
-    max_total_suspicions: int = 10000
-
-
-@dataclass(slots=True)
-class JobSuspicion:
-    """
-    Suspicion state for a specific node within a specific job.
-
-    Tracks the suspicion independently of global node status.
-    """
-
-    job_id: JobId
-    node: NodeAddress
-    incarnation: int
-    start_time: float
-    min_timeout: float
-    max_timeout: float
-    confirmers: set[NodeAddress] = field(default_factory=set)
-    _logical_confirmation_count: int = 0
-
-    # Timer management
-    _poll_task: asyncio.Task | None = field(default=None, repr=False)
-    _cancelled: bool = False
-
-    def add_confirmation(self, from_node: NodeAddress) -> bool:
-        """Add a confirmation from another node. Returns True if new."""
-        if from_node in self.confirmers:
-            return False
-
-        self._logical_confirmation_count += 1
-        if len(self.confirmers) < 1000:  # Bound memory
-            self.confirmers.add(from_node)
-        return True
-
-    @property
-    def confirmation_count(self) -> int:
-        """Number of independent confirmations."""
-        return max(len(self.confirmers), self._logical_confirmation_count)
-
-    def calculate_timeout(self, n_members: int) -> float:
-        """
-        Calculate timeout using Lifeguard formula.
-
-        timeout = max(min, max - (max - min) * log(C+1) / log(N+1))
-        """
-        c = self.confirmation_count
-        n = max(1, n_members)
-
-        if n <= 1:
-            return self.max_timeout
-
-        log_factor = math.log(c + 1) / math.log(n + 1)
-        timeout = self.max_timeout - (self.max_timeout - self.min_timeout) * log_factor
-
-        return max(self.min_timeout, timeout)
-
-    def time_remaining(self, n_members: int) -> float:
-        """Calculate time remaining before expiration."""
-        elapsed = time.monotonic() - self.start_time
-        timeout = self.calculate_timeout(n_members)
-        return max(0, timeout - elapsed)
-
-    def cancel(self) -> None:
-        """Cancel this suspicion's timer."""
-        self._cancelled = True
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-
-    def cleanup(self) -> None:
-        """Clean up resources."""
-        self.cancel()
-        self.confirmers.clear()
+from .job_suspicion_manager_shared import _DEFAULT_CLOCK
+from .job_suspicion_manager_shared import NodeAddress
+from .job_suspicion_manager_shared import JobId
+from .job_suspicion import JobSuspicion
+from .job_suspicion_config import JobSuspicionConfig
 
 
 class JobSuspicionManager:
@@ -191,7 +108,6 @@ class JobSuspicionManager:
 
     async def _log_error(self, message: str) -> None:
         if self._logger:
-            from hyperscale.logging.hyperscale_logging_models import ServerError
 
             await self._logger.log(
                 ServerError(
@@ -253,49 +169,90 @@ class JobSuspicionManager:
             key = (job_id, node)
             existing = self._suspicions.get(key)
 
-            if existing:
-                if incarnation < existing.incarnation:
-                    # Stale suspicion, ignore
-                    return existing
-                elif incarnation == existing.incarnation:
-                    # Same suspicion, add confirmation
-                    if existing.add_confirmation(from_node):
-                        self._confirmed_count += 1
-                    # Timer will pick up new confirmation count
-                    return existing
-                else:
-                    # Higher incarnation, replace
-                    existing.cancel()
-                    self._per_job_counts[job_id] = (
-                        self._per_job_counts.get(job_id, 1) - 1
-                    )
-            else:
-                # Check limits
-                job_count = self._per_job_counts.get(job_id, 0)
-                if job_count >= self._config.max_suspicions_per_job:
-                    return None
-                if len(self._suspicions) >= self._config.max_total_suspicions:
-                    return None
+            preempted, preempting_result = self._preempt_new_suspicion(
+                job_id, existing, incarnation, from_node
+            )
+            if preempted:
+                return preempting_result
 
             # Create new suspicion
             suspicion = JobSuspicion(
                 job_id=job_id,
                 node=node,
                 incarnation=incarnation,
-                start_time=time.monotonic(),
+                start_time=_DEFAULT_CLOCK.monotonic(),
                 min_timeout=min_timeout,
                 max_timeout=max_timeout,
+                originator=from_node,
             )
+            # Originator's vote is implicit (see the field docstring).
             suspicion.add_confirmation(from_node)
 
             self._suspicions[key] = suspicion
             self._per_job_counts[job_id] = self._per_job_counts.get(job_id, 0) + 1
             self._started_count += 1
 
-            # Start adaptive polling timer
-            suspicion._poll_task = asyncio.create_task(self._poll_suspicion(suspicion))
+            # Start adaptive polling timer.
+            # Phase 6b: explicit ``loop.create_task`` so the task binds
+            # to the loop the suspicion was started on rather than
+            # implicitly going through ``get_running_loop`` at task-
+            # creation time.
+            suspicion._poll_task = asyncio.get_running_loop().create_task(
+                self._poll_suspicion(suspicion)
+            )
 
             return suspicion
+
+    def _preempt_new_suspicion(
+        self,
+        job_id: JobId,
+        existing: JobSuspicion | None,
+        incarnation: int,
+        from_node: NodeAddress,
+    ) -> tuple[bool, JobSuspicion | None]:
+        """Decide whether start_suspicion returns early, and with what; the caller holds the lock."""
+        if existing:
+            return self._merge_existing_suspicion(job_id, existing, incarnation, from_node)
+        # Check limits
+        return self._at_suspicion_limit(job_id), None
+
+    def _merge_existing_suspicion(
+        self,
+        job_id: JobId,
+        existing: JobSuspicion,
+        incarnation: int,
+        from_node: NodeAddress,
+    ) -> tuple[bool, JobSuspicion | None]:
+        """Fold a suspicion into the existing one: keep it unless the incarnation is higher (then replace)."""
+        if incarnation < existing.incarnation:
+            # Stale suspicion, ignore
+            return True, existing
+        elif incarnation == existing.incarnation:
+            # Same suspicion, add confirmation
+            self._add_job_confirmation(existing, from_node)
+            # Timer will pick up new confirmation count
+            return True, existing
+        # Higher incarnation, replace
+        existing.cancel()
+        self._per_job_counts[job_id] = (
+            self._per_job_counts.get(job_id, 1) - 1
+        )
+        return False, None
+
+    def _at_suspicion_limit(self, job_id: JobId) -> bool:
+        """Whether the per-job or total suspicion limit refuses a new suspicion."""
+        job_count = self._per_job_counts.get(job_id, 0)
+        return (
+            job_count >= self._config.max_suspicions_per_job
+            or len(self._suspicions) >= self._config.max_total_suspicions
+        )
+
+    def _add_job_confirmation(self, suspicion: JobSuspicion, from_node: NodeAddress) -> bool:
+        """Add ``from_node``'s confirmation, counting it; True when it was new."""
+        if suspicion.add_confirmation(from_node):
+            self._confirmed_count += 1
+            return True
+        return False
 
     async def _poll_suspicion(self, suspicion: JobSuspicion) -> None:
         """
@@ -311,39 +268,47 @@ class JobSuspicionManager:
         node = suspicion.node
 
         try:
-            while not suspicion._cancelled and self._running:
-                n_members = self._get_n_members_for_job(job_id)
-                remaining = suspicion.time_remaining(n_members)
-
-                if remaining <= 0:
-                    # Expired - handle expiration
-                    await self._handle_expiration(suspicion)
-                    return
-
-                # Calculate adaptive sleep interval
-                poll_interval = self._calculate_poll_interval(remaining)
-                # Don't sleep longer than remaining time
-                sleep_time = min(poll_interval, remaining)
-
-                await asyncio.sleep(sleep_time)
+            await self._run_poll_loop(suspicion, job_id)
 
         except asyncio.CancelledError:
             await self._log_error(
                 f"Suspicion timer cancelled for job {suspicion.job_id}, node {suspicion.node}"
             )
 
+    async def _run_poll_loop(self, suspicion: JobSuspicion, job_id: JobId) -> None:
+        """Poll ``suspicion`` at the adaptive interval until it expires, is cancelled, or the manager stops."""
+        while self._is_polling(suspicion):
+            n_members = self._get_n_members_for_job(job_id)
+            remaining = suspicion.time_remaining(n_members)
+
+            if remaining <= 0:
+                # Expired - handle expiration
+                await self._handle_expiration(suspicion)
+                return
+
+            # Calculate adaptive sleep interval
+            poll_interval = self._calculate_poll_interval(remaining)
+            # Don't sleep longer than remaining time — floored so
+            # the clock always moves (defense in depth for the
+            # frozen-instant class; the epsilon contract in
+            # time_remaining is the primary guard).
+            sleep_time = max(min(poll_interval, remaining), 0.001)
+
+            await _DEFAULT_CLOCK.sleep(sleep_time)
+
+    def _is_polling(self, suspicion: JobSuspicion) -> bool:
+        """Whether the poll loop continues: the suspicion is live and the manager running."""
+        return not suspicion._cancelled and self._running
+
     async def _handle_expiration(self, suspicion: JobSuspicion) -> None:
         """Handle suspicion expiration - declare node dead for this job."""
         key = (suspicion.job_id, suspicion.node)
 
         async with self._lock:
-            # Double-check still exists (may have been refuted)
-            if key not in self._suspicions:
-                return
-
-            current = self._suspicions.get(key)
-            if current is not suspicion:
-                # Different suspicion now (race)
+            # Double-check still exists (may have been refuted), and is
+            # not a different suspicion now (race): a missing key reads
+            # None, which is never ``suspicion``.
+            if self._suspicions.get(key) is not suspicion:
                 return
 
             # Remove from tracking
@@ -354,26 +319,38 @@ class JobSuspicionManager:
             self._expired_count += 1
 
         # Call callback outside lock
+        await self._notify_expired(suspicion)
+
+    async def _notify_expired(self, suspicion: JobSuspicion) -> None:
+        """Invoke on_expired for ``suspicion``, reporting a callback failure."""
         if self._on_expired:
             try:
                 self._on_expired(
                     suspicion.job_id, suspicion.node, suspicion.incarnation
                 )
             except Exception as callback_error:
-                if self._on_error:
-                    try:
-                        self._on_error(
-                            f"on_expired callback failed for job {suspicion.job_id}, node {suspicion.node}",
-                            callback_error,
-                        )
-                    except Exception as error_callback_error:
-                        await self._log_error(
-                            f"on_error callback failed: {error_callback_error}, original: {callback_error}"
-                        )
-                else:
-                    await self._log_error(
-                        f"on_expired callback failed for job {suspicion.job_id}, node {suspicion.node}: {callback_error}"
-                    )
+                await self._report_expired_callback_failure(suspicion, callback_error)
+
+    async def _report_expired_callback_failure(
+        self,
+        suspicion: JobSuspicion,
+        callback_error: Exception,
+    ) -> None:
+        """Route an on_expired failure to on_error, else the log; log an on_error failure too."""
+        if self._on_error:
+            try:
+                self._on_error(
+                    f"on_expired callback failed for job {suspicion.job_id}, node {suspicion.node}",
+                    callback_error,
+                )
+            except Exception as error_callback_error:
+                await self._log_error(
+                    f"on_error callback failed: {error_callback_error}, original: {callback_error}"
+                )
+        else:
+            await self._log_error(
+                f"on_expired callback failed for job {suspicion.job_id}, node {suspicion.node}: {callback_error}"
+            )
 
     async def confirm_suspicion(
         self,
@@ -393,9 +370,7 @@ class JobSuspicionManager:
             suspicion = self._suspicions.get(key)
 
             if suspicion and suspicion.incarnation == incarnation:
-                if suspicion.add_confirmation(from_node):
-                    self._confirmed_count += 1
-                    return True
+                return self._add_job_confirmation(suspicion, from_node)
             return False
 
     async def refute_suspicion(
@@ -430,12 +405,12 @@ class JobSuspicionManager:
         Returns number of suspicions cleared.
         """
         async with self._lock:
-            to_remove: list[tuple[JobId, NodeAddress]] = []
+            # Keys and values iterate in the same order, so compress selects the job's suspicions.
+            job_matches = list(map(eq, map(itemgetter(0), self._suspicions.keys()), repeat(job_id)))
+            to_remove: list[tuple[JobId, NodeAddress]] = list(compress(self._suspicions.keys(), job_matches))
 
-            for key, suspicion in self._suspicions.items():
-                if key[0] == job_id:
-                    suspicion.cancel()
-                    to_remove.append(key)
+            for suspicion in compress(self._suspicions.values(), job_matches):
+                suspicion.cancel()
 
             for key in to_remove:
                 del self._suspicions[key]
@@ -497,3 +472,11 @@ class JobSuspicionManager:
             "suspicion_count": count,
             "suspected_nodes": len(suspected),
         }
+
+_REHOMED = (
+    JobSuspicionConfig,
+    JobSuspicion,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

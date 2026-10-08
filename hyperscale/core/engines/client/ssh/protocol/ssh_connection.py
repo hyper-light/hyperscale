@@ -34,7 +34,8 @@ class SSHConnection:
     ) -> SSHClientConnection:
         
         family, _, _, _, address = socket_config
-        host, port = address
+        # (host, port) for IPv4; IPv6 adds its flow info and scope id.
+        host, port = address[0], address[1]
         
         options = SSHClientConnectionOptions(
             options=None,

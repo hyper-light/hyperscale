@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from enum import Enum
 from typing import Dict, Literal
 
 from hyperscale.ui.config.mode import TerminalMode
 
+from .base_color_type import BaseColorType as BaseColorType
 from .extended_color import ExtendedColorName, ExtendedColorType
 
 ColorName = Literal[
@@ -25,26 +25,6 @@ ColorName = Literal[
     "light_cyan",
     "white",
 ]
-
-
-class BaseColorType(Enum):
-    BLACK = 30
-    GREY = 30
-    RED = 31
-    GREEN = 32
-    YELLOW = 33
-    BLUE = 34
-    MAGENTA = 35
-    CYAN = 36
-    LIGHT_GREY = 37
-    DARK_GREY = 90
-    LIGHT_REd = 91
-    LIGHT_GREEN = 92
-    LIGHT_YELLOW = 93
-    LIGHT_BLUE = 94
-    LIGHT_MAGENTA = 95
-    LIGHT_CYAN = 96
-    WHITE = 97
 
 
 class Color:

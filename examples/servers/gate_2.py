@@ -18,6 +18,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes import GateServer
 
+# Every node and client of this example shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 
 async def run_gate_2():
     """Run Gate server 2 on ports 9102/9103"""
@@ -65,7 +69,7 @@ async def run_gate_2():
         host='127.0.0.1',
         tcp_port=9102,
         udp_port=9103,
-        env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
+        env=Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
         dc_id='global',
         gate_peers=gate_peers_tcp,
         gate_udp_peers=gate_peers_udp,

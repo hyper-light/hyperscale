@@ -21,7 +21,7 @@ class WorkflowRuntimeState:
     extension decisions:
 
     * ``cores_completed`` (existing) — primary, finished-core count.
-    * ``step_transitions`` — secondary, AD-33 state-machine
+    * ``step_transitions`` — secondary, AD-54 state-machine
       transition count (PENDING→RUNNING→COMPLETED, FAILED, etc.).
     * ``actions_completed`` — tertiary, sum of action-level
       completions from ``StepStats.completed_count``.

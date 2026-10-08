@@ -4,7 +4,8 @@ from hyperscale.ui.components.table import Table, TableConfig
 from hyperscale.ui.components.text import Text, TextConfig
 from hyperscale.ui.components.terminal import Section, SectionConfig
 from hyperscale.ui.components.terminal import Terminal, action
-from typing import Any, Callable
+from typing import Callable
+from .json_value import JSONValue
 
 
 @action()
@@ -46,7 +47,7 @@ async def update_params(
     return params
 
 @action()
-async def update_headers(headers: dict[str, Any] | None):
+async def update_headers(headers: dict[str, JSONValue] | None):
 
     if headers is None:
         return {}

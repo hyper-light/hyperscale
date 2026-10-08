@@ -50,6 +50,16 @@ async def update_workflow_executions_total_rate(
 
 
 @action()
+async def update_workflow_executions_final_rate(
+    workflow: str,
+    count: int,
+    elapsed: float,
+):
+    """The run's final total and the elapsed time it was counted over."""
+    return (f"update_total_executions_rate_{workflow}", (count, True, elapsed))
+
+
+@action()
 async def update_workflow_executions_rates(
     workflow: str,
     execution_rates: list[tuple[float, int]],

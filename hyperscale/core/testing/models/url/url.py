@@ -1,3 +1,4 @@
+import asyncio
 from typing import Generic, Optional, TypeVar
 
 from hyperscale.core.engines.client.shared.models import URL as OptimizedUrl
@@ -49,6 +50,7 @@ class URL(OptimizedArg, Generic[T]):
             case (
                 RequestType.GRAPHQL
                 | RequestType.GRAPHQL_HTTP2
+                | RequestType.GRPC
                 | RequestType.HTTP
                 | RequestType.HTTP2
                 | RequestType.HTTP3
@@ -65,7 +67,11 @@ class URL(OptimizedArg, Generic[T]):
                 await self.optimized.lookup_ssh()
 
             case RequestType.SMTP:
-                await self.optimized.lookup_smtp()
+                await self.optimized.lookup_smtp(
+                    self.data,
+                    asyncio.get_running_loop(),
+                    connection_type=None,
+                )
 
             case _:
                 pass

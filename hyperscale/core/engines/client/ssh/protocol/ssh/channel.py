@@ -127,6 +127,8 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         self._recv_buf: List[Tuple[bytes, DataType]] = []
 
         self._request_queue: List[Tuple[str, SSHPacket, bool]] = []
+        # Whether _service_next_request's loop is running.
+        self._servicing_requests = False
 
         self._open_waiter: Optional[asyncio.Future[SSHPacket]] = None
         self._request_waiters: List[asyncio.Future[bool]] = []
@@ -381,23 +383,35 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
             self._deliver_data(data, datatype)
 
     def _service_next_request(self) -> None:
-        """Process next item on channel request queue"""
+        """Process queued channel requests in order, until one is answered later"""
 
-        request, packet, _ = self._request_queue[0]
+        self._servicing_requests = True
 
-        name = '_process_' + map_handler_name(request) + '_request'
-        handler: _RequestHandler = getattr(self, name, None)
+        try:
+            while self._request_queue:
+                head = self._request_queue[0]
+                request, packet, _ = head
 
-        if handler:
-            result: bool | None = handler(packet)
-        else:
-            result = False
+                name = '_process_' + map_handler_name(request) + '_request'
+                handler: _RequestHandler = getattr(self, name, None)
 
-        if result is not None:
-            self._report_response(result)
+                if handler:
+                    result: bool | None = handler(packet)
+                else:
+                    result = False
 
-    def _report_response(self, result: bool) -> None:
-        """Report back the response to a previously issued channel request"""
+                if result is not None:
+                    self._send_response(result)
+
+                elif self._request_queue and self._request_queue[0] is head:
+                    # Its handler answers later, through _report_response.
+                    return
+
+        finally:
+            self._servicing_requests = False
+
+    def _send_response(self, result: bool) -> None:
+        """Send back the response to the oldest queued channel request"""
 
         request, _, want_reply = self._request_queue.pop(0)
 
@@ -412,7 +426,16 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
             self._session.session_started()
             self.resume_reading()
 
-        if self._request_queue:
+    def _report_response(self, result: bool) -> None:
+        """Report back the response to a previously issued channel request
+           that its handler answered later, then process the requests
+           queued behind it"""
+
+        self._send_response(result)
+
+        # An answer given while the queue is being serviced leaves the
+        # rest to that loop.
+        if self._request_queue and not self._servicing_requests:
             self._service_next_request()
 
     def process_connection_close(self, exc: Optional[Exception]) -> None:

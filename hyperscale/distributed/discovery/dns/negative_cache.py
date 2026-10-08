@@ -2,27 +2,20 @@
 Negative cache for DNS resolution failures.
 
 Prevents repeated lookups for known-failed hostnames.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
-import time
 from dataclasses import dataclass, field
+from hyperscale.distributed.runtime import Clock, RealClock
 
+from .negative_entry import NegativeEntry
 
-@dataclass(slots=True)
-class NegativeEntry:
-    """A cached negative result for DNS lookup."""
-
-    hostname: str
-    """The hostname that failed resolution."""
-
-    error_message: str
-    """Description of the failure."""
-
-    cached_at: float
-    """Timestamp when this entry was cached."""
-
-    failure_count: int = 1
-    """Number of consecutive failures for this hostname."""
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass
@@ -64,7 +57,7 @@ class NegativeCache:
             return None
 
         ttl = self._compute_ttl(entry.failure_count)
-        if time.monotonic() - entry.cached_at > ttl:
+        if _DEFAULT_CLOCK.monotonic() - entry.cached_at > ttl:
             # Entry expired, remove it
             del self._entries[hostname]
             return None
@@ -107,7 +100,7 @@ class NegativeCache:
         entry = NegativeEntry(
             hostname=hostname,
             error_message=error_message,
-            cached_at=time.monotonic(),
+            cached_at=_DEFAULT_CLOCK.monotonic(),
             failure_count=failure_count,
         )
         self._entries[hostname] = entry
@@ -151,7 +144,16 @@ class NegativeCache:
         Returns:
             Number of entries removed
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
+        to_remove = self._expired_hostnames(now)
+
+        for hostname in to_remove:
+            del self._entries[hostname]
+
+        return len(to_remove)
+
+    def _expired_hostnames(self, now: float) -> list[str]:
+        """Hostnames whose backoff TTL elapsed by ``now``."""
         to_remove = []
 
         for hostname, entry in self._entries.items():
@@ -159,10 +161,7 @@ class NegativeCache:
             if now - entry.cached_at > ttl:
                 to_remove.append(hostname)
 
-        for hostname in to_remove:
-            del self._entries[hostname]
-
-        return len(to_remove)
+        return to_remove
 
     def _compute_ttl(self, failure_count: int) -> float:
         """
@@ -195,7 +194,7 @@ class NegativeCache:
             return None
 
         ttl = self._compute_ttl(entry.failure_count)
-        elapsed = time.monotonic() - entry.cached_at
+        elapsed = _DEFAULT_CLOCK.monotonic() - entry.cached_at
         remaining = ttl - elapsed
 
         if remaining <= 0:
@@ -209,3 +208,10 @@ class NegativeCache:
     def size(self) -> int:
         """Return the number of entries in the cache."""
         return len(self._entries)
+
+_REHOMED = (
+    NegativeEntry,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -1,143 +1,99 @@
-#!/usr/bin/env python
 """
-Debug test to isolate where worker startup hangs.
+A worker's startup, phase by phase, each bounded on its own so a hang
+names the phase it is in: the executor addresses, the CPU and memory
+monitors, the local server pool's setup, the pool leader
+(RemoteGraphManager) starting, the executor pool running, and the leader
+connecting to every executor. The worker's core count comes from
+``WORKER_MAX_CORES`` (no explicit ``total_cores``).
 """
 
 import asyncio
-import os
-import sys
+import pathlib
+from collections.abc import AsyncIterator, Awaitable
+
+import pytest
+
+from hyperscale.distributed.nodes import WorkerServer
+from tests.integration.in_process_nodes import LOCALHOST, node_env, reserve_worker_ports
+
+DATACENTER_ID = "DC-TEST"
+WORKER_MAX_CORES = 2
+MONITOR_START_SECONDS = 5.0
+POOL_PHASE_SECONDS = 10.0
+# connect_to_workers' own budget per operation, and the outer bound on the
+# whole connection (its poll for every executor's start acknowledgement).
+EXECUTOR_CONNECT_SECONDS = 5.0
+EXECUTOR_CONNECT_OUTER_SECONDS = 15.0
+TEARDOWN_SECONDS = 30.0
 
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+async def run_phase(phase_description: str, phase: Awaitable[None], within_seconds: float) -> None:
+    """Await one startup phase; fail naming it if it hangs past ``within_seconds``."""
+    try:
+        await asyncio.wait_for(phase, timeout=within_seconds)
+    except TimeoutError as timeout_error:
+        raise AssertionError(f"{phase_description} hung past {within_seconds}s") from timeout_error
 
-from hyperscale.logging.config import LoggingConfig
-from hyperscale.distributed.env.env import Env
-from hyperscale.distributed.nodes.worker import WorkerServer
 
-
-async def validte_worker_startup_phases():
-    """Test worker startup in phases to find where it hangs."""
-    
-    # Setup logging
-    LoggingConfig().update(log_directory=os.getcwd(), log_level="debug")
-    
-    env = Env()
-    
-    # Set WORKER_MAX_CORES via env
-    env.WORKER_MAX_CORES = 2
-
+@pytest.fixture
+async def unstarted_worker(node_directory: pathlib.Path) -> AsyncIterator[WorkerServer]:
+    """A standalone worker of ``WORKER_MAX_CORES`` cores (from the Env) at
+    debug log level, never started as a server: the test drives its
+    lifecycle phases itself, so teardown shuts those components down
+    (pool leader, monitors, server pool, executor processes)."""
+    (worker_tcp_port,) = reserve_worker_ports([WORKER_MAX_CORES])
     worker = WorkerServer(
-        host='127.0.0.1',
-        tcp_port=9200,
-        udp_port=9201,
-        env=env,
-        dc_id="DC-TEST",
-        seed_managers=[],  # No managers
+        host=LOCALHOST,
+        tcp_port=worker_tcp_port,
+        udp_port=worker_tcp_port + 1,
+        env=node_env(node_directory, MERCURY_SYNC_LOG_LEVEL="debug", WORKER_MAX_CORES=WORKER_MAX_CORES),
+        dc_id=DATACENTER_ID,
+        seed_managers=[],
     )
-    
-    print("[1/8] Worker created")
-    print(f"  - _local_udp_port: {worker._local_udp_port}")
-    print(f"  - _total_cores: {worker._total_cores}")
-    
-    # Phase 1: Calculate worker IPs
-    print("\n[2/8] Calculating worker IPs...")
-    worker_ips = worker._bin_and_check_socket_range()
-    print(f"  ✓ Worker IPs: {worker_ips}")
-    
-    # Phase 2: Start CPU monitor
-    print("\n[3/8] Starting CPU monitor...")
-    await asyncio.wait_for(
-        worker._cpu_monitor.start_background_monitor(
-            worker._node_id.datacenter,
-            worker._node_id.full,
-        ),
-        timeout=5.0
-    )
-    print("  ✓ CPU monitor started")
-    
-    # Phase 3: Start memory monitor
-    print("\n[4/8] Starting memory monitor...")
-    await asyncio.wait_for(
-        worker._memory_monitor.start_background_monitor(
-            worker._node_id.datacenter,
-            worker._node_id.full,
-        ),
-        timeout=5.0
-    )
-    print("  ✓ Memory monitor started")
-    
-    # Phase 4: Setup server pool
-    print("\n[5/8] Setting up server pool...")
     try:
-        await asyncio.wait_for(
-            worker._server_pool.setup(),
-            timeout=10.0
-        )
-        print("  ✓ Server pool setup complete")
-    except asyncio.TimeoutError:
-        print("  ✗ TIMEOUT: Server pool setup hung!")
-        return
-    
-    # Phase 5: Start remote manager
-    print("\n[6/8] Starting remote manager...")
-    try:
-        await asyncio.wait_for(
-            worker._remote_manger.start(
-                worker._host,
-                worker._local_udp_port,
-                worker._local_env,
-            ),
-            timeout=10.0
-        )
-        print("  ✓ Remote manager started")
-    except asyncio.TimeoutError:
-        print("  ✗ TIMEOUT: Remote manager start hung!")
-        return
-    
-    # Phase 6: Run pool (spawns worker processes)
-    print("\n[7/8] Running server pool...")
-    try:
-        await asyncio.wait_for(
-            worker._server_pool.run_pool(
-                (worker._host, worker._local_udp_port),
-                worker_ips,
-                worker._local_env,
-            ),
-            timeout=10.0
-        )
-        print("  ✓ Server pool running")
-    except asyncio.TimeoutError:
-        print("  ✗ TIMEOUT: Server pool run_pool hung!")
-        return
-    
-    # Phase 7: Connect to workers (THIS IS LIKELY THE HANG)
-    print("\n[8/8] Connecting to workers...")
-    print("  Note: This calls poll_for_start which has NO TIMEOUT!")
-    try:
-        await asyncio.wait_for(
-            worker._remote_manger.connect_to_workers(
-                worker_ips,
-                timeout=5.0,  # This timeout is for individual operations, not poll_for_start
-            ),
-            timeout=15.0  # Outer timeout
-        )
-        print("  ✓ Connected to workers")
-    except asyncio.TimeoutError:
-        print("  ✗ TIMEOUT: connect_to_workers hung!")
-        print("  ✗ Root cause: poll_for_start() loops forever waiting for worker acknowledgments")
-        return
-    
-    print("\n✓ All phases completed successfully!")
-    
-    # Cleanup
-    await worker.stop()
-    print("✓ Worker shutdown")
+        yield worker
+    finally:
+        await asyncio.wait_for(worker._shutdown_lifecycle_components(), timeout=TEARDOWN_SECONDS)
 
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(validte_worker_startup_phases())
-    except KeyboardInterrupt:
-        print("\nInterrupted")
+async def test_every_worker_startup_phase_completes_within_its_bound(unstarted_worker: WorkerServer) -> None:
+    lifecycle = unstarted_worker._lifecycle_manager
+    datacenter_id = unstarted_worker._node_id.datacenter
+    node_id = unstarted_worker._node_id.full
+    lifecycle.setup_logging_config()
 
+    assert unstarted_worker._total_cores == WORKER_MAX_CORES, (
+        f"WORKER_MAX_CORES={WORKER_MAX_CORES} not honoured: the worker has {unstarted_worker._total_cores} cores"
+    )
+
+    executor_addresses = lifecycle.get_worker_ips()
+    assert len(executor_addresses) == WORKER_MAX_CORES, (
+        f"expected one executor address per core ({WORKER_MAX_CORES}), got {executor_addresses}"
+    )
+
+    await run_phase(
+        "starting the CPU monitor",
+        lifecycle.cpu_monitor.start_background_monitor(datacenter_id, node_id),
+        MONITOR_START_SECONDS,
+    )
+    await run_phase(
+        "starting the memory monitor",
+        lifecycle.memory_monitor.start_background_monitor(datacenter_id, node_id),
+        MONITOR_START_SECONDS,
+    )
+    await run_phase("setting up the server pool", lifecycle.setup_server_pool(), POOL_PHASE_SECONDS)
+    await lifecycle.initialize_remote_manager(
+        unstarted_worker._updates_controller,
+        unstarted_worker._config.progress_update_interval,
+    )
+    await run_phase(
+        "starting the pool leader (RemoteGraphManager)",
+        lifecycle.start_remote_manager(),
+        POOL_PHASE_SECONDS,
+    )
+    await run_phase("running the executor pool", lifecycle.run_worker_pool(), POOL_PHASE_SECONDS)
+    await run_phase(
+        "connecting the pool leader to every executor",
+        lifecycle.connect_to_workers(timeout=EXECUTOR_CONNECT_SECONDS),
+        EXECUTOR_CONNECT_OUTER_SECONDS,
+    )

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from ssl import SSLContext
-from typing import Optional, Tuple
+from typing import Iterator, Optional, Sequence, Tuple
 
+from hyperscale.core.engines.client.http2.frames import FrameBuffer
 from hyperscale.core.engines.client.http2.streams import Stream
-from hyperscale.core.engines.client.shared.protocols import _DEFAULT_LIMIT
+from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import SocketConfig
 
 from .tcp import TCPConnection
 
@@ -17,7 +18,9 @@ class HTTP2Connection:
         "stream_id",
         "stream",
         "connected",
+        "target",
         "reset_connections",
+        "consecutive_read_timeouts",
         "_connection_factory",
     )
 
@@ -40,7 +43,11 @@ class HTTP2Connection:
         )
 
         self.connected = False
+        # The origin (scheme and authority) the open transport serves.
+        self.target: Tuple[str, str] | None = None
         self.reset_connections = reset_connections
+        # Read timeouts in a row on this transport; a second means it is dead.
+        self.consecutive_read_timeouts = 0
         self._connection_factory = TCPConnection()
 
     async def make_connection(
@@ -68,35 +75,118 @@ class HTTP2Connection:
             self.port = port
             self.ssl = ssl
         else:
-            self.stream.update_stream_id()
+            # The next stream: client streams are odd (RFC 9113 5.1.1), and
+            # every id starts odd, so a step of two keeps it odd.
+            self.stream.stream_id += 2
 
-    @property
-    def empty(self):
-        return not self.stream.reader._buffer
+    def reuse_transport(
+        self,
+        target: Tuple[str, str],
+        addresses: Sequence[Tuple[str, SocketConfig]],
+    ) -> Optional[Tuple[str, SocketConfig]]:
+        """
+        When this connection's transport serves ``target`` (the request's
+        scheme and authority) at one of ``addresses``, move to the next
+        stream and return that address and its socket config; otherwise
+        None. Another host on the same address and port gets its own
+        transport: this one's TLS session names this host. Synchronous, so
+        the common case -- a request on an open connection -- awaits nothing.
+        """
+        if self.connected and self.target == target:
+            # A transport the server closed while it sat in the pool -- its
+            # reader at the end of the stream, or holding the error -- is not
+            # reused: the request opens a new one.
+            reader = self.stream.reader
+            if reader is None or reader._eof or reader._exception is not None:
+                return None
 
-    def read(self, limit: int = _DEFAULT_LIMIT):
-        return self.stream.reader.read(n=_DEFAULT_LIMIT)
+            for address, socket_config in addresses:
+                if address == self.dns_address:
+                    # The next stream: client streams are odd (RFC 9113
+                    # 5.1.1), and every id starts odd, so a step of two keeps
+                    # it odd.
+                    self.stream.stream_id += 2
+                    return address, socket_config
 
-    def readexactly(self, n_bytes: int):
-        return self.stream.reader.readexactly(n=n_bytes)
+        return None
 
-    def readuntil(self, sep=b"\n"):
-        return self.stream.reader.readuntil(separator=sep)
+    async def connect_to_any(
+        self,
+        target: Tuple[str, str],
+        hostname: str,
+        addresses: Sequence[Tuple[str, SocketConfig]],
+        port: int,
+        address_rotation: Iterator[int],
+        ssl: Optional[SSLContext] = None,
+    ) -> Tuple[str, SocketConfig, bool]:
+        """
+        Reuse this connection's transport when it already serves ``target``
+        at one of the host's ``addresses``. Otherwise open a new one, racing the
+        addresses (RFC 8305) from the next offset in ``address_rotation`` so
+        a pool's connections spread across all of them.
 
-    def readline(self):
-        return self.stream.reader.readline()
+        Returns the address and socket config connected to, and whether the
+        transport is new.
+        """
+        if (reused := self.reuse_transport(target, addresses)) is not None:
+            return *reused, False
+
+        if not addresses:
+            raise ConnectionError(f"No addresses to connect to for {hostname}")
+
+        if self.connected:
+            # The transport reaches a different host: close it first.
+            self.reset()
+
+        offset = next(address_rotation) % len(addresses)
+        ordered = [*addresses[offset:], *addresses[:offset]]
+
+        reader, writer, winner_index = await self._connection_factory.create_http2_racing(
+            hostname,
+            [socket_config for _, socket_config in ordered],
+            ssl=ssl,
+        )
+
+        address, socket_config = ordered[winner_index]
+
+        self.stream.reader = reader
+        self.stream.writer = writer
+
+        self.connected = True
+        self.target = target
+        self.dns_address = address
+        self.port = port
+        self.ssl = ssl
+
+        return address, socket_config, True
 
     def write(self, data):
         self.stream.writer.write(data)
 
-    def reset_buffer(self):
-        self.stream.reader._buffer = bytearray()
-
-    def read_headers(self):
-        return self.stream.reader.read_headers()
-
     def close(self):
+        if self.stream.reader:
+            self.stream.reader = None
+
+        if self.stream.writer:
+            self.stream.writer.clear()
+
         try:
             self._connection_factory.close()
         except Exception:
             pass
+
+    def reset(self):
+        self.connected = False
+        self.target = None
+        self.consecutive_read_timeouts = 0
+
+        # Bytes buffered from the old transport mean nothing on the next one.
+        self.stream.frame_buffer = FrameBuffer()
+
+        if self.stream.reader:
+            self.stream.reader = None
+
+        if self.stream.writer:
+            self.stream.writer.clear()
+
+        self._connection_factory.reset()

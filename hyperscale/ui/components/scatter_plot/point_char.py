@@ -1,20 +1,6 @@
-from enum import Enum
 from typing import Dict, Literal
 
-
-class PointCharType(Enum):
-    X = "X"
-    DOT = "●"
-    PERIOD = "."
-    LEFT_ARROW_EMPTY = "▹"
-    LEFT_ARROW_FULL = "▸"
-    EMPTY_DOT = "o"
-    SQUARE = "▄"
-    DASH = "-"
-    CENTER_PERIOD = "∙"
-    TRIPLE_EQUALS = "≡"
-    CIRCLE_TOGGLE = "◉"
-
+from .point_char_type import PointCharType as PointCharType
 
 PointCharName = Literal[
     "x",

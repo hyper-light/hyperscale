@@ -98,8 +98,8 @@ async def validate_18_1_client_requests_cancellation() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_errors, dict), (
-            "Client requests cancellation expected cancellation errors"
+        assert gate._cancellation_handler is not None, (
+            "Client requests cancellation expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()
@@ -118,8 +118,8 @@ async def validate_18_1_cancellation_to_managers() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_completion_events, dict), (
-            "Cancellation to managers expected cancellation events"
+        assert gate._cancellation_handler is not None, (
+            "Cancellation to managers expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()
@@ -138,8 +138,8 @@ async def validate_18_1_cancellation_acknowledgment() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_completion_events, dict), (
-            "Cancellation acknowledgment expected cancellation events"
+        assert gate._cancellation_handler is not None, (
+            "Cancellation acknowledgment expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()
@@ -158,8 +158,8 @@ async def validate_18_1_cancellation_completion() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_completion_events, dict), (
-            "Cancellation completion expected cancellation events"
+        assert gate._cancellation_handler is not None, (
+            "Cancellation completion expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()
@@ -178,8 +178,8 @@ async def validate_18_2_single_workflow_cancel() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_errors, dict), (
-            "Single workflow cancel expected cancellation errors"
+        assert gate._cancellation_handler is not None, (
+            "Single workflow cancel expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()
@@ -198,8 +198,8 @@ async def validate_18_2_workflow_cancel_response() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_errors, dict), (
-            "Workflow cancel response expected cancellation errors"
+        assert gate._cancellation_handler is not None, (
+            "Workflow cancel response expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()
@@ -218,8 +218,8 @@ async def validate_18_2_workflow_cancellation_status() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_errors, dict), (
-            "Workflow cancellation status expected cancellation errors"
+        assert gate._cancellation_handler is not None, (
+            "Workflow cancellation status expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()
@@ -257,8 +257,8 @@ async def validate_18_3_cancellation_errors() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_errors, dict), (
-            "Cancellation errors expected cancellation errors"
+        assert gate._cancellation_handler is not None, (
+            "Cancellation errors expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()
@@ -277,8 +277,8 @@ async def validate_18_3_cancellation_event() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._cancellation_completion_events, dict), (
-            "Cancellation event expected cancellation events"
+        assert gate._cancellation_handler is not None, (
+            "Cancellation event expected the gate's cancellation handler (managers hold the bookkeeping)"
         )
     finally:
         await runtime.stop_cluster()

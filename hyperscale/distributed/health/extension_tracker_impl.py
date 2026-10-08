@@ -1,0 +1,326 @@
+"""``ExtensionTracker`` -- pickled under the namespace
+``hyperscale.distributed.health.extension_tracker`` (see that module)."""
+
+from dataclasses import dataclass, field
+from hyperscale.distributed.runtime import Clock, RealClock
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
+
+@dataclass(slots=True)
+class ExtensionTracker:
+    """
+    Tracks deadline extension requests for a single worker.
+
+    Implements logarithmic decay for extension grants per AD-26
+    line 32 (``grant = base / 2^extension_count`` where
+    ``extension_count`` is the count *before* this grant):
+    - 1st extension (count=0): base_deadline / 1 = 30s (with base=30s)
+    - 2nd extension (count=1): base_deadline / 2 = 15s
+    - 3rd extension (count=2): base_deadline / 4 = 7.5s
+    - 4th extension (count=3): base_deadline / 8 = 3.75s
+    - 5th extension (count=4): floored to min_grant (1.875s -> 1.0s)
+    - cumulative ≈ 57.25s for base=30s, min=1s
+
+    Extensions require progress since the last extension to be granted.
+    This prevents stuck workers from getting unlimited extensions.
+
+    AD-26 Issue 4: Supports both absolute metrics (completed_items) and
+    relative metrics (current_progress). Absolute metrics are preferred
+    as they avoid float precision issues with values close to 1.0.
+
+    Graceful Exhaustion:
+    - When remaining extensions hit warning_threshold, sends warning
+    - After exhaustion, grace_period gives final time before eviction
+    - Allows workflows to checkpoint/save before being killed
+
+    Attributes:
+        worker_id: Unique identifier for the worker being tracked.
+        base_deadline: Base deadline in seconds (default 30.0).
+        min_grant: Minimum extension grant in seconds (default 1.0).
+        max_extensions: Maximum number of extensions allowed (default 5).
+        warning_threshold: Remaining extensions count to trigger warning (default 1).
+        grace_period: Seconds of grace after exhaustion before kill (default 10.0).
+        extension_count: Number of extensions granted so far.
+        last_progress: Progress value at last extension (for comparison).
+        last_completed_items: Absolute completed items at last extension (for comparison).
+        total_extended: Total seconds extended so far.
+        last_extension_time: Timestamp of last extension grant.
+        exhaustion_time: Timestamp when extensions were exhausted (None if not exhausted).
+        warning_sent: Whether exhaustion warning has been sent.
+    """
+
+    worker_id: str
+    base_deadline: float = 30.0
+    min_grant: float = 1.0
+    max_extensions: int = 5
+    warning_threshold: int = 1
+    grace_period: float = 10.0
+    extension_count: int = 0
+    last_progress: float = 0.0
+    last_completed_items: int | None = None  # AD-26 Issue 4: Track absolute metrics
+    total_extended: float = 0.0
+    last_extension_time: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
+    exhaustion_time: float | None = None
+    warning_sent: bool = False
+
+    def request_extension(
+        self,
+        reason: str,
+        current_progress: float,
+        completed_items: int | None = None,
+        total_items: int | None = None,
+    ) -> tuple[bool, float, str | None, bool]:
+        """
+        Request a deadline extension.
+
+        Extensions are granted if:
+        1. max_extensions has not been reached
+        2. Progress has been made since the last extension
+
+        AD-26 Issue 4: Prioritizes absolute metrics (completed_items) over
+        relative progress (current_progress) when available. This avoids
+        float precision issues with values close to 1.0.
+
+        The extension amount uses logarithmic decay (AD-26 line 32, with
+        the extension count starting at 0 *before* this grant is applied):
+
+            grant = max(min_grant, base_deadline / 2 ** extension_count)
+
+        For ``base_deadline = 30s``:
+            1st extension (count=0): 30 / 2^0 = 30s
+            2nd extension (count=1): 30 / 2^1 = 15s
+            3rd extension (count=2): 30 / 2^2 = 7.5s
+            4th extension (count=3): 30 / 2^3 = 3.75s
+            5th extension (count=4): 30 / 2^4 = 1.875s -> floored to min_grant=1.0s
+
+        Cumulative ≈ 57.25s (geometric series, AD-26 line 220-228).
+
+        Args:
+            reason: Reason for requesting extension (for logging).
+            current_progress: Current progress metric (must increase to show progress).
+            completed_items: Absolute count of completed items (preferred metric).
+            total_items: Total items to complete (for validation).
+
+        Returns:
+            Tuple of (granted, extension_seconds, denial_reason, is_warning).
+            - granted: True if extension was granted
+            - extension_seconds: Amount of time granted (0 if denied)
+            - denial_reason: Reason for denial, or None if granted
+            - is_warning: True if this is a warning about impending exhaustion
+        """
+        # Check max extensions
+        if self.extension_count >= self.max_extensions:
+            return self._deny_exhausted()
+
+        # Check for progress since last extension
+        # AD-26 Issue 4: Prioritize absolute metrics when available
+        if (progress_denial := self._progress_denial(current_progress, completed_items)) is not None:
+            return progress_denial
+
+        return self._grant_extension(current_progress, completed_items)
+
+    def _deny_exhausted(self) -> tuple[bool, float, str | None, bool]:
+        """Deny past ``max_extensions``, starting the AD-26 grace period
+        clock on the first such denial."""
+        # Track exhaustion time for grace period
+        if self.exhaustion_time is None:
+            self.exhaustion_time = _DEFAULT_CLOCK.monotonic()
+        return (
+            False,
+            0.0,
+            f"Maximum extensions ({self.max_extensions}) exceeded",
+            False,
+        )
+
+    def _progress_denial(
+        self,
+        current_progress: float,
+        completed_items: int | None,
+    ) -> tuple[bool, float, str | None, bool] | None:
+        """The denial when no progress was made since the last extension
+        (AD-26 Issue 4), or ``None``; a first extension needs no progress."""
+        if not self.extension_count > 0:
+            return None
+        # Use absolute metrics if both current and last values are available
+        if self._has_absolute_progress_metrics(completed_items):
+            return self._absolute_progress_denial(completed_items)
+        # Fall back to relative progress if absolute metrics not available
+        return self._relative_progress_denial(current_progress)
+
+    def _has_absolute_progress_metrics(self, completed_items: int | None) -> bool:
+        """Whether both this request and the last grant carry the absolute
+        ``completed_items`` metric (AD-26 Issue 4)."""
+        return completed_items is not None and self.last_completed_items is not None
+
+    def _absolute_progress_denial(self, completed_items: int) -> tuple[bool, float, str | None, bool] | None:
+        """Deny unless ``completed_items`` strictly increased (AD-26 Issue 4)."""
+        # Strict increase required for absolute metrics
+        if completed_items <= self.last_completed_items:
+            return (
+                False,
+                0.0,
+                f"No progress since last extension (completed_items={completed_items}, last={self.last_completed_items})",
+                False,
+            )
+        return None
+
+    def _relative_progress_denial(self, current_progress: float) -> tuple[bool, float, str | None, bool] | None:
+        """Deny unless the relative ``current_progress`` increased."""
+        if current_progress <= self.last_progress:
+            return (
+                False,
+                0.0,
+                f"No progress since last extension (current={current_progress}, last={self.last_progress})",
+                False,
+            )
+        return None
+
+    def _grant_extension(
+        self,
+        current_progress: float,
+        completed_items: int | None,
+    ) -> tuple[bool, float, str | None, bool]:
+        """Grant the AD-26 line 32 decayed extension and record it."""
+        # Calculate extension grant with logarithmic decay per AD-26
+        # line 32: grant = max(min_grant, base / 2^extension_count)
+        # where extension_count is the *pre-grant* count (n = 0 for the
+        # first extension yields a full base_deadline grant). Earlier
+        # versions used 2^(n+1) which silently halved every grant
+        # against the AD spec; cumulative was ~29s instead of ~58s.
+        divisor = 2 ** self.extension_count
+        grant = max(self.min_grant, self.base_deadline / divisor)
+
+        # Update state
+        self.extension_count += 1
+        self.last_progress = current_progress
+        if completed_items is not None:
+            self.last_completed_items = completed_items
+        self.total_extended += grant
+        self.last_extension_time = _DEFAULT_CLOCK.monotonic()
+
+        # Check if we should send a warning about impending exhaustion
+        is_warning = self._mark_exhaustion_warning()
+
+        return (True, grant, None, is_warning)
+
+    def _mark_exhaustion_warning(self) -> bool:
+        """Whether this grant crosses the AD-26 exhaustion-warning threshold
+        for the first time; marks the warning sent when it does."""
+        remaining = self.get_remaining_extensions()
+        is_warning = remaining <= self.warning_threshold and not self.warning_sent
+        if is_warning:
+            self.warning_sent = True
+        return is_warning
+
+    def reset(self) -> None:
+        """
+        Reset the tracker for a new health check cycle.
+
+        Call this when a worker becomes healthy again or when
+        a new workflow starts.
+        """
+        self.extension_count = 0
+        self.last_progress = 0.0
+        self.last_completed_items = None  # AD-26 Issue 4: Reset absolute metrics
+        self.total_extended = 0.0
+        self.last_extension_time = _DEFAULT_CLOCK.monotonic()
+        self.exhaustion_time = None
+        self.warning_sent = False
+
+    # =========================================================================
+    # Phase H5 — externally-driven commit API
+    # =========================================================================
+    #
+    # Used by ``ExtensionDecisionEvaluator`` after the multi-witness
+    # decision has been disseminated through the AD-48 channel
+    # (Phase H7). The evaluator returns a pure ``ExtensionDecision``;
+    # the caller then commits via one of these methods so the
+    # tracker's internal state stays consistent with what was
+    # gossipped to the rest of the cluster.
+
+    def commit_grant(
+        self,
+        grant_seconds: float,
+        completed_items: int | None = None,
+        current_progress: float = 0.0,
+    ) -> None:
+        """Apply the state mutation for a granted extension.
+
+        Mirrors the post-grant state changes in ``request_extension``
+        without re-running the witness checks (which already passed
+        in the evaluator).
+        """
+        self.extension_count += 1
+        self.last_progress = current_progress
+        if completed_items is not None:
+            self.last_completed_items = completed_items
+        self.total_extended += grant_seconds
+        self.last_extension_time = _DEFAULT_CLOCK.monotonic()
+        # Track exhaustion warning, matching the existing semantics.
+        self._mark_exhaustion_warning()
+
+    def commit_deny(self, code: str) -> None:
+        """Apply the state mutation for a denied extension.
+
+        Currently a no-op for non-exhaustion denies; for
+        ``MAX_EXHAUSTED`` we set ``exhaustion_time`` so the AD-26
+        grace-period logic engages.
+        """
+        if code == "max_exhausted" and self.exhaustion_time is None:
+            self.exhaustion_time = _DEFAULT_CLOCK.monotonic()
+
+    def get_remaining_extensions(self) -> int:
+        """Get the number of remaining extension requests allowed."""
+        return max(0, self.max_extensions - self.extension_count)
+
+    def get_new_deadline(self, current_deadline: float, grant: float) -> float:
+        """
+        Calculate the new deadline after an extension grant.
+
+        Args:
+            current_deadline: The current deadline timestamp.
+            grant: The extension grant in seconds.
+
+        Returns:
+            The new deadline timestamp.
+        """
+        return current_deadline + grant
+
+    @property
+    def is_exhausted(self) -> bool:
+        """Check if all extensions have been used."""
+        return self.extension_count >= self.max_extensions
+
+    @property
+    def is_in_grace_period(self) -> bool:
+        """Check if currently in grace period after exhaustion."""
+        if self.exhaustion_time is None:
+            return False
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.exhaustion_time
+        return elapsed < self.grace_period
+
+    @property
+    def grace_period_remaining(self) -> float:
+        """Get seconds remaining in grace period (0 if not in grace period or expired)."""
+        if self.exhaustion_time is None:
+            return 0.0
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.exhaustion_time
+        remaining = self.grace_period - elapsed
+        return max(0.0, remaining)
+
+    @property
+    def should_evict(self) -> bool:
+        """
+        Check if worker should be evicted.
+
+        Returns True if:
+        - Extensions are exhausted AND
+        - Grace period has expired
+        """
+        if not self.is_exhausted:
+            return False
+        if self.exhaustion_time is None:
+            return False
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.exhaustion_time
+        return elapsed >= self.grace_period

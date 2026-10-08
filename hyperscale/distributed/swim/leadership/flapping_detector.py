@@ -3,36 +3,25 @@ Leadership flapping detection for SWIM clusters.
 
 Detects rapid leadership changes that indicate cluster instability,
 network issues, or misconfiguration.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
-import time
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Callable, Any
-
+from typing import Callable
+from hyperscale.distributed.protocol.time_quantum import TIME_REMAINDER_EPSILON_SECONDS
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 
-
-from ..core.protocols import LoggerProtocol
-
-
-@dataclass(slots=True)
-class LeadershipChange:
-    """
-    Record of a leadership change event.
-    
-    Uses __slots__ for memory efficiency since many instances may be created
-    during flapping episodes.
-    """
-    timestamp: float
-    old_leader: tuple[str, int] | None
-    new_leader: tuple[str, int] | None
-    term: int
-    reason: str  # e.g., 'election', 'stepdown', 'timeout', 'conflict'
-    
-    def __post_init__(self):
-        if self.timestamp == 0:
-            self.timestamp = time.monotonic()
+from .flapping_detector_shared import _DEFAULT_CLOCK
+from .flapping_detector_stats import FlappingDetectorStats
+from .leadership_change import LeadershipChange
 
 
 @dataclass(slots=True)
@@ -93,12 +82,14 @@ class FlappingDetector:
     _last_detection_time: float = 0.0
     
     # Callbacks
-    _on_flapping_detected: Callable[[int, float], Any] | None = None
-    _on_flapping_resolved: Callable[[], Any] | None = None
-    _on_warning: Callable[[int], Any] | None = None
+    _on_flapping_detected: Callable[[int, float], None] | None = None
+    _on_flapping_resolved: Callable[[], None] | None = None
+    _on_warning: Callable[[int], None] | None = None
     
     # Stats
     _total_changes: int = 0
+    # Debug log records lost because the logger's write itself failed.
+    _log_write_failures: int = 0
     _flapping_episodes: int = 0
     _total_flapping_duration: float = 0.0
     
@@ -139,13 +130,15 @@ class FlappingDetector:
                     node_id=self._node_id,
                 ))
             except Exception:
-                pass  # Don't let logging errors propagate
+                # The logger itself failed: nowhere left to report it but
+                # this detector's stats.
+                self._log_write_failures += 1
     
     def set_callbacks(
         self,
-        on_flapping_detected: Callable[[int, float], Any] | None = None,
-        on_flapping_resolved: Callable[[], Any] | None = None,
-        on_warning: Callable[[int], Any] | None = None,
+        on_flapping_detected: Callable[[int, float], None] | None = None,
+        on_flapping_resolved: Callable[[], None] | None = None,
+        on_warning: Callable[[int], None] | None = None,
     ) -> None:
         """
         Set callback functions for flapping events.
@@ -178,7 +171,7 @@ class FlappingDetector:
         Returns:
             True if this change triggered flapping detection.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         
         change = LeadershipChange(
             timestamp=now,
@@ -195,19 +188,25 @@ class FlappingDetector:
         changes_in_window = self._count_changes_in_window(now)
         
         # Check thresholds
-        triggered_flapping = False
-        
+        return await self._apply_thresholds(changes_in_window, now)
+
+    async def _apply_thresholds(self, changes_in_window: int, now: float) -> bool:
+        """Act on the critical, then flapping threshold; True only when this change began flapping."""
         if changes_in_window >= self.critical_threshold:
             await self._handle_critical(changes_in_window)
-        elif changes_in_window >= self.max_changes_per_window:
-            triggered_flapping = await self._handle_flapping_detected(changes_in_window, now)
-        elif changes_in_window >= self.warning_threshold:
+            return False
+        if changes_in_window >= self.max_changes_per_window:
+            return await self._handle_flapping_detected(changes_in_window, now)
+        await self._apply_sub_flapping_thresholds(changes_in_window, now)
+        return False
+
+    async def _apply_sub_flapping_thresholds(self, changes_in_window: int, now: float) -> None:
+        """Below the flapping threshold: warn when near it, else check whether flapping resolved."""
+        if changes_in_window >= self.warning_threshold:
             await self._handle_warning(changes_in_window)
         elif self._is_flapping:
             # Check if flapping has resolved
             await self._check_flapping_resolved(now)
-        
-        return triggered_flapping
     
     def _count_changes_in_window(self, now: float) -> int:
         """Count leadership changes within the window."""
@@ -238,19 +237,23 @@ class FlappingDetector:
         # Escalate cooldown
         self._escalate_cooldown()
         
+        await self._notify_flapping_detected(count)
+        
+        return True
+
+    async def _notify_flapping_detected(self, count: int) -> None:
+        """Invoke on_flapping_detected with the escalated cooldown, logging a callback failure."""
         if self._on_flapping_detected:
             try:
                 self._on_flapping_detected(count, self._current_cooldown)
             except Exception as e:
                 await self._log_debug(f"Flapping detected callback failed: {type(e).__name__}: {e}")
-        
-        return True
     
     async def _handle_critical(self, count: int) -> None:
         """Handle critical flapping level."""
         # Ensure we're in flapping state
         if not self._is_flapping:
-            await self._handle_flapping_detected(count, time.monotonic())
+            await self._handle_flapping_detected(count, _DEFAULT_CLOCK.monotonic())
         
         # Max out cooldown
         self._current_cooldown = self.max_cooldown
@@ -275,11 +278,15 @@ class FlappingDetector:
                 self._current_cooldown / self.cooldown_multiplier,
             )
             
-            if self._on_flapping_resolved:
-                try:
-                    self._on_flapping_resolved()
-                except Exception as e:
-                    await self._log_debug(f"Flapping resolved callback failed: {type(e).__name__}: {e}")
+            await self._notify_flapping_resolved()
+
+    async def _notify_flapping_resolved(self) -> None:
+        """Invoke on_flapping_resolved, logging a callback failure."""
+        if self._on_flapping_resolved:
+            try:
+                self._on_flapping_resolved()
+            except Exception as e:
+                await self._log_debug(f"Flapping resolved callback failed: {type(e).__name__}: {e}")
     
     def _escalate_cooldown(self) -> None:
         """Increase the cooldown period."""
@@ -301,7 +308,7 @@ class FlappingDetector:
     @property
     def changes_in_window(self) -> int:
         """Get current count of changes in the window."""
-        return self._count_changes_in_window(time.monotonic())
+        return self._count_changes_in_window(_DEFAULT_CLOCK.monotonic())
     
     def get_recent_changes(self, count: int = 10) -> list[LeadershipChange]:
         """
@@ -332,13 +339,26 @@ class FlappingDetector:
         if not self._is_flapping:
             return (False, 0.0)
         
-        # Check time since last detection
-        now = time.monotonic()
+        # Check time since last detection. The cooldown remainder is a
+        # COMPOSED float (``cooldown - (now - last_detection)`` on a
+        # quantized clock), so it can be a positive sub-quantum artifact
+        # (observed live: 1.64e-11s at frozen virtual instant
+        # 39.376650491999996 — the chaos-suite gate-a livelock) even
+        # though the cooldown has semantically elapsed. Returning that
+        # artifact as a delay makes the election loop wait on a timer
+        # the quantized clock cannot honor: the wait expires at the SAME
+        # instant, this predicate re-evaluates the same remainder, and
+        # the loop spins forever — a hard livelock under deterministic
+        # simulation and a 100%-CPU micro-spin on a real host. The
+        # epsilon-expiry contract (``protocol/time_quantum.py``) applies:
+        # a remainder at or below the epsilon IS expiry.
+        now = _DEFAULT_CLOCK.monotonic()
         time_since_detection = now - self._last_detection_time
-        
-        if time_since_detection < self._current_cooldown:
-            return (True, self._current_cooldown - time_since_detection)
-        
+        remaining_cooldown = self._current_cooldown - time_since_detection
+
+        if remaining_cooldown > TIME_REMAINDER_EPSILON_SECONDS:
+            return (True, remaining_cooldown)
+
         return (False, 0.0)
     
     def reset(self) -> None:
@@ -348,7 +368,7 @@ class FlappingDetector:
         self._current_cooldown = self.base_cooldown
         self._flapping_start = None
     
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> FlappingDetectorStats:
         """Get detector statistics."""
         return {
             'is_flapping': self._is_flapping,
@@ -357,8 +377,15 @@ class FlappingDetector:
             'change_rate_per_min': self.get_change_rate(),
             'total_changes': self._total_changes,
             'flapping_episodes': self._flapping_episodes,
+            'log_write_failures': self._log_write_failures,
             'total_flapping_duration': self._total_flapping_duration,
             'window_seconds': self.window_seconds,
             'max_changes_per_window': self.max_changes_per_window,
         }
 
+_REHOMED = (
+    LeadershipChange,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

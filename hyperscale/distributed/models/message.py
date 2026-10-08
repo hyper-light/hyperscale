@@ -1,11 +1,12 @@
+import dataclasses
 import io
 import os
 import secrets
-import time
 import cloudpickle
 from typing import Self
 
 from hyperscale.distributed.models.restricted_unpickler import RestrictedUnpickler
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.taskex.snowflake import SnowflakeGenerator
 
 
@@ -25,22 +26,83 @@ def _generate_instance_id() -> int:
     return pid_component | random_component
 
 
-# Module-level Snowflake generator for message IDs
-# Uses combined PID + random incarnation for collision resistance
-_message_id_generator = SnowflakeGenerator(instance=_generate_instance_id())
+# Module-level Snowflake generator for message IDs — LAZY, and bound
+# to the module's CURRENT clock.
+#
+# Construction is deferred to first use for two determinism reasons
+# (both measured as chaos-VOPR twin forks):
+# * the taskex generator captures its clock AT CONSTRUCTION — a
+#   module-import-time instance is born BEFORE the SIM seam swap
+#   (spawn bootstrap imports the entry's whole module graph first)
+#   and keeps the REAL clock forever, so every message id embeds a
+#   wall-time cursor that differs run to run;
+# * the instance bits combine PID + secrets — random per run. Under
+#   SIM the swapped ``_DEFAULT_RANDOM`` supplies them
+#   deterministically; REAL mode keeps the PID+secrets nonce.
+#
+# The generator in use is the one built for ``_DEFAULT_CLOCK`` (which
+# ``swap_defaults`` / ``restore_defaults`` rebind): a generator built
+# while a virtual clock was swapped in must not outlive the swap, or
+# every later id embeds that dead clock's frozen time and receivers'
+# replay guards reject the frames as stale. The REAL clock's generator
+# is kept for the process's life, so ids minted on the REAL axis stay
+# strictly monotone across any number of swaps.
+_REAL_CLOCK: Clock = RealClock()
+_DEFAULT_CLOCK: Clock = _REAL_CLOCK
+_DEFAULT_RANDOM = None
+_real_clock_message_id_generator: SnowflakeGenerator | None = None
+_message_id_generator: SnowflakeGenerator | None = None
+_message_id_generator_clock: Clock | None = None
+
+
+def _message_id_generator_instance() -> int:
+    """The generator's 10 instance bits: from the swapped ``_DEFAULT_RANDOM``
+    under SIM, else the PID + secrets nonce."""
+    if _DEFAULT_RANDOM is not None:
+        return int(_DEFAULT_RANDOM.uniform(0.0, 1023.0))
+    return _generate_instance_id()
+
+
+def _real_clock_generator() -> SnowflakeGenerator:
+    """The process-lifetime generator on the REAL clock, built on first use."""
+    global _real_clock_message_id_generator
+    if _real_clock_message_id_generator is None:
+        _real_clock_message_id_generator = SnowflakeGenerator(
+            instance=_message_id_generator_instance(), clock=_REAL_CLOCK
+        )
+    return _real_clock_message_id_generator
+
+
+def _bind_message_id_generator() -> None:
+    """Bind the generator for the module's current ``_DEFAULT_CLOCK``: the
+    REAL clock's lifetime generator, or a fresh one on a swapped clock."""
+    global _message_id_generator, _message_id_generator_clock
+    if _DEFAULT_CLOCK is _REAL_CLOCK:
+        _message_id_generator = _real_clock_generator()
+    else:
+        _message_id_generator = SnowflakeGenerator(
+            instance=_message_id_generator_instance(), clock=_DEFAULT_CLOCK
+        )
+    _message_id_generator_clock = _DEFAULT_CLOCK
+
+
+def generate_message_id() -> int:
+    """Generate a unique message ID using Snowflake algorithm.
+
+    ``generate_sync`` is total and monotone (backwards realtime steps
+    and same-millisecond sequence exhaustion are absorbed by the
+    generator), so no retry is needed — the previous ``None``-retry
+    here spun a blocking ``time.sleep`` on the event-loop thread, which
+    under a frozen virtual clock could never terminate.
+    """
+    if _message_id_generator_clock is not _DEFAULT_CLOCK:
+        _bind_message_id_generator()
+    return _message_id_generator.generate_sync()
+
 
 # Incarnation nonce - random value generated at module load time
 # Used to detect messages from previous incarnations of this process
 MESSAGE_INCARNATION = secrets.token_bytes(8)
-
-
-def _generate_message_id() -> int:
-    """Generate a unique message ID using Snowflake algorithm."""
-    message_id = _message_id_generator.generate_sync()
-    while message_id is None:
-        time.sleep(0.001)
-        message_id = _message_id_generator.generate_sync()
-    return message_id
 
 
 class Message:
@@ -74,7 +136,7 @@ class Message:
         a timestamp and is used for replay attack detection.
         """
         if self._message_id is None:
-            self._message_id = _generate_message_id()
+            self._message_id = generate_message_id()
         return self._message_id
 
     @message_id.setter
@@ -119,6 +181,54 @@ class Message:
         """
         return RestrictedUnpickler(io.BytesIO(data)).load()
 
+    def __getattr__(self, name: str) -> object:
+        """A field this message's sender did not have reads as the field's
+        default (AD-25 rolling upgrades).
+
+        A sender running an older version pickles only the fields it knows,
+        so a field added since is unset on this side, and reading it raised
+        AttributeError. Python calls this only after normal lookup fails, so
+        reading a set field costs nothing extra. The default is stored, so
+        later reads are ordinary. Every other missing attribute raises as
+        usual. A sender running a newer version is already read safely: its
+        unknown fields land in the instance ``__dict__`` and are never read.
+        """
+        if (message_field := getattr(type(self), "__dataclass_fields__", {}).get(name)) is None:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+        default = _field_default(message_field, type(self).__name__)
+        object.__setattr__(self, name, default)
+        return default
+
     def dump(self) -> bytes:
-        """Serialize the message using cloudpickle."""
+        """Serialize the message using cloudpickle, stamped with a fresh
+        message id and this process's incarnation.
+
+        Both are stamped on every serialization, so each frame carries the
+        id the receiver's replay guard checks. Generated lazily on first
+        read instead, they were never pickled unless something happened to
+        read them first; the receiver then minted a fresh id of its own for
+        every copy of a frame, so a captured frame replayed as new every
+        time. A resend serializes again under a new id: replay protection
+        refuses captured frames, while idempotency keys deduplicate retries.
+        """
+        self._message_id = generate_message_id()
+        self._sender_incarnation = MESSAGE_INCARNATION
         return cloudpickle.dumps(self)
+
+
+def _field_default(message_field: dataclasses.Field, message_type_name: str) -> object:
+    """The value a field takes when its sender did not send it: the
+    field's default, or a fresh value from its default factory.
+
+    Raises:
+        AttributeError: the field has no default, so a message without it
+            cannot be read (adding a field with no default is a breaking
+            wire change).
+    """
+    if message_field.default_factory is not dataclasses.MISSING:
+        return message_field.default_factory()
+    if message_field.default is dataclasses.MISSING:
+        raise AttributeError(
+            f"{message_type_name!r} message lacks field {message_field.name!r}, which has no default"
+        )
+    return message_field.default

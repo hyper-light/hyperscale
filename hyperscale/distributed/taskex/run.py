@@ -3,11 +3,10 @@ import functools
 import inspect
 import json
 import pathlib
-import time
 import traceback
 from asyncio.subprocess import Process
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Awaitable, Callable, Dict, Generic, Optional, TypeVar
 
 from .models import (
     CommandType,
@@ -17,8 +16,15 @@ from .models import (
     TaskType,
 )
 
+from hyperscale.distributed.runtime import Clock, RealClock
 
-class Run:
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
+T = TypeVar("T")
+
+
+class Run(Generic[T]):
     __slots__ = (
         "run_id",
         "status",
@@ -52,7 +58,7 @@ class Run:
         self,
         run_id: int,
         task_name: str,
-        call: Callable[..., Awaitable[Any]] | str,
+        call: Callable[..., Awaitable[T]] | str,
         task_type: TaskType,
         executor: ProcessPoolExecutor | ThreadPoolExecutor | None,
         semaphore: asyncio.Semaphore,
@@ -62,61 +68,32 @@ class Run:
         self.task_name = task_name
         self.status = RunStatus.CREATED
 
-        self._args: tuple[Any, ...] | None = None
-        self._env: dict[str, Any] | None = None
+        self._args: tuple[str, ...] | None = None
+        self._env: dict[str, str] | None = None
         self._working_directory: str | None = None
 
         self.error: Optional[str] = None
         self.trace: Optional[str] = None
-        self.start = time.monotonic()
+        self.start = _DEFAULT_CLOCK.monotonic()
         self.end = 0
         self.elapsed = 0
         self.timeout = timeout
 
         self.call = call
         self.task_type = task_type
-        self.result: Any | None = None
-        self._args: tuple[Any, ...] | None = None
-        self._env: dict[str, Any] | None = None
+        self.result: T | None = None
+        self._args: tuple[str, ...] | None = None
+        self._env: dict[str, str] | None = None
         self._working_directory: str | None = None
         self._read_lock = asyncio.Lock()
 
-        if not isinstance(
-            self.call,
-            str,
-        ) and not isinstance(
-            call,
-            functools.partial,
-        ) and hasattr(
-            call,
-            "__self__",
-        ):
-            bound_instance = call.__self__
-            self.call = self.call.__get__(bound_instance, self.call.__class__)
-            # Caching the bound method on the instance is an optimization; it
-            # is impossible (and unnecessary) on classes using __slots__ that
-            # do not list this attribute. Skip the cache when that's the case.
-            try:
-                setattr(bound_instance, self.call.__name__, self.call)
-            except AttributeError:
-                pass
-
-        elif not isinstance(
-            self.call,
-            str,
-        ) and isinstance(
-            call,
-            functools.partial,
-        ) and hasattr(
-            call.func,
-            "__self__",
-        ):
-            bound_instance = call.func.__self__
-            self.call = self.call.__get__(bound_instance, self.call.__class__)
-            try:
-                setattr(bound_instance, call.func.__name__, self.call)
-            except AttributeError:
-                pass
+        # ``call`` runs as given: a bound method is already bound to its
+        # instance and a partial already carries its bound method. Re-binding
+        # them (and caching the result on the instance) did nothing for a
+        # method, while a partial broke -- ``partial`` has no ``__get__``
+        # before Python 3.14 (AttributeError), and from 3.14 binding one
+        # prepends the instance as an extra argument and the cache replaced
+        # the instance's method with that partial.
 
         self._task: Optional[asyncio.Task] = None
         self._process: Process | None = None
@@ -201,7 +178,7 @@ class Run:
         await self._read_lock.acquire()
 
         try:
-            chunk = await asyncio.wait_for(
+            chunk = await _DEFAULT_CLOCK.wait_for(
                 self._process.stderr.read(self._buffer_size),
                 timeout=self._read_timeout,
             )
@@ -218,7 +195,7 @@ class Run:
         await self._read_lock.acquire()
 
         try:
-            chunk = await asyncio.wait_for(
+            chunk = await _DEFAULT_CLOCK.wait_for(
                 self._process.stdout.read(self._buffer_size),
                 timeout=self._read_timeout,
             )
@@ -236,6 +213,11 @@ class Run:
         if self._process:
             return self._return_code is None
 
+        return self._task_unfinished()
+
+    def _task_unfinished(self):
+        """The callable run's task when it is neither done nor cancelled
+        (the value ``task_running`` has always returned)."""
         return self._task and not self._task.done() and not self._task.cancelled()
 
     async def get_run_update(self):
@@ -256,7 +238,7 @@ class Run:
                 error=stderr,
                 result=stdout,
                 trace=self.trace,
-                elapsed=time.monotonic() - self.start,
+                elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
             )
 
         return TaskRun(
@@ -267,13 +249,13 @@ class Run:
             trace=self.trace,
             start=self.start,
             end=self.end,
-            elapsed=time.monotonic() - self.start,
+            elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
             result=self.result,
         )
 
     def update_status(self, status: RunStatus):
         self.status = status
-        self.elapsed = time.monotonic() - self.start
+        self.elapsed = _DEFAULT_CLOCK.monotonic() - self.start
 
     async def complete(self):
         completed = self.status in [RunStatus.COMPLETE, RunStatus.FAILED]
@@ -294,14 +276,10 @@ class Run:
                 pass
 
         # Actually cancel the asyncio task if it's running
-        if self._task and not self._task.done():
+        if self._task_pending():
             try:
                 self._task.cancel()
-                # Give the task a chance to handle cancellation
-                try:
-                    await self._task
-                except asyncio.CancelledError:
-                    pass
+                await self._await_cancelled_task()
             except Exception:
                 pass
         else:
@@ -312,6 +290,23 @@ class Run:
                 pass
 
         self.status = RunStatus.CANCELLED
+
+    def _task_pending(self):
+        """The task when it was started and has not finished (truthiness
+        is what ``cancel`` tests)."""
+        return self._task and not self._task.done()
+
+    async def _await_cancelled_task(self) -> None:
+        """Give the cancelled task a chance to handle its cancellation."""
+        # Give the task a chance to handle cancellation
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
 
     def abort(self):
         if self._process:
@@ -327,7 +322,7 @@ class Run:
         # heartbeat loops — to mirror real process death. ``cancel()``
         # delivers the ``CancelledError`` to whatever the task is
         # awaiting, which is the correct stop signal.
-        if self._task is not None and not self._task.done():
+        if self._task_unfinished_since_started():
             try:
                 self._task.cancel()
             except Exception:
@@ -335,12 +330,16 @@ class Run:
 
         self.status = RunStatus.CANCELLED
 
+    def _task_unfinished_since_started(self) -> bool:
+        """Whether the task was started and has not finished."""
+        return self._task is not None and not self._task.done()
+
     def execute(self, *args, **kwargs):
         self._task = asyncio.ensure_future(self._execute(*args, **kwargs))
 
     def execute_shell(
         self,
-        *args: tuple[Any, ...],
+        *args: str,
         poll_interval: int | float = 0.5,
         env: Dict[str, str] | None = None,
         cwd: str | pathlib.Path | None = None,
@@ -366,7 +365,7 @@ class Run:
 
     async def _execute_shell(
         self,
-        *args: tuple[Any, ...],
+        *args: str,
         poll_interval: int | float = 0.5,
         env: Dict[str, str] | None = None,
         cwd: str | pathlib.Path | None = None,
@@ -376,99 +375,161 @@ class Run:
         if shell:
             self._command_type = "shell"
 
+        if (spawn_failure := await self._spawn_process(args, env, cwd, shell)) is not None:
+            return spawn_failure
+
+        self.status = RunStatus.RUNNING
+
+        return await self._await_process(timeout)
+
+    async def _spawn_process(
+        self,
+        args: tuple[str, ...],
+        env: Dict[str, str] | None,
+        cwd: str | pathlib.Path | None,
+        shell: bool,
+    ) -> ShellProcess | None:
+        """Start the run's process; the failed run's ShellProcess when it
+        could not start, else None."""
         working_directory: pathlib.Path | None = None
         if cwd:
             working_directory = pathlib.Path(cwd)
 
         try:
-            if shell:
-                command = [self.call]
-                command.extend(args)
+            self._process = await self._create_process(args, env, shell, working_directory)
 
-                self._process = await asyncio.create_subprocess_shell(
-                    " ".join(command),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                    cwd=working_directory if cwd else None,
-                )
+        except Exception as spawn_error:
+            return self._spawn_failed(spawn_error)
 
-            else:
-                self._process = await asyncio.create_subprocess_exec(
-                    self.call,
-                    *args,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                    cwd=working_directory if cwd else None,
-                )
+        return None
 
-        except Exception:
-            pass
+    async def _create_process(
+        self,
+        args: tuple[str, ...],
+        env: Dict[str, str] | None,
+        shell: bool,
+        working_directory: pathlib.Path | None,
+    ) -> Process:
+        """Spawn the command through a shell or directly. (The working
+        directory is None exactly when no ``cwd`` was given.)"""
+        if shell:
+            command = [self.call]
+            command.extend(args)
 
-        self.status = RunStatus.RUNNING
+            return await asyncio.create_subprocess_shell(
+                " ".join(command),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=working_directory,
+            )
 
-        stderr: str | None = (None,)
-        stdout: str | None = None
+        return await asyncio.create_subprocess_exec(
+            self.call,
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd=working_directory,
+        )
 
+    def _spawn_failed(self, spawn_error: Exception) -> ShellProcess:
+        """Fail the run with the spawn's own error (called while handling it)."""
+        # No process exists: the run fails with the spawn's own error.
+        self.error = f"Err. - Task Run - {self.run_id} - could not start: {spawn_error!r}."
+        self.trace = traceback.format_exc()
+        self.status = RunStatus.FAILED
+
+        return ShellProcess(
+            run_id=self.run_id,
+            task_name=self.task_name,
+            process_id=None,
+            command=self.call,
+            args=self._args,
+            status=self.status,
+            env=self._env,
+            working_directory=self._working_directory,
+            command_type=self._command_type,
+            error=self.error,
+            trace=self.trace,
+            elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
+        )
+
+    async def _await_process(self, timeout: int | float | None) -> ShellProcess:
+        """Wait for the started process and settle the run from its exit."""
         try:
-            if timeout:
-                self._return_code = await asyncio.wait_for(
-                    self._process.wait(),
-                    timeout=timeout,
-                )
-
-                stderr = await self.get_stderr()
-                stdout = await self.get_stdout()
-
-            else:
-                self._return_code = await self._process.wait()
-
-                stderr = await self.get_stderr()
-                stdout = await self.get_stdout()
+            stderr, stdout = await self._wait_and_read_output(timeout)
 
         except asyncio.TimeoutError:
-            error = f"Err. - Task Run - {self.run_id} - timed out. Exceeded deadline of - {self.timeout} - seconds."
-            self.status = RunStatus.FAILED
-
-            stderr = await self.get_stderr()
-            stdout = await self.get_stdout()
-
-            return ShellProcess(
-                run_id=self.run_id,
-                task_name=self.task_name,
-                process_id=self._process.pid,
-                command=self.call,
-                args=self._args,
-                status=self.status,
-                env=self._env,
-                working_directory=self._working_directory,
-                command_type=self._command_type,
-                error=error,
-                trace=self.trace,
-                elapsed=self.start - time.monotonic(),
-            )
+            return await self._timed_out_process()
 
         except Exception as err:
-            error = f"Err. - Task Run - {self.run_id} - encountered error {str(err)}."
-            self.trace = traceback.format_exc()
-            self.status = RunStatus.FAILED
+            return self._failed_process(err)
 
-            return ShellProcess(
-                run_id=self.run_id,
-                task_name=self.task_name,
-                process_id=self._process.pid,
-                command=self.call,
-                args=self._args,
-                status=self.status,
-                env=self._env,
-                working_directory=self._working_directory,
-                command_type=self._command_type,
-                error=error,
-                trace=self.trace,
-                elapsed=self.start - time.monotonic(),
+        return self._finished_process(stdout, stderr)
+
+    async def _wait_and_read_output(self, timeout: int | float | None) -> tuple[str, str]:
+        """The process's exit code, within ``timeout`` when one is set,
+        then its stderr and stdout."""
+        if timeout:
+            self._return_code = await _DEFAULT_CLOCK.wait_for(
+                self._process.wait(),
+                timeout=timeout,
             )
 
+        else:
+            self._return_code = await self._process.wait()
+
+        stderr = await self.get_stderr()
+        stdout = await self.get_stdout()
+        return stderr, stdout
+
+    async def _timed_out_process(self) -> ShellProcess:
+        """Fail a run whose process overran its deadline."""
+        error = f"Err. - Task Run - {self.run_id} - timed out. Exceeded deadline of - {self.timeout} - seconds."
+        self.status = RunStatus.FAILED
+
+        await self.get_stderr()
+        await self.get_stdout()
+
+        return ShellProcess(
+            run_id=self.run_id,
+            task_name=self.task_name,
+            process_id=self._process.pid,
+            command=self.call,
+            args=self._args,
+            status=self.status,
+            env=self._env,
+            working_directory=self._working_directory,
+            command_type=self._command_type,
+            error=error,
+            trace=self.trace,
+            elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
+        )
+
+    def _failed_process(self, err: Exception) -> ShellProcess:
+        """Fail a run whose wait raised (called while handling ``err``)."""
+        error = f"Err. - Task Run - {self.run_id} - encountered error {str(err)}."
+        self.trace = traceback.format_exc()
+        self.status = RunStatus.FAILED
+
+        return ShellProcess(
+            run_id=self.run_id,
+            task_name=self.task_name,
+            process_id=self._process.pid,
+            command=self.call,
+            args=self._args,
+            status=self.status,
+            env=self._env,
+            working_directory=self._working_directory,
+            command_type=self._command_type,
+            error=error,
+            trace=self.trace,
+            elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
+        )
+
+    def _finished_process(self, stdout: str, stderr: str) -> ShellProcess:
+        """Settle a run whose process exited: complete on exit code 0."""
         self.result = stdout
         if stderr:
             self.error = stderr
@@ -494,7 +555,7 @@ class Run:
             error=self.error,
             result=self.result,
             trace=self.trace,
-            elapsed=self.start - time.monotonic(),
+            elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
         )
 
     async def _execute(self, *args, **kwargs):
@@ -508,7 +569,7 @@ class Run:
             )
 
             if self.timeout and is_coroutine:
-                self.result = await asyncio.wait_for(
+                self.result = await _DEFAULT_CLOCK.wait_for(
                     self.call(*args, **kwargs), timeout=self.timeout
                 )
 
@@ -517,7 +578,7 @@ class Run:
 
             elif self.timeout:
                 await self._semaphore.acquire()
-                self.result = await asyncio.wait_for(
+                self.result = await _DEFAULT_CLOCK.wait_for(
                     self._loop.run_in_executor(
                         self._executor, 
                         functools.partial(
@@ -554,7 +615,7 @@ class Run:
             self.trace = traceback.format_exc()
             self.status = RunStatus.FAILED
 
-        self.end = time.monotonic()
+        self.end = _DEFAULT_CLOCK.monotonic()
         self.elapsed = self.end - self.start
 
         return TaskRun(
@@ -565,6 +626,6 @@ class Run:
             trace=self.trace,
             start=self.start,
             end=self.end,
-            elapsed=time.monotonic() - self.start,
+            elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
             result=self.result,
         )

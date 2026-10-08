@@ -34,6 +34,9 @@ class HTTP3Response(CallResult):
     status: Optional[int] = None
     status_message: Optional[str] = None
     headers: Optional[Dict[bytes, bytes]] = None
+    # The trailer section's fields, kept apart from the header section's
+    # (RFC 9110 6.5).
+    trailers: Optional[Dict[bytes, bytes]] = None
     content: bytes = b""
     timings: Optional[
         Dict[

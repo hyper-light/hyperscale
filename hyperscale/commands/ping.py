@@ -1,6 +1,9 @@
 import asyncio
+import functools
 import json
-from ipaddress import IPv4Address, IPv6Address
+import sys
+import traceback
+import ipaddress
 from typing import Literal
 from hyperscale.core.engines.client.time_parser import TimeParser
 from .requests import (
@@ -58,6 +61,10 @@ def get_default_data():
     return None
 
 
+def get_default_socket_data():
+    return 'PING'
+
+
 def load_options(options: str | None):
     try:
         return json.loads(options)
@@ -71,85 +78,49 @@ def load_data(data: str | None):
         return data
 
     try:
-        return load_data(data)
-    
+        return json.loads(data)
+
     except Exception:
         return data
     
-def is_missing_http_prefix(url: str):
+def load_graphql_query(query: str):
+    """The GraphQL request ``--query`` describes: a JSON object of
+    ``query``/``operation_name``/``variables``, or a bare query document."""
+    if isinstance(loaded_query := load_data(query), dict):
+        return loaded_query
 
-    address = url.split(':', maxsplit=1)
-    host: str | None = None
-    
-    if len(address) == 2:
-        host, _ = address
+    return {"query": query}
 
-    elif len(address) == 1:
-        host = address[0]
+def is_missing_http_prefix(url: str) -> bool:
+    """Whether a target needs the ``http://`` scheme: it has neither
+    ``http://`` nor ``https://`` (an IP address needs a scheme too)."""
+    return not url.startswith(("http://", "https://"))
 
-    if url.startswith("http://") or url.startswith('https://'):
-        return False
-    
-    elif isinstance(
-        host,
-        IPv4Address
-    ) or isinstance(
-        host,
-        IPv6Address
-    ):
-        return False
-    
-    return True
+def is_missing_websocket_prefix(url: str) -> bool:
+    """Whether a target needs the ``ws://`` scheme: it has neither ``ws://``
+    nor ``wss://`` (a ``wss://`` URL was prefixed into ``ws://wss://...``)."""
+    return not url.startswith(("ws://", "wss://"))
 
-def is_missing_websocket_prefix(url: str):
+def smtp_target_host(url: str) -> str:
+    """The host part of an SMTP target: ``[v6]:port``, ``host:port``, a bare
+    IPv6 address, or a bare host."""
+    if url.startswith("["):
+        return url[1 : url.find("]")]
+    return url.split(":", maxsplit=1)[0] if url.count(":") == 1 else url
 
-    address = url.split(':', maxsplit=1)
-    host: str | None = None
-    
-    if len(address) == 2:
-        host, _ = address
 
-    elif len(address) == 1:
-        host = address[0]
-
-    if url.startswith("ws://"):
-        return False
-    
-    elif isinstance(
-        host,
-        IPv4Address
-    ) or isinstance(
-        host,
-        IPv6Address
-    ):
-        return False
-    
-    return True
-
-def is_missing_smtp_prefix(url: str):
-
-    address = url.split(':', maxsplit=1)
-    host: str | None = None
-    
-    if len(address) == 2:
-        host, _ = address
-
-    elif len(address) == 1:
-        host = address[0]
-
+def is_missing_smtp_prefix(url: str) -> bool:
+    """Whether a bare SMTP target needs the ``smtp.`` host prefix: never for
+    a target already starting with it, nor for an IP address (the old check
+    compared the host string with an ipaddress class and never matched, so
+    every IP became ``smtp.<ip>``)."""
     if url.startswith("smtp"):
         return False
-    
-    elif isinstance(
-        host,
-        IPv4Address
-    ) or isinstance(
-        host,
-        IPv6Address
-    ):
-        return False
-    
-    return True
+    try:
+        ipaddress.ip_address(smtp_target_host(url))
+    except ValueError:
+        return True
+    return False
 
 @CLI.group()
 async def ping():
@@ -174,9 +145,10 @@ async def ftp(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
-    Run a one-off GraphQL request
+    Run a one-off FTP request
 
     @param url The url to use for the request
     @param timeout The request timeout
@@ -184,9 +156,11 @@ async def ftp(
     @param user The user required by authentication
     @param password The password associated with the user
     @param account The account associated with the user
+    @param secure Use a TLS-secured (FTPS) connection
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
     
     if lookup:
@@ -210,6 +184,7 @@ async def ftp(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
 
     )
 
@@ -235,6 +210,7 @@ async def graphql(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off GraphQL request
@@ -249,6 +225,7 @@ async def graphql(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -267,13 +244,16 @@ async def graphql(
     return await make_graphql_request(
         url,
         method=method_name,
+        params={},
+        cookies=None,
         headers=json.loads(headers),
-        data=load_data(query),
+        data=load_graphql_query(query),
         redirects=redirects,
         timeout=timeout_seconds,
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
 
     )
 
@@ -299,6 +279,7 @@ async def graphqlh2(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off GraphQL HTTP2 request
@@ -313,6 +294,7 @@ async def graphqlh2(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -331,13 +313,15 @@ async def graphqlh2(
     return await make_graphqlh2_request(
         url,
         method=method_name,
+        cookies=None,
         headers=json.loads(headers),
-        data=load_data(query),
+        data=load_graphql_query(query),
         redirects=redirects,
         timeout=timeout_seconds,
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
 
     )
 
@@ -370,6 +354,7 @@ async def http(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off HTTP request
@@ -386,6 +371,7 @@ async def http(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -419,13 +405,16 @@ async def http(
             output_file=filepath,
             wait=wait,
             quiet=quiet,
+            verify_tls=not insecure,
 
         )
     
     except Exception:
-        import traceback
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, print, traceback.format_exc())
+        # A failed request is reported on stderr and fails the command;
+        # printing the traceback to stdout and exiting 0 hid it from scripts.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, functools.partial(print, traceback.format_exc(), file=sys.stderr))
+        raise SystemExit(1)
 
 @ping.command(
     shortnames={
@@ -455,6 +444,7 @@ async def http2(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off HTTP2 request
@@ -473,6 +463,7 @@ async def http2(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -504,6 +495,7 @@ async def http2(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
     )
 
 
@@ -535,6 +527,7 @@ async def http3(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off HTTP3 request
@@ -551,6 +544,7 @@ async def http3(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_http_prefix(url):
@@ -582,6 +576,7 @@ async def http3(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
     )
 
 @ping.command()
@@ -600,7 +595,7 @@ async def scp(
     '''
     Run a one-off SCP request
 
-    @param url The url to use for the email server
+    @param url The url to use for the SSH server
     @param filepath The remote path to download the file from
     @param timeout The request timeout
     @param user The user required by authentication
@@ -615,7 +610,6 @@ async def scp(
     if lookup:
         return await lookup_url(
             url,
-            as_smtp=True,
             wait=wait,
             quiet=quiet,
         )
@@ -653,10 +647,10 @@ async def sftp(
     quiet:bool= False,
 ):
     '''
-    Run a one-off SCP request
+    Run a one-off SFTP request
 
-    @param url The url to use for the email server
-    @param filepath The path to download the file to
+    @param url The url to use for the SSH server
+    @param filepath Output the request results to the specified filepath
     @param timeout The request timeout
     @param user The user required by authentication
     @param password The password associated with the user
@@ -671,7 +665,6 @@ async def sftp(
     if lookup:
         return await lookup_url(
             url,
-            as_smtp=True,
             wait=wait,
             quiet=quiet,
         )
@@ -708,6 +701,7 @@ async def smtp(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off SMTP request
@@ -722,6 +716,7 @@ async def smtp(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_smtp_prefix(url):
@@ -748,6 +743,7 @@ async def smtp(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
 
     )
         
@@ -762,13 +758,14 @@ async def tcp(
             "bidirectional",
         ]
     ] = "send",
-    data: str = get_default_data,
+    data: str = get_default_socket_data,
     options: str = get_default_options,
     timeout: str = "1m",
     filepath: str = get_default_output_filepath,
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off TCP request
@@ -782,6 +779,7 @@ async def tcp(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if lookup:
@@ -803,6 +801,7 @@ async def tcp(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
     )
         
 
@@ -816,7 +815,7 @@ async def udp(
             "bidirectional",
         ]
     ] = "send",
-    data: str = get_default_data,
+    data: str = get_default_socket_data,
     options: str = get_default_options,
     timeout: str = "1m",
     filepath: str = get_default_output_filepath,
@@ -893,6 +892,7 @@ async def websocket(
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
+    insecure: bool = False,
 ):
     '''
     Run a one-off request using one of the supported client types
@@ -909,6 +909,7 @@ async def websocket(
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
+    @param insecure Skip verifying the server's TLS certificate and name (for a self-signed target)
     '''
 
     if is_missing_websocket_prefix(url):
@@ -941,5 +942,6 @@ async def websocket(
         output_file=filepath,
         wait=wait,
         quiet=quiet,
+        verify_tls=not insecure,
     )
             

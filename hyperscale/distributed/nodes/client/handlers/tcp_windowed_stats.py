@@ -1,10 +1,10 @@
-import asyncio
-import cloudpickle
+import inspect
 
 from hyperscale.distributed.reliability.rate_limiting import RequestPriority
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
+from hyperscale.distributed.jobs import WindowedStatsPush
 
 
 class WindowedStatsPushHandler:
@@ -31,37 +31,35 @@ class WindowedStatsPushHandler:
 
         Args:
             addr: Source address (gate/manager)
-            data: Cloudpickle-serialized WindowedStatsPush message
+            data: Pickled WindowedStatsPush message
             clock_time: Logical clock time
 
         Returns:
             b'ok' on success, b'rate_limited' if throttled, b'error' on failure
         """
         try:
-            # Rate limiting: operation "progress_update" has limits of (300, 10.0) = 30/s
+            # Rate limiting (AD-24): a windowed stats push is a "stats_update"
             if self._rate_limiter:
                 client_id = f"{addr[0]}:{addr[1]}"
                 result = await self._rate_limiter.check(
                     client_id=client_id,
-                    operation="progress_update",
+                    operation="stats_update",
                     priority=RequestPriority.NORMAL,
                 )
                 if not result.allowed:
                     return b"rate_limited"
 
-            # Import WindowedStatsPush from jobs module (avoid circular import)
-            from hyperscale.distributed.jobs import WindowedStatsPush
-
-            push: WindowedStatsPush = cloudpickle.loads(data)
+            # Network bytes: read through the restricted unpickler, never cloudpickle.loads.
+            push = WindowedStatsPush.load(data)
 
             callback = self._state._progress_callbacks.get(push.job_id)
             if callback:
                 try:
-                    if asyncio.iscoroutinefunction(callback):
-                        await callback(push)
-                    else:
-                        loop = asyncio.get_running_loop()
-                        await loop.run_in_executor(None, callback, push)
+                    # Called on the event loop -- never handed to an executor
+                    # thread -- and awaited when it returns an awaitable, so an
+                    # async callback, or a sync one wrapping one, both work.
+                    if inspect.isawaitable(callback_outcome := callback(push)):
+                        await callback_outcome
                 except Exception as callback_error:
                     if self._logger:
                         await self._logger.log(

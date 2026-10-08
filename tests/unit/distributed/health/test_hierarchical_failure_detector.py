@@ -46,13 +46,22 @@ def default_config() -> HierarchicalConfig:
 @pytest.fixture
 def fast_config() -> HierarchicalConfig:
     """Fast configuration for quick expiration tests."""
+    # The tick values must satisfy the TimingWheelConfig post-init invariants
+    # (coarse_tick_ms == fine_tick_ms * fine_wheel_size, and the default
+    # fine_wheel_threshold_ms of 1000 must not exceed the fine-wheel span
+    # fine_tick_ms * fine_wheel_size). HFD only forwards coarse_tick_ms /
+    # fine_tick_ms, so with the default fine_wheel_size=10 the smallest valid
+    # pair is 1000/100. The event-driven wheel does not consume these tick
+    # values for timing — expiration speed is driven by the sub-100ms min/max
+    # timeout values below — so keeping the standard ticks does not slow the
+    # test.
     return HierarchicalConfig(
         global_min_timeout=0.05,
         global_max_timeout=0.1,
         job_min_timeout=0.05,
         job_max_timeout=0.1,
-        coarse_tick_ms=10,
-        fine_tick_ms=10,
+        coarse_tick_ms=1000,
+        fine_tick_ms=100,
         poll_interval_far_ms=10,
         poll_interval_near_ms=5,
         reconciliation_interval_s=0.1,
@@ -179,8 +188,9 @@ class TestHierarchicalHappyPath:
             result = await detector.confirm_global(node, 1, make_node(3))
 
             assert result is True
+            # Originator (node 2) implicit; node 3 is the counted vote.
             state = await detector.get_global_suspicion_state(node)
-            assert state.confirmation_count == 2
+            assert state.confirmation_count == 1
         finally:
             await detector.stop()
 
@@ -232,6 +242,14 @@ class TestHierarchicalHappyPath:
 
             assert state is not None
             assert state.required_confirmations == 1
+            # Originator semantics: the starting node's own vote does
+            # NOT accelerate — the bracket holds at max until an
+            # INDEPENDENT confirmer corroborates (pre-fix, self-start
+            # alone collapsed this to min: eviction on zero external
+            # evidence).
+            assert state.calculate_timeout() == pytest.approx(5.0)
+
+            await detector.confirm_global(node, 1, make_node(3))
             assert state.calculate_timeout() == pytest.approx(1.0)
         finally:
             await detector.stop()
@@ -250,8 +268,9 @@ class TestHierarchicalHappyPath:
             result = await detector.confirm_job(job_id, node, 1, make_node(3))
 
             assert result is True
+            # Originator (node 2) implicit; node 3 is the counted vote.
             state = detector.get_job_suspicion_state(job_id, node)
-            assert state.confirmation_count == 2
+            assert state.confirmation_count == 1
         finally:
             await detector.stop()
 
@@ -280,6 +299,18 @@ class TestHierarchicalHappyPath:
             assert deaths[0][0] == node
             assert deaths[0][1] == 1
 
+            # With a custom on_global_death callback, timing-wheel expiry is
+            # only a *candidate* death notification. HFD defers the actual
+            # DEAD_GLOBAL commit to the owner (which validates the incarnation
+            # against the authoritative SWIM state machine and then calls
+            # commit_global_death). Until that commit lands the node is not
+            # yet globally dead.
+            status = await detector.get_node_status(node)
+            assert status == NodeStatus.ALIVE
+
+            # Owner accepts the transition -> node becomes DEAD_GLOBAL.
+            committed = await detector.commit_global_death(node, deaths[0][1])
+            assert committed is True
             status = await detector.get_node_status(node)
             assert status == NodeStatus.DEAD_GLOBAL
         finally:
@@ -695,8 +726,21 @@ class TestHierarchicalEdgeCases:
             await detector.suspect_global(node, 1, make_node(2))
 
             state = await detector.get_global_suspicion_state(node)
-            # Timeout should be multiplied by LHM
-            assert state.max_timeout == default_config.global_max_timeout * 2.0
+            # AD-30: the suspicion bracket no longer scales the max timeout by
+            # a raw LHM multiplication (which compounded explosively). It now
+            # uses a bounded prob-OR aggregation: each multiplier m_i >= 1 is
+            # treated as an inverse reliability, and the combined unreliability
+            # U = 1 - 1/prod(m_i) linearly extends the bracket headroom:
+            #   adjusted_max = base_max + (base_max - base_min) * U
+            # With only LHM=2.0 active: U = 1 - 1/2 = 0.5, so the max timeout
+            # is 30 + (30 - 5) * 0.5 = 42.5, still strictly greater than the
+            # unadjusted 30 (LHM does extend the timeout, just bounded).
+            combined_unreliability = 1.0 - (1.0 / 2.0)
+            expected_max = default_config.global_max_timeout + (
+                default_config.global_max_timeout - default_config.global_min_timeout
+            ) * combined_unreliability
+            assert state.max_timeout == pytest.approx(expected_max)
+            assert state.max_timeout > default_config.global_max_timeout
         finally:
             await detector.stop()
 
@@ -834,7 +878,9 @@ class TestHierarchicalConcurrency:
             # State should be consistent
             state = await detector.get_global_suspicion_state(node)
             assert state is not None
-            assert state.confirmation_count == 10
+            # Ten concurrent suspectors: the winner is the originator
+            # (implicit); the other nine count as confirmations.
+            assert state.confirmation_count == 9
         finally:
             await detector.stop()
 

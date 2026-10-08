@@ -238,7 +238,9 @@ class TestJobSuspicionManagerHappyPath:
             await manager.start_suspicion(job_id, node, 1, make_node(2))
             suspicion = await manager.start_suspicion(job_id, node, 1, make_node(3))
 
-            assert suspicion.confirmation_count == 2
+            # Originator semantics: node 2's vote is implicit in the
+            # suspicion itself; only node 3's counts as a confirmation.
+            assert suspicion.confirmation_count == 1
             stats = manager.get_stats()
             assert stats["confirmed_count"] == 1  # Second start counted as confirm
         finally:
@@ -259,7 +261,8 @@ class TestJobSuspicionManagerHappyPath:
 
             assert result is True
             suspicion = manager.get_suspicion(job_id, node)
-            assert suspicion.confirmation_count == 2
+            # Originator (node 2) implicit; node 3 is the sole counted vote.
+            assert suspicion.confirmation_count == 1
         finally:
             await manager.shutdown()
 
@@ -455,7 +458,8 @@ class TestJobSuspicionManagerNegativePath:
             suspicion = await manager.start_suspicion(job_id, node, 5, make_node(3))
 
             assert suspicion.incarnation == 5
-            assert suspicion.confirmation_count == 1  # New suspicion
+            # New suspicion: originator implicit, zero counted votes.
+            assert suspicion.confirmation_count == 0
         finally:
             await manager.shutdown()
 
@@ -630,8 +634,8 @@ class TestJobSuspicionManagerFailureModes:
                 await manager.confirm_suspicion(job_id, node, 1, make_node(100 + i))
 
             suspicion = manager.get_suspicion(job_id, node)
-            # 1 from start + 50 confirmations
-            assert suspicion.confirmation_count == 51
+            # Originator implicit; the 50 independent confirmations count.
+            assert suspicion.confirmation_count == 50
         finally:
             await manager.shutdown()
 
@@ -848,9 +852,10 @@ class TestJobSuspicionManagerConcurrency:
             assert all(r is not None for r in results)
             # But only one should exist
             assert manager.get_stats()["active_suspicions"] == 1
-            # And it should have all confirmations
+            # And it should have all confirmations except the winning
+            # starter's own (originator implicit).
             suspicion = manager.get_suspicion(job_id, node)
-            assert suspicion.confirmation_count == 10
+            assert suspicion.confirmation_count == 9
         finally:
             await manager.shutdown()
 
@@ -897,8 +902,8 @@ class TestJobSuspicionManagerConcurrency:
             await asyncio.gather(*[confirm(i) for i in range(50)])
 
             suspicion = manager.get_suspicion(job_id, node)
-            # 1 original + 50 confirmations
-            assert suspicion.confirmation_count == 51
+            # Originator implicit; the 50 independent confirmations count.
+            assert suspicion.confirmation_count == 50
         finally:
             await manager.shutdown()
 

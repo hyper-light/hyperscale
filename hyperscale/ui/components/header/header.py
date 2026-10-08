@@ -3,7 +3,6 @@ import math
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.ui.styling import stylize, get_style
-from typing import Any
 
 from .header_config import HeaderConfig
 from .font import (
@@ -137,7 +136,7 @@ class Header:
 
         return word_lines
 
-    async def update(self, _: Any):
+    async def update(self, _: object):
         pass
 
     async def get_next_frame(self):

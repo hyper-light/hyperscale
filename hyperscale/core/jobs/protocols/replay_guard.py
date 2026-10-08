@@ -19,10 +19,23 @@ state for that sender. This prevents:
 """
 
 import time
+
+# Runtime-default time source — MUST follow the same clock axis as the
+# snowflake generator whose timestamps this guard validates
+# (hyperscale/core/snowflake/snowflake_generator.py). With the ids
+# minted from the virtual clock under SIM but freshness judged against
+# the realtime wall, every message read as ~epoch-aged and the guard
+# rejected ALL protocol traffic (executors never acked starts, workers
+# never registered, and the capacity fence refused every submission —
+# the chaos VOPR's seed-1 never-accepted regression). The SIM swap
+# rebinds this alongside the generator's; REAL mode keeps realtime for
+# both, so the guard's semantics are unchanged outside simulation.
+_DEFAULT_TIME_SOURCE = time.time
 from collections import OrderedDict
 from typing import Optional, Tuple
 
 from hyperscale.core.snowflake import Snowflake
+from hyperscale.core.snowflake.constants import MAX_INSTANCE, MAX_SEQ
 
 
 # Default configuration
@@ -30,6 +43,10 @@ DEFAULT_MAX_AGE_SECONDS = 300  # 5 minutes - messages older than this are reject
 DEFAULT_MAX_FUTURE_SECONDS = 60  # 1 minute - messages from "future" are rejected (clock skew)
 DEFAULT_WINDOW_SIZE = 100000  # Maximum number of message IDs to track
 DEFAULT_MAX_INCARNATIONS = 10000  # Maximum number of sender incarnations to track
+
+# A Snowflake's millisecond timestamp sits above its instance and sequence
+# fields (see SnowflakeGenerator).
+SNOWFLAKE_TIMESTAMP_SHIFT = MAX_INSTANCE.bit_length() + MAX_SEQ.bit_length()
 
 
 class ReplayError(Exception):
@@ -68,6 +85,9 @@ class ReplayGuard:
         '_stats_future',
         '_stats_accepted',
         '_stats_incarnation_changes',
+        '_stats_malformed',
+        '_seen_frame_nonces',
+        '_frame_watermark_ms',
     )
 
     def __init__(
@@ -93,8 +113,15 @@ class ReplayGuard:
         # Track known incarnations per sender (keyed by incarnation bytes)
         # Value is (last_seen_timestamp_ms, set of message IDs from this incarnation)
         self._known_incarnations: OrderedDict[bytes, int] = OrderedDict()
+        # validate_frame: each accepted frame's nonce with its frame's
+        # timestamp, oldest first, and the newest timestamp evicted from it.
+        self._seen_frame_nonces: OrderedDict[bytes, int] = OrderedDict()
         self._max_age_ms = int(max_age_seconds * 1000)
         self._max_future_ms = int(max_future_seconds * 1000)
+        # A guard starts remembering no frame: anything stamped longer than
+        # the max age before it started is refused, so frames captured
+        # before it started cannot be replayed into it.
+        self._frame_watermark_ms = int(_DEFAULT_TIME_SOURCE() * 1000) - self._max_age_ms
         self._max_window_size = max_window_size
         self._max_incarnations = max_incarnations
         self._epoch = epoch
@@ -105,6 +132,7 @@ class ReplayGuard:
         self._stats_future = 0
         self._stats_accepted = 0
         self._stats_incarnation_changes = 0
+        self._stats_malformed = 0
     
     def validate(self, shard_id: int, raise_on_error: bool = True) -> Tuple[bool, Optional[str]]:
         """
@@ -153,7 +181,7 @@ class ReplayGuard:
         Raises:
             ReplayError: If raise_on_error is True and the message is invalid
         """
-        current_time_ms = int(time.time() * 1000)
+        current_time_ms = int(_DEFAULT_TIME_SOURCE() * 1000)
 
         # Track this incarnation
         self._track_incarnation(sender_incarnation, current_time_ms)
@@ -161,18 +189,70 @@ class ReplayGuard:
         # Perform standard validation
         return self._validate_timestamp_and_duplicate(shard_id, raise_on_error)
 
+    def validate_frame(self, frame_id: int, frame_nonce: bytes) -> bool:
+        """Whether a received transport frame is new, recording it when it is.
+
+        ``frame_id`` is the Snowflake its sender stamped on this send, and
+        ``frame_nonce`` the frame's AES-GCM nonce, 96 random bits per
+        encryption. A resend is a new encryption under a new nonce and is
+        accepted. A captured frame replayed byte for byte is refused:
+        * while its nonce is still remembered, as a duplicate (nonces, not
+          Snowflakes, key this: Snowflakes of different senders collide
+          whenever their instance bits do);
+        * once its nonce was evicted to keep the set at
+          ``max_window_size``, because its timestamp is at or below the
+          newest timestamp ever evicted (the watermark), and every frame
+          that could have been forgotten lies at or below it.
+
+        Wall clocks are compared across hosts only against the guard's start:
+        a frame stamped more than the max age before the receiving guard
+        started is refused. After that, clock skew between nodes never
+        refuses a frame. A sender is refused only while its frames
+        carry timestamps at or below the watermark: frames delayed longer
+        than the remembered span, or a sender whose clock lags the others
+        by more than that span. Runs once per received frame, so its checks
+        are inlined.
+        """
+        frame_ms = frame_id >> SNOWFLAKE_TIMESTAMP_SHIFT
+        if frame_ms <= self._frame_watermark_ms:
+            self._stats_stale += 1
+            return False
+
+        seen_frame_nonces = self._seen_frame_nonces
+        if frame_nonce in seen_frame_nonces:
+            self._stats_duplicates += 1
+            return False
+
+        seen_frame_nonces[frame_nonce] = frame_ms
+        self._stats_accepted += 1
+        if len(seen_frame_nonces) > self._max_window_size:
+            self._frame_watermark_ms = max(self._frame_watermark_ms, seen_frame_nonces.popitem(last=False)[1])
+        return True
+
     def _validate_timestamp_and_duplicate(
         self,
         shard_id: int,
         raise_on_error: bool,
     ) -> Tuple[bool, Optional[str]]:
         """Core validation logic for timestamp and duplicate checking."""
+        # A message id that is not an int (a hostile or corrupted frame)
+        # must be REJECTED, not crash the receive path: ``Snowflake.parse``
+        # on a non-int raises ``TypeError``, which the read dispatch's
+        # ``except ReplayError`` would never catch — the whole datagram
+        # handler would die instead of dropping one bad message.
+        if type(shard_id) is not int:
+            self._stats_malformed += 1
+            error = f"Malformed message id: {type(shard_id).__name__}"
+            if raise_on_error:
+                raise ReplayError(error)
+            return (False, error)
+
         # Parse the Snowflake to extract timestamp
         snowflake = Snowflake.parse(shard_id, self._epoch)
         message_time_ms = snowflake.milliseconds
 
         # Get current time in milliseconds
-        current_time_ms = int(time.time() * 1000)
+        current_time_ms = int(_DEFAULT_TIME_SOURCE() * 1000)
 
         # Check for stale messages (too old)
         age_ms = current_time_ms - message_time_ms
@@ -261,6 +341,7 @@ class ReplayGuard:
             'duplicates_rejected': self._stats_duplicates,
             'stale_rejected': self._stats_stale,
             'future_rejected': self._stats_future,
+            'malformed_rejected': self._stats_malformed,
             'incarnation_changes': self._stats_incarnation_changes,
             'tracked_ids': len(self._seen_ids),
             'tracked_incarnations': len(self._known_incarnations),
@@ -276,11 +357,14 @@ class ReplayGuard:
         self._stats_future = 0
         self._stats_accepted = 0
         self._stats_incarnation_changes = 0
+        self._stats_malformed = 0
 
     def clear(self) -> None:
         """Clear all tracked message IDs and incarnations."""
         self._seen_ids.clear()
         self._known_incarnations.clear()
+        self._seen_frame_nonces.clear()
+        self._frame_watermark_ms = int(_DEFAULT_TIME_SOURCE() * 1000) - self._max_age_ms
         self.reset_stats()
 
     def __len__(self) -> int:
@@ -307,6 +391,8 @@ class ReplayGuard:
         self._epoch = state['epoch']
         self._seen_ids = OrderedDict()
         self._known_incarnations = OrderedDict()
+        self._seen_frame_nonces = OrderedDict()
+        self._frame_watermark_ms = int(_DEFAULT_TIME_SOURCE() * 1000) - self._max_age_ms
         self._stats_duplicates = 0
         self._stats_stale = 0
         self._stats_future = 0

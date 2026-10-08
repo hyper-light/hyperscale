@@ -66,7 +66,10 @@ class LamportRunner:
 
     def run(self):
         self._running = True
-        self._run_task = asyncio.ensure_future(self._run())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop ``run`` was called from rather than implicitly going
+        # through ``get_running_loop`` at task-creation time.
+        self._run_task = asyncio.get_running_loop().create_task(self._run())
 
     async def _run(self):
         while self._running:
@@ -102,9 +105,15 @@ class LamportRunner:
         if self._run_task is None:
             return
 
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
         try:
             self._run_task.cancel()
             await self._run_task
 
-        except (asyncio.CancelledError, asyncio.InvalidStateError):
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
+        except asyncio.InvalidStateError:
             pass

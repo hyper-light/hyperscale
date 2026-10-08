@@ -280,8 +280,15 @@ __aexit__:
 
 Rules:
 
-- Cleanup **never** raises out of `__aexit__`. Errors collect into a
-  `CleanupReport` attached to the test failure.
+- Cleanup never replaces the test's own failure, and never drops a finding.
+  `ClusterHarness.__aexit__` collects the supervisor's `cleanup_errors` and
+  the invariant violation still pending into a `CleanupReport`
+  (`tests/simulation/harness/cleanup_report.py`). When the body already
+  failed, every finding is attached to that exception as a PEP 678 note, so
+  it keeps its type and traceback; when the body passed, the pending
+  violation is raised carrying the cleanup errors as notes, or the cleanup
+  errors alone are raised as one `RuntimeError`. Test:
+  `tests/unit/simulation/test_harness_cleanup_report.py`.
 - All harness background tasks go through the project's `TaskRunner`
   (CLAUDE.md: "we never create asyncio orphaned tasks or futures").
 - **Step 8 is the critical one.** Leaked asyncio tasks across tests cause
@@ -312,15 +319,21 @@ Built-in predicates: `has_quorum`, `has_primary`, `has_n_workers`,
 `gate_cluster_formed`, `job_running`, `job_completed`, `workflow_status`,
 `no_in_flight_rpcs`.
 
-### 8.2 Scenario-level retries — for legitimately stochastic tests
+### 8.2 Scenario-level retries — retired (2026-10-07, ledger D-11)
 
-```python
-@scenario(retries=3, retry_on=(ElectionTimeoutError, QuorumNotFormedError))
-async def test_election_under_partition(harness): ...
-```
+The original design proposed `@scenario(retries=3, retry_on=(...))` for
+"legitimately stochastic" scenarios. It is retired, not deferred:
 
-The retry policy declares **what** is acceptable to retry, so true bugs are
-not masked under blanket `@flaky`.
+- A SIM run is a pure function of its seed. A retry with the same seed
+  replays the same failure; a retry with another seed is a different test
+  that hides the failing one. Either way the retry adds nothing but a
+  chance to report green over a reproducible bug.
+- A REAL-mode election or quorum that misses its deadline is what these
+  scenarios exist to catch (the SWIM/election latency bugs in the VOPR gate
+  findings were exactly such "flakes"). The remedy is a deadline derived
+  from the protocol's detection latency in the wait condition, or a fix in
+  the code, then a SIM reproduction under the failing seed — never a
+  retry.
 
 ## 9. Configuration variety
 
@@ -355,8 +368,15 @@ class ClusterSpec:
     per_node_env: dict[str, EnvOverrides] = field(default_factory=dict)
         # e.g. {"east.manager.1": EnvOverrides(request_timeout="1s")}
     timeouts: HarnessTimeouts = HarnessTimeouts()
-    base_port: int = 9000
 ```
+
+Simulation ports are allocated by `PortAllocator` from a process-global
+active reservation table over a dedicated harness range. The range is
+independent of `ClusterSpec` so test files never coordinate port bases;
+worker allocations keep their logical spacing envelopes, but only the
+TCP/UDP ports the worker runtime actually binds are probe-checked during
+allocation and teardown. Ports are returned to the active pool only
+after teardown verification proves they are bindable again.
 
 `pytest.mark.parametrize` over `ClusterSpec` instances gives matrix testing.
 SIM mode adds `seed: int | None = None` to `ClusterSpec` once Phase 3 lands.
@@ -448,6 +468,32 @@ Initial L2/L3 catalog:
 The catalog is extensible per scenario: a scenario can register
 scenario-specific invariants in its `setup`.
 
+*As built (2026-10-07): `InvariantChecker` (`tests/simulation/harness/invariants.py`)
+polls every `invariant_poll_interval` (0.1 s) and every `ClusterHarness`
+registers the whole catalog (`continuous_catalog()`); each check lives in
+`tests/simulation/harness/invariant_checks/`. Built: `AtMostOneJobLeaderPerJob`,
+`MonotonicFenceTokens` (manager lease + dispatch tokens, worker accepted
+tokens, gate tokens; a high-water mark per node instance, so a token
+forgotten and re-learned older is caught), `WorkerSubprocessAttribution`,
+`NoOrphanWorkflows`, `LeakedLocksBounded`. Three entries above are wrong
+for a correct cluster and were replaced:
+`WorkerSubprocessAttribution` as written compares the pool with the
+supervisor's 1 s copy of the same pool, so it can only fire on a spawn
+between snapshots -- the check is that no executor PID sits in two
+workers' pools; `NoOrphanWorkflows` is checked on the worker, which sets a
+workflow's leader in the same step that makes it active
+(`WorkerState.add_active_workflow`), and requires that leader to be a
+cluster manager; `LeakedLocksBounded`'s `<= active peers + 1` fails on a
+correct manager, which keeps a dead peer's lock until the reaper drops it
+(`_cleanup_stale_dead_manager_tracking`), so the bound is set membership:
+every lock's peer is active, dead-not-yet-reaped, known or awaiting
+recovery verification, and every gate lock's gate is known. Mutation
+checks: `tests/unit/simulation/harness/test_continuous_invariants.py`;
+live evaluation: `tests/simulation/scenarios/l2_single_dc/test_continuous_invariant_catalog.py`.
+Leader exclusivity, terminal agreement, execution counts, single-DC
+placement and DC-health convergence are also checked post-hoc by the VOPR
+oracle (`tests/simulation/oracle/cluster_trace_oracle.py:191-695`).*
+
 ## 13. Liveness invariants
 
 Distinct mechanism. A `LivenessInvariant` carries a `progress_predicate`
@@ -469,6 +515,19 @@ Catches "deadlock that pretends to be slowness." Initial catalog:
   follower at least every `heartbeat_interval × 2`.
 - `BackpressureEventuallyClears` — once load drops, backpressure level
   returns to NONE within bounded time.
+
+*As built (2026-10-07): `cluster_membership_progress` (`invariants.py`,
+staleness budget `stabilization_default`) and `JobMakesProgress`
+(`invariant_checks/job_progress.py`). `JobMakesProgress` as written --
+the completion count rises every N seconds -- fails on a correct cluster
+running one long workflow; it is built as the bound the protocol enforces
+(AD-34): a job with a workflow DISPATCHED or RUNNING shows progress (job
+status/counts, a workflow's status or lifecycle state, a dispatch's
+completed/failed actions or finished cores) within `stuck_threshold` +
+the AD-26 extension seconds since its last progress + one
+`JOB_TIMEOUT_CHECK_INTERVAL`, read from the job's `TimeoutTrackingState`
+and the leader's Env. `LeaderHeartbeatsContinue` and
+`BackpressureEventuallyClears` are not built.*
 
 ## 14. Diagnostics
 
@@ -498,7 +557,6 @@ Scenarios are plain `async def` functions taking a harness:
 Example:
 
 ```python
-@scenario(retries=3, retry_on=(ElectionTimeoutError,))
 @pytest.mark.parametrize("mode", [ExecutionMode.REAL, ExecutionMode.SIM])
 async def test_manager_primary_dies_mid_dispatch(harness, mode):
     async with ClusterHarness(SINGLE_DC_3M_4W, mode=mode) as cluster:
@@ -850,7 +908,7 @@ FaultMatrix primitives compose with the Phase 3 lifecycle faults so
 future scenarios can mix kill/restart with transport faults without
 new harness code.
 
-### Phase 5 — Clock / Random / Transport interface refactor
+### Phase 5 — Clock / Random / Transport interface refactor — *landed*
 
 - Production code: introduce `Clock`, `Random`, `Transport` interfaces.
 - Mechanical replacement of 619 `time.X` / `asyncio.sleep` sites + scattered
@@ -858,25 +916,218 @@ new harness code.
 - All existing tests continue passing — pure dependency-injection move,
   no behavior change.
 
-**Exit criteria:** integration + simulation test suites green; no
-production-code direct calls to `time.monotonic` / `time.time` /
-`asyncio.sleep` / `random.X` outside the interface implementations.
+**Exit criteria — met, and enforced.** No production module under
+`hyperscale/distributed/` makes a direct call to any wall/monotonic
+time read (`time.monotonic` / `time.time` / `time.monotonic_ns` /
+`time.time_ns`), `asyncio.sleep` / `asyncio.wait_for`, ANY `random.X`
+module-level function (the whole module is blocked; the seedable
+generator classes `random.Random` / `random.SystemRandom` are the
+allowed building blocks), or the non-deterministic id generators
+`uuid.uuid4` / `uuid.uuid1`. The guard is
+`tests/simulation/lints/test_no_direct_time_random.py`: an AST lint
+with import-alias tracking (an `import time as t` bypass hid a real
+violation for months), a ratcheted violation snapshot holding only the
+two seam-adapter files, and self-tests pinning both the flagged and
+the allowed patterns.
 
-### Phase 6 — SIM mode
+### Phase 6 — SIM mode — *landed*
 
-- `VirtualClock`, `SeededRandom`, `InProcessTransport`, `DeterministicTaskRunner`.
-- `ExecutionMode.SIM` wired into `ClusterHarness`.
-- All Phase 1–4 scenarios run under SIM mode via parametrize.
-- Replay command: `pytest --sim-replay=<seed>`.
+**Shipped — with one deliberate architecture change from the plan
+above.** The plan called for in-process SIM parametrized through
+`ClusterHarness`. What landed is stronger: the **multi-process
+`SimulationCoordinator`** (`tests/simulation/harness/sim/multiprocess/`)
+runs REAL OS processes — production `GateServer` / `ManagerServer` /
+`WorkerServer` (spawning its real executor-pool children through the
+`ProcessSpawner` seam) / `HyperscaleClient` — in conservative lockstep
+virtual time: every child gets the same window grant, cross-process
+datagrams and stream frames route at `send_time + latency` ordered by
+`(delivery_time, origin_seq)`, and two identical-seed runs compare
+**byte-identically**, timestamps included. Determinism inputs are all
+pinned: virtual clock, per-child `SeededRandom` (seed + admission
+index), `PYTHONHASHSEED=0` in every child, topology-derived node
+identities, and seeded logical-id generation throughout production
+(monotone snowflakes, no uuid4). In-process building blocks
+(`VirtualClock`, `SeededRandom`, `SimulationLoop`,
+`InProcessTransport`, the production `TaskRunner` running
+deterministically under the simulation loop) shipped as planned and
+power the single-process tier (`SimulationRuntime`, the sim_smoke
+scenarios).
 
-**Exit criteria:** every scenario passes deterministically in SIM mode;
-seed-driven random fault schedules generate ≥ 1000 scenarios per CI minute.
+**Scenario coverage** lives as SIM-native scenario classes rather than
+a parametrize of the REAL corpus (real scenarios depend on wall-clock
+stabilization, psutil process tracking, and OS sockets — the
+coordinator supersedes rather than wraps them). Classes covered under
+`tests/unit/simulation/sim/` + `tests/simulation/scenarios/sim_smoke/`:
+quorum formation and leadership stability over a window; end-to-end
+job dispatch (direct, through a gate from cold start, multi-DC with
+authoritative datacenter pinning, through a 3-gate cluster);
+worker/executor kill with retry; late-joining worker; eviction +
+notice-driven re-registration; and the Phase 4 network-fault classes —
+partition/heal with production failure detection and rejoin, seeded
+packet loss, added jittered latency, UDP duplication — via the
+coordinator's declarative fault schedule (`schedule_kill` /
+`schedule_partition` / `schedule_drop_rate` / `schedule_delay` /
+`schedule_duplicate`, all evaluated at the single datagram chokepoint,
+loss/duplication scoped to datagrams by fidelity — TCP masks packet
+loss; streams never duplicate). A wall-clock deadman on every
+coordinator barrier turns a wedged child into a loud named failure
+instead of a silent pytest hang.
 
-### Phase 7 — Storage faults + linearizability oracle
+**The VOPR** (`tests/simulation/vopr/`): `generate_fault_plan(seed)`
+expands one integer into a complete fault schedule (executor kills,
+partitions, loss, delay, duplication at seeded virtual times) run
+against the real production stack; invariants require an accepted job,
+a client-observed terminal outcome (silence is always a violation),
+completion under non-stranding faults, and a byte-identical replay.
+Replay command (per the plan): `pytest tests/simulation/vopr
+--sim-replay=<seed>` re-runs exactly that schedule with the expanded
+plan printed — a failing seed is a permanent reproducer.
+
+**Exit criteria — met, with the throughput target recalibrated.**
+Every SIM scenario passes deterministically (replay twins assert
+byte-identical reruns). The original "≥ 1000 scenarios per CI minute"
+figure presumed a single-process microsim; the landed SIM runs *real
+OS processes with the full production transport and crypto stack*, and
+measures **~11 generated scenarios/minute on one core** (each scenario
+= two complete cluster runs: judge + replay) — fidelity bought with
+wall time, scaling linearly with pytest-xdist workers and
+`--sim-vopr-count` for soak runs. A microsim-rate fuzzing tier over
+`SimulationRuntime` (thousands/minute, membership-level faults only)
+remains open as a future addition if raw schedule volume is wanted.
+
+### Phase 7 — Storage faults + linearizability oracle — *landed*
 
 - `FaultMatrix.slow_disk / disk_full / fsync_reorder` (SIM-mode
-  implementations).
+  implementations). **Landed.**
 - Linearizability checker for the client-facing job-submission API.
+  **Landed** — see below.
+
+The oracle half (see `hyperscale/distributed/jobs/job_status_order.py`,
+`hyperscale/distributed/nodes/client/status_application.py`,
+`tests/simulation/oracle/`, `tests/unit/distributed/manager/
+test_manager_restart_truth.py`):
+
+- **JobStatusOrder** — the lifecycle spec as a monotone rank order
+  (forward skips legal, regressions never, terminals absorbing per
+  AD-20; both live timeout spellings rank terminal). **JobStatusApplier**
+  — the ONE chokepoint for every client-side status write, replacing
+  four blind-assignment sites (poll, two push handlers, local marks);
+  stats apply via max-counters and an elapsed-freshness gate; typed
+  outcomes (`StatusApplyOutcome`) distinguish stale rejections from
+  UNKNOWN VOCABULARY, which every async caller logs.
+- **JobStatusOracle** — judges client-observed milestone histories
+  (rank monotonicity, absorbing terminals, finished/observed
+  agreement, exactly-once result delivery); wired into the VOPR as
+  invariant 4 for every generated schedule.
+- **AD-40 idempotency keys live** — the client generates one key per
+  logical submission; the manager ledger dedups on it; disk_full
+  faults bite the reservation path and explicit rejection is the
+  accepted loud outcome.
+- **Durable job record + restart truth** — the manager runs the full
+  event-sourced JobLedger (create/accept/complete/timeout/cancel at
+  LOCAL durability on the shared HLC); recovered ACTIVE jobs
+  transition to durable FAILED and the recorded requestor contact
+  gets a best-effort final push; a new manager `job_status` endpoint
+  (and client gateless-poll fallback) reads truth across restarts.
+- **Incarnation persistence wired** — all three nodes accept
+  `incarnation_storage_dir` (the manager derives it from
+  `wal_data_dir`), `initialize_incarnation_store` runs at start, and
+  the `join_cluster` zombie-rejoin bump persists; a restarted node
+  rejoins STRICTLY ABOVE its pre-restart incarnation.
+- **Detection design bounds** — scenario tests assert failure-
+  detection latency bounds derived from the traced mechanism
+  (evidence-accelerated [20, 70]s; witness-less max-leg [25, 85]s),
+  never widened windows.
+
+The three follow-ups beyond Phase 7's mandate are also **landed**:
+
+- **Coordinator restart primitive** — `schedule_restart(process_id,
+  at_time, down_seconds=, fsync_reorder_seed=)`: power loss + reboot
+  with the durable disk carried across process generations. The victim
+  (at its window barrier) receives SNAPSHOT instead of GRANT, arms
+  fsync_reorder if the event carries a seed, `crash()`es its
+  SimFilesystem, returns the surviving durable state + its result, and
+  exits; the coordinator re-spawns the same spec at the down window's
+  end seeded with that disk. Survivors observe the death exactly like
+  a kill; the reboot joins exactly like a late joiner. Earlier
+  generations' results appear under `{process_id}.gen{n}`. Fully
+  deterministic (per-child seeds come from a monotone admission
+  counter so a reboot can never collide RNG streams).
+- **Job RESUME from persisted submissions** — the manager durably
+  stores each accepted submission payload (`atomic_write` under
+  `wal_data_dir/submissions/`, discarded at every terminal
+  chokepoint); on restart, recovery runs at the END of `start()` (the
+  submit tail it re-runs needs the dispatcher, the rebound Raft tick
+  loop, and leader election — running it in the ledger block silently
+  no-opped dispatch and wedged start), resumes each recovered ACTIVE
+  job under its original job id, and falls back to the durable-FAILED
+  truth-telling path when the payload is missing. Workflow execution
+  is at-least-once across the restart; the client outcome is
+  exactly-once. Three re-admission mechanisms close the worker-side
+  gaps: the TCP dial now sits INSIDE the request timeout (a dial to a
+  down manager previously hung forever HOLDING the TCP semaphore); the
+  worker watches for manager incarnation jumps ≥ the rejoin bump (the
+  restart signature, observable because incarnation persistence makes
+  every boot rejoin above its predecessor); and a manager receiving
+  heartbeats from a worker it does not know sends the existing
+  eviction-notice nudge (heartbeats now carry the worker's TCP
+  contact), which covers the IDLE-worker restart where no failure path
+  would ever trigger re-registration.
+- **Deterministic job/workflow ids** — `LogicalIdGenerator`
+  (identity + injected-Clock monotonic ns + monotone counter) replaces
+  `secrets.token_hex`: unique without consuming the shared protocol
+  RNG, deterministic under SIM.
+- **VOPR restart events** — plans draw `("restart", at, down,
+  fsync_reorder_seed)` against the manager; restart classifies as
+  stranding-capable (resume usually completes — verified on pure-
+  restart seeds including reorder debris — but a crash between the
+  ledger record and the payload write legitimately degrades to loud
+  FAILED). End-to-end scenario pins live in
+  `test_multiprocess_manager_restart.py`, including byte-identical
+  replay of both restart flavors.
+
+What landed (see `hyperscale/core/runtime/filesystem.py`,
+`tests/simulation/harness/sim/sim_filesystem.py`,
+`tests/unit/simulation/sim/test_storage_faults.py`,
+`tests/simulation/lints/test_no_direct_disk_io.py`):
+
+- **The `Filesystem` seam** — async-native Protocol in
+  `hyperscale/core/runtime`; `RealFilesystem` owns a dedicated,
+  lifecycle-managed thread pool (the executor hop lives INSIDE the
+  seam); `SimFilesystem` is pure in-memory with a durable/volatile
+  segment model (`crash()` = power loss). Every durability component
+  routes through it: WALWriter, NodeWAL + RaftWAL (write AND recovery
+  sides), the manager idempotency ledger, IncarnationStore,
+  CheckpointManager, JobArchiveStore, and LoggerStream (its hot path
+  via `write_flush` — one off-loop job per log line, hop count
+  preserved).
+- **Fault knobs** (deterministic, on `SimFilesystem`):
+  `set_slow_disk(seconds)` charges VIRTUAL time inside every op;
+  `set_disk_full(bytes)` raises `OSError(ENOSPC)` past a byte budget;
+  `set_fsync_reorder(seed)` makes `crash()` keep a seeded SUBSET of
+  un-fsynced segments and tear the last survivor (out-of-order
+  persistence). Durable content is untouched by construction.
+- **Crash/recovery scenarios** — NodeWAL and RaftWAL survive power
+  loss and recover truncation-safely past torn/CRC-fail debris; the
+  idempotency ledger round-trips a crash end to end.
+- **VOPR storage events** — generated plans draw `slow_disk` /
+  `disk_full` events; SIM managers always run `wal_data_dir` (the
+  in-memory disk), so every scenario exercises the production storage
+  stack; `disk_full` classifies as stranding-capable in the
+  invariants. `fsync_reorder` is exercised by the in-process
+  crash/recovery scenarios instead: it only manifests through a crash
+  + RESTART cycle, and the coordinator has no restart primitive.
+- **Ratchet lint** — `test_no_direct_disk_io.py` forbids raw
+  `open` / `os.*` disk calls / pathlib IO in `hyperscale/distributed`
+  + `hyperscale/logging`; three justified snapshot entries; the seven
+  seamed durability components are asserted clean structurally.
+- **Bugs found by this half**: WAL-writes crashing on 128-bit HLC
+  msgpack overflow; idempotency torn-tail boot loop; fsync-less +
+  loop-blocking incarnation saves; torn rotation metadata; a raw
+  `mkdir` in `WALWriter.start()`; and — via VOPR `disk_full` — the
+  finding that the manager's `NodeWAL` is opened but NEVER appended
+  to: job events are not persisted, which becomes the oracle slice's
+  restart-survival invariant.
 
 ## 19. Open questions
 

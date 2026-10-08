@@ -11,11 +11,12 @@ Covers:
 """
 
 import asyncio
-import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
+from hyperscale.distributed.hlc import HLCTimestamp
 from hyperscale.distributed.raft.models import (
     AppendEntries,
     AppendEntriesResponse,
@@ -28,6 +29,7 @@ from hyperscale.distributed.raft.raft_node import (
     ELECTION_TIMEOUT_MIN,
     RaftNode,
 )
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 # =============================================================================
@@ -43,7 +45,7 @@ def make_entry(term: int, index: int, job_id: str = "job-1") -> RaftLogEntry:
         command=b"test-data",
         command_type="NO_OP",
         job_id=job_id,
-        timestamp=time.monotonic(),
+        hlc=HLCTimestamp(wall_ms=0, logical=index, node_id=1),
     )
 
 
@@ -74,13 +76,16 @@ def make_node(
     node = RaftNode(
         job_id="job-1",
         node_id=node_id,
-        members=members,
+        initial_voters=frozenset(members),
         member_addrs=member_addrs,
         send_message=send_mock,
         apply_command=apply_mock,
         on_become_leader=None,
         on_lose_leadership=None,
         logger=logger_mock,
+        configured_cluster_size=len(members),
+        clock=new_hybrid_logical_clock(),
+        may_lead=lambda: True, storage=VolatileRaftStorage()
     )
     return node, send_mock, apply_mock
 
@@ -92,6 +97,31 @@ def make_single_node() -> tuple[RaftNode, AsyncMock, AsyncMock]:
         members={"solo"},
         member_addrs={"solo": ("127.0.0.1", 9001)},
     )
+
+
+async def propose_and_apply(
+    node: RaftNode, command: bytes, command_type: str
+) -> tuple[bool, int]:
+    """Propose a command while concurrently draining the apply loop.
+
+    ``RaftNode.propose`` blocks until the committed entry has been *applied*
+    to the state machine (its waiter is resolved inside
+    ``apply_committed_entries``). In production a background consensus loop
+    drives apply; in these unit tests nothing does, so we drive it inline here
+    to release the proposal waiter deterministically.
+    """
+
+    async def _drain_apply() -> None:
+        # Yield so ``propose`` runs its synchronous prep (append entry,
+        # advance commit_index, register the waiter) before we apply.
+        await asyncio.sleep(0)
+        await node.apply_committed_entries()
+
+    (result, _) = await asyncio.gather(
+        node.propose(command, command_type),
+        _drain_apply(),
+    )
+    return result
 
 
 # =============================================================================
@@ -328,9 +358,10 @@ class TestPropose:
         await node.start_election()
         assert node.is_leader()
 
-        success, index = await node.propose(b"cmd", "CREATE_JOB")
+        success, index = await propose_and_apply(node, b"cmd", "CREATE_JOB")
         assert success is True
-        assert index == 1
+        # The term opened with its blank entry at index 1 (Raft 8).
+        assert index == 2
 
     @pytest.mark.asyncio
     async def test_propose_fails_on_follower(self) -> None:
@@ -344,10 +375,10 @@ class TestPropose:
         node, _, _ = make_single_node()
         await node.start_election()
 
-        _, index1 = await node.propose(b"a", "CREATE_JOB")
-        _, index2 = await node.propose(b"b", "CREATE_JOB")
-        assert index1 == 1
-        assert index2 == 2
+        _, index1 = await propose_and_apply(node, b"a", "CREATE_JOB")
+        _, index2 = await propose_and_apply(node, b"b", "CREATE_JOB")
+        assert index1 == 2
+        assert index2 == 3
 
 
 # =============================================================================
@@ -473,25 +504,43 @@ class TestAppendEntriesResponse:
 
     @pytest.mark.asyncio
     async def test_successful_response_advances_match(self) -> None:
-        node, _, _ = make_single_node()
-        await node.start_election()
-        # Add another member manually for this test
-        node.update_membership(
-            {"solo", "node-2"},
-            {"solo": ("127.0.0.1", 9001), "node-2": ("127.0.0.1", 9002)},
+        # Two voters: nothing commits without node-2's acknowledgment.
+        node, _, _ = make_node(
+            node_id="solo",
+            members={"solo", "node-2"},
+            member_addrs={"solo": ("127.0.0.1", 9001), "node-2": ("127.0.0.1", 9002)},
         )
+        await node.start_election()
+        await node.handle_request_vote_response(
+            RequestVoteResponse(
+                job_id="job-1", term=node.current_term, vote_granted=True, voter_id="node-2",
+            )
+        )
+        assert node.is_leader()
 
-        await node.propose(b"cmd", "NO_OP")
+        # ``propose`` blocks until the entry is applied, so run it in the
+        # background: it appends the entry (after the leader's term-start
+        # entry) and advances commit_index synchronously before awaiting its
+        # waiter.
+        propose_task = asyncio.create_task(node.propose(b"cmd", "NO_OP"))
+        await asyncio.sleep(0.01)
+        uncommitted = node.commit_index
+
         response = AppendEntriesResponse(
             job_id="job-1",
             term=node.current_term,
             success=True,
             follower_id="node-2",
-            match_index=1,
+            match_index=node.last_log_index,
         )
         await node.handle_append_entries_response(response)
-        # Commit should advance since both nodes agree
-        assert node.commit_index == 1
+        # Commit advances once both voters hold the entry.
+        assert uncommitted == 0
+        assert node.commit_index == node.last_log_index
+
+        # Release the proposal waiter and clean up the background task.
+        await node.apply_committed_entries()
+        await propose_task
 
     @pytest.mark.asyncio
     async def test_steps_down_on_higher_term(self) -> None:
@@ -534,24 +583,23 @@ class TestApplyCommitted:
         node, _, apply_mock = make_single_node()
         await node.start_election()
 
-        await node.propose(b"cmd1", "CREATE_JOB")
-        await node.propose(b"cmd2", "CREATE_JOB")
-
-        # Single-node: entries committed immediately when proposed
-        # But commit_index only advances via _advance_commit_index
-        # Force commit by simulating the commit advance
-        # In single-node, there are no followers, so match_index is empty
-        # But quorum is 1 (just leader), so commit should already advance
-        applied = await node.apply_committed_entries()
-        assert applied == 2
+        # Quorum is 1 (single node): each proposal commits and applies
+        # inside propose, resolving without waiting for a tick's apply pass.
+        # The term's blank entry (index 1, Raft 8) commits with them and
+        # never reaches the state machine.
+        assert await node.propose(b"cmd1", "CREATE_JOB") == (True, 2)
+        assert await node.propose(b"cmd2", "CREATE_JOB") == (True, 3)
         assert apply_mock.call_count == 2
+
+        # Nothing is left for the tick's apply pass.
+        assert await node.apply_committed_entries() == 0
 
     @pytest.mark.asyncio
     async def test_apply_is_idempotent(self) -> None:
         node, _, apply_mock = make_single_node()
         await node.start_election()
 
-        await node.propose(b"cmd", "CREATE_JOB")
+        await propose_and_apply(node, b"cmd", "CREATE_JOB")
         await node.apply_committed_entries()
         apply_count_first = apply_mock.call_count
 
@@ -593,38 +641,6 @@ class TestReplication:
 
 
 # =============================================================================
-# Test Membership Updates
-# =============================================================================
-
-
-class TestMembership:
-    """Tests for dynamic membership changes."""
-
-    def test_update_membership_adds_new_members(self) -> None:
-        node, _, _ = make_node()
-        new_members = {"node-1", "node-2", "node-3", "node-4"}
-        new_addrs = {
-            "node-1": ("127.0.0.1", 9001),
-            "node-2": ("127.0.0.1", 9002),
-            "node-3": ("127.0.0.1", 9003),
-            "node-4": ("127.0.0.1", 9004),
-        }
-        node.update_membership(new_members, new_addrs)
-        # No crash, membership updated
-
-    @pytest.mark.asyncio
-    async def test_leader_tracks_new_members(self) -> None:
-        node, _, _ = make_single_node()
-        await node.start_election()
-
-        node.update_membership(
-            {"solo", "new-node"},
-            {"solo": ("127.0.0.1", 9001), "new-node": ("127.0.0.1", 9002)},
-        )
-        # Leader should have initialized next_index for new member
-
-
-# =============================================================================
 # Test Destroy / Cleanup
 # =============================================================================
 
@@ -650,7 +666,7 @@ class TestDestroy:
     async def test_destroy_clears_state(self) -> None:
         node, _, _ = make_single_node()
         await node.start_election()
-        await node.propose(b"cmd", "CREATE_JOB")
+        await propose_and_apply(node, b"cmd", "CREATE_JOB")
 
         node.destroy()
         # All internal collections should be cleared
@@ -720,3 +736,37 @@ class TestConstants:
 
     def test_election_timeout_max(self) -> None:
         assert ELECTION_TIMEOUT_MAX == 0.300
+
+
+# =============================================================================
+# Vote safety
+# =============================================================================
+
+
+class TestSameTermStepDown:
+    @pytest.mark.asyncio
+    async def test_same_term_step_down_keeps_the_vote_cast_in_that_term(self) -> None:
+        """A leader that learns of a same-term leader (only possible after a
+        fault) steps down, but it voted for itself in that term: a second
+        candidate in the same term must not get its vote too."""
+        node, _, _ = make_node(node_id="node-1")
+        await node.start_election()
+        await node.handle_request_vote_response(
+            RequestVoteResponse(job_id="job-1", term=node.current_term, vote_granted=True, voter_id="node-2")
+        )
+        assert node.role == "leader"
+        term = node.current_term
+
+        await node.handle_append_entries(
+            AppendEntries(
+                job_id="job-1", term=term, leader_id="node-2",
+                prev_log_index=0, prev_log_term=0, entries=[], leader_commit=0,
+            )
+        )
+        assert node.role == "follower"
+        node._last_leader_contact = float("-inf")  # past leader stickiness
+
+        response = await node.handle_request_vote(
+            RequestVote(job_id="job-1", term=term, candidate_id="node-3", last_log_index=0, last_log_term=0)
+        )
+        assert response.vote_granted is False

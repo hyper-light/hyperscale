@@ -12,16 +12,15 @@ Covers:
 """
 
 import os
+from hyperscale.distributed.nodes.worker.worker_config_derivation import derive_orphan_grace_seconds
 from unittest.mock import patch, MagicMock
 
 import pytest
 
 from hyperscale.distributed.env import Env
-from hyperscale.distributed.nodes.worker.config import (
-    WorkerConfig,
-    create_worker_config_from_env,
-    _get_os_cpus,
-)
+from hyperscale.distributed.nodes.worker.config import create_worker_config_from_env
+from hyperscale.distributed.nodes.worker.models.worker_config import WorkerConfig
+from hyperscale.distributed.nodes.worker.worker_config_derivation import _get_os_cpus
 
 
 class TestWorkerConfig:
@@ -251,7 +250,15 @@ class TestWorkerConfigFromEnv:
         mock_env.WORKER_PROGRESS_UPDATE_INTERVAL = 2.0
         mock_env.WORKER_PROGRESS_FLUSH_INTERVAL = 1.0
         mock_env.WORKER_CANCELLATION_POLL_INTERVAL = 10.0
-        mock_env.WORKER_ORPHAN_GRACE_PERIOD = 180.0
+        # The orphan grace is derived from the cluster's timings.
+        mock_env.SWIM_SUSPICION_MAX_TIMEOUT = 20.0
+        mock_env.SWIM_NO_WITNESS_SUSPICION_TIMEOUT = 40.0
+        mock_env.LEADER_PRE_VOTE_TIMEOUT = 3.0
+        mock_env.LEADER_ELECTION_TIMEOUT_BASE = 6.0
+        mock_env.LEADER_ELECTION_TIMEOUT_JITTER = 4.0
+        mock_env.MANAGER_TCP_TIMEOUT_STANDARD = 5.0
+        mock_env.EXTENSION_MIN_GRANT = 1.0
+        mock_env.EXTENSION_MAX_EXTENSIONS = 5
         mock_env.WORKER_ORPHAN_CHECK_INTERVAL = 20.0
         mock_env.WORKER_PENDING_TRANSFER_TTL = 90.0
         mock_env.WORKER_OVERLOAD_POLL_INTERVAL = 0.5
@@ -277,28 +284,42 @@ class TestWorkerConfigFromEnv:
         assert config.datacenter_id == "dc-west"
         assert config.total_cores == 8
         assert config.tcp_timeout_short_seconds == 1.5
-        assert config.orphan_grace_period_seconds == 180.0
+        assert config.orphan_grace_period_seconds == 40.0 + 3.0 + 6.0 + 4.0 + 5.0
         assert config.registration_max_retries == 7
         assert config.registration_base_delay_seconds == 0.4
         assert config.initial_registration_jitter_max_seconds == 6.0
 
-    def test_from_env_with_missing_attrs(self):
-        """Test from_env with missing Env attributes uses defaults."""
-        mock_env = MagicMock(spec=[])  # Empty spec, all getattr return default
+    def test_from_env_with_missing_attrs_fails_loudly(self):
+        """A setting missing from the Env raises instead of falling back to a hidden literal."""
+        mock_env = MagicMock(spec=[])  # Empty spec: every attribute is missing
+
+        with pytest.raises(AttributeError):
+            WorkerConfig.from_env(
+                env=mock_env,
+                host="localhost",
+                tcp_port=8000,
+                udp_port=8001,
+            )
+
+    def test_from_env_unset_settings_take_env_defaults(self):
+        """With nothing overridden, every setting is the Env's own default."""
+        env = Env()
 
         config = WorkerConfig.from_env(
-            env=mock_env,
+            env=env,
             host="localhost",
             tcp_port=8000,
             udp_port=8001,
         )
 
-        # Should fall back to defaults for missing attributes
-        assert config.tcp_timeout_short_seconds == 2.0
-        assert config.tcp_timeout_standard_seconds == 5.0
+        assert config.tcp_timeout_short_seconds == env.WORKER_TCP_TIMEOUT_SHORT
+        assert config.dead_manager_reap_interval_seconds == env.WORKER_DEAD_MANAGER_REAP_INTERVAL
+        assert config.orphan_grace_period_seconds == derive_orphan_grace_seconds(env)
+        assert config.recovery_jitter_min_seconds == env.RECOVERY_JITTER_MIN
+        assert config.recovery_jitter_max_seconds == env.RECOVERY_JITTER_MAX
         assert (
             config.initial_registration_jitter_max_seconds
-            == Env().WORKER_INITIAL_REGISTRATION_JITTER_MAX
+            == env.WORKER_INITIAL_REGISTRATION_JITTER_MAX
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -332,10 +353,8 @@ class TestWorkerConfigFromEnv:
 
     def test_from_env_default_datacenter(self):
         """Test from_env with default datacenter."""
-        mock_env = MagicMock(spec=[])
-
         config = WorkerConfig.from_env(
-            env=mock_env,
+            env=Env(),
             host="localhost",
             tcp_port=8000,
             udp_port=8001,
@@ -419,18 +438,19 @@ class TestCreateWorkerConfigFromEnv:
         assert config.progress_flush_interval_seconds == 2.0
 
     @patch.dict(os.environ, {
-        "WORKER_ORPHAN_GRACE_PERIOD": "300.0",
+        "SWIM_NO_WITNESS_SUSPICION_TIMEOUT": "90.0",
         "WORKER_ORPHAN_CHECK_INTERVAL": "60.0",
     })
     def test_orphan_settings_override(self):
-        """Test orphan settings environment override (Section 2.7)."""
+        """The orphan grace follows the cluster timings it is derived from
+        (Section 2.7): a longer suspicion window, a longer grace."""
         config = create_worker_config_from_env(
             host="localhost",
             tcp_port=8000,
             udp_port=8001,
         )
 
-        assert config.orphan_grace_period_seconds == 300.0
+        assert config.orphan_grace_period_seconds == derive_orphan_grace_seconds(Env()) - 30.0 + 90.0
         assert config.orphan_check_interval_seconds == 60.0
 
     @patch.dict(os.environ, {
@@ -493,10 +513,13 @@ class TestCreateWorkerConfigFromEnv:
             udp_port=8001,
         )
 
-        # All should use defaults
+        # All should use defaults sourced from Env (create_worker_config_from_env
+        # builds an Env, so Env's defaults are authoritative here). Env sets
+        # WORKER_DEAD_MANAGER_REAP_INTERVAL to 900.0 (15 minutes), which differs
+        # from the WorkerConfig dataclass literal default of 60.0.
         assert config.tcp_timeout_short_seconds == 2.0
         assert config.tcp_timeout_standard_seconds == 5.0
-        assert config.dead_manager_reap_interval_seconds == 60.0
+        assert config.dead_manager_reap_interval_seconds == 900.0
 
 
 class TestGetOsCpus:
@@ -509,7 +532,7 @@ class TestGetOsCpus:
         assert isinstance(result, int)
         assert result >= 1
 
-    @patch("hyperscale.distributed.nodes.worker.config.os.cpu_count")
+    @patch("os.cpu_count")
     def test_fallback_to_os_cpu_count(self, mock_cpu_count):
         """Test fallback when psutil is not available."""
         # Simulate psutil import failure

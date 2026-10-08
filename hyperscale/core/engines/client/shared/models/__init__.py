@@ -1,3 +1,4 @@
+from .address_rotation import AddressRotation as AddressRotation
 from .call_result import CallResult as CallResult
 from .cookies import Cookies as Cookies
 from .metadata import Metadata as Metadata

@@ -10,16 +10,20 @@ from hyperscale.ui.components.counter import Counter
 from hyperscale.ui.components.empty import Empty
 from hyperscale.ui.components.header import Header
 from hyperscale.ui.components.link import Link
+from hyperscale.ui.components.meter import Meter
 from hyperscale.ui.components.multiline_text import MultilineText
 from hyperscale.ui.components.progress_bar import ProgressBar
 from hyperscale.ui.components.scatter_plot import ScatterPlot
 from hyperscale.ui.components.spinner import Spinner
+from hyperscale.ui.components.stat_tile import StatTile
+from hyperscale.ui.components.status_badge import StatusBadge
 from hyperscale.ui.components.text import Text
 from hyperscale.ui.components.total_rate import TotalRate
 from hyperscale.ui.components.windowed_rate import WindowedRate
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 from typing import Generic, TypeVar
 
+from .rule_glyphs import RULE_GLYPHS
 from .section_config import SectionConfig, HorizontalSectionSize, VerticalSectionSize
 
 
@@ -28,10 +32,13 @@ Component = (
     | Empty
     | Header
     | Link
+    | Meter
     | MultilineText
     | ProgressBar
     | ScatterPlot
     | Spinner
+    | StatTile
+    | StatusBadge
     | Text
     | TotalRate
     | WindowedRate
@@ -125,8 +132,7 @@ class Section(Generic[T]):
         width_scale = self._scale[self.config.width]
         self._actual_width = math.floor(width_scale * canvas_width)
 
-        height_scale = self._scale[self.config.height]
-        self._actual_height = math.floor(height_scale * canvans_height)
+        self._actual_height = self._rows_of(canvans_height)
 
         if self.config.max_width and self._actual_width > self.config.max_width:
             self._actual_width = self.config.max_width
@@ -151,11 +157,27 @@ class Section(Generic[T]):
             border_size = len(self.config.top_border.split("\n"))
             vertical_padding += border_size
 
-        if self.config.bottom_border:
-            border_size = len(self.config.bottom_border.split("\n"))
+        if bottom_border := self._bottom_border_glyph():
+            border_size = len(bottom_border.split("\n"))
             vertical_padding += border_size
 
         self._inner_height = self._actual_height - vertical_padding
+
+    def _bottom_border_glyph(self) -> str | None:
+        """What the section's bottom border is drawn with: the mode's rule
+        glyph for a ``bottom_rule``, else its ``bottom_border``."""
+        if self.config.bottom_rule:
+            return RULE_GLYPHS[self._mode]
+
+        return self.config.bottom_border
+
+    def _rows_of(self, canvas_height: int) -> int:
+        """The rows the section takes of a canvas ``canvas_height`` rows
+        tall: its ``height_rows``, or its ``height``'s share."""
+        if self.config.height_rows is not None:
+            return self.config.height_rows(canvas_height)
+
+        return math.floor(self._scale[self.config.height] * canvas_height)
 
     async def create_blocks(self):
         if len(self._blocks) > 0:
@@ -175,10 +197,8 @@ class Section(Generic[T]):
                 self.config.bottom_padding
             )
 
-        if self.config.bottom_border:
-            self._bottom_border = await self._create_border_row(
-                self.config.bottom_border
-            )
+        if bottom_border := self._bottom_border_glyph():
+            self._bottom_border = await self._create_border_row(bottom_border)
 
         if self.config.left_border:
             self._left_border = await stylize(
@@ -201,17 +221,21 @@ class Section(Generic[T]):
         self._right_pad = " " * (self.config.right_padding + self._right_remainder_pad)
 
     async def render(self):
+        # A section given no rows (a layout dropped it to fit a short
+        # canvas) draws nothing at all.
+        if self._actual_height < 1:
+            return []
+
         if self._empty is False:
             return await self._render_with_component()
 
-        elif self._last_render is None:
-            render = await self._render_without_component()
-            self._last_render = render
+        return await self._render_empty()
 
-            return render
+    async def _render_empty(self):
+        if self._last_render is None:
+            self._last_render = await self._render_without_component()
 
-        else:
-            return self._last_render
+        return self._last_render
 
     async def _fit_components(self, component_name: str | None = None):
         if component_name and (component := self.components.get(component_name)):

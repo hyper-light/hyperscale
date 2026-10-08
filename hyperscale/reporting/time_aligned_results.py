@@ -2,14 +2,15 @@
 Time-Aligned Results Aggregation.
 
 This module provides time-aware aggregation for WorkflowStats across multiple
-workers and datacenters. Unlike the basic Results.merge_results(), this class
-accounts for collection time differences to provide more accurate rate metrics.
+workers and datacenters, reporting how far apart in time the sources' stats
+were collected.
 
 Time Alignment Strategy:
 - Each WorkflowStats or progress update includes a `collected_at` Unix timestamp
-- When aggregating, we interpolate or align values to a common reference time
-- Rate metrics are adjusted based on the time window they represent
-- This prevents misleading aggregations when data arrives with network latency
+- Merged stats are Results.merge_results() of the sources: when a source's
+  stats were collected changes neither its samples nor its elapsed time
+- Concurrent sources' rates add; counts can be interpolated to a common
+  reference time
 
 Usage:
     from hyperscale.reporting.time_aligned_results import TimeAlignedResults
@@ -23,44 +24,19 @@ Usage:
     )
 """
 
-import statistics
+import math
+import operator
 import time
-from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
-import numpy as np
-
-from hyperscale.reporting.common.results_types import (
-    CheckSet,
-    ContextCount,
-    CountResults,
-    MetricsSet,
-    QuantileSet,
-    ResultSet,
-    StatsResults,
-    WorkflowStats,
-)
+from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.reporting.results import Results
 
+from .time_alignment_metadata import TimeAlignmentMetadata as TimeAlignmentMetadata
+from .timestamped_stats import TimestampedStats as TimestampedStats
 
-@dataclass
-class TimestampedStats:
-    """WorkflowStats with associated collection timestamp."""
-    stats: WorkflowStats
-    collected_at: float  # Unix timestamp when stats were collected
-    source: str = ""     # Identifier for source (worker_id, datacenter, etc.)
-
-
-@dataclass
-class TimeAlignmentMetadata:
-    """Metadata about the time alignment performed during aggregation."""
-    reference_time: float       # The target alignment timestamp
-    min_collected_at: float     # Earliest collection time
-    max_collected_at: float     # Latest collection time
-    time_spread_seconds: float  # Spread between earliest and latest
-    sources_count: int          # Number of sources aggregated
-    sources: list[str]          # Source identifiers
+# A progress update's rate; an update without one contributes none.
+RATE_PER_SECOND = operator.methodcaller("get", "rate_per_second", 0.0)
 
 
 class TimeAlignedResults(Results):
@@ -71,10 +47,9 @@ class TimeAlignedResults(Results):
     which is important for accurate rate calculations when aggregating
     data from multiple workers or datacenters with network latency.
 
-    Key improvements over basic merge_results():
-    - Rate interpolation: Adjusts rates based on actual time windows
+    Beyond merge_results():
     - Time skew reporting: Reports the time spread across sources
-    - Reference time alignment: Can align all stats to a specific timestamp
+    - Reference time alignment: Can align progress counts to a specific timestamp
     """
 
     def __init__(
@@ -100,10 +75,8 @@ class TimeAlignedResults(Results):
         """
         Merge WorkflowStats with time alignment.
 
-        Unlike the base merge_results(), this method:
-        1. Tracks collection timestamps from each source
-        2. Calculates time-adjusted rates
-        3. Reports time skew metadata
+        The merged stats are merge_results() of the sources; the metadata
+        reports their collection timestamps and time skew.
 
         Args:
             timestamped_stats: List of stats with collection timestamps
@@ -138,72 +111,15 @@ class TimeAlignedResults(Results):
             sources=sources,
         )
 
-        # Perform base merge
-        merged = self.merge_results(workflow_stats_list)
-
-        # Adjust rate metrics with time awareness
-        merged = self._adjust_rate_for_time_alignment(
-            merged,
-            timestamped_stats,
-            reference_time,
-        )
-
-        return merged, metadata
-
-    def _adjust_rate_for_time_alignment(
-        self,
-        merged: WorkflowStats,
-        timestamped_stats: List[TimestampedStats],
-        reference_time: float,
-    ) -> WorkflowStats:
-        """
-        Adjust rate metrics based on time alignment.
-
-        For rate calculations (aps - actions per second), we need to account
-        for the fact that different sources may have collected data at different
-        times. Simply summing rates can be misleading.
-
-        Strategy:
-        - Calculate weighted average rate based on each source's contribution
-        - Account for the time window each rate represents
-        - Use the most recent elapsed time as the reference
-        """
-        if not timestamped_stats:
-            return merged
-
-        # Calculate time-weighted rate
-        total_executed = 0
-        weighted_elapsed_sum = 0.0
-        weights_sum = 0.0
-
-        for ts in timestamped_stats:
-            stats = ts.stats
-            executed = stats.get("stats", {}).get("executed", 0)
-            elapsed = stats.get("elapsed", 0.0)
-
-            if elapsed > 0:
-                # Weight by recency - more recent data gets higher weight
-                time_delta = reference_time - ts.collected_at
-                # Decay weight for older data (half-life of 1 second)
-                weight = np.exp(-time_delta / 1.0) if time_delta > 0 else 1.0
-
-                total_executed += executed
-                weighted_elapsed_sum += elapsed * weight
-                weights_sum += weight
-
-        # Calculate time-adjusted rate
-        if weights_sum > 0 and weighted_elapsed_sum > 0:
-            weighted_elapsed = weighted_elapsed_sum / weights_sum
-            if weighted_elapsed > 0:
-                merged["aps"] = total_executed / weighted_elapsed
-
-        return merged
+        # The sources ran concurrently: the merged rate is every action over
+        # the longest elapsed, whenever each source's stats were collected.
+        return self.merge_results(workflow_stats_list), metadata
 
     def aggregate_progress_stats(
         self,
-        progress_updates: List[Dict[str, Any]],
+        progress_updates: List[Dict[str, float]],
         reference_time: Optional[float] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, float]:
         """
         Aggregate progress statistics with time alignment.
 
@@ -246,11 +162,9 @@ class TimeAlignedResults(Results):
         total_completed = sum(p.get("completed_count", 0) for p in progress_updates)
         total_failed = sum(p.get("failed_count", 0) for p in progress_updates)
 
-        # Calculate time-weighted rate
-        weighted_rate = self._calculate_time_weighted_rate(
-            progress_updates,
-            reference_time,
-        )
+        # The sources run concurrently: their rates add (fsum: correctly
+        # rounded, whatever order the updates arrived in).
+        total_rate = math.fsum(map(RATE_PER_SECOND, progress_updates))
 
         # Use maximum elapsed as the reference (all sources started around same time)
         max_elapsed = max(p.get("elapsed_seconds", 0.0) for p in progress_updates)
@@ -258,66 +172,18 @@ class TimeAlignedResults(Results):
         return {
             "completed_count": total_completed,
             "failed_count": total_failed,
-            "rate_per_second": weighted_rate,
+            "rate_per_second": total_rate,
             "elapsed_seconds": max_elapsed,
             "collected_at": reference_time,
             "time_spread_seconds": max_collected - min_collected,
             "sources_count": len(progress_updates),
         }
 
-    def _calculate_time_weighted_rate(
-        self,
-        progress_updates: List[Dict[str, Any]],
-        reference_time: float,
-    ) -> float:
-        """
-        Calculate time-weighted rate from multiple progress updates.
-
-        More recent rates are weighted more heavily to account for
-        network latency causing some updates to arrive later.
-
-        Args:
-            progress_updates: List of progress dicts with rate_per_second and collected_at
-            reference_time: Reference time for weight calculation
-
-        Returns:
-            Time-weighted average rate
-        """
-        if not progress_updates:
-            return 0.0
-
-        weighted_sum = 0.0
-        weights_sum = 0.0
-
-        for progress in progress_updates:
-            rate = progress.get("rate_per_second", 0.0)
-            collected_at = progress.get("collected_at", reference_time)
-
-            if rate >= 0:  # Include zero rates
-                # Calculate time delta from reference
-                time_delta = reference_time - collected_at
-
-                # Apply exponential decay weight
-                # Half-life of 2 seconds - recent data is more relevant
-                if time_delta >= 0:
-                    weight = np.exp(-time_delta / 2.0)
-                else:
-                    # Future timestamp (clock skew) - use full weight
-                    weight = 1.0
-
-                weighted_sum += rate * weight
-                weights_sum += weight
-
-        if weights_sum > 0:
-            return weighted_sum / weights_sum
-
-        return 0.0
-
     def interpolate_to_reference_time(
         self,
-        progress_updates: List[Dict[str, Any]],
+        progress_updates: List[Dict[str, float]],
         reference_time: float,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, float]:
         """
         Interpolate progress values to a common reference time.
 
@@ -367,7 +233,7 @@ class TimeAlignedResults(Results):
             interpolated_failed += failed
 
         # Recalculate rate as sum of individual rates
-        total_rate = sum(p.get("rate_per_second", 0.0) for p in progress_updates)
+        total_rate = math.fsum(map(RATE_PER_SECOND, progress_updates))
 
         # Use max elapsed
         max_elapsed = max(p.get("elapsed_seconds", 0.0) for p in progress_updates)

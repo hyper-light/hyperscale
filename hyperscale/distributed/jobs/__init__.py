@@ -18,7 +18,6 @@ Shared (Manager/Gate):
 Supporting types:
 - TrackingToken: Globally unique workflow tracking IDs
 - JobInfo, WorkflowInfo, SubWorkflowInfo: Job state containers
-- WorkflowStateMachine: State machine for workflow transitions
 - AllocationResult: Core allocation result container
 - JobLeadership: Leadership info for a single job
 - DCManagerLeadership: Per-DC manager leadership info (for gates)
@@ -35,9 +34,6 @@ from hyperscale.distributed.models import (
     WorkflowInfo as WorkflowInfo,
     SubWorkflowInfo as SubWorkflowInfo,
     TrackingToken as TrackingToken,
-)
-from hyperscale.distributed.jobs.workflow_state_machine import (
-    WorkflowStateMachine as WorkflowStateMachine,
 )
 from hyperscale.distributed.jobs.worker_pool import (
     WorkerPool as WorkerPool,

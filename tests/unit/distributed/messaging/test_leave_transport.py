@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.server.protocol import MessagePriority
 from hyperscale.distributed.server.protocol.in_flight_tracker import (
     PriorityLimits,
@@ -18,6 +19,12 @@ class RecordingDispatcher:
 
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[str, int], bytes, int]] = []
+
+    def is_dedup_eligible(self, msg_type_prefix: bytes) -> bool:
+        # Mirrors the production taxonomy: leave IS dedup-eligible
+        # (idempotent dissemination); the ingress consults this before
+        # the duplicate check.
+        return msg_type_prefix in (b"suspect", b"alive", b"join", b"leave")
 
     async def dispatch(
         self,
@@ -46,6 +53,7 @@ def _make_receive_server(
     dispatcher = RecordingDispatcher()
     rate_limit_calls: list[tuple[tuple[str, int], str]] = []
 
+    server._clock = RealClock()
     server._udp_addr_slug = b"127.0.0.1:9000"
     server._udp_logger = RecordingLogger()
     server._host = "127.0.0.1"
@@ -57,6 +65,8 @@ def _make_receive_server(
         "rejected": 0,
     }
     server._is_duplicate_message = lambda addr, data: False
+    # Built when the probe cycle starts; this server never starts one.
+    server._probe_budget = None
 
     async def check_rate_limit(
         addr: tuple[str, int],

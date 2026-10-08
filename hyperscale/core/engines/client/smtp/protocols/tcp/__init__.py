@@ -1,2 +1,2 @@
 from .connection import TCPConnection
-from .limits import SMTP_LIMIT
+from .limits import IMPLICIT_TLS_PORT, SMTP_LIMIT

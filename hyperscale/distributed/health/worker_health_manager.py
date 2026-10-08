@@ -9,16 +9,18 @@ Key responsibilities:
 - Handle extension requests with proper validation
 - Reset trackers when workers become healthy
 - Coordinate with the three-signal health model (AD-19)
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from dataclasses import dataclass, field
-import time
+from hyperscale.distributed.runtime import Clock, RealClock
 from typing import TYPE_CHECKING
-
-from hyperscale.distributed.health.alpha_posterior import (
-    HierarchicalAlphaTuner,
-    HierarchicalAlphaTunerConfig,
-)
+from hyperscale.distributed.health.alpha_posterior import HierarchicalAlphaTuner, HierarchicalAlphaTunerConfig
 from hyperscale.distributed.health.extension_decision import (
     ExtensionDecision,
     ExtensionDecisionConfig,
@@ -30,47 +32,21 @@ from hyperscale.distributed.health.extension_ledger import (
     ExtensionLedger,
     ExtensionLedgerConfig,
 )
-from hyperscale.distributed.health.extension_outcome import (
-    ExtensionOutcomeEvent,
-    ExtensionOutcomeKind,
-)
+from hyperscale.distributed.health.extension_outcome import ExtensionOutcomeEvent, ExtensionOutcomeKind
+from hyperscale.distributed.health.extension_tracker import ExtensionTracker, ExtensionTrackerConfig
+from hyperscale.distributed.health.progress_witness import ThroughputWitness
+from hyperscale.distributed.health.workflow_progress_snapshot import WorkflowProgressSnapshot
+from hyperscale.distributed.models import HealthcheckExtensionRequest, HealthcheckExtensionResponse
+from hyperscale.distributed.health.progress_witness import WitnessVerdictKind
+from hyperscale.distributed.health.extension_decision import ExtensionWitnessEvidence
+
+from .applied_outcome_window import AppliedOutcomeWindow
+from .worker_health_manager_config import WorkerHealthManagerConfig
 
 if TYPE_CHECKING:
     from hyperscale.distributed.models.jobs import TimeoutTrackingState
-from hyperscale.distributed.health.extension_tracker import (
-    ExtensionTracker,
-    ExtensionTrackerConfig,
-)
-from hyperscale.distributed.health.progress_witness import ThroughputWitness
-from hyperscale.distributed.health.workflow_progress_snapshot import (
-    WorkflowProgressSnapshot,
-)
-from hyperscale.distributed.models import (
-    HealthcheckExtensionRequest,
-    HealthcheckExtensionResponse,
-)
 
-
-@dataclass(slots=True)
-class WorkerHealthManagerConfig:
-    """
-    Configuration for WorkerHealthManager.
-
-    Attributes:
-        base_deadline: Base deadline in seconds for extensions.
-        min_grant: Minimum extension grant in seconds.
-        max_extensions: Maximum extensions per worker per cycle.
-        eviction_threshold: Number of failed extensions before eviction.
-        warning_threshold: Remaining extensions to trigger warning notification.
-        grace_period: Seconds of grace after exhaustion before kill.
-    """
-
-    base_deadline: float = 30.0
-    min_grant: float = 1.0
-    max_extensions: int = 5
-    eviction_threshold: int = 3
-    warning_threshold: int = 1
-    grace_period: float = 10.0
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class WorkerHealthManager:
@@ -105,6 +81,8 @@ class WorkerHealthManager:
         config: WorkerHealthManagerConfig | None = None,
         throughput_witness: ThroughputWitness | None = None,
         decision_config: ExtensionDecisionConfig | None = None,
+        *,
+        clock: Clock | None = None,
     ):
         """
         Initialize the WorkerHealthManager.
@@ -129,24 +107,46 @@ class WorkerHealthManager:
             grace_period=self._config.grace_period,
         )
 
+        # Phase 5 DI seam — every wall/monotonic read routes through
+        # ``self._clock`` so Phase 6 SIM mode can drive timestamps
+        # deterministically.
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
+
         # Per-worker extension trackers
         self._trackers: dict[str, ExtensionTracker] = {}
 
         # Track consecutive extension failures for eviction decisions
         self._extension_failures: dict[str, int] = {}
 
+        # Phase H8 — Bayesian per-workflow-class outcome posterior.
+        # Updated whenever an outcome event is applied (locally on
+        # workflow termination, or remotely via AD-48 #|o
+        # dissemination); read by the H5 evaluator, which weights each
+        # throughput-witness test's α by the class's learned failure
+        # rate via ``alpha_budget``.
+        alpha_tuner_config = HierarchicalAlphaTunerConfig()
+        self._alpha_tuner: HierarchicalAlphaTuner = HierarchicalAlphaTuner(
+            alpha_tuner_config
+        )
+        # Each terminated workflow counts once in the tuner however
+        # many gossip copies of its outcome arrive. Ids are held for
+        # the tuner's own staleness horizon: past it an outcome no
+        # longer shapes a posterior the tuner keeps, and it exceeds
+        # the O(log n)-round dissemination of a ``#|o`` event (Das,
+        # Gupta & Motivala 2002, SWIM §4) by orders of magnitude.
+        self._applied_outcomes: AppliedOutcomeWindow = AppliedOutcomeWindow(
+            alpha_tuner_config.stale_after_seconds
+        )
+
         # Phase H5 — multi-witness decision orchestrator. Lazy: a manager
         # without a witness wired in (e.g. unit tests) gets the legacy
-        # path; the production HealthAwareServer construction passes a
-        # witness so the full multi-witness logic activates.
+        # path; ManagerServer passes one, so the full multi-witness
+        # logic decides in production.
         self._throughput_witness: ThroughputWitness | None = throughput_witness
         self._decision_evaluator: ExtensionDecisionEvaluator | None = (
-            ExtensionDecisionEvaluator(
-                throughput_witness=throughput_witness,
-                config=decision_config,
+            self._build_decision_evaluator(
+                throughput_witness, decision_config, self._alpha_tuner
             )
-            if throughput_witness is not None
-            else None
         )
 
         # Phase H7 — local authoritative ledger of every extension
@@ -155,13 +155,22 @@ class WorkerHealthManager:
         # cross-DC correlation tooling can query consistently.
         self._ledger: ExtensionLedger = ExtensionLedger(ExtensionLedgerConfig())
 
-        # Phase H8 — Bayesian per-workflow-class α posterior tuner.
-        # Updated whenever an outcome event is applied (locally on
-        # workflow termination, or remotely via AD-48 #|o
-        # dissemination). Composes with H6's hierarchical α budget
-        # via ``alpha_budget(class, floor, ceiling)``.
-        self._alpha_tuner: HierarchicalAlphaTuner = HierarchicalAlphaTuner(
-            HierarchicalAlphaTunerConfig()
+    @staticmethod
+    def _build_decision_evaluator(
+        throughput_witness: ThroughputWitness | None,
+        decision_config: ExtensionDecisionConfig | None,
+        alpha_tuner: HierarchicalAlphaTuner,
+    ) -> ExtensionDecisionEvaluator | None:
+        """The AD-26 H5 multi-witness evaluator, or ``None`` (legacy path)
+        when no throughput witness is wired in."""
+        return (
+            ExtensionDecisionEvaluator(
+                throughput_witness=throughput_witness,
+                config=decision_config,
+                alpha_tuner=alpha_tuner,
+            )
+            if throughput_witness is not None
+            else None
         )
 
     def _get_tracker(self, worker_id: str) -> ExtensionTracker:
@@ -251,6 +260,7 @@ class WorkerHealthManager:
         active_in_dc: int,
         active_on_manager: int,
         active_on_worker: int,
+        workflow_class: str,
         job_id: str = "",
         fence_token: int = 0,
         leader_term: int = 0,
@@ -272,6 +282,10 @@ class WorkerHealthManager:
         full ``ExtensionDecision`` value (for H7 ledger replication
         and H8 outcome feedback).
 
+        ``workflow_class`` keys the H8 outcome posterior that weights
+        the throughput witness's significance level for this
+        workflow.
+
         Falls back to the legacy ``handle_extension_request`` path
         when no throughput witness is wired (i.e. the manager was
         constructed without one — typically unit-test surfaces).
@@ -279,49 +293,15 @@ class WorkerHealthManager:
         if self._decision_evaluator is None:
             # Legacy single-witness path; preserve behavior for callers
             # that didn't wire a throughput witness.
-            response = self.handle_extension_request(request, current_deadline)
-            # Synthesize a minimal ExtensionDecision matching the
-            # legacy outcome so the caller's H7/H8 hooks see a
-            # consistent shape.
-            tracker = self._get_tracker(request.worker_id)
-            from hyperscale.distributed.health.extension_decision import (
-                ExtensionWitnessEvidence,
-            )
-            from hyperscale.distributed.health.progress_witness import (
-                WitnessVerdictKind,
-            )
-            evidence = ExtensionWitnessEvidence(
-                progress_meaningful=response.granted,
-                progress_all_non_regressed=response.granted,
-                progress_any_advanced=response.granted,
-                throughput_verdict_kind=WitnessVerdictKind.COLD_START,
-                throughput_change_point_probability=0.0,
-                throughput_alpha_workflow=0.0,
-                throughput_predictive_mean_before=0.0,
-                throughput_predictive_mean_after=0.0,
-                overload_state=overload_state,
-                seconds_since_last_extension=0.0,
-                extension_count_pre_decision=tracker.extension_count,
-            )
-            decision = ExtensionDecision(
-                granted=response.granted,
-                extension_seconds=response.extension_seconds,
-                denial_reason_code=ExtensionDenialCode(
-                    response.denial_reason_code or "none"
-                ),
-                denial_message=response.denial_reason,
-                evidence=evidence,
-                is_exhaustion_warning=response.is_exhaustion_warning,
-            )
-            event = self._record_decision_event(
-                job_id=job_id,
-                worker_id=request.worker_id,
-                decision=decision,
+            return self._handle_legacy_witness_request(
+                request=request,
+                current_deadline=current_deadline,
                 snapshot=snapshot,
+                overload_state=overload_state,
+                job_id=job_id,
                 fence_token=fence_token,
                 leader_term=leader_term,
             )
-            return response, decision, event
 
         tracker = self._get_tracker(request.worker_id)
         decision = self._decision_evaluator.decide(
@@ -334,9 +314,90 @@ class WorkerHealthManager:
             active_in_dc=active_in_dc,
             active_on_manager=active_on_manager,
             active_on_worker=active_on_worker,
+            workflow_class=workflow_class,
         )
 
         # Commit tracker state mutation.
+        response = self._commit_witnessed_decision(
+            tracker, request, current_deadline, decision
+        )
+
+        event = self._record_decision_event(
+            job_id=job_id,
+            worker_id=request.worker_id,
+            decision=decision,
+            snapshot=snapshot,
+            fence_token=fence_token,
+            leader_term=leader_term,
+        )
+        return response, decision, event
+
+    def _handle_legacy_witness_request(
+        self,
+        *,
+        request: HealthcheckExtensionRequest,
+        current_deadline: float,
+        snapshot: WorkflowProgressSnapshot,
+        overload_state: str,
+        job_id: str,
+        fence_token: int,
+        leader_term: int,
+    ) -> tuple[
+        HealthcheckExtensionResponse,
+        ExtensionDecision,
+        ExtensionDecisionEvent,
+    ]:
+        """AD-26 legacy single-witness path of
+        ``handle_extension_request_with_witnesses``, used when no throughput
+        witness is wired: decide via ``handle_extension_request`` and record
+        a synthesized decision so H7/H8 hooks see a consistent shape."""
+        response = self.handle_extension_request(request, current_deadline)
+        # Synthesize a minimal ExtensionDecision matching the
+        # legacy outcome so the caller's H7/H8 hooks see a
+        # consistent shape.
+        tracker = self._get_tracker(request.worker_id)
+        evidence = ExtensionWitnessEvidence(
+            progress_meaningful=response.granted,
+            progress_all_non_regressed=response.granted,
+            progress_any_advanced=response.granted,
+            throughput_verdict_kind=WitnessVerdictKind.COLD_START,
+            throughput_change_point_probability=0.0,
+            throughput_alpha_workflow=0.0,
+            throughput_predictive_mean_before=0.0,
+            throughput_predictive_mean_after=0.0,
+            overload_state=overload_state,
+            seconds_since_last_extension=0.0,
+            extension_count_pre_decision=tracker.extension_count,
+        )
+        decision = ExtensionDecision(
+            granted=response.granted,
+            extension_seconds=response.extension_seconds,
+            denial_reason_code=ExtensionDenialCode(
+                response.denial_reason_code or "none"
+            ),
+            denial_message=response.denial_reason,
+            evidence=evidence,
+            is_exhaustion_warning=response.is_exhaustion_warning,
+        )
+        event = self._record_decision_event(
+            job_id=job_id,
+            worker_id=request.worker_id,
+            decision=decision,
+            snapshot=snapshot,
+            fence_token=fence_token,
+            leader_term=leader_term,
+        )
+        return response, decision, event
+
+    def _commit_witnessed_decision(
+        self,
+        tracker: ExtensionTracker,
+        request: HealthcheckExtensionRequest,
+        current_deadline: float,
+        decision: ExtensionDecision,
+    ) -> HealthcheckExtensionResponse:
+        """Commit an AD-26 H5 decision to the tracker and failure counts
+        and build the worker's wire response."""
         if decision.granted:
             tracker.commit_grant(
                 grant_seconds=decision.extension_seconds,
@@ -373,16 +434,7 @@ class WorkerHealthManager:
                 in_grace_period=tracker.is_in_grace_period,
                 denial_reason_code=decision.denial_reason_code.value,
             )
-
-        event = self._record_decision_event(
-            job_id=job_id,
-            worker_id=request.worker_id,
-            decision=decision,
-            snapshot=snapshot,
-            fence_token=fence_token,
-            leader_term=leader_term,
-        )
-        return response, decision, event
+        return response
 
     def _record_decision_event(
         self,
@@ -421,7 +473,7 @@ class WorkerHealthManager:
             cumulative_extended=post_cumulative,
             progress_snapshot=snapshot,
             fence_token=fence_token,
-            timestamp=time.monotonic(),
+            timestamp=self._clock.monotonic(),
             leader_term=leader_term,
         )
         self._ledger.record(event)
@@ -471,10 +523,7 @@ class WorkerHealthManager:
         equal-or-lower leader_term return the existing event
         unchanged. Higher-leader-term outcomes supersede.
         """
-        entry = self._ledger.get_workflow_entry(workflow_id)
-        granted_count = entry.extension_count if entry is not None else 0
-        denied_count = entry.denial_count if entry is not None else 0
-        total_extended = entry.cumulative_extended if entry is not None else 0.0
+        granted_count, denied_count, total_extended = self._ledger_totals(workflow_id)
 
         event = ExtensionOutcomeEvent(
             job_id=job_id,
@@ -493,29 +542,53 @@ class WorkerHealthManager:
         self._apply_outcome_locally(event)
         return event
 
+    def _ledger_totals(self, workflow_id: str) -> tuple[int, int, float]:
+        """Granted count, denied count and cumulative extended seconds the
+        H7 ledger holds for ``workflow_id`` (zeros when it holds none)."""
+        entry = self._ledger.get_workflow_entry(workflow_id)
+        if entry is None:
+            return 0, 0, 0.0
+        return entry.extension_count, entry.denial_count, entry.cumulative_extended
+
     def ingest_remote_outcome_event(
         self, event: ExtensionOutcomeEvent
-    ) -> None:
+    ) -> bool:
         """Apply an outcome event received from a peer manager via
-        AD-48 ``#|o`` dissemination. Idempotent through the
-        ledger's stale-term rejection.
-        """
-        self._apply_outcome_locally(event)
+        AD-48 ``#|o`` dissemination.
 
-    def _apply_outcome_locally(self, event: ExtensionOutcomeEvent) -> None:
+        Returns True for the first copy of this workflow's outcome
+        (the caller re-arms its dissemination), False for a repeat,
+        which leaves the tuner untouched: gossip delivers every
+        outcome many times, and each workflow is one observation.
+        """
+        return self._apply_outcome_locally(event)
+
+    def _apply_outcome_locally(self, event: ExtensionOutcomeEvent) -> bool:
         """Shared codepath for both leader-emitted and follower-
         ingested outcome events. Pairs the ledger update with the
         tuner update in a single call so the two stay coherent.
+
+        The ledger record is idempotent itself (stale-term rejection).
+        The tuner is fed only the first copy of each workflow's
+        outcome inside the ``AppliedOutcomeWindow``; the return says
+        whether this was it. A workflow never seen as an extension
+        request locally still informs its class's posterior: the
+        tuner needs only the outcome kind and progress fraction.
+
+        A workflow that COMPLETED ends its worker's extension cycle
+        (AD-26: "reset extension tracker when worker completes
+        successfully"): the worker's tracker and failure count reset, so
+        its grants are budgeted per cycle, not over its lifetime. Only
+        the first copy resets: a late gossip repeat must not wipe grants
+        made since.
         """
-        applied = self._ledger.record_outcome(event)
-        # Even when the workflow was never seen as an extension
-        # request locally (``applied is None``), the outcome still
-        # informs the global per-workflow-class posterior. The
-        # only caveat is that we won't have decision counts to
-        # cross-reference; the tuner only needs outcome_kind +
-        # final_progress_fraction.
-        del applied
+        self._ledger.record_outcome(event)
+        if not self._applied_outcomes.admit(event.workflow_id, self._clock.monotonic()):
+            return False
         self._alpha_tuner.apply_outcome(event)
+        if event.outcome_kind == ExtensionOutcomeKind.COMPLETED:
+            self.on_worker_healthy(event.worker_id)
+        return True
 
     @property
     def alpha_tuner(self) -> HierarchicalAlphaTuner:
@@ -581,8 +654,7 @@ class WorkerHealthManager:
         Returns the number of events replayed.
         """
         replayed = 0
-        if state.alpha_tuner_snapshot:
-            self._alpha_tuner.restore(list(state.alpha_tuner_snapshot.values()))
+        self._restore_alpha_tuner_snapshot(state)
         for decision_event in state.last_extension_decisions.values():
             self._ledger.record(decision_event)
             replayed += 1
@@ -591,15 +663,34 @@ class WorkerHealthManager:
             replayed += 1
         return replayed
 
+    def _restore_alpha_tuner_snapshot(self, state: "TimeoutTrackingState") -> None:
+        """Restore the H8 tuner from the previous leader's persisted
+        snapshot, when it left one (AD-34 leader transfer)."""
+        if state.alpha_tuner_snapshot:
+            self._alpha_tuner.restore(list(state.alpha_tuner_snapshot.values()))
+
     def _snapshot_alpha_tuner(self) -> dict[str, bytes]:
         return {
             posterior.workflow_class: posterior.to_bytes()
             for posterior in self._alpha_tuner
         }
 
+    def ingest_workflow_progress(
+        self, worker_id: str, workflow_id: str, completed_count: int, elapsed_seconds: float
+    ) -> None:
+        """Feed one ``WorkflowProgress`` report of an in-flight workflow to
+        the H6 throughput witness (no-op without one). The manager's
+        progress path calls this; the witness samples the workflow's rate
+        between reports at most once per its derived sampling interval."""
+        if self._throughput_witness is not None:
+            self._throughput_witness.ingest_progress(worker_id, workflow_id, completed_count, elapsed_seconds)
+
     def forget_workflow(self, workflow_id: str) -> None:
-        """Drop H7 ledger state for a terminated workflow."""
+        """Drop H7 ledger state and H6 throughput streams for a
+        terminated workflow."""
         self._ledger.forget_workflow(workflow_id)
+        if self._throughput_witness is not None:
+            self._throughput_witness.forget_workflow(workflow_id)
 
     def forget_job(self, job_id: str) -> None:
         """Cascade-drop H7 ledger state for a terminated job."""
@@ -647,6 +738,8 @@ class WorkerHealthManager:
         # closes the H8 outcome-feedback loop: every workflow owned
         # by the worker is implicitly resolved as "worker_lost".
         self._ledger.forget_worker(worker_id)
+        if self._throughput_witness is not None:
+            self._throughput_witness.forget_worker(worker_id)
 
     def should_evict_worker(self, worker_id: str) -> tuple[bool, str | None]:
         """
@@ -673,8 +766,7 @@ class WorkerHealthManager:
                 f"Worker exhausted {failures} extension requests without progress",
             )
 
-        tracker = self._trackers.get(worker_id)
-        if tracker and tracker.should_evict:
+        if self._tracker_should_evict(worker_id):
             # Extensions exhausted AND grace period expired
             return (
                 True,
@@ -683,6 +775,14 @@ class WorkerHealthManager:
             )
 
         return (False, None)
+
+    def _tracker_should_evict(self, worker_id: str) -> bool:
+        """Whether the worker's tracker has exhausted its extensions and
+        its AD-26 grace period."""
+        tracker = self._trackers.get(worker_id)
+        if tracker is None:
+            return False
+        return tracker.should_evict
 
     def get_worker_extension_state(self, worker_id: str) -> dict:
         """
@@ -750,3 +850,10 @@ class WorkerHealthManager:
         return sum(
             1 for tracker in self._trackers.values() if tracker.extension_count > 0
         )
+
+_REHOMED = (
+    WorkerHealthManagerConfig,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

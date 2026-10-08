@@ -2,11 +2,14 @@
 Leader state tracking for Raft-like leadership with pre-voting.
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from ..core.types import LeaderRole
+from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.swim.core.types import LeaderRole
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 # Maximum term value - prevents overflow and wrap-around attacks
 # Using 2^53 - 1 to stay within JavaScript safe integer range for JSON serialization
@@ -52,11 +55,28 @@ class LeaderState:
     # Lease tracking
     leader_lease_start: float = 0.0
     lease_duration: float = 5.0  # Seconds
+
+    # Monotonic heartbeat sequence (fix 2/4). The leader increments
+    # ``heartbeat_seq`` on every beat it sends; a follower records the
+    # last ``applied_heartbeat_seq`` it accepted for the current
+    # ``leader_term`` and applies beats MONOTONICALLY. This makes every
+    # beat unique on the wire (a content-hash cache can never coalesce
+    # them — defense in depth beyond the dedup class-separation) and
+    # makes lease renewal idempotent and reorder/replay-safe by
+    # construction.
+    heartbeat_seq: int = 0
+    applied_heartbeat_seq: int = -1
     
     # Election state (bounded to prevent memory exhaustion)
     votes_received: set[tuple[str, int]] = field(default_factory=set)
     voted_for: tuple[str, int] | None = None
     voted_in_term: int = -1
+    # When this node last granted its vote to another candidate. Raft
+    # resets a voter's election timer on every vote it grants (section
+    # 5.2); here the grant holds like a lease for ``lease_duration``: the
+    # voter neither grants pre-votes nor stands meanwhile, so the claim it
+    # answered anchors the winner's quorum lease (LeaderQuorumLease).
+    vote_granted_at: float = float("-inf")
     election_timeout: float = 10.0  # Seconds
     last_heartbeat_time: float = 0.0
     max_votes: int = MAX_VOTES  # Configurable bound
@@ -110,18 +130,34 @@ class LeaderState:
         """Check if the current leader's lease is still valid."""
         if self.current_leader is None:
             return False
-        return time.monotonic() < self.leader_lease_start + self.lease_duration
+        return _DEFAULT_CLOCK.monotonic() < self.leader_lease_start + self.lease_duration
     
     def time_until_lease_expiry(self) -> float:
         """Get time until leader lease expires."""
         expiry = self.leader_lease_start + self.lease_duration
-        return max(0, expiry - time.monotonic())
+        return max(0, expiry - _DEFAULT_CLOCK.monotonic())
     
     def should_start_election(self) -> bool:
         """Check if we should start a new election."""
         if self.role == 'leader':
             return False
-        return not self.is_lease_valid()
+        return not self.is_bound_to_leader()
+
+    def is_bound_to_leader(self) -> bool:
+        """Whether a leader's lease, or a vote this node granted, still binds it."""
+        return self.is_lease_valid() or self.holds_granted_vote()
+
+    def time_until_unbound(self) -> float:
+        """Seconds until neither the leader's lease nor a granted vote binds this node."""
+        bound_until = max(
+            self.leader_lease_start + self.lease_duration,
+            self.vote_granted_at + self.lease_duration,
+        )
+        return max(0, bound_until - _DEFAULT_CLOCK.monotonic())
+
+    def holds_granted_vote(self) -> bool:
+        """Whether a vote granted to another candidate is younger than the lease duration."""
+        return _DEFAULT_CLOCK.monotonic() < self.vote_granted_at + self.lease_duration
     
     def is_term_valid(self, term: int) -> bool:
         """Check if a term value is within valid range."""
@@ -182,17 +218,25 @@ class LeaderState:
         self.role = 'leader'
         self.current_term = term
         self.leader_term = term
-        self.leader_lease_start = time.monotonic()
+        self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
+        # Reset the outgoing beat counter for this leadership epoch; the
+        # first beat we send is seq 1 (fix 2/4).
+        self.heartbeat_seq = 0
+        self.applied_heartbeat_seq = -1
         self.current_leader = None  # We are the leader, set by caller
 
         # Clear vote sets to free memory - we're done with the election
         self.votes_received.clear()
         self.abort_pre_vote()
 
-        if not was_leader and self._on_become_leader:
-            self._on_become_leader()
+        self._announce_became_leader(was_leader)
 
         return True
+
+    def _announce_became_leader(self, was_leader: bool) -> None:
+        """Invoke on_become_leader on a follower/candidate -> leader transition only."""
+        if not was_leader and self._on_become_leader:
+            self._on_become_leader()
     
     def become_follower(self, term: int, leader: tuple[str, int] | None = None) -> None:
         """Transition to follower state."""
@@ -204,33 +248,95 @@ class LeaderState:
         self.votes_received.clear()
         
         if leader:
+            self._adopt_leader_term(term)
             self.current_leader = leader
-            self.leader_term = term
-            self.leader_lease_start = time.monotonic()
+            self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
             self.abort_pre_vote()
         
+        self._announce_lost_leadership(was_leader)
+        
+        self._announce_leader_change(leader, old_leader)
+
+    def _adopt_leader_term(self, term: int) -> None:
+        """Follow the leader of ``term``: the applied-beat watermark is per
+        leadership epoch, so a new term restarts it. Kept across a new
+        term, the previous leader's sequence numbers rejected the new
+        leader's first beats as replays -- its lease went unrenewed until
+        its own sequence caught up, and it lost followers it still had."""
+        if term != self.leader_term:
+            self.applied_heartbeat_seq = -1
+        self.leader_term = term
+
+    def _announce_lost_leadership(self, was_leader: bool) -> None:
+        """Invoke on_lose_leadership when this node was the leader."""
         if was_leader and self._on_lose_leadership:
             self._on_lose_leadership()
-        
+
+    def _announce_leader_change(
+        self,
+        leader: tuple[str, int] | None,
+        old_leader: tuple[str, int] | None,
+    ) -> None:
+        """Invoke on_leader_change when the known leader differs from ``old_leader``."""
         if leader != old_leader and self._on_leader_change:
             self._on_leader_change(leader)
     
-    def update_heartbeat(self, leader: tuple[str, int], term: int) -> None:
-        """Update lease on receiving leader heartbeat."""
-        if term >= self.leader_term:
-            self.current_leader = leader
-            self.leader_term = term
-            self.leader_lease_start = time.monotonic()
-            self.last_heartbeat_time = time.monotonic()
-            self.abort_pre_vote()
-            
-            if self.role != 'follower':
-                self.become_follower(term, leader)
+    def update_heartbeat(
+        self,
+        leader: tuple[str, int],
+        term: int,
+        heartbeat_seq: int = -1,
+        lease_duration: float | None = None,
+    ) -> None:
+        """Renew the leader lease on receiving a heartbeat.
+
+        MONOTONE (fix 2/4): accept a beat only if it advances the
+        ``(term, seq)`` position — a newer term, or the same term with a
+        strictly greater sequence. An older-or-equal beat (reorder or
+        replay within a term) is ignored. AUTHORITATIVE lease (fix 4/4):
+        when the beat carries a ``lease_duration``, the leader's grant is
+        adopted, so leader and follower cannot disagree on the lease
+        length via divergent local config.
+
+        A beat without a sequence (``heartbeat_seq < 0``) bypasses the
+        monotone gate and always renews, preserving behavior for any
+        sequence-less sender.
+        """
+        if term < self.leader_term:
+            return  # stale term: a deposed leader's beat
+        if (
+            term == self.leader_term
+            and heartbeat_seq >= 0
+            and heartbeat_seq <= self.applied_heartbeat_seq
+        ):
+            return  # reordered / replayed beat within the current term
+
+        if term > self.leader_term:
+            # New leadership epoch — reset the applied-sequence watermark.
+            self.applied_heartbeat_seq = -1
+        if heartbeat_seq >= 0:
+            self.applied_heartbeat_seq = heartbeat_seq
+
+        self.current_leader = leader
+        self.leader_term = term
+        # Raft section 5.1: a beat of a newer term advances this node's term.
+        # Recorded only as the leader's, a node that joined or restarted
+        # after the election -- it never voted -- stayed at its old term and
+        # stood next for one the cluster had already used.
+        self.current_term = max(self.current_term, term)
+        self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
+        self.last_heartbeat_time = _DEFAULT_CLOCK.monotonic()
+        if lease_duration is not None and lease_duration > 0:
+            self.lease_duration = lease_duration
+        self.abort_pre_vote()
+
+        if self.role != 'follower':
+            self.become_follower(term, leader)
     
     def renew_lease(self) -> None:
         """Renew leader lease (called by leader on heartbeat send)."""
         if self.role == 'leader':
-            self.leader_lease_start = time.monotonic()
+            self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
     
     def can_vote_for(self, candidate: tuple[str, int], term: int) -> bool:
         """Check if we can vote for a candidate."""
@@ -245,6 +351,11 @@ class LeaderState:
         self.voted_for = candidate
         self.voted_in_term = term
         self.current_term = max(self.current_term, term)
+
+    def grant_vote(self, candidate: tuple[str, int], term: int) -> None:
+        """Vote for another candidate, binding this node to it for a lease duration."""
+        self.vote_for(candidate, term)
+        self.vote_granted_at = _DEFAULT_CLOCK.monotonic()
     
     # Pre-voting methods (split-brain prevention)
     def start_pre_vote(self, term: int) -> None:
@@ -300,22 +411,17 @@ class LeaderState:
         
         Grant pre-vote if:
         1. Candidate's term is >= our term
-        2. We don't have a valid leader lease
+        2. No leader lease, nor a vote we granted, still binds us
         3. Candidate's LHM is acceptable
         """
         # Don't grant if candidate's term is too low
-        if term < self.current_term:
-            return False
-        
         # Don't grant if we have a healthy leader
-        if self.is_lease_valid():
-            return False
-        
         # Don't grant if candidate is unhealthy
-        if candidate_lhm > max_leader_lhm:
-            return False
-        
-        return True
+        return (
+            term >= self.current_term
+            and not self.is_bound_to_leader()
+            and candidate_lhm <= max_leader_lhm
+        )
     
     # Fencing token methods
     def get_fencing_token(self) -> int:
@@ -361,6 +467,15 @@ class LeaderState:
         """
         if other_term > self.current_term:
             return True
+        return self._loses_same_term_tiebreak(other_addr, other_term, self_addr)
+
+    def _loses_same_term_tiebreak(
+        self,
+        other_addr: tuple[str, int],
+        other_term: int,
+        self_addr: tuple[str, int],
+    ) -> bool:
+        """Whether, as a same-term leader, this node loses the lower-address tiebreak."""
         if other_term == self.current_term and self.role == 'leader':
             # Same term, both leaders - use address as tiebreaker
             # Lower address wins
@@ -377,21 +492,31 @@ class LeaderState:
         Returns:
             Dict with cleanup stats.
         """
-        votes_cleared = len(self.votes_received)
-        pre_votes_cleared = len(self.pre_votes_received)
-        
         # Only clear if not in an active election
-        if self.role != 'candidate':
-            self.votes_received.clear()
-        
-        if not self.pre_voting_in_progress:
-            self.pre_votes_received.clear()
+        votes_cleared = self._clear_votes_unless_campaigning()
+        pre_votes_cleared = self._clear_pre_votes_unless_pre_voting()
         
         return {
-            'votes_cleared': votes_cleared if self.role != 'candidate' else 0,
-            'pre_votes_cleared': pre_votes_cleared if not self.pre_voting_in_progress else 0,
+            'votes_cleared': votes_cleared,
+            'pre_votes_cleared': pre_votes_cleared,
             'votes_dropped': self._votes_dropped,
         }
+
+    def _clear_votes_unless_campaigning(self) -> int:
+        """Clear received votes outside a candidacy; the number cleared (0 while a candidate)."""
+        votes_cleared = len(self.votes_received)
+        if self.role != 'candidate':
+            self.votes_received.clear()
+            return votes_cleared
+        return 0
+
+    def _clear_pre_votes_unless_pre_voting(self) -> int:
+        """Clear received pre-votes outside a pre-vote phase; the number cleared (0 while pre-voting)."""
+        pre_votes_cleared = len(self.pre_votes_received)
+        if not self.pre_voting_in_progress:
+            self.pre_votes_received.clear()
+            return pre_votes_cleared
+        return 0
     
     def get_memory_stats(self) -> dict[str, int]:
         """Get memory-related statistics for monitoring."""

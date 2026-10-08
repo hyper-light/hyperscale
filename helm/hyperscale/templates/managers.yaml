@@ -1,0 +1,185 @@
+{{- $root := . }}
+{{- $gateName := include "hyperscale.gate.name" . }}
+{{- $gates := .Values.gates }}
+{{- $gateTcp := include "hyperscale.podAddresses" (dict "root" . "name" $gateName "replicas" $gates.replicas "port" $gates.ports.tcp) }}
+{{- $gateUdp := include "hyperscale.podAddresses" (dict "root" . "name" $gateName "replicas" $gates.replicas "port" $gates.ports.udp) }}
+{{- range $datacenter := .Values.datacenters }}
+{{- $name := include "hyperscale.manager.name" (dict "root" $root "datacenter" $datacenter.name) }}
+{{- $managers := $datacenter.managers }}
+{{- $selector := dict "root" $root "component" "manager" "datacenter" $datacenter.name }}
+{{- $managerTcp := include "hyperscale.podAddresses" (dict "root" $root "name" $name "replicas" $managers.replicas "port" $managers.ports.tcp) }}
+{{- $managerUdp := include "hyperscale.podAddresses" (dict "root" $root "name" $name "replicas" $managers.replicas "port" $managers.ports.udp) }}
+---
+# Datacenter {{ $datacenter.name }}'s manager cohort: every manager is
+# given the whole cohort (it skips itself), so the cohort's size -- the
+# election quorum -- is fixed by `replicas`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyperscale.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: manager
+    hyperscale.io/datacenter: {{ $datacenter.name }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "hyperscale.componentSelectorLabels" $selector | nindent 4 }}
+  ports:
+    - name: tcp
+      port: {{ $managers.ports.tcp }}
+      protocol: TCP
+    - name: swim
+      port: {{ $managers.ports.udp }}
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyperscale.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: manager
+    hyperscale.io/datacenter: {{ $datacenter.name }}
+spec:
+  serviceName: {{ $name }}
+  replicas: {{ $managers.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "hyperscale.componentSelectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hyperscale.componentSelectorLabels" $selector | nindent 8 }}
+        {{- with $root.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $root.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ add $root.Values.shutdownTimeoutSeconds $root.Values.terminationGraceMargin }}
+      containers:
+        - name: manager
+          image: {{ include "hyperscale.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml $root.Values.securityContext | nindent 12 }}
+          workingDir: /home/hyperscale/run
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MERCURY_SYNC_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hyperscale.secretName" $root }}
+                  key: {{ $root.Values.clusterSecret.key }}
+            {{- range $envName, $envValue := $root.Values.env }}
+            - name: {{ $envName }}
+              value: {{ $envValue | quote }}
+            {{- end }}
+          args:
+            - run
+            - manager
+            - --host
+            - "$(POD_NAME).{{ $name }}.{{ $root.Release.Namespace }}.svc.{{ $root.Values.clusterDomain }}"
+            - --tcp-port
+            - {{ $managers.ports.tcp | quote }}
+            - --udp-port
+            - {{ $managers.ports.udp | quote }}
+            - --datacenter
+            - {{ $datacenter.name | quote }}
+            - --data-directory
+            - /var/lib/hyperscale
+            - --boot-timeout
+            - "{{ $root.Values.bootTimeoutSeconds }}s"
+            - --shutdown-timeout
+            - "{{ $root.Values.shutdownTimeoutSeconds }}s"
+            - --log-level
+            - {{ $root.Values.logLevel | quote }}
+            {{- if gt (int $managers.replicas) 1 }}
+            - --managers
+            {{- range splitList " " $managerTcp }}
+            - {{ . | quote }}
+            {{- end }}
+            - --manager-udp
+            {{- range splitList " " $managerUdp }}
+            - {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            - --gates
+            {{- range splitList " " $gateTcp }}
+            - {{ . | quote }}
+            {{- end }}
+            - --gate-udp
+            {{- range splitList " " $gateUdp }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: tcp
+              containerPort: {{ $managers.ports.tcp }}
+              protocol: TCP
+            - name: swim
+              containerPort: {{ $managers.ports.udp }}
+              protocol: UDP
+          readinessProbe:
+            tcpSocket:
+              port: tcp
+            periodSeconds: 5
+          startupProbe:
+            tcpSocket:
+              port: tcp
+            periodSeconds: 5
+            failureThreshold: {{ div $root.Values.bootTimeoutSeconds 5 }}
+          {{- with $managers.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyperscale
+            - name: run
+              mountPath: /home/hyperscale/run
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with $managers.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $managers.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $managers.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $managers.persistence.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $managers.persistence.size }}
+{{- end }}

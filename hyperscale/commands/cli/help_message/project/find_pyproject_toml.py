@@ -53,22 +53,26 @@ def _find_caller_module_name_and_file() -> tuple[str, str | None]:
         __name__,
     )
 
-    frame_info = None
+    # Walk the frames directly: inspect.stack() builds a FrameInfo (reading
+    # source and searching every loaded module) for every frame on the stack.
+    frame = inspect.currentframe()
     try:
         # Crawl up the stack until we no longer find a caller in THIS module or any
         # excluded module (e.g., ignore calls within pathlib)
-        for frame_info in inspect.stack():
-            mod_name = frame_info.frame.f_globals.get("__name__")
+        while frame is not None:
+            mod_name = frame.f_globals.get("__name__")
             if mod_name not in MODULE_EXCEPTIONS:
                 assert isinstance(mod_name, str)
-                filename = frame_info.frame.f_globals.get("__file__")
+                filename = frame.f_globals.get("__file__")
                 return mod_name, filename
+
+            frame = frame.f_back
+
         raise RuntimeError(f"cannot find any caller outside of {__name__}")
     finally:
-        # Remove a reference cycle caused due to holding frame_info.frame
+        # Remove a reference cycle caused by holding the frame
         # See: https://docs.python.org/3/library/inspect.html#the-interpreter-stack
-        if frame_info is not None:
-            del frame_info
+        del frame
 
 
 def _find_pyproject_by_parent_traversal(base: Path) -> Path:

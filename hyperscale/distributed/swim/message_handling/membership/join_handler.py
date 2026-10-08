@@ -2,7 +2,6 @@
 Handler for JOIN messages.
 """
 
-import time
 from typing import ClassVar
 
 from hyperscale.distributed.protocol.version import CURRENT_PROTOCOL_VERSION
@@ -13,6 +12,11 @@ from hyperscale.distributed.swim.message_handling.models import (
     ServerInterface,
 )
 from hyperscale.distributed.swim.message_handling.core import BaseHandler
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 # SWIM protocol version prefix (included in join messages)
@@ -33,6 +37,9 @@ class JoinHandler(BaseHandler):
     """
 
     message_types: ClassVar[tuple[bytes, ...]] = (b"join",)
+    # Membership dissemination: adding a known member is idempotent, and
+    # joins are re-gossiped — content-hash dedup is safe flood control.
+    dedup_eligible: ClassVar[bool] = True
 
     def __init__(self, server: ServerInterface) -> None:
         super().__init__(server)
@@ -178,8 +185,6 @@ class JoinHandler(BaseHandler):
                 source=source_addr,
             )
 
-            await self._server.write_context(target, b"OK")
-
             self._queue_join_propagation(
                 target, role, target_addr_bytes, sent_incarnation
             )
@@ -207,7 +212,7 @@ class JoinHandler(BaseHandler):
             # the incarnation tracker directly so the DEAD→OK
             # transition fires ``_on_node_join_callbacks``.
             await self._server.update_node_state(
-                target, b"OK", sent_incarnation, time.monotonic()
+                target, b"OK", sent_incarnation, _DEFAULT_CLOCK.monotonic()
             )
 
             incarnation_tracker.clear_death_record(target)
@@ -284,7 +289,7 @@ class JoinHandler(BaseHandler):
         # Parse target address
         parsed_target: tuple[str, int] | None = None
         try:
-            host, port_str = addr_part.decode().split(":", maxsplit=1)
+            host, port_str = addr_part.decode().rsplit(":", maxsplit=1)
             parsed_target = (host, int(port_str))
         except (ValueError, UnicodeDecodeError):
             pass

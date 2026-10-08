@@ -78,7 +78,7 @@ class TestGatePingHandlerHappyPath:
     @pytest.mark.asyncio
     async def test_returns_gate_info(self):
         """Handler returns gate identity information."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         state.set_gate_state(GateStateEnum.ACTIVE)
 
         handler = GatePingHandler(
@@ -119,7 +119,7 @@ class TestGatePingHandlerHappyPath:
     @pytest.mark.asyncio
     async def test_includes_datacenter_info(self):
         """Handler includes per-datacenter information."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         state.set_gate_state(GateStateEnum.ACTIVE)
 
         # Set up manager status with leader
@@ -148,7 +148,7 @@ class TestGatePingHandlerHappyPath:
     @pytest.mark.asyncio
     async def test_includes_active_peers(self):
         """Handler includes active peer gates."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         await state.add_active_peer(("10.0.0.2", 9000))
         await state.add_active_peer(("10.0.0.3", 9000))
 
@@ -181,7 +181,7 @@ class TestGatePingHandlerNegativePath:
     @pytest.mark.asyncio
     async def test_handles_invalid_request_data(self):
         """Handler handles invalid request data gracefully."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
         handler = GatePingHandler(
             state=state,
@@ -216,7 +216,7 @@ class TestGatePingHandlerFailureMode:
     @pytest.mark.asyncio
     async def test_handles_exception_in_dependencies(self):
         """Handler handles exceptions from dependencies gracefully."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
         def failing_node_id():
             raise Exception("Node ID error")
@@ -259,7 +259,7 @@ class TestGatePingHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_no_datacenters(self):
         """Handler works with no datacenters."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
         handler = GatePingHandler(
             state=state,
@@ -282,7 +282,7 @@ class TestGatePingHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_no_active_jobs(self):
         """Handler works with no active jobs."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
         handler = GatePingHandler(
             state=state,
@@ -304,7 +304,7 @@ class TestGatePingHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_no_active_peers(self):
         """Handler works with no active peers."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         # No peers added
 
         handler = GatePingHandler(
@@ -326,7 +326,7 @@ class TestGatePingHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_many_datacenters(self):
         """Handler works with many datacenters."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
         dcs = {f"dc-{i}": [(f"10.0.{i}.1", 8000)] for i in range(50)}
 
@@ -350,7 +350,7 @@ class TestGatePingHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_many_active_jobs(self):
         """Handler works with many active jobs."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
         job_ids = [f"job-{i}" for i in range(1000)]
 
@@ -374,7 +374,7 @@ class TestGatePingHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_syncing_state(self):
         """Handler works in SYNCING state."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         state.set_gate_state(GateStateEnum.SYNCING)
 
         handler = GatePingHandler(
@@ -396,7 +396,7 @@ class TestGatePingHandlerEdgeCases:
     @pytest.mark.asyncio
     async def test_dc_without_leader(self):
         """Handler handles DC without elected leader."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
         # DC with managers but no leader
         state._datacenter_manager_status["dc-east"] = {
@@ -433,7 +433,7 @@ class TestGatePingHandlerConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_pings(self):
         """Handler handles concurrent ping requests."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
 
         handler = GatePingHandler(
             state=state,
@@ -479,7 +479,7 @@ class TestGatePingHandlerStateConsistency:
     @pytest.mark.asyncio
     async def test_state_changes_during_ping(self):
         """Handler handles state changes during ping processing."""
-        state = GateRuntimeState()
+        state = GateRuntimeState(forward_throughput_interval_start=0.0)
         await state.add_active_peer(("10.0.0.1", 9000))
 
         handler = GatePingHandler(

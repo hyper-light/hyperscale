@@ -1,38 +1,21 @@
-from dataclasses import dataclass
+"""
 
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
+"""
+
+from dataclasses import dataclass
 from hyperscale.distributed.datacenters.datacenter_overload_config import (
     DatacenterOverloadConfig,
     DatacenterOverloadState,
     OVERLOAD_STATE_ORDER,
 )
 
-
-@dataclass(slots=True)
-class DatacenterOverloadSignals:
-    total_workers: int
-    healthy_workers: int
-    overloaded_workers: int
-    stressed_workers: int
-    busy_workers: int
-    total_managers: int
-    alive_managers: int
-    total_cores: int
-    available_cores: int
-    overloaded_managers: int = 0
-    stressed_managers: int = 0
-    busy_managers: int = 0
-    leader_health_state: str = "healthy"
-
-
-@dataclass(slots=True)
-class DatacenterOverloadResult:
-    state: DatacenterOverloadState
-    worker_overload_ratio: float
-    manager_unhealthy_ratio: float
-    manager_overload_ratio: float
-    capacity_utilization: float
-    health_severity_weight: float
-    leader_overloaded: bool = False
+from .datacenter_overload_result import DatacenterOverloadResult
+from .datacenter_overload_signals import DatacenterOverloadSignals
 
 
 class DatacenterOverloadClassifier:
@@ -104,23 +87,25 @@ class DatacenterOverloadClassifier:
 
     def _classify_by_worker_overload(self, ratio: float) -> DatacenterOverloadState:
         config = self._config
-        if ratio >= config.worker_overload_unhealthy_threshold:
-            return DatacenterOverloadState.UNHEALTHY
-        if ratio >= config.worker_overload_degraded_threshold:
-            return DatacenterOverloadState.DEGRADED
-        if ratio >= config.worker_overload_busy_threshold:
-            return DatacenterOverloadState.BUSY
-        return DatacenterOverloadState.HEALTHY
+        return self._first_crossed_state(
+            ratio,
+            (
+                (config.worker_overload_unhealthy_threshold, DatacenterOverloadState.UNHEALTHY),
+                (config.worker_overload_degraded_threshold, DatacenterOverloadState.DEGRADED),
+                (config.worker_overload_busy_threshold, DatacenterOverloadState.BUSY),
+            ),
+        )
 
     def _classify_by_manager_health(self, ratio: float) -> DatacenterOverloadState:
         config = self._config
-        if ratio >= config.manager_unhealthy_unhealthy_threshold:
-            return DatacenterOverloadState.UNHEALTHY
-        if ratio >= config.manager_unhealthy_degraded_threshold:
-            return DatacenterOverloadState.DEGRADED
-        if ratio >= config.manager_unhealthy_busy_threshold:
-            return DatacenterOverloadState.BUSY
-        return DatacenterOverloadState.HEALTHY
+        return self._first_crossed_state(
+            ratio,
+            (
+                (config.manager_unhealthy_unhealthy_threshold, DatacenterOverloadState.UNHEALTHY),
+                (config.manager_unhealthy_degraded_threshold, DatacenterOverloadState.DEGRADED),
+                (config.manager_unhealthy_busy_threshold, DatacenterOverloadState.BUSY),
+            ),
+        )
 
     def _classify_by_manager_overload(
         self,
@@ -129,21 +114,35 @@ class DatacenterOverloadClassifier:
     ) -> DatacenterOverloadState:
         if leader_overloaded:
             return DatacenterOverloadState.DEGRADED
-        if ratio >= 0.5:
-            return DatacenterOverloadState.DEGRADED
-        if ratio >= 0.3:
-            return DatacenterOverloadState.BUSY
-        return DatacenterOverloadState.HEALTHY
+        return self._first_crossed_state(
+            ratio,
+            (
+                (0.5, DatacenterOverloadState.DEGRADED),
+                (0.3, DatacenterOverloadState.BUSY),
+            ),
+        )
 
     def _classify_by_capacity(self, utilization: float) -> DatacenterOverloadState:
         config = self._config
-        if utilization >= config.capacity_utilization_unhealthy_threshold:
-            return DatacenterOverloadState.UNHEALTHY
-        if utilization >= config.capacity_utilization_degraded_threshold:
-            return DatacenterOverloadState.DEGRADED
-        if utilization >= config.capacity_utilization_busy_threshold:
-            return DatacenterOverloadState.BUSY
-        return DatacenterOverloadState.HEALTHY
+        return self._first_crossed_state(
+            utilization,
+            (
+                (config.capacity_utilization_unhealthy_threshold, DatacenterOverloadState.UNHEALTHY),
+                (config.capacity_utilization_degraded_threshold, DatacenterOverloadState.DEGRADED),
+                (config.capacity_utilization_busy_threshold, DatacenterOverloadState.BUSY),
+            ),
+        )
+
+    @staticmethod
+    def _first_crossed_state(
+        value: float,
+        threshold_ladder: tuple[tuple[float, DatacenterOverloadState], ...],
+    ) -> DatacenterOverloadState:
+        """The state of the first (most severe) threshold ``value`` reaches, else HEALTHY."""
+        return next(
+            (state for threshold, state in threshold_ladder if value >= threshold),
+            DatacenterOverloadState.HEALTHY,
+        )
 
     def _get_worst_state(
         self,
@@ -176,3 +175,11 @@ class DatacenterOverloadClassifier:
         overload_adjustment = 1.0 + (worker_overload_ratio * 0.5)
 
         return base_weight * overload_adjustment
+
+_REHOMED = (
+    DatacenterOverloadSignals,
+    DatacenterOverloadResult,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -49,6 +49,10 @@ class Writer:
     def close(self):
         return self._transport.close()
 
+    def abort(self):
+        """Close the transport now, discarding anything still buffered."""
+        self._transport.abort()
+
     def is_closing(self):
         return self._transport.is_closing()
 
@@ -57,6 +61,10 @@ class Writer:
 
     def get_extra_info(self, name, default=None):
         return self._transport.get_extra_info(name, default)
+
+    def clear(self):
+        if self._protocol:
+            self._protocol.eof_received()
 
     async def drain(self):
         """Flush the write buffer.

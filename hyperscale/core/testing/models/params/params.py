@@ -1,5 +1,4 @@
 from typing import (
-    Any,
     Dict,
     Generator,
     Generic,
@@ -19,6 +18,7 @@ from hyperscale.core.testing.models.base.base_types import (
 from .params_validator import ParamsValidator
 
 T = TypeVar("T")
+DefaultT = TypeVar("DefaultT")
 
 
 class Params(OptimizedArg, Generic[T]):
@@ -52,7 +52,7 @@ class Params(OptimizedArg, Generic[T]):
     def __getitem__(self, key: str) -> HTTPEncodableValue:
         return self.data[key]
 
-    def __iter__(self) -> Generator[str, Any, None]:
+    def __iter__(self) -> Generator[str, None, None]:
         for key in self.data:
             yield key
 
@@ -68,6 +68,6 @@ class Params(OptimizedArg, Generic[T]):
     def get(
         self,
         key: str,
-        default: Optional[Any] = None,
-    ) -> Optional[HTTPEncodableValue]:
+        default: DefaultT | None = None,
+    ) -> HTTPEncodableValue | DefaultT:
         return self.data.get(key, default)

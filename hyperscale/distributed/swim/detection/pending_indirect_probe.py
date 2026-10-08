@@ -2,8 +2,12 @@
 Pending indirect probe tracking for SWIM protocol.
 """
 
-import time
 from dataclasses import dataclass, field
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 # Maximum proxies per probe - typically k=3, but allow some margin
 MAX_PROXIES = 10
@@ -67,7 +71,7 @@ class PendingIndirectProbe:
     
     def is_expired(self) -> bool:
         """Check if the probe request has timed out."""
-        return time.monotonic() - self.start_time > self.timeout
+        return _DEFAULT_CLOCK.monotonic() - self.start_time > self.timeout
     
     def is_completed(self) -> bool:
         """Check if we've received an ack (probe succeeded)."""

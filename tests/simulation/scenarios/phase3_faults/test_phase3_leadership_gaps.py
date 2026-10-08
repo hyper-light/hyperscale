@@ -12,9 +12,9 @@ import time
 
 import pytest
 
-from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
 from hyperscale.distributed.swim.leadership import LocalLeaderElection
 from hyperscale.distributed.swim.leadership.leader_state import MAX_TERM, LeaderState
+from hyperscale.distributed.testing.workflows import LongRunningWorkflow
 from tests.simulation.harness import (
     ClusterHarness,
     ClusterSpec,
@@ -23,19 +23,25 @@ from tests.simulation.harness import (
     ExecutionMode,
     HarnessTimeouts,
     ServerHandle,
+    Submission,
+    SubmissionPattern,
+    WorkloadSpec,
     dc_has_leader,
     wait_until,
 )
 
+# Long enough for the job to stay in flight through two leadership moves
+# and a death detection, and the bound on that takeover.
+_LONG_JOB_TIMEOUT_SECONDS = 120.0
 
-def _l2_spec(base_port: int) -> ClusterSpec:
+
+def _l2_spec() -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "main": DCSpec(managers=3, workers=0),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -101,7 +107,7 @@ def _followers_observe_stable_leader(managers: list[ServerHandle]) -> bool:
 @pytest.mark.simulation
 async def test_pre_vote_rejected_during_stable_lease() -> None:
     """Follower rejects a pre-vote while a healthy leader lease is active."""
-    spec = _l2_spec(base_port=31500)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -147,7 +153,7 @@ async def test_pre_vote_rejected_during_stable_lease() -> None:
 @pytest.mark.simulation
 async def test_flapping_detector_backs_off_after_election_failures() -> None:
     """Repeated election failures trip flapping detection and delay elections."""
-    spec = _l2_spec(base_port=33000)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -205,7 +211,7 @@ async def test_term_exhaustion_bails_cleanly() -> None:
 @pytest.mark.simulation
 async def test_swim_leader_and_raft_job_leader_can_diverge_safely() -> None:
     """Per-job Raft leadership may differ from the SWIM DC leader without split brain."""
-    spec = _l2_spec(base_port=34500)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -220,71 +226,112 @@ async def test_swim_leader_and_raft_job_leader_can_diverge_safely() -> None:
         )
 
         swim_leader = _find_leader(managers)
-        raft_job_leader = _find_follower(managers)
+        job_leader = _find_follower(managers)
         job_id = "synthetic-job"
-        tracker: JobLeadershipTracker[int] = (
-            raft_job_leader.instance._raft_leadership_tracker
-        )
-        token = await tracker.assume_leadership_async(
-            job_id,
-            metadata=1,
-            initial_token=7,
-        )
+        job_leader_id = _manager_node_id(job_leader)
+        fence_token = 7
 
-        for manager in managers:
-            manager_tracker: JobLeadershipTracker[int] = (
-                manager.instance._raft_leadership_tracker
-            )
-            if manager is raft_job_leader:
-                continue
-            accepted = await manager_tracker.process_leadership_claim_async(
+        # Job leadership is a fenced per-job claim (AD-10 fence tokens,
+        # applied through ManagerLeaseCoordinator), independent of which
+        # manager leads the SWIM tier.
+        claim_results = [
+            manager.instance._leases.apply_job_leadership(
                 job_id=job_id,
-                claimer_id=tracker.node_id,
-                claimer_addr=tracker.node_addr,
-                fencing_token=token,
-                metadata=1,
-            )
-            assert accepted is True
-
-        stale_claim_results = [
-            await manager.instance._raft_leadership_tracker.process_leadership_claim_async(
-                job_id=job_id,
-                claimer_id=swim_leader.node_id,
-                claimer_addr=(swim_leader.host, swim_leader.tcp_port),
-                fencing_token=token - 1,
-                metadata=1,
+                leader_id=job_leader_id,
+                leader_addr=_manager_tcp_addr(job_leader),
+                fencing_token=fence_token,
             )
             for manager in managers
         ]
 
-        leaderships = tracker.get_all_leaderships()
-        assert raft_job_leader.instance.is_leader() is False
-        assert swim_leader.node_id != raft_job_leader.node_id
+        stale_claim_results = [
+            manager.instance._leases.apply_job_leadership(
+                job_id=job_id,
+                leader_id=_manager_node_id(swim_leader),
+                leader_addr=_manager_tcp_addr(swim_leader),
+                fencing_token=fence_token - 1,
+            )
+            for manager in managers
+        ]
+
+        assert claim_results == [True, True, True]
+        assert job_leader.instance.is_leader() is False
+        assert swim_leader.node_id != job_leader.node_id
         assert stale_claim_results == [False, False, False]
-        assert len(leaderships) == 1
-        assert leaderships[0][0] == job_id
-        assert leaderships[0][1] == tracker.node_id
-        assert leaderships[0][3] == token
 
         local_job_leaders = [
             manager
             for manager in managers
-            if manager.instance._raft_leadership_tracker.is_leader(job_id)
+            if manager.instance._leases.is_job_leader(job_id)
         ]
-        assert local_job_leaders == [raft_job_leader]
+        assert local_job_leaders == [job_leader]
         assert {
-            manager.instance._raft_leadership_tracker.get_leader(job_id)
+            manager.instance._leases.get_job_leader(job_id)
             for manager in managers
-        } == {tracker.node_id}
+        } == {job_leader_id}
         assert {
-            manager.instance._raft_leadership_tracker.get_fencing_token(job_id)
+            manager.instance._leases.get_fence_token(job_id)
             for manager in managers
-        } == {token}
+        } == {fence_token}
 
         heartbeat_time = swim_leader.instance._leader_election.state.leader_lease_start
         assert heartbeat_time <= time.monotonic()
         assert swim_leader.instance._leader_election.state.is_lease_valid()
         assert dc_has_leader(managers)() is True
+
+
+def _l2_workload_spec() -> ClusterSpec:
+    return ClusterSpec(
+        gates=0,
+        datacenters={
+            "main": DCSpec(managers=3, workers=1, cores_per_worker=2),
+        },
+        env=EnvOverrides(request_timeout="5s", log_level="error"),
+        timeouts=HarnessTimeouts(stabilization_default=60.0),
+    )
+
+
+def _long_running_workload() -> WorkloadSpec:
+    """One LongRunningWorkflow: the job is admitted and stays in flight
+    across the leadership moves and the job leader's death."""
+    return WorkloadSpec(
+        submissions=[
+            Submission(
+                workflows=[([], LongRunningWorkflow)],
+                dc_count=1,
+                timeout_seconds=_LONG_JOB_TIMEOUT_SECONDS,
+                vus=1,
+            ),
+        ],
+        pattern=SubmissionPattern.SINGLE,
+        expectations=[],
+    )
+
+
+def _job_leaders(managers: list[ServerHandle], job_id: str) -> list[ServerHandle]:
+    return [manager for manager in managers if manager.instance._leases.is_job_leader(job_id)]
+
+
+async def _move_swim_leadership_off(
+    managers: list[ServerHandle],
+    keeper: ServerHandle,
+) -> ServerHandle:
+    """Step ``keeper`` down until another manager wins the SWIM election;
+    the new SWIM leader. Each step-down is one election, so the cohort
+    size bounds the rounds."""
+    for _ in managers:
+        if not keeper.instance.is_leader():
+            break
+        await keeper.instance._leader_election._step_down()
+        await wait_until(
+            dc_has_leader(managers),
+            timeout=60.0,
+            poll=0.5,
+            description="a SWIM leader after the step-down",
+        )
+    swim_leader = _find_leader(managers)
+    assert swim_leader is not keeper
+    return swim_leader
 
 
 @pytest.mark.asyncio
@@ -295,8 +342,14 @@ async def test_dead_job_leader_failover_uses_swim_leader() -> None:
     Steady-state job leadership may diverge from SWIM leadership, but death
     recovery is intentionally centralized through the SWIM cluster leader so a
     busy manager tier does not split-brain job ownership under failover load.
+
+    The job is admitted for real -- a job known only as a lease entry was
+    never admitted, and the takeover settles it rather than claiming it
+    (``ManagerServer._job_still_needs_takeover``). Its leader is then made
+    a SWIM follower, the third manager the job's per-job Raft group leader,
+    and the job leader dies.
     """
-    spec = _l2_spec(base_port=34700)
+    spec = _l2_workload_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -310,67 +363,55 @@ async def test_dead_job_leader_failover_uses_swim_leader() -> None:
             description="initial SWIM leader elected",
         )
 
-        swim_leader = _find_leader(managers)
-        followers = _find_followers(managers)
-        failed_job_leader = followers[0]
-        raft_job_leader = followers[-1]
-        job_id = "synthetic-dead-job-leader"
-        failed_job_leader_id = _manager_node_id(failed_job_leader)
-        failed_job_leader_addr = _manager_tcp_addr(failed_job_leader)
-        swim_leader_id = _manager_node_id(swim_leader)
-        swim_leader_addr = _manager_tcp_addr(swim_leader)
-        original_fence_token = 7
-
-        for manager in managers:
-            manager.instance._leases.apply_job_leadership(
-                job_id=job_id,
-                leader_id=failed_job_leader_id,
-                leader_addr=failed_job_leader_addr,
-                fencing_token=original_fence_token,
+        async with cluster.workload(_long_running_workload()) as driver:
+            await driver.submit()
+            await driver.wait_until_running(timeout=30.0)
+            job_id = driver.observations.submitted_job_ids[-1]
+            await wait_until(
+                lambda: len(_job_leaders(managers, job_id)) == 1,
+                timeout=10.0,
+                poll=0.2,
+                description="the admitted job has one leader",
             )
-            manager.instance._manager_state.add_dead_manager(
-                failed_job_leader_addr,
-                time.monotonic(),
+            [failed_job_leader] = _job_leaders(managers, job_id)
+            original_fence_token = failed_job_leader.instance._leases.get_fence_token(job_id)
+
+            swim_leader = await _move_swim_leadership_off(managers, failed_job_leader)
+            [raft_job_leader] = [
+                manager
+                for manager in managers
+                if manager is not swim_leader and manager is not failed_job_leader
+            ]
+            swim_leader_id = _manager_node_id(swim_leader)
+
+            # The third manager leads the job's per-job Raft group: that is
+            # no failover authority (AD-52 job groups), so neither the
+            # callback nor the deprecated hook takes the job over.
+            raft_job_leader.instance._on_job_raft_leader(job_id)
+            await raft_job_leader.instance._check_raft_leader_takeover(job_id)
+
+            await cluster.faults.kill(failed_job_leader)
+            survivors = [swim_leader, raft_job_leader]
+
+            await wait_until(
+                lambda: _all_managers_observe_job_leader(
+                    survivors,
+                    job_id,
+                    swim_leader_id,
+                ),
+                timeout=_LONG_JOB_TIMEOUT_SECONDS,
+                poll=0.2,
+                description="all survivors observe SWIM-leader job takeover",
+                on_fail=lambda: cluster.dump_diagnostics(
+                    reason="dead job leader did not transfer to SWIM leader"
+                ),
             )
 
-        raft_token = await raft_job_leader.instance._raft_leadership_tracker.assume_leadership_async(
-            job_id,
-            metadata=1,
-            initial_token=original_fence_token + 10,
-        )
-        assert raft_token > original_fence_token
-
-        await raft_job_leader.instance._check_raft_leader_takeover(job_id)
-        await raft_job_leader.instance._handle_job_leader_failure(
-            failed_job_leader_addr
-        )
-
-        assert _all_managers_observe_job_leader(
-            managers,
-            job_id,
-            failed_job_leader_id,
-        )
-
-        await swim_leader.instance._handle_job_leader_failure(failed_job_leader_addr)
-
-        await wait_until(
-            lambda: _all_managers_observe_job_leader(
-                managers,
-                job_id,
-                swim_leader_id,
-            ),
-            timeout=10.0,
-            poll=0.2,
-            description="all managers observe SWIM-leader job takeover",
-            on_fail=lambda: cluster.dump_diagnostics(
-                reason="dead job leader did not transfer to SWIM leader"
-            ),
-        )
-
-        assert swim_leader.instance._manager_state.get_job_leader_addr(
-            job_id
-        ) == swim_leader_addr
-        assert (
-            swim_leader.instance._leases.get_fence_token(job_id)
-            > original_fence_token
-        )
+            assert swim_leader.instance._manager_state.get_job_leader_addr(
+                job_id
+            ) == _manager_tcp_addr(swim_leader)
+            assert (
+                swim_leader.instance._leases.get_fence_token(job_id)
+                > original_fence_token
+            )
+            assert not raft_job_leader.instance._leases.is_job_leader(job_id)

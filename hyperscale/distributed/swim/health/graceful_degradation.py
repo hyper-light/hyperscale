@@ -6,61 +6,26 @@ When a node is overloaded (high LHM, event loop lag, etc.), it should:
 2. Step down from leadership
 3. Extend timeouts to avoid false positives
 4. Shed load progressively
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Any
-
+from typing import Callable
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+from hyperscale.distributed.runtime import Clock, RealClock
 
+from .degradation_level import DegradationLevel
+from .degradation_policy import DegradationPolicy
+from .graceful_degradation_stats import GracefulDegradationStats
 
-from ..core.protocols import LoggerProtocol
-
-
-class DegradationLevel(Enum):
-    """Levels of graceful degradation."""
-    NORMAL = 0       # Normal operation
-    LIGHT = 1        # Minor load shedding
-    MODERATE = 2     # Significant load shedding
-    HEAVY = 3        # Major load shedding
-    CRITICAL = 4     # Emergency mode - minimal operation
-
-
-@dataclass(slots=True)
-class DegradationPolicy:
-    """
-    Policy for graceful degradation behavior at each level.
-    
-    Higher degradation levels progressively shed more load while
-    maintaining core functionality (responding to probes, gossip).
-    """
-    
-    # Probe rate multiplier (1.0 = normal, 0.5 = half rate)
-    probe_rate: float = 1.0
-    
-    # Gossip rate multiplier
-    gossip_rate: float = 1.0
-    
-    # Max piggyback updates per message
-    max_piggyback_updates: int = 5
-    
-    # Timeout multiplier (extends all timeouts)
-    timeout_multiplier: float = 1.0
-    
-    # Should step down from leadership
-    should_step_down: bool = False
-    
-    # Should refuse leadership candidacy
-    refuse_leadership: bool = False
-    
-    # Skip indirect probing when overloaded
-    skip_indirect_probing: bool = False
-    
-    # Description for logging
-    description: str = ""
-
+_DEFAULT_CLOCK: Clock = RealClock()
 
 # Pre-defined policies for each degradation level
 DEGRADATION_POLICIES: dict[DegradationLevel, DegradationPolicy] = {
@@ -157,7 +122,7 @@ class GracefulDegradation:
     
     # Current state
     _current_level: DegradationLevel = DegradationLevel.NORMAL
-    _level_entered_at: float = field(default_factory=time.monotonic)
+    _level_entered_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     _min_level_duration: float = 5.0  # Min seconds at a level before changing
     
     # Callbacks
@@ -176,6 +141,8 @@ class GracefulDegradation:
     
     # Logger for structured logging (optional)
     _logger: LoggerProtocol | None = None
+    # Log records lost because the logger's write itself failed.
+    _log_write_failures: int = 0
     _node_host: str = ""
     _node_port: int = 0
     _node_id: int = 0
@@ -204,10 +171,12 @@ class GracefulDegradation:
                     node_id=self._node_id,
                 ))
             except Exception:
-                pass  # Don't let logging errors propagate
+                # The logger itself failed: nowhere left to report it but
+                # these stats.
+                self._log_write_failures += 1
     
     def __post_init__(self):
-        self._level_entered_at = time.monotonic()
+        self._level_entered_at = _DEFAULT_CLOCK.monotonic()
     
     def set_health_callbacks(
         self,
@@ -230,7 +199,7 @@ class GracefulDegradation:
         new_level = self._calculate_level()
         
         # Check if we can change level (hysteresis)
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         time_at_level = now - self._level_entered_at
         
         if new_level != self._current_level and time_at_level >= self._min_level_duration:
@@ -239,17 +208,26 @@ class GracefulDegradation:
             self._level_entered_at = now
             self._level_changes += 1
             
-            if self._on_level_change:
-                try:
-                    self._on_level_change(old_level, new_level)
-                except Exception as e:
-                    await self._log_debug(
-                        f"Level change callback error "
-                        f"({old_level.name} -> {new_level.name}): "
-                        f"{type(e).__name__}: {e}"
-                    )
+            await self._notify_level_change(old_level, new_level, "Level change")
         
         return self._current_level
+
+    async def _notify_level_change(
+        self,
+        old_level: DegradationLevel,
+        new_level: DegradationLevel,
+        callback_label: str,
+    ) -> None:
+        """Invoke on_level_change, logging (labelled by ``callback_label``) a callback failure."""
+        if self._on_level_change:
+            try:
+                self._on_level_change(old_level, new_level)
+            except Exception as e:
+                await self._log_debug(
+                    f"{callback_label} callback error "
+                    f"({old_level.name} -> {new_level.name}): "
+                    f"{type(e).__name__}: {e}"
+                )
     
     def _calculate_level(self) -> DegradationLevel:
         """Calculate what degradation level we should be at."""
@@ -385,16 +363,8 @@ class GracefulDegradation:
         if level != self._current_level:
             old_level = self._current_level
             self._current_level = level
-            self._level_entered_at = time.monotonic()
-            if self._on_level_change:
-                try:
-                    self._on_level_change(old_level, level)
-                except Exception as e:
-                    await self._log_debug(
-                        f"Force level callback error "
-                        f"({old_level.name} -> {level.name}): "
-                        f"{type(e).__name__}: {e}"
-                    )
+            self._level_entered_at = _DEFAULT_CLOCK.monotonic()
+            await self._notify_level_change(old_level, level, "Force level")
     
     async def reset(self) -> None:
         """Reset to normal operation."""
@@ -402,7 +372,7 @@ class GracefulDegradation:
         self._probe_skip_counter = 0
         self._gossip_skip_counter = 0
     
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> GracefulDegradationStats:
         """Get degradation statistics."""
         policy = self.get_current_policy()
         return {
@@ -415,6 +385,14 @@ class GracefulDegradation:
             'level_changes': self._level_changes,
             'probes_skipped': self._probes_skipped,
             'gossips_skipped': self._gossips_skipped,
-            'time_at_level': time.monotonic() - self._level_entered_at,
+            'log_write_failures': self._log_write_failures,
+            'time_at_level': _DEFAULT_CLOCK.monotonic() - self._level_entered_at,
         }
 
+_REHOMED = (
+    DegradationLevel,
+    DegradationPolicy,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

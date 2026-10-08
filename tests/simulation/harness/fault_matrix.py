@@ -271,6 +271,7 @@ class FaultMatrix:
         from tests.simulation.harness import fault_transport
 
         fault_transport.reinstall_for(handle, self.harness)
+        self.harness.reclaim_signals()
 
     async def kill_many(self, handles: list[ServerHandle]) -> None:
         """Abruptly kill every handle concurrently."""
@@ -1235,6 +1236,27 @@ class FaultMatrix:
 
     def paused_nodes(self) -> list[str]:
         return sorted(self._paused)
+
+    def has_active_disruption(self) -> bool:
+        """Whether a fault that legitimately splits the cluster's views is
+        in force: a paused node, a suspended worker subprocess, or any
+        network rule (partition, delay, drop, bandwidth cap, reorder,
+        duplication, TCP reset). A kill is not a disruption: the killed
+        node is gone, and the survivors owe a converged view of that."""
+        self._prune_expired_network_rules()
+        return any(
+            (
+                self._paused,
+                self._suspended_processes,
+                self._partitions,
+                self._delays,
+                self._drops,
+                self._bandwidth_caps,
+                self._reorders,
+                self._duplicates,
+                self._tcp_resets,
+            )
+        )
 
     def partition_count(self) -> int:
         return len(self._partitions)

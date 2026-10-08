@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import io
 import math
@@ -9,12 +10,15 @@ import shutil
 import signal
 import sys
 import time
+from collections.abc import AsyncIterator
+from types import FrameType
 from typing import (
-    Any,
     Awaitable,
     Callable,
+    Coroutine,
     Dict,
     List,
+    Never,
     TypeVar,
 )
 
@@ -35,12 +39,42 @@ from .section import Section
 from .terminal_protocol import TerminalProtocol, patch_transport_close
 from .writer import Writer
 
-SignalHandlers = Callable[[int], Any] | int | None
+# What ``signal.getsignal`` returns: a handler (its result is ignored),
+# SIG_DFL/SIG_IGN, or None for a handler not installed from Python.
+SignalHandlers = Callable[[int, FrameType | None], object] | int | None
 Notification = Callable[[], Awaitable[None]]
 
 
 K = TypeVar("K")
 T = TypeVar("T", bound=ActionData)
+
+# The share of the terminal's columns a canvas spans (its lines are that
+# wide plus the horizontal padding on each side, so no line reaches the
+# terminal's last column).
+TERMINAL_WIDTH_SHARE = 0.75
+# The terminal's last column, which no line of a frame reaches.
+LAST_COLUMN = 1
+
+
+def canvas_size(
+    columns: int,
+    lines: int,
+    horizontal_padding: int,
+    vertical_padding: int,
+    width_share: float = TERMINAL_WIDTH_SHARE,
+) -> tuple[int, int]:
+    """The canvas a terminal of ``columns`` x ``lines`` holds: its
+    ``width_share`` of the columns less the horizontal padding -- never so
+    wide that a line (the canvas and the padding on each side) reaches the
+    terminal's last column, where a terminal wraps the cursor -- rounded
+    down to a multiple of three (the sections' thirds), and every line but
+    the vertical padding above and below it -- so a frame fills the
+    terminal's rows exactly and never passes its bottom."""
+    width = min(
+        math.floor(columns * width_share) - horizontal_padding,
+        columns - 2 * horizontal_padding - LAST_COLUMN,
+    )
+    return max(width - width % 3, 1), max(lines - 2 * vertical_padding, 1)
 
 
 async def handle_resize(engine: Terminal):
@@ -50,35 +84,17 @@ async def handle_resize(engine: Terminal):
 
         terminal_size = await loop.run_in_executor(None, shutil.get_terminal_size)
 
-        width = int(math.floor(terminal_size.columns * 0.75))
-
-        height = terminal_size.lines - 5
-
-        width_threshold = 0
-        height_threshold = 0
-
-        width_difference = abs(width - engine.canvas.total_width)
-        height_difference = abs(height - engine.canvas.total_height)
-
-        width = max(width - (width % 3), 1)
-
-        if width_difference > width_threshold and height_difference > height_threshold:
-            await engine.resize(
-                width=width,
-                height=height,
-            )
-
-        elif width_difference > width_threshold:
-            await engine.resize(
-                width=width,
-                height=engine.canvas.height,
-            )
-
-        elif height_difference > height_threshold:
-            await engine.resize(
-                width=engine.canvas.width,
-                height=height,
-            )
+        # Every section is laid out again for the terminal's new size; the
+        # render loop's restart clears the screen and redraws.
+        width, height = canvas_size(
+            terminal_size.columns,
+            terminal_size.lines,
+            engine._horizontal_padding,
+            engine._vertical_padding,
+            engine.width_share,
+        )
+        if (width, height) != (engine.canvas.width, engine.canvas.height):
+            await engine.resize(width=width, height=height)
 
         if len(engine._updates.triggers) > 0:
             await asyncio.gather(
@@ -95,7 +111,9 @@ async def handle_resize(engine: Terminal):
 
 
 class Terminal:
-    _actions: List[tuple[Action[Any, ActionData], str | None]] = []
+    # Every wrapped action, whatever its argument (``Never``: a one-argument
+    # callable of any parameter type is an ``Action[Never, ...]``).
+    _actions: List[tuple[Action[Never, ActionData], str | None]] = []
     _updates = SubscriptionSet()
     _render_event: asyncio.Event | None = None
 
@@ -103,9 +121,12 @@ class Terminal:
         self,
         sections: List[Section],
         config: EngineConfig | None = None,
-        sigmap: Dict[signal.Signals, asyncio.Coroutine] = None,
+        sigmap: Dict[signal.Signals, Coroutine[None, None, None]] | None = None,
+        width_share: float = TERMINAL_WIDTH_SHARE,
     ) -> None:
         self.config = config
+        # The share of the terminal's columns the canvas spans (canvas_size).
+        self.width_share = width_share
         self.canvas = Canvas(sections)
 
         refresh_rate = RefreshRate.MEDIUM.value
@@ -137,9 +158,32 @@ class Terminal:
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
 
-        # Pre-encoded ANSI sequences for efficiency
-        self._frame_prefix = b"\033[3J\033[H"
-        self._frame_suffix = b"\n"
+        # Tasks the SIGWINCH and SIGINT handlers start, held until they end:
+        # the loop keeps only a weak reference to a task.
+        self._resize_tasks: set[asyncio.Task[None]] = set()
+        self._keyboard_interrupt_task: asyncio.Task[None] | None = None
+
+        # Each frame reaches the terminal in one write, drawn over the last
+        # one in place: the cursor goes home and every line (padded to the
+        # frame's width by its sections) overwrites the line under it --
+        # never cleared first, which shows a blank screen between frames,
+        # and never cleared of scrollback (a full repaint on some
+        # terminals): the screen is cleared once, when the render loop
+        # starts, and again after a resize. A frame fills the terminal's
+        # rows (canvas_size) and ends on its last row with a carriage
+        # return, never a newline: a newline there scrolls the screen up a
+        # line, and every frame would step the header down. The frame is
+        # wrapped in a synchronized update (DEC private mode 2026:
+        # "Synchronized Output", contour-terminal's specification adopted
+        # from the terminal-wg proposal,
+        # https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e399004036):
+        # a terminal that supports it shows the frame only once all of it
+        # has arrived; one that does not ignores the unknown mode.
+        self._frame_prefix = b"\033[?2026h\033[H"
+        self._frame_suffix = b"\033[?2026l"
+        # The last frame, drawn as the terminal stops, leaves the cursor on
+        # the line below it for whatever the shell writes next.
+        self._final_frame_suffix = b"\033[?2026l\n"
 
         components: dict[str, tuple[list[str], Action[ActionData, ActionData]]] = {}
 
@@ -169,6 +213,11 @@ class Terminal:
             for subscription in subscriptions:
                 self._updates.add_topic(subscription, [update])
 
+    @property
+    def refresh_interval(self) -> float:
+        """Seconds between the terminal's refreshes, from its refresh rate."""
+        return self._interval
+
     @classmethod
     def trigger_render(cls):
         """Signal the render loop to wake up and re-render immediately."""
@@ -188,6 +237,31 @@ class Terminal:
             default_channel=default_channel,
             on_update=cls.trigger_render,
         )
+
+    @classmethod
+    def subscribe(cls, channel: str, update: Callable[[ActionData], Awaitable[None]]) -> None:
+        """Receive every update a wrapped action publishes on ``channel``,
+        as a component does, without rendering: a reader of the actions
+        other than a terminal (the CI-safe summary of a run)."""
+        cls._updates.add_topic(channel, [update])
+
+    @classmethod
+    def unsubscribe(cls, updates: list[Callable[[ActionData], Awaitable[None]]]) -> None:
+        """Stop ``updates`` receiving any channel's updates, and release
+        them."""
+        cls._updates.remove_updates(updates)
+
+    @contextlib.asynccontextmanager
+    async def updating(self) -> AsyncIterator[None]:
+        """Hold the next frame while a batch of updates is published, so
+        no frame shows part of the batch: the render loop draws once the
+        batch is whole."""
+        await self._stdout_lock.acquire()
+        try:
+            yield
+
+        finally:
+            self._stdout_lock.release()
 
     async def set_component_active(self, component_name: str):
         if self._stdout_lock is None:
@@ -259,6 +333,11 @@ class Terminal:
             )
 
             self._run_engine = asyncio.ensure_future(self._run())
+            # Return once the terminal has hidden the cursor, claimed its
+            # signals and started its render loop: a caller that routes
+            # SIGINT itself (ShutdownSignals) must claim it after this, not
+            # race the terminal's own registration.
+            await self._run_engine
 
     async def _dup_stdout(self):
         stdout_fileno = await self._loop.run_in_executor(None, sys.stdout.fileno)
@@ -319,15 +398,20 @@ class Terminal:
             width = self.config.width - self._horizontal_padding
             height = self.config.height - self._vertical_padding
 
+        terminal_width, terminal_height = canvas_size(
+            terminal_size.columns,
+            terminal_size.lines,
+            self._horizontal_padding,
+            self._vertical_padding,
+            self.width_share,
+        )
         if width is None:
-            width = (
-                int(math.floor(terminal_size.columns * 0.75)) - self._horizontal_padding
-            )
+            width = terminal_width
 
         width = max(width - (width % 3), 1)
 
         if height is None:
-            height = terminal_size.lines - 5 - self._vertical_padding
+            height = terminal_height
 
         self._stop_run = asyncio.Event()
         self._hide_run = asyncio.Event()
@@ -370,9 +454,7 @@ class Terminal:
 
             frame = await self.canvas.render()
 
-            self._writer.write(self._frame_prefix)
-            self._writer.write(frame.encode())
-            self._writer.write(self._frame_suffix)
+            self._writer.write(self._frame_prefix + frame.encode() + self._frame_suffix)
             await self._writer.drain()
 
         except Exception:
@@ -399,9 +481,7 @@ class Terminal:
 
                 frame = await self.canvas.render()
 
-                self._writer.write(self._frame_prefix)
-                self._writer.write(frame.encode())
-                self._writer.write(self._frame_suffix)
+                self._writer.write(self._frame_prefix + frame.encode() + self._frame_suffix)
                 await self._writer.drain()
 
             except Exception:
@@ -436,7 +516,7 @@ class Terminal:
         force: bool = False,
     ):
         if force:
-            self._writer.write(b"\033[2J\033H")
+            self._writer.write(b"\033[2J\033[H")
 
         else:
             self._writer.write(b"\033[3J\033[H")
@@ -491,6 +571,7 @@ class Terminal:
         if self._dfl_sigmap:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
+            await self._cancel_resize_tasks()
 
         self._stop_run.set()
 
@@ -510,9 +591,7 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        self._writer.write(self._frame_prefix)
-        self._writer.write(frame.encode())
-        self._writer.write(self._frame_suffix)
+        self._writer.write(self._frame_prefix + frame.encode() + self._final_frame_suffix)
         await self._writer.drain()
 
         try:
@@ -533,6 +612,7 @@ class Terminal:
         if self._dfl_sigmap:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
+            await self._cancel_resize_tasks()
 
         self._stop_run.set()
 
@@ -557,9 +637,7 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        self._writer.write(self._frame_prefix)
-        self._writer.write(frame.encode())
-        self._writer.write(self._frame_suffix)
+        self._writer.write(self._frame_prefix + frame.encode() + self._final_frame_suffix)
         await self._writer.drain()
 
         try:
@@ -577,21 +655,56 @@ class Terminal:
         await self._show_cursor()
 
     def _reset_signal_handlers(self):
+        # A resize after the terminal stopped must not restart its render
+        # loop (handle_resize resumes it).
+        self._loop.remove_signal_handler(signal.SIGWINCH)
+
         for sig, sig_handler in self._dfl_sigmap.items():
             if sig and sig_handler:
                 signal.signal(sig, sig_handler)
 
-    def _register_signal_handlers(self):
-        self._loop.add_signal_handler(
-            signal.SIGWINCH, lambda: asyncio.create_task(handle_resize(self))
+    async def close(self):
+        """Release what the terminal holds past stop() or abort(): its
+        components' subscriptions to the actions, and its duplicate of
+        stdout. Call it once the terminal will render no more."""
+        self._updates.remove_updates(
+            [component.update for section in self.canvas.sections for component in section.components.values()]
         )
+
+        # Closed only once the transport has flushed what the terminal
+        # wrote: its process may exit right after.
+        self._writer.close()
+        await self._writer.wait_closed()
+
+    def _register_signal_handlers(self):
+        self._loop.add_signal_handler(signal.SIGWINCH, self._on_resize_signal)
 
         # Store the original SIGINT handler so we can restore and re-raise
         self._dfl_sigmap[signal.SIGINT] = signal.getsignal(signal.SIGINT)
 
-        self._loop.add_signal_handler(
-            signal.SIGINT, lambda: asyncio.create_task(self._handle_keyboard_interrupt())
-        )
+        self._loop.add_signal_handler(signal.SIGINT, self._on_keyboard_interrupt_signal)
+
+    def _on_resize_signal(self) -> None:
+        """SIGWINCH: resize in a task the terminal holds until it ends, so
+        stop() and abort() can cancel it before it resumes the render loop."""
+        resize_task = self._loop.create_task(handle_resize(self))
+        self._resize_tasks.add(resize_task)
+        resize_task.add_done_callback(self._resize_tasks.discard)
+
+    def _on_keyboard_interrupt_signal(self) -> None:
+        """SIGINT: abort the terminal in a task it holds. A repeat while
+        that abort runs is ignored so it cannot interrupt the abort midway
+        (as ShutdownSignals does); the abort re-sends SIGINT when done."""
+        if self._keyboard_interrupt_task is None or self._keyboard_interrupt_task.done():
+            self._keyboard_interrupt_task = self._loop.create_task(self._handle_keyboard_interrupt())
+
+    async def _cancel_resize_tasks(self) -> None:
+        """Cancel and wait out the resizes still running: a resize resumes
+        the render loop, which stop() and abort() end."""
+        for resize_task in self._resize_tasks:
+            resize_task.cancel()
+
+        await asyncio.gather(*self._resize_tasks, return_exceptions=True)
 
     async def _handle_keyboard_interrupt(self):
         """Handle keyboard interrupt by aborting the terminal and re-sending SIGINT."""

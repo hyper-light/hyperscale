@@ -1,0 +1,96 @@
+# A gateless Hyperscale cluster for development testing: one manager, one
+# worker, a local HTTP target, and a one-shot client that runs a short
+# test through the manager.
+#
+#   cd docker/cluster
+#   python -c "import secrets; print('HYPERSCALE_CLUSTER_SECRET=' + secrets.token_urlsafe(48))" > .env
+#   docker compose up --build -d manager worker target
+#   docker compose run --rm client
+#   docker compose logs -f manager worker
+#   docker compose down -v
+#
+# The services run without a TTY, as they would in CI, so the node
+# dashboards write their CI-safe line output into `docker compose logs`.
+# .env holds the cluster secret and is not committed.
+
+name: hyperscale-dev-cluster
+
+x-hyperscale: &hyperscale
+  build:
+    context: ../..
+    dockerfile: docker/images/Dockerfile.source
+  image: hyperscale:dev
+  environment:
+    MERCURY_SYNC_AUTH_SECRET: ${HYPERSCALE_CLUSTER_SECRET:?generate docker/cluster/.env first}
+  volumes:
+    - ./hyperscale.json:/etc/hyperscale/hyperscale.json:ro
+
+services:
+  target:
+    image: nginx:1.29-alpine
+
+  manager:
+    <<: *hyperscale
+    hostname: manager
+    command:
+      - run
+      - manager
+      - --host
+      - manager
+      - --tcp-port
+      - "8231"
+      - --udp-port
+      - "8241"
+      - --data-directory
+      - /var/lib/hyperscale/data
+      - --config
+      - /etc/hyperscale/hyperscale.json
+    volumes:
+      - ./hyperscale.json:/etc/hyperscale/hyperscale.json:ro
+      - manager-state:/var/lib/hyperscale
+
+  worker:
+    <<: *hyperscale
+    hostname: worker
+    depends_on: [manager]
+    command:
+      - run
+      - worker
+      - --host
+      - worker
+      - --tcp-port
+      - "8331"
+      - --udp-port
+      - "8341"
+      - --managers
+      - manager:8231
+      - --workers
+      - "2"
+      - --config
+      - /etc/hyperscale/hyperscale.json
+    volumes:
+      - ./hyperscale.json:/etc/hyperscale/hyperscale.json:ro
+      - worker-state:/var/lib/hyperscale
+
+  client:
+    <<: *hyperscale
+    hostname: client
+    profiles: [run]
+    depends_on: [manager, worker, target]
+    command:
+      - run
+      - workflow
+      - /work/cluster_test.py
+      - --managers
+      - manager:8231
+      - --host
+      - client
+      - --config
+      - /etc/hyperscale/hyperscale.json
+    volumes:
+      - ./hyperscale.json:/etc/hyperscale/hyperscale.json:ro
+      - ./cluster_test.py:/work/cluster_test.py:ro
+
+volumes:
+  manager-state:
+  worker-state:

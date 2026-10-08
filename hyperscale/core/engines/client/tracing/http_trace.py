@@ -129,13 +129,11 @@ class HTTPTrace:
         self,
         span: Span,
         connection_url: str,
-        ssl_upgrade_url: str | None = None,
     ):
         span.add_event(
             'http.connection_create_start',
             attributes={
                 'http.connection_url': connection_url,
-                'http.ssl_upgrade_url': ssl_upgrade_url,
                 'http.ssl_version': self.ssl_version,
             },
             timestamp=int(time.monotonic())
@@ -393,7 +391,6 @@ class HTTPTrace:
         redirect_url: str,
         redirects_taken: int,
         max_redirects: int,
-        is_ssl_upgrade: bool = False
     ):
         span.add_event(
             'http.request_redirect',
@@ -401,7 +398,6 @@ class HTTPTrace:
                 'http.redirect_url': redirect_url,
                 'http.redirects_taken': redirects_taken,
                 'http.max_redirects': max_redirects,
-                'http.is_ssl_upgrade': is_ssl_upgrade,
             },
             timestamp=int(time.monotonic())
         )

@@ -37,7 +37,6 @@ def _l2_spec() -> ClusterSpec:
             "main": DCSpec(managers=3, workers=2, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=19200,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -45,24 +44,32 @@ def _l2_spec() -> ClusterSpec:
 @pytest.mark.asyncio
 @pytest.mark.simulation
 async def test_l2_framework_structure() -> None:
-    """A 3-manager, 2-worker spec spends ports in a contiguous range.
+    """A 3-manager, 2-worker spec reserves unique harness ports.
 
-    3 manager TCP/UDP pairs (6) + 2 worker (TCP/UDP/derived) triples (6)
-    validates the PortAllocator under realistic L2 load without
-    actually starting any servers.
+    Manager TCP/UDP pairs and worker-derived port envelopes validate
+    the PortAllocator under realistic L2 load without actually starting
+    any servers.
     """
     spec = _l2_spec()
     assert spec.total_node_count() == 5
 
-    ports = PortAllocator(host=spec.host, base_port=spec.base_port)
-    pairs = [ports.reserve_pair() for _ in range(3)]
-    triples = [ports.reserve_range(3) for _ in range(2)]
+    ports = PortAllocator(host=spec.host)
+    try:
+        for dc_spec in spec.datacenters.values():
+            for _ in range(dc_spec.managers):
+                ports.reserve_pair()
+            for _ in range(dc_spec.workers):
+                ports.reserve_worker_block(
+                    cores=dc_spec.cores_per_worker,
+                    block_size=dc_spec.worker_port_block_size,
+                )
 
-    flat = [p for pair in pairs for p in pair] + [
-        p for triple in triples for p in triple
-    ]
-    assert len(set(flat)) == len(flat), "all reserved ports must be unique"
-    assert min(flat) >= spec.base_port
+        reserved_ports = ports.reserved_ports()
+        assert len(set(reserved_ports)) == len(reserved_ports), (
+            "all reserved ports must be unique"
+        )
+    finally:
+        ports.release_all()
 
 
 @pytest.mark.asyncio

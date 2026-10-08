@@ -1,6 +1,7 @@
 import asyncio
 from pydantic import BaseModel, StrictStr
-from typing import Dict, Any, Literal
+from typing import Dict, Literal
+from .json_value import JSONValue
 from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.engines.client.graphql import MercurySyncGraphQLConnection
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
@@ -16,20 +17,22 @@ from .terminal_ui import (
     create_ping_ui,
     map_status_to_error,
 )
+from .ping_result_output import PingResultOutput
+from .ping_result_serializer import PingResultSerializer
 
 
 
 class GraphQLQuery(BaseModel):
     query: StrictStr
     operation_name: StrictStr | None = None
-    variables: Dict[StrictStr, Any] | None = None
+    variables: Dict[StrictStr, JSONValue] | None = None
 
 
 async def make_graphql_request(
     url: str,
     cookies: list[HTTPCookie],
     params: dict[str, str],
-    headers: dict[str, Any],
+    headers: dict[str, JSONValue],
     method: Literal[
         "query",
         "mutation",
@@ -45,7 +48,7 @@ async def make_graphql_request(
         ]
         | Dict[
             Literal["query", "operation_name", "variables"], 
-            str | dict[str, Any],
+            str | dict[str, JSONValue],
         ]
     ),
     redirects: int, 
@@ -53,20 +56,23 @@ async def make_graphql_request(
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
+    verify_tls: bool = True,
 ):
     
-    graphql_data = GraphQLQuery(**data)
     
     timeouts = Timeouts(request_timeout=timeout)
     graphql = MercurySyncGraphQLConnection(
         timeouts=timeouts,
     )
 
-    graphql = setup_client(graphql, 1)
+    graphql = setup_client(graphql, 1, verify_tls=verify_tls)
     terminal = create_ping_ui(
         url,
         method,
     )
+
+    result_serializer = PingResultSerializer('graphql', url, method.upper())
+    result_output = PingResultOutput(output_file, result_serializer)
 
     try:
 
@@ -76,6 +82,8 @@ async def make_graphql_request(
                 vertical_padding=1
             )
 
+
+        graphql_data = GraphQLQuery(**data)
 
         match method:
             case "query":
@@ -108,6 +116,8 @@ async def make_graphql_request(
                     timeout=timeout,
                     redirects=redirects,
                 )
+
+        await result_output.record(result_serializer.from_http_response, response)
 
         if quiet is False:
             response_text = response.reason
@@ -172,6 +182,7 @@ async def make_graphql_request(
             await terminal.stop()
 
     except Exception as err:
+        await result_output.record_failure(err)
         error_message = str(err)
         if str(err) == "":
             error_message = "Encountered unknown error"
@@ -179,3 +190,5 @@ async def make_graphql_request(
         if quiet is False:
             await update_text(error_message)
             await terminal.stop()
+
+    result_output.raise_on_write_failure()

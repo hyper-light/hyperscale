@@ -36,14 +36,13 @@ from tests.simulation.harness import (
 )
 
 
-def _l2_spec(base_port: int) -> ClusterSpec:
+def _l2_spec() -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "main": DCSpec(managers=3, workers=2, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -74,7 +73,7 @@ async def test_leader_kill_then_restart() -> None:
       6. Assert the cluster reconverges to peers=2 from every manager
          (the restarted node has rejoined).
     """
-    spec = _l2_spec(base_port=20500)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -139,7 +138,7 @@ async def test_follower_kill_then_restart() -> None:
     Surviving managers continue with the existing leader. The killed
     follower comes back, rejoins via SWIM, and peer counts converge.
     """
-    spec = _l2_spec(base_port=20600)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

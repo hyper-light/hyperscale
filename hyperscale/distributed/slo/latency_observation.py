@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from time import monotonic
 
 
 @dataclass(slots=True)
@@ -16,6 +15,7 @@ class LatencyObservation:
     window_start: float
     window_end: float
 
-    def is_stale(self, max_age_seconds: float) -> bool:
-        """Return True when the observation is older than max_age_seconds."""
-        return (monotonic() - self.window_end) > max_age_seconds
+    def is_stale(self, max_age_seconds: float, now: float) -> bool:
+        """Return True when the observation is older than max_age_seconds
+        at ``now`` (the observing node's monotonic time)."""
+        return (now - self.window_end) > max_age_seconds

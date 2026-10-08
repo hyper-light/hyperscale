@@ -63,7 +63,6 @@ from ctypes import (
 from datetime import timedelta
 from logging import getLogger
 from os import path
-from threading import Lock
 
 from .err import SSL_ERROR_NONE, SSL_ERROR_TEXT, openssl_error
 from .util import _BIO, _EC_KEY
@@ -1320,7 +1319,6 @@ def SSL_CTX_set1_curves_list(ctx, s):
 _rvoid_voidp_int_int = CFUNCTYPE(None, c_void_p, c_int, c_int)
 
 _info_callback = dict()
-_info_callback_lock = Lock()
 
 
 def SSL_CTX_set_info_callback(ctx, app_info_cb):
@@ -1338,20 +1336,19 @@ def SSL_CTX_set_info_callback(ctx, app_info_cb):
             pass
         return
 
-    _info_callback_lock.acquire()
     global _info_callback
     _info_callback[ctx] = _rvoid_voidp_int_int(py_info_callback)
     _SSL_CTX_set_info_callback(ctx, _info_callback[ctx])
-    _info_callback_lock.release()
 
+
+# The info and timer callback registries are only touched from the event-loop
+# thread (the DTLS engine runs no executor work), so they need no lock.
 
 def remove_from_info_callback(ctx):
-    _info_callback_lock.acquire()
     global _info_callback
     if ctx in _info_callback:
         _SSL_CTX_set_info_callback(ctx, None)
         _info_callback.pop(ctx)
-    _info_callback_lock.release()
 
 
 def SSL_CTX_set_max_send_fragment(ctx, m):
@@ -1483,7 +1480,6 @@ def DTLS_set_link_mtu(ssl, mtu):
 _ruint_voidp_uint = CFUNCTYPE(c_uint, c_void_p, c_uint)
 
 _timer_callbacks = dict()
-_timer_callbacks_lock = Lock()
 
 
 def DTLS_set_timer_cb(ssl, cb):
@@ -1494,20 +1490,16 @@ def DTLS_set_timer_cb(ssl, cb):
             return 0
         return timer_us
 
-    _timer_callbacks_lock.acquire()
     global _timer_callbacks
     _timer_callbacks[ssl] = _ruint_voidp_uint(py_dtls_timer_cb)
     _DTLS_set_timer_cb(ssl, _timer_callbacks[ssl])
-    _timer_callbacks_lock.release()
 
 
 def remove_from_timer_callbacks(ssl):
-    _timer_callbacks_lock.acquire()
     global _timer_callbacks
     if ssl in _timer_callbacks:
         _DTLS_set_timer_cb(ssl, None)
         _timer_callbacks.pop(ssl)
-    _timer_callbacks_lock.release()
 
 
 def SSL_read(ssl, length, buffer):
@@ -1569,7 +1561,7 @@ def SSL_set1_sigalgs_list(ssl, s):
 def SSL_get1_curves(ssl, curves=None):
     assert curves is None or isinstance(curves, list)
     if curves is not None:
-        cnt = SSL_get1_curves(ssl, None)
+        cnt = _SSL_ctrl(ssl, SSL_CTRL_GET_CURVES, 0, None)
         if cnt:
             mem = create_string_buffer(sizeof(POINTER(c_int)) * cnt)
             _SSL_ctrl(ssl, SSL_CTRL_GET_CURVES, 0, mem)

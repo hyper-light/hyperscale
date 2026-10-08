@@ -5,7 +5,6 @@ Observed latency state for adaptive route learning (AD-45).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from time import monotonic
 
 
 import statistics
@@ -46,30 +45,20 @@ class ObservedLatencyState:
         self,
         latency_ms: float,
         alpha: float,
-        now: float | None = None,
+        now: float,
     ) -> None:
         """
-        Record an observed job completion latency.
+        Record an observed job latency.
 
         Args:
             latency_ms: Observed latency in milliseconds.
             alpha: EWMA decay factor (0.0-1.0, higher = more responsive).
-            now: Current monotonic time for testing.
+            now: The observing node's monotonic time.
         """
-        current_time = now or monotonic()
-
-        if self.sample_count == 0:
-            self.ewma_ms = latency_ms
-            self.ewma_variance = 0.0
-        else:
-            delta = latency_ms - self.ewma_ms
-            self.ewma_ms = self.ewma_ms + alpha * delta
-            self.ewma_variance = (1 - alpha) * (
-                self.ewma_variance + alpha * delta * delta
-            )
+        self._update_ewma(latency_ms, alpha)
 
         self.sample_count += 1
-        self.last_update = current_time
+        self.last_update = now
 
         # Jitter tracking (Task 61)
         if self._last_latency_ms > 0:
@@ -81,6 +70,19 @@ class ObservedLatencyState:
         if self._recent_samples is not None:
             self._recent_samples.append(latency_ms)
             self._update_percentiles()
+
+    def _update_ewma(self, latency_ms: float, alpha: float) -> None:
+        """Fold ``latency_ms`` into the EWMA and its variance (AD-45); the
+        first sample seeds them."""
+        if self.sample_count == 0:
+            self.ewma_ms = latency_ms
+            self.ewma_variance = 0.0
+        else:
+            delta = latency_ms - self.ewma_ms
+            self.ewma_ms = self.ewma_ms + alpha * delta
+            self.ewma_variance = (1 - alpha) * (
+                self.ewma_variance + alpha * delta * delta
+            )
 
     def _update_percentiles(self) -> None:
         """Update percentile calculations from recent samples (Task 61)."""
@@ -114,9 +116,8 @@ class ObservedLatencyState:
             return 0.0
         return self.ewma_variance**0.5
 
-    def is_stale(self, max_age_seconds: float, now: float | None = None) -> bool:
+    def is_stale(self, max_age_seconds: float, now: float) -> bool:
         """Return True when observations are stale."""
-        current_time = now or monotonic()
-        if self.last_update == 0.0:
+        if self.sample_count == 0:
             return True
-        return (current_time - self.last_update) > max_age_seconds
+        return (now - self.last_update) > max_age_seconds

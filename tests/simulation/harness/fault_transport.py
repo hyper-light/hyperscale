@@ -11,10 +11,11 @@ monkey-patching the class. The wrapper closes over a reference to
 the harness's ``FaultMatrix`` and the harness's address-to-node-id
 maps, consults the matrix's rules on every send, and:
 
-* Returns a synthetic ``(asyncio.TimeoutError, clock)`` tuple if the
-  pair is partitioned or hits a drop_rate roll. The shape matches
-  the original methods' on-error return contract so production code
-  consuming the result sees an indistinguishable timeout.
+* Sleeps through the caller's request timeout and returns a synthetic
+  ``(asyncio.TimeoutError, clock)`` tuple if the pair is partitioned
+  or hits a drop_rate roll. The shape and timing match the original
+  methods' on-error return contract so production code consuming the
+  result sees an indistinguishable timeout.
 * Sleeps for a configured delay (with optional jitter) before
   forwarding. Real-network delay simulation.
 * Adds token-bucket bandwidth delay and UDP-style reordering holds at
@@ -77,15 +78,41 @@ def reinstall_for(handle: "ServerHandle", harness: "ClusterHarness") -> None:
     _install_one(harness, handle)
 
 
+def construct[ServerT](
+    harness: "ClusterHarness",
+    node_id: str,
+    server_class: type[ServerT],
+    **constructor_arguments: Any,
+) -> ServerT:
+    """Build a ``server_class`` instance whose sends are fault-injected
+    from birth.
+
+    Server constructors hand ``self.send_tcp`` / ``self.send_udp`` to
+    their coordinators as bound methods (constructor injection, e.g. the
+    manager's ``ManagerDispatchCoordinator`` and the worker's progress
+    and registration modules). A wrapper installed after ``__init__``
+    replaces only the instance attribute, so every send a coordinator
+    makes through its captured method would bypass the ``FaultMatrix``.
+    Installing the wrappers between ``__new__`` and ``__init__`` makes
+    the constructor capture the wrappers themselves.
+    """
+    instance = server_class.__new__(server_class)
+    _install_on_instance(harness, node_id, instance)
+    instance.__init__(**constructor_arguments)
+    return instance
+
+
 def _install_one(harness: "ClusterHarness", handle: "ServerHandle") -> None:
-    instance = handle.instance
+    _install_on_instance(harness, handle.node_id, handle.instance)
+
+
+def _install_on_instance(harness: "ClusterHarness", src_node_id: str, instance: Any) -> None:
     if getattr(instance, "_fault_transport_installed", False):
         return
 
     original_send_tcp: SendMethod = instance.send_tcp
     original_send_udp: SendMethod = instance.send_udp
 
-    src_node_id = handle.node_id
     matrix_provider: Callable[[], FaultMatrix] = lambda: harness.faults
     rng = random.Random(hash(src_node_id) & 0xFFFFFFFF)
 
@@ -177,12 +204,12 @@ async def _send_with_faults(
     if dst_node_id is not None and matrix.is_partitioned(
         src_node_id, dst_node_id
     ):
-        return _synthetic_timeout(instance, kind, "partitioned")
+        return await _synthetic_timeout(instance, kind, "partitioned", timeout)
 
     if dst_node_id is not None:
         drop_p = matrix.drop_probability(src_node_id, dst_node_id)
         if drop_p > 0.0 and rng.random() < drop_p:
-            return _synthetic_timeout(instance, kind, "dropped")
+            return await _synthetic_timeout(instance, kind, "dropped", timeout)
 
         if kind == "tcp" and matrix.should_reset_tcp(
             src_node_id,
@@ -222,14 +249,25 @@ async def _send_with_faults(
     return await original(address, action, data, timeout=timeout)
 
 
-def _synthetic_timeout(
-    instance: Any, kind: str, reason: str
+async def _synthetic_timeout(
+    instance: Any,
+    kind: str,
+    reason: str,
+    timeout: int | float | None,
 ) -> tuple[Any, int]:
-    """Return the on-error tuple the original would produce on
-    timeout — preserves the production-side error-handling shape."""
-    clock_attr = "_tcp_clock" if kind == "tcp" else "_udp_clock"
-    clock = getattr(instance, clock_attr, None)
-    clock_value = getattr(clock, "time", 0)
+    """Return the on-error tuple the original would produce on timeout.
+
+    The wait is part of the fault contract: production timeouts consume the
+    caller's request budget before surfacing ``TimeoutError``. Returning an
+    error immediately makes probe callers observe a synchronous send failure
+    instead of an elapsed probe timeout, which bypasses Lifeguard LHM growth.
+    """
+    timeout_seconds = timeout if timeout is not None else instance._request_timeout
+    if timeout_seconds > 0:
+        await asyncio.sleep(float(timeout_seconds))
+
+    clock = instance._tcp_clock if kind == "tcp" else instance._udp_clock
+    clock_value = clock.time
     return (asyncio.TimeoutError(reason), clock_value)
 
 

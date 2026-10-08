@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from hyperscale.distributed.env import Env
 
@@ -11,26 +11,32 @@ from .slo_config import SLOConfig
 class ResourceAwareSLOPredictor:
     """Predicts SLO violations from AD-41 resource metrics."""
 
-    _config: SLOConfig = field(default_factory=SLOConfig.from_env)
+    _config: SLOConfig
 
     @classmethod
-    def from_env(cls, env: Env | None = None) -> "ResourceAwareSLOPredictor":
+    def from_env(cls, env: Env) -> "ResourceAwareSLOPredictor":
         return cls(_config=SLOConfig.from_env(env))
 
     def predict_slo_risk(
         self,
         cpu_pressure: float,
-        cpu_uncertainty: float,
+        cpu_uncertainty_pressure: float,
         memory_pressure: float,
-        memory_uncertainty: float,
+        memory_uncertainty_pressure: float,
         current_slo_score: float,
     ) -> float:
-        """Return predicted SLO risk factor (1.0 = normal, >1.0 = risk)."""
+        """Return predicted SLO risk factor (1.0 = normal, >1.0 = risk).
+
+        Each pressure is the workload's share of the datacenter's capacity,
+        and its uncertainty is measured the same way (the estimate's
+        standard deviation over that capacity): a pressure counts in full
+        when its estimate is certain, and half when the estimate is
+        uncertain by the whole capacity."""
         if not self._config.enable_resource_prediction:
             return current_slo_score
 
-        cpu_confidence = 1.0 / (1.0 + cpu_uncertainty / 20.0)
-        memory_confidence = 1.0 / (1.0 + memory_uncertainty / 1e8)
+        cpu_confidence = 1.0 / (1.0 + cpu_uncertainty_pressure)
+        memory_confidence = 1.0 / (1.0 + memory_uncertainty_pressure)
 
         cpu_contribution = (
             cpu_pressure * self._config.cpu_latency_correlation * cpu_confidence

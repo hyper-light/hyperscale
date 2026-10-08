@@ -32,6 +32,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes import GateServer
 
+# Every node and client of this example shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
+
 
 async def run_gate_1():
     """Run Gate server 1 on ports 9100/9101"""
@@ -84,6 +88,7 @@ async def run_gate_1():
         tcp_port=9100,
         udp_port=9101,
         env=Env(
+            MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET,
             MERCURY_SYNC_REQUEST_TIMEOUT='2s',
         ),
         dc_id='global',
@@ -91,7 +96,6 @@ async def run_gate_1():
         gate_udp_peers=gate_peers_udp,
         datacenter_managers=datacenter_managers_tcp,
         datacenter_manager_udp=datacenter_managers_udp,
-        lease_timeout=30.0,
     )
     
     await server.start()
@@ -136,7 +140,6 @@ async def run_gate_1():
             # Job status
             print(f"\n  Jobs:")
             print(f"    Active: {len(server._jobs)}")
-            print(f"    Leases: {len(server._leases)}")
             
     except asyncio.CancelledError:
         print("\n[Gate 1] Shutting down...")

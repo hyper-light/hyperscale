@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from ssl import SSLContext
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterator, Optional, Sequence, Tuple
 
 from hyperscale.core.engines.client.shared.protocols import (
     _DEFAULT_LIMIT,
     Reader,
     Writer,
 )
+from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import SocketConfig
 
 from .tcp import TCPConnectionFactory
 
@@ -75,6 +76,55 @@ class TCPConnection:
             self.reader = reader
             self.writer = writer
 
+    async def connect_to_any(
+        self,
+        target: Tuple[str, str],
+        hostname: str,
+        addresses: Sequence[Tuple[str, SocketConfig]],
+        port: int,
+        address_rotation: Iterator[int],
+        ssl: Optional[SSLContext] = None,
+    ) -> Tuple[Optional[str], Optional[SocketConfig], bool]:
+        """
+        Reuse this connection's cached transport for ``target``, the
+        scheme and address the request names (``hostname`` is the TLS
+        server name). Otherwise
+        open a new one, racing the host's ``addresses`` (RFC 8305) from the
+        next offset in ``address_rotation`` so a pool's connections spread
+        across all of them.
+
+        Returns the address and socket config of a new transport (``None``
+        for both on reuse), and whether the transport is new.
+        """
+        if (cached := self._reader_and_writer.get(target)) is not None:
+            self.reader, self.writer = cached
+            return None, None, False
+
+        if not addresses:
+            raise ConnectionError(f"No addresses to connect to for {hostname}")
+
+        offset = next(address_rotation) % len(addresses)
+        ordered = [*addresses[offset:], *addresses[:offset]]
+
+        reader, writer, winner_index = await self._connection_factory.create_racing(
+            hostname,
+            [socket_config for _, socket_config in ordered],
+            ssl=ssl,
+        )
+
+        address, socket_config = ordered[winner_index]
+
+        self.reader = reader
+        self.writer = writer
+
+        self._reader_and_writer[target] = (reader, writer)
+
+        self.dns_address = address
+        self.port = port
+        self.ssl = ssl
+
+        return address, socket_config, True
+
     @property
     def empty(self):
         return not self.reader._buffer
@@ -101,4 +151,36 @@ class TCPConnection:
         return self.reader.read_headers()
 
     def close(self):
+        # One transport per target this connection served, while the factory
+        # closes only its newest: abort every one, or the rest stay open.
+        for _, writer in self._reader_and_writer.values():
+            writer.abort()
+
+        self._reader_and_writer.clear()
+
+        if self.reader:
+            self.reader = None
+
+        if self.writer:
+            self.writer.clear()
+
         self._connection_factory.close()
+
+    def reset(self):
+        """
+        Discard the transport in use: an error or a cut-off request left it
+        in an unknown state. Transports to this connection's other targets
+        are healthy and stay open for their next requests.
+        """
+        if (writer := self.writer) is not None:
+            writer.clear()
+            writer.abort()
+
+            # Its entry, found by identity: only a failure comes this way.
+            for target, (_, cached_writer) in self._reader_and_writer.items():
+                if cached_writer is writer:
+                    del self._reader_and_writer[target]
+                    break
+
+        if self.reader:
+            self.reader = None

@@ -5,6 +5,9 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
 from tests.end_to_end.workflows.base_scenario_workflow import BaseScenarioWorkflow
+from tests.end_to_end.workflow_lifecycle_checks import (
+    assert_workflow_lifecycle_sound,
+)
 from tests.framework.results.scenario_outcome import ScenarioOutcome
 from tests.framework.results.scenario_result import ScenarioResult
 from tests.framework.runner.scenario_runner import ScenarioRunner
@@ -98,10 +101,7 @@ async def validate_7_1_pending_to_dispatched() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "PENDING → DISPATCHED expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "PENDING → DISPATCHED expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -118,10 +118,7 @@ async def validate_7_1_dispatched_to_running() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "DISPATCHED → RUNNING expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "DISPATCHED → RUNNING expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -138,10 +135,7 @@ async def validate_7_1_running_to_completed() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "RUNNING → COMPLETED expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "RUNNING → COMPLETED expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -158,10 +152,7 @@ async def validate_7_1_running_to_failed() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "RUNNING → FAILED expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "RUNNING → FAILED expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -178,10 +169,7 @@ async def validate_7_1_any_to_cancelled() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "Any → CANCELLED expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "Any → CANCELLED expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -198,10 +186,7 @@ async def validate_7_2_completed_invalid_transition() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "COMPLETED invalid transition expected lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "COMPLETED invalid transition expected lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -218,10 +203,7 @@ async def validate_7_2_failed_invalid_transition() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "FAILED invalid transition expected lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "FAILED invalid transition expected lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -238,10 +220,7 @@ async def validate_7_2_cancelled_invalid_transition() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "CANCELLED invalid transition expected lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "CANCELLED invalid transition expected lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -258,10 +237,7 @@ async def validate_7_3_successful_transitions_logging() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "Successful transitions logging expected lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "Successful transitions logging expected lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -278,10 +254,7 @@ async def validate_7_3_failed_transitions_logging() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "Failed transitions logging expected lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "Failed transitions logging expected lifecycle states")
     finally:
         await runtime.stop_cluster()
 

@@ -1,5 +1,6 @@
 import asyncio
-from typing import Literal, Any
+from typing import Literal
+from .json_value import JSONValue
 from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.engines.client.websocket import MercurySyncWebsocketConnection
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
@@ -15,23 +16,26 @@ from .terminal_ui import (
     create_ping_ui,
     map_status_to_error,
 )
+from .ping_result_output import PingResultOutput
+from .ping_result_serializer import PingResultSerializer
 
 
 async def make_websocket_request(
     url: str,
     cookies: list[HTTPCookie],
     params: dict[str, str],
-    headers: dict[str, Any],
+    headers: dict[str, JSONValue],
     method: Literal[
         "send",
         "receive",
     ],
-    data: Any | None,
+    data: JSONValue,
     redirects: int, 
     timeout: int | float,
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
+    verify_tls: bool = True,
 ):
     
     if method is None or method not in ["send", "receive"]:
@@ -42,11 +46,14 @@ async def make_websocket_request(
         timeouts=timeouts,
     )
 
-    websocket = setup_client(websocket, 1)
+    websocket = setup_client(websocket, 1, verify_tls=verify_tls)
     terminal = create_ping_ui(
         url,
         method,
     )
+
+    result_serializer = PingResultSerializer('websocket', url, method.upper())
+    result_output = PingResultOutput(output_file, result_serializer)
 
     try:
         if quiet is False:
@@ -88,6 +95,8 @@ async def make_websocket_request(
                     redirects=redirects,
                     timeout=timeout,
                 )
+
+        await result_output.record(result_serializer.from_http_response, response)
 
         if quiet is False:
             response_text = response.reason
@@ -149,6 +158,7 @@ async def make_websocket_request(
             await terminal.stop()
 
     except Exception as err:
+        await result_output.record_failure(err)
         error_message = str(err)
         if str(err) == "":
             error_message = "Encountered unknown error"
@@ -156,3 +166,5 @@ async def make_websocket_request(
         if quiet is False:
             await update_text(error_message)
             await terminal.stop()
+
+    result_output.raise_on_write_failure()

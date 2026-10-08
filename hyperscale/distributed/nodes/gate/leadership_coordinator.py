@@ -4,17 +4,11 @@ Gate leadership coordination module.
 Coordinates job leadership, lease management, and peer gate coordination.
 """
 
-import asyncio
 from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
     GateJobLeaderTransfer,
     JobLeadershipAnnouncement,
-    JobLeadershipAck,
-    JobLeaderGateTransfer,
-    JobLeaderGateTransferAck,
-    LeaseTransfer,
-    LeaseTransferAck,
 )
 from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
@@ -30,13 +24,12 @@ if TYPE_CHECKING:
 
 class GateLeadershipCoordinator:
     """
-    Coordinates job leadership across peer gates.
+    Announces this gate's job leadership to peer gates and the client,
+    and answers the gate cluster's quorum questions.
 
-    Responsibilities:
-    - Track job leadership with fencing tokens
-    - Handle leadership announcements
-    - Coordinate leadership transfers
-    - Manage orphaned jobs
+    Receiving announcements and gate-to-gate transfers is the server's
+    job_leadership_announcement endpoint and GateJobHandler; orphan
+    tracking is GateOrphanJobCoordinator's.
     """
 
     def __init__(
@@ -49,7 +42,8 @@ class GateLeadershipCoordinator:
         get_node_addr: Callable,
         send_tcp: Callable,
         get_active_peers: Callable,
-        configured_gate_count: int = 1,
+        get_cluster_size: Callable[[], int],
+        peer_rpc_timeout_seconds: float,
     ) -> None:
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
@@ -59,32 +53,8 @@ class GateLeadershipCoordinator:
         self._get_node_addr: Callable = get_node_addr
         self._send_tcp: Callable = send_tcp
         self._get_active_peers: Callable = get_active_peers
-        self._configured_gate_count = max(1, configured_gate_count)
-
-    def is_job_leader(self, job_id: str) -> bool:
-        """
-        Check if this gate is the leader for a job.
-
-        Args:
-            job_id: Job identifier
-
-        Returns:
-            True if this gate is the leader
-        """
-        return self._leadership_tracker.is_leader(job_id)
-
-    def assume_leadership(self, job_id: str, target_dc_count: int) -> None:
-        """
-        Assume leadership for a job.
-
-        Args:
-            job_id: Job identifier
-            target_dc_count: Number of target datacenters
-        """
-        self._leadership_tracker.assume_leadership(
-            job_id=job_id,
-            metadata=target_dc_count,
-        )
+        self._get_cluster_size: Callable[[], int] = get_cluster_size
+        self._peer_rpc_timeout_seconds = peer_rpc_timeout_seconds
 
     async def broadcast_leadership(
         self,
@@ -118,7 +88,7 @@ class GateLeadershipCoordinator:
 
         # Send to all active peers
         peers = self._get_active_peers()
-        for peer_addr in peers:
+        for peer_addr in sorted(peers):
             self._task_runner.run(
                 self._send_leadership_announcement,
                 peer_addr,
@@ -140,20 +110,22 @@ class GateLeadershipCoordinator:
         announcement: JobLeadershipAnnouncement,
     ) -> None:
         try:
-            await self._send_tcp(
+            response, _ = await self._send_tcp(
                 peer_addr,
                 "job_leadership_announcement",
                 announcement.dump(),
-                timeout=5.0,
+                timeout=self._peer_rpc_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
         except Exception as error:
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=f"Failed to send leadership announcement to {peer_addr}: {error}",
-                    node_host=self._get_host(),
-                    node_port=self._get_tcp_port(),
-                    node_id=self._get_node_id(),
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
+                    node_id=self._get_node_id().short,
                 ),
             )
 
@@ -163,292 +135,32 @@ class GateLeadershipCoordinator:
         transfer: GateJobLeaderTransfer,
     ) -> None:
         try:
-            await self._send_tcp(
+            response, _ = await self._send_tcp(
                 callback_addr,
                 "receive_gate_job_leader_transfer",
                 transfer.dump(),
-                timeout=5.0,
+                timeout=self._peer_rpc_timeout_seconds,
             )
+            # send_tcp returns transport errors rather than raising.
+            if isinstance(response, Exception):
+                raise response
         except Exception as error:
             await self._logger.log(
-                {
-                    "level": "warning",
-                    "message": (
+                ServerWarning(
+                    message=(
                         f"Failed to deliver gate leader transfer for job {transfer.job_id} "
                         f"to client {callback_addr}: {error}"
                     ),
-                }
-            )
-
-    def handle_leadership_announcement(
-        self,
-        job_id: str,
-        leader_id: str,
-        leader_addr: tuple[str, int],
-        fence_token: int,
-        target_dc_count: int,
-    ) -> JobLeadershipAck:
-        """
-        Handle leadership announcement from peer gate.
-
-        Args:
-            job_id: Job identifier
-            leader_id: Leader gate ID
-            leader_addr: Leader gate address
-            fence_token: Fencing token for ordering
-            target_dc_count: Number of target datacenters
-
-        Returns:
-            Acknowledgment
-        """
-        # Check if we already have leadership with higher fence token
-        current_token = self._leadership_tracker.get_fencing_token(job_id)
-        node_id = self._get_node_id()
-        if current_token and current_token >= fence_token:
-            return JobLeadershipAck(
-                job_id=job_id,
-                accepted=False,
-                responder_id=node_id.full,
-            )
-
-        # Accept the leadership announcement
-        self._leadership_tracker.record_external_leader(
-            job_id=job_id,
-            leader_id=leader_id,
-            leader_addr=leader_addr,
-            fence_token=fence_token,
-            metadata=target_dc_count,
-        )
-
-        return JobLeadershipAck(
-            job_id=job_id,
-            accepted=True,
-            responder_id=node_id.full,
-        )
-
-    async def transfer_leadership(
-        self,
-        job_id: str,
-        new_leader_id: str,
-        new_leader_addr: tuple[str, int],
-        reason: str = "requested",
-    ) -> bool:
-        """
-        Transfer job leadership to another gate.
-
-        Args:
-            job_id: Job identifier
-            new_leader_id: New leader gate ID
-            new_leader_addr: New leader gate address
-            reason: Transfer reason
-
-        Returns:
-            True if transfer succeeded
-        """
-        if not self.is_job_leader(job_id):
-            return False
-
-        fence_token = self._leadership_tracker.get_fencing_token(job_id)
-        new_token = fence_token + 1
-
-        transfer = JobLeaderGateTransfer(
-            job_id=job_id,
-            new_gate_id=new_leader_id,
-            new_gate_addr=new_leader_addr,
-            fence_token=new_token,
-            old_gate_id=self._get_node_id().full,
-        )
-
-        try:
-            response, _ = await self._send_tcp(
-                new_leader_addr,
-                "job_leader_gate_transfer",
-                transfer.dump(),
-                timeout=10.0,
-            )
-
-            if response and not isinstance(response, Exception):
-                ack = JobLeaderGateTransferAck.load(response)
-                if ack.accepted:
-                    self._leadership_tracker.relinquish(job_id)
-
-                    target_dcs = self._state._job_dc_managers.get(job_id, {}).keys()
-                    for datacenter in target_dcs:
-                        self._task_runner.run(
-                            self._send_lease_transfer,
-                            job_id,
-                            datacenter,
-                            new_leader_id,
-                            new_leader_addr,
-                            new_token,
-                        )
-                    return True
-
-            return False
-
-        except Exception:
-            return False
-
-    async def _send_lease_transfer(
-        self,
-        job_id: str,
-        datacenter: str,
-        new_gate_id: str,
-        new_gate_addr: tuple[str, int],
-        fence_token: int,
-    ) -> bool:
-        """
-        Send lease transfer to new leader gate (Task 41).
-
-        Args:
-            job_id: Job identifier
-            datacenter: Datacenter the lease is for
-            new_gate_id: New leader gate ID
-            new_gate_addr: New leader gate address
-            fence_token: New fence token
-
-        Returns:
-            True if transfer succeeded
-        """
-        node_id = self._get_node_id()
-        transfer = LeaseTransfer(
-            job_id=job_id,
-            datacenter=datacenter,
-            from_gate=node_id.full,
-            to_gate=new_gate_id,
-            new_fence_token=fence_token,
-            version=self._state._state_version,
-        )
-
-        try:
-            response, _ = await self._send_tcp(
-                new_gate_addr,
-                "lease_transfer",
-                transfer.dump(),
-                timeout=5.0,
-            )
-
-            if response and not isinstance(response, Exception):
-                ack = LeaseTransferAck.load(response)
-                if ack.accepted:
-                    self._task_runner.run(
-                        self._logger.log,
-                        ServerDebug(
-                            message=f"Lease transfer for job {job_id[:8]}... "
-                            f"DC {datacenter} to {new_gate_id[:8]}... succeeded",
-                            node_host=self._get_node_addr()[0],
-                            node_port=self._get_node_addr()[1],
-                            node_id=node_id.short,
-                        ),
-                    )
-                    return True
-
-            self._task_runner.run(
-                self._logger.log,
-                ServerWarning(
-                    message=f"Lease transfer for job {job_id[:8]}... "
-                    f"DC {datacenter} to {new_gate_id[:8]}... rejected",
                     node_host=self._get_node_addr()[0],
                     node_port=self._get_node_addr()[1],
-                    node_id=node_id.short,
-                ),
+                    node_id=self._get_node_id().short,
+                )
             )
-            return False
-
-        except Exception as transfer_error:
-            self._task_runner.run(
-                self._logger.log,
-                ServerWarning(
-                    message=f"Lease transfer for job {job_id[:8]}... "
-                    f"DC {datacenter} failed: {transfer_error}",
-                    node_host=self._get_node_addr()[0],
-                    node_port=self._get_node_addr()[1],
-                    node_id=node_id.short,
-                ),
-            )
-            return False
-
-    def handle_leadership_transfer(
-        self,
-        job_id: str,
-        old_leader_id: str,
-        new_leader_id: str,
-        fence_token: int,
-        reason: str,
-    ) -> JobLeaderGateTransferAck:
-        """
-        Handle incoming leadership transfer request.
-
-        Args:
-            job_id: Job identifier
-            old_leader_id: Previous leader gate ID
-            new_leader_id: New leader gate ID (should be us)
-            fence_token: New fence token
-            reason: Transfer reason
-
-        Returns:
-            Transfer acknowledgment
-        """
-        my_id = self._get_node_id().full
-        if new_leader_id != my_id:
-            return JobLeaderGateTransferAck(
-                job_id=job_id,
-                manager_id=my_id,
-                accepted=False,
-            )
-
-        # Accept the transfer
-        self._leadership_tracker.assume_leadership(
-            job_id=job_id,
-            metadata=0,  # Will be updated from job state
-            fence_token=fence_token,
-        )
-
-        return JobLeaderGateTransferAck(
-            job_id=job_id,
-            manager_id=my_id,
-            accepted=True,
-        )
-
-    def get_job_leader(self, job_id: str) -> tuple[str, tuple[str, int]] | None:
-        """
-        Get the leader for a job.
-
-        Args:
-            job_id: Job identifier
-
-        Returns:
-            (leader_id, leader_addr) or None if not known
-        """
-        return self._leadership_tracker.get_leader(job_id)
-
-    def mark_job_orphaned(self, job_id: str) -> None:
-        """
-        Mark a job as orphaned (leader dead).
-
-        Args:
-            job_id: Job identifier
-        """
-        import time
-
-        self._state.mark_job_orphaned(job_id, time.monotonic())
-
-    def clear_orphaned_job(self, job_id: str) -> None:
-        """
-        Clear orphaned status for a job.
-
-        Args:
-            job_id: Job identifier
-        """
-        self._state.clear_orphaned_job(job_id)
 
     def get_quorum_size(self) -> int:
-        total_gates = max(
-            self._configured_gate_count,
-            self._state.get_known_gate_count() + 1,
-            self._state.get_active_peer_count() + 1,
-        )
-        return (total_gates // 2) + 1
+        """Majority of the gate cluster (the server's one cluster-size
+        definition, read live)."""
+        return (self._get_cluster_size() // 2) + 1
 
     def has_quorum(self, gate_state_value: str) -> bool:
         if gate_state_value != "active":

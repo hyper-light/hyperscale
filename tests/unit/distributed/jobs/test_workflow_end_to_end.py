@@ -20,8 +20,6 @@ import asyncio
 import os
 import sys
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from hyperscale.logging.config import LoggingConfig
 from hyperscale.distributed.env.env import Env
@@ -29,6 +27,10 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 from hyperscale.distributed.nodes.client import HyperscaleClient
 from hyperscale.graph import Workflow, step
+
+# Every node and client of this test shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
 
 
 # =============================================================================
@@ -60,7 +62,7 @@ async def run_test():
     # Setup logging
     LoggingConfig().update(log_directory=os.getcwd(), log_level="info")
     
-    env = Env()
+    env = Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET)
     
     # Server addresses
     manager_tcp = 9100

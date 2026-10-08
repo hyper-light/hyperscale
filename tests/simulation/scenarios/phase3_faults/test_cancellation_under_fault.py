@@ -39,14 +39,13 @@ from tests.simulation.scenarios.phase3_faults.test_leader_faults import (
 )
 
 
-def _l2_spec(base_port: int) -> ClusterSpec:
+def _l2_spec() -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "main": DCSpec(managers=3, workers=2, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -93,7 +92,7 @@ async def test_cancel_running_workflow() -> None:
     budget; success means the cancel + await round-trip returned
     without timeout.
     """
-    spec = _l2_spec(base_port=21500)
+    spec = _l2_spec()
     workload = _cancellable_workload(timeout_seconds=30.0)
     async with ClusterHarness(
         spec,
@@ -134,7 +133,7 @@ async def test_cancel_during_leader_failover() -> None:
     which would indicate the cancellation push got stuck on the
     dead leader's queue or never re-routed.
     """
-    spec = _l2_spec(base_port=21600)
+    spec = _l2_spec()
     workload = _cancellable_workload(timeout_seconds=45.0)
     async with ClusterHarness(
         spec,

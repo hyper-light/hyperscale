@@ -3,17 +3,17 @@ import os
 from functools import partial
 from typing import Callable, Dict, Optional, Text, Union, cast
 
-from ..buffer import Buffer
-from ..quic.configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
-from ..quic.connection import NetworkAddress, QuicConnection
-from ..quic.packet import (
+from hyperscale.core.engines.client.http3.protocols.quic.buffer import Buffer
+from hyperscale.core.engines.client.http3.protocols.quic.quic.configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
+from hyperscale.core.engines.client.http3.protocols.quic.quic.connection import NetworkAddress, QuicConnection
+from hyperscale.core.engines.client.http3.protocols.quic.quic.packet import (
     PACKET_TYPE_INITIAL,
     encode_quic_retry,
     encode_quic_version_negotiation,
     pull_quic_header,
 )
-from ..quic.retry import QuicRetryTokenHandler
-from ..tls import SessionTicketFetcher, SessionTicketHandler
+from hyperscale.core.engines.client.http3.protocols.quic.quic.retry import QuicRetryTokenHandler
+from hyperscale.core.engines.client.http3.protocols.quic.tls import SessionTicketFetcher, SessionTicketHandler
 from .protocol import QuicConnectionProtocol, QuicStreamHandler
 
 __all__ = ["serve"]

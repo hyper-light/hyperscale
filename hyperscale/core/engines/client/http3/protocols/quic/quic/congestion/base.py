@@ -1,7 +1,7 @@
 import abc
 from typing import Any, Dict, Iterable, Optional, Protocol
 
-from ..packet_builder import QuicSentPacket
+from hyperscale.core.engines.client.http3.protocols.quic.quic.packet_builder import QuicSentPacket
 
 K_GRANULARITY = 0.001  # seconds
 K_INITIAL_WINDOW = 10

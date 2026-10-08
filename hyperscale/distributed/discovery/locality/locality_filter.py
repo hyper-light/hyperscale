@@ -183,30 +183,67 @@ class LocalityFilter:
         groups = self.group_by_tier(peers)
 
         # Try same-DC first
-        if self.prefer_same_dc and groups[LocalityTier.SAME_DC]:
-            result = selector(groups[LocalityTier.SAME_DC])
-            if result is not None:
-                return (result, LocalityTier.SAME_DC)
+        if (result := self._select_same_datacenter(groups, selector)) is not None:
+            return (result, LocalityTier.SAME_DC)
 
         # Check minimum local peers threshold
-        local_count = len(groups[LocalityTier.SAME_DC])
-        if self.min_local_peers > 0 and local_count >= self.min_local_peers:
+        if self._has_enough_local_peers(groups):
             # Have enough local peers, don't fall back
             return (None, None)
 
+        return self._select_beyond_datacenter(groups, selector)
+
+    @staticmethod
+    def _select_from_tier(
+        groups: dict[LocalityTier, list[PeerInfo]],
+        tier: LocalityTier,
+        selector: Callable[[list[PeerInfo]], T | None],
+    ) -> T | None:
+        """``selector``'s pick among ``tier``'s peers; None when the tier has none."""
+        if not groups[tier]:
+            return None
+        return selector(groups[tier])
+
+    def _select_same_datacenter(
+        self,
+        groups: dict[LocalityTier, list[PeerInfo]],
+        selector: Callable[[list[PeerInfo]], T | None],
+    ) -> T | None:
+        """The same-DC pick, when same-DC peers are preferred."""
+        if not self.prefer_same_dc:
+            return None
+        return self._select_from_tier(groups, LocalityTier.SAME_DC, selector)
+
+    def _has_enough_local_peers(self, groups: dict[LocalityTier, list[PeerInfo]]) -> bool:
+        """Whether the same-DC peers meet ``min_local_peers``, which forbids falling back."""
+        local_count = len(groups[LocalityTier.SAME_DC])
+        return self.min_local_peers > 0 and local_count >= self.min_local_peers
+
+    def _select_beyond_datacenter(
+        self,
+        groups: dict[LocalityTier, list[PeerInfo]],
+        selector: Callable[[list[PeerInfo]], T | None],
+    ) -> tuple[T | None, LocalityTier | None]:
+        """The same-region pick, else the global one (if enabled), with its tier."""
         # Try same-region
-        if groups[LocalityTier.SAME_REGION]:
-            result = selector(groups[LocalityTier.SAME_REGION])
-            if result is not None:
-                return (result, LocalityTier.SAME_REGION)
+        if (result := self._select_from_tier(groups, LocalityTier.SAME_REGION, selector)) is not None:
+            return (result, LocalityTier.SAME_REGION)
 
         # Try global (if enabled)
-        if self.global_fallback_enabled and groups[LocalityTier.GLOBAL]:
-            result = selector(groups[LocalityTier.GLOBAL])
-            if result is not None:
-                return (result, LocalityTier.GLOBAL)
+        if (result := self._select_global(groups, selector)) is not None:
+            return (result, LocalityTier.GLOBAL)
 
         return (None, None)
+
+    def _select_global(
+        self,
+        groups: dict[LocalityTier, list[PeerInfo]],
+        selector: Callable[[list[PeerInfo]], T | None],
+    ) -> T | None:
+        """The global pick, when global fallback is enabled."""
+        if not self.global_fallback_enabled:
+            return None
+        return self._select_from_tier(groups, LocalityTier.GLOBAL, selector)
 
     def invalidate_cache(self, peer_id: str | None = None) -> int:
         """

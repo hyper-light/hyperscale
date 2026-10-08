@@ -104,12 +104,21 @@ class Postgres:
             echo=False,
         )
 
-        if not await self._loop.run_in_executor(
+        # ``self._loop`` was never assigned on this class, so both
+        # executor hops below raised AttributeError and no Postgres
+        # report ever connected. Sibling reporters capture
+        # ``asyncio.get_event_loop()`` in ``__init__``; the running
+        # loop read at the point of use is the same loop without the
+        # 3.12 deprecation or the risk of caching a loop that is not
+        # the one this coroutine is on.
+        event_loop = asyncio.get_running_loop()
+
+        if not await event_loop.run_in_executor(
             None,
             database_exists,
             connection_uri,
         ):
-            await self._loop.run_in_executor(
+            await event_loop.run_in_executor(
                 None,
                 functools.partial(
                     create_database,

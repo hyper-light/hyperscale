@@ -33,7 +33,8 @@ class UDPConnection:
         self.socket = socket.socket(family=family, type=type_)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        await self.loop.run_in_executor(None, self.socket.connect, address)
+        # A UDP connect only fixes the peer: no round trip, so no pool thread.
+        self.socket.connect(address)
 
         self.socket.setblocking(False)
 
@@ -80,3 +81,10 @@ class UDPConnection:
 
         except Exception:
             pass
+
+    def reset(self):
+        self.close()
+        self.transport = None
+        self._connection = None
+        self.socket: socket.socket = None
+        self._writer = None

@@ -18,8 +18,6 @@ import sys
 import os
 import time
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from hyperscale.graph import Workflow, step
 from hyperscale.core.graph.depends import depends
@@ -33,6 +31,10 @@ from hyperscale.distributed.nodes.client import HyperscaleClient
 from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.models import JobStatus
 from hyperscale.logging.config.logging_config import LoggingConfig
+
+# Every node and client of this test shares one explicit secret: there is
+# no default cluster secret.
+TEST_AUTH_SECRET = "hyperscale-test-cluster-secret-0123456789"
 
 # Initialize logging directory (required for server pool)
 _logging_config = LoggingConfig()
@@ -175,7 +177,7 @@ async def run_test():
                 host='127.0.0.1',
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
-                env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
+                env=Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
                 dc_id=DC_ID,
                 manager_peers=get_manager_peer_tcp_addrs(config["tcp"]),
                 manager_udp_peers=get_manager_peer_udp_addrs(config["udp"]),
@@ -236,7 +238,7 @@ async def run_test():
                 host='127.0.0.1',
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
-                env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
+                env=Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
                 dc_id=DC_ID,
                 total_cores=config["cores"],
                 seed_managers=seed_managers,
@@ -286,7 +288,7 @@ async def run_test():
         client = HyperscaleClient(
             host='127.0.0.1',
             port=CLIENT_CONFIG['tcp'],
-            env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='5s'),
+            env=Env(MERCURY_SYNC_AUTH_SECRET=TEST_AUTH_SECRET, MERCURY_SYNC_REQUEST_TIMEOUT='5s'),
         )
         
         await client.start()
@@ -341,69 +343,66 @@ async def run_test():
         print("[7/8] Verifying context consistency...")
         print("-" * 60)
         
-        # Check context in job leader's context store
-        job_context = manager_leader._job_contexts.get(job_id)
-        
-        if job_context:
-            print(f"  ✓ Job context exists in manager")
-            
-            # Get the context dictionary
-            context_dict = job_context.dict()
-            print(f"    Context contents: {context_dict}")
-            
-            # Check if AuthProvider's context was stored
-            if 'AuthProvider' in context_dict:
-                auth_context = context_dict['AuthProvider']
-                print(f"    AuthProvider context: {auth_context}")
-                
-                if 'auth_token' in auth_context:
-                    stored_token = auth_context['auth_token']
-                    if stored_token == 'test-token-12345':
-                        print(f"  ✓ Context key 'auth_token' stored correctly: {stored_token}")
-                    else:
-                        print(f"  ✗ Context value mismatch: expected 'test-token-12345', got '{stored_token}'")
-                        return False
-                else:
-                    print(f"  ⚠ Context key 'auth_token' not found in AuthProvider context")
-            else:
-                print(f"  ⚠ AuthProvider context not found (may not have executed yet)")
-        else:
-            print(f"  ⚠ Job context not found (job may not have started)")
-        
-        # Check context layer version
-        layer_version = manager_leader._job_layer_version.get(job_id, 0)
-        print(f"  Context layer version: {layer_version}")
-        
-        # Check if context was replicated to other managers
+        # The job leader's context is the job's: AuthProvider's run returned
+        # its context, and the provided value lands in the provider's own
+        # namespace and in the namespace it targets (DataConsumer).
+        leader_job = manager_leader._job_manager.get_job_by_id(job_id)
+        if leader_job is None:
+            print("  ✗ Job not found on the job leader")
+            return False
+
+        context_dict = leader_job.context.dict()
+        print(f"    Context contents: {context_dict}")
+        print(f"    Context layer version: {leader_job.layer_version}")
+
+        for namespace in ("AuthProvider", "DataConsumer"):
+            stored_token = context_dict.get(namespace, {}).get("auth_token")
+            if stored_token != "test-token-12345":
+                print(
+                    f"  ✗ context[{namespace!r}]['auth_token'] is {stored_token!r}, "
+                    "expected 'test-token-12345'"
+                )
+                return False
+            print(f"  ✓ context[{namespace!r}]['auth_token'] stored correctly")
+
+        # Peers hold the job's context through job state sync.
         context_replicated = 0
         for i, manager in enumerate(managers):
             if manager != manager_leader:
-                peer_context = manager._job_contexts.get(job_id)
-                if peer_context:
+                peer_job = manager._job_manager.get_job_by_id(job_id)
+                if (
+                    peer_job is not None
+                    and peer_job.context.dict().get("AuthProvider", {}).get("auth_token")
+                    == "test-token-12345"
+                ):
                     context_replicated += 1
                     print(f"  ✓ Context replicated to {MANAGER_CONFIGS[i]['name']}")
-        
+
         print(f"  Context replicated to {context_replicated}/{len(managers)-1} peer managers")
-        
+
         print()
-        
+
         # ==============================================================
         # STEP 8: Verify DataConsumer received the token
         # ==============================================================
         print("[8/8] Verifying DataConsumer received context...")
         print("-" * 60)
-        
-        if DataConsumer.received_token:
-            if DataConsumer.received_token == 'test-token-12345':
-                print(f"  ✓ DataConsumer received correct token: {DataConsumer.received_token}")
-            else:
-                print(f"  ✗ DataConsumer received wrong token: {DataConsumer.received_token}")
-                return False
-        else:
-            print(f"  ⚠ DataConsumer.received_token is None (workflow may not have run)")
-        
+
+        # The consumer's Use hook runs in a worker process -- a class
+        # attribute it sets there is invisible here -- but its result is
+        # stored in the consumer's namespace under the hook's name and comes
+        # back to the job leader with the run's context.
+        received_token = context_dict.get("DataConsumer", {}).get("get_auth_token")
+        if received_token != "test-token-12345":
+            print(
+                f"  ✗ DataConsumer's get_auth_token received {received_token!r}, "
+                "expected 'test-token-12345'"
+            )
+            return False
+        print(f"  ✓ DataConsumer received correct token: {received_token}")
+
         print()
-        
+
         # ==============================================================
         # SUCCESS
         # ==============================================================
@@ -415,8 +414,7 @@ async def run_test():
         print(f"  - AuthProvider provided context key 'auth_token' = 'test-token-12345'")
         print(f"  - Context stored in job leader")
         print(f"  - Context replicated to {context_replicated} peer managers")
-        if DataConsumer.received_token:
-            print(f"  - DataConsumer received token via @state('AuthProvider')")
+        print(f"  - DataConsumer received token via @state('AuthProvider')")
         
         return True
         

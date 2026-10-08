@@ -1,53 +1,33 @@
+"""
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
+"""
+
 from __future__ import annotations
 
-# Length prefix size (4 bytes = 32-bit unsigned integer, supports up to ~4GB messages)
-LENGTH_PREFIX_SIZE = 4
+import json
 
-# Security limits - prevent memory exhaustion attacks
-# Max frame length: 1MB compressed (aligns with MAX_MESSAGE_SIZE in security.py)
-MAX_FRAME_LENGTH = 1 * 1024 * 1024
-# Max buffer size: 2MB (allows for some buffering of partial frames)
-MAX_BUFFER_SIZE = 2 * 1024 * 1024
+from hyperscale.core.jobs.protocols.constants import MAX_MESSAGE_SIZE
+from hyperscale.distributed.encryption.aesgcm_fernet import CIPHERTEXT_OVERHEAD
 
+from .receive_buffer_shared import LENGTH_PREFIX_SIZE
+from .buffer_overflow_error import BufferOverflowError
+from .frame_too_large_error import FrameTooLargeError
 
-class BufferOverflowError(Exception):
-    """Raised when buffer size limits are exceeded."""
-    pass
+# Security limits - prevent memory exhaustion attacks.
+# A frame carries one encrypted, compressed message: the largest a message
+# may be (``MAX_MESSAGE_SIZE``, checked again after decryption) plus what
+# encryption adds. It was a separate 1 MiB literal that fell out of step
+# with the 3 MiB message limit, refusing every message between the two.
+MAX_FRAME_LENGTH = MAX_MESSAGE_SIZE + CIPHERTEXT_OVERHEAD
 
-
-class FrameTooLargeError(Exception):
-    """Raised when a frame's length prefix exceeds the maximum allowed."""
-
-    def __init__(
-        self,
-        message: str,
-        actual_size: int = 0,
-        max_size: int = 0,
-    ) -> None:
-        super().__init__(message)
-        self.actual_size = actual_size
-        self.max_size = max_size
-
-    def to_error_response(self) -> bytes:
-        """
-        Generate structured error response for protocol size violation (Task 63).
-
-        Returns a length-prefixed JSON error response with:
-        - error_type: "FRAME_TOO_LARGE"
-        - actual_size: The actual frame size
-        - max_size: The maximum allowed size
-        - suggestion: Remediation suggestion
-        """
-        import json
-        error = {
-            "error_type": "FRAME_TOO_LARGE",
-            "actual_size": self.actual_size,
-            "max_size": self.max_size,
-            "suggestion": "Split payload into smaller chunks or compress data",
-        }
-        json_bytes = json.dumps(error).encode("utf-8")
-        length_prefix = len(json_bytes).to_bytes(LENGTH_PREFIX_SIZE, "big")
-        return length_prefix + json_bytes
+# Room for one whole largest frame, length prefix included, while the next
+# arrives behind it.
+MAX_BUFFER_SIZE = 2 * (LENGTH_PREFIX_SIZE + MAX_FRAME_LENGTH)
 
 
 class ReceiveBuffer:
@@ -166,3 +146,11 @@ def frame_message(data: bytes) -> bytes:
     """
     length_prefix = len(data).to_bytes(LENGTH_PREFIX_SIZE, 'big')
     return length_prefix + data
+
+_REHOMED = (
+    BufferOverflowError,
+    FrameTooLargeError,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

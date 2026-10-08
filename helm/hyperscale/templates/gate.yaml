@@ -1,0 +1,172 @@
+{{- $name := include "hyperscale.gate.name" . }}
+{{- $gates := .Values.gates }}
+{{- $selector := dict "root" . "component" "gate" }}
+{{- $gateTcp := include "hyperscale.podAddresses" (dict "root" . "name" $name "replicas" $gates.replicas "port" $gates.ports.tcp) }}
+{{- $gateUdp := include "hyperscale.podAddresses" (dict "root" . "name" $name "replicas" $gates.replicas "port" $gates.ports.udp) }}
+# Peers address each gate by its stable pod name; the headless Service
+# publishes every pod's record as soon as it has an IP, ready or not, so
+# peers resolve each other while the tier boots.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyperscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gate
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "hyperscale.componentSelectorLabels" $selector | nindent 4 }}
+  ports:
+    - name: tcp
+      port: {{ $gates.ports.tcp }}
+      protocol: TCP
+    - name: swim
+      port: {{ $gates.ports.udp }}
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyperscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gate
+spec:
+  serviceName: {{ $name }}
+  replicas: {{ $gates.replicas }}
+  # Gates start together and find each other; ordered start would make
+  # gate-1 wait on gate-0's readiness for nothing.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "hyperscale.componentSelectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hyperscale.componentSelectorLabels" $selector | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      # The StatefulSet gives each pod hostname <pod> and subdomain
+      # <service>, which puts its FQDN in /etc/hosts: the gate binds the
+      # name it advertises from its first instant.
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ add .Values.shutdownTimeoutSeconds .Values.terminationGraceMargin }}
+      containers:
+        - name: gate
+          image: {{ include "hyperscale.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          workingDir: /home/hyperscale/run
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MERCURY_SYNC_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hyperscale.secretName" . }}
+                  key: {{ .Values.clusterSecret.key }}
+            {{- range $envName, $envValue := .Values.env }}
+            - name: {{ $envName }}
+              value: {{ $envValue | quote }}
+            {{- end }}
+          args:
+            - run
+            - gate
+            - --host
+            - "$(POD_NAME).{{ $name }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}"
+            - --tcp-port
+            - {{ $gates.ports.tcp | quote }}
+            - --udp-port
+            - {{ $gates.ports.udp | quote }}
+            - --datacenter
+            - {{ $gates.datacenter | quote }}
+            - --data-directory
+            - /var/lib/hyperscale
+            - --boot-timeout
+            - "{{ .Values.bootTimeoutSeconds }}s"
+            - --shutdown-timeout
+            - "{{ .Values.shutdownTimeoutSeconds }}s"
+            - --log-level
+            - {{ .Values.logLevel | quote }}
+            {{- if gt (int $gates.replicas) 1 }}
+            - --gates
+            {{- range splitList " " $gateTcp }}
+            - {{ . | quote }}
+            {{- end }}
+            - --gate-udp
+            {{- range splitList " " $gateUdp }}
+            - {{ . | quote }}
+            {{- end }}
+            {{- end }}
+          ports:
+            - name: tcp
+              containerPort: {{ $gates.ports.tcp }}
+              protocol: TCP
+            - name: swim
+              containerPort: {{ $gates.ports.udp }}
+              protocol: UDP
+          readinessProbe:
+            tcpSocket:
+              port: tcp
+            periodSeconds: 5
+          startupProbe:
+            tcpSocket:
+              port: tcp
+            periodSeconds: 5
+            failureThreshold: {{ div .Values.bootTimeoutSeconds 5 }}
+          {{- with $gates.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyperscale
+            - name: run
+              mountPath: /home/hyperscale/run
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with $gates.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $gates.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $gates.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $gates.persistence.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $gates.persistence.size }}

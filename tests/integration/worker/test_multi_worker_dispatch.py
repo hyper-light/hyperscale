@@ -1,79 +1,71 @@
-#!/usr/bin/env python3
 """
-Multi-Worker Workflow Dispatch Integration Test.
+A job of four workflows on two 4-core workers under a three-manager
+datacenter, submitted by a client straight to the managers (no gates):
 
-Tests workflow dependency execution and core allocation:
+- the two workflows with no dependencies run together, while both
+  dependents wait pending;
+- the dependent of the short workflow is dispatched once that workflow
+  completes, while the long one still runs and the dependent of both
+  still waits;
+- the dependent of both is dispatched once the long workflow completes;
+- every workflow completes, the client is pushed each workflow's result
+  and windowed progress stats for both independent workflows, and the
+  client's job result holds all four workflow results.
 
-1. TestWorkflow and TestWorkflowTwo execute concurrently, each getting half
-   the available cores (4 cores each on 2 workers with 4 cores each)
-
-2. NonTestWorkflow depends on TestWorkflowTwo - should be enqueued until
-   TestWorkflowTwo completes, then get assigned to freed cores
-
-3. NonTestWorkflowTwo depends on BOTH TestWorkflow and TestWorkflowTwo -
-   should remain enqueued until both complete
-
-This validates:
-- Dependency-based workflow scheduling
-- Core allocation (test workflows split cores evenly)
-- Enqueued/pending state for dependent workflows
-- Eager dispatch when dependencies complete
-- Aggregate workflow results pushed to client (WorkflowResultPush)
-- Stats updates pushed to client (JobStatusPush)
-- Job's workflow_results dict populated with all workflow results
+The two independent workflows call https://httpbin.org/get, so the test
+needs outbound network access.
 """
 
 import asyncio
-import sys
-import os
-import time
+import pathlib
+from collections.abc import Collection
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-from hyperscale.graph import Workflow, step, depends
-from hyperscale.testing import URL, HTTPResponse
-from hyperscale.distributed.nodes.manager import ManagerServer
-from hyperscale.distributed.nodes.worker import WorkerServer
-from hyperscale.distributed.nodes.client import HyperscaleClient
-from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.jobs import WindowedStatsPush
-from hyperscale.logging.config.logging_config import LoggingConfig
+from hyperscale.distributed.models import JobStatusPush, WorkflowResultPush, WorkflowStatus, WorkflowStatusInfo
+from hyperscale.distributed.nodes import HyperscaleClient, WorkerServer
+from hyperscale.graph import Workflow, depends, step
+from hyperscale.testing import URL, HTTPResponse
+from tests.integration.in_process_nodes import (
+    LOCALHOST,
+    node_env,
+    reserve_cluster_ports,
+    wait_until,
+)
+from tests.integration.worker.worker_cluster import (
+    WORKER_REGISTRATION_SECONDS,
+    new_manager_cluster,
+    running_cluster,
+)
 
-# Initialize logging directory (required for server pool)
-_logging_config = LoggingConfig()
-_logging_config.update(log_directory=os.getcwd())
 
-
-# ==========================================================================
-# Test Workflows
-# ==========================================================================
-
-class TestWorkflow(Workflow):
+class LongHttpWorkflow(Workflow):
     vus = 2000
     duration = "20s"
 
     @step()
     async def get_httpbin(
         self,
-        url: URL = 'https://httpbin.org/get',
+        url: URL = "https://httpbin.org/get",
     ) -> HTTPResponse:
         return await self.client.http.get(url)
 
-class TestWorkflowTwo(Workflow):
+
+class ShortHttpWorkflow(Workflow):
     vus = 500
     duration = "5s"
 
     @step()
     async def get_httpbin(
         self,
-        url: URL = 'https://httpbin.org/get',
+        url: URL = "https://httpbin.org/get",
     ) -> HTTPResponse:
         return await self.client.http.get(url)
 
-@depends('TestWorkflowTwo')
-class NonTestWorkflow(Workflow):
-    """Second workflow that should wait for first to complete."""
+
+@depends("ShortHttpWorkflow")
+class DependsOnShortWorkflow(Workflow):
+    """Waits for ShortHttpWorkflow to complete."""
+
     vus = 100
     duration = "3s"
 
@@ -81,9 +73,11 @@ class NonTestWorkflow(Workflow):
     async def second_step(self) -> dict:
         return {"status": "done"}
 
-@depends('TestWorkflow', 'TestWorkflowTwo')
-class NonTestWorkflowTwo(Workflow):
-    """Second workflow that should wait for first to complete."""
+
+@depends("LongHttpWorkflow", "ShortHttpWorkflow")
+class DependsOnBothWorkflow(Workflow):
+    """Waits for both LongHttpWorkflow and ShortHttpWorkflow to complete."""
+
     vus = 100
     duration = "3s"
 
@@ -91,567 +85,194 @@ class NonTestWorkflowTwo(Workflow):
     async def second_step(self) -> dict:
         return {"status": "done"}
 
-# ==========================================================================
-# Configuration
-# ==========================================================================
 
-DC_ID = "DC-EAST"
-
-# Manager configuration - 3 managers for quorum
-MANAGER_CONFIGS = [
-    {"name": "Manager 1", "tcp": 9000, "udp": 9001},
-    {"name": "Manager 2", "tcp": 9002, "udp": 9003},
-    {"name": "Manager 3", "tcp": 9004, "udp": 9005},
-]
-
-# Worker configuration - 4 workers
-WORKER_CONFIGS = [
-    {"name": "Worker 1", "tcp": 9200, "udp": 9250, "cores": 4},
-    {"name": "Worker 2", "tcp": 9300, "udp": 9350, "cores": 4},
-]
-
-# Client configuration
-CLIENT_CONFIG = {"tcp": 9630}
-
-MANAGER_STABILIZATION_TIME = 15  # seconds for manager to start
-WORKER_REGISTRATION_TIME = 15  # seconds for workers to register
-
-
-def get_all_manager_tcp_addrs() -> list[tuple[str, int]]:
-    """Get TCP addresses of all managers."""
-    return [('127.0.0.1', cfg['tcp']) for cfg in MANAGER_CONFIGS]
+DATACENTER_ID = "DC-EAST"
+MANAGER_COUNT = 3
+WORKER_CORES = [4, 4]
+LOG_LEVEL = "error"
+NODE_REQUEST_TIMEOUT = "5s"
+CLIENT_REQUEST_TIMEOUT = "10s"
+JOB_TIMEOUT_SECONDS = 120.0
+CLIENT_STOP_SECONDS = 30.0
+INDEPENDENT_WORKFLOWS = ["LongHttpWorkflow", "ShortHttpWorkflow"]
+DEPENDENT_WORKFLOWS = ["DependsOnShortWorkflow", "DependsOnBothWorkflow"]
+ALL_WORKFLOWS = [*INDEPENDENT_WORKFLOWS, *DEPENDENT_WORKFLOWS]
+DISPATCHED_STATUSES = {WorkflowStatus.RUNNING.value, WorkflowStatus.ASSIGNED.value}
+DISPATCHED_OR_DONE_STATUSES = {*DISPATCHED_STATUSES, WorkflowStatus.COMPLETED.value}
+PENDING_STATUSES = {WorkflowStatus.PENDING.value}
+COMPLETED_STATUSES = {WorkflowStatus.COMPLETED.value}
+# The script this test replaces waited 2 s for dispatch to begin and 1 s
+# for each dependent's eager dispatch; each wait here ends once the
+# statuses hold, within these bounds.
+DISPATCH_SECONDS = 10.0
+# The script polled up to 60 s for each workflow to complete.
+COMPLETION_SECONDS = 60.0
+PUSH_DELIVERY_SECONDS = 10.0
+STATUS_POLL_SECONDS = 1.0
 
 
-def get_manager_peer_tcp_addrs(exclude_port: int) -> list[tuple[str, int]]:
-    """Get TCP addresses of all managers except the one with exclude_port."""
-    return [
-        ('127.0.0.1', cfg['tcp'])
-        for cfg in MANAGER_CONFIGS
-        if cfg['tcp'] != exclude_port
+async def wait_for_workflow_statuses(
+    client: HyperscaleClient,
+    job_id: str,
+    expected_statuses: dict[str, Collection[str]],
+    within_seconds: float,
+) -> dict[str, WorkflowStatusInfo]:
+    """Poll the managers until each named workflow's status is one of its
+    expected statuses; the statuses of the last poll. Fails naming the
+    statuses last seen if they do not all hold within ``within_seconds``."""
+    deadline = asyncio.get_running_loop().time() + within_seconds
+    while True:
+        results = await client.query_workflows(list(expected_statuses), job_id=job_id)
+        statuses_by_name = {
+            workflow.workflow_name: workflow
+            for datacenter_workflows in results.values()
+            for workflow in datacenter_workflows
+        }
+        if all(
+            name in statuses_by_name and statuses_by_name[name].status in allowed
+            for name, allowed in expected_statuses.items()
+        ):
+            return statuses_by_name
+        last_seen = {name: workflow.status for name, workflow in statuses_by_name.items()}
+        assert asyncio.get_running_loop().time() < deadline, (
+            f"workflow statuses did not reach {expected_statuses} within {within_seconds}s; last seen: {last_seen}"
+        )
+        await asyncio.sleep(STATUS_POLL_SECONDS)
+
+
+async def test_dependent_workflows_dispatch_as_their_dependencies_complete(node_directory: pathlib.Path) -> None:
+    # The client binds a TCP/UDP pair like a manager: one more node block.
+    node_tcp_ports, worker_tcp_ports = reserve_cluster_ports(MANAGER_COUNT + 1, WORKER_CORES)
+    *manager_tcp_ports, client_tcp_port = node_tcp_ports
+    managers = new_manager_cluster(
+        node_directory,
+        DATACENTER_ID,
+        manager_tcp_ports,
+        MERCURY_SYNC_LOG_LEVEL=LOG_LEVEL,
+        MERCURY_SYNC_REQUEST_TIMEOUT=NODE_REQUEST_TIMEOUT,
+    )
+    manager_addresses = [(LOCALHOST, manager._tcp_port) for manager in managers]
+    workers = [
+        WorkerServer(
+            host=LOCALHOST,
+            tcp_port=worker_tcp_port,
+            udp_port=worker_tcp_port + 1,
+            env=node_env(
+                node_directory,
+                MERCURY_SYNC_LOG_LEVEL=LOG_LEVEL,
+                MERCURY_SYNC_REQUEST_TIMEOUT=NODE_REQUEST_TIMEOUT,
+                WORKER_MAX_CORES=worker_cores,
+            ),
+            dc_id=DATACENTER_ID,
+            seed_managers=manager_addresses,
+        )
+        for worker_tcp_port, worker_cores in zip(worker_tcp_ports, WORKER_CORES, strict=True)
     ]
 
+    status_pushes: list[JobStatusPush] = []
+    progress_pushes: list[WindowedStatsPush] = []
+    workflow_result_statuses: dict[str, str] = {}
 
-def get_manager_peer_udp_addrs(exclude_port: int) -> list[tuple[str, int]]:
-    """Get UDP addresses of all managers except the one with exclude_port."""
-    return [
-        ('127.0.0.1', cfg['udp'])
-        for cfg in MANAGER_CONFIGS
-        if cfg['udp'] != exclude_port
-    ]
+    def on_workflow_result(push: WorkflowResultPush) -> None:
+        workflow_result_statuses[push.workflow_name] = push.status
 
-
-async def run_test():
-    """Run the multi-worker dispatch integration test."""
-
-    managers: list[ManagerServer] = []
-    workers: list[WorkerServer] = []
-    client: HyperscaleClient | None = None
-
-    # Container for tracking push notifications (avoids nonlocal anti-pattern)
-    counters: dict[str, int | dict] = {
-        'status_updates': 0,
-        'progress_updates': 0,
-        'workflow_results': {},  # workflow_name -> status
-        'workflow_progress_counts': {},  # workflow_name -> update count
-    }
-
-    def on_status_update(push):
-        """Callback for critical status updates (job status changes)."""
-        counters['status_updates'] += 1
-
-    def on_progress_update(push: WindowedStatsPush):
-        """Callback for streaming windowed stats updates."""
-        counters['progress_updates'] += 1
-        # Track per-workflow progress updates
-        workflow_name = push.workflow_name
-        if workflow_name:
-            progress_counts = counters['workflow_progress_counts']
-            progress_counts[workflow_name] = progress_counts.get(workflow_name, 0) + 1
-
-    def on_workflow_result(push):
-        """Callback for workflow completion results."""
-        counters['workflow_results'][push.workflow_name] = push.status
-
-    try:
-        # ==============================================================
-        # STEP 1: Create servers
-        # ==============================================================
-        print("[1/8] Creating servers...")
-        print("-" * 60)
-
-        # Create managers with peer configuration for quorum
-        for config in MANAGER_CONFIGS:
-            manager = ManagerServer(
-                host='127.0.0.1',
-                tcp_port=config["tcp"],
-                udp_port=config["udp"],
-                env=Env(
-                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
-                    MERCURY_SYNC_LOG_LEVEL="error",
-                ),
-                dc_id=DC_ID,
-                manager_peers=get_manager_peer_tcp_addrs(config["tcp"]),
-                manager_udp_peers=get_manager_peer_udp_addrs(config["udp"]),
-            )
-            managers.append(manager)
-            print(f"  Created {config['name']} (TCP:{config['tcp']} UDP:{config['udp']})")
-
-        # Create workers
-        seed_managers = get_all_manager_tcp_addrs()
-
-        for config in WORKER_CONFIGS:
-            worker = WorkerServer(
-                host='127.0.0.1',
-                tcp_port=config["tcp"],
-                udp_port=config["udp"],
-                env=Env(
-                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
-                    MERCURY_SYNC_LOG_LEVEL="error",
-                    WORKER_MAX_CORES=config["cores"],
-                ),
-                dc_id=DC_ID,
-                seed_managers=seed_managers,
-            )
-            workers.append(worker)
-            print(f"  Created {config['name']} (TCP:{config['tcp']} UDP:{config['udp']}, {config['cores']} cores)")
-
-        print()
-
-        # ==============================================================
-        # STEP 2: Start managers (concurrently for proper cluster formation)
-        # ==============================================================
-        print("[2/8] Starting managers...")
-        print("-" * 60)
-
-        # Start all managers concurrently - critical for proper SWIM cluster
-        # formation and leader election timing
-        start_tasks = [manager.start() for manager in managers]
-        await asyncio.gather(*start_tasks)
-
-        for i, manager in enumerate(managers):
-            config = MANAGER_CONFIGS[i]
-            print(f"  Started {config['name']} - Node ID: {manager._node_id.short}")
-
-        print(f"\n  Waiting for manager stabilization ({MANAGER_STABILIZATION_TIME}s)...")
-        await asyncio.sleep(MANAGER_STABILIZATION_TIME)
-        print()
-
-        # ==============================================================
-        # STEP 3: Start workers
-        # ==============================================================
-        print("[3/8] Starting workers...")
-        print("-" * 60)
-
-        start_tasks = [worker.start() for worker in workers]
-        await asyncio.gather(*start_tasks)
-
-        for i, worker in enumerate(workers):
-            config = WORKER_CONFIGS[i]
-            print(f"  Started {config['name']} - Node ID: {worker._node_id.short}")
-
-        print(f"\n  Waiting for worker registration ({WORKER_REGISTRATION_TIME}s)...")
-        await asyncio.sleep(WORKER_REGISTRATION_TIME)
-
-        # Verify workers registered
-        for idx, manager in enumerate(managers):
-            registered_workers = len(manager._workers)
-            registered_managers = len(manager._get_active_manager_peer_addrs())
-            total_cores = manager._get_total_available_cores()
-            print(f'  Registered managers for manager {idx}: {registered_managers}')
-            print(f"  Registered workers for manager {idx}: {registered_workers}")
-            print(f"  Total available cores for manager {idx}: {total_cores}")
-
-
-        print()
-
-        # ==============================================================
-        # STEP 4: Create client
-        # ==============================================================
-        print("[4/8] Creating client...")
-        print("-" * 60)
+    async with running_cluster(managers, workers):
+        worker_ids = {worker._node_id.full for worker in workers}
+        await wait_until(
+            lambda: all(set(manager._manager_state.get_all_workers()) == worker_ids for manager in managers),
+            within_seconds=WORKER_REGISTRATION_SECONDS,
+            description=f"every manager tracking both workers ({sum(WORKER_CORES)} cores)",
+        )
 
         client = HyperscaleClient(
-            host='127.0.0.1',
-            port=CLIENT_CONFIG["tcp"],
-            env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='10s'),
-            managers=get_all_manager_tcp_addrs(),  # Direct to manager (no gates)
+            host=LOCALHOST,
+            port=client_tcp_port,
+            env=node_env(node_directory, MERCURY_SYNC_REQUEST_TIMEOUT=CLIENT_REQUEST_TIMEOUT),
+            managers=manager_addresses,
         )
-        await client.start()
-        print(f"  Client started on port {CLIENT_CONFIG['tcp']}")
-        print()
-
-        # ==============================================================
-        # STEP 5: Submit job with all workflows
-        # ==============================================================
-        print("[5/10] Submitting job with all 4 workflows...")
-        print("-" * 60)
-
-        job_id = await client.submit_job(
-            workflows=[([], TestWorkflow()), ([], TestWorkflowTwo()), (["TestWorkflowTwo"],NonTestWorkflow()), (["TestWorkflow", "TestWorkflowTwo"], NonTestWorkflowTwo())],
-            timeout_seconds=120.0,
-            on_status_update=on_status_update,
-            on_workflow_result=on_workflow_result,
-            on_progress_update=on_progress_update,
-        )
-        print(f"  Job submitted: {job_id}")
-
-        # Wait a moment for dispatch to begin
-        await asyncio.sleep(2)
-
-        # ==============================================================
-        # STEP 6: Verify initial state - test workflows running, dependent workflows pending
-        # ==============================================================
-        print()
-        print("[6/10] Verifying initial workflow state...")
-        print("-" * 60)
-
-        all_workflow_names = ['TestWorkflow', 'TestWorkflowTwo', 'NonTestWorkflow', 'NonTestWorkflowTwo']
-
-        # Helper to get workflow status by name
-        def get_workflow_by_name(results: dict, name: str):
-            for dc_id, workflows in results.items():
-                for wf in workflows:
-                    if wf.workflow_name == name:
-                        return wf
-            return None
-
-        # Query initial state
-        results = await client.query_workflows(all_workflow_names, job_id=job_id)
-        print(f"  Query returned {sum(len(wfs) for wfs in results.values())} workflows")
-
-        test_wf = get_workflow_by_name(results, 'TestWorkflow')
-        test_wf_two = get_workflow_by_name(results, 'TestWorkflowTwo')
-        non_test_wf = get_workflow_by_name(results, 'NonTestWorkflow')
-        non_test_wf_two = get_workflow_by_name(results, 'NonTestWorkflowTwo')
-
-        # Verify test workflows are running/assigned
-        test_wf_ok = test_wf and test_wf.status in ('running', 'assigned')
-        test_wf_two_ok = test_wf_two and test_wf_two.status in ('running', 'assigned')
-        print(f"  TestWorkflow: status={test_wf.status if test_wf else 'NOT FOUND'}, "
-              f"cores={test_wf.provisioned_cores if test_wf else 0}, "
-              f"workers={len(test_wf.assigned_workers) if test_wf else 0}")
-        print(f"  TestWorkflowTwo: status={test_wf_two.status if test_wf_two else 'NOT FOUND'}, "
-              f"cores={test_wf_two.provisioned_cores if test_wf_two else 0}, "
-              f"workers={len(test_wf_two.assigned_workers) if test_wf_two else 0}")
-
-        # Verify dependent workflows are pending/enqueued
-        non_test_pending = non_test_wf and non_test_wf.status == 'pending'
-        non_test_two_pending = non_test_wf_two and non_test_wf_two.status == 'pending'
-        print(f"  NonTestWorkflow: status={non_test_wf.status if non_test_wf else 'NOT FOUND'}, "
-              f"is_enqueued={non_test_wf.is_enqueued if non_test_wf else False}")
-        print(f"  NonTestWorkflowTwo: status={non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'}, "
-              f"is_enqueued={non_test_wf_two.is_enqueued if non_test_wf_two else False}")
-
-        initial_state_ok = test_wf_ok and test_wf_two_ok and non_test_pending and non_test_two_pending
-        print(f"\n  Initial state verification: {'PASS' if initial_state_ok else 'FAIL'}")
-
-        # ==============================================================
-        # STEP 7: Poll for TestWorkflowTwo to complete
-        # ==============================================================
-        print()
-        print("[7/10] Waiting for TestWorkflowTwo to complete...")
-        print("-" * 60)
-
-        test_wf_two_completed = False
-        for i in range(60):  # 60 second timeout
-            results = await client.query_workflows(['TestWorkflowTwo'], job_id=job_id)
-            test_wf_two = get_workflow_by_name(results, 'TestWorkflowTwo')
-
-            if test_wf_two and test_wf_two.status == 'completed':
-                test_wf_two_completed = True
-                print(f"  TestWorkflowTwo completed after {i+1}s")
-                break
-
-            # While waiting, verify dependent workflows remain pending
-            dep_results = await client.query_workflows(['NonTestWorkflow', 'NonTestWorkflowTwo'], job_id=job_id)
-            non_test_wf = get_workflow_by_name(dep_results, 'NonTestWorkflow')
-            non_test_wf_two = get_workflow_by_name(dep_results, 'NonTestWorkflowTwo')
-
-            if i % 5 == 0:  # Log every 5 seconds
-                print(f"  [{i}s] TestWorkflowTwo: {test_wf_two.status if test_wf_two else 'NOT FOUND'}, "
-                      f"NonTestWorkflow: {non_test_wf.status if non_test_wf else 'NOT FOUND'}, "
-                      f"NonTestWorkflowTwo: {non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'}")
-
-            await asyncio.sleep(1)
-
-        if not test_wf_two_completed:
-            print("  ERROR: TestWorkflowTwo did not complete in time")
-            return False
-
-        # ==============================================================
-        # STEP 8: Verify TestWorkflow still running, NonTestWorkflow assigned,
-        #         NonTestWorkflowTwo still pending
-        # ==============================================================
-        print()
-        print("[8/10] Verifying state after TestWorkflowTwo completed...")
-        print("-" * 60)
-
-        # Small delay for dispatch to happen
-        await asyncio.sleep(1)
-
-        results = await client.query_workflows(all_workflow_names, job_id=job_id)
-
-        test_wf = get_workflow_by_name(results, 'TestWorkflow')
-        non_test_wf = get_workflow_by_name(results, 'NonTestWorkflow')
-        non_test_wf_two = get_workflow_by_name(results, 'NonTestWorkflowTwo')
-
-        # TestWorkflow should still be running (longer duration)
-        test_wf_still_running = test_wf and test_wf.status in ('running', 'assigned')
-        print(f"  TestWorkflow: status={test_wf.status if test_wf else 'NOT FOUND'} "
-              f"(expected: running/assigned) {'PASS' if test_wf_still_running else 'FAIL'}")
-
-        # NonTestWorkflow should now be assigned/running (dependency on TestWorkflowTwo met)
-        non_test_assigned = non_test_wf and non_test_wf.status in ('running', 'assigned', 'completed')
-        print(f"  NonTestWorkflow: status={non_test_wf.status if non_test_wf else 'NOT FOUND'}, "
-              f"workers={non_test_wf.assigned_workers if non_test_wf else []} "
-              f"(expected: running/assigned) {'PASS' if non_test_assigned else 'FAIL'}")
-
-        # NonTestWorkflowTwo should still be pending (needs both TestWorkflow AND TestWorkflowTwo)
-        non_test_two_still_pending = non_test_wf_two and non_test_wf_two.status == 'pending'
-        print(f"  NonTestWorkflowTwo: status={non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'} "
-              f"(expected: pending) {'PASS' if non_test_two_still_pending else 'FAIL'}")
-
-        step8_ok = test_wf_still_running and non_test_assigned and non_test_two_still_pending
-        print(f"\n  Post-TestWorkflowTwo state: {'PASS' if step8_ok else 'FAIL'}")
-
-        # ==============================================================
-        # STEP 9: Wait for TestWorkflow to complete, verify NonTestWorkflowTwo gets assigned
-        # ==============================================================
-        print()
-        print("[9/10] Waiting for TestWorkflow to complete...")
-        print("-" * 60)
-
-        test_wf_completed = False
-        for i in range(60):  # 60 second timeout
-            results = await client.query_workflows(['TestWorkflow'], job_id=job_id)
-            test_wf = get_workflow_by_name(results, 'TestWorkflow')
-
-            if test_wf and test_wf.status == 'completed':
-                test_wf_completed = True
-                print(f"  TestWorkflow completed after {i+1}s")
-                break
-
-            if i % 5 == 0:
-                print(f"  [{i}s] TestWorkflow: {test_wf.status if test_wf else 'NOT FOUND'}")
-
-            await asyncio.sleep(1)
-
-        if not test_wf_completed:
-            print("  ERROR: TestWorkflow did not complete in time")
-            return False
-
-        # Small delay for dispatch
-        await asyncio.sleep(1)
-
-        # Verify NonTestWorkflowTwo is now assigned
-        results = await client.query_workflows(['NonTestWorkflowTwo'], job_id=job_id)
-        non_test_wf_two = get_workflow_by_name(results, 'NonTestWorkflowTwo')
-
-        non_test_two_assigned = non_test_wf_two and non_test_wf_two.status in ('running', 'assigned', 'completed')
-        print(f"  NonTestWorkflowTwo: status={non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'}, "
-              f"workers={non_test_wf_two.assigned_workers if non_test_wf_two else []} "
-              f"(expected: running/assigned) {'PASS' if non_test_two_assigned else 'FAIL'}")
-
-        # ==============================================================
-        # STEP 10: Wait for all remaining workflows to complete
-        # ==============================================================
-        print()
-        print("[10/10] Waiting for NonTestWorkflow and NonTestWorkflowTwo to complete...")
-        print("-" * 60)
-
-        all_complete = False
-        for i in range(60):
-            results = await client.query_workflows(['NonTestWorkflow', 'NonTestWorkflowTwo'], job_id=job_id)
-            non_test_wf = get_workflow_by_name(results, 'NonTestWorkflow')
-            non_test_wf_two = get_workflow_by_name(results, 'NonTestWorkflowTwo')
-
-            non_test_done = non_test_wf and non_test_wf.status == 'completed'
-            non_test_two_done = non_test_wf_two and non_test_wf_two.status == 'completed'
-
-            if non_test_done and non_test_two_done:
-                all_complete = True
-                print(f"  All workflows completed after {i+1}s")
-                break
-
-            if i % 5 == 0:
-                print(f"  [{i}s] NonTestWorkflow: {non_test_wf.status if non_test_wf else 'NOT FOUND'}, "
-                      f"NonTestWorkflowTwo: {non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'}")
-
-            await asyncio.sleep(1)
-
-        if not all_complete:
-            print("  WARNING: Not all workflows completed in time")
-
-        # ==============================================================
-        # STEP 11: Verify aggregate results and stats updates
-        # ==============================================================
-        print()
-        print("[11/11] Verifying aggregate results and stats updates...")
-        print("-" * 60)
-
-        # Give a moment for any final push notifications
-        await asyncio.sleep(1)
-
-        # Check workflow results received via callback
-        expected_workflows = {'TestWorkflow', 'TestWorkflowTwo', 'NonTestWorkflow', 'NonTestWorkflowTwo'}
-        workflow_results_received = counters['workflow_results']
-        received_workflows = set(workflow_results_received.keys())
-
-        workflow_results_ok = received_workflows == expected_workflows
-        print(f"  Workflow results received: {len(workflow_results_received)}/4")
-        for workflow_name, status in sorted(workflow_results_received.items()):
-            print(f"    - {workflow_name}: {status}")
-
-        if not workflow_results_ok:
-            missing = expected_workflows - received_workflows
-            extra = received_workflows - expected_workflows
-            if missing:
-                print(f"  Missing workflow results: {missing}")
-            if extra:
-                print(f"  Unexpected workflow results: {extra}")
-
-        print(f"  Workflow results verification: {'PASS' if workflow_results_ok else 'FAIL'}")
-
-        # Check streaming progress updates received (windowed stats)
-        progress_updates_received = counters['progress_updates']
-        progress_updates_ok = progress_updates_received > 0
-        print(f"\n  Progress updates received (windowed stats): {progress_updates_received}")
-        print(f"  Progress updates verification (>0): {'PASS' if progress_updates_ok else 'FAIL'}")
-
-        # Check per-workflow progress updates (should have stats for test workflows)
-        # Test workflows (TestWorkflow, TestWorkflowTwo) run longer and should have progress
-        workflow_progress_counts = counters['workflow_progress_counts']
-        test_workflow_progress_ok = (
-            workflow_progress_counts.get('TestWorkflow', 0) > 0 and
-            workflow_progress_counts.get('TestWorkflowTwo', 0) > 0
-        )
-        print(f"\n  Per-workflow progress updates:")
-        for workflow_name in ['TestWorkflow', 'TestWorkflowTwo', 'NonTestWorkflow', 'NonTestWorkflowTwo']:
-            count = workflow_progress_counts.get(workflow_name, 0)
-            print(f"    - {workflow_name}: {count} updates")
-        print(f"  Test workflow progress verification (both > 0): {'PASS' if test_workflow_progress_ok else 'FAIL'}")
-
-        # Also check the job result's workflow_results dict
-        job_result = client.get_job_status(job_id)
-        job_workflow_results_ok = False
-        if job_result:
-            job_workflow_results = set(job_result.workflow_results.keys())
-            # workflow_results is keyed by workflow_id, not name, so check count
-            job_workflow_results_ok = len(job_result.workflow_results) == 4
-            print(f"\n  Job result workflow_results count: {len(job_result.workflow_results)}/4")
-            for workflow_id, wf_result in sorted(job_result.workflow_results.items()):
-                print(f"    - {wf_result.workflow_name} ({workflow_id}): {wf_result.status}")
-            print(f"  Job workflow_results verification: {'PASS' if job_workflow_results_ok else 'FAIL'}")
-
-        # ==============================================================
-        # Final Results
-        # ==============================================================
-        print()
-        print("=" * 70)
-        all_passed = (
-            initial_state_ok and
-            step8_ok and
-            non_test_two_assigned and
-            all_complete and
-            workflow_results_ok and
-            progress_updates_ok and
-            test_workflow_progress_ok and
-            job_workflow_results_ok
-        )
-
-        if all_passed:
-            print("TEST RESULT: PASSED")
-        else:
-            print("TEST RESULT: FAILED")
-
-        print()
-        print("  Test Summary:")
-        print(f"    - Initial state (test wfs running, deps pending): {'PASS' if initial_state_ok else 'FAIL'}")
-        print(f"    - After TestWorkflowTwo done (NonTestWorkflow assigned): {'PASS' if step8_ok else 'FAIL'}")
-        print(f"    - After TestWorkflow done (NonTestWorkflowTwo assigned): {'PASS' if non_test_two_assigned else 'FAIL'}")
-        print(f"    - All workflows completed: {'PASS' if all_complete else 'FAIL'}")
-        print(f"    - Workflow results pushed to client (4/4): {'PASS' if workflow_results_ok else 'FAIL'}")
-        print(f"    - Progress updates received (>0): {'PASS' if progress_updates_ok else 'FAIL'}")
-        print(f"    - Test workflow progress stats (both > 0): {'PASS' if test_workflow_progress_ok else 'FAIL'}")
-        print(f"    - Job workflow_results populated: {'PASS' if job_workflow_results_ok else 'FAIL'}")
-        print()
-        print("=" * 70)
-
-        return all_passed
-
-    except Exception as e:
-        import traceback
-        print(f"\nTest failed with exception: {e}")
-        traceback.print_exc()
-        return False
-
-    finally:
-        # ==============================================================
-        # Cleanup
-        # ==============================================================
-        print()
-        print("Cleaning up...")
-        print("-" * 60)
-
-        # Stop client
-        if client:
-            try:
-                await client.stop()
-                print("  Client stopped")
-            except Exception as e:
-                print(f"  Client stop failed: {e}")
-
-        # Stop workers
-        for i, worker in enumerate(workers):
-            try:
-                await worker.stop(drain_timeout=0.5, broadcast_leave=False)
-                print(f"  {WORKER_CONFIGS[i]['name']} stopped")
-            except Exception as e:
-                print(f"  {WORKER_CONFIGS[i]['name']} stop failed: {e}")
-
-        # Stop managers
-        for i, manager in enumerate(managers):
-            try:
-                await manager.stop(drain_timeout=0.5, broadcast_leave=False)
-                print(f"  {MANAGER_CONFIGS[i]['name']} stopped")
-            except Exception as e:
-                print(f"  {MANAGER_CONFIGS[i]['name']} stop failed: {e}")
-
-        print()
-        print("Test complete.")
-        print("=" * 70)
-
-
-def main():
-    print("=" * 70)
-    print("WORKFLOW DEPENDENCY & CORE ALLOCATION TEST")
-    print("=" * 70)
-    print()
-    print("This test validates:")
-    print("  1. TestWorkflow and TestWorkflowTwo run concurrently (split cores)")
-    print("  2. NonTestWorkflow (depends on TestWorkflowTwo) waits, then runs")
-    print("  3. NonTestWorkflowTwo (depends on BOTH) waits for both to complete")
-    print("  4. Dependency-based scheduling triggers eager dispatch")
-    print("  5. Workflow results are pushed to client for each completed workflow")
-    print("  6. Windowed progress updates are streamed to client (>0 received)")
-    print("  7. Per-workflow progress stats received for both test workflows")
-    print("  8. Job's workflow_results dict is populated with all 4 workflow results")
-    print()
-    print("Workflow dependencies:")
-    print("  - TestWorkflow: no dependencies")
-    print("  - TestWorkflowTwo: no dependencies")
-    print("  - NonTestWorkflow: depends on TestWorkflowTwo")
-    print("  - NonTestWorkflowTwo: depends on TestWorkflow AND TestWorkflowTwo")
-    print()
-    print(f"Configuration:")
-    print(f"  - {len(MANAGER_CONFIGS)} manager(s)")
-    print(f"  - {len(WORKER_CONFIGS)} workers ({sum(c['cores'] for c in WORKER_CONFIGS)} total cores)")
-    print(f"  - Datacenter: {DC_ID}")
-    print()
-
-    success = asyncio.run(run_test())
-    sys.exit(0 if success else 1)
-
-
-if __name__ == "__main__":
-    main()
+        try:
+            await client.start()
+            job_id = await client.submit_job(
+                workflows=[
+                    ([], LongHttpWorkflow()),
+                    ([], ShortHttpWorkflow()),
+                    (["ShortHttpWorkflow"], DependsOnShortWorkflow()),
+                    (["LongHttpWorkflow", "ShortHttpWorkflow"], DependsOnBothWorkflow()),
+                ],
+                timeout_seconds=JOB_TIMEOUT_SECONDS,
+                on_status_update=status_pushes.append,
+                on_workflow_result=on_workflow_result,
+                on_progress_update=progress_pushes.append,
+            )
+
+            # Both independent workflows run together; both dependents wait.
+            initial_statuses = await wait_for_workflow_statuses(
+                client,
+                job_id,
+                {
+                    **{name: DISPATCHED_STATUSES for name in INDEPENDENT_WORKFLOWS},
+                    **{name: PENDING_STATUSES for name in DEPENDENT_WORKFLOWS},
+                },
+                within_seconds=DISPATCH_SECONDS,
+            )
+            enqueued_dependents = {name: initial_statuses[name].is_enqueued for name in DEPENDENT_WORKFLOWS}
+            assert all(enqueued_dependents.values()), f"pending dependents should be enqueued: {enqueued_dependents}"
+
+            # The short workflow completes: its dependent is dispatched, the
+            # long workflow still runs, the dependent of both still waits.
+            await wait_for_workflow_statuses(
+                client, job_id, {"ShortHttpWorkflow": COMPLETED_STATUSES}, within_seconds=COMPLETION_SECONDS
+            )
+            await wait_for_workflow_statuses(
+                client, job_id, {"DependsOnShortWorkflow": DISPATCHED_OR_DONE_STATUSES}, within_seconds=DISPATCH_SECONDS
+            )
+            await wait_for_workflow_statuses(
+                client,
+                job_id,
+                {"LongHttpWorkflow": DISPATCHED_STATUSES, "DependsOnBothWorkflow": PENDING_STATUSES},
+                within_seconds=0.0,
+            )
+
+            # The long workflow completes: the dependent of both is dispatched.
+            await wait_for_workflow_statuses(
+                client, job_id, {"LongHttpWorkflow": COMPLETED_STATUSES}, within_seconds=COMPLETION_SECONDS
+            )
+            await wait_for_workflow_statuses(
+                client, job_id, {"DependsOnBothWorkflow": DISPATCHED_OR_DONE_STATUSES}, within_seconds=DISPATCH_SECONDS
+            )
+
+            await wait_for_workflow_statuses(
+                client,
+                job_id,
+                {name: COMPLETED_STATUSES for name in DEPENDENT_WORKFLOWS},
+                within_seconds=COMPLETION_SECONDS,
+            )
+
+            await wait_until(
+                lambda: set(workflow_result_statuses) >= set(ALL_WORKFLOWS),
+                within_seconds=PUSH_DELIVERY_SECONDS,
+                description="a workflow result pushed to the client for each of the four workflows",
+            )
+            assert set(workflow_result_statuses) == set(ALL_WORKFLOWS), (
+                f"workflow results pushed for {sorted(workflow_result_statuses)}, expected {sorted(ALL_WORKFLOWS)}"
+            )
+
+            assert len(progress_pushes) > 0, "no windowed progress stats were pushed to the client"
+            progress_push_counts = {
+                name: sum(1 for push in progress_pushes if push.workflow_name == name) for name in ALL_WORKFLOWS
+            }
+            assert all(progress_push_counts[name] > 0 for name in INDEPENDENT_WORKFLOWS), (
+                f"both independent workflows should have pushed progress stats: {progress_push_counts}"
+            )
+
+            job_result = client.get_job_status(job_id)
+            assert job_result is not None, f"the client holds no result for job {job_id}"
+            job_workflow_results = {
+                workflow_id: (result.workflow_name, result.status)
+                for workflow_id, result in job_result.workflow_results.items()
+            }
+            assert len(job_workflow_results) == len(ALL_WORKFLOWS), (
+                f"the job result should hold {len(ALL_WORKFLOWS)} workflow results, got {job_workflow_results}"
+            )
+        finally:
+            await asyncio.wait_for(client.stop(), timeout=CLIENT_STOP_SECONDS)

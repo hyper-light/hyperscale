@@ -2,8 +2,9 @@
 Integration tests for Raft node integration (Phase 5).
 
 Tests that ManagerRaftIntegration and GateRaftIntegration correctly
-wire Raft consensus into the server lifecycle, TCP handlers, and
-SWIM membership callbacks.
+wire Raft consensus into the server lifecycle, TCP handlers, and the
+cluster membership group (AD-52 slice C) that job groups take their
+members from.
 """
 
 import asyncio
@@ -12,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
+from hyperscale.distributed.ledger.job_ledger_replica import JobLedgerReplica
 from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
 from hyperscale.distributed.nodes.gate.raft_integration import GateRaftIntegration
 from hyperscale.distributed.nodes.manager.raft_integration import ManagerRaftIntegration
@@ -21,6 +24,7 @@ from hyperscale.distributed.raft.models import (
     RequestVote,
     RequestVoteResponse,
 )
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 # =========================================================================
@@ -71,20 +75,32 @@ def mock_send_tcp():
 
 
 @pytest.fixture
+def cluster_members_view():
+    """The cluster's committed membership as the integration reads it --
+    replaced whole when it changes, as ``ClusterMembership.node_addresses``
+    is. Only this node until the cluster forms."""
+    return [{"node-1": ("127.0.0.1", 8000)}]
+
+
+@pytest.fixture
 def manager_integration(
     mock_job_manager,
     leadership_tracker,
     mock_logger,
     mock_task_runner,
     mock_send_tcp,
+    cluster_members_view,
 ):
     return ManagerRaftIntegration(
+        cluster_members=lambda: cluster_members_view[0],
+        clock=new_hybrid_logical_clock(),
+        may_lead=lambda: True,
+        ledger_replica=JobLedgerReplica(),
+        request_timeout_seconds=5.0,
         node_id="node-1",
-        job_manager=mock_job_manager,
-        leadership_tracker=leadership_tracker,
         logger=mock_logger,
         task_runner=mock_task_runner,
-        send_tcp=mock_send_tcp,
+        send_tcp=mock_send_tcp, storage=VolatileRaftStorage()
     )
 
 
@@ -96,15 +112,20 @@ def gate_integration(
     mock_logger,
     mock_task_runner,
     mock_send_tcp,
+    cluster_members_view,
 ):
     return GateRaftIntegration(
+        cluster_members=lambda: cluster_members_view[0],
+        clock=new_hybrid_logical_clock(),
+        may_lead=lambda: True,
+        ledger_replica=JobLedgerReplica(),
+        request_timeout_seconds=5.0,
+        cluster_size=lambda: 3,
+        proposal_timeout_seconds=5.0,
         node_id="node-1",
-        job_manager=mock_gate_job_manager,
-        leadership_tracker=leadership_tracker,
-        gate_state=mock_gate_state,
         logger=mock_logger,
         task_runner=mock_task_runner,
-        send_tcp=mock_send_tcp,
+        send_tcp=mock_send_tcp, storage=VolatileRaftStorage()
     )
 
 
@@ -122,48 +143,43 @@ class TestManagerRaftIntegration:
         assert consensus is not None
         assert consensus._node_id == "node-1"
 
-    def test_raft_job_manager_property(self, manager_integration: ManagerRaftIntegration) -> None:
-        """Raft job manager property returns the wrapper."""
-        raft_jm = manager_integration.raft_job_manager
-        assert raft_jm is not None
-        assert raft_jm._node_id == "node-1"
-
-    def test_start_begins_tick_loop(self, manager_integration: ManagerRaftIntegration) -> None:
+    async def test_start_begins_tick_loop(self, manager_integration: ManagerRaftIntegration) -> None:
         """start() initiates the Raft tick loop."""
-        manager_integration.start()
+        await manager_integration.start()
         assert manager_integration.consensus._tick_running is True
 
     @pytest.mark.asyncio
     async def test_stop_destroys_all(self, manager_integration: ManagerRaftIntegration) -> None:
         """stop() destroys all Raft instances and stops ticking."""
-        manager_integration.start()
+        await manager_integration.start()
         await manager_integration.stop()
         assert manager_integration.consensus._tick_running is False
         assert len(manager_integration.consensus._nodes) == 0
 
-    def test_membership_on_node_join(self, manager_integration: ManagerRaftIntegration) -> None:
-        """on_node_join updates Raft cluster membership."""
-        manager_integration.on_node_join("peer-1", ("10.0.0.2", 8000))
-        assert "peer-1" in manager_integration.consensus._members
-        assert manager_integration.consensus._member_addrs["peer-1"] == ("10.0.0.2", 8000)
+    def test_job_groups_take_their_members_from_the_cluster_membership(
+        self,
+        manager_integration: ManagerRaftIntegration,
+        cluster_members_view: list[dict[str, tuple[str, int]]],
+    ) -> None:
+        """Before the cluster forms only this node is known; once it has,
+        a job group's voters and every peer's address come from the
+        committed membership."""
+        consensus = manager_integration.consensus
+        assert consensus.current_members() == frozenset({"node-1"})
+        assert consensus.member_addresses() == {}
 
-    def test_membership_on_node_leave(self, manager_integration: ManagerRaftIntegration) -> None:
-        """on_node_leave removes peer from Raft cluster membership."""
-        manager_integration.on_node_join("peer-1", ("10.0.0.2", 8000))
-        manager_integration.on_node_leave("peer-1")
-        assert "peer-1" not in manager_integration.consensus._members
-        assert "peer-1" not in manager_integration.consensus._member_addrs
-
-    def test_set_initial_membership(self, manager_integration: ManagerRaftIntegration) -> None:
-        """set_initial_membership seeds the Raft cluster from SWIM state."""
-        members = {"peer-1", "peer-2"}
-        addrs = {
+        cluster_members_view[0] = {
+            "node-1": ("127.0.0.1", 8000),
             "peer-1": ("10.0.0.2", 8000),
             "peer-2": ("10.0.0.3", 8000),
         }
-        manager_integration.set_initial_membership(members, addrs)
-        assert manager_integration.consensus._members == members
-        assert manager_integration.consensus._member_addrs == addrs
+
+        assert consensus.current_members() == frozenset({"node-1", "peer-1", "peer-2"})
+        assert consensus.member_address("peer-1") == ("10.0.0.2", 8000)
+        assert consensus.member_addresses() == {
+            "peer-1": ("10.0.0.2", 8000),
+            "peer-2": ("10.0.0.3", 8000),
+        }
 
     @pytest.mark.asyncio
     async def test_handle_request_vote_roundtrip(
@@ -171,7 +187,9 @@ class TestManagerRaftIntegration:
     ) -> None:
         """RequestVote handler deserializes, routes, and serializes response."""
         # Create a Raft instance for a job first
-        await manager_integration.consensus.create_job_raft("job-1")
+        await manager_integration.consensus.create_job_raft(
+            "job-1", manager_integration.consensus.current_members()
+        )
 
         request = RequestVote(
             job_id="job-1",
@@ -190,7 +208,9 @@ class TestManagerRaftIntegration:
         self, manager_integration: ManagerRaftIntegration
     ) -> None:
         """AppendEntries handler deserializes, routes, and serializes response."""
-        await manager_integration.consensus.create_job_raft("job-1")
+        await manager_integration.consensus.create_job_raft(
+            "job-1", manager_integration.consensus.current_members()
+        )
 
         request = AppendEntries(
             job_id="job-1",
@@ -210,7 +230,7 @@ class TestManagerRaftIntegration:
     async def test_send_raft_message_dispatches_tcp(
         self, manager_integration: ManagerRaftIntegration, mock_send_tcp: AsyncMock
     ) -> None:
-        """_send_raft_message routes message types to correct TCP method names."""
+        """_send_raft_message only enqueues; _exchange uses the correct TCP method name."""
         vote = RequestVote(
             job_id="job-1",
             term=1,
@@ -219,6 +239,11 @@ class TestManagerRaftIntegration:
             last_log_term=0,
         )
         await manager_integration._send_raft_message(("10.0.0.2", 8000), vote)
+        mock_send_tcp.assert_not_called()
+        assert manager_integration._outbox.pending_count == 1
+
+        mock_send_tcp.return_value = b""
+        await manager_integration._exchange(("10.0.0.2", 8000), vote)
         mock_send_tcp.assert_called_once()
         call_args = mock_send_tcp.call_args
         assert call_args[0][1] == "raft_request_vote"
@@ -238,42 +263,44 @@ class TestGateRaftIntegration:
         assert consensus is not None
         assert consensus._node_id == "node-1"
 
-    def test_raft_job_manager_property(self, gate_integration: GateRaftIntegration) -> None:
-        """Raft job manager property returns the gate wrapper."""
-        raft_jm = gate_integration.raft_job_manager
-        assert raft_jm is not None
-        assert raft_jm._node_id == "node-1"
-
-    def test_start_begins_tick_loop(self, gate_integration: GateRaftIntegration) -> None:
+    async def test_start_begins_tick_loop(self, gate_integration: GateRaftIntegration) -> None:
         """start() initiates the gate Raft tick loop."""
-        gate_integration.start()
+        await gate_integration.start()
         assert gate_integration.consensus._tick_running is True
 
     @pytest.mark.asyncio
     async def test_stop_destroys_all(self, gate_integration: GateRaftIntegration) -> None:
         """stop() destroys all gate Raft instances."""
-        gate_integration.start()
+        await gate_integration.start()
         await gate_integration.stop()
         assert gate_integration.consensus._tick_running is False
 
-    def test_membership_on_node_join(self, gate_integration: GateRaftIntegration) -> None:
-        """on_node_join updates gate Raft cluster membership."""
-        gate_integration.on_node_join("gate-2", ("10.0.0.2", 9000))
-        assert "gate-2" in gate_integration.consensus._members
-        assert gate_integration.consensus._member_addrs["gate-2"] == ("10.0.0.2", 9000)
+    def test_job_groups_take_their_members_from_the_cluster_membership(
+        self,
+        gate_integration: GateRaftIntegration,
+        cluster_members_view: list[dict[str, tuple[str, int]]],
+    ) -> None:
+        """A gate job group's voters and peers' addresses come from the
+        gate cluster's committed membership."""
+        consensus = gate_integration.consensus
+        assert consensus.current_members() == frozenset({"node-1"})
 
-    def test_membership_on_node_leave(self, gate_integration: GateRaftIntegration) -> None:
-        """on_node_leave removes gate peer from Raft cluster membership."""
-        gate_integration.on_node_join("gate-2", ("10.0.0.2", 9000))
-        gate_integration.on_node_leave("gate-2")
-        assert "gate-2" not in gate_integration.consensus._members
+        cluster_members_view[0] = {
+            "node-1": ("127.0.0.1", 8000),
+            "gate-2": ("10.0.0.2", 9000),
+        }
+
+        assert consensus.current_members() == frozenset({"node-1", "gate-2"})
+        assert consensus.member_addresses() == {"gate-2": ("10.0.0.2", 9000)}
 
     @pytest.mark.asyncio
     async def test_handle_request_vote_roundtrip(
         self, gate_integration: GateRaftIntegration
     ) -> None:
         """RequestVote handler roundtrips through gate Raft."""
-        await gate_integration.consensus.create_job_raft("gate-job-1")
+        await gate_integration.consensus.create_job_raft(
+            "gate-job-1", gate_integration.consensus.current_members()
+        )
 
         request = RequestVote(
             job_id="gate-job-1",
@@ -292,7 +319,9 @@ class TestGateRaftIntegration:
         self, gate_integration: GateRaftIntegration
     ) -> None:
         """AppendEntries handler roundtrips through gate Raft."""
-        await gate_integration.consensus.create_job_raft("gate-job-1")
+        await gate_integration.consensus.create_job_raft(
+            "gate-job-1", gate_integration.consensus.current_members()
+        )
 
         request = AppendEntries(
             job_id="gate-job-1",
@@ -312,7 +341,7 @@ class TestGateRaftIntegration:
     async def test_send_raft_message_uses_gate_prefix(
         self, gate_integration: GateRaftIntegration, mock_send_tcp: AsyncMock
     ) -> None:
-        """Gate _send_raft_message uses gate_raft_ prefixed method names."""
+        """Gate _exchange uses gate_raft_ prefixed method names."""
         vote = RequestVote(
             job_id="gate-job-1",
             term=1,
@@ -320,7 +349,8 @@ class TestGateRaftIntegration:
             last_log_index=0,
             last_log_term=0,
         )
-        await gate_integration._send_raft_message(("10.0.0.2", 9000), vote)
+        mock_send_tcp.return_value = (b"", 0)
+        await gate_integration._exchange(("10.0.0.2", 9000), vote)
         mock_send_tcp.assert_called_once()
         call_args = mock_send_tcp.call_args
         assert call_args[0][1] == "gate_raft_request_vote"
@@ -329,7 +359,7 @@ class TestGateRaftIntegration:
     async def test_send_append_entries_uses_gate_prefix(
         self, gate_integration: GateRaftIntegration, mock_send_tcp: AsyncMock
     ) -> None:
-        """Gate _send_raft_message uses gate_raft_append_entries method name."""
+        """Gate _exchange uses the gate_raft_append_entries method name."""
         append = AppendEntries(
             job_id="gate-job-1",
             term=1,
@@ -339,7 +369,8 @@ class TestGateRaftIntegration:
             entries=[],
             leader_commit=0,
         )
-        await gate_integration._send_raft_message(("10.0.0.2", 9000), append)
+        mock_send_tcp.return_value = (b"", 0)
+        await gate_integration._exchange(("10.0.0.2", 9000), append)
         mock_send_tcp.assert_called_once()
         call_args = mock_send_tcp.call_args
         assert call_args[0][1] == "gate_raft_append_entries"
@@ -360,7 +391,9 @@ class TestCrossIntegration:
         gate_integration: GateRaftIntegration,
     ) -> None:
         """A RequestVote serialized by manager can be deserialized by gate."""
-        await gate_integration.consensus.create_job_raft("shared-job")
+        await gate_integration.consensus.create_job_raft(
+            "shared-job", gate_integration.consensus.current_members()
+        )
 
         vote = RequestVote(
             job_id="shared-job",
@@ -380,7 +413,9 @@ class TestCrossIntegration:
         gate_integration: GateRaftIntegration,
     ) -> None:
         """AppendEntries serialized by gate can be deserialized by manager."""
-        await manager_integration.consensus.create_job_raft("shared-job")
+        await manager_integration.consensus.create_job_raft(
+            "shared-job", manager_integration.consensus.current_members()
+        )
 
         append = AppendEntries(
             job_id="shared-job",
@@ -402,11 +437,15 @@ class TestCrossIntegration:
         gate_integration: GateRaftIntegration,
     ) -> None:
         """Both integrations clean up all resources on stop."""
-        manager_integration.start()
-        gate_integration.start()
+        await manager_integration.start()
+        await gate_integration.start()
 
-        await manager_integration.consensus.create_job_raft("job-1")
-        await gate_integration.consensus.create_job_raft("job-1")
+        await manager_integration.consensus.create_job_raft(
+            "job-1", manager_integration.consensus.current_members()
+        )
+        await gate_integration.consensus.create_job_raft(
+            "job-1", gate_integration.consensus.current_members()
+        )
 
         assert manager_integration.consensus.active_instance_count == 1
         assert gate_integration.consensus.active_instance_count == 1
@@ -437,13 +476,16 @@ class TestManagerRaftLeaderCallbacks:
         """on_job_raft_leader callback is forwarded to RaftConsensus."""
         callback = MagicMock()
         integration = ManagerRaftIntegration(
+            clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
+            ledger_replica=JobLedgerReplica(),
+            request_timeout_seconds=5.0,
+            cluster_members=lambda: {},
             node_id="node-1",
-            job_manager=mock_job_manager,
-            leadership_tracker=leadership_tracker,
             logger=mock_logger,
             task_runner=mock_task_runner,
             send_tcp=mock_send_tcp,
-            on_job_raft_leader=callback,
+            on_job_raft_leader=callback, storage=VolatileRaftStorage()
         )
         assert integration.consensus._on_become_leader is callback
 
@@ -458,13 +500,16 @@ class TestManagerRaftLeaderCallbacks:
         """on_job_raft_lose_leader callback is forwarded to RaftConsensus."""
         callback = MagicMock()
         integration = ManagerRaftIntegration(
+            clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
+            ledger_replica=JobLedgerReplica(),
+            request_timeout_seconds=5.0,
+            cluster_members=lambda: {},
             node_id="node-1",
-            job_manager=mock_job_manager,
-            leadership_tracker=leadership_tracker,
             logger=mock_logger,
             task_runner=mock_task_runner,
             send_tcp=mock_send_tcp,
-            on_job_raft_lose_leader=callback,
+            on_job_raft_lose_leader=callback, storage=VolatileRaftStorage()
         )
         assert integration.consensus._on_lose_leadership is callback
 
@@ -484,16 +529,21 @@ class TestManagerRaftLeaderCallbacks:
             invoked_jobs.append(job_id)
 
         integration = ManagerRaftIntegration(
+            clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
+            ledger_replica=JobLedgerReplica(),
+            request_timeout_seconds=5.0,
+            cluster_members=lambda: {},
             node_id="node-1",
-            job_manager=mock_job_manager,
-            leadership_tracker=leadership_tracker,
             logger=mock_logger,
             task_runner=mock_task_runner,
             send_tcp=mock_send_tcp,
-            on_job_raft_leader=on_leader,
+            on_job_raft_leader=on_leader, storage=VolatileRaftStorage()
         )
 
-        await integration.consensus.create_job_raft("job-1")
+        await integration.consensus.create_job_raft(
+            "job-1", integration.consensus.current_members()
+        )
         node = integration.consensus.get_node("job-1")
         assert node is not None
 
@@ -524,14 +574,18 @@ class TestGateRaftLeaderCallbacks:
         """on_job_raft_leader callback is forwarded to GateRaftConsensus."""
         callback = MagicMock()
         integration = GateRaftIntegration(
+            clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
+            ledger_replica=JobLedgerReplica(),
+            request_timeout_seconds=5.0,
+            cluster_members=lambda: {},
+            cluster_size=lambda: 3,
+            proposal_timeout_seconds=5.0,
             node_id="gate-1",
-            job_manager=mock_gate_job_manager,
-            leadership_tracker=leadership_tracker,
-            gate_state=mock_gate_state,
             logger=mock_logger,
             task_runner=mock_task_runner,
             send_tcp=mock_send_tcp,
-            on_job_raft_leader=callback,
+            on_job_raft_leader=callback, storage=VolatileRaftStorage()
         )
         assert integration.consensus._on_become_leader is callback
 
@@ -547,14 +601,18 @@ class TestGateRaftLeaderCallbacks:
         """on_job_raft_lose_leader callback is forwarded to GateRaftConsensus."""
         callback = MagicMock()
         integration = GateRaftIntegration(
+            clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
+            ledger_replica=JobLedgerReplica(),
+            request_timeout_seconds=5.0,
+            cluster_members=lambda: {},
+            cluster_size=lambda: 3,
+            proposal_timeout_seconds=5.0,
             node_id="gate-1",
-            job_manager=mock_gate_job_manager,
-            leadership_tracker=leadership_tracker,
-            gate_state=mock_gate_state,
             logger=mock_logger,
             task_runner=mock_task_runner,
             send_tcp=mock_send_tcp,
-            on_job_raft_lose_leader=callback,
+            on_job_raft_lose_leader=callback, storage=VolatileRaftStorage()
         )
         assert integration.consensus._on_lose_leadership is callback
 
@@ -575,17 +633,23 @@ class TestGateRaftLeaderCallbacks:
             invoked_jobs.append(job_id)
 
         integration = GateRaftIntegration(
+            clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
+            ledger_replica=JobLedgerReplica(),
+            request_timeout_seconds=5.0,
+            cluster_members=lambda: {},
+            cluster_size=lambda: 3,
+            proposal_timeout_seconds=5.0,
             node_id="gate-1",
-            job_manager=mock_gate_job_manager,
-            leadership_tracker=leadership_tracker,
-            gate_state=mock_gate_state,
             logger=mock_logger,
             task_runner=mock_task_runner,
             send_tcp=mock_send_tcp,
-            on_job_raft_leader=on_leader,
+            on_job_raft_leader=on_leader, storage=VolatileRaftStorage()
         )
 
-        await integration.consensus.create_job_raft("gate-job-1")
+        await integration.consensus.create_job_raft(
+            "gate-job-1", integration.consensus.current_members()
+        )
         node = integration.consensus.get_node("gate-job-1")
         assert node is not None
 

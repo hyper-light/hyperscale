@@ -6,7 +6,6 @@ from hyperscale.core.engines.client import TimeParser
 from hyperscale.core.graph import Workflow
 from hyperscale.core.jobs.models import TerminalMode
 from hyperscale.ui.components.counter import Counter, CounterConfig
-from hyperscale.ui.components.header import Header, HeaderConfig
 from hyperscale.ui.components.multiline_text import MultilineText, MultilineTextConfig
 from hyperscale.ui.components.progress_bar import ProgressBar, ProgressBarConfig
 from hyperscale.ui.components.scatter_plot import PlotConfig, ScatterPlot
@@ -15,6 +14,7 @@ from hyperscale.ui.components.terminal import Section, SectionConfig
 from hyperscale.ui.components.text import Text, TextConfig
 from hyperscale.ui.components.timer import Timer, TimerConfig
 from hyperscale.ui.components.total_rate import TotalRate, TotalRateConfig
+from hyperscale.ui.hyperscale_header import create_hyperscale_header
 
 WorkflowConfig = list[
     dict[
@@ -112,40 +112,7 @@ def generate_ui_sections(
         Section(
             SectionConfig(height="xx-small", width="large"),
             components=[
-                Header(
-                    "header",
-                    HeaderConfig(
-                        header_text="hyperscale",
-                        formatters={
-                            "y": [
-                                lambda letter, _: "\n".join(
-                                    [" " + line for line in letter.split("\n")]
-                                )
-                            ],
-                            "l": [
-                                lambda letter, _: "\n".join(
-                                    [
-                                        line[:-1] if idx == 2 else line
-                                        for idx, line in enumerate(letter.split("\n"))
-                                    ]
-                                )
-                            ],
-                            "e": [
-                                lambda letter, idx: "\n".join(
-                                    [
-                                        line[1:] if idx < 2 else line
-                                        for idx, line in enumerate(letter.split("\n"))
-                                    ]
-                                )
-                                if idx == 9
-                                else letter
-                            ],
-                        },
-                        color="aquamarine_2",
-                        attributes=["bold"],
-                        terminal_mode=hyperscale_terminal_mode,
-                    ),
-                ),
+                create_hyperscale_header(hyperscale_terminal_mode),
             ],
         ),
         Section(

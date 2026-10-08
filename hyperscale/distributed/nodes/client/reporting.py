@@ -5,7 +5,8 @@ Handles submission to local file-based reporters (JSON/CSV/XML).
 """
 
 from hyperscale.distributed.nodes.client.state import ClientState
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
+from hyperscale.distributed.runtime import Clock
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
 from hyperscale.reporting.reporter import Reporter
@@ -20,7 +21,10 @@ class ClientReportingManager:
     1. Get reporter configs for job from state
     2. Filter to local file-based types (JSON/CSV/XML)
     3. If no local configs, create default per-workflow JSON
-    4. For each config: create Reporter, connect, submit, close
+    4. For each config: create Reporter, connect and submit within one
+       ``reporter_submission_timeout_seconds`` deadline on ``clock``, then
+       close within another, so a hung reporter delays the job's results
+       (and the reporters after it) by a bounded time, never forever
     5. Best-effort submission (don't raise on reporter failures)
     """
 
@@ -29,10 +33,12 @@ class ClientReportingManager:
         state: ClientState,
         config: ClientConfig,
         logger: Logger,
+        clock: Clock,
     ) -> None:
         self._state = state
         self._config = config
         self._logger = logger
+        self._clock = clock
 
     async def submit_to_local_reporters(
         self,
@@ -80,21 +86,31 @@ class ClientReportingManager:
         reporter_type = getattr(config, "reporter_type", None)
         reporter_type_name = reporter_type.name if reporter_type else "unknown"
 
+        deadline = self._clock.monotonic() + self._config.reporter_submission_timeout_seconds
         try:
             reporter = Reporter(config)
-            await reporter.connect()
-
             try:
-                await reporter.submit_workflow_results(workflow_stats)
-                await reporter.submit_step_results(workflow_stats)
+                # A connect that failed or timed out may have opened part of
+                # its backend: it is closed all the same.
+                await self._clock.wait_for(reporter.connect(), max(deadline - self._clock.monotonic(), 0.0))
+                await self._clock.wait_for(
+                    reporter.submit_workflow_results(workflow_stats),
+                    max(deadline - self._clock.monotonic(), 0.0),
+                )
+                await self._clock.wait_for(
+                    reporter.submit_step_results(workflow_stats),
+                    max(deadline - self._clock.monotonic(), 0.0),
+                )
             finally:
-                await reporter.close()
+                # A deadline of its own: one spent by a hung submission
+                # would cancel the close before it began.
+                await self._clock.wait_for(reporter.close(), self._config.reporter_submission_timeout_seconds)
 
         except Exception as reporter_error:
             workflow_name = workflow_stats.get("workflow_name", "unknown")
             await self._logger.log(
                 ServerWarning(
-                    message=f"Reporter submission failed: {reporter_error}, "
+                    message=f"Reporter submission failed: {type(reporter_error).__name__}: {reporter_error}, "
                     f"reporter_type={reporter_type_name}, "
                     f"workflow={workflow_name}",
                     node_host="client",
@@ -122,8 +138,7 @@ class ClientReportingManager:
         local_configs = [
             config
             for config in configs
-            if hasattr(config, "reporter_type")
-            and config.reporter_type.name in self._config.local_reporter_types
+            if getattr(config, "reporter_type", None) in self._config.local_reporter_types
         ]
 
         return local_configs

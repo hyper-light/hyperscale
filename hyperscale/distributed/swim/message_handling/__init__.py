@@ -17,6 +17,7 @@ Handler Categories:
 - Probing: probe, ping-req, ping-req-ack
 - Suspicion: alive, suspect
 - Leadership: leader-claim, leader-vote, leader-elected, leader-heartbeat,
+              leader-heartbeat-ack,
               leader-stepdown, pre-vote-req, pre-vote-resp
 - CrossCluster: xprobe, xack, xnack
 
@@ -65,6 +66,7 @@ from .leadership import (
     LeaderVoteHandler,
     LeaderElectedHandler,
     LeaderHeartbeatHandler,
+    LeaderHeartbeatAckHandler,
     LeaderStepdownHandler,
     PreVoteReqHandler,
     PreVoteRespHandler,
@@ -107,6 +109,7 @@ def register_default_handlers(
     dispatcher.register(LeaderVoteHandler(server))
     dispatcher.register(LeaderElectedHandler(server))
     dispatcher.register(LeaderHeartbeatHandler(server))
+    dispatcher.register(LeaderHeartbeatAckHandler(server))
     dispatcher.register(LeaderStepdownHandler(server))
     dispatcher.register(PreVoteReqHandler(server))
     dispatcher.register(PreVoteRespHandler(server))
@@ -145,6 +148,7 @@ __all__ = [
     "LeaderVoteHandler",
     "LeaderElectedHandler",
     "LeaderHeartbeatHandler",
+    "LeaderHeartbeatAckHandler",
     "LeaderStepdownHandler",
     "PreVoteReqHandler",
     "PreVoteRespHandler",

@@ -45,14 +45,13 @@ from tests.simulation.scenarios.phase3_faults.test_leader_faults import (
 )
 
 
-def _l2_spec(base_port: int) -> ClusterSpec:
+def _l2_spec() -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "main": DCSpec(managers=3, workers=2, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -101,7 +100,7 @@ async def test_worker_kill_mid_workload() -> None:
     expectations and raises ``WorkloadFailure`` if any fail. The
     harness's diagnostic dump fires automatically on failure.
     """
-    spec = _l2_spec(base_port=21300)
+    spec = _l2_spec()
     workload = _simple_workload(timeout_seconds=30.0)
     async with ClusterHarness(
         spec,
@@ -134,7 +133,7 @@ async def test_leader_kill_mid_workload() -> None:
       5. ``wait_until`` a new leader from the survivor set.
       6. ``wait_for_completion`` — same budget enforcement as above.
     """
-    spec = _l2_spec(base_port=21400)
+    spec = _l2_spec()
     workload = _simple_workload(timeout_seconds=45.0)
     async with ClusterHarness(
         spec,

@@ -21,14 +21,35 @@ Usage:
     await client.stop()
 """
 
+from collections.abc import AsyncIterator
+from operator import attrgetter
 from typing import Callable
 
+from hyperscale.distributed.cluster import ClusterJoinError, decode_join_message
+from hyperscale.distributed.cluster.models import (
+    ClusterLeaveReply,
+    ClusterLeaveRequest,
+    ClusterMemberId,
+    ClusterMetricsReply,
+    ClusterModeReply,
+    ClusterModeRequest,
+    ClusterResizeReply,
+    ClusterResizeRequest,
+    ClusterStatusReply,
+    ClusterStatusRequest,
+    ClusterWatchReply,
+    ClusterWatchRequest,
+)
 from hyperscale.distributed.server import tcp
 from hyperscale.distributed.server.server.mercury_sync_base_server import (
     MercurySyncBaseServer,
 )
 from hyperscale.distributed.models import (
+    JobStatusQuery,
+    ReadConsistency,
     JobStatusPush,
+    NodeJoinRequest,
+    NodeJoinResponse,
     ReporterResultPush,
     WorkflowResultPush,
     ManagerPingResponse,
@@ -37,8 +58,19 @@ from hyperscale.distributed.models import (
     DatacenterListResponse,
     JobCancelResponse,
     GlobalJobStatus,
+    RegisterCallback,
+    RegisterCallbackResponse,
 )
 from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.models.message import Message
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+from hyperscale.distributed.resources.resource_budget import ResourceBudget
+from hyperscale.distributed.runtime import (
+    Clock,
+    Random,
+    RealClock,
+    TransportFactory,
+)
 from hyperscale.distributed.reliability.rate_limiting import (
     AdaptiveRateLimiter,
     AdaptiveRateLimitConfig,
@@ -46,8 +78,15 @@ from hyperscale.distributed.reliability.rate_limiting import (
 from hyperscale.distributed.reliability.overload import HybridOverloadDetector
 
 # Import all client modules
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.idempotency.idempotency_key import (
+    IdempotencyKeyGenerator,
+)
+from hyperscale.distributed.jobs.logical_id_generator import (
+    LogicalIdGenerator,
+)
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.nodes.client.protocol import ClientProtocol
 from hyperscale.distributed.nodes.client.leadership import ClientLeadershipTracker
@@ -78,6 +117,7 @@ from hyperscale.distributed.models import (
     ClientWorkflowResult,
     ClientJobResult,
 )
+from hyperscale.logging import Logger
 
 # Type aliases for backwards compatibility
 ReporterResult = ClientReporterResult
@@ -110,6 +150,10 @@ class HyperscaleClient(MercurySyncBaseServer):
         env: Env | None = None,
         managers: list[tuple[str, int]] | None = None,
         gates: list[tuple[str, int]] | None = None,
+        *,
+        clock: Clock | None = None,
+        random_source: Random | None = None,
+        transport_factory: TransportFactory | None = None,
     ):
         """
         Initialize the client.
@@ -120,6 +164,10 @@ class HyperscaleClient(MercurySyncBaseServer):
             env: Environment configuration
             managers: List of manager (host, port) addresses
             gates: List of gate (host, port) addresses
+            clock: Phase 6 SIM seam — virtual clock (None in REAL mode)
+            random_source: Phase 6 SIM seam — seeded random (None in REAL mode)
+            transport_factory: Phase 6 SIM seam — simulation transport in
+                place of real sockets (None in REAL mode)
         """
         env = env or Env()
 
@@ -128,48 +176,54 @@ class HyperscaleClient(MercurySyncBaseServer):
             tcp_port=port,
             udp_port=port + 1,  # UDP not used but required by base
             env=env,
+            clock=clock,
+            random_source=random_source,
+            transport_factory=transport_factory,
         )
 
         # Logger used by every client submodule. The base class also creates
         # `_tcp_logger` / `_udp_logger` during `start_server`, but the
         # submodules below take a single Logger reference at construction.
-        from hyperscale.logging import Logger
         self._logger = Logger()
 
         # Initialize config and state
-        self._config = ClientConfig(
-            host=host,
-            tcp_port=port,
-            managers=tuple(managers or []),
-            gates=tuple(gates or []),
-            env=env,
-        )
+        self._config = self._build_client_config(env, host, port, managers, gates)
         self._state = ClientState()
 
-        # Initialize rate limiter for progress updates (AD-24)
-        # Uses AdaptiveRateLimiter with operation limits: (300, 10.0) = 30/s
-        self._rate_limiter = AdaptiveRateLimiter(
+        # Rate limiter for inbound windowed-stats pushes (AD-24, operation
+        # "stats_update", derived from this client's Env); named apart from
+        # the base server's transport limiter (``_rate_limiter``), which
+        # admits every inbound TCP request
+        self._progress_rate_limiter = AdaptiveRateLimiter(
             overload_detector=HybridOverloadDetector(),
-            config=AdaptiveRateLimitConfig(),
+            config=AdaptiveRateLimitConfig.from_env(env, self._tcp_server_state.max_connections),
         )
 
         # Initialize all modules with dependency injection
         self._targets = ClientTargetSelector(
             config=self._config,
             state=self._state,
+            discovery=DiscoveryService(
+                DiscoveryConfig.from_env(
+                    env,
+                    node_role="client",
+                    static_seeds=[],
+                    allow_dynamic_registration=True,
+                ),
+                self._logger,
+            ),
         )
         self._protocol = ClientProtocol(
             state=self._state,
             logger=self._logger,
         )
-        self._leadership = ClientLeadershipTracker(
-            state=self._state,
-            logger=self._logger,
-        )
+        self._leadership = ClientLeadershipTracker(state=self._state)
         self._tracker = ClientJobTracker(
             state=self._state,
             logger=self._logger,
+            result_drain_timeout_seconds=self._config.result_drain_timeout_seconds,
             poll_gate_for_status=self._poll_gate_for_job_status,
+            request_replay=self._request_job_replay,
         )
         self._submitter = ClientJobSubmitter(
             state=self._state,
@@ -179,6 +233,13 @@ class HyperscaleClient(MercurySyncBaseServer):
             tracker=self._tracker,
             protocol=self._protocol,
             send_tcp_func=self.send_tcp,
+            idempotency_key_generator=IdempotencyKeyGenerator(
+                client_id=f"{host}:{port}"
+            ),
+            logical_id_generator=LogicalIdGenerator(
+                scope=f"{host}-{port}",
+                clock=clock if clock is not None else RealClock(),
+            ),
         )
         self._cancellation = ClientCancellationManager(
             state=self._state,
@@ -192,6 +253,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             state=self._state,
             config=self._config,
             logger=self._logger,
+            clock=self._clock,
         )
         self._discovery = ClientDiscovery(
             state=self._state,
@@ -203,6 +265,23 @@ class HyperscaleClient(MercurySyncBaseServer):
 
         # Initialize all TCP handlers with dependencies
         self._register_handlers()
+
+    @staticmethod
+    def _build_client_config(
+        env: Env,
+        host: str,
+        port: int,
+        managers: list[tuple[str, int]] | None,
+        gates: list[tuple[str, int]] | None,
+    ) -> ClientConfig:
+        """The client's config from the env and its configured managers and gates."""
+        return ClientConfig.from_env(
+            env,
+            host=host,
+            tcp_port=port,
+            managers=tuple(managers or []),
+            gates=tuple(gates or []),
+        )
 
     def _register_handlers(self) -> None:
         """Register all TCP handlers with module dependencies.
@@ -221,27 +300,29 @@ class HyperscaleClient(MercurySyncBaseServer):
             state=self._state,
             logger=self._logger,
         )
-        self._job_final_result_handler = JobFinalResultHandler(
-            state=self._state,
-            logger=self._logger,
-        )
-        self._global_job_result_handler = GlobalJobResultHandler(
-            state=self._state,
-            logger=self._logger,
-        )
-        self._reporter_result_push_handler = ReporterResultPushHandler(
-            state=self._state,
-            logger=self._logger,
-        )
         self._workflow_result_push_handler = WorkflowResultPushHandler(
             state=self._state,
             logger=self._logger,
             reporting_manager=self._reporting,
         )
+        self._job_final_result_handler = JobFinalResultHandler(
+            state=self._state,
+            logger=self._logger,
+            workflow_results=self._workflow_result_push_handler,
+        )
+        self._global_job_result_handler = GlobalJobResultHandler(
+            state=self._state,
+            logger=self._logger,
+            workflow_results=self._workflow_result_push_handler,
+        )
+        self._reporter_result_push_handler = ReporterResultPushHandler(
+            state=self._state,
+            logger=self._logger,
+        )
         self._windowed_stats_push_handler = WindowedStatsPushHandler(
             state=self._state,
             logger=self._logger,
-            rate_limiter=self._rate_limiter,
+            rate_limiter=self._progress_rate_limiter,
         )
         self._cancellation_complete_handler = CancellationCompleteHandler(
             state=self._state,
@@ -288,8 +369,21 @@ class HyperscaleClient(MercurySyncBaseServer):
         on_workflow_result: Callable[[WorkflowResultPush], None] | None = None,
         reporting_configs: list | None = None,
         on_reporter_result: Callable[[ReporterResultPush], None] | None = None,
+        retry_budget: int = 0,
+        retry_budget_per_workflow: int = 0,
+        resource_budget: ResourceBudget | None = None,
+        best_effort: bool = False,
+        best_effort_min_dcs: int = 0,
+        best_effort_deadline_seconds: float = 0.0,
+        dispatch_latency_budget_ms: float = 0.0,
     ) -> str:
         """Submit a job for execution (delegates to ClientJobSubmitter).
+
+        ``datacenters`` is a placement CONSTRAINT, not a hint: when
+        provided, the job runs only in the listed datacenters (the gate
+        still picks the best of them by health/score). If none of the
+        listed datacenters is available, the submission is rejected
+        with an explicit error — it never silently runs elsewhere.
 
         Phase H2: ``timeout_seconds=None`` (the default) lets the
         manager apply the AD-26/AD-34 override hierarchy:
@@ -298,7 +392,36 @@ class HyperscaleClient(MercurySyncBaseServer):
         ``workflow.duration × HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER``
         (1.5 by default). Pass a positive number to force an explicit
         per-job override that the manager honors verbatim.
+
+        AD-44: ``retry_budget`` caps total workflow retries across the
+        job and ``retry_budget_per_workflow`` caps any single workflow;
+        0 (the default) applies the manager's configured defaults, and
+        the manager clamps explicit values to its configured maxima.
+
+        AD-41: ``resource_budget`` sets the CPU/memory limits each of the
+        job's workflows is enforced against (None applies the manager's
+        configured default). A manager with resource guards disabled
+        rejects a job that sets one rather than run it unenforced.
+
+        AD-44: ``best_effort`` completes a multi-datacenter job once
+        ``best_effort_min_dcs`` datacenters completed, or with whatever
+        completed once ``best_effort_deadline_seconds`` passed, instead
+        of waiting for every datacenter; the rest are cancelled. 0 applies
+        the gate's configured default for either.
+
+        D-62: ``dispatch_latency_budget_ms`` asks a gate to place the job
+        only in datacenters whose p95 workflow dispatch round trip (their
+        D-5 digest) is within it, while as many as the job asks for are;
+        when fewer are, the job is placed nearest to the budget. 0 (the
+        default) sets none; a gateless manager has its one datacenter.
+
+        Jobs finished for longer than the configured retention are
+        forgotten here, so a long-lived client's tracking stays bounded.
         """
+        self._state.release_finished_jobs(
+            now=self._clock.monotonic(),
+            retention_seconds=self._config.job_retention_seconds,
+        )
         return await self._submitter.submit_job(
             workflows=workflows,
             vus=vus,
@@ -310,6 +433,264 @@ class HyperscaleClient(MercurySyncBaseServer):
             on_workflow_result=on_workflow_result,
             reporting_configs=reporting_configs,
             on_reporter_result=on_reporter_result,
+            retry_budget=retry_budget,
+            retry_budget_per_workflow=retry_budget_per_workflow,
+            resource_budget=resource_budget,
+            best_effort=best_effort,
+            best_effort_min_dcs=best_effort_min_dcs,
+            best_effort_deadline_seconds=best_effort_deadline_seconds,
+            dispatch_latency_budget_ms=dispatch_latency_budget_ms,
+        )
+
+    async def join_node(
+        self,
+        node_addr: tuple[str, int],
+        target_addr: tuple[str, int],
+        timeout: float,
+    ) -> NodeJoinResponse:
+        """Tell the node at ``node_addr`` to join the node at ``target_addr``.
+
+        The node runs its own registration routine against the target
+        (worker->manager, manager->gate, gate->manager); the target's
+        register endpoint validates isolation and protocol version.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a join response. A refused join is returned, not
+                raised, so callers can report the node's reason.
+        """
+        request = NodeJoinRequest(target_host=target_addr[0], target_port=target_addr[1])
+        response, _ = await self.send_tcp(
+            node_addr,
+            "node_join",
+            request.dump(),
+            timeout=timeout,
+        )
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"node {node_addr[0]}:{node_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+
+        return decode_join_message(
+            response,
+            NodeJoinResponse,
+            f"join reply from {node_addr[0]}:{node_addr[1]}",
+        )
+
+    async def remove_cluster_member(
+        self,
+        node_addr: tuple[str, int],
+        member_addr: tuple[str, int],
+        timeout: float,
+    ) -> ClusterLeaveReply:
+        """Ask the cluster that the node at ``node_addr`` belongs to to
+        release the member at ``member_addr`` now (AD-52 section 13
+        force-remove) -- for a manager or gate that is gone for good,
+        instead of waiting out the tombstone retention. The group's leader
+        refuses while the member still answers.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a leave reply. A refusal is returned, not raised.
+        """
+        request = ClusterLeaveRequest(host=member_addr[0], port=member_addr[1]).dump()
+        return await self._send_to_cluster_leader(
+            node_addr,
+            "cluster_leave",
+            request,
+            ClusterLeaveReply,
+            "leave",
+            attrgetter("released"),
+            timeout,
+        )
+
+    async def set_cluster_mode(
+        self,
+        node_addr: tuple[str, int],
+        mode: str,
+        timeout: float,
+    ) -> ClusterModeReply:
+        """Set the mode of the cluster the node at ``node_addr`` belongs to
+        (AD-52 section 13): ``open``, ``frozen`` (no membership change
+        commits) or ``read-only`` (frozen, and job submissions refused).
+        A member that does not know its leader names none; one that does
+        passes the change on.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a mode reply. A refusal is returned, not raised.
+        """
+        request = ClusterModeRequest(mode=mode).dump()
+        return await self._send_to_cluster_leader(
+            node_addr,
+            "cluster_mode",
+            request,
+            ClusterModeReply,
+            "mode",
+            attrgetter("applied"),
+            timeout,
+        )
+
+    async def resize_cluster(
+        self,
+        node_addr: tuple[str, int],
+        member_addr: tuple[str, int],
+        add: bool,
+        timeout: float,
+    ) -> ClusterResizeReply:
+        """Add ``member_addr`` to the cohort of the cluster the node at
+        ``node_addr`` belongs to, or remove it (AD-52 ``ResizeCluster``).
+        A member that does not know its leader names none; one that does
+        passes the change on.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a resize reply. A refusal is returned, not raised.
+        """
+        request = ClusterResizeRequest(host=member_addr[0], port=member_addr[1], add=add).dump()
+        return await self._send_to_cluster_leader(
+            node_addr,
+            "cluster_resize",
+            request,
+            ClusterResizeReply,
+            "resize",
+            attrgetter("applied"),
+            timeout,
+        )
+
+    async def cluster_status(self, node_addr: tuple[str, int], timeout: float) -> ClusterStatusReply:
+        """The membership of the cluster the node at ``node_addr`` belongs to,
+        as of now (AD-52 section 11): its leader answers after confirming it
+        still leads. A member that does not know its leader names none; one
+        that does passes the request on.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a status reply. A refusal is returned, not raised.
+        """
+        request = ClusterStatusRequest().dump()
+        return await self._send_to_cluster_leader(
+            node_addr,
+            "cluster_status",
+            request,
+            ClusterStatusReply,
+            "status",
+            attrgetter("served"),
+            timeout,
+        )
+
+    async def _send_to_cluster_leader[ReplyType: Message](
+        self,
+        node_addr: tuple[str, int],
+        action: str,
+        request: bytes,
+        reply_type: type[ReplyType],
+        reply_kind: str,
+        is_answered: Callable[[ReplyType], bool],
+        timeout: float,
+    ) -> ReplyType:
+        """Send a cluster request to a member, then once to the leader it names when it did not answer (AD-52)."""
+        # A member that is not the group's leader names it: ask it once.
+        asked_addr = node_addr
+        for _ in range(2):
+            reply = await self._ask_cluster_member(asked_addr, action, request, reply_type, reply_kind, timeout)
+            if self._cluster_reply_settled(reply, is_answered, asked_addr, node_addr):
+                return reply
+            asked_addr = ClusterMemberId.parse(reply.leader_member_id).address
+        return reply
+
+    async def _ask_cluster_member[ReplyType: Message](
+        self,
+        asked_addr: tuple[str, int],
+        action: str,
+        request: bytes,
+        reply_type: type[ReplyType],
+        reply_kind: str,
+        timeout: float,
+    ) -> ReplyType:
+        """Send a cluster request to one member and decode its reply; raises when it is unreachable."""
+        response, _ = await self.send_tcp(asked_addr, action, request, timeout=timeout)
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"node {asked_addr[0]}:{asked_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+        return decode_join_message(
+            response,
+            reply_type,
+            f"{reply_kind} reply from {asked_addr[0]}:{asked_addr[1]} "
+            "(only managers and gates hold cluster membership)",
+        )
+
+    @staticmethod
+    def _cluster_reply_settled[ReplyType: Message](
+        reply: ReplyType,
+        is_answered: Callable[[ReplyType], bool],
+        asked_addr: tuple[str, int],
+        node_addr: tuple[str, int],
+    ) -> bool:
+        """Whether the reply is final: answered, naming no leader, or already from the named leader."""
+        return is_answered(reply) or reply.leader_member_id is None or asked_addr != node_addr
+
+    async def watch_cluster(
+        self,
+        node_addr: tuple[str, int],
+        cluster_uuid: str | None,
+        after_index: int,
+        wait_seconds: float,
+        timeout: float,
+    ) -> ClusterWatchReply:
+        """One long poll of a membership watch (AD-52 section 9): the
+        changes the node applied after ``after_index`` of ``cluster_uuid``,
+        or a snapshot to resume from -- answered within ``wait_seconds``
+        when nothing changes. Resume the next poll after the reply's
+        ``applied_index``.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a watch reply. A refusal is returned, not raised.
+        """
+        response, _ = await self.send_tcp(
+            node_addr,
+            "cluster_watch",
+            ClusterWatchRequest(
+                cluster_uuid=cluster_uuid, after_index=after_index, wait_seconds=wait_seconds
+            ).dump(),
+            timeout=timeout,
+        )
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"node {node_addr[0]}:{node_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+        return decode_join_message(
+            response,
+            ClusterWatchReply,
+            f"watch reply from {node_addr[0]}:{node_addr[1]} "
+            "(only managers and gates hold cluster membership)",
+        )
+
+    async def cluster_metrics(self, node_addr: tuple[str, int], timeout: float) -> ClusterMetricsReply:
+        """The node's own metrics (AD-52 section 18): a manager's or gate's
+        membership, and every role's telemetry in the one schema all roles
+        share (D-68) -- a worker's too.
+
+        Raises:
+            ClusterJoinError: the node was unreachable or did not answer
+                with a metrics reply.
+        """
+        response, _ = await self.send_tcp(node_addr, "cluster_metrics", b"", timeout=timeout)
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"node {node_addr[0]}:{node_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+        return decode_join_message(
+            response,
+            ClusterMetricsReply,
+            f"metrics reply from {node_addr[0]}:{node_addr[1]} "
+            "(gates, managers and workers answer)",
         )
 
     async def wait_for_job(
@@ -319,6 +700,25 @@ class HyperscaleClient(MercurySyncBaseServer):
     ) -> ClientJobResult:
         """Wait for job completion (delegates to ClientJobTracker)."""
         return await self._tracker.wait_for_job(job_id, timeout=timeout)
+
+    def stream_workflow_results(
+        self,
+        job_id: str,
+        timeout: float | None = None,
+    ) -> AsyncIterator[ClientWorkflowResult]:
+        """Each workflow result of a job as it arrives, until the job is
+        done (delegates to ClientJobTracker)::
+
+            async for workflow_result in client.stream_workflow_results(job_id):
+                print(workflow_result.workflow_id, workflow_result.status)
+        """
+        return self._tracker.stream_workflow_results(job_id, timeout=timeout)
+
+    def release_job(self, job_id: str) -> None:
+        """Forget a job the caller is done with: its status, results and
+        callbacks. Finished jobs are also forgotten once the configured
+        retention has passed."""
+        self._state.release_job(job_id)
 
     def get_job_status(self, job_id: str) -> ClientJobResult | None:
         """Get current job status (delegates to ClientJobTracker)."""
@@ -330,7 +730,6 @@ class HyperscaleClient(MercurySyncBaseServer):
         reason: str = "",
         max_redirects: int = 3,
         max_retries: int = 3,
-        retry_base_delay: float = 0.5,
         timeout: float = 10.0,
     ) -> JobCancelResponse:
         """Cancel a running job (delegates to ClientCancellationManager)."""
@@ -339,7 +738,6 @@ class HyperscaleClient(MercurySyncBaseServer):
             reason=reason,
             max_redirects=max_redirects,
             max_retries=max_retries,
-            retry_base_delay=retry_base_delay,
             timeout=timeout,
         )
 
@@ -445,29 +843,159 @@ class HyperscaleClient(MercurySyncBaseServer):
     # Internal Helper Methods
     # =========================================================================
 
+    async def query_job_status(
+        self,
+        node_addr: tuple[str, int],
+        job_id: str,
+        timeout: float,
+        consistency: ReadConsistency = ReadConsistency.EVENTUAL,
+        max_staleness_seconds: float = 0.0,
+    ) -> GlobalJobStatus | None:
+        """A job's status, asked of the gate or manager at ``node_addr`` at
+        ``consistency`` (AD-38 Part 8): it answers from what it holds (live
+        state, or a manager's durable ledger) or from the job's leader --
+        None when it has no answer at that level. A SESSION read of a job
+        this client tracks is never older than the newest view of it a read
+        here answered; BOUNDED_STALENESS bounds the view's age by
+        ``max_staleness_seconds``.
+
+        Raises:
+            ClusterJoinError: the node was unreachable.
+        """
+        observed_fence_token, observed_view_time = self._state.get_job_read_view(job_id)
+        query = JobStatusQuery(
+            job_id=job_id,
+            consistency=consistency.value,
+            observed_fence_token=observed_fence_token,
+            observed_view_time=observed_view_time,
+            max_staleness_seconds=max_staleness_seconds,
+        )
+        response, _ = await self.send_tcp(node_addr, "job_status", query.dump(), timeout=timeout)
+        if isinstance(response, Exception):
+            raise ClusterJoinError(
+                f"node {node_addr[0]}:{node_addr[1]} is unreachable: "
+                f"{type(response).__name__}: {response}"
+            )
+        if not response:
+            return None
+        job_status = GlobalJobStatus.load(response)
+        self._state.record_job_read_view(job_id, job_status.fence_token, job_status.view_time)
+        return job_status
+
     async def _poll_gate_for_job_status(
         self,
         job_id: str,
     ) -> GlobalJobStatus | None:
-        gate_addr = self._targets.get_gate_for_job(job_id)
-        if not gate_addr:
-            gate_addr = self._targets.get_next_gate()
-        if not gate_addr:
+        """Poll the job's gate — or, gateless (L2), its manager — for
+        authoritative status. The manager answers from live state or
+        its durable ledger, so this reads truth even across a manager
+        restart."""
+        poll_addr = self._job_status_poll_address(job_id)
+        if not poll_addr:
             return None
 
         try:
-            response_data, _ = await self.send_tcp(
-                gate_addr,
-                "job_status",
-                job_id.encode(),
-                timeout=5.0,
+            return await self._fetch_job_status(poll_addr, job_id)
+        except Exception as poll_error:
+            await self._logger.log(
+                ServerDebug(
+                    message=(
+                        f"Status poll to {poll_addr} for job "
+                        f"{job_id[:8]} failed: {poll_error}"
+                    ),
+                    node_host="client",
+                    node_port=0,
+                    node_id="client",
+                )
             )
-            if response_data and response_data != b"":
-                return GlobalJobStatus.load(response_data)
-        except Exception:
-            pass
 
         return None
+
+    def _job_status_poll_address(self, job_id: str) -> tuple[str, int] | None:
+        """The job's gate, else the next gate, else the next manager (gateless, L2)."""
+        poll_addr = self._targets.get_gate_for_job(job_id)
+        if not poll_addr:
+            poll_addr = self._targets.get_next_gate()
+        if not poll_addr:
+            poll_addr = self._targets.get_next_manager()
+        return poll_addr
+
+    async def _fetch_job_status(self, poll_addr: tuple[str, int], job_id: str) -> GlobalJobStatus | None:
+        """Query an address for the job's status; raises on a transport error."""
+        response_data = await self._send_tcp_or_raise(
+            poll_addr,
+            "job_status",
+            job_id.encode(),
+        )
+        return self._load_job_status(response_data)
+
+    @staticmethod
+    def _load_job_status(response_data: bytes | None) -> GlobalJobStatus | None:
+        """The job status a non-empty response carries, else None."""
+        if response_data and response_data != b"":
+            return GlobalJobStatus.load(response_data)
+        return None
+
+    async def _send_tcp_or_raise(
+        self,
+        address: tuple[str, int],
+        action: str,
+        payload: bytes,
+    ) -> bytes | None:
+        """Send a status-query-bounded request, raising the transport error send_tcp returns."""
+        response_data, _ = await self.send_tcp(
+            address,
+            action,
+            payload,
+            timeout=self._config.status_query_timeout_seconds,
+        )
+        # send_tcp returns transport errors rather than raising.
+        if isinstance(response_data, Exception):
+            raise response_data
+        return response_data
+
+    async def _request_job_replay(self, job_id: str) -> bool:
+        """Have the job's gate send again what it recorded for this client
+        and could not deliver: re-registering this client's callback for
+        the job makes the gate replay its update history from the last
+        update that reached the client -- answered once the replay is sent.
+        Gateless (L2), a manager keeps no such history: nothing to ask."""
+        gate_address = self._targets.get_gate_for_job(job_id)
+        if not gate_address:
+            return False
+
+        try:
+            return await self._send_replay_request(gate_address, job_id)
+        except Exception as replay_error:
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        f"Asking gate {gate_address} to replay job {job_id[:8]}... "
+                        f"failed: {replay_error}"
+                    ),
+                    node_host="client",
+                    node_port=0,
+                    node_id="client",
+                )
+            )
+        return False
+
+    async def _send_replay_request(self, gate_address: tuple[str, int], job_id: str) -> bool:
+        """Re-register this client's callback for the job with its gate; True once the gate accepted."""
+        response_data = await self._send_tcp_or_raise(
+            gate_address,
+            "register_callback",
+            RegisterCallback(
+                job_id=job_id,
+                callback_addr=(self._host, self._tcp_port),
+            ).dump(),
+        )
+        return self._replay_acknowledged(response_data)
+
+    @staticmethod
+    def _replay_acknowledged(response_data: bytes | None) -> bool:
+        """Whether the gate answered the callback registration with success."""
+        return bool(response_data and RegisterCallbackResponse.load(response_data).success)
 
     # =========================================================================
     # TCP Handlers - Delegate to Handler Classes

@@ -19,9 +19,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hyperscale.distributed.nodes.client.reporting import ClientReportingManager
+from hyperscale.distributed.runtime import RealClock
 from hyperscale.distributed.nodes.client.discovery import ClientDiscovery
 from hyperscale.distributed.nodes.client.state import ClientState
-from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.models.client_config import ClientConfig
+from hyperscale.distributed.discovery import DiscoveryConfig, DiscoveryService
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.models import (
     ManagerPingResponse,
@@ -36,6 +39,19 @@ from hyperscale.distributed.models import (
 from hyperscale.reporting.json import JSONConfig
 from hyperscale.reporting.csv import CSVConfig
 from hyperscale.logging import Logger
+
+
+def make_client_discovery() -> DiscoveryService:
+    """AD-28 discovery service as HyperscaleClient builds it."""
+    return DiscoveryService(
+        DiscoveryConfig.from_env(
+            Env(),
+            node_role="client",
+            static_seeds=[],
+            allow_dynamic_registration=True,
+        ),
+        Logger(),
+    )
 
 
 # =============================================================================
@@ -54,10 +70,10 @@ class TestClientReportingManager:
     @pytest.fixture
     def config(self):
         """Create ClientConfig instance."""
-        return ClientConfig(
+        return ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[("manager1", 7000)],
             gates=[("gate1", 9000)],
         )
@@ -72,7 +88,7 @@ class TestClientReportingManager:
     @pytest.fixture
     def reporting_manager(self, state, config, logger):
         """Create ClientReportingManager instance."""
-        return ClientReportingManager(state, config, logger)
+        return ClientReportingManager(state, config, logger, RealClock())
 
     @pytest.mark.asyncio
     async def test_happy_path_with_default_json_config(self, reporting_manager):
@@ -296,10 +312,10 @@ class TestClientDiscovery:
     @pytest.fixture
     def config(self):
         """Create ClientConfig instance."""
-        return ClientConfig(
+        return ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[("manager1", 7000), ("manager2", 7001)],
             gates=[("gate1", 9000), ("gate2", 9001)],
         )
@@ -314,7 +330,7 @@ class TestClientDiscovery:
     @pytest.fixture
     def targets(self, config, state):
         """Create ClientTargetSelector instance."""
-        return ClientTargetSelector(config, state)
+        return ClientTargetSelector(config, state, make_client_discovery())
 
     @pytest.fixture
     def send_tcp(self):
@@ -380,14 +396,14 @@ class TestClientDiscovery:
     @pytest.mark.asyncio
     async def test_ping_manager_no_targets_configured(self, state, logger, send_tcp):
         """Test ping_manager with no managers configured."""
-        config = ClientConfig(
+        config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[],  # No managers
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No managers configured"):
@@ -396,14 +412,14 @@ class TestClientDiscovery:
     @pytest.mark.asyncio
     async def test_ping_gate_no_targets_configured(self, state, logger, send_tcp):
         """Test ping_gate with no gates configured."""
-        config = ClientConfig(
+        config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[],
             gates=[],  # No gates
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No gates configured"):
@@ -547,14 +563,14 @@ class TestClientDiscovery:
     async def test_happy_path_query_workflows(self, state, logger, send_tcp):
         """Test workflow query from managers."""
         # Use single-manager config to avoid duplicate results from parallel queries
-        config = ClientConfig(
+        config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[("manager1", 7000)],
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         workflow_info = WorkflowStatusInfo(
@@ -580,14 +596,14 @@ class TestClientDiscovery:
     @pytest.mark.asyncio
     async def test_query_workflows_no_managers(self, state, logger, send_tcp):
         """Test query_workflows with no managers configured."""
-        config = ClientConfig(
+        config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[],
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No managers configured"):
@@ -652,14 +668,14 @@ class TestClientDiscovery:
     @pytest.mark.asyncio
     async def test_query_workflows_via_gate_no_gates(self, state, logger, send_tcp):
         """Test query via gate with no gates configured."""
-        config = ClientConfig(
+        config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[],
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No gates configured"):
@@ -738,14 +754,14 @@ class TestClientDiscovery:
     @pytest.mark.asyncio
     async def test_get_datacenters_no_gates(self, state, logger, send_tcp):
         """Test get_datacenters with no gates configured."""
-        config = ClientConfig(
+        config = ClientConfig.from_env(
             host="localhost",
             tcp_port=8000,
-            env="test",
+            env=Env(),
             managers=[],
             gates=[],
         )
-        targets = ClientTargetSelector(config, state)
+        targets = ClientTargetSelector(config, state, make_client_discovery())
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No gates configured"):

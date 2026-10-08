@@ -28,14 +28,12 @@ Usage:
 
 import asyncio
 import sys
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from hyperscale.logging import Logger
 from hyperscale.distributed.discovery import (
     DiscoveryConfig,
     DiscoveryService,
@@ -314,7 +312,7 @@ def create_discovery_with_mock_resolver(
         datacenter_id=datacenter_id,
     )
 
-    service = DiscoveryService(config=config)
+    service = DiscoveryService(config=config, logger=Logger())
     # Inject mock resolver
     service._resolver = mock_resolver  # type: ignore
 

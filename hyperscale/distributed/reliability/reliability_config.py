@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from hyperscale.distributed.env import Env
 
+from .late_result_policy import LateResultPolicy
+
 
 @dataclass(slots=True)
 class ReliabilityConfig:
@@ -19,6 +21,7 @@ class ReliabilityConfig:
     best_effort_deadline_default: float
     best_effort_min_dcs_default: int
     best_effort_deadline_check_interval: float
+    best_effort_late_result_policy: LateResultPolicy
 
 
 def create_reliability_config_from_env(env: Env):
@@ -32,4 +35,5 @@ def create_reliability_config_from_env(env: Env):
         best_effort_deadline_default=env.BEST_EFFORT_DEADLINE_DEFAULT,
         best_effort_min_dcs_default=env.BEST_EFFORT_MIN_DCS_DEFAULT,
         best_effort_deadline_check_interval=env.BEST_EFFORT_DEADLINE_CHECK_INTERVAL,
+        best_effort_late_result_policy=LateResultPolicy(env.BEST_EFFORT_LATE_RESULT_POLICY),
     )

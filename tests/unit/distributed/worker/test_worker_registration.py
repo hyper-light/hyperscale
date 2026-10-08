@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.worker.registration import WorkerRegistrationHandler
 from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
 from hyperscale.distributed.models import (
@@ -25,8 +26,14 @@ from hyperscale.distributed.models import (
     NodeInfo,
     RegistrationResponse,
 )
-from hyperscale.distributed.protocol.version import NodeCapabilities, ProtocolVersion
+from hyperscale.distributed.protocol.version import CURRENT_PROTOCOL_VERSION, NodeCapabilities, ProtocolVersion
 from hyperscale.distributed.swim.core import CircuitState
+
+
+def _select_lowest_id(healthy_manager_ids: set[str]) -> str | None:
+    """Stand-in for AD-28 selection: a deterministic choice."""
+    return min(healthy_manager_ids)
+
 
 
 class MockDiscoveryService:
@@ -57,7 +64,7 @@ class TestWorkerRegistrationHandlerInitialization:
 
     def test_happy_path_instantiation(self) -> None:
         """Test normal instantiation."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
 
@@ -74,7 +81,7 @@ class TestWorkerRegistrationHandlerInitialization:
 
     def test_with_node_capabilities(self) -> None:
         """Test with explicit node capabilities."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         capabilities = NodeCapabilities.current(node_version="1.0.0")
 
@@ -88,7 +95,7 @@ class TestWorkerRegistrationHandlerInitialization:
 
     def test_set_node_capabilities(self) -> None:
         """Test updating node capabilities."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -108,7 +115,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
     @pytest.mark.asyncio
     async def test_register_success(self) -> None:
         """Test successful registration."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
         logger.log = AsyncMock()
@@ -147,7 +154,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
     @pytest.mark.asyncio
     async def test_register_circuit_breaker_open(self) -> None:
         """Test registration when circuit breaker is open."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
         logger.log = AsyncMock()
@@ -194,7 +201,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
     @pytest.mark.asyncio
     async def test_register_with_retries(self) -> None:
         """Test registration with retry logic."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
         logger.log = AsyncMock()
@@ -241,7 +248,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
     @pytest.mark.asyncio
     async def test_register_all_retries_fail(self) -> None:
         """Test registration when all retries fail."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
         logger = MagicMock()
         logger.log = AsyncMock()
@@ -282,9 +289,10 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
 class TestWorkerRegistrationHandlerProcessResponse:
     """Test processing registration responses."""
 
-    def test_process_response_success(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_response_success(self) -> None:
         """Test processing successful registration response."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -312,10 +320,10 @@ class TestWorkerRegistrationHandlerProcessResponse:
             capabilities="heartbeat_piggyback,priority_routing",
         )
 
-        add_unconfirmed_peer = MagicMock()
+        add_unconfirmed_peer = AsyncMock()
         add_to_probe_scheduler = MagicMock()
 
-        accepted, primary_id = handler.process_registration_response(
+        accepted, primary_id = await handler.process_registration_response(
             data=response.dump(),
             node_host="192.168.1.1",
             node_port=8000,
@@ -329,9 +337,10 @@ class TestWorkerRegistrationHandlerProcessResponse:
         assert handler._negotiated_capabilities is not None
         assert handler._negotiated_capabilities.compatible is True
 
-    def test_process_response_rejected(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_response_rejected(self) -> None:
         """Test processing rejected registration response."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -345,10 +354,10 @@ class TestWorkerRegistrationHandlerProcessResponse:
             healthy_managers=[],
         )
 
-        add_unconfirmed_peer = MagicMock()
+        add_unconfirmed_peer = AsyncMock()
         add_to_probe_scheduler = MagicMock()
 
-        accepted, primary_id = handler.process_registration_response(
+        accepted, primary_id = await handler.process_registration_response(
             data=response.dump(),
             node_host="192.168.1.1",
             node_port=8000,
@@ -360,9 +369,10 @@ class TestWorkerRegistrationHandlerProcessResponse:
         assert accepted is False
         assert primary_id is None
 
-    def test_process_response_with_multiple_managers(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_response_with_multiple_managers(self) -> None:
         """Test processing response with multiple managers."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -398,10 +408,10 @@ class TestWorkerRegistrationHandlerProcessResponse:
             protocol_version_minor=0,
         )
 
-        add_unconfirmed_peer = MagicMock()
+        add_unconfirmed_peer = AsyncMock()
         add_to_probe_scheduler = MagicMock()
 
-        accepted, primary_id = handler.process_registration_response(
+        accepted, primary_id = await handler.process_registration_response(
             data=response.dump(),
             node_host="192.168.1.1",
             node_port=8000,
@@ -417,9 +427,10 @@ class TestWorkerRegistrationHandlerProcessResponse:
         assert "mgr-1" in registry._known_managers
         assert "mgr-2" in registry._known_managers
 
-    def test_process_response_invalid_data(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_response_invalid_data(self) -> None:
         """Test processing invalid response data."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -427,10 +438,10 @@ class TestWorkerRegistrationHandlerProcessResponse:
             discovery_service=discovery,
         )
 
-        add_unconfirmed_peer = MagicMock()
+        add_unconfirmed_peer = AsyncMock()
         add_to_probe_scheduler = MagicMock()
 
-        accepted, primary_id = handler.process_registration_response(
+        accepted, primary_id = await handler.process_registration_response(
             data=b"invalid data",
             node_host="192.168.1.1",
             node_port=8000,
@@ -446,9 +457,10 @@ class TestWorkerRegistrationHandlerProcessResponse:
 class TestWorkerRegistrationHandlerProcessManagerRegistration:
     """Test processing registration requests from managers."""
 
-    def test_process_manager_registration_success(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_manager_registration_success(self) -> None:
         """Test processing manager registration request."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -473,10 +485,10 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
             known_managers=[],
         )
 
-        add_unconfirmed_peer = MagicMock()
+        add_unconfirmed_peer = AsyncMock()
         add_to_probe_scheduler = MagicMock()
 
-        result = handler.process_manager_registration(
+        result = await handler.process_manager_registration(
             data=registration.dump(),
             node_id_full="worker-full-id",
             total_cores=8,
@@ -497,9 +509,10 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
         # Manager should be added to discovery service
         assert "mgr-new" in discovery._peers
 
-    def test_process_manager_registration_as_leader(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_manager_registration_as_leader(self) -> None:
         """Test processing registration from leader manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -524,10 +537,10 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
             known_managers=[],
         )
 
-        add_unconfirmed_peer = MagicMock()
+        add_unconfirmed_peer = AsyncMock()
         add_to_probe_scheduler = MagicMock()
 
-        result = handler.process_manager_registration(
+        result = await handler.process_manager_registration(
             data=registration.dump(),
             node_id_full="worker-full-id",
             total_cores=8,
@@ -542,9 +555,10 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
         # Should be set as primary
         assert registry._primary_manager_id == "mgr-leader"
 
-    def test_process_manager_registration_with_known_managers(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_manager_registration_with_known_managers(self) -> None:
         """Test processing registration with known managers list."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -579,10 +593,10 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
             known_managers=[known_manager],
         )
 
-        add_unconfirmed_peer = MagicMock()
+        add_unconfirmed_peer = AsyncMock()
         add_to_probe_scheduler = MagicMock()
 
-        result = handler.process_manager_registration(
+        result = await handler.process_manager_registration(
             data=registration.dump(),
             node_id_full="worker-full-id",
             total_cores=8,
@@ -598,9 +612,10 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
         assert "mgr-new" in registry._known_managers
         assert "mgr-existing" in registry._known_managers
 
-    def test_process_manager_registration_invalid_data(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_manager_registration_invalid_data(self) -> None:
         """Test processing invalid registration data."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -608,10 +623,10 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
             discovery_service=discovery,
         )
 
-        add_unconfirmed_peer = MagicMock()
+        add_unconfirmed_peer = AsyncMock()
         add_to_probe_scheduler = MagicMock()
 
-        result = handler.process_manager_registration(
+        result = await handler.process_manager_registration(
             data=b"invalid data",
             node_id_full="worker-full-id",
             total_cores=8,
@@ -628,9 +643,10 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
 class TestWorkerRegistrationHandlerNegotiatedCapabilities:
     """Test negotiated capabilities handling."""
 
-    def test_negotiated_capabilities_property(self) -> None:
+    @pytest.mark.asyncio
+    async def test_negotiated_capabilities_property(self) -> None:
         """Test negotiated_capabilities property."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -650,12 +666,12 @@ class TestWorkerRegistrationHandlerNegotiatedCapabilities:
             capabilities="feature1,feature2",
         )
 
-        handler.process_registration_response(
+        await handler.process_registration_response(
             data=response.dump(),
             node_host="localhost",
             node_port=8000,
             node_id_short="wkr",
-            add_unconfirmed_peer=MagicMock(),
+            add_unconfirmed_peer=AsyncMock(),
             add_to_probe_scheduler=MagicMock(),
         )
 
@@ -666,9 +682,10 @@ class TestWorkerRegistrationHandlerNegotiatedCapabilities:
 class TestWorkerRegistrationHandlerEdgeCases:
     """Test edge cases."""
 
-    def test_empty_capabilities_string(self) -> None:
+    @pytest.mark.asyncio
+    async def test_empty_capabilities_string(self) -> None:
         """Test processing response with empty capabilities."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -685,12 +702,12 @@ class TestWorkerRegistrationHandlerEdgeCases:
             capabilities="",
         )
 
-        accepted, _ = handler.process_registration_response(
+        accepted, _ = await handler.process_registration_response(
             data=response.dump(),
             node_host="localhost",
             node_port=8000,
             node_id_short="wkr",
-            add_unconfirmed_peer=MagicMock(),
+            add_unconfirmed_peer=AsyncMock(),
             add_to_probe_scheduler=MagicMock(),
         )
 
@@ -698,9 +715,10 @@ class TestWorkerRegistrationHandlerEdgeCases:
         # Should have empty common features set
         assert handler.negotiated_capabilities.common_features == set()
 
-    def test_special_characters_in_node_id(self) -> None:
+    @pytest.mark.asyncio
+    async def test_special_characters_in_node_id(self) -> None:
         """Test with special characters in node ID."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         discovery = MockDiscoveryService()
 
         handler = WorkerRegistrationHandler(
@@ -725,15 +743,79 @@ class TestWorkerRegistrationHandlerEdgeCases:
             known_managers=[],
         )
 
-        result = handler.process_manager_registration(
+        result = await handler.process_manager_registration(
             data=registration.dump(),
             node_id_full="worker-🚀-id",
             total_cores=8,
             available_cores=4,
-            add_unconfirmed_peer=MagicMock(),
+            add_unconfirmed_peer=AsyncMock(),
             add_to_probe_scheduler=MagicMock(),
         )
 
         ack = ManagerToWorkerRegistrationAck.load(result)
         assert ack.accepted is True
         assert ack.worker_id == "worker-🚀-id"
+
+
+class TestWorkerRegistrationHandlerVersionSkew:
+    """AD-25 on the worker's side of registration: a manager of another
+    MAJOR protocol version is refused even when it accepted the worker
+    (an older manager may not check), and the negotiated features are the
+    ones both sides name."""
+
+    @staticmethod
+    def make_handler() -> WorkerRegistrationHandler:
+        registry = WorkerRegistry(
+            None,
+            forget_manager_backpressure=lambda manager_id: None,
+            circuit_breaker_config=Env().get_circuit_breaker_config(),
+            select_manager=_select_lowest_id,
+        )
+        return WorkerRegistrationHandler(registry=registry, discovery_service=MockDiscoveryService())
+
+    @staticmethod
+    async def process(handler: WorkerRegistrationHandler, response: RegistrationResponse) -> tuple[bool, str | None]:
+        return await handler.process_registration_response(
+            data=response.dump(),
+            node_host="localhost",
+            node_port=8000,
+            node_id_short="wkr",
+            add_unconfirmed_peer=AsyncMock(),
+            add_to_probe_scheduler=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_accepting_manager_of_another_major_version_is_refused(self) -> None:
+        handler = self.make_handler()
+        response = RegistrationResponse(
+            accepted=True,
+            manager_id="mgr-1",
+            healthy_managers=[],
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major + 1,
+            protocol_version_minor=0,
+            capabilities="cancellation",
+        )
+
+        assert await self.process(handler, response) == (False, None)
+        assert handler.negotiated_capabilities is None
+        assert handler._registry._primary_manager_id is None
+
+    @pytest.mark.asyncio
+    async def test_the_negotiated_features_are_those_both_sides_name(self) -> None:
+        handler = self.make_handler()
+        response = RegistrationResponse(
+            accepted=True,
+            manager_id="mgr-1",
+            healthy_managers=[],
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor + 1,
+            capabilities="cancellation,heartbeat,feature_from_a_newer_minor",
+        )
+
+        assert await self.process(handler, response) == (True, "mgr-1")
+        negotiated = handler.negotiated_capabilities
+        assert negotiated.compatible is True
+        assert negotiated.common_features == {"cancellation", "heartbeat"}
+        assert negotiated.remote_version == ProtocolVersion(
+            CURRENT_PROTOCOL_VERSION.major, CURRENT_PROTOCOL_VERSION.minor + 1
+        )

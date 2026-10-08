@@ -40,7 +40,23 @@ class MockLeaderElection:
     async def handle_elected(self, target: tuple[str, int], term: int) -> None:
         pass
 
-    async def handle_heartbeat(self, target: tuple[str, int], term: int) -> None:
+    async def handle_heartbeat(
+        self,
+        target: tuple[str, int],
+        term: int,
+        heartbeat_seq: int = 0,
+        lease_duration_seconds: float | None = None,
+    ) -> None:
+        pass
+
+    def heartbeat_acknowledgement(
+        self, leader: tuple[str, int], term: int
+    ) -> bytes | None:
+        return None
+
+    def handle_heartbeat_ack(
+        self, voter: tuple[str, int], term: int, heartbeat_seq: int
+    ) -> None:
         pass
 
     async def handle_stepdown(self, target: tuple[str, int], term: int) -> None:
@@ -116,6 +132,7 @@ class MockTrackedNodeState:
 @dataclass
 class MockIncarnationTracker:
     _nodes: dict = field(default_factory=dict)
+    _self_incarnation: int = 1
 
     async def update_node(
         self,
@@ -160,6 +177,12 @@ class MockIncarnationTracker:
             return self._nodes[node][1]
         return 0
 
+    def get_self_incarnation(self) -> int:
+        return self._self_incarnation
+
+    def is_potential_zombie(self, node: tuple[str, int], incarnation: int) -> bool:
+        return False
+
     def get_required_rejoin_incarnation(self, node: tuple[str, int]) -> int:
         return 0
 
@@ -177,6 +200,27 @@ class MockAuditLog:
         self._events.append((event_type, kwargs))
 
 
+class _AlwaysContains:
+    """Container stand-in that reports membership for any proxy address."""
+
+    def __contains__(self, item: Any) -> bool:
+        return True
+
+
+@dataclass
+class MockPendingProbe:
+    """Mock pending indirect-probe record.
+
+    Production ``PingReqAckHandler`` calls ``matches_request`` and reads
+    ``proxies`` on the object returned by ``get_pending_probe``.
+    """
+
+    proxies: Any = field(default_factory=_AlwaysContains)
+
+    def matches_request(self, request_id: str | None) -> bool:
+        return True
+
+
 @dataclass
 class MockIndirectProbeManager:
     """Mock indirect probe manager."""
@@ -187,7 +231,7 @@ class MockIndirectProbeManager:
         return self._pending_probes.get(target)
 
     def add_pending_probe(self, target: tuple[str, int]) -> None:
-        self._pending_probes[target] = True
+        self._pending_probes[target] = MockPendingProbe()
 
 
 @dataclass
@@ -211,6 +255,7 @@ class MockServerInterface:
         # Identity
         self._udp_addr_slug = b"127.0.0.1:9000"
         self._self_addr = ("127.0.0.1", 9000)
+        self._self_node_id = "server-1"
 
         # State
         self._nodes: dict[tuple[str, int], asyncio.Queue] = {}
@@ -235,6 +280,9 @@ class MockServerInterface:
         self._dead_notifications: list[tuple[tuple[str, int], int, str]] = []
         self._registered_node_ids_by_addr: dict[tuple[str, int], str] = {}
         self._queued_gossip_updates: list[tuple[str, tuple[str, int], int]] = []
+        self._registered_peers: set[tuple[str, int]] = set()
+        self._peer_roles: dict[tuple[str, int], str] = {}
+        self._join_notifications: list[tuple[str, int]] = []
 
         # Configurable behaviors
         self._validate_target_result = True
@@ -250,6 +298,9 @@ class MockServerInterface:
 
     def get_self_udp_addr(self) -> tuple[str, int]:
         return self._self_addr
+
+    def get_self_node_id(self) -> str:
+        return self._self_node_id
 
     def udp_target_is_self(self, target: tuple[str, int]) -> bool:
         return target == self._self_addr
@@ -283,6 +334,18 @@ class MockServerInterface:
     def is_peer_confirmed(self, peer: tuple[str, int]) -> bool:
         return peer in self._confirmed_peers
 
+    def register_peer(self, peer: tuple[str, int]) -> None:
+        self._registered_peers.add(peer)
+
+    def is_peer_registered(self, peer: tuple[str, int]) -> bool:
+        return peer in self._registered_peers
+
+    def record_peer_role(self, peer: tuple[str, int], role: str) -> None:
+        self._peer_roles[peer] = role
+
+    def notify_node_join(self, node: tuple[str, int]) -> None:
+        self._join_notifications.append(node)
+
     # === Node State ===
 
     async def update_node_state(
@@ -312,11 +375,7 @@ class MockServerInterface:
     async def decrease_failure_detector(self, reason: str) -> None:
         pass
 
-    def get_lhm_adjusted_timeout(
-        self,
-        base_timeout: float,
-        target_node_id: str | None = None,
-    ) -> float:
+    def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
         return base_timeout
 
     # === Suspicion ===
@@ -560,7 +619,10 @@ class MockServerInterface:
     # === Indirect Probing ===
 
     async def handle_indirect_probe_response(
-        self, target: tuple[str, int], is_alive: bool
+        self,
+        target: tuple[str, int],
+        is_alive: bool,
+        request_id: str | None = None,
     ) -> None:
         pass
 
@@ -590,6 +652,44 @@ class MockServerInterface:
     ) -> None:
         self._queued_gossip_updates.append((update_type, node, incarnation))
 
+    async def _disseminate_leave(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        message: bytes,
+    ) -> None:
+        """Background dissemination stub (never invoked directly in tests)."""
+
+    async def _disseminate_join(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        message: bytes,
+    ) -> None:
+        """Background dissemination stub (never invoked directly in tests)."""
+
+    def queue_leave_dissemination(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        target_addr_bytes: bytes | None,
+        message: bytes,
+    ) -> None:
+        self._task_runner.run(
+            self._disseminate_leave, target, incarnation, message
+        )
+
+    def queue_join_dissemination(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        target_addr_bytes: bytes | None,
+        message: bytes,
+    ) -> None:
+        self._task_runner.run(
+            self._disseminate_join, target, incarnation, message
+        )
+
     def update_probe_scheduler_membership(self) -> None:
         pass
 
@@ -608,13 +708,6 @@ class MockServerInterface:
 
     async def context_with_value(self, target: tuple[str, int]) -> "MockContextManager":
         return MockContextManager()
-
-    async def write_context(self, key: Any, value: Any) -> None:
-        if key == "nodes":
-            pass
-        elif isinstance(key, tuple):
-            if key not in self._nodes:
-                self._nodes[key] = asyncio.Queue()
 
     # === Leadership Broadcasting ===
 

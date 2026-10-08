@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import reduce
-from typing import Any, AsyncIterable, List, Union
+from typing import Any, AsyncIterable, Callable, List, Union
 
 from hyperscale.tools.helpers import awaitable, wrap
 
@@ -211,7 +211,7 @@ class AsyncList:
 
         return AsyncList(found)
 
-    async def reduce(self, reducer: function) -> AsyncList:
+    async def reduce(self, reducer: Callable[[Any, Any], Any]) -> AsyncList:
         reduced = await awaitable(reduce, reducer, self.data)
         return AsyncList(reduced)
 

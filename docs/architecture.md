@@ -144,10 +144,10 @@ The distributed system implements a three-tier architecture optimized for execut
 
 1. **Workers are the source of truth** - Workers maintain authoritative state for their own workflows
 2. **Passive state discovery** - Serf-style heartbeat embedding in SWIM messages
-3. **Quorum-based provisioning** - Manager decisions require quorum confirmation
-4. **Lease-based execution** - Gates use leases for at-most-once DC semantics
+3. **Quorum-replicated dispatch** - A job leader dispatches a workflow only after the job's state has been synced to a quorum of peer managers (`_replicate_job_state_for_dispatch`); the old `Provision*` confirmation round was deleted (2026-10, plan D5)
+4. **Fenced execution** - Gates get at-most-once DC semantics from per-job gate leadership and fencing tokens (every takeover first adopts the freshest replica a quorum of gates committed, then commits a `GateJobReplica` with a raised fence to a quorum of live gates by two-phase commit -- `nodes/gate/replication_coordinator.py` `take_over_committed_replica`; each gate writes its prepare votes and commits to its Raft store before acknowledging them and recovers them at start (A2-G-266), so a replica survives a power loss of every gate; not through a Raft group: an idempotency key binds one job across jobs, which per-job groups cannot decide, and the committed replica founds the job's group), AD-40 idempotency keys, and manager-side fencing that refuses a stale gate fence. (2026-10-06: the never-acquired datacenter lease subsystem -- `DatacenterLeaseManager`, `DatacenterLease`, `LeaseTransfer`/`LeaseTransferAck` and the gate's `lease_transfer` handler -- was removed; it provided none of this.)
 5. **Graceful degradation** - Load shedding under pressure, LHM-aware timeouts
-6. **Composition over inheritance** - All extensibility via callbacks, not method overriding
+6. **Composition over inheritance** - Extensibility is via callbacks and composed collaborators; the node servers also override 26 `HealthAwareServer`/`MercurySyncBaseServer` methods, which are deliberate template hooks (`stop`, `abort`, `_join_node`, piggyback get/process pairs, election cohort, leave targets; plan D12)
 7. **TaskRunner for lifecycle management** - All background tasks managed via TaskRunner
 8. **Quorum uses configured size** - Prevents split-brain in partitions (see below)
 
@@ -159,7 +159,9 @@ This section documents key architectural decisions made during development.
 
 ### AD-1: Composition Over Inheritance
 
-**Decision**: All extensibility is via callbacks and composition, never method overriding.
+**Decision**: Extensibility is via callbacks and composition. Method overriding is limited to template hooks the base server declares for its roles.
+
+> **Amended (2026-10, plan decision D12).** The node servers override 26 base-server methods (manager 13, gate 7, worker 6): `stop`/`abort`, `_join_node`, `_get_registered_node_id_for_addr`, election-cohort sizing, leave targets, and the SWIM piggyback get/process pairs. These are deliberate template hooks, not fragile-base-class overrides, so the doc changed rather than the code.
 
 **Rationale**: 
 - Prevents fragile base class problems
@@ -263,13 +265,13 @@ def _has_quorum_available(self) -> bool:
 - New manager needs to know about in-flight work
 
 **Implementation**:
-- Worker registers `_handle_manager_failure` as `on_node_dead` callback
-- On manager death: clear current manager, try alternatives
-- On successful failover: call `_report_active_workflows_to_manager()`
+- Worker registers its health integration's `on_node_dead` (`nodes/worker/server.py`), which runs `_handle_manager_failure_async` on the TaskRunner
+- On manager death: invalidate the cached TCP transport to it, mark it unhealthy, `select_new_primary_manager()`, and mark that manager's workflows orphaned (the orphan-check loop cancels them if no new job leader claims them within the grace period)
+- No push after failover: the new leader pulls (`sync_state_from_workers` on leadership). The old `_report_active_workflows_to_manager()` push was dead and was deleted (2026-10, plan Phase 3 "AD-7").
 
 ### AD-8: Cores Completed for Faster Provisioning
 
-**Decision**: Workers report `cores_completed` in progress updates; managers optimistically update available cores.
+**Decision**: Workers report their current `available_cores` (with the allocator's availability version) in progress updates and results; managers update the worker's free cores from it without waiting for the heartbeat.
 
 **Rationale**:
 - Don't wait for entire workflow to complete before provisioning
@@ -277,13 +279,13 @@ def _has_quorum_available(self) -> bool:
 - Better utilization of worker capacity
 
 **Implementation**:
-- `WorkflowProgress.cores_completed` field
-- Manager's `_update_worker_cores_from_progress()` calculates freed cores
-- Optimistic update may be superseded by next heartbeat (acceptable)
+- Manager's `_update_worker_cores_from_workflow_progress()` calls `WorkerPool.update_worker_cores_from_progress(node_id, worker_available_cores, dispatch_token, cores_version)` (`jobs/worker_pool.py`), clears that dispatch's reservation and signals waiting dispatches
+- Reservations are kept per dispatch; a report older than the newest seen availability version never overwrites it (2026-10, plan Phase 3 G-8: the earlier `cores_completed` arithmetic double-booked cores)
+- Test: `tests/unit/simulation/sim/test_worker_core_accounting.py`
 
 ### AD-9: Retry Data Preserved at Dispatch
 
-**Decision**: Original `WorkflowDispatch` bytes are stored when workflow is first dispatched, not reconstructed on retry.
+**Decision**: A retried workflow is requeued as its parsed pending workflow and dispatched afresh, excluding the workers it failed on. (Amended 2026-10: the original byte-replay design's `_workflow_retries` state was orphaned and is gone.)
 
 **Rationale**:
 - Ensures retry has exact same parameters (VUs, timeout, context)
@@ -291,11 +293,24 @@ def _has_quorum_available(self) -> bool:
 - Simplifies retry logic
 
 **Implementation**:
-- `_workflow_retries[workflow_id] = (count, original_dispatch_bytes, failed_workers)`
-- On retry: deserialize original, create new dispatch with updated fence_token
-- `failed_workers` set prevents re-dispatching to same worker
+- `WorkflowDispatcher.requeue_workflow(sub_workflow_token, excluded_worker_id)` (`jobs/workflow_dispatcher.py`) puts the `PendingWorkflow` back in the queue
+- `PendingWorkflow.excluded_worker_ids` (`models/pending_workflow.py`) keeps allocation off workers it failed on
+- The new dispatch carries a fresh fence token
+- Test: `tests/unit/distributed/jobs/test_workflow_dispatch_routing.py`
 
 ### AD-10: Fencing Tokens from Terms
+
+> **Amended (2026-10, plan decision D15).** A term alone cannot fence one
+> job (every job in the group shares it), so tokens are per job. A workflow
+> dispatch carries `(leader_term << 32) | per_job_counter`
+> (`JobManager.get_next_fence_token`, `jobs/job_manager.py`): a new term
+> outranks every token of the old one, and the counter orders dispatches
+> within a term. Job leadership has its own per-job counter
+> (`nodes/manager/leases.py` `get_fence_token` / `increment_fence_token` /
+> `update_fence_token_if_higher`). Workers keep the highest token seen per job
+> and per workflow and refuse anything at or below it (`nodes/worker/state.py`
+> `update_job_fence_token`, `update_workflow_fence_token`). The text below is
+> the original decision.
 
 **Decision**: Fencing tokens are derived from election terms.
 
@@ -319,10 +334,11 @@ def _has_quorum_available(self) -> bool:
 - Exponential backoff prevents thundering herd on recovery
 
 **Implementation**:
-- `_request_worker_state(max_retries=3, base_delay=0.5)` retries with backoff
-- `_request_manager_peer_state(max_retries=3, base_delay=0.5)` similarly
-- Delay formula: `base_delay * (2 ** attempt)`
-- After exhausting retries, error is logged but sync continues with other peers
+- `ManagerStateSync` (`nodes/manager/sync.py`) builds one `RetryConfig(max_attempts=state_sync_retries + 1, base_delay=state_sync_timeout_seconds / (2**retries - 1), jitter=FULL)`, so the backoffs together span one sync timeout
+- Retried: a refused/reset connection or a target answering not-ready (`StateSyncNotReadyError`); a timeout is not retried (it already spent a full budget)
+- Used by `sync_state_from_workers` and `sync_full_state_from_manager_peers` through `RetryExecutor`
+- After exhausting retries, the error is logged and sync continues with other targets
+- Test: `tests/unit/distributed/manager/test_state_sync_retries.py`
 
 ### AD-12: Manager Peer State Sync on Leadership
 
@@ -397,13 +413,24 @@ class JobStatsCRDT:
 | Tier | Stats | Frequency | Transport |
 |------|-------|-----------|-----------|
 | Immediate | Job completion, failure, critical alerts | Event-driven | TCP push |
-| Periodic | Workflow progress, aggregate rates | Every 1-5s | TCP batch |
+| Periodic | Workflow progress, aggregate rates | Every 0.25 s (`GATE_BATCH_STATS_INTERVAL`) | TCP batch |
 | On-Demand | Step-level stats, historical data | Client request | TCP pull |
+
+**Periodic-tier cadence** (`GATE_BATCH_STATS_INTERVAL`, default 0.25 s): the
+batch push is a gate-fronted client's only source of live aggregate progress,
+so the interval is the staleness bound on what the operator watches. Nielsen's
+response-time limits put continuous feedback under 1.0 s (beyond it the user
+loses the sense of a live system); a "1-5 s" cadence breaks that bound. The
+floor is the upstream refresh: workers flush progress every
+`WORKER_PROGRESS_FLUSH_INTERVAL` (0.05 s), so 0.25 s folds five worker flushes
+into one push and costs four messages per second per job callback. It equals
+`MANAGER_BATCH_PUSH_INTERVAL`, so gate-fronted and gateless clients see the
+same cadence.
 
 **Implementation**:
 - `_send_immediate_update()` for tier 1 events
 - `_batch_stats_loop()` aggregates tier 2 stats periodically
-- `receive_job_status_request()` fetches tier 3 on demand
+- `job_status()` answers tier 3 on demand (at the requested `ReadConsistency`, AD-38 Part 8)
 
 ### AD-16: Datacenter Health Classification
 
@@ -420,10 +447,20 @@ class JobStatsCRDT:
 
 | State | Definition | Condition |
 |-------|------------|-----------|
-| UNHEALTHY | No managers responding OR no workers registered | `alive_managers == 0` OR `worker_count == 0` |
+| INITIALIZING | Managers configured, none has ever sent a heartbeat | no manager info recorded yet |
+| UNHEALTHY | No managers responding, or the reporting manager cannot write durably | `alive_managers == 0` OR `not storage_writable` |
 | DEGRADED | Majority of workers unhealthy OR majority of managers unhealthy | `healthy_workers < worker_count // 2 + 1` OR `alive_managers < total_managers // 2 + 1` |
-| BUSY | Not degraded AND no available capacity | NOT degraded AND `available_cores == 0` |
+| BUSY | Live managers but no workers, or not degraded AND no available capacity | `worker_count == 0` OR (NOT degraded AND `available_cores == 0`) |
 | HEALTHY | Not degraded AND capacity available | NOT degraded AND `available_cores > 0` |
+
+> **As built (2026-10).** `DatacenterHealthManager` (`datacenters/datacenter_health_manager.py`)
+> checks, in order: no managers known → UNHEALTHY; managers configured but none
+> ever reported → INITIALIZING; no fresh heartbeat or `storage_writable` false →
+> UNHEALTHY; `worker_count == 0` → BUSY. Otherwise HEALTHY/BUSY/DEGRADED/UNHEALTHY
+> come from `DatacenterOverloadClassifier` over the heartbeat's worker and
+> manager overload counts, not from the majority rule above. Zero
+> workers is BUSY because the manager tier is up and queues the job until a
+> worker registers; UNHEALTHY there made worker warmup terminal.
 
 **Key Metrics from ManagerHeartbeat**:
 - `worker_count`: Total registered workers
@@ -437,12 +474,13 @@ class DatacenterHealth(Enum):
     HEALTHY = "healthy"      # Capacity available, all systems operational
     BUSY = "busy"            # No capacity but structurally healthy (transient)
     DEGRADED = "degraded"    # Majority of workers/managers unhealthy
-    UNHEALTHY = "unhealthy"  # No managers OR no workers
+    UNHEALTHY = "unhealthy"  # No managers, or storage not writable
+    INITIALIZING = "initializing"  # No manager has reported yet
 
 def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
     # 1. Check manager liveness via SWIM
     # 2. If alive_managers == 0 → UNHEALTHY
-    # 3. If no workers registered → UNHEALTHY
+    # 3. If no workers registered → BUSY (work queues until one registers)
     # 4. Check majority health:
     #    - healthy_workers < worker_quorum → DEGRADED
     #    - alive_managers < manager_quorum → DEGRADED
@@ -970,6 +1008,14 @@ class GateHealthState:
 
 #### Generic Node Health Infrastructure
 
+> **As built (2026-10).** `NodeHealthTracker` was never wired and was deleted
+> (plan Phase 6). The cascade guard it described is `is_systemic_failure`
+> (`hyperscale/distributed/health/systemic_failure.py`: at least 2 failing and
+> more than half the population), which holds every eviction in the manager's
+> `_enforce_worker_deadlines` and stops retry-budget charging while it holds.
+> Test: `tests/unit/distributed/manager/test_systemic_eviction_hold.py`. The
+> sketch below is history.
+
 ```python
 from typing import Generic, TypeVar, Protocol
 
@@ -1386,6 +1432,15 @@ class StatsBuffer:
 
 ### AD-24: Rate Limiting (Client and Server)
 
+> **As built (2026-10).** The authoritative limiter is server-side and counts
+> each client's requests per operation in a `SlidingWindowCounter`
+> (`reliability/sliding_window_counter.py`, used by
+> `reliability/adaptive_rate_limiter.py`) behind `ServerRateLimiter`, built by
+> the manager and gate servers; a refused request gets a `RateLimitResponse`
+> with `retry_after_seconds`, which the client waits out. `TokenBucket` was
+> deleted (plan Phase 6). The token-bucket design below is history; the
+> current limits and their configuration are in `docs/architecture/AD_24.md`.
+
 **Decision**: Implement token bucket rate limiting at both client and server sides.
 
 **Rationale**:
@@ -1468,6 +1523,19 @@ class ServerRateLimiter:
 ### AD-25: Version Skew Handling
 
 **Decision**: Support rolling upgrades via protocol versioning and capability negotiation.
+
+> **As built (2026-10-06).** Wire evolution for `Message` dataclasses is
+> built in `Message.__getattr__` (`hyperscale/distributed/models/message.py`):
+> a field an older sender lacked reads as its default (stored on first read;
+> normal lookup is untouched, so set fields cost nothing), a newer sender's
+> unknown fields land in `__dict__` and are never read, and a field added
+> without a default raises, naming the field, when read. The pickle format is
+> unchanged. `tests/unit/distributed/models/test_rolling_upgrade_wire_compatibility.py`
+> checks all 104 wire messages in both directions plus the breaking-change
+> case. Capability negotiation runs and the manager stores each gate's
+> negotiated capabilities (`nodes/manager/version_skew.py`), but no behavior
+> is yet gated on a negotiated feature: `gate_supports_feature` and
+> `get_common_features_with_all_gates` have no callers.
 
 **Rationale**:
 - Zero-downtime upgrades require version compatibility
@@ -1800,8 +1868,10 @@ hyperscale/distributed_rewrite/
 ├── datacenters/                  # DC-level coordination
 │   ├── __init__.py
 │   ├── datacenter_health.py      # DatacenterHealthManager
-│   ├── manager_dispatcher.py     # ManagerDispatcher
-│   └── lease_manager.py          # DC lease management
+│   ├── (manager_dispatcher.py)   # removed 2026-10-04: never read; gate
+│   │                             #   dispatch is GateDispatchCoordinator
+│   └── (lease_manager.py)        # removed 2026-10-06: DC leases never acquired;
+│                                 #   at-most-once is leadership + fencing + AD-40
 │
 ├── reliability/                  # Cross-cutting reliability
 │   ├── __init__.py
@@ -1809,7 +1879,7 @@ hyperscale/distributed_rewrite/
 │   ├── circuit_breaker.py        # CircuitBreaker
 │   ├── load_shedding.py          # LoadShedder
 │   ├── backpressure.py           # BackpressureController
-│   ├── rate_limiting.py          # TokenBucket, RateLimiter
+│   ├── rate_limiting.py          # sliding-window limiter (TokenBucket deleted)
 │   ├── overload.py               # HybridOverloadDetector
 │   └── jitter.py                 # Jitter utilities
 │
@@ -1832,11 +1902,35 @@ hyperscale/distributed_rewrite/
 4. Add tests for each extracted class
 5. Final cleanup of gate.py
 
+**Status (2026-10)**: steps 1-4 are done. The gate lives in
+`hyperscale/distributed/nodes/gate/` with its coordinators (dispatch,
+replication, health, job failover, leadership, orphan job, peer, stats) and
+TCP handlers, and the dead `GateCancellationCoordinator`, inline fallback
+duplicates and `GateConfig` are gone. Step 5 is not done:
+`nodes/gate/server.py` is still one `GateServer` class of about 10,100 lines
+(it grew from 6,901 while complexity splits added methods in place); moving
+its remaining domains into composed classes is plan Phase 8, not started.
+
 ---
 
 ### AD-28: Enhanced DNS Discovery with Peer Selection
 
 **Decision**: Implement a robust, locality-aware peer discovery and selection system using Weighted Rendezvous Hashing combined with Adaptive EWMA-based selection, bounded connection pools, and comprehensive security validation.
+
+> **As built (2026-10).** Selection is built and live: the gate orders a
+> datacenter's managers through `DatacenterManagerSelector`
+> (`nodes/gate/datacenter_manager_selector.py`) and records dispatch success
+> and failure; the client ranks targets with rendezvous hashing
+> (`nodes/client/targets.py`); the worker picks managers with
+> `select_peer_with_filter`. The connection pool and sticky primary/backup
+> connections were deleted (plan decision D4, `discovery/pool/` removed): they
+> duplicated the transport's own connection cache. The bootstrap half is
+> AD-52's seed locators (D3). Managers run no discovery selection: dispatch
+> allocates cores over every worker in the datacenter (AD-17 buckets in
+> `WorkerPool`) and peer sync reaches every active peer, so the unfed
+> `ManagerDiscoveryCoordinator` was deleted (2026-10-07). Tests:
+> `tests/unit/distributed/gate/test_datacenter_manager_selector.py`,
+> `tests/unit/distributed/discovery/test_select_peers_fill.py`.
 
 **Rationale**:
 - Current static seed approach doesn't scale for globally distributed deployments
@@ -2352,7 +2446,7 @@ hyperscale/distributed_rewrite/discovery/
 │
 ├── pool/
 │   ├── __init__.py
-│   ├── connection_pool.py         # ConnectionPool with sticky connections
+│   ├── (connection_pool.py)       # deleted 2026-10 (D4): transport caches
 │   ├── peer_health.py             # PeerHealthTracker
 │   └── promotion.py               # PromotionManager
 │
@@ -3659,6 +3753,20 @@ Manager1 (job leader in DC) dies
 
 This prevents memory exhaustion while ensuring latency-critical messages (SWIM heartbeats) are never delayed by queue overhead, and slow destinations don't block fast ones.
 
+> **As built (2026-10, plan decision D10).** The client side is not a
+> `RobustMessageQueue` per destination and there is no
+> `OutgoingRequestManager`. Each TCP destination gets its own
+> `asyncio.Semaphore` bounded by `OUTGOING_QUEUE_SIZE`
+> (`server/server/mercury_sync_base_server.py`, `_tcp_destination_slots`),
+> taken before a node-wide slot, so requests queued behind a silent peer hold
+> no node-wide slot; the whole request (waits, dial, reply) fits one
+> deadline, and a destination's semaphore is forgotten once its last request
+> settles. Test: `tests/unit/simulation/sim/test_send_destination_isolation.py`.
+> `OUTGOING_OVERFLOW_SIZE`, `OUTGOING_MAX_DESTINATIONS` and
+> `Env.get_outgoing_queue_config()` are still defined but nothing reads them.
+> The client-side queue design and its throttle/batch/reject thresholds below
+> are history; the server-side half is as described.
+
 **Rationale - Why Hybrid?**
 
 In a globally distributed performance testing framework:
@@ -4451,14 +4559,14 @@ Cross-datacenter coordinators that manage global job state and DC-level retries.
 │  │ • Probe/Ack      │    │ • Job Submission │                   │
 │  │ • Suspicion      │    │ • Status Relay   │                   │
 │  │ • Leadership     │    │ • State Sync     │                   │
-│  │ • State Embed    │    │ • Lease Transfer │                   │
+│  │ • State Embed    │    │ • Job Leadership │                   │
 │  └──────────────────┘    └──────────────────┘                   │
 │           │                      │                               │
 │           ▼                      ▼                               │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                    Gate State                            │    │
 │  │  • _jobs: GlobalJobStatus per job                       │    │
-│  │  • _leases: DatacenterLease per job:dc                  │    │
+│  │  • job leaders + fencing tokens per job                 │    │
 │  │  • _datacenter_status: ManagerHeartbeat per DC          │    │
 │  │  • _versioned_clock: Per-entity Lamport timestamps      │    │
 │  └─────────────────────────────────────────────────────────┘    │
@@ -4466,9 +4574,9 @@ Cross-datacenter coordinators that manage global job state and DC-level retries.
 │  Responsibilities:                                               │
 │  • Accept job submissions from clients                          │
 │  • Select target datacenters for job execution                  │
-│  • Create leases for at-most-once semantics                     │
+│  • Fence dispatches for at-most-once (AD-40)                    │
 │  • Aggregate status from managers across DCs                    │
-│  • Handle DC-level failure and retry (lease-based)              │
+│  • Handle DC-level failure and retry (fenced)                   │
 │  • Leader election among gates                                   │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -4631,8 +4739,8 @@ TCP is a stream protocol, not a message protocol. Data can arrive fragmented acr
 │  Design Rationale:                                               │
 │  ┌────────────────────────────────────────────────────────────┐ │
 │  │                                                             │ │
-│  │  • 4-byte prefix supports messages up to ~4GB              │ │
-│  │  • Handles arbitrary-sized cloudpickled classes            │ │
+│  │  • Frames capped at MAX_FRAME_LENGTH = MAX_MESSAGE_SIZE    │ │
+│  │    (3 MiB) + AES-GCM overhead (receive_buffer.py)          │ │
 │  │  • Prevents pickle truncation on large payloads            │ │
 │  │  • Applied after compression/encryption (framing is outer) │ │
 │  │                                                             │ │
@@ -4734,7 +4842,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                    Gossip Buffer                         │    │
 │  │  • Piggybacked membership updates                       │    │
-│  │  • Priority: JOIN > LEAVE > ALIVE > SUSPECT > DEAD      │    │
+│  │  • Fewest-transmits first (memberlist), no type order   │    │
 │  │  • Bounded size with overflow callback                  │    │
 │  │  • Efficient encoding within UDP MTU                    │    │
 │  └─────────────────────────────────────────────────────────┘    │
@@ -4929,24 +5037,24 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │           │            FOR EACH WORKFLOW IN JOB:              │             │
 │           ▼                                                    │             │
 │  ┌─────────────────────────────────────────────────────────┐  │             │
-│  │  WORKER SELECTION (crypto-random for security)          │  │             │
+│  │  WORKER SELECTION (WorkerPool.allocate_cores)           │  │             │
 │  │  ───────────────────────────────────────────────────────│  │             │
 │  │  1. Get all registered workers from _workers            │  │             │
 │  │  2. Filter by health: HEALTHY or DEGRADED (not DRAINING)│  │             │
 │  │  3. Filter by capacity: available_cores >= vus          │  │             │
 │  │  4. Apply backpressure: queue_depth < soft_limit        │  │             │
-│  │  5. Use secrets.SystemRandom().choice() for selection   │  │             │
+│  │  5. Pick by health bucket (healthy, then busy/degraded) │  │             │
 │  └─────────────────────────────────────────────────────────┘  │             │
 │                         │                                      │             │
 │                         ▼                                      │             │
 │  ┌─────────────────────────────────────────────────────────┐  │             │
-│  │  QUORUM CONFIRMATION (if manager cluster size > 1)      │  │             │
+│  │  JOB-STATE QUORUM (if manager cluster size > 1)         │  │             │
 │  │  ───────────────────────────────────────────────────────│  │             │
-│  │  1. Create ProvisionRequest { workflow_id, worker, ... }│  │             │
-│  │  2. Send to all peer managers                           │  │             │
-│  │  3. Wait for quorum: (n // 2) + 1 confirmations         │  │             │
-│  │  4. Timeout → reject provisioning                       │  │             │
-│  │  5. Quorum achieved → proceed to commit                 │  │             │
+│  │  1. _replicate_job_state_for_dispatch(job_id)           │  │             │
+│  │  2. Sync job state (context, layer) to peer managers    │  │             │
+│  │  3. Wait for quorum: (n // 2) + 1 acceptances           │  │             │
+│  │  4. No quorum → dispatch refused, workflow stays queued │  │             │
+│  │  5. Quorum reached → dispatch                           │  │             │
 │  └─────────────────────────────────────────────────────────┘  │             │
 │                         │                                      │             │
 │                         ▼                                      │             │
@@ -4955,7 +5063,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │  ───────────────────────────────────────────────────────│  │             │
 │  │  1. Create WorkflowDispatch { fence_token, ... }        │  │             │
 │  │  2. Store in _workflow_assignments[workflow_id]         │  │             │
-│  │  3. Store pickled bytes in _workflow_retries for retry  │  │             │
+│  │  3. Retry requeues the pending workflow (excluded ids)  │  │             │
 │  │  4. Send via send_tcp(worker_addr, "dispatch", data)    │  │             │
 │  │  5. Wait for WorkflowDispatchAck                        │  │             │
 │  └─────────────────────────────────────────────────────────┘  │             │
@@ -5028,14 +5136,14 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │           │            FOR EACH TARGET DATACENTER:            │             │
 │           ▼                                                    │             │
 │  ┌─────────────────────────────────────────────────────────┐  │             │
-│  │  LEASE CREATION (at-most-once semantics)                │  │             │
+│  │  JOB FENCING (at-most-once semantics)                   │  │             │
 │  │  ───────────────────────────────────────────────────────│  │             │
-│  │  1. Generate fence_token (monotonic, derived from term) │  │             │
-│  │  2. Create DatacenterLease {                            │  │             │
-│  │       job_id, datacenter, lease_holder: self.node_id,  │  │             │
-│  │       fence_token, expires_at: now + timeout           │  │             │
-│  │     }                                                   │  │             │
-│  │  3. Store in _leases[(job_id, datacenter)]             │  │             │
+│  │  1. fence_token from the job's gate leadership; every   │  │             │
+│  │     takeover commits a strictly higher one (Raft        │  │             │
+│  │     GateJobReplica); managers refuse stale fences      │  │             │
+│  │  2. AD-40 idempotency key dedupes resubmission         │  │             │
+│  │                                                         │  │             │
+│  │  (DC leases removed 2026-10-06)                        │  │             │
 │  └─────────────────────────────────────────────────────────┘  │             │
 │                         │                                      │             │
 │                         ▼                                      │             │
@@ -5237,6 +5345,28 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 
 ### Worker States
 
+> **As built (2026-10).** A worker's advertised state comes from its graceful
+> degradation level, not from CPU, memory or queue-depth thresholds:
+> `WorkerServer._get_worker_state` returns OFFLINE when not running, DRAINING
+> while stopping, and otherwise maps `GracefulDegradation.current_level`
+> (`swim/health/graceful_degradation.py`, the worse of the LHM score and event
+> loop lag ratio levels; LHM thresholds 2/4/6/7, lag ratio 0.5/1.0/1.5/2.0) to
+> DRAINING at HEAVY or worse, DEGRADED at MODERATE, else HEALTHY. DRAINING
+> refuses dispatch. One resource does feed the state, because its threshold
+> is derivable: a process at its RLIMIT_NOFILE descriptor ceiling raises the
+> level to HEAVY (AD-41 `FileDescriptorCeiling`, see AD_41.md). The worker samples CPU and memory for its heartbeat, but they do
+> not decide its state, by decision (2026-10, ledger A1-G-42): no threshold
+> on them can be derived. CPU: a worker is a load generator whose intended
+> operating point is saturated cores, so a "CPU < 80%" bar would mark every
+> productive worker DEGRADED; what CPU pressure harms (timely processing) is
+> measured directly by event loop lag and the LHM (Lifeguard's
+> probe-timeout-driven local health). Memory: per-workflow budgets are
+> enforced by AD-41's `ResourceEnforcer` (kill/evict) from the same samples;
+> a node-wide percentage has no derivable value (host vs container limits,
+> co-tenant processes). Queue depth: workers do not queue; a dispatch is
+> admitted against free cores (`CoreAllocator`) or refused, so the depth is
+> always 0. Shedding by overload is the manager's AD-18 hybrid detector.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         WORKER STATE MACHINE                                 │
@@ -5255,24 +5385,24 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │   │                        HEALTHY                                 │    │ │
 │  │   │                                                                │    │ │
 │  │   │  Conditions:                                                   │    │ │
-│  │   │  • CPU < 80%                                                  │    │ │
-│  │   │  • Memory < 85%                                               │    │ │
-│  │   │  • Queue depth < soft_limit                                   │    │ │
-│  │   │  • LHM score < 4                                              │    │ │
+│  │   │  • Degradation level NORMAL or LIGHT                          │    │ │
+│  │   │    (LHM < 4, lag ratio < 1.0, FD < ceiling)                   │    │ │
+│  │   │  • Not stopping                                               │    │ │
+│  │   │                                                               │    │ │
 │  │   │                                                                │    │ │
 │  │   │  Behavior: Accepts new workflows normally                     │    │ │
 │  │   └────────────────────────────┬──────────────────────────────────┘    │ │
 │  │                                │                                        │ │
 │  │              resource pressure increases                                │ │
-│  │              (CPU ≥ 80% OR memory ≥ 85% OR queue ≥ soft_limit)         │ │
+│  │              (LHM ≥ 4 OR event loop lag ratio ≥ 1.0)                   │ │
 │  │                                │                                        │ │
 │  │                                ▼                                        │ │
 │  │   ┌───────────────────────────────────────────────────────────────┐    │ │
 │  │   │                       DEGRADED                                 │    │ │
 │  │   │                                                                │    │ │
 │  │   │  Conditions:                                                   │    │ │
-│  │   │  • CPU 80-95% OR Memory 85-95% OR Queue at soft_limit         │    │ │
-│  │   │  • LHM score 4-6                                              │    │ │
+│  │   │  • Degradation level MODERATE                                 │    │ │
+│  │   │    (LHM 4-5 OR lag ratio 1.0-1.5)                             │    │ │
 │  │   │                                                                │    │ │
 │  │   │  Behavior:                                                     │    │ │
 │  │   │  • Accepts work with backpressure signaling                   │    │ │
@@ -5281,7 +5411,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │   └──────────┬─────────────────────────────────┬──────────────────┘    │ │
 │  │              │                                 │                        │ │
 │  │    pressure relieved                  pressure critical                 │ │
-│  │    (metrics return to normal)         (CPU > 95% OR OOM risk)          │ │
+│  │    (metrics return to normal)         (LHM≥6, lag≥1.5, FD ceiling)     │ │
 │  │              │                                 │                        │ │
 │  │              ▼                                 ▼                        │ │
 │  │   ┌─────────────────┐               ┌─────────────────┐                │ │
@@ -5556,9 +5686,9 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │    ▼                                                             │
 │  Gate (Leader)                                                   │
 │    │                                                             │
-│    ├──► Create DatacenterLease (fence_token)                    │
+│    ├──► Stamp the job's fence_token (leadership)                │
 │    │                                                             │
-│    │ TCP: JobSubmission (with lease)                            │
+│    │ TCP: JobSubmission (with fence_token)                      │
 │    ▼                                                             │
 │  Manager (Leader)                                                │
 │    │                                                             │
@@ -5566,10 +5696,10 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │    │                                                             │
 │    │    For each workflow:                                      │
 │    │    ┌────────────────────────────────────────────────┐      │
-│    │    │ 1. Select eligible worker (crypto-random)      │      │
-│    │    │ 2. Create ProvisionRequest (fence_token)       │      │
-│    │    │ 3. Request quorum confirmation from peers      │      │
-│    │    │ 4. On quorum: commit and dispatch              │      │
+│    │    │ 1. Select eligible worker (health bucket)      │      │
+│    │    │ 2. Sync job state to a quorum of peer managers │      │
+│    │    │ 3. No quorum: requeue the workflow, no send    │      │
+│    │    │ 4. On quorum: dispatch (fence_token)           │      │
 │    │    └────────────────────────────────────────────────┘      │
 │    │                                                             │
 │    │ TCP: WorkflowDispatch                                      │
@@ -5746,6 +5876,18 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 ```
 
 ### Quorum Confirmation
+
+> **Superseded (2026-10, plan decision D5).** The `ProvisionRequest` /
+> `ProvisionConfirm` / `ProvisionCommit` / `ProvisionAbort` round below was
+> never sent and its handlers, models and state were deleted. Per-dispatch
+> quorum is the AD-3 job leader plus quorum job-state replication: before any
+> dispatch is sent, the leader syncs the job's state (context and layer
+> version included) to a quorum of peer managers
+> (`WorkflowDispatcher(on_dispatch_state_registered=_replicate_job_state_for_dispatch)`,
+> `hyperscale/distributed/nodes/manager/server.py` `_replicate_job_state_for_dispatch`,
+> checked in `jobs/workflow_dispatcher.py` `_dispatch_state_unreplicated`). With
+> no quorum nothing is sent; the plans are given back and the workflow is
+> requeued with backoff. The diagram is kept as history.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -6045,7 +6187,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │                                                                  │
 │  In-Flight Work:                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ • Pending provisions: timeout and client retries          │  │
+│  │ • Queued dispatches: retried by the new job leader        │  │
 │  │ • Running workflows: continue on workers (unaffected)     │  │
 │  │ • Progress updates: resume after new leader sync          │  │
 │  └───────────────────────────────────────────────────────────┘  │
@@ -6063,24 +6205,24 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  When a worker detects its assigned manager has failed:          │
 │                                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ _handle_manager_failure() (via on_node_dead callback):    │  │
+│  │ _handle_manager_failure_async() (on_node_dead):           │  │
 │  │                                                            │  │
-│  │ 1. Check if dead node is current manager                  │  │
-│  │ 2. Clear _current_manager reference                       │  │
-│  │ 3. Iterate through _manager_addrs backup list             │  │
-│  │ 4. Skip the failed manager                                │  │
-│  │ 5. Attempt registration with each alternative             │  │
-│  │ 6. On success: set _current_manager, report workflows     │  │
+│  │ 1. Invalidate the cached TCP transport to it              │  │
+│  │ 2. registry.mark_manager_unhealthy(manager_id)            │  │
+│  │ 3. If primary: select_new_primary_manager()               │  │
+│  │ 4. Mark that manager's workflows orphaned                 │  │
+│  │ 5. Orphan loop cancels any no new leader claims           │  │
+│  │    within orphan_grace_period_seconds                     │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                            │                                     │
 │                            ▼                                     │
-│  Report Active Workflows:                                        │
+│  No push to the new manager (deleted 2026-10):                   │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ _report_active_workflows_to_manager():                    │  │
+│  │ The new leader pulls instead:                             │  │
 │  │                                                            │  │
-│  │ For each workflow in _active_workflows:                   │  │
-│  │   • Send WorkflowProgress to new manager                  │  │
-│  │   • Ensures new manager is aware of in-flight work        │  │
+│  │ sync_state_from_workers() on becoming leader              │  │
+│  │   • StateSyncRequest to every registered worker           │  │
+│  │   • Rebuilds in-flight work from the snapshots            │  │
 │  │   • No workflow interruption during failover              │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
@@ -6093,19 +6235,19 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │  SWIM detects (probe → indirect → suspicion → DEAD)       │  │
 │  │       │                                                    │  │
 │  │       ▼                                                    │  │
-│  │  Worker._on_node_dead(Manager A addr)                     │  │
+│  │  health_integration.on_node_dead(Manager A addr)          │  │
 │  │       │                                                    │  │
 │  │       ▼                                                    │  │
-│  │  _handle_manager_failure() runs                           │  │
+│  │  _handle_manager_failure_async() runs                     │  │
 │  │       │                                                    │  │
 │  │       ▼                                                    │  │
-│  │  Try Manager B from _manager_addrs                        │  │
+│  │  select_new_primary_manager() → Manager B                 │  │
 │  │       │                                                    │  │
 │  │       ▼                                                    │  │
-│  │  Registration succeeds → _current_manager = B             │  │
+│  │  Workflows of A marked orphaned (grace period)            │  │
 │  │       │                                                    │  │
 │  │       ▼                                                    │  │
-│  │  _report_active_workflows_to_manager()                    │  │
+│  │  New job leader syncs from workers, claims them           │  │
 │  │       │                                                    │  │
 │  │       ▼                                                    │  │
 │  │  Normal operation resumes with Manager B                  │  │
@@ -6132,10 +6274,10 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │                            ▼                                     │
 │  Gate Handling:                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ Lease-based at-most-once:                                 │  │
+│  │ Fenced at-most-once (leadership + AD-40):                 │  │
 │  │                                                            │  │
-│  │ • If lease expired → Job marked FAILED for that DC        │  │
-│  │ • If lease valid → Wait for recovery or timeout           │  │
+│  │ • DC lost → job marked FAILED for that DC                 │  │
+│  │ • DC recovering → wait for recovery or timeout            │  │
 │  │                                                            │  │
 │  │ User-facing: Gate returns job failure to client           │  │
 │  │ (No automatic cross-DC retry - explicit decision)         │  │
@@ -6180,13 +6322,13 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
 │  │                │                     │                                  ││
 │  │ Gate leader    │ SWIM among gates    │ New gate leader elected          ││
-│  │ crash          │                     │ Lease transfer to new leader     ││
+│  │ crash          │                     │ Per-job takeover, fence raised   ││
 │  │                │                     │ Jobs continue with new gate      ││
 │  │                │                     │                                  ││
 │  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
 │  │                │                     │                                  ││
 │  │ Datacenter     │ All managers DEAD   │ Gate marks DC as failed          ││
-│  │ total failure  │ No ManagerHeartbeat │ Lease expires → job FAILED       ││
+│  │ total failure  │ No ManagerHeartbeat │ DC settles as failed (AD-44)     ││
 │  │                │                     │ Return failure to client         ││
 │  │                │                     │                                  ││
 │  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
@@ -6286,7 +6428,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  Behavior:                                                                   │
 │  • Gate stops receiving ManagerHeartbeat from DC-A                          │
 │  • Gate marks DC-A managers as DEAD via SWIM                                │
-│  • Lease for DC-A jobs expires                                              │
+│  • Gate settles DC-A's part of each job as failed                           │
 │  • Gate returns job failure to client (no cross-DC retry)                   │
 │  • DC-A workflows eventually timeout or complete (ignored by gate)          │
 │                                                                              │
@@ -6470,33 +6612,15 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ 1. WORKFLOW TIMEOUT DETECTION (WorkflowDispatcher)                     │ │
+│  │ 1. PENDING WORKFLOW RETRY BUDGET (WorkflowDispatcher, AD-44)           │ │
 │  │                                                                        │ │
-│  │    Location: hyperscale/distributed_rewrite/jobs/workflow_dispatcher.py│ │
+│  │    Location: hyperscale/distributed/jobs/workflow_dispatcher.py        │ │
 │  │                                                                        │ │
-│  │    ┌─────────────────────────────────────────────────────────────────┐ │ │
-│  │    │                                                                  │ │ │
-│  │    │    WorkflowDispatcher.check_timeouts()                          │ │ │
-│  │    │           │                                                      │ │ │
-│  │    │           ▼                                                      │ │ │
-│  │    │    for pending in self._pending:                                │ │ │
-│  │    │        age = now - pending.registered_at                        │ │ │
-│  │    │        │                                                         │ │ │
-│  │    │        ├── if age > pending.timeout_seconds:                    │ │ │
-│  │    │        │       └── EVICT (reason: "timeout")                    │ │ │
-│  │    │        │                                                         │ │ │
-│  │    │        └── if pending.dispatch_attempts > max_attempts:         │ │ │
-│  │    │                └── EVICT (reason: "max_dispatch_attempts")       │ │ │
-│  │    │                                                                  │ │ │
-│  │    │    Default timeout_seconds: 300 (5 minutes)                     │ │ │
-│  │    │    Default max_dispatch_attempts: 5                             │ │ │
-│  │    │    Check interval: 30 seconds (via _job_cleanup_loop)            │ │ │
-│  │    │                                                                  │ │ │
-│  │    └─────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                        │ │
-│  │    Callbacks Invoked:                                                  │ │
-│  │    • on_workflow_evicted(job_id, workflow_id, reason)                 │ │
-│  │    • on_dispatch_failed(job_id, workflow_id)                          │ │
+│  │    No age-based eviction sweep: dispatch is event-driven. A failed     │ │
+│  │    attempt (no worker took it) spends the job's AD-44 retry budget     │ │
+│  │    and backs off; waiting for capacity spends nothing. Budget spent,   │ │
+│  │    the workflow fails for good with its last attempt's cause.          │ │
+│  │    Running jobs are bounded by their timeout strategy (AD-34).         │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
@@ -6712,33 +6836,18 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
 │  │ 1. MANAGER JOB CLEANUP LOOP                                            │ │
 │  │                                                                        │ │
-│  │    Location: Manager._job_cleanup_loop() (manager.py:6225)             │ │
+│  │    Location: ManagerServer._job_cleanup_loop()                         │ │
+│  │    Interval: JOB_CLEANUP_INTERVAL (default 60 s = 4 x                  │ │
+│  │    MANAGER_PEER_JOB_SYNC_INTERVAL)                                     │ │
 │  │                                                                        │ │
-│  │    Interval: MERCURY_SYNC_CLEANUP_INTERVAL (default: 30s)              │ │
-│  │                                                                        │ │
-│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
-│  │    │                                                                 │  │ │
-│  │    │  while running:                                                 │  │ │
-│  │    │      await sleep(cleanup_interval)                             │  │ │
-│  │    │                                                                 │  │ │
-│  │    │      # 1. Check workflow timeouts via dispatcher               │  │ │
-│  │    │      evicted = await _workflow_dispatcher.check_timeouts()     │  │ │
-│  │    │      for (job_id, workflow_id, reason) in evicted:             │  │ │
-│  │    │          mark_workflow_failed(job_id, workflow_id, reason)     │  │ │
-│  │    │                                                                 │  │ │
-│  │    │      # 2. Clean completed jobs after retention period          │  │ │
-│  │    │      for job_id, job in _jobs.items():                         │  │ │
-│  │    │          if job.status == COMPLETED:                           │  │ │
-│  │    │              if age > _completed_job_max_age:  # ~30 min       │  │ │
-│  │    │                  cleanup_job(job_id)                           │  │ │
-│  │    │                                                                 │  │ │
-│  │    │      # 3. Clean failed/cancelled/timeout jobs                  │  │ │
-│  │    │      for job_id, job in _jobs.items():                         │  │ │
-│  │    │          if job.status in [FAILED, CANCELLED, TIMEOUT]:        │  │ │
-│  │    │              if age > _failed_job_max_age:  # longer retention │  │ │
-│  │    │                  cleanup_job(job_id)                           │  │ │
-│  │    │                                                                 │  │ │
-│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │    Each sweep:                                                         │ │
+│  │    1. Drop terminal jobs past retention: COMPLETED_JOB_MAX_AGE         │ │
+│  │       (300 s) for completed, FAILED_JOB_MAX_AGE (3600 s) for           │ │
+│  │       failed, cancelled and timed-out jobs.                            │ │
+│  │    2. Reconcile silent copies: a live job led elsewhere that heard     │ │
+│  │       no sync for a whole interval asks its leader (or the DC          │ │
+│  │       leader) for the settled status. The leader re-syncs every        │ │
+│  │       15 s, so silence spans four missed syncs before it counts.       │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
@@ -7097,7 +7206,7 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  ┌────────────────────────────────────┬──────────┬────────────────────────┐ │
 │  │ Variable                           │ Default  │ Description            │ │
 │  ├────────────────────────────────────┼──────────┼────────────────────────┤ │
-│  │ MERCURY_SYNC_CLEANUP_INTERVAL      │ 30s      │ Job cleanup loop freq  │ │
+│  │ JOB_CLEANUP_INTERVAL               │ 60s      │ Job cleanup loop freq  │ │
 │  │ MANAGER_DEAD_WORKER_REAP_INTERVAL  │ 86400s   │ Dead worker reap (24h) │ │
 │  │ MANAGER_DEAD_PEER_REAP_INTERVAL    │ 86400s   │ Dead peer reap (24h)   │ │
 │  │ MANAGER_DEAD_GATE_REAP_INTERVAL    │ 86400s   │ Dead gate reap (24h)   │ │
@@ -7180,7 +7289,7 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  │     │                    │                   │                   │      ││
 │  │  ───┴────────────────────┴───────────────────┴───────────────────┴───── ││
 │  │                                                                          ││
-│  │   If ALL workers at capacity:                                            ││
+│  │   If ALL workers at capacity (as built 2026-10):                         ││
 │  │                                                                          ││
 │  │   Worker 1            Worker 2            Worker 3                       ││
 │  │   queue: 50           queue: 48           queue: 50                      ││
@@ -7189,17 +7298,17 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  │       └───────────────────┼───────────────────┘                          ││
 │  │                           │                                              ││
 │  │                           ▼                                              ││
-│  │                    Manager rejects                                        ││
-│  │                    new workflow with                                      ││
-│  │                    backpressure error                                     ││
+│  │                    Manager queues the                                     ││
+│  │                    workflow; DC reports                                   ││
+│  │                    BUSY (no free core)                                    ││
 │  │                           │                                              ││
 │  │                           ▼                                              ││
-│  │                    Gate/Client receives                                   ││
-│  │                    "capacity exceeded"                                    ││
+│  │                    Gates prefer HEALTHY                                   ││
+│  │                    DCs / spill over (AD-43)                               ││
 │  │                           │                                              ││
 │  │                           ▼                                              ││
-│  │                    Client implements                                      ││
-│  │                    exponential backoff                                    ││
+│  │                    Only overload sheds:                                   ││
+│  │                    JobAck(accepted=False)                                 ││
 │  │                                                                          ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 │                                                                              │
@@ -7377,7 +7486,7 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  │      │──────────────────────►│ (to leader)                               ││
 │  │      │                       │                                           ││
 │  │      │ ③ TCP: GlobalJobStatus[]│                                         ││
-│  │      │◄──────────────────────│ + DatacenterLease[]                       ││
+│  │      │◄──────────────────────│ + job leaders/fences                      ││
 │  │      │                       │                                           ││
 │  │      │ Apply state           │                                           ││
 │  │      │                       │                                           ││
@@ -7392,11 +7501,11 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  │                                                                          ││
 │  │   Leaving Gate (★)          Other Gates                                  ││
 │  │      │                          │                                        ││
-│  │      │ ① Transfer leases        │                                        ││
-│  │      │    to new leader         │                                        ││
+│  │      │ ① Drain membership       │                                        ││
+│  │      │    (AD-52)               │                                        ││
 │  │      │──────────────────────────►│                                        ││
 │  │      │                          │                                        ││
-│  │      │ ② LeaseTransfer ack      │                                        ││
+│  │      │ ② Peers take its jobs    │                                        ││
 │  │      │◄──────────────────────────│                                        ││
 │  │      │                          │                                        ││
 │  │      │ ③ Update registry        │                                        ││
@@ -7516,6 +7625,12 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 
 ### Encryption & Authentication
 
+**Trust boundary (decided 2026-10-06).** Workflows travel as cloudpickle by-value code, and running a workflow
+means running its submitter's code. The boundary is therefore the authenticated frame, not the unpickler: a frame
+is accepted only if it authenticates under the cluster secret (weak secrets refused; a per-user 0600 cookie or a
+per-run secret when none is configured) and passes replay checks. `RestrictedUnpickler` remains defense in depth
+for non-workflow payloads. Anyone holding the cluster secret can run code on the cluster, by design.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                   SECURITY ARCHITECTURE                          │
@@ -7526,27 +7641,30 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │  │ • HKDF key derivation from shared secret                  │  │
 │  │ • Per-message salt (never reuse nonces)                   │  │
 │  │ • Key rotation via MERCURY_SYNC_AUTH_SECRET_PREVIOUS      │  │
-│  │ • Weak secret detection and rejection                     │  │
+│  │ • Weak/default secrets always refused (no                 │  │
+│  │   HYPERSCALE_ENV escape hatch); no default secret         │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  Replay Protection:                                              │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ • Snowflake IDs with embedded timestamps                  │  │
-│  │ • Sliding window detection (configurable)                 │  │
-│  │ • Rejects duplicate and stale messages                    │  │
+│  │ • Every frame (TCP and UDP) carries a per-send Snowflake  │  │
+│  │   frame id inside its AES-GCM-authenticated body          │  │
+│  │ • Duplicates keyed on the frame's encryption nonce        │  │
+│  │ • Eviction watermark refuses anything forgettable;        │  │
+│  │   starts at guard start minus max age (2026-10-06)        │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  Rate Limiting:                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ • Token bucket per source address                         │  │
-│  │ • Configurable tokens and refill rate                     │  │
+│  │ • Sliding window per client and operation (AD-24)         │  │
+│  │ • Refusal carries retry_after_seconds                     │  │
 │  │ • Prevents DoS from flooding                              │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  Message Size Limits:                                            │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ • MAX_MESSAGE_SIZE: 1MB (compressed)                      │  │
-│  │ • MAX_DECOMPRESSED_SIZE: 50MB                             │  │
+│  │ • MAX_MESSAGE_SIZE: 3MB (compressed)                      │  │
+│  │ • MAX_DECOMPRESSED_SIZE: 5MB                              │  │
 │  │ • Compression bomb detection (max ratio: 100x)            │  │
 │  │ • Large enough for cloudpickled workflow classes          │  │
 │  └───────────────────────────────────────────────────────────┘  │
@@ -7561,9 +7679,10 @@ This section documents the mechanisms for detecting, preventing, and cleaning up
 │                                                                  │
 │  TLS Configuration:                                              │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ • MERCURY_SYNC_TLS_VERIFY_HOSTNAME: true/false            │  │
+│  │ • MERCURY_SYNC_TLS_VERIFY_HOSTNAME: default true          │  │
 │  │ • Certificate-based authentication available              │  │
-│  │ • Configurable for local vs production environments       │  │
+│  │ • Engine clients verify server certs by default           │  │
+│  │   (a Workflow opts out with verify_tls = False)           │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -7652,13 +7771,17 @@ hyperscale/distributed_rewrite/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MERCURY_SYNC_AUTH_SECRET` | (required) | Shared secret for encryption (min 16 chars) |
-| `MERCURY_SYNC_AUTH_SECRET_PREVIOUS` | None | Previous secret for key rotation |
+| `MERCURY_SYNC_AUTH_SECRET` | None (no published default) | Shared secret for encryption (min 16 chars; known weak values refused). Cluster commands resolve `--acm-secret`, then this variable, then the per-user cluster cookie (`$XDG_CONFIG_HOME/hyperscale/cluster_cookie`, `~/.config/hyperscale/cluster_cookie`, or `%APPDATA%\hyperscale\cluster_cookie`; created once, mode 0600). Local runs generate a per-run secret shared with their workers. |
+| `MERCURY_SYNC_AUTH_SECRET_PREVIOUS` | None | Previous secret for key rotation (same length and weak-value rules) |
 | `MERCURY_SYNC_TLS_VERIFY_HOSTNAME` | `true` | TLS hostname verification |
-| `MERCURY_SYNC_CLEANUP_INTERVAL` | `30s` | Background cleanup interval |
-| `MERCURY_SYNC_TASK_RUNNER_MAX_THREADS` | 4 | TaskRunner thread pool size |
+| `MERCURY_SYNC_CLEANUP_INTERVAL` | `0.25s` | Background cleanup interval |
+| `MERCURY_SYNC_TASK_RUNNER_MAX_THREADS` | `os.cpu_count()` (1 if unknown) | TaskRunner executor pool size |
 
 ### Node Configuration
+
+Nodes are normally started with `hyperscale run manager|gate|worker`
+(`hyperscale/commands/run/`), which opens the node's Raft store and data
+directory, resolves seed locators and builds the server. Constructed directly:
 
 ```python
 # Worker example
@@ -7668,7 +7791,7 @@ worker = WorkerServer(
     udp_port=8002,
     env=Env(),
     dc_id="us-east-1",
-    manager_addrs=[("manager1.local", 9001)],
+    seed_managers=[("manager1.local", 9001)],
 )
 
 # Manager example
@@ -7679,9 +7802,8 @@ manager = ManagerServer(
     env=Env(),
     dc_id="us-east-1",
     gate_addrs=[("gate1.local", 10001)],
-    manager_peers=[("manager2.local", 9001)],
+    seed_managers=[("manager2.local", 9001)],
     quorum_timeout=5.0,
-    max_workflow_retries=3,
 )
 
 # Gate example
@@ -7812,29 +7934,10 @@ gate = GateServer(
 │  │ QUORUM & PROVISIONING MESSAGES                                         │ │
 │  ├────────────────────────────────────────────────────────────────────────┤ │
 │  │                                                                         │ │
-│  │  ProvisionRequest                                                        │ │
-│  │  ├─ job_id: str                    # Job identifier                     │ │
-│  │  ├─ workflow_id: str               # Workflow to provision              │ │
-│  │  ├─ target_worker: str             # Selected worker node_id            │ │
-│  │  ├─ cores_required: int            # Cores needed                       │ │
-│  │  ├─ fence_token: int               # Fencing token                      │ │
-│  │  └─ version: int                   # State version                      │ │
-│  │                                                                         │ │
-│  │  ProvisionConfirm                                                        │ │
-│  │  ├─ job_id: str                    # Job identifier                     │ │
-│  │  ├─ workflow_id: str               # Workflow                           │ │
-│  │  ├─ confirming_node: str           # Confirming manager                 │ │
-│  │  ├─ confirmed: bool                # Whether confirmed                  │ │
-│  │  ├─ version: int                   # Node's version                     │ │
-│  │  └─ error: str | None = None       # Error if not confirmed             │ │
-│  │                                                                         │ │
-│  │  ProvisionCommit                                                         │ │
-│  │  ├─ job_id: str                    # Job identifier                     │ │
-│  │  ├─ workflow_id: str               # Workflow                           │ │
-│  │  ├─ target_worker: str             # Final worker                       │ │
-│  │  ├─ cores_assigned: int            # Cores allocated                    │ │
-│  │  ├─ fence_token: int               # Fencing token                      │ │
-│  │  └─ committed_version: int         # Version at commit                  │ │
+│  │  Deleted (2026-10, plan decision D5): ProvisionRequest,                 │ │
+│  │  ProvisionConfirm and ProvisionCommit were never sent. Per-dispatch     │ │
+│  │  quorum is the job leader's quorum job-state sync before dispatch       │ │
+│  │  (see Quorum Confirmation above).                                       │ │
 │  │                                                                         │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
@@ -7869,28 +7972,6 @@ gate = GateServer(
 │  │  ├─ version: int                   # State version                      │ │
 │  │  ├─ workers: list[WorkerStateSnapshot]  # Registered workers            │ │
 │  │  └─ jobs: dict[str, JobProgress]   # Active jobs                        │ │
-│  │                                                                         │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ LEASE MESSAGES (Gates only)                                            │ │
-│  ├────────────────────────────────────────────────────────────────────────┤ │
-│  │                                                                         │ │
-│  │  DatacenterLease                                                         │ │
-│  │  ├─ job_id: str                    # Job identifier                     │ │
-│  │  ├─ datacenter: str                # Datacenter holding lease           │ │
-│  │  ├─ lease_holder: str              # Gate node_id                       │ │
-│  │  ├─ fence_token: int               # Fencing token                      │ │
-│  │  ├─ expires_at: float              # Monotonic expiration               │ │
-│  │  └─ version: int                   # Lease version                      │ │
-│  │                                                                         │ │
-│  │  LeaseTransfer                                                           │ │
-│  │  ├─ job_id: str                    # Job identifier                     │ │
-│  │  ├─ datacenter: str                # Datacenter                         │ │
-│  │  ├─ from_gate: str                 # Current holder                     │ │
-│  │  ├─ to_gate: str                   # New holder                         │ │
-│  │  ├─ new_fence_token: int           # New fencing token                  │ │
-│  │  └─ version: int                   # Transfer version                   │ │
 │  │                                                                         │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
@@ -7995,13 +8076,15 @@ gate = GateServer(
 │  │  Update format: TYPE:HOST:PORT:INCARNATION                              │ │
 │  │                                                                         │ │
 │  │  Types:                                                                  │ │
-│  │  • J = JOIN (highest priority)                                          │ │
+│  │  • J = JOIN                                                             │ │
 │  │  • L = LEAVE                                                            │ │
 │  │  • A = ALIVE                                                            │ │
 │  │  • S = SUSPECT                                                          │ │
-│  │  • D = DEAD (lowest priority)                                           │ │
+│  │  • D = DEAD                                                             │ │
 │  │                                                                         │ │
-│  │  Priority ensures important updates propagate first when space limited  │ │
+│  │  Fewest-broadcast updates go first (GossipBuffer, memberlist-style);    │ │
+│  │  no update-type priority. A same-incarnation conflict keeps             │ │
+│  │  dead/leave over suspect over alive/join.                               │ │
 │  │                                                                         │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
@@ -8116,6 +8199,12 @@ New managers join the cluster in a SYNCING state before becoming ACTIVE:
 
 ### Quorum Timeout Handling (✅ Implemented)
 
+> **As built (2026-10).** Only the gate has a quorum circuit (see Gate Quorum
+> Timeout Handling below). The manager's `_quorum_circuit` and `_gate_circuit`
+> were dead and were deleted (plan Phase 3 G-55); a manager without a quorum
+> refuses dispatch through the job-state quorum check instead. There is no
+> `get_quorum_status()` on either node.
+
 When quorum cannot be achieved (e.g., too many managers down), operations fail fast with clear errors.
 
 **Implementation**:
@@ -8160,8 +8249,8 @@ Gates use the same circuit breaker pattern as managers for fail-fast behavior.
 - `_quorum_circuit` ErrorStats instance tracks failures
 - `_quorum_size()` calculates required quorum (majority of gates)
 - `_has_quorum_available()` checks gate state and active peer count
-- `get_quorum_status()` returns circuit state and gate metrics
-- `receive_job_submission()` checks circuit breaker before accepting jobs
+- Thresholds come from `CIRCUIT_BREAKER_MAX_ERRORS` (3), `CIRCUIT_BREAKER_WINDOW_SECONDS` (30) and `CIRCUIT_BREAKER_HALF_OPEN_AFTER` (10)
+- The submission handler (`nodes/gate/handlers/tcp_job.py`) raises `QuorumCircuitOpenError` while the circuit is OPEN and `QuorumUnavailableError` without a quorum, and counts other quorum failures against the circuit
 - `_dispatch_job_to_datacenters()` records success/failure for circuit breaker
 
 **Job Submission Flow**:
@@ -8302,8 +8391,8 @@ Client push notifications allow Gates and Managers to push job status updates di
 │  3. Gate/Manager stores callback in _job_callbacks           │
 │  4. On Tier 1 events (completion/failure):                   │
 │     Gate/Manager → Client: JobStatusPush                     │
-│  5. On Tier 2 interval (every 2s):                           │
-│     Gate/Manager → Client: JobBatchPush                      │
+│  5. Every GATE_BATCH_STATS_INTERVAL (0.25 s):                │
+│     Gate → Client: JobBatchPush (gates only)                 │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -8738,13 +8827,12 @@ class WorkflowDispatch(Message):
     job_id: str              # Parent job identifier
     workflow_id: str         # Unique workflow instance ID
     workflow: bytes          # Cloudpickled Workflow class
-    context: bytes           # Cloudpickled context dict
+    context: bytes           # Cloudpickled job context, every workflow namespace
     vus: int                 # Virtual users (can be 50k+)
     cores: int               # CPU cores to allocate (from priority)
     timeout_seconds: float   # Execution timeout
     fence_token: int         # Fencing token for at-most-once
     context_version: int     # Layer version for staleness detection
-    dependency_context: bytes # Context from dependencies
 ```
 
 Workers allocate `cores` CPU cores and distribute `vus` virtual users across them.
@@ -9915,6 +10003,19 @@ After thread allocation, VUs are distributed among the allocated threads.
 ```
 
 ### Cross-Manager Context Synchronization
+
+> **As built (2026-10).** There are no `ContextForward`, `ContextLayerSync`
+> or `ContextLayerSyncAck` messages and no `dependency_context` field; they
+> were never wired and are gone. A dispatch carries the whole job context
+> (`WorkflowDispatch.context`, every workflow namespace, as of
+> `context_version`; AD-49), and before any dispatch the job leader syncs the
+> job's state, context and layer version included, to a quorum of peer
+> managers (`_replicate_job_state_for_dispatch` →
+> `_sync_job_state_to_peers(require_quorum=True)`,
+> `nodes/manager/server.py`); with no quorum nothing is dispatched. Tests:
+> `tests/unit/distributed/jobs/test_workflow_context_propagation.py`,
+> `tests/unit/simulation/sim/test_multiprocess_l2_dag.py`. The design below is
+> history.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -11144,6 +11245,19 @@ We combine the best properties from multiple approaches:
 
 ### Protocol Specification
 
+> **As built (2026-10).** There are no `ContextForward`, `ContextLayerSync`
+> or `ContextLayerSyncAck` messages and no `dependency_context` field; they
+> were never wired and are gone. A dispatch carries the whole job context
+> (`WorkflowDispatch.context`, every workflow namespace, as of
+> `context_version`; AD-49), and before any dispatch the job leader syncs the
+> job's state, context and layer version included, to a quorum of peer
+> managers (`_replicate_job_state_for_dispatch` →
+> `_sync_job_state_to_peers(require_quorum=True)`,
+> `nodes/manager/server.py`); with no quorum nothing is dispatched. Tests:
+> `tests/unit/distributed/jobs/test_workflow_context_propagation.py`,
+> `tests/unit/simulation/sim/test_multiprocess_l2_dag.py`. The design below is
+> history.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    CONTEXT CONSISTENCY PROTOCOL                              │
@@ -11544,6 +11658,23 @@ We combine the best properties from multiple approaches:
 
 This section documents the distributed job ownership model for gates, enabling horizontal scaling and fault tolerance without single-leader bottlenecks.
 
+> **As built (2026-10).** The gate that admits a job leads it: it acquires a
+> local `JobLease` (`leases/job_lease_manager.py`; the lease is always this
+> gate's own) and commits the job's `GateJobReplica` to a quorum of live gates
+> by two-phase commit (`nodes/gate/replication_coordinator.py`). The consistent
+> hash ring (`jobs/gates/consistent_hash_ring.py`) does not assign owners; it
+> only picks the peer to forward job progress to when this gate is not the
+> job's leader. When SWIM confirms a gate dead, its jobs are marked orphaned
+> (`orphan_job_coordinator.py` `mark_jobs_orphaned_by_gate`) and the SWIM
+> cluster leader takes them over: it adopts the freshest replica a gate quorum
+> committed and commits a takeover replica whose fence is above every fence
+> known for the job (`_commit_gate_job_leadership_takeover`). Lease
+> import/export between gates, lease expiry hooks and backup claiming of an
+> expired lease were deleted on 2026-10-06 (never needed: dispatch and manager
+> fencing read the replica's fence, never the lease). The committed replicas
+> are held in gate memory only, so they survive only while a gate quorum stays
+> up. The lease-transfer and ring-ownership components below are history.
+
 ### Overview
 
 ```
@@ -11896,7 +12027,30 @@ The architecture consists of five key components that work together:
 
 ### Component 4: Client Reconnection
 
-**Status: IMPLEMENTED**
+**Status: IMPLEMENTED** (client half since 2026-10; see "As built")
+
+**As built (2026-10)**: the gate half (``register_callback`` re-registers
+the callback and replays the job's recorded updates) long existed; no
+client ever sent ``RegisterCallback``, so updates a gate could not deliver
+stayed in its history and a job ended with their workflow results listed
+missing. Now:
+
+* the gate replays from the client's *position* -- the last update below
+  which every update reached that callback; an update landing ahead of an
+  earlier failed one no longer moves it past the failure (it was
+  overwritten with each delivery), and a gap older than the retained
+  history closes, since nothing can resend it;
+* a client whose completed job still lacks workflow results once the
+  in-flight ones had a result-drain window to land re-registers its
+  callback with the job's gate (``RegisterCallback(last_sequence=0)``:
+  the gate's own position) and waits one more window for the replay; the
+  gate answers after sending it;
+* the client applies a workflow's result once and its status in lifecycle
+  order, so a replayed update changes nothing it already has.
+
+Clients address the job's gate as they submit (``get_gate_for_job``), not
+by computing hash-ring ownership; gateless (L2) managers keep no update
+history, so a gateless client has nothing to ask.
 
 **Decision**: Sophisticated approach - Clients compute job owner deterministically.
 
@@ -12166,7 +12320,7 @@ async def main():
     client = HyperscaleClient(gate_tcp_addrs=[...])
     await client.start()
     job_id = await client.submit_job(...)
-    result = await client.wait_for_completion(job_id)
+    result = await client.wait_for_job(job_id)
     
     # 4. Validate results
     assert result.status == "completed"
@@ -12557,8 +12711,8 @@ Rate limiting prevents any single client from overwhelming the system while adap
 │  │ SlidingWindowCounter│      │ Per-Client Stress   │         │
 │  │                     │      │ Counters            │         │
 │  │ Per-operation limits│      │                     │         │
-│  │ (100 req/10s for    │      │ Fair-share limits   │         │
-│  │ job_submit, etc.)   │      │ when stressed       │         │
+│  │ (derived from the   │      │ Fair-share limits   │         │
+│  │ protocol's rates)   │      │ when stressed       │         │
 │  └─────────────────────┘      └─────────────────────┘         │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
@@ -12588,55 +12742,38 @@ Example:
 - 15 seconds into current window (25% progress)
 - Effective count = 30 + 100 * 0.75 = 105
 
-#### Configuration
+#### Configuration and Per-Operation Limits
 
-```python
-# Environment variables for rate limiting
-RATE_LIMIT_DEFAULT_BUCKET_SIZE: int = 100
-RATE_LIMIT_DEFAULT_REFILL_RATE: float = 10.0
-RATE_LIMIT_CLIENT_IDLE_TIMEOUT: float = 300.0
-RATE_LIMIT_CLEANUP_INTERVAL: float = 60.0
-RATE_LIMIT_MAX_RETRIES: int = 3
-RATE_LIMIT_MAX_TOTAL_WAIT: float = 60.0
-RATE_LIMIT_BACKOFF_MULTIPLIER: float = 1.5
-```
-
-#### Per-Operation Limits
-
-| Operation | Max Requests | Window (seconds) |
-|-----------|--------------|------------------|
-| stats_update | 500 | 10.0 |
-| heartbeat | 200 | 10.0 |
-| progress_update | 300 | 10.0 |
-| job_submit | 50 | 10.0 |
-| job_status | 100 | 10.0 |
-| workflow_dispatch | 100 | 10.0 |
-| cancel | 20 | 10.0 |
-| reconnect | 10 | 10.0 |
+The token-bucket settings this section used to list (`RATE_LIMIT_DEFAULT_BUCKET_SIZE`,
+`RATE_LIMIT_DEFAULT_REFILL_RATE`, `RATE_LIMIT_MAX_RETRIES`, ...) were never read by
+the nodes and are gone, as is the fixed per-operation table. The limits are Env
+settings (`RATE_LIMIT_WINDOW_SECONDS`, `RATE_LIMIT_<OPERATION>_MAX_REQUESTS`,
+`RATE_LIMIT_STRESSED_MAX_REQUESTS`, `RATE_LIMIT_MAX_TRACKED_CLIENTS`), each derived
+when unset from the protocol rate it bounds
+(`hyperscale/distributed/reliability/rate_limit_derivation.py`). The derivations and
+their arithmetic are in `docs/architecture/AD_24.md` (2026-10-06).
 
 #### Client-Side Cooperation
 
-The `CooperativeRateLimiter` enables clients to respect server rate limits:
-
-```python
-limiter = CooperativeRateLimiter()
-
-# Before sending request
-await limiter.wait_if_needed("job_submit")
-
-# After receiving 429 response
-if response.status == 429:
-    retry_after = float(response.headers.get("Retry-After", 1.0))
-    limiter.handle_rate_limit("job_submit", retry_after)
-```
+The client honors the server's hint directly: `ClientJobSubmitter`
+(`hyperscale/distributed/nodes/client/submission.py`, `_backoff_before_retry`)
+waits out a refusal's `retry_after_seconds`, jittered upward so clients refused
+together do not return together, including after the last refused attempt
+before the failure is raised. An un-hinted transient refusal waits an
+exponential, equal-jittered back-off. (2026-10-06: the unused
+`CooperativeRateLimiter` and `execute_with_rate_limit_retry` helpers were
+deleted; no node or client called them.)
 
 #### Key Files
 
 | File | Purpose |
 |------|---------|
-| `hyperscale/distributed_rewrite/reliability/rate_limiting.py` | All rate limiting components |
-| `hyperscale/distributed_rewrite/reliability/overload.py` | HybridOverloadDetector |
-| `hyperscale/distributed_rewrite/reliability/load_shedding.py` | RequestPriority enum |
+| `hyperscale/distributed/reliability/server_rate_limiter.py` | `ServerRateLimiter` (node-side admission) |
+| `hyperscale/distributed/reliability/adaptive_rate_limiter.py` | Health-gated per-client, per-operation limiting |
+| `hyperscale/distributed/reliability/sliding_window_counter.py` | `SlidingWindowCounter` |
+| `hyperscale/distributed/reliability/rate_limit_derivation.py` | Derived default limits |
+| `hyperscale/distributed/reliability/overload.py` | HybridOverloadDetector |
+| `hyperscale/distributed/reliability/priority.py` | RequestPriority enum |
 
 ---
 
@@ -12657,9 +12794,9 @@ The three-signal health model provides nuanced health tracking beyond simple ali
 │  │ "Is the node alive and responsive?"                         │
 │  │                                                             │
 │  │ • UDP ping/ack from SWIM protocol                           │
-│  │ • Timeout: LIVENESS_PROBE_TIMEOUT (1.0s)                    │
-│  │ • Period: LIVENESS_PROBE_PERIOD (10.0s)                     │
-│  │ • Failure threshold: LIVENESS_PROBE_FAILURE_THRESHOLD (3)   │
+│  │ • Timing: SWIM probe/suspicion settings (AD-29, AD-30)      │
+│  │ • (LIVENESS_PROBE_* Env fields deleted with                 │
+│  │   health/probes.py, 2026-10, plan Phase 6)                  │
 │  └─────────────────────────────────────────────────────────────┘
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────────┐
@@ -12670,7 +12807,7 @@ The three-signal health model provides nuanced health tracking beyond simple ali
 │  │ • Capacity check (available cores/slots)                    │
 │  │ • Overload state from HybridOverloadDetector                │
 │  │ • Not accepting if: at capacity, overloaded, draining       │
-│  │ • Timeout: READINESS_PROBE_TIMEOUT (2.0s)                   │
+│  │ • No separate readiness probe (fields deleted)              │
 │  └─────────────────────────────────────────────────────────────┘
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────────┐
@@ -12728,41 +12865,22 @@ class HealthSignals(Protocol):
 
 #### Correlation Detection
 
-The NodeHealthTracker prevents cascade evictions when multiple nodes fail simultaneously (likely network issue):
-
-```python
-tracker = NodeHealthTracker[WorkerHealthState]()
-
-# Check if we should evict (with correlation detection)
-evict_decision = tracker.should_evict("worker-1")
-if evict_decision.should_evict:
-    if evict_decision.correlated_failures:
-        # Investigate network issue, don't evict
-        pass
-    else:
-        # Safe to evict
-        pass
-```
+Cascade evictions are prevented by `is_systemic_failure(failing_count, population)`
+(`hyperscale/distributed/health/systemic_failure.py`): when at least 2 workers and
+more than half of them fail together, the manager's `_enforce_worker_deadlines`
+holds every eviction and `_systemic_eviction_hold` stops charging retry budgets
+for the lost work. `NodeHealthTracker`, which this section used to show, was never
+wired and was deleted (2026-10, plan Phase 6). Test:
+`tests/unit/distributed/manager/test_systemic_eviction_hold.py`.
 
 #### Configuration
 
-```python
-# Health probe settings
-LIVENESS_PROBE_TIMEOUT: float = 1.0
-LIVENESS_PROBE_PERIOD: float = 10.0
-LIVENESS_PROBE_FAILURE_THRESHOLD: int = 3
-LIVENESS_PROBE_SUCCESS_THRESHOLD: int = 1
-
-READINESS_PROBE_TIMEOUT: float = 2.0
-READINESS_PROBE_PERIOD: float = 10.0
-READINESS_PROBE_FAILURE_THRESHOLD: int = 3
-READINESS_PROBE_SUCCESS_THRESHOLD: int = 1
-
-STARTUP_PROBE_TIMEOUT: float = 5.0
-STARTUP_PROBE_PERIOD: float = 5.0
-STARTUP_PROBE_FAILURE_THRESHOLD: int = 30  # Allow slow startups (150s)
-STARTUP_PROBE_SUCCESS_THRESHOLD: int = 1
-```
+There are no separate liveness/readiness/startup probe settings. `health/probes.py`
+and its 12 Env fields (`LIVENESS_PROBE_*`, `READINESS_PROBE_*`, `STARTUP_PROBE_*`)
+were dead and were deleted (2026-10, plan Phase 6). Liveness timing is SWIM's
+probe and suspicion configuration; readiness and progress come from each role's
+health state (`health/worker_health_state.py`, `manager_health_state.py`,
+`gate_health_state.py`).
 
 #### SWIM Piggyback
 
@@ -12786,9 +12904,10 @@ class HealthPiggyback:
 
 | File | Purpose |
 |------|---------|
-| `hyperscale/distributed_rewrite/health/tracker.py` | NodeHealthTracker, HealthSignals protocol |
-| `hyperscale/distributed_rewrite/health/worker_health.py` | WorkerHealthState implementation |
-| `hyperscale/distributed_rewrite/health/worker_health_manager.py` | Manager-side health tracking |
+| `hyperscale/distributed/health/tracker.py` | `HealthPiggyback` |
+| `hyperscale/distributed/health/worker_health_state.py` | `WorkerHealthState` implementation |
+| `hyperscale/distributed/health/worker_health_manager.py` | Manager-side health tracking |
+| `hyperscale/distributed/health/systemic_failure.py` | Systemic-failure eviction hold |
 
 ---
 
@@ -12964,18 +13083,18 @@ Multiple mechanisms work together to detect and prevent zombie jobs (jobs that a
 │     ├─ Three-signal model tracks progress state                │
 │     ├─ States: IDLE → PROGRESSING → STALLED → STUCK            │
 │     ├─ STUCK triggers investigation and potential eviction     │
-│     └─ Correlation detection prevents cascade evictions        │
+│     └─ Systemic-failure hold prevents cascade evictions        │
 │                                                                 │
 │  4. LEASE EXPIRY                                                │
-│     ├─ Gates hold time-limited leases for jobs                 │
+│     ├─ The admitting gate holds a local job lease              │
 │     ├─ Lease duration: configurable per-job                    │
-│     ├─ Expired leases allow other gates to take over           │
+│     ├─ Takeover: SWIM gate death → quorum replica commit       │
 │     └─ Prevents single-gate failures from blocking jobs        │
 │                                                                 │
 │  5. ORPHAN WORKFLOW SCANNER (New)                               │
 │     ├─ Manager periodically queries workers for active workflows│
 │     ├─ Compares against manager's workflow assignments          │
-│     ├─ Marks orphaned workflows as failed                       │
+│     ├─ Reassigns orphans (job leader retries or fails)          │
 │     ├─ Interval: ORPHAN_SCAN_INTERVAL (120s)                    │
 │     └─ Worker timeout: ORPHAN_SCAN_WORKER_TIMEOUT (5s)          │
 │                                                                 │
@@ -13061,6 +13180,13 @@ async def _orphan_workflow_scan_loop(self) -> None:
                 )
 ```
 
+> **As built (2026-10).** Orphans are reassigned, not failed outright:
+> `_handle_orphaned_workflows` (`nodes/manager/server.py`) supersedes each
+> lost sub-workflow, and the job's leader retries it (charged to the
+> workflow's retry budget as an unexplained loss) or fails it for good when
+> the budget is spent; orphans of jobs another manager leads are broadcast to
+> the peers for that leader. The sketch above is the original design.
+
 #### Configuration
 
 ```python
@@ -13141,7 +13267,7 @@ async for workflow_result in client.stream_workflow_results(job_id):
     # Process individual workflow results...
 
 # Or wait for all results
-final_result = await client.wait_for_completion(job_id)
+final_result = await client.wait_for_job(job_id)
 ```
 
 ---
@@ -14107,6 +14233,13 @@ class HyperscaleClient:
 
 The client applies rate limiting specifically to `windowed_stats_push` to prevent overwhelming the callback:
 
+> **As built (2026-10).** There is no `CLIENT_PROGRESS_RATE_LIMIT` /
+> `CLIENT_PROGRESS_BURST` token limiter; those Env fields were dead and were
+> deleted (plan Phase 6). The client's `WindowedStatsPushHandler`
+> (`nodes/client/handlers/tcp_windowed_stats.py`) checks each push against its
+> AD-24 rate limiter (per sender, per operation) and answers
+> `b"rate_limited"` when refused. The sketch below is history.
+
 ```python
 class HyperscaleClient:
     def __init__(self, ...):
@@ -14141,14 +14274,11 @@ class HyperscaleClient:
 New environment variables in `Env`:
 
 ```python
-# Stats windowing
-STATS_WINDOW_SIZE_MS: float = 100.0        # Window bucket size
-STATS_DRIFT_TOLERANCE_MS: float = 50.0     # Clock drift tolerance
-STATS_PUSH_INTERVAL: float = 100.0         # How often to flush windows (ms)
-
-# Client rate limiting (progress updates only)
-CLIENT_PROGRESS_RATE_LIMIT: float = 20.0   # Max progress callbacks per second
-CLIENT_PROGRESS_BURST: int = 5             # Burst allowance
+# Stats windowing (defaults in hyperscale/distributed/env/env.py)
+STATS_WINDOW_SIZE_MS: float = 50.0         # Window bucket size
+STATS_DRIFT_TOLERANCE_MS: float = 25.0     # Network latency allowance
+STATS_PUSH_INTERVAL_MS: float = 50.0       # How often to flush windows (ms)
+STATS_MAX_WINDOW_AGE_MS: float = 5000.0    # Max age before a window is dropped
 ```
 
 ### Memory Management
@@ -14198,6 +14328,23 @@ Worker1     Worker2     Manager           Gate           Client
 ---
 
 ## Bootstrap & Service Discovery
+
+> **Superseded (2026-10, plan decision D3).** The bootstrap module designed in
+> this section (`BootstrapConfig`, `ParallelProber`, the 4-byte PING/PONG probe,
+> the bootstrap package tree and its backoff settings) was never built and will
+> not be: AD-52 replaces it. A node's cohort flag takes seed locators
+> (`tcp://`, `dns://` A/AAAA, `dns-srv://`, `file://`, `exec://`), resolved
+> once at launch and retried within the boot timeout
+> (`hyperscale/commands/run/seed_locators.py` `resolve_seed_addresses`, used by
+> `hyperscale run manager|gate|worker`); joining, formation and membership
+> watch are `hyperscale/distributed/cluster/cluster_membership.py`, and the
+> join rides the AES-GCM-authenticated, replay-checked frame protocol. Peers a
+> node has joined are remembered in `cluster/joined_peer_store.py`. The 15
+> unread `DiscoveryConfig` bootstrap fields were deleted; the one kept
+> (`max_concurrent_probes`) is now `max_concurrent_dns_resolutions`. Tests:
+> `tests/unit/commands/test_seed_locators.py`,
+> `tests/integration/cli/test_cli_seed_locators.py`,
+> `tests/integration/cli/test_cli_node_join.py`. The design below is history.
 
 ### Design Goals
 
@@ -15207,11 +15354,15 @@ class Gate:
             max_consecutive_failures=fed_config['max_consecutive_failures'],
         )
 
-    async def _route_job(self, job: Job) -> str:
+    async def _route_job(self, job: Job) -> str | None:
         """Route job to best DC."""
         healthy_dcs = self._dc_health_monitor.get_healthy_datacenters()
         if not healthy_dcs:
-            raise NoHealthyDatacentersError()
+            # As built: no exception crosses the wire. The gate's submission
+            # handler answers JobAck(accepted=False,
+            # error="No available datacenters - all unhealthy")
+            # (nodes/gate/handlers/tcp_job.py).
+            return None
 
         # Select based on capacity from xack
         return self._select_best_dc(healthy_dcs)
@@ -15246,7 +15397,10 @@ class Gate:
 
 ---
 
-# AD-33: Workflow State Machine for Complete Lifecycle Management
+# AD-54: Workflow State Machine for Complete Lifecycle Management
+
+> Renumbered from AD-33 (2026-10): AD-33 is Federated Health Monitoring, published
+> first. The decision record is `docs/architecture/AD_54.md`.
 
 ## Overview
 
@@ -15370,7 +15524,7 @@ A comprehensive state machine that governs the **entire workflow lifecycle**, fr
 ```python
 class WorkflowState(Enum):
     """
-    Complete workflow lifecycle states (AD-33).
+    Complete workflow lifecycle states (AD-54).
     
     State machine ensures workflows can only transition through valid paths,
     preventing race conditions and maintaining system invariants.
@@ -15459,7 +15613,7 @@ class StateTransition:
 
 class WorkflowStateMachine:
     """
-    Manages workflow state transitions with validation (AD-33).
+    Manages workflow state transitions with validation (AD-54).
     
     Ensures workflows can only transition through valid paths,
     preventing race conditions and maintaining system invariants.
@@ -15555,7 +15709,7 @@ When a worker fails:
 ```python
 async def _handle_worker_failure(self, worker_node_id: str) -> None:
     """
-    Handle worker becoming unavailable (AD-33 state machine).
+    Handle worker becoming unavailable (AD-54 state machine).
     
     Flow:
     1. Identify workflows in RUNNING/DISPATCHED states on failed worker
@@ -16241,7 +16395,7 @@ workflow_state_transitions_total{from="failed_ready_for_retry",to="pending"} 8
 
 ## Summary
 
-AD-33 introduces a **complete workflow lifecycle state machine** that:
+AD-54 introduces a **complete workflow lifecycle state machine** that:
 
 ✅ **Enforces valid transitions** - prevents impossible states  
 ✅ **Prevents race conditions** - atomic state changes with locking  
@@ -16252,6 +16406,35 @@ AD-33 introduces a **complete workflow lifecycle state machine** that:
 ✅ **Works with WorkflowDispatcher** - reuses existing dependency-aware dispatch  
 
 This is the **most robust and correct** approach to workflow lifecycle management.
+
+---
+
+## Part 13: As Built (2026-10)
+
+The machine is live: `JobManager.workflow_lifecycle`
+(`hyperscale/distributed/workflow/workflow_lifecycle_state_machine.py`) is
+the single source of truth for every workflow's lifecycle, and
+`WorkflowInfo.status` is only ever written as its projection. Where the
+design above and the build differ, the build is authoritative:
+
+| Aspect | As built |
+|--------|----------|
+| Ownership | `JobManager` owns the one machine; the dispatcher, the cancellation coordinator and the server move workflows only through `JobManager` methods. |
+| Keying | `(job_id, workflow_id)` -- workflow ids are client-generated and stable; token strings embed a manager's id and differ after a takeover or restart. |
+| Atomicity | `apply_transition` / `install_state` are synchronous, so they are atomic under asyncio without a lock; callers apply inside their own `job.lock` sections and publish (logs, observers) after releasing it. No global lock. |
+| Projection | `WORKFLOW_STATUS_BY_WORKFLOW_STATE`: DISPATCHED -> ASSIGNED (a dispatched workflow stays cancellable), AGGREGATED -> COMPLETED (clients read anything else as failure), FAILED_* -> FAILED / PENDING, CANCELLING -> CANCELLED. |
+| Unit | The parent workflow; sub-workflows (one per worker) are data on it. AGGREGATED when results merged from more than one sub. |
+| History | Bounded per workflow: registration + max budgeted retries x 6 + 3 + 2 transitions. |
+| DISPATCHED -> RUNNING | On the first progress report or result -- the evidence it executes. A worker's dispatch ack keeps it DISPATCHED. A superseded sub's late report proves nothing. |
+| Claim | PENDING -> DISPATCHED once cores are allocated, before anything is sent, so a cancellation racing the send sees it dispatched; sends are withheld for a workflow that left DISPATCHED/RUNNING, and plans a worker took after it did are cancelled again. |
+| Failed dispatch | Capacity waits (no cores; readiness refusals; stale pool entries; withheld sends) are not failures: the workflow returns to PENDING, spends no retry budget, waits event-driven, bounded by the job's deadline (AD-34). Undeliverable or refused dispatches spend one AD-44 unit and back off; once the budget is spent the workflow fails for good, its dependents cascade, and the job closes with the cause. `max_dispatch_attempts` is gone. |
+| Retry chain | FAILED -> FAILED_CANCELING_DEPENDENTS -> FAILED_READY_FOR_RETRY -> PENDING is applied in one synchronous step: an observable FAILED is always terminal. Its dependents wait on its completion, so none can have started. |
+| Worker loss | Decided by the job's leader only (followers mirror the superseded subs). A loss is charged to the workflow's retry budget when attributable (an unexplained death, a restarted incarnation, an AD-41 over-budget eviction, an AD-30 stall, an orphan); our own deadline eviction and anything during the AD-19 systemic hold are not. Without a dispatch entry to run it again (a takeover without its payload) it fails loudly. |
+| Dependencies | Stored on `WorkflowInfo.dependency_workflow_ids`; a failure cascades along them in one iterative sweep (no recursion), dependents leave the dispatch queue with it. |
+| Cancellation | PENDING -> CANCELLING -> CANCELLED at once; DISPATCHED/RUNNING -> CANCELLING until the workers confirm (or the cancelled results arrive, or the worker is lost); a workflow cancelled while its job goes on counts as failed. Single-workflow cancel is real: the leader cancels the workflow and (by request) its dependents, or fails them. CANCELLING past the cancel window (`CANCELLED_WORKFLOW_TIMEOUT`) is forced to CANCELLED. |
+| Snapshots | Carry `lifecycle_state`, `retry_generation`, `dependency_workflow_ids`. A follower mirrors its fenced leader; the job's own leader -- and a worker's report, which is evidence only -- merges forward by `(retry_generation, WORKFLOW_STATE_RANK)` and never regresses. |
+| AD-34 progress | Lifecycle transitions and worker reports whose completed/failed counts advanced restart the stuck clock; each AD-26 extension adds its (log-decaying) grant to the tolerated silence. Only work in flight can be stuck. |
+| Verification | `tests/unit/simulation/sim/test_multiprocess_workflow_lifecycle.py` runs real jobs and judges every manager's recorded history with `WorkflowLifecycleOracle`. |
 
 ---
 
@@ -17276,7 +17459,7 @@ class ManagerServer:
 ### Progress Reporting Integration
 
 ```python
-# Integrate with WorkflowStateMachine from AD-33
+# Integrate with WorkflowStateMachine from AD-54
 async def _on_workflow_state_transition(
     self,
     job_id: str,
@@ -17504,7 +17687,7 @@ If partition lasts 5+ minutes:
 
 ## Part 9: Complete Workflow Integration
 
-### Progress Tracking with AD-33 State Machine
+### Progress Tracking with AD-54 State Machine
 
 ```python
 # Enhance WorkflowStateMachine to track progress
@@ -17657,7 +17840,7 @@ ServerWarning: "Failed to send global timeout to us-east: Connection refused"
 | `distributed_rewrite/models/distributed.py` | JobProgressReport, JobTimeoutReport, JobGlobalTimeout, JobLeaderTransfer messages |
 | `nodes/manager.py` | Strategy selection, unified timeout loop, leader transfer handling |
 | `nodes/gate.py` | GateJobTracker, global timeout loop, broadcast coordination |
-| `distributed_rewrite/workflow/state_machine.py` | Progress tracking integration (from AD-33) |
+| `distributed_rewrite/workflow/state_machine.py` | Progress tracking integration (from AD-54) |
 
 ---
 
@@ -17678,7 +17861,7 @@ ServerWarning: "Failed to send global timeout to us-east: Connection refused"
 - Implement GateJobTracker and global timeout loop
 - Enable gate_addr-based strategy selection
 
-**Phase 4**: Integration with AD-33
+**Phase 4**: Integration with AD-54
 - Connect WorkflowStateMachine progress events
 - Timeout strategies receive workflow state transitions
 - Complete stuck workflow detection
@@ -17692,7 +17875,7 @@ AD-34 introduces **adaptive job timeout with multi-DC coordination** that:
 ✅ **Auto-detects topology** - Uses local authority (single-DC) or gate coordination (multi-DC)
 ✅ **Robust to failures** - Leader transfers, gate failures, network partitions
 ✅ **Race condition safe** - Fence tokens, timestamps, status corrections
-✅ **Detects stuck workflows** - Progress tracking via AD-33 state machine
+✅ **Detects stuck workflows** - Progress tracking via AD-54 state machine
 ✅ **Global consistency** - Gate ensures timeout cancels job in ALL DCs
 ✅ **Fallback protection** - Managers timeout locally if gate unreachable (5 min)
 ✅ **Zero configuration** - Strategy chosen per-job based on `gate_addr`
@@ -19840,6 +20023,13 @@ if dc in preferred:
 
 ## Part 5: Hysteresis and Stickiness
 
+> **Doc-obsolete (2026-10, plan Phase 3 G-247).** The built router
+> (`routing/gate_job_router.py` `GateJobRouter`) is stateless per job: each
+> `route_job` call ranks candidates afresh, ties break by rendezvous hashing
+> so a job's choice is stable without held state, and a failed dispatch cools
+> that datacenter for that job (`JobDispatchCooldowns`). There is no hold-down,
+> switch threshold or switch state; the rules and diagram below are history.
+
 Routing decisions must be stable to avoid oscillation:
 
 1. **Hold-down**: keep current primary for `HOLD_DOWN_S` unless it becomes excluded
@@ -19934,18 +20124,17 @@ Gate               DC-A Manager          DC-B Manager
 
 ## Part 11: Observability
 
-**Metrics**:
-- `routing_decisions_total{bucket,reason}`
-- `routing_score{dc_id}`
-- `routing_score_component{dc_id,component="rtt_ucb|load|quality"}`
-- `routing_switch_total{reason}`
-- `routing_hold_down_blocks_total`
+**Metrics** (as built, exported by `hyperscale cluster --metrics` on a gate,
+`hyperscale/commands/cluster.py`, from `GateJobRouter.get_metrics()`):
+- `routing_decisions_total{bucket}`
+- `routing_exclusions_total{reason}`
 - `routing_fallback_used_total{from_dc,to_dc}`
+- `routing_cooldowns_total`
 
-**Logs**:
-- `RoutingDecision` with candidate list and score components
-- `RoutingSwitch` with old/new DC and improvement ratio
-- `RoutingCooldown` when a DC fails dispatch
+Not built, and not planned: per-DC score gauges, `routing_switch_total`,
+`routing_hold_down_blocks_total` and the `RoutingDecision` / `RoutingSwitch` /
+`RoutingCooldown` logs. The router has no switch or hold-down state to report
+(Part 5).
 
 ---
 
@@ -19956,6 +20145,13 @@ Gate               DC-A Manager          DC-B Manager
 3. **Failover Speed**: < 10 seconds from DC failure to routing around it
 4. **Stability**: switch rate < 1% of routing decisions
 5. **Zero Configuration**: no static priority lists required
+
+Status (2026-10): criteria 1 and 2 are tested against the real router
+(`tests/unit/distributed/gate/test_gate_job_routing.py`). Criterion 3 is
+unverified: no test asserts < 10 s, and the only DC-loss bound,
+`tests/unit/simulation/sim/test_multiprocess_dc_loss.py`, holds the gate's
+death classification to at most 30 s (measured 12.0-16.25 s for one seed).
+Criterion 4 does not apply to a stateless router (Part 5).
 
 ---
 
@@ -20050,6 +20246,36 @@ T0+interval: Flush loop checks max signal
 **Decision**: Implement a tiered durability architecture combining per-node Write-Ahead Logs (WAL) with a globally replicated Job Ledger for cross-datacenter job coordination, with operation-specific durability levels and separate control/data planes.
 
 **Related**: AD-20 (Cancellation), AD-33 (Federated Health Monitoring), AD-35 (Vivaldi Coordinates), AD-36 (Cross-DC Routing), AD-37 (Backpressure)
+
+> **Implementation status (2026-10-06): built, on per-job Raft.** The tier
+> diagrams and numbers below are the original design; read them with these
+> corrections (details in `docs/architecture/AD_38.md`):
+> - Every manager and gate started by `hyperscale run` has a node directory, so
+>   each keeps an fsync'd `NodeWAL` under a `JobLedger`
+>   (`ledger/job_ledger.py`, `ledger/wal/node_wal.py`).
+> - All 8 event types of Part 1 are emitted, plus `JobRelinquished`,
+>   `JobDatacenterReassigned` and `JobLeadershipAcquired`; all 11 replay
+>   through `ledger/job_event_applier.py`.
+> - REGIONAL proposes one `LedgerAppendCommand` to the job's own Raft group
+>   (`raft/ledger_replicator.py`). GLOBAL means the entry's holders span two or
+>   more regions (`nodes/gate/ledger_region_span.py`, plan decision D14); a
+>   gate tier in one region commits its records REGIONAL and logs that once
+>   (`_ledger_target_durability`, `nodes/gate/server.py`). Managers commit job
+>   events REGIONAL and progress LOCAL.
+> - Per-job VSR (Part 14), Merkle anti-entropy (Part 6) and worker
+>   acknowledgment windows (Part 3.3) are superseded by per-job Raft log
+>   replication, the AD-54 DISPATCHED state and the orphan scan.
+> - Checkpoints cut the WAL (Part 7); leveled reads are built (Part 8, D2).
+> - The latency, recovery and throughput figures are design targets, none
+>   measured (plan D16).
+> - Gate takeover replicas (`GateJobReplica`) are not part of this ledger:
+>   they commit by an in-memory two-phase commit across a quorum of live gates
+>   (`nodes/gate/replication_coordinator.py`), neither persisted nor
+>   Raft-replicated, so they survive only while a gate quorum stays up.
+> - WAL recovery (2026-10-06): `NodeWAL` cuts only a torn tail (bytes
+>   preserved, `WALTailDiscarded`); damage with written bytes after it is
+>   refused with `WALUntrustworthyError` and the node does not start
+>   (`docs/architecture/AD_38.md` Part 3.2).
 
 **Rationale**:
 - Gates assign jobs to datacenters worldwide; job state must survive node, rack, and region failures.
@@ -20477,6 +20703,17 @@ Different operations require different durability guarantees. Using GLOBAL durab
 
 ## Part 3.3: Acknowledgment Windows (Worker Communication)
 
+> **As built (2026-10):** realized without a separate ack-window manager.
+> Dispatch never blocks on a worker: a dispatched workflow stays DISPATCHED
+> until its first progress report or result proves it runs (AD-54). A
+> worker that never received it is found by the manager's orphan
+> reconciliation (`_orphan_scan_loop`: the manager asks each worker what it
+> holds and re-places what it lost), and a worker that holds it but goes
+> silent by AD-30's per-job responsiveness suspicion
+> (`_job_responsiveness_loop`), with AD-26 extensions as the healthy-but-busy
+> "extend window" path. The state machine below is the design those pieces
+> implement.
+
 Workers under load cannot provide timely acks. Instead of blocking on worker responses, use **Acknowledgment Windows**.
 
 **Traditional Approach (WRONG for workers under load)**:
@@ -20541,6 +20778,16 @@ Manager ──► Worker: Dispatch workflow
 ---
 
 ## Part 3.4: Circuit Breakers for Cross-DC Communication
+
+> **Superseded (2026-10, plan decision D6): reject-or-reroute, no
+> queue-and-replay.** The gate keeps a circuit breaker per manager
+> (`health/circuit_breaker_manager.py`, thresholds from `CIRCUIT_BREAKER_*`).
+> A dispatch to a manager whose circuit is OPEN fails at once ("Circuit
+> breaker is OPEN", `nodes/gate/dispatch_coordinator.py`), and dispatch moves
+> on to the next manager or the next datacenter in the job's fallback chain.
+> Nothing is queued for replay: a replayed dispatch could carry a stale fence
+> token, and routing already fails over. The queue/replay design below is
+> history.
 
 Cross-DC communication can be slow or fail entirely. Use circuit breakers to prevent cascading failures.
 
@@ -20613,6 +20860,14 @@ Client ──► Gate: SubmitJob(target_dcs=[dc-east, dc-west])
 ---
 
 ## Part 3.5: Coalesced Stats Reporting
+
+> **As built (2026-10): a different mechanism.** No `StatsAggregator` exists.
+> Workers flush their latest progress per workflow; the manager collects it
+> into time windows (`jobs/windowed_stats_collector.py`); for a gate-routed
+> job the manager pushes per-worker windows to the job's origin gate, and for
+> a gateless job it pushes aggregated windows to the client; the gate
+> aggregates across datacenters (`nodes/gate/stats_coordinator.py`). The
+> "5000x" reduction claimed below has never been measured.
 
 Stats are high-volume, low-criticality. Reduce cross-DC traffic through coalescing.
 
@@ -20829,6 +21084,31 @@ Resolution priority (deterministic):
 
 ## Part 6: Anti-Entropy and Repair
 
+> **Not the design (decided 2026-10): Raft's log repair is.** This part
+> assumed regions replicate a job's events asynchronously and drift apart,
+> so a Merkle tree over job ranges finds what diverged and Part 5's
+> conflict rules merge it. As built, a job's ledger events are entries in
+> the job's Raft log -- the manager tier's group for REGIONAL, the gate
+> tier's group, whose members span the regions, for GLOBAL
+> (`raft/ledger_replicator.py`) -- and every member applies them, in the one
+> committed order, into its `JobLedgerReplica`. The steps below map onto
+> what Raft already does:
+>
+> | Here | As built |
+> |---|---|
+> | Root-hash exchange finds a divergent replica | AppendEntries' consistency check (previous index and term) finds the first entry a member lacks or holds wrongly |
+> | Drill down to the divergent job range | The leader backs that member's next index up to the point of agreement (Raft §5.3) |
+> | Fetch events from the authority | The leader resends its log from there; a member added later (a learner, AD-52) receives the whole log |
+> | Merge with conflict resolution | Nothing to merge: one leader orders every event, and a member's conflicting suffix is uncommitted and replaced (log matching). Competing writers for one job are fenced by AD-10 tokens |
+> | Recompute and verify hashes | The commit index: an entry counts as REGIONAL or GLOBAL only once a quorum holds it (`RaftNode.members_holding`) |
+>
+> State kept outside a job's log has its own repair: each job's leader
+> re-syncs the job to its peer managers every
+> `MANAGER_PEER_JOB_SYNC_INTERVAL`, a follower's copy that falls silent asks
+> the job's leader before retention drops it, and gates version job
+> replicas by (fence, sequence) so a takeover adopts the freshest one a
+> quorum holds.
+
 Merkle tree-based consistency verification:
 
 **Merkle Tree Structure**:
@@ -21001,6 +21281,28 @@ Efficient recovery through periodic snapshots:
 ---
 
 ## Part 8: Session Consistency Guarantees
+
+> **Built (2026-10, plan decision D2).** A `JobStatusQuery` carries a
+> `ReadConsistency` level (`hyperscale/distributed/models/read_consistency.py`):
+> EVENTUAL, SESSION, BOUNDED_STALENESS or STRONG. An EVENTUAL read, or any read
+> of a terminal status, is answered from the asked node's own view. Otherwise
+> the job's leader answers: a manager leader answering STRONG first re-syncs
+> the job's state to a quorum of peers (`_sync_job_state_to_peers(...,
+> require_quorum=True)`, `nodes/manager/server.py` `_strong_read_unconfirmed`),
+> and a gate leader re-commits the job's replica to a gate quorum
+> (`revise_committed_replica`, `nodes/gate/server.py`
+> `_gate_strong_read_unconfirmed`). A manager follower answers SESSION when its
+> leader's last synced view (fence token, view time) is at least as new as what
+> the reader observed, and BOUNDED_STALENESS when the view's age bound (time
+> since arrival plus the sync send timeout) is within `max_staleness_seconds`;
+> otherwise the read is forwarded once to the job's leader. The client carries
+> its session view per tracked job, and `hyperscale job status` takes
+> `--consistency` and `--max-staleness`. Tests:
+> `tests/unit/distributed/manager/test_job_status_consistency.py`,
+> `tests/unit/distributed/gate/test_gate_job_status_consistency.py`,
+> `tests/unit/distributed/client/test_client_job_status_session.py`. STRONG is
+> a quorum re-replication, not Raft ReadIndex. The session-state diagram and
+> sketches below predate this and are illustrative only.
 
 Read consistency levels for different use cases:
 
@@ -21234,6 +21536,14 @@ class HybridLogicalClock:
 ```
 
 ### WAL Segment
+
+> **Not built (superseded 2026-10).** There are no segments and no mmap. Each
+> node's job WAL is one file written by the ledger `WALWriter`
+> (`ledger/wal/wal_writer.py`, group commit by queue drain); each checkpoint
+> cuts it atomically to what the oldest kept checkpoint still needs
+> (`NodeWAL.discard_through` → `WALWriter.rewrite`, plan Phase 2). Test:
+> `tests/unit/distributed/ledger/test_wal_reclamation.py`. This listing is
+> history.
 
 ```python
 """
@@ -22301,6 +22611,9 @@ class CheckpointManager:
 
 ### Data Plane Stats Aggregator (Uses Logger)
 
+> **Not built (superseded 2026-10).** The data plane is the windowed-stats
+> pipeline described in the Part 3.5 note; this listing is history.
+
 ```python
 """
 hyperscale/distributed_rewrite/ledger/data_plane/stats_aggregator.py
@@ -22553,6 +22866,10 @@ class StatsAggregator:
 
 ### Acknowledgment Window Manager
 
+> **Not built (superseded 2026-10).** Lost and stuck dispatches are handled by
+> the AD-54 DISPATCHED state, the manager's orphan scan and AD-30 suspicion
+> (see the Part 3.3 note); this listing is history.
+
 ```python
 """
 hyperscale/distributed_rewrite/ledger/coordination/ack_window_manager.py
@@ -22746,6 +23063,16 @@ class AckWindowManager:
 ```
 
 ### Circuit Breaker for Cross-DC Communication
+
+> **Superseded (2026-10, plan decision D6): reject-or-reroute, no
+> queue-and-replay.** The gate keeps a circuit breaker per manager
+> (`health/circuit_breaker_manager.py`, thresholds from `CIRCUIT_BREAKER_*`).
+> A dispatch to a manager whose circuit is OPEN fails at once ("Circuit
+> breaker is OPEN", `nodes/gate/dispatch_coordinator.py`), and dispatch moves
+> on to the next manager or the next datacenter in the job's fallback chain.
+> Nothing is queued for replay: a replayed dispatch could carry a stale fence
+> token, and routing already fails over. The queue/replay design below is
+> history.
 
 ```python
 """
@@ -23024,6 +23351,13 @@ class CircuitOpenError(Exception):
 
 ## Part 11: File Organization
 
+> **Planned layout, not the tree as built.** The ledger lives in
+> `hyperscale/distributed/ledger/` (events, WAL, checkpoint, archive,
+> storage format, commit pipeline, replica); its REGIONAL and GLOBAL legs
+> are the per-job Raft groups in `hyperscale/distributed/raft/`. There is no
+> `consensus/`, `anti_entropy/` (Part 6), `session/` or `coordination/`
+> package: Part 3.3's acknowledgment windows are AD-54's DISPATCHED state.
+
 ```
 hyperscale/distributed_rewrite/ledger/
 ├── __init__.py
@@ -23109,7 +23443,7 @@ ManagerNode
 │   └── Aggregates worker progress (uses Logger)
 ├── CircuitBreaker (AD-38)
 │   └── For cross-DC gate communication
-├── WorkflowStateMachine (AD-33)
+├── WorkflowStateMachine (AD-54)
 │   └── Persists state transitions to WAL
 ├── FederatedHealthMonitor (AD-33)
 │   └── Reads global ledger for cross-DC state
@@ -23155,6 +23489,14 @@ WorkerNode
 
 ## Part 13: Success Criteria
 
+> **Status (2026-10).** Criterion 7 is met by the checkpoint cut (the log is
+> bounded after quiesce, `tests/unit/distributed/ledger/test_wal_reclamation.py`).
+> The latency, throughput, recovery-time and stats figures (2, 3, 4, 8-10) are
+> unmeasured design targets; plan decision D16 keeps them and calls for probe
+> scripts, none of which exist yet. No single test asserts criterion 1 across
+> tiers. Criteria 13 and 14 describe superseded mechanisms (Part 3.4 and Part
+> 3.3 notes).
+
 **Control Plane (Job/Workflow Operations)**:
 1. **Durability**: Zero job loss under any single failure (node, rack, region)
 2. **Latency**: LOCAL <1ms, REGIONAL <10ms, GLOBAL <300ms (p99)
@@ -23179,6 +23521,23 @@ WorkerNode
 ---
 
 ## Part 14: Per-Job Viewstamped Replication
+
+> **Not the design (decided 2026-10): per-job Raft is.** This section argued
+> for Viewstamped Replication over Raft; the system was built on per-job
+> Raft groups instead, and AD-52's membership work builds on that Raft. The
+> ideas below map onto what was built:
+>
+> | VSR here | As built (per-job Raft, `hyperscale/distributed/raft/`) |
+> |---|---|
+> | View number / fencing token | Raft term; job fence tokens are derived from it (AD-10) |
+> | Primary from hash ring + lease | Leader elected by the job's group (PreVote, leader stickiness, randomized timeouts); the job leader proposes through it |
+> | View change on lease expiry | Election when the leader goes quiet past the election timeout |
+> | Durable-before-ack quorum | AD-38 REGIONAL: an entry commits once a quorum of the group's voters holds it -- never fewer than a majority of the configured cohort |
+> | Replica set | The group's voters and learners (`RaftConfiguration`), changed only through the log by joint consensus (AD-52 slice A) |
+> | Log matching "not needed" | Raft's log matching and leader completeness hold, and are checked by `tests/unit/simulation/sim/test_raft_membership_vopr.py` |
+>
+> Cross-datacenter (GLOBAL) placement is judged on the same groups
+> (`RaftNode.members_holding`); see `raft/ledger_replicator.py`.
 
 This section defines the maximally correct, robust, and performant architecture for global job ledger replication across datacenters, integrated with the existing per-job leadership model.
 
@@ -24595,6 +24954,8 @@ class GateJobLedger:
 
 ### Performance Characteristics
 
+> Part of the superseded per-job VSR design (see the Part 14 note): not built, and these figures were never measured.
+
 | Metric | Value | Notes |
 |--------|-------|-------|
 | **Write Latency** | 80-150ms | RTT to nearest quorum member |
@@ -24617,6 +24978,8 @@ class GateJobLedger:
 | Complexity | Higher (Raft + sharding) | Lower (VSR + per-job leadership) |
 
 ### Configuration Recommendations
+
+> Part of the superseded per-job VSR design (see the Part 14 note); not built.
 
 ```python
 # Production configuration for global job ledger (Per-Job VSR)
@@ -24656,6 +25019,8 @@ LEASE_CONFIG = GateJobLeaseConfig(
 ```
 
 ### Why This Is Maximally Correct
+
+> Part of the superseded per-job VSR design (see the Part 14 note); not built.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -24916,6 +25281,11 @@ class LoggerStream:
 ```
 
 ### 1.5 Critical Gap: `_write_to_file` Implementation
+
+> **As built (2026-10).** `LoggerStream._write_to_file` is now async and
+> writes through the `Filesystem` seam (`hyperscale/logging/streams/logger_stream.py`),
+> which is the better design for an asyncio logger; the synchronous listing
+> below is the pre-change code.
 
 ```python
 # CURRENT IMPLEMENTATION (logger_stream.py:857-873)
@@ -26448,6 +26818,19 @@ def _write_to_file(
 
 ## Part 12: High-Concurrency I/O Architecture
 
+> **Superseded (2026-10).** The `WALWriter`/`WALReader` coalescing layer for
+> `LoggerStream` designed in 12.5-12.8 was not built. Group commit lives in the
+> ledger `WALWriter` (`hyperscale/distributed/ledger/wal/wal_writer.py`), and
+> `LoggerStream` keeps its durability modes (plan decision D11): FSYNC_BATCH
+> batches up to `batch_max_size` entries or a `batch_timeout_ms` timer (both
+> constructor parameters; the 10 ms default's derivation is at
+> `DEFAULT_BATCH_TIMEOUT_MS` in `logging/streams/logger_stream.py`), `log()`
+> returns once its entry is durable, and a full batch raises
+> `WALBatchOverflowError` rather than dropping or blocking. Reads go through
+> `LoggerStream.read_entries` / `get_last_lsn`, which always verify CRCs; there
+> is no `verify_crc` switch, `count_entries` or 64 KB buffered reader. The
+> design below is history.
+
 This section addresses the critical question: **How do we handle 10,000+ concurrent writes efficiently?**
 
 The current `run_in_executor()` pattern has fundamental limitations for high-concurrency WAL operations. This section documents the problem and the recommended solution.
@@ -27546,6 +27929,12 @@ Write coalescing is the recommended approach for high-concurrency WAL operations
 
 ## Part 13: Portable High-Concurrency I/O Design
 
+> **Superseded (2026-10).** See the Part 12 note: `LoggerStream` did not gain
+> `enable_coalescing`; it takes `batch_timeout_ms` (default 10 ms, about one
+> rotational flush: PostgreSQL commit_delay / Kafka linger.ms practice) and
+> `batch_max_size` as constructor parameters. Coalesced group commit is the
+> ledger `WALWriter`'s.
+
 This section provides a definitive answer to the question: **What is the most correct and robust approach for high-concurrency, low-latency logging that is asyncio-compatible AND portable?**
 
 ### 13.1 Platform I/O Mechanisms Overview
@@ -28117,12 +28506,13 @@ def portable_fsync(file) -> None:
     """
     Portable fsync that works correctly on all platforms.
 
-    Python's os.fsync() handles platform differences:
-    - Linux: fdatasync() or fsync()
-    - macOS: fcntl(F_FULLFSYNC) when available
-    - Windows: FlushFileBuffers()
-
-    For extra safety on macOS (which may lie about fsync):
+    Python's os.fsync() calls the platform's fsync (FlushFileBuffers on
+    Windows). On macOS that only moves data to the drive, which may keep
+    it in its volatile cache (fsync(2)), so a durable sync there is
+    fcntl(F_FULLFSYNC) -- os.fsync never issues it. Implemented as
+    RealFilesystem._sync_durably (hyperscale/core/runtime/real_filesystem.py),
+    which every filesystem sync goes through: F_FULLFSYNC on macOS, fsync
+    on a filesystem that reports it unsupported, any other error raised.
     """
     import sys
 
@@ -28473,6 +28863,18 @@ This is the implementation documented in Part 12 (WALWriter/WALReader classes) a
 ---
 
 ## Part 14: High-Concurrency Reading and Buffer Architecture
+
+> **Superseded (2026-10) -- Parts 14-16 describe a buffer layer that was
+> never built and is not needed.** The ledger WAL stack that was built
+> instead has neither problem these parts solve: `NodeWAL` recovery reads
+> the whole log in ONE `Filesystem.read_bytes` call and parses its frames
+> in memory (no per-entry executor round trips -- Part 14's reading
+> problem), and `WALWriter` is a single writer task draining a bounded
+> queue with batched group commit and one durable sync per batch (Part
+> 15's single writer), behind the `Filesystem` seam that also gives SIM
+> its storage faults. `BufferPool`, `DoubleBuffer`, `SingleWriterBuffer`,
+> `SingleReaderBuffer`, `ReaderPool`, `IndexedReader` and `wait_durable`
+> do not exist; read the code in `hyperscale/distributed/ledger/wal/`.
 
 This section addresses two critical questions:
 1. **How do we implement high-concurrency reading that is asyncio-compatible and portable?**
@@ -32420,6 +32822,21 @@ class JobAck(Message):
 
 #### Integration with Per-Job VSR (AD-38)
 
+> **As built (2026-10): no VSR.** Per-job VSR was not built (per-job Raft is
+> the design; AD-38 Part 14). The cross-gate leg is the gate takeover replica:
+> `GateJobReplica.idempotency_key` is adopted by every gate that commits the
+> replica, and a prepare is refused while another job's prepared or committed
+> replica holds the same key (`nodes/gate/replication_coordinator.py`
+> `_idempotency_key_held_elsewhere_locked`); quorums intersect, so of two
+> gates admitting one key at once at most one commits. That replica is
+> committed by in-memory two-phase commit across live gates, not Raft or a
+> WAL, so this leg holds only while a gate quorum stays up, and the check is a
+> linear scan of the held replicas rather than the O(1) index this AD asks
+> for. `IdempotencyReservedEvent` / `IdempotencyCommittedEvent`
+> (`hyperscale/distributed/idempotency/`) exist but have no producer or
+> consumer. Test: `tests/unit/distributed/gate/test_gate_cross_gate_idempotency.py`.
+> The VSR design below is history.
+
 Idempotency entries are replicated as part of the job's VSR log:
 
 ```python
@@ -32841,11 +33258,13 @@ class GateJobHandler:
                     original_job_id=entry.job_id or "",
                 )
             else:
-                # PENDING with no result - shouldn't happen if wait_for_pending=True
+                # PENDING with no result - shouldn't happen if wait_for_pending=True.
+                # Worded in the shared transient vocabulary
+                # (protocol/transient_errors.py): the sender retries.
                 return JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error="Request pending, please retry",
+                    error="submission in progress, retry",
                 )
 
         # New request - forward to manager
@@ -32930,11 +33349,13 @@ class ManagerJobHandler:
                     original_job_id=entry.job_id,
                 )
             else:
-                # Still PENDING - race condition, return pending response
+                # Still PENDING - race condition, return pending response,
+                # worded in the shared transient vocabulary so the gate
+                # retries this manager instead of dispatching elsewhere
                 return JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error="Request pending",
+                    error="submission in progress, retry",
                 )
 
         # Process submission
@@ -33045,6 +33466,10 @@ The system provides at-most-once semantics through layered deduplication:
 - Ensures any replica can detect duplicates
 - Survives DC-level failures
 
+> As built (2026-10), layer 3 is the cross-gate `GateJobReplica.idempotency_key`
+> check described in the Part 8 note, not VSR; it survives only while a gate
+> quorum stays up. Read "VSR" in the proof sketch below as that replica.
+
 #### Proof Sketch
 
 **Claim**: A job submission with idempotency key K executes at most once.
@@ -33140,6 +33565,27 @@ The system provides at-most-once semantics through layered deduplication:
 ```
 
 ## AD-41: Resource Guards - CPU/Memory Monitoring and Enforcement
+
+> **As built (2026-10).** Enforcement is built: `ResourceEnforcer`
+> (`hyperscale/distributed/resources/resource_enforcer.py`; WARN → THROTTLE →
+> KILL, a kill only when the estimate exceeds the limit by
+> `KILL_CONFIDENCE_SIGMAS = 2.0` standard deviations, EVICT_WORKER when a
+> worker ignores a kill) is constructed by the manager (on by default,
+> `RESOURCE_GUARD_ENABLED`), judged on every progress report, throttles a
+> worker through `WorkflowThrottleRequest`/`WorkflowThrottleResponse`, and
+> kills through the existing workflow cancel path. Budgets ride
+> `JobSubmission.resource_budget`. Where the sketches in Parts 4-8 differ,
+> the built design is in `docs/architecture/AD_41.md` Part 4 "As built":
+> managers share `ManagerResourceReport`s by `ManagerResourceGossipMessage`,
+> each tagged with its age, and the freshest copy wins (no vector clocks);
+> gates aggregate every manager's report themselves
+> (`DatacenterResourceAggregator`) and gossip nothing; routing weighs
+> pressure through the AD-42 predictor instead of skipping a datacenter past
+> a fixed `cpu_pressure > 0.95`; there are no `ResourceKillRequest` /
+> `ResourceKillResponse` or gate resource-gossip messages. File descriptors
+> are sampled but not budgeted (`ResourceViolationType` has CPU and MEMORY
+> only). Tests: `tests/unit/distributed/resources/test_resource_enforcer.py`,
+> `tests/integration/cli/test_cli_resource_guard.py`.
 
 ### Part 1: Problem Statement and Requirements
 
@@ -34851,6 +35297,16 @@ Before selecting an implementation approach, we evaluated four streaming percent
 
 ### Part 3: SWIM Hierarchy for SLO Data
 
+> **Superseded (2026-10).** Nothing rides worker heartbeats or gate gossip.
+> Each manager measures dispatch → response latency itself into one
+> `TimeWindowedTDigest` (`nodes/manager/state.py`), and every manager
+> heartbeats every gate with its SLO summary, so each gate already holds every
+> datacenter's summary; worker `latency_samples` and gate `dc_slo_summaries`
+> would carry nothing a node lacks (the topology argument of AD-41 Part 4).
+> Gate health is the worse of the managers' view and `SLOHealthClassifier`'s
+> verdict (`nodes/gate/health_coordinator.py`). See `docs/architecture/AD_42.md`.
+> The hierarchy below is history.
+
 SLO data flows through the existing 3-tier SWIM hierarchy, piggybacked on heartbeats:
 
 ```
@@ -35515,6 +35971,15 @@ SLO violations contribute to datacenter health classification:
 
 ### Part 9: Integration with AD-41 Resource Guards
 
+> **As built (2026-10).** There is no separate `resource_factor` and no
+> `SLOAwareRoutingScorer` class. `ResourceAwareSLOPredictor` (constructed by
+> the gate) adjusts a datacenter's SLO routing factor by its AD-41 pressure
+> and that pressure's uncertainty (`GateHealthCoordinator._datacenter_routing_factor`),
+> and the routing score carries it through `slo_routing_factor` on
+> `DatacenterCandidate` and `DatacenterRoutingScore`. Test:
+> `tests/unit/distributed/resources/test_resource_aware_slo_prediction.py`.
+> Parts 9 and 10 below are history.
+
 Resource pressure from AD-41 predicts latency violations before they occur:
 
 ```
@@ -36162,6 +36627,15 @@ class ExecutionTimeEstimator:
 
 ### Part 5: Extended ManagerHeartbeat
 
+> **As built (2026-10).** `ManagerHeartbeat` (`models/manager_heartbeat.py`)
+> carries `pending_workflow_count`, `pending_duration_seconds`,
+> `active_remaining_seconds` and `cores_freeing_schedule` (a list of
+> `(seconds after this report, cores)`, soonest first), filled from the
+> manager's `CapacityReporter` snapshot. `estimated_cores_free_at` and
+> `estimated_cores_freeing` were replaced by that schedule; the gate walks it
+> (`capacity/datacenter_capacity.py`). Test:
+> `tests/unit/distributed/manager/test_manager_capacity_reporter.py`.
+
 Add capacity estimation fields to ManagerHeartbeat:
 
 ```python
@@ -36605,9 +37079,11 @@ class Env(BaseModel):
     # Maximum age of capacity data before considering it stale.
     # Stale capacity data falls back to health-bucket routing.
 
-    CAPACITY_AGGREGATION_INTERVAL_SECONDS: StrictFloat = 5.0
-    # How often gates aggregate capacity from manager heartbeats.
 ```
+
+`CAPACITY_AGGREGATION_INTERVAL_SECONDS` was never added: gates compute
+capacity on read from the heartbeats they recorded
+(`capacity/capacity_aggregator.py`), so there is no aggregation loop to pace.
 
 ### Part 10: Data Flow Diagram
 
@@ -36921,6 +37397,20 @@ Reason: Wait time acceptable, prefer lower latency
 ---
 
 ## AD-44: Retry Budgets and Best-Effort Completion
+
+> **Status (2026-10).** Built: the `JobSubmission` fields (`retry_budget`,
+> `retry_budget_per_workflow`, `best_effort`, `best_effort_min_dcs`,
+> `best_effort_deadline_seconds`), the client's keyword arguments, the
+> dispatcher charging `submission.retry_budget`, and the gate's
+> `BestEffortManager` (deadline loop, completion on policy, takeover resume).
+> Tests: `tests/unit/distributed/gate/test_gate_best_effort_result_order.py`,
+> `tests/unit/simulation/sim/test_multiprocess_best_effort.py`. Not built: a
+> late-result policy (a datacenter result arriving after the job completed is
+> acked without re-aggregation and is not logged), and the AD-44 metrics and
+> log models (`retry_budget_consumed_total`, `retry_budget_exhausted_total`,
+> `best_effort_completions_total`, `best_effort_completion_ratio`,
+> `RetryBudgetExhausted`, `BestEffortCompletion`, `LateDatacenterResult`).
+> `RETRY_BUDGET_DEFAULT` is 10 (`env/env.py`); whether to raise it is open.
 
 ### Part 1: Problem Statement
 
@@ -37254,8 +37744,8 @@ class BestEffortState:
 │  ─────────────────────────────────────                                  │
 │                                                                          │
 │  dc-central reports: COMPLETED (50 workflows done)                      │
-│    → Job already completed, result logged but not aggregated            │
-│    → OR: Job result updated with late DC data (configurable)            │
+│    → As built: acked without re-aggregation; not logged                 │
+│      (no LateDatacenterResult, no update-result option)                 │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -37673,7 +38163,7 @@ hyperscale/distributed/
 | Budget exhausted early | Many workflows fail | Log prominently; allow job-level override in submission |
 | Deadline too short | Job completes with few results | Minimum deadline enforced via Env |
 | All DCs fail before min | Job fails with no results | Return partial results if any; clear failure reason |
-| Late DC result after completion | Results not included | Optionally log/store; don't re-aggregate |
+| Late DC result after completion | Results not included | As built: acked without re-aggregating (`_finalized_workflow_results`, `nodes/gate/server.py`); not logged or stored, and no option updates the result |
 | Clock skew affects deadline | Premature/late completion | Use monotonic time; deadline relative to submission |
 
 ### Part 12: Design Decision Summary
@@ -38341,10 +38831,10 @@ class Env(BaseModel):
     ADAPTIVE_ROUTING_ENABLED: StrictBool = True
     # Enable blended latency scoring. When False, uses RTT UCB only.
 
-    ADAPTIVE_ROUTING_EWMA_ALPHA: StrictFloat = 0.2
-    # EWMA decay factor for observed latency.
-    # Higher = more responsive to recent observations.
-    # Range: 0.05 to 0.5 recommended.
+    ADAPTIVE_ROUTING_EWMA_ALPHA: StrictFloat = 0.125
+    # EWMA gain for observed latency: 1/8, the SRTT gain of RFC 6298
+    # section 2 (plan Phase 3 G-56). Follows a lasting shift within a few
+    # dozen samples; one outlier moves it an eighth of its excess.
 
     ADAPTIVE_ROUTING_MIN_SAMPLES: StrictInt = 10
     # Minimum samples before observed latency reaches full confidence.
@@ -38508,6 +38998,18 @@ Stale observations decay toward prediction-only.
 ```
 
 ### Part 12: Observability
+
+> **As built (2026-10, plan Phase 3 G-57).** A gate's `hyperscale cluster
+> --metrics` exports, per datacenter, `route_learning_observed_latency_ms`,
+> `route_learning_blended_latency_ms`, `route_learning_confidence` and
+> `route_learning_sample_count` (`hyperscale/commands/cluster.py`, from
+> `GateServer._add_route_learning_metrics`). Logs: `ObservedLatencyRecorded`
+> per recorded observation and `StaleObservationsDecayed` when stale
+> observations decay (`hyperscale/logging/hyperscale_logging_models.py`). The
+> metric names below, `routing_latency_source`, the stddev gauge and a
+> per-decision `BlendedLatencyComputed` log were not built: a per-decision log
+> would fire for every datacenter on every job, so the metrics replace it.
+> `ADAPTIVE_ROUTING_EWMA_ALPHA` defaults to 1/8, RFC 6298's SRTT gain.
 
 **Metrics**:
 

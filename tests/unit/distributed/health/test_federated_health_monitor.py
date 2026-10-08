@@ -40,10 +40,10 @@ def make_tcp_status(health: DatacenterHealth) -> DatacenterStatus:
         dc_id="main",
         health=health.value,
         available_capacity=2,
-        queue_depth=0,
         manager_count=1,
         worker_count=1,
         last_update=time.monotonic(),
+        health_severity_weight=1.4,
     )
 
 
@@ -140,7 +140,6 @@ def test_unproven_federated_failure_does_not_override_tcp_health() -> None:
     )
 
     status = coordinator._merge_unreachable_federated_health(
-        "main",
         tcp_status,
         federated_state,
     )
@@ -159,10 +158,12 @@ def test_confirmed_federated_failure_degrades_fresh_tcp_health() -> None:
     )
 
     status = coordinator._merge_unreachable_federated_health(
-        "main",
         tcp_status,
         federated_state,
     )
 
     assert status.health == DatacenterHealth.DEGRADED.value
     assert status.available_capacity == tcp_status.available_capacity
+    # The merge keeps every TCP-derived field it does not override: the
+    # overload severity the router multiplies scores by survives it.
+    assert status.health_severity_weight == tcp_status.health_severity_weight

@@ -1,8 +1,8 @@
 import asyncio
-import inspect
 import pathlib
 import sys
 import textwrap
+from importlib import resources
 
 try:
 
@@ -17,7 +17,12 @@ from hyperscale.ui.components.terminal import Section, SectionConfig, Terminal
 from hyperscale.ui.components.text import Text, TextConfig
 
 from .cli import CLI
-from .workflow import test
+
+# The new-test template, read as text and never imported: an imported
+# template Workflow subclass joins every `run workflow` (which collects
+# Workflow subclasses), so each run also ran the template's test.
+TEMPLATE_PACKAGE = "hyperscale.commands.workflow"
+TEMPLATE_FILE = "test.py"
 
 
 
@@ -129,7 +134,9 @@ async def create_test(
         await loop.run_in_executor(
             None,
             test_file.write,
-            textwrap.dedent(inspect.getsource(test)),
+            textwrap.dedent(
+                await loop.run_in_executor(None, resources.files(TEMPLATE_PACKAGE).joinpath(TEMPLATE_FILE).read_text)
+            ),
         )
 
     except Exception:

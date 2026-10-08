@@ -12,6 +12,7 @@ import pytest
 
 from hyperscale.logging.config.logging_config import (
     LoggingConfig,
+    _global_log_level,
     _global_logging_disabled,
     _global_disabled_loggers,
 )
@@ -111,14 +112,17 @@ class TestLoggingConfigEnabled:
     """Tests for LoggingConfig.enabled() method."""
 
     def setup_method(self):
-        """Reset logging state before each test."""
+        """Reset logging state before each test -- the level too: a server
+        built earlier in the process sets it from its Env."""
         _global_logging_disabled.set(False)
         _global_disabled_loggers.set([])
+        self._log_level_token = _global_log_level.set(LogLevel.ERROR)
 
     def teardown_method(self):
         """Reset logging state after each test."""
         _global_logging_disabled.set(False)
         _global_disabled_loggers.set([])
+        _global_log_level.reset(self._log_level_token)
 
     def test_enabled_respects_log_level(self) -> None:
         """enabled() respects the configured log level."""

@@ -133,27 +133,28 @@ class BaseMonitor:
         run_id: int,
         workflow_name: str,
     ):
-        try:
-            while self._running_monitors[run_id].get(workflow_name):
-                await self._loop.run_in_executor(
-                    None,
-                    self.update_monitor,
+        # The running loop, not ``self._loop``: that attribute was never
+        # assigned, so the first sample raised AttributeError, the blanket
+        # ``except Exception: pass`` here swallowed it, and every monitor
+        # stopped before recording anything (all CPU/memory stats were 0).
+        loop = asyncio.get_running_loop()
+        while self._running_monitors[run_id].get(workflow_name):
+            await loop.run_in_executor(
+                self._executor,
+                self.update_monitor,
+                run_id,
+                workflow_name,
+            )
+            await asyncio.sleep(self._sample_interval)
+
+            if (
+                self.get_moving_median(
                     run_id,
                     workflow_name,
                 )
-                await asyncio.sleep(self._sample_interval)
-
-                if (
-                    self.get_moving_median(
-                        run_id,
-                        workflow_name,
-                    )
-                    < self.limit
-                ):
-                    self.release_lock(run_id, workflow_name)
-
-        except Exception:
-            pass
+                < self.limit
+            ):
+                self.release_lock(run_id, workflow_name)
 
     async def stop_background_monitor(
         self,
@@ -167,14 +168,41 @@ class BaseMonitor:
         if self._locked_runs[run_id].get(workflow_name):
             del self._locked_runs[run_id][workflow_name]
 
-        if self._background_monitors[run_id].get(workflow_name):
+        # Cancel and await the sampling task (``set_result`` on a Task
+        # always raised, was swallowed, and left the task running until
+        # its next flag check). Awaiting surfaces a genuine failure of the
+        # sampling loop instead of discarding it.
+        if (monitor := self._background_monitors[run_id].pop(workflow_name, None)) is not None:
+            monitor.cancel()
             try:
-                self._background_monitors[run_id][workflow_name].set_result(None)
-
-            except Exception:
+                await monitor
+            except asyncio.CancelledError:
                 pass
 
-            del self._background_monitors[run_id][workflow_name]
+    def release_run(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        """
+        Drop everything kept for the workflow's run -- its samples, its
+        flags and its lock -- once nothing reads them. The run's
+        sampler is stopped by then (stop_background_monitor); one still
+        running is cancelled.
+        """
+        if (monitor := self._background_monitors.get(run_id, {}).pop(workflow_name, None)) is not None:
+            monitor.cancel()
+
+        for run_states in (
+            self.active,
+            self._running_monitors,
+            self._locked_runs,
+            self._background_monitors,
+        ):
+            if (workflow_states := run_states.get(run_id)) is not None:
+                workflow_states.pop(workflow_name, None)
+                if not workflow_states:
+                    del run_states[run_id]
 
     async def stop_all_background_monitors(self):
         if len(self.active) > 0:
@@ -201,11 +229,7 @@ class BaseMonitor:
                 if self._locked_runs[run_id].get(workflow_name):
                     del self._locked_runs[run_id][workflow_name]
 
-                try:
-                    monitor.set_result(None)
-
-                except Exception:
-                    pass
+                monitor.cancel()
 
                 del self.active[run_id][workflow_name]
 

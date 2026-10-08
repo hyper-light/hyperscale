@@ -11,31 +11,32 @@ Key features:
 - Async-compatible synchronous I/O (file writes are fast)
 - Automatic directory creation
 - Graceful fallback if storage unavailable
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-
+from hyperscale.distributed.runtime import Clock, Filesystem, RealClock, RealFilesystem
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
-from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerError, ServerInfo, ServerWarning
 
+from .incarnation_record import IncarnationRecord
 
-@dataclass(slots=True)
-class IncarnationRecord:
-    """
-    Record of a node's incarnation history.
+_DEFAULT_CLOCK: Clock = RealClock()
 
-    Stores both the last known incarnation and the timestamp when it was
-    last updated. The timestamp enables time-based zombie detection.
-    """
-
-    incarnation: int
-    last_updated_at: float
-    node_address: str
+# Module-level storage seam (Phase 7). The store BORROWS this (or an
+# injected instance) — it never shuts the filesystem down.
+# ``swap_defaults`` rebinds it to the SIM filesystem so incarnation
+# persistence becomes deterministic and storage-faultable under replay.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 
 @dataclass
@@ -64,6 +65,12 @@ class IncarnationStore:
     # Minimum incarnation bump on restart to ensure freshness
     restart_incarnation_bump: int = 10
 
+    # Storage seam (Phase 7): borrowed, never shut down here. All disk
+    # touches route through it — crash-safe atomic writes, off-loop by
+    # construction (the previous inline pathlib IO ran synchronously ON
+    # the event loop and skipped every fsync).
+    filesystem: Filesystem | None = None
+
     # Logger for debugging
     _logger: LoggerProtocol | None = None
     _node_host: str = ""
@@ -74,8 +81,20 @@ class IncarnationStore:
     _current_record: IncarnationRecord | None = field(default=None, init=False)
     _initialized: bool = field(default=False, init=False)
 
+    # Persistence-degradation truth (the anti-swallow contract): the
+    # LIVE incarnation must advance regardless of disk health — protocol
+    # monotonicity cannot wait on storage — but a failed save means the
+    # PERSISTED value is stale, eroding the restart zombie-guard margin
+    # this store exists for. That state is tracked here, logged loudly
+    # on every transition, and exposed via ``persistence_degraded`` /
+    # ``get_stats`` instead of being silently absorbed.
+    _persist_failure_count: int = field(default=0, init=False)
+    _persistence_degraded: bool = field(default=False, init=False)
+
     def __post_init__(self):
         self._lock = asyncio.Lock()
+        if self.filesystem is None:
+            self.filesystem = _DEFAULT_FILESYSTEM
 
     def set_logger(
         self,
@@ -107,52 +126,68 @@ class IncarnationStore:
         """
         async with self._lock:
             if self._initialized:
-                return (
-                    self._current_record.incarnation
-                    if self._current_record
-                    else self.restart_incarnation_bump
-                )
+                return self._initialized_incarnation()
 
-            try:
-                self.storage_directory.mkdir(parents=True, exist_ok=True)
-            except OSError as error:
-                await self._log_warning(
-                    f"Failed to create incarnation storage directory: {error}"
-                )
+            if not await self._ensure_storage_directory():
                 self._initialized = True
                 return self.restart_incarnation_bump
 
-            loaded_record = await self._load_from_disk()
-
-            if loaded_record:
-                # Bump incarnation on restart to ensure we're always fresh
-                new_incarnation = (
-                    loaded_record.incarnation + self.restart_incarnation_bump
-                )
-                self._current_record = IncarnationRecord(
-                    incarnation=new_incarnation,
-                    last_updated_at=time.time(),
-                    node_address=self.node_address,
-                )
-                await self._save_to_disk(self._current_record)
-                await self._log_debug(
-                    f"Loaded persisted incarnation {loaded_record.incarnation}, "
-                    f"starting at {new_incarnation}"
-                )
-            else:
-                # First time - start with restart_incarnation_bump
-                self._current_record = IncarnationRecord(
-                    incarnation=self.restart_incarnation_bump,
-                    last_updated_at=time.time(),
-                    node_address=self.node_address,
-                )
-                await self._save_to_disk(self._current_record)
-                await self._log_debug(
-                    f"No persisted incarnation found, starting at {self.restart_incarnation_bump}"
-                )
+            await self._start_current_record()
 
             self._initialized = True
             return self._current_record.incarnation
+
+    def _initialized_incarnation(self) -> int:
+        """The incarnation an already-initialized store reports: its record's, else the restart bump."""
+        return (
+            self._current_record.incarnation
+            if self._current_record
+            else self.restart_incarnation_bump
+        )
+
+    async def _ensure_storage_directory(self) -> bool:
+        """Create the storage directory; False (logged) when the filesystem refuses."""
+        try:
+            await self.filesystem.mkdir(
+                self.storage_directory, parents=True, exist_ok=True
+            )
+        except OSError as error:
+            await self._log_warning(
+                f"Failed to create incarnation storage directory: {error}"
+            )
+            return False
+        return True
+
+    async def _start_current_record(self) -> None:
+        """Set and persist the starting record: the persisted incarnation bumped, else the bump alone."""
+        loaded_record = await self._load_from_disk()
+
+        if loaded_record:
+            # Bump incarnation on restart to ensure we're always fresh
+            new_incarnation = (
+                loaded_record.incarnation + self.restart_incarnation_bump
+            )
+            self._current_record = IncarnationRecord(
+                incarnation=new_incarnation,
+                last_updated_at=_DEFAULT_CLOCK.time(),
+                node_address=self.node_address,
+            )
+            await self._save_to_disk(self._current_record)
+            await self._log_debug(
+                f"Loaded persisted incarnation {loaded_record.incarnation}, "
+                f"starting at {new_incarnation}"
+            )
+        else:
+            # First time - start with restart_incarnation_bump
+            self._current_record = IncarnationRecord(
+                incarnation=self.restart_incarnation_bump,
+                last_updated_at=_DEFAULT_CLOCK.time(),
+                node_address=self.node_address,
+            )
+            await self._save_to_disk(self._current_record)
+            await self._log_debug(
+                f"No persisted incarnation found, starting at {self.restart_incarnation_bump}"
+            )
 
     async def get_incarnation(self) -> int:
         """Get the current persisted incarnation."""
@@ -161,6 +196,15 @@ class IncarnationStore:
                 return self._current_record.incarnation
             return 0
 
+    @property
+    def persistence_degraded(self) -> bool:
+        """True while the most recent save attempt failed: the LIVE
+        incarnation is ahead of the PERSISTED one, so a reboot in this
+        state starts from a stale value and the restart bump's
+        zombie-guard margin is eroded. Heals on the next successful
+        save (every accepted ``update_incarnation`` attempts one)."""
+        return self._persistence_degraded
+
     async def update_incarnation(self, new_incarnation: int) -> bool:
         """
         Update the persisted incarnation number.
@@ -168,11 +212,18 @@ class IncarnationStore:
         Only updates if the new value is higher than the current one.
         This ensures monotonicity of incarnation numbers.
 
+        The returned bool is the MONOTONICITY verdict only: the live
+        record always advances on acceptance, because protocol
+        correctness cannot wait on storage. Whether the accepted value
+        actually reached disk is tracked separately — a failed save
+        flips ``persistence_degraded`` and logs loudly rather than
+        silently reporting success.
+
         Args:
             new_incarnation: The new incarnation number.
 
         Returns:
-            True if updated, False if rejected (not higher).
+            True if accepted (higher), False if rejected (not higher).
         """
         async with self._lock:
             current = self._current_record.incarnation if self._current_record else 0
@@ -182,7 +233,7 @@ class IncarnationStore:
 
             self._current_record = IncarnationRecord(
                 incarnation=new_incarnation,
-                last_updated_at=time.time(),
+                last_updated_at=_DEFAULT_CLOCK.time(),
                 node_address=self.node_address,
             )
 
@@ -207,10 +258,12 @@ class IncarnationStore:
     async def _load_from_disk(self) -> IncarnationRecord | None:
         """Load incarnation record from disk."""
         try:
-            if not self._storage_path.exists():
+            if not await self.filesystem.exists(self._storage_path):
                 return None
 
-            content = self._storage_path.read_text(encoding="utf-8")
+            content = await self.filesystem.read_text(
+                self._storage_path, encoding="utf-8"
+            )
             data = json.loads(content)
 
             return IncarnationRecord(
@@ -226,7 +279,19 @@ class IncarnationStore:
         """
         Save incarnation record to disk atomically.
 
-        Uses write-to-temp-then-rename for crash safety.
+        ``Filesystem.atomic_write`` performs the FULL crash-consistency
+        sequence — temp file, flush, fsync, atomic rename, parent-
+        directory fsync — off the event loop. The previous inline
+        temp-then-rename skipped both fsyncs (a lost/torn-write window
+        on power failure that undermined the zombie-prevention
+        guarantee this store exists for) and blocked the loop.
+
+        Failure is CONTAINED but never silent: the degraded transition
+        logs at ERROR with the eroded-zombie-guard consequence spelled
+        out, every repeat is counted, and recovery logs the heal — the
+        pre-fix behavior logged a WARNING per failure and reported
+        nothing to any caller or diagnostic surface while the persisted
+        value went stale under the advancing live incarnation.
         """
         try:
             data = {
@@ -235,43 +300,92 @@ class IncarnationStore:
                 "node_address": record.node_address,
             }
 
-            temp_path = self._storage_path.with_suffix(".tmp")
-            temp_path.write_text(json.dumps(data), encoding="utf-8")
-            temp_path.rename(self._storage_path)
-            return True
+            await self.filesystem.atomic_write(
+                self._storage_path,
+                json.dumps(data).encode("utf-8"),
+            )
         except OSError as error:
-            await self._log_warning(f"Failed to save incarnation to disk: {error}")
+            await self._record_persist_failure(record, error)
             return False
+
+        if self._persistence_degraded:
+            self._persistence_degraded = False
+            await self._log_info(
+                f"Incarnation persistence RECOVERED at incarnation "
+                f"{record.incarnation} after "
+                f"{self._persist_failure_count} failed save(s)"
+            )
+        return True
+
+    async def _record_persist_failure(self, record: IncarnationRecord, error: OSError) -> None:
+        """Count a failed save; log the degraded transition at ERROR once, then each repeat as a warning."""
+        self._persist_failure_count += 1
+        if not self._persistence_degraded:
+            self._persistence_degraded = True
+            await self._log_error(
+                f"Incarnation persistence DEGRADED: save of "
+                f"incarnation {record.incarnation} failed "
+                f"({type(error).__name__}: {error}); the live "
+                "incarnation is now ahead of disk — a reboot in "
+                "this state starts from a stale value and erodes "
+                "the restart zombie-guard margin. Every accepted "
+                "update retries; recovery will be logged."
+            )
+        else:
+            await self._log_warning(
+                f"Incarnation save still failing "
+                f"({type(error).__name__}); "
+                f"{self._persist_failure_count} failures since "
+                "degradation"
+            )
 
     async def _log_debug(self, message: str) -> None:
         """Log a debug message."""
         if self._logger:
-            try:
-                await self._logger.log(
-                    ServerDebug(
-                        message=f"[IncarnationStore] {message}",
-                        node_host=self._node_host,
-                        node_port=self._node_port,
-                        node_id=0,
-                    )
+            await self._logger.log(
+                ServerDebug(
+                    message=f"[IncarnationStore] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self.node_address,
                 )
-            except Exception:
-                pass
+            )
+
+    async def _log_info(self, message: str) -> None:
+        """Log an info message."""
+        if self._logger:
+            await self._logger.log(
+                ServerInfo(
+                    message=f"[IncarnationStore] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self.node_address,
+                )
+            )
 
     async def _log_warning(self, message: str) -> None:
         """Log a warning message."""
         if self._logger:
-            try:
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"[IncarnationStore] {message}",
-                        node_host=self._node_host,
-                        node_port=self._node_port,
-                        node_id=0,
-                    )
+            await self._logger.log(
+                ServerWarning(
+                    message=f"[IncarnationStore] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self.node_address,
                 )
-            except Exception:
-                pass
+            )
+
+    async def _log_error(self, message: str) -> None:
+        """Log an error message."""
+        if self._logger:
+            await self._logger.log(
+                ServerError(
+                    message=f"[IncarnationStore] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self.node_address,
+                )
+            )
 
     def get_stats(self) -> dict:
         """Get storage statistics."""
@@ -285,4 +399,13 @@ class IncarnationStore:
             else 0,
             "storage_path": str(self._storage_path),
             "restart_bump": self.restart_incarnation_bump,
+            "persistence_degraded": self._persistence_degraded,
+            "persist_failure_count": self._persist_failure_count,
         }
+
+_REHOMED = (
+    IncarnationRecord,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

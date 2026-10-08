@@ -2,18 +2,40 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 import pathlib
 import sys
-import threading
-from typing import Any, Callable, Dict, Literal, TypeVar
+from typing import Callable, Dict, Literal, TypeVar
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
+from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.models import Entry, Log
 
 from .logger_context import LoggerContext
 from .retention_policy import RetentionPolicyConfig
 
 T = TypeVar("T", bound=Entry)
+
+
+def _named_directory(directory: pathlib.Path) -> str | None:
+    """``directory`` made absolute, or None when the path named none."""
+    if not directory.parts:
+        return None
+    return str(directory.absolute())
+
+
+def _split_log_path(path: str | None) -> tuple[str | None, str | None]:
+    """A context's log file name and directory from its ``path``: a path
+    with a suffix names a file, any other a directory. A bare filename
+    names no directory, so the stream places it in the configured logs
+    directory (``LoggingConfig``), else the working directory -- resolving
+    it against the working directory here bypassed a configured one."""
+    if not path:
+        return None, None
+    logfile_path = pathlib.Path(path)
+    if not logfile_path.suffix:
+        return None, str(logfile_path.absolute())
+    return logfile_path.name, _named_directory(logfile_path.parent)
 
 
 class Logger:
@@ -37,7 +59,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -49,19 +71,8 @@ class Logger:
         if name is None:
             name = "default"
 
-        filename: str | None = None
-        directory: str | None = None
 
-        if path:
-            logfile_path = pathlib.Path(path)
-            is_logfile = len(logfile_path.suffix) > 0
-
-            filename = logfile_path.name if is_logfile else None
-            directory = (
-                str(logfile_path.parent.absolute())
-                if is_logfile
-                else str(logfile_path.absolute())
-            )
+        filename, directory = _split_log_path(path)
 
         self._contexts[name] = LoggerContext(
             name=name,
@@ -88,7 +99,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -100,19 +111,8 @@ class Logger:
         if name is None:
             name = "default"
 
-        filename: str | None = None
-        directory: str | None = None
 
-        if path:
-            logfile_path = pathlib.Path(path)
-            is_logfile = len(logfile_path.suffix) > 0
-
-            filename = logfile_path.name if is_logfile else None
-            directory = (
-                str(logfile_path.parent.absolute())
-                if is_logfile
-                else str(logfile_path.absolute())
-            )
+        filename, directory = _split_log_path(path)
 
         self._contexts[name] = LoggerContext(
             name=name,
@@ -138,7 +138,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -150,19 +150,8 @@ class Logger:
         if name is None:
             name = "default"
 
-        filename: str | None = None
-        directory: str | None = None
 
-        if path:
-            logfile_path = pathlib.Path(path)
-            is_logfile = len(logfile_path.suffix) > 0
-
-            filename = logfile_path.name if is_logfile else None
-            directory = (
-                str(logfile_path.parent.absolute())
-                if is_logfile
-                else str(logfile_path.absolute())
-            )
+        filename, directory = _split_log_path(path)
 
         if self._contexts.get(name) is None:
             self._contexts[name] = LoggerContext(
@@ -210,7 +199,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -219,22 +208,11 @@ class Logger:
         enable_lsn: bool = False,
         instance_id: int = 0,
     ):
-        filename: str | None = None
-        directory: str | None = None
 
         if name is None:
             name = "default"
 
-        if path:
-            logfile_path = pathlib.Path(path)
-            is_logfile = len(logfile_path.suffix) > 0
-
-            filename = logfile_path.name if is_logfile else None
-            directory = (
-                str(logfile_path.parent.absolute())
-                if is_logfile
-                else str(logfile_path.absolute())
-            )
+        filename, directory = _split_log_path(path)
 
         if self._contexts.get(name) is None:
             self._contexts[name] = LoggerContext(
@@ -276,11 +254,24 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
     ) -> int | None:
+        # Honor the global logging kill-switch at the outermost entry,
+        # BEFORE opening the logger context. The context's ``__aenter__``
+        # eagerly sets up its output stream (``connect_write_pipe``) and
+        # reads the cwd via ``run_in_executor`` — both real-I/O
+        # operations. Gating here means a disabled logger performs zero
+        # I/O setup (an optimization in REAL) and, critically, never
+        # touches those operations under SIM mode, where the
+        # SimulationLoop bans them. The inner ``LoggerStream._log``
+        # already honors this flag; this lifts the same check above the
+        # context so the setup is skipped too.
+        if LoggingConfig().disabled:
+            return None
+
         if name is None:
             name = "default"
 
@@ -298,7 +289,7 @@ class Logger:
                     filename=code.co_filename,
                     function_name=code.co_name,
                     line_number=frame.f_lineno,
-                    thread_id=threading.get_native_id(),
+                    thread_id=os.getpid(),
                     timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
                 ),
                 template=template,
@@ -315,7 +306,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -339,7 +330,7 @@ class Logger:
                             filename=code.co_filename,
                             function_name=code.co_name,
                             line_number=frame.f_lineno,
-                            thread_id=threading.get_native_id(),
+                            thread_id=os.getpid(),
                             timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
                         ),
                     )
@@ -355,7 +346,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -377,7 +368,7 @@ class Logger:
                     filename=code.co_filename,
                     function_name=code.co_name,
                     line_number=frame.f_lineno,
-                    thread_id=threading.get_native_id(),
+                    thread_id=os.getpid(),
                     timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
                 ),
             )
@@ -390,7 +381,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -421,7 +412,7 @@ class Logger:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,

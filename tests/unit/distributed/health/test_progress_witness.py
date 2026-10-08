@@ -37,9 +37,12 @@ class TestBOCPDDetector:
         det = BayesianOnlineChangePointDetector()
         post = det.observe(1.0)
         assert det.observation_count == 1
-        # Run-length 0 (i.e. the just-observed change-point) has full
-        # mass after the very first observation, by construction.
-        assert post.probabilities[0] == pytest.approx(1.0)
+        # After the very first observation the run-length posterior
+        # splits between r=0 (change-point) and r=1 (growth). With a
+        # constant hazard H = 1/hazard_lambda the change-point mass is
+        # exactly H (default hazard_lambda=250 -> H=0.004), because the
+        # shared predictive likelihood cancels in the normalisation.
+        assert post.probabilities[0] == pytest.approx(1.0 / 250.0)
 
     def test_stationary_stream_keeps_change_probability_low(self) -> None:
         """A stable Gaussian stream should never trigger a high
@@ -58,24 +61,42 @@ class TestBOCPDDetector:
             f"< 0.2, got {cp_prob}"
         )
 
-    def test_step_change_triggers_high_change_probability(self) -> None:
-        """A step change in the mean should produce an elevated
-        change-point probability shortly after the step."""
+    def test_step_change_collapses_run_length_posterior(self) -> None:
+        """A step change in the mean should collapse the run-length
+        posterior — the MAP run length drops sharply after the step.
+
+        Note: with a *constant* hazard the raw change-point mass
+        P(r_t = 0) is identically H = 1/hazard_lambda at every step
+        (the shared predictive likelihood cancels in the normaliser),
+        so the change-point *signal* lives in the run-length posterior
+        collapsing back toward 0, not in P(r_t = 0). The throughput
+        witness consults the predictive-mean shift for the same reason.
+        """
         det = BayesianOnlineChangePointDetector(BOCPDConfig(hazard_lambda=500.0))
         rng = random.Random(42)
         # 30 samples around mean 10
         for _ in range(30):
             det.observe(rng.gauss(10.0, 0.5))
-        baseline_cp = det.posterior.change_point_probability()
+        baseline_map = det.posterior.maximum_a_posteriori_run_length()
+        baseline_mean = det.posterior.expected_predictive_mean(
+            BOCPDConfig(hazard_lambda=500.0), 10.0
+        )
         # Step to mean 1 (much smaller, well outside the prior range)
         for _ in range(5):
             det.observe(rng.gauss(1.0, 0.5))
-        post_step_cp = det.posterior.change_point_probability()
-        # The change-point probability after the step should be
-        # noticeably higher than during the stationary baseline.
-        assert post_step_cp > baseline_cp, (
-            f"Expected change-point probability to rise after step "
-            f"(baseline={baseline_cp}, post={post_step_cp})"
+        post_step_map = det.posterior.maximum_a_posteriori_run_length()
+        post_step_mean = det.posterior.expected_predictive_mean(
+            BOCPDConfig(hazard_lambda=500.0), 10.0
+        )
+        # The run length should collapse after the step (regime broke),
+        # and the predictive mean should drop toward the new regime.
+        assert post_step_map < baseline_map, (
+            f"Expected run length to collapse after step "
+            f"(baseline_map={baseline_map}, post_map={post_step_map})"
+        )
+        assert post_step_mean < baseline_mean, (
+            f"Expected predictive mean to drop after step "
+            f"(baseline={baseline_mean}, post={post_step_mean})"
         )
 
     def test_reset_clears_state(self) -> None:
@@ -229,10 +250,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=100.0,
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
             assert verdict.kind == WitnessVerdictKind.COLD_START
 
@@ -250,10 +268,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(100.0, 1.0),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
             last_kind = verdict.kind
         assert last_kind == WitnessVerdictKind.STATIONARY
@@ -278,10 +293,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(100.0, 0.5),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
         # Drop to 10 — well outside the prior — for several samples
         any_regime_down = False
@@ -290,10 +302,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(10.0, 0.5),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
             if verdict.kind == WitnessVerdictKind.REGIME_CHANGE_DOWN:
                 any_regime_down = True
@@ -320,10 +329,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(10.0, 0.5),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
         any_regime_up = False
         for _ in range(10):
@@ -331,10 +337,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=rng.gauss(100.0, 0.5),
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
             if verdict.kind == WitnessVerdictKind.REGIME_CHANGE_UP:
                 any_regime_up = True
@@ -351,10 +354,7 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=10.0,
-                active_in_cluster=1,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
             )
         assert ("w1", "wf1") in witness._streams
         witness.reset_stream("w1", "wf1")
@@ -368,19 +368,13 @@ class TestThroughputWitness:
                 worker_id="w1",
                 workflow_id="wf1",
                 throughput=100.0,
-                active_in_cluster=2,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(2, 1, 1, 1),
             )
             witness.observe(
                 worker_id="w2",
                 workflow_id="wf2",
                 throughput=10.0,
-                active_in_cluster=2,
-                active_in_dc=1,
-                active_on_manager=1,
-                active_on_worker=1,
+                alpha_workflow=witness.budget.workflow_alpha_from_counts(2, 1, 1, 1),
             )
         # Each detector saw 20 observations. The means should differ.
         s1 = witness._streams[("w1", "wf1")]
@@ -399,10 +393,7 @@ class TestThroughputWitness:
             worker_id="w1",
             workflow_id="wf1",
             throughput=42.0,
-            active_in_cluster=1,
-            active_in_dc=1,
-            active_on_manager=1,
-            active_on_worker=1,
+            alpha_workflow=witness.budget.workflow_alpha_from_counts(1, 1, 1, 1),
         )
         assert verdict.observation == 42.0
         assert verdict.observation_count == 1

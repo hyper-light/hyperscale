@@ -3,13 +3,24 @@ Silent drop counter for tracking and periodically logging dropped messages.
 
 Tracks various categories of dropped messages (rate limited, too large, etc.)
 and provides periodic logging summaries for security monitoring.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
+
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Literal
+from hyperscale.distributed.runtime import Clock, RealClock
+
+from .drop_counter_snapshot import DropCounterSnapshot
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -28,7 +39,10 @@ class DropCounter:
     malformed_message: int = 0
     replay_detected: int = 0
     load_shed: int = 0  # AD-32: Messages dropped due to backpressure
-    _last_reset: float = field(default_factory=time.monotonic)
+    # Log records lost because the logger's write itself failed: with the
+    # logger broken there is nowhere else to report them.
+    log_write_failed: int = 0
+    _last_reset: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
     def increment_rate_limited(self) -> None:
         self.rate_limited += 1
@@ -62,11 +76,12 @@ class DropCounter:
             + self.malformed_message
             + self.replay_detected
             + self.load_shed
+            + self.log_write_failed
         )
 
     @property
     def interval_seconds(self) -> float:
-        return time.monotonic() - self._last_reset
+        return _DEFAULT_CLOCK.monotonic() - self._last_reset
 
     def reset(self) -> "DropCounterSnapshot":
         """
@@ -83,6 +98,7 @@ class DropCounter:
             malformed_message=self.malformed_message,
             replay_detected=self.replay_detected,
             load_shed=self.load_shed,
+            log_write_failed=self.log_write_failed,
             interval_seconds=self.interval_seconds,
         )
 
@@ -93,36 +109,14 @@ class DropCounter:
         self.malformed_message = 0
         self.replay_detected = 0
         self.load_shed = 0
-        self._last_reset = time.monotonic()
+        self.log_write_failed = 0
+        self._last_reset = _DEFAULT_CLOCK.monotonic()
 
         return snapshot
 
+_REHOMED = (
+    DropCounterSnapshot,
+)
 
-@dataclass(frozen=True)
-class DropCounterSnapshot:
-    """Immutable snapshot of drop counter values."""
-
-    rate_limited: int
-    message_too_large: int
-    decompression_too_large: int
-    decryption_failed: int
-    malformed_message: int
-    replay_detected: int
-    load_shed: int  # AD-32: Messages dropped due to backpressure
-    interval_seconds: float
-
-    @property
-    def total(self) -> int:
-        return (
-            self.rate_limited
-            + self.message_too_large
-            + self.decompression_too_large
-            + self.decryption_failed
-            + self.malformed_message
-            + self.replay_detected
-            + self.load_shed
-        )
-
-    @property
-    def has_drops(self) -> bool:
-        return self.total > 0
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

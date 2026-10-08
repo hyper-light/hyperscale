@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import time
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class JobIdGenerator:
@@ -28,7 +32,7 @@ class JobIdGenerator:
 
     async def generate(self) -> str:
         async with self._lock:
-            current_ms = int(time.time() * 1000)
+            current_ms = int(_DEFAULT_CLOCK.time() * 1000)
 
             if current_ms == self._last_ms:
                 self._sequence += 1

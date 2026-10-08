@@ -36,11 +36,13 @@ class MercurySyncTCPConnection:
         pool_size: Optional[int] = None,
         cert_path: Optional[str] = None,
         key_path: Optional[str] = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ) -> None:
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._cert_path = cert_path
@@ -196,38 +198,25 @@ class MercurySyncTCPConnection:
         url: URL,
     ):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
-                    url,
-                    upgrade_ssl,
+                    optimized_url,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
+                    self._connect_to_url_location(None, url),
+                    timeout=self.timeouts.request_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
+            # Plain-string requests for the same address reuse this lookup:
+            # the resolved URL, under the key the connect path reads. One
+            # that never resolved is left for the connect path to look up.
+            if optimized_url.ip_addresses:
+                self._url_cache[optimized_url.target] = optimized_url
 
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                self._connections.append(connection)
-
-            self._url_cache[url.optimized.hostname] = url
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -266,6 +255,8 @@ class MercurySyncTCPConnection:
         }
 
 
+        connection: TCPConnection | None = None
+
         try:
             timings["connect_start"] = time.monotonic()
 
@@ -274,17 +265,16 @@ class MercurySyncTCPConnection:
                 connection,
                 url,
             ) = await asyncio.wait_for(
-                self._connect_to_url_location(request_url),
-                timeout=self.timeouts.connect_timeout,
+                self._connect_to_url_location(connection, request_url),
+                timeout=self.timeouts.request_timeout,
             )
 
-            if connection.reader is None:
+            if error or connection is None or connection.reader is None:
                 timings["connect_end"] = time.monotonic()
-                self._connections.append(
-                    TCPConnection(
-                        reset_connections=self.reset_connections,
-                    )
-                )
+
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
 
                 if error is None:
                     error = Exception('Err. - no connection')
@@ -328,7 +318,7 @@ class MercurySyncTCPConnection:
                             connection.reader.readexactly(
                                 response_size
                             ),
-                            timeout=self.timeouts.read_timeout
+                            timeout=self.timeouts.request_timeout,
                         )
 
                     else:
@@ -336,7 +326,7 @@ class MercurySyncTCPConnection:
                             connection.reader.readuntil(
                                 separator=delimiter
                             ),
-                            timeout=self.timeouts.read_timeout
+                            timeout=self.timeouts.request_timeout,
                         )
 
                     timings["read_end"] = time.monotonic()
@@ -393,7 +383,10 @@ class MercurySyncTCPConnection:
                 timings=timings,
             )
 
-        except Exception as err:
+        except (
+            BaseException,
+            Exception,
+        ) as err:
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
 
@@ -403,11 +396,9 @@ class MercurySyncTCPConnection:
             elif isinstance(request_url, URL):
                 request_url: ParseResult = urlparse(request_url.data)
 
-            self._connections.append(
-                TCPConnection(
-                    reset_connections=self.reset_connections,
-                )
-            )
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
             timings["request_end"] = time.monotonic()
 
@@ -422,17 +413,17 @@ class MercurySyncTCPConnection:
 
     async def _connect_to_url_location(
         self,
+        connection: TCPConnection | None,
         request_url: str | URL,
-        ssl_redirect_url=None,
     ) -> Tuple[
         Optional[Exception],
         TCPConnection,
         TCPUrl,
     ]:
-        has_optimized_url = isinstance(request_url, URL)
-
-        if has_optimized_url:
-            parsed_url = request_url.optimized
+        if isinstance(request_url, URL):
+            # Resolved when the workflow prepared it: never looked up here,
+            # and never read from or added to the lookup cache.
+            url = parsed_url = request_url.optimized
 
         else:
             parsed_url = TCPUrl(
@@ -441,72 +432,79 @@ class MercurySyncTCPConnection:
                 protocol=self.address_protocol,
             )
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+            # A lookup serves only the address it resolved: its target (scheme
+            # and authority), not the hostname every port on a host shares.
+            cache_key = parsed_url.target
+            url = self._url_cache.get(cache_key)
 
-        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
+            if url is None:
+                dns_lock = self._dns_lock[cache_key]
+                dns_waiter = self._dns_waiters[cache_key]
 
-        if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup()
+                if dns_lock.locked() is False:
+                    try:
+                        async with dns_lock:
+                            url = parsed_url
+                            await url.lookup()
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                            self._url_cache[cache_key] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+                    finally:
+                        # However the lookup ended, release its waiters; after
+                        # a failed or cancelled lookup the next request looks
+                        # up again with a fresh waiter.
+                        if dns_waiter.done() is False:
+                            dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
+                        if cache_key not in self._url_cache:
+                            del self._dns_waiters[cache_key]
 
-            dns_lock.release()
-
-        elif do_dns_lookup:
-            await dns_waiter
-            url = self._url_cache.get(parsed_url.hostname)
-
-        elif has_optimized_url:
-            url = request_url.optimized
+                else:
+                    # Shielded: a waiter's cancellation must not cancel the
+                    # lookup future every other waiter shares.
+                    await asyncio.shield(dns_waiter)
+                    url = self._url_cache.get(cache_key)
 
         connection_error: Optional[Exception] = None
         connection = self._connections.pop()
 
-        if url.address is None:
-            for address, ip_info in url:
-                try:
-                    await connection.make_connection(
-                        url.hostname,
-                        address,
-                        url.port,
-                        ip_info,
-                        ssl=self._tcp_ssl_context if url.scheme in ['ssl', 'tls', 'https'] else None,
-                    )
+        try:
+            # Reuses the connection's transport for this host; otherwise
+            # races a new one across the host's addresses.
+            address, socket_config, new_transport = await connection.connect_to_any(
+                parsed_url.target,
+                url.hostname,
+                url.ip_addresses,
+                url.port,
+                url.address_rotation,
+                ssl=self._tcp_ssl_context if url.scheme in ['ssl', 'tls', 'https'] else None,
+            )
 
-                    url.address = address
-                    url.socket_config = ip_info
+            if new_transport:
+                url.address = address
+                url.socket_config = socket_config
 
-                except Exception:
-                    pass
-                
-        else:
-            try:
-                await connection.make_connection(
-                    url.hostname,
-                    url.address,
-                    url.port,
-                    url.socket_config,
-                    ssl=self._tcp_ssl_context if  url.scheme in ['ssl', 'tls', 'https'] else None,
-                )
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                parsed_url,
+            )
 
-            except Exception as err:
-                connection_error = err
+        except Exception as err:
+            connection_error = err
 
-        return (
-            connection_error,
-            connection,
-            parsed_url,
-        )
+        try:
+            return (
+                connection_error,
+                connection,
+                parsed_url,
+            )
+
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     def _encode_data(
         self,

@@ -1,21 +1,21 @@
+"""
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
+"""
+
 from dataclasses import dataclass
 
+from .idempotency_committed_event import IdempotencyCommittedEvent
+from .idempotency_reserved_event import IdempotencyReservedEvent
 
-@dataclass(slots=True)
-class IdempotencyReservedEvent:
-    """Event emitted when an idempotency key is reserved."""
+_REHOMED = (
+    IdempotencyReservedEvent,
+    IdempotencyCommittedEvent,
+)
 
-    idempotency_key: str
-    job_id: str
-    reserved_at: float
-    source_dc: str
-
-
-@dataclass(slots=True)
-class IdempotencyCommittedEvent:
-    """Event emitted when an idempotency key is committed."""
-
-    idempotency_key: str
-    job_id: str
-    committed_at: float
-    result_serialized: bytes
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

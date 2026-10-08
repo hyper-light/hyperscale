@@ -12,22 +12,21 @@ Key properties:
   where K is total jobs and N is number of gates
 
 Uses virtual nodes (replicas) to improve distribution uniformity.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 import bisect
 import hashlib
 from dataclasses import dataclass
+from itertools import filterfalse
 
-
-@dataclass(slots=True)
-class HashRingNode:
-    """A node in the consistent hash ring."""
-
-    node_id: str
-    tcp_host: str
-    tcp_port: int
-    weight: int = 1
+from .hash_ring_node import HashRingNode
 
 
 class ConsistentHashRing:
@@ -92,19 +91,24 @@ class ConsistentHashRing:
         if not node:
             return None
 
+        positions_to_remove = self._unmap_replica_positions(node_id, node.weight)
+
+        self._ring_positions = list(
+            filterfalse(positions_to_remove.__contains__, self._ring_positions)
+        )
+
+        return node
+
+    def _unmap_replica_positions(self, node_id: str, weight: int) -> set[int]:
+        """Unmap every virtual-node position of ``node_id`` and return those positions."""
         positions_to_remove: set[int] = set()
-        replica_count = self._replicas * node.weight
+        replica_count = self._replicas * weight
         for replica_index in range(replica_count):
             key = f"{node_id}:{replica_index}"
             hash_value = self._hash(key)
             positions_to_remove.add(hash_value)
             self._position_to_node.pop(hash_value, None)
-
-        self._ring_positions = [
-            pos for pos in self._ring_positions if pos not in positions_to_remove
-        ]
-
-        return node
+        return positions_to_remove
 
     async def get_node(self, key: str) -> HashRingNode | None:
         async with self._lock:
@@ -134,20 +138,29 @@ class ConsistentHashRing:
             if primary is None:
                 return None
 
-            hash_value = self._hash(key)
-            index = bisect.bisect_left(self._ring_positions, hash_value)
+            index = self._wrapped_start_index(key)
 
-            if index >= len(self._ring_positions):
-                index = 0
+            return self._next_distinct_node(index, primary.node_id)
 
-            ring_size = len(self._ring_positions)
-            for offset in range(1, ring_size):
-                check_index = (index + offset) % ring_size
-                candidate_id = self._position_to_node[self._ring_positions[check_index]]
-                if candidate_id != primary.node_id:
-                    return self._nodes.get(candidate_id)
+    def _wrapped_start_index(self, key: str) -> int:
+        """The ring index the key hashes to, wrapping past the last position to 0 (lock held)."""
+        hash_value = self._hash(key)
+        index = bisect.bisect_left(self._ring_positions, hash_value)
 
-            return None
+        if index >= len(self._ring_positions):
+            index = 0
+        return index
+
+    def _next_distinct_node(self, index: int, primary_node_id: str) -> HashRingNode | None:
+        """Walk clockwise from ``index`` to the first position owned by a node other than the primary."""
+        ring_size = len(self._ring_positions)
+        for offset in range(1, ring_size):
+            check_index = (index + offset) % ring_size
+            candidate_id = self._position_to_node[self._ring_positions[check_index]]
+            if candidate_id != primary_node_id:
+                return self._nodes.get(candidate_id)
+
+        return None
 
     async def get_nodes(self, key: str, count: int = 1) -> list[HashRingNode]:
         async with self._lock:
@@ -161,25 +174,41 @@ class ConsistentHashRing:
             hash_value = self._hash(key)
             index = bisect.bisect_left(self._ring_positions, hash_value)
 
-            result: list[HashRingNode] = []
-            seen_node_ids: set[str] = set()
+            return self._collect_distinct_nodes(index, count)
 
-            ring_size = len(self._ring_positions)
-            for offset in range(ring_size):
-                position_index = (index + offset) % ring_size
-                position = self._ring_positions[position_index]
-                node_id = self._position_to_node[position]
+    def _collect_distinct_nodes(self, index: int, count: int) -> list[HashRingNode]:
+        """Walk clockwise from ``index`` collecting up to ``count`` distinct nodes (lock held)."""
+        result: list[HashRingNode] = []
+        seen_node_ids: set[str] = set()
 
-                if node_id not in seen_node_ids:
-                    node = self._nodes.get(node_id)
-                    if node:
-                        result.append(node)
-                        seen_node_ids.add(node_id)
+        ring_size = len(self._ring_positions)
+        for offset in range(ring_size):
+            position_index = (index + offset) % ring_size
+            position = self._ring_positions[position_index]
+            node_id = self._position_to_node[position]
 
-                        if len(result) >= count:
-                            break
+            if self._collect_node(node_id, seen_node_ids, result, count):
+                break
 
-            return result
+        return result
+
+    def _collect_node(
+        self,
+        node_id: str,
+        seen_node_ids: set[str],
+        result: list[HashRingNode],
+        count: int,
+    ) -> bool:
+        """Collect an unseen, present node; True once ``count`` nodes are collected."""
+        if node_id in seen_node_ids:
+            return False
+        node = self._nodes.get(node_id)
+        if not node:
+            return False
+        result.append(node)
+        seen_node_ids.add(node_id)
+
+        return len(result) >= count
 
     async def get_owner_id(self, key: str) -> str | None:
         node = await self.get_node(key)
@@ -212,7 +241,7 @@ class ConsistentHashRing:
 
     async def get_distribution(self, sample_keys: list[str]) -> dict[str, int]:
         async with self._lock:
-            distribution: dict[str, int] = {node_id: 0 for node_id in self._nodes}
+            distribution: dict[str, int] = dict.fromkeys(self._nodes, 0)
 
         for key in sample_keys:
             owner_id = await self.get_owner_id(key)
@@ -246,3 +275,10 @@ class ConsistentHashRing:
     def _hash(self, key: str) -> int:
         digest = hashlib.md5(key.encode("utf-8"), usedforsecurity=False).digest()
         return int.from_bytes(digest[:4], byteorder="big")
+
+_REHOMED = (
+    HashRingNode,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

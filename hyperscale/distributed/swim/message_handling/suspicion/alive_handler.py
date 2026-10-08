@@ -2,7 +2,6 @@
 Handler for ALIVE messages (refutations).
 """
 
-import time
 from typing import ClassVar
 
 from hyperscale.distributed.swim.message_handling.models import (
@@ -11,6 +10,11 @@ from hyperscale.distributed.swim.message_handling.models import (
     ServerInterface,
 )
 from hyperscale.distributed.swim.message_handling.core import BaseHandler
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class AliveHandler(BaseHandler):
@@ -21,6 +25,9 @@ class AliveHandler(BaseHandler):
     """
 
     message_types: ClassVar[tuple[bytes, ...]] = (b"alive",)
+    # Epidemic dissemination: re-gossiped, incarnation-idempotent —
+    # content-hash dedup is safe flood control.
+    dedup_eligible: ClassVar[bool] = True
 
     def __init__(self, server: ServerInterface) -> None:
         super().__init__(server)
@@ -69,7 +76,7 @@ class AliveHandler(BaseHandler):
                 target,
                 b"OK",
                 msg_incarnation,
-                time.monotonic(),
+                _DEFAULT_CLOCK.monotonic(),
             )
             await self._server.decrease_failure_detector("successful_probe")
 

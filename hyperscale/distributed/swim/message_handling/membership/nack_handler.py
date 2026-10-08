@@ -2,7 +2,6 @@
 Handler for NACK messages.
 """
 
-import time
 from typing import ClassVar
 
 from hyperscale.distributed.swim.message_handling.models import (
@@ -11,6 +10,11 @@ from hyperscale.distributed.swim.message_handling.models import (
     ServerInterface,
 )
 from hyperscale.distributed.swim.message_handling.core import BaseHandler
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class NackHandler(BaseHandler):
@@ -35,7 +39,7 @@ class NackHandler(BaseHandler):
         nodes = self._server.read_nodes()
         if source_addr in nodes:
             await self._server.update_node_state(
-                source_addr, b"OK", 0, time.monotonic()
+                source_addr, b"OK", 0, _DEFAULT_CLOCK.monotonic()
             )
 
         return self._ack()

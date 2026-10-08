@@ -29,66 +29,27 @@ Design constraints honored:
 * **Memory-bounded per-workflow tracking** — last-snapshot dict is
   keyed by ``workflow_id`` and cleaned up via
   ``forget_workflow`` when the workflow terminates.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
-
-from hyperscale.distributed.health.workflow_progress_snapshot import (
-    WorkflowProgressSnapshot,
-)
-from hyperscale.distributed.nodes.worker.models.workflow_runtime_state import (
-    WorkflowRuntimeState,
-)
+from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.health.workflow_progress_snapshot import WorkflowProgressSnapshot
+from hyperscale.distributed.nodes.worker.models.workflow_runtime_state import WorkflowRuntimeState
 from hyperscale.distributed.taskex.util.time_parser import TimeParser
 
+from hyperscale.distributed.nodes.worker.models.extension_trigger_config import ExtensionTriggerConfig
+from hyperscale.distributed.nodes.worker.models.per_workflow_trigger_state import _PerWorkflowTriggerState
 
-# ============================================================================
-# Configuration
-# ============================================================================
-
-
-@dataclass(slots=True, frozen=True)
-class ExtensionTriggerConfig:
-    """Configuration for the worker autonomous extension trigger."""
-
-    # How often the loop scans active workflows. Defaults align with
-    # the worker heartbeat cadence so any extension request the
-    # trigger sets piggybacks on the very next outbound heartbeat.
-    poll_interval_seconds: float = 5.0
-    # Fraction of the workflow's deadline at which the trigger starts
-    # requesting extensions. 0.75 = "request once 75% of the budget
-    # is consumed." Picked so short workflows complete normally
-    # without ever requesting; only workflows running into the last
-    # quarter of their budget get extensions.
-    lookahead_fraction: float = 0.75
-    # Hard floor on the time before the deadline at which we send
-    # the first request, regardless of lookahead-fraction math.
-    # Ensures very short deadlines (e.g. 4s) still leave a request
-    # window long enough for the heartbeat round-trip + manager
-    # processing.
-    minimum_lookahead_seconds: float = 1.0
-
-    @classmethod
-    def from_env_values(
-        cls,
-        poll_interval_str: str,
-        lookahead_fraction: float,
-    ) -> "ExtensionTriggerConfig":
-        """Build a config from the parsed env-var values."""
-        return cls(
-            poll_interval_seconds=TimeParser(poll_interval_str).time,
-            lookahead_fraction=lookahead_fraction,
-        )
-
-
-# ============================================================================
-# Snapshot construction protocol
-# ============================================================================
-
+_DEFAULT_CLOCK: Clock = RealClock()
 
 # Pulled out so unit tests can substitute a deterministic snapshot
 # builder without depending on the full WorkerServer/state graph.
@@ -103,7 +64,9 @@ def default_snapshot_builder(
     Reads the H3 multi-dimensional counters (``cores_completed``,
     ``step_transitions``, ``actions_completed``) plus the workflow's
     nominal ``vus`` allocation as ``cores_total``. The snapshot
-    timestamp is captured from the worker's monotonic clock.
+    timestamp is captured from the module-level ``RealClock``; SIM
+    mode swaps in a deterministic builder via the ``snapshot_builder``
+    constructor parameter on ``ExtensionTrigger``.
     """
     return WorkflowProgressSnapshot(
         workflow_id=runtime.workflow_id,
@@ -111,22 +74,8 @@ def default_snapshot_builder(
         cores_total=runtime.vus,
         step_transitions=runtime.step_transitions,
         actions_completed=runtime.actions_completed,
-        snapshot_time=time.monotonic(),
+        snapshot_time=_DEFAULT_CLOCK.monotonic(),
     )
-
-
-# ============================================================================
-# Trigger
-# ============================================================================
-
-
-@dataclass(slots=True)
-class _PerWorkflowTriggerState:
-    """Per-workflow trigger bookkeeping kept on the worker side."""
-
-    last_request_snapshot: WorkflowProgressSnapshot | None = None
-    last_request_time: float = 0.0
-    last_request_count: int = 0
 
 
 class ExtensionTrigger:
@@ -162,26 +111,35 @@ class ExtensionTrigger:
         request_extension: Callable[..., None],
         config: ExtensionTriggerConfig | None = None,
         snapshot_builder: SnapshotBuilder | None = None,
-        time_source: Callable[[], float] | None = None,
+        clock: Clock | None = None,
     ) -> None:
+        # Phase 5 DI seam — replaces the prior ``time_source:
+        # Callable[[], float] | None`` parameter. ``clock.monotonic``
+        # is bound to ``self._now`` so the existing call sites in
+        # ``tick`` keep working unchanged. The injected ``clock`` is
+        # NOT threaded into the snapshot builder by default: under
+        # SIM mode callers should provide a custom ``snapshot_builder``
+        # that captures simulated time on each call.
         self._active_runtimes_provider: Callable[
             [], list[WorkflowRuntimeState]
         ] = active_runtimes_provider
         self._deadline_provider: Callable[[str], float | None] = deadline_provider
         self._is_extension_pending: Callable[[], bool] = is_extension_pending
         self._request_extension: Callable[..., None] = request_extension
-        self._config: ExtensionTriggerConfig = (
-            config if config is not None else ExtensionTriggerConfig()
-        )
+        self._config: ExtensionTriggerConfig = self._resolve_config(config)
         self._snapshot_builder: SnapshotBuilder = (
             snapshot_builder
             if snapshot_builder is not None
             else default_snapshot_builder
         )
-        self._now: Callable[[], float] = (
-            time_source if time_source is not None else time.monotonic
-        )
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
+        self._now: Callable[[], float] = self._clock.monotonic
         self._workflows: dict[str, _PerWorkflowTriggerState] = {}
+
+    @staticmethod
+    def _resolve_config(config: ExtensionTriggerConfig | None) -> ExtensionTriggerConfig:
+        """The given config, or a default one when none was given."""
+        return config if config is not None else ExtensionTriggerConfig()
 
     @property
     def config(self) -> ExtensionTriggerConfig:
@@ -219,69 +177,121 @@ class ExtensionTrigger:
         if self._is_extension_pending():
             return []
 
-        triggered: list[str] = []
         now = self._now()
+        triggered_workflow_id = self._first_triggered_workflow(now)
+        return [triggered_workflow_id] if triggered_workflow_id is not None else []
 
+    def _first_triggered_workflow(self, now: float) -> str | None:
+        """Request an extension for the first due workflow; return its id."""
         for runtime in self._active_runtimes_provider():
-            workflow_id = runtime.workflow_id
-            if not workflow_id:
-                continue
+            if self._maybe_request_extension(runtime, now):
+                # One extension request per scan — the worker's
+                # heartbeat piggyback can only carry one snapshot at a
+                # time, so we yield to the next tick for any other
+                # workflows ready to ask.
+                return runtime.workflow_id
+        return None
 
-            deadline = self._deadline_provider(workflow_id)
-            if deadline is None or deadline <= 0.0:
-                continue
+    def _maybe_request_extension(self, runtime: WorkflowRuntimeState, now: float) -> bool:
+        """Steps 2-5 of ``tick`` for one workflow; True when a request was issued."""
+        workflow_id = runtime.workflow_id
+        if not workflow_id:
+            return False
 
-            elapsed = now - runtime.start_time
-            lookahead_seconds = max(
-                self._config.minimum_lookahead_seconds,
-                deadline * self._config.lookahead_fraction,
-            )
-            if elapsed < lookahead_seconds:
-                continue
+        deadline = self._deadline_provider(workflow_id)
+        if not self._deadline_is_set(deadline):
+            return False
 
-            snapshot = self._snapshot_builder(runtime)
-            tracker = self._workflows.get(workflow_id)
-            last_snapshot = (
-                tracker.last_request_snapshot if tracker is not None else None
-            )
-            if last_snapshot is not None and not snapshot.any_advanced(
-                last_snapshot
-            ):
-                # No progress on any dimension since the last
-                # request — let the manager's hard timeout fire.
-                continue
+        return self._request_if_due(runtime, workflow_id, deadline, now)
 
-            self._request_extension(
-                reason="autonomous-trigger",
-                progress=runtime.cores_completed,
-                completed_items=runtime.cores_completed,
-                total_items=runtime.vus,
-                estimated_completion=max(0.0, deadline - elapsed),
-                workflow_id=workflow_id,
-                step_transitions=runtime.step_transitions,
-                actions_completed=runtime.actions_completed,
-                snapshot_time=snapshot.snapshot_time,
-            )
+    @staticmethod
+    def _deadline_is_set(deadline: float | None) -> bool:
+        """Whether a deadline was recorded and is positive."""
+        return not (deadline is None or deadline <= 0.0)
 
-            new_state = _PerWorkflowTriggerState(
-                last_request_snapshot=snapshot,
-                last_request_time=now,
-                last_request_count=(
-                    (tracker.last_request_count + 1)
-                    if tracker is not None
-                    else 1
-                ),
-            )
-            self._workflows[workflow_id] = new_state
-            triggered.append(workflow_id)
+    def _request_if_due(
+        self,
+        runtime: WorkflowRuntimeState,
+        workflow_id: str,
+        deadline: float,
+        now: float,
+    ) -> bool:
+        """Request once elapsed runtime crosses the lookahead threshold."""
+        elapsed = now - runtime.start_time
+        lookahead_seconds = max(
+            self._config.minimum_lookahead_seconds,
+            deadline * self._config.lookahead_fraction,
+        )
+        if elapsed < lookahead_seconds:
+            return False
 
-            # One extension request per scan — the worker's
-            # heartbeat piggyback can only carry one snapshot at a
-            # time, so we yield to the next tick for any other
-            # workflows ready to ask.
-            break
+        return self._request_if_progressed(runtime, workflow_id, deadline, elapsed, now)
 
-        return triggered
+    def _request_if_progressed(
+        self,
+        runtime: WorkflowRuntimeState,
+        workflow_id: str,
+        deadline: float,
+        elapsed: float,
+        now: float,
+    ) -> bool:
+        """Request unless no progress dimension advanced since the last request."""
+        snapshot = self._snapshot_builder(runtime)
+        tracker = self._workflows.get(workflow_id)
+        if self._stalled_since_last_request(snapshot, tracker):
+            # No progress on any dimension since the last
+            # request — let the manager's hard timeout fire.
+            return False
+
+        self._issue_extension_request(runtime, workflow_id, deadline, elapsed, snapshot, tracker, now)
+        return True
+
+    @staticmethod
+    def _stalled_since_last_request(
+        snapshot: WorkflowProgressSnapshot,
+        tracker: _PerWorkflowTriggerState | None,
+    ) -> bool:
+        """Whether a previous request exists and no dimension advanced since."""
+        last_snapshot = (
+            tracker.last_request_snapshot if tracker is not None else None
+        )
+        return last_snapshot is not None and not snapshot.any_advanced(
+            last_snapshot
+        )
+
+    def _issue_extension_request(
+        self,
+        runtime: WorkflowRuntimeState,
+        workflow_id: str,
+        deadline: float,
+        elapsed: float,
+        snapshot: WorkflowProgressSnapshot,
+        tracker: _PerWorkflowTriggerState | None,
+        now: float,
+    ) -> None:
+        """Invoke ``request_extension`` and record the request's snapshot."""
+        self._request_extension(
+            reason="autonomous-trigger",
+            progress=runtime.cores_completed,
+            completed_items=runtime.cores_completed,
+            total_items=runtime.vus,
+            estimated_completion=max(0.0, deadline - elapsed),
+            workflow_id=workflow_id,
+            step_transitions=runtime.step_transitions,
+            actions_completed=runtime.actions_completed,
+            snapshot_time=snapshot.snapshot_time,
+        )
+
+        new_state = _PerWorkflowTriggerState(
+            last_request_snapshot=snapshot,
+            last_request_time=now,
+            last_request_count=(
+                (tracker.last_request_count + 1)
+                if tracker is not None
+                else 1
+            ),
+        )
+        self._workflows[workflow_id] = new_state
 
     async def run_loop(
         self,
@@ -305,3 +315,11 @@ class ExtensionTrigger:
                 # the next tick try again. Production callers wire a
                 # logger/metric counter to surface these.
                 raise
+
+_REHOMED = (
+    ExtensionTriggerConfig,
+    _PerWorkflowTriggerState,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -51,3 +51,9 @@ class WebsocketResponse(HTTPResponse):
     @classmethod
     def response_type(cls):
         return RequestType.WEBSOCKET
+
+    @property
+    def successful(self) -> bool:
+        # 101 Switching Protocols: the WebSocket is open and the exchange on
+        # it completed. Every failure carries another status.
+        return self.status == 101

@@ -27,26 +27,24 @@ from tests.simulation.harness import (
 )
 
 
-def _l1_worker_spec(base_port: int, workers: int = 1) -> ClusterSpec:
+def _l1_worker_spec(workers: int = 1) -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "local": DCSpec(managers=1, workers=workers, cores_per_worker=1),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
 
-def _l2_manager_spec(base_port: int) -> ClusterSpec:
+def _l2_manager_spec() -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "main": DCSpec(managers=3, workers=0),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -108,7 +106,7 @@ def _process_gone_or_zombie(pid: int) -> bool:
 @pytest.mark.simulation
 async def test_cpu_saturation_marks_worker_overloaded() -> None:
     """Synthetic CPU saturation drives the worker overload detector."""
-    spec = _l1_worker_spec(base_port=52000)
+    spec = _l1_worker_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -135,7 +133,7 @@ async def test_cpu_saturation_marks_worker_overloaded() -> None:
 @pytest.mark.simulation
 async def test_memory_pressure_marks_worker_overloaded() -> None:
     """Synthetic memory pressure drives graceful worker overload state."""
-    spec = _l1_worker_spec(base_port=53500)
+    spec = _l1_worker_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -160,7 +158,7 @@ async def test_memory_pressure_marks_worker_overloaded() -> None:
 @pytest.mark.simulation
 async def test_worker_subprocess_crash_is_reaped() -> None:
     """A crashed worker-pool child gives active work an explicit terminal outcome."""
-    spec = _l1_worker_spec(base_port=55000)
+    spec = _l1_worker_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -198,7 +196,7 @@ async def test_worker_subprocess_crash_is_reaped() -> None:
 @pytest.mark.simulation
 async def test_worker_subprocess_hang_can_be_resumed() -> None:
     """A suspended active worker-pool child models a hang and can recover."""
-    spec = _l1_worker_spec(base_port=56500)
+    spec = _l1_worker_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -241,7 +239,7 @@ async def test_worker_subprocess_hang_can_be_resumed() -> None:
 @pytest.mark.simulation
 async def test_event_loop_lag_injection_raises_lhm_and_steps_down_leader() -> None:
     """Synthetic event-loop lag drives LHM and leadership handoff."""
-    spec = _l2_manager_spec(base_port=58000)
+    spec = _l2_manager_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

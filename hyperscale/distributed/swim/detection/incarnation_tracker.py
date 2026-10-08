@@ -1,46 +1,28 @@
 """
 Incarnation number tracking for SWIM protocol.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import compress, repeat
+from operator import lt
 from typing import Callable
-
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.swim.core.types import Status
 from hyperscale.distributed.swim.core.node_state import NodeState
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
+from .message_freshness import MessageFreshness
 
-class MessageFreshness(Enum):
-    """
-    Result of checking message freshness.
-
-    Indicates whether a message should be processed and why it was
-    accepted or rejected. This enables appropriate handling per case.
-    """
-
-    FRESH = "fresh"
-    """Message has new information - process it."""
-
-    DUPLICATE = "duplicate"
-    """Same incarnation and same/lower status priority - silent ignore.
-    This is completely normal in gossip protocols where the same state
-    propagates via multiple paths."""
-
-    STALE = "stale"
-    """Lower incarnation than known - indicates delayed message or state drift.
-    Worth logging as it may indicate network issues."""
-
-    INVALID = "invalid"
-    """Incarnation number failed validation (negative or exceeds max).
-    Indicates bug or corruption."""
-
-    SUSPICIOUS = "suspicious"
-    """Incarnation jump is suspiciously large - possible attack or serious bug."""
-
+_DEFAULT_CLOCK: Clock = RealClock()
 
 # Maximum valid incarnation number (2^31 - 1 for wide compatibility)
 MAX_INCARNATION = 2**31 - 1
@@ -89,6 +71,8 @@ class IncarnationTracker:
     _death_incarnations: dict[tuple[str, int], int] = field(default_factory=dict)
 
     _logger: LoggerProtocol | None = None
+    # Log records lost because the logger's write itself failed.
+    _log_write_failures: int = 0
     _node_host: str = ""
     _node_port: int = 0
     _node_id: str = ""
@@ -127,7 +111,9 @@ class IncarnationTracker:
                     )
                 )
             except Exception:
-                pass  # Don't let logging errors propagate
+                # The logger itself failed: nowhere left to report it but
+                # these stats.
+                self._log_write_failures += 1
 
     def get_self_incarnation(self) -> int:
         """Get current incarnation number for this node."""
@@ -361,32 +347,57 @@ class IncarnationTracker:
         Returns:
             Number of nodes removed.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.dead_node_retention_seconds
 
         async with self._lock:
-            to_remove = []
-            for node, state in list(self.node_states.items()):
-                if state.status == b"DEAD" and state.last_update_time < cutoff:
-                    to_remove.append(node)
+            to_remove = [
+                node
+                for node, state in list(self.node_states.items())
+                if self._is_expired_dead_state(state, cutoff)
+            ]
 
-            removed_nodes: list[tuple[tuple[str, int], NodeState]] = []
-            for node in to_remove:
-                state = self.node_states.pop(node)
-                self._cleanup_count += 1
-                removed_nodes.append((node, state))
+            removed_nodes = self._pop_expired_dead_nodes(to_remove)
 
-        for node, state in removed_nodes:
-            if self._on_node_evicted:
-                try:
-                    self._on_node_evicted(node, state)
-                except Exception as e:
-                    await self._log_debug(
-                        f"Eviction callback error for node {node}: "
-                        f"{type(e).__name__}: {e}"
-                    )
+        await self._notify_evicted_nodes(removed_nodes)
 
         return len(removed_nodes)
+
+    @staticmethod
+    def _is_expired_dead_state(state: NodeState, cutoff: float) -> bool:
+        """Whether ``state`` is DEAD and last updated before the retention ``cutoff``."""
+        return state.status == b"DEAD" and state.last_update_time < cutoff
+
+    def _pop_expired_dead_nodes(
+        self,
+        to_remove: list[tuple[str, int]],
+    ) -> list[tuple[tuple[str, int], NodeState]]:
+        """Pop each retention-expired dead node, counting it; the caller holds the lock."""
+        removed_nodes: list[tuple[tuple[str, int], NodeState]] = []
+        for node in to_remove:
+            state = self.node_states.pop(node)
+            self._cleanup_count += 1
+            removed_nodes.append((node, state))
+        return removed_nodes
+
+    async def _notify_evicted_nodes(
+        self,
+        removed_nodes: list[tuple[tuple[str, int], NodeState]],
+    ) -> None:
+        """Invoke the eviction callback for each removed node, outside the lock."""
+        for node, state in removed_nodes:
+            await self._notify_node_eviction(node, state)
+
+    async def _notify_node_eviction(self, node: tuple[str, int], state: NodeState) -> None:
+        """Invoke the eviction callback for one node, logging (not raising) its failure."""
+        if self._on_node_evicted:
+            try:
+                self._on_node_evicted(node, state)
+            except Exception as e:
+                await self._log_debug(
+                    f"Eviction callback error for node {node}: "
+                    f"{type(e).__name__}: {e}"
+                )
 
     async def evict_if_needed(self) -> int:
         """
@@ -428,15 +439,7 @@ class IncarnationTracker:
                 self._eviction_count += 1
                 evicted_nodes.append((node, state))
 
-        for node, state in evicted_nodes:
-            if self._on_node_evicted:
-                try:
-                    self._on_node_evicted(node, state)
-                except Exception as e:
-                    await self._log_debug(
-                        f"Eviction callback error for node {node}: "
-                        f"{type(e).__name__}: {e}"
-                    )
+        await self._notify_evicted_nodes(evicted_nodes)
 
         return len(evicted_nodes)
 
@@ -478,6 +481,7 @@ class IncarnationTracker:
             "total_cleanups": self._cleanup_count,
             "zombie_rejections": self._zombie_rejections,
             "active_death_records": len(self._death_timestamps),
+            "log_write_failures": self._log_write_failures,
         }
 
     # =========================================================================
@@ -503,22 +507,20 @@ class IncarnationTracker:
             True if node was added, False if already exists with higher status
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = _DEFAULT_CLOCK.monotonic()
 
         async with self._lock:
-            existing = self.node_states.get(node)
-            if existing and existing.status != b"UNCONFIRMED":
+            # A tracked node is never re-added: a higher-status node is
+            # refused, and an UNCONFIRMED one already exists.
+            if node in self.node_states:
                 return False
 
-            if node not in self.node_states:
-                self.node_states[node] = NodeState(
-                    status=b"UNCONFIRMED",
-                    incarnation=0,
-                    last_update_time=timestamp,
-                )
-                return True
-
-            return False
+            self.node_states[node] = NodeState(
+                status=b"UNCONFIRMED",
+                incarnation=0,
+                last_update_time=timestamp,
+            )
+            return True
 
     async def confirm_node(
         self,
@@ -541,7 +543,7 @@ class IncarnationTracker:
             True if node was confirmed, False if not found or already confirmed
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = _DEFAULT_CLOCK.monotonic()
 
         async with self._lock:
             existing = self.node_states.get(node)
@@ -554,17 +556,22 @@ class IncarnationTracker:
                 )
                 return True
 
-            if existing.status == b"UNCONFIRMED":
-                existing.status = b"OK"
-                existing.incarnation = max(existing.incarnation, incarnation)
-                existing.last_update_time = timestamp
-                return True
+            return self._confirm_existing_node(existing, incarnation, timestamp)
 
-            if incarnation > existing.incarnation:
-                existing.incarnation = incarnation
-                existing.last_update_time = timestamp
+    @staticmethod
+    def _confirm_existing_node(existing: NodeState, incarnation: int, timestamp: float) -> bool:
+        """Confirm a tracked node (AD-29 Task 12.3.2); True only for an UNCONFIRMED -> OK transition."""
+        if existing.status == b"UNCONFIRMED":
+            existing.status = b"OK"
+            existing.incarnation = max(existing.incarnation, incarnation)
+            existing.last_update_time = timestamp
+            return True
 
-            return False
+        if incarnation > existing.incarnation:
+            existing.incarnation = incarnation
+            existing.last_update_time = timestamp
+
+        return False
 
     async def clear_suspicion_after_confirmation(
         self,
@@ -582,17 +589,11 @@ class IncarnationTracker:
         observed after the suspicion began.
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = _DEFAULT_CLOCK.monotonic()
 
         async with self._lock:
             existing = self.node_states.get(node)
-            if existing is None:
-                return False
-
-            if existing.status != b"SUSPECT":
-                return False
-
-            if incarnation < existing.incarnation:
+            if not self._is_clearable_suspicion(existing, incarnation):
                 return False
 
             existing.status = b"OK"
@@ -601,6 +602,11 @@ class IncarnationTracker:
             self._death_timestamps.pop(node, None)
             self._death_incarnations.pop(node, None)
             return True
+
+    @staticmethod
+    def _is_clearable_suspicion(existing: NodeState | None, incarnation: int) -> bool:
+        """Whether ``existing`` is a SUSPECT state that ``incarnation`` is not older than."""
+        return existing is not None and existing.status == b"SUSPECT" and incarnation >= existing.incarnation
 
     def is_node_confirmed(self, node: tuple[str, int]) -> bool:
         """
@@ -633,18 +639,10 @@ class IncarnationTracker:
             True if node can be suspected (is confirmed and not already DEAD)
         """
         state = self.node_states.get(node)
-        if state is None:
-            return False
 
         # AD-29: Cannot suspect unconfirmed peers
-        if state.status == b"UNCONFIRMED":
-            return False
-
         # Cannot re-suspect dead nodes
-        if state.status == b"DEAD":
-            return False
-
-        return True
+        return state is not None and state.status not in (b"UNCONFIRMED", b"DEAD")
 
     def get_nodes_by_state(self, status: Status) -> list[tuple[str, int]]:
         """
@@ -679,7 +677,7 @@ class IncarnationTracker:
             timestamp: Death timestamp (defaults to now)
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = _DEFAULT_CLOCK.monotonic()
 
         self._death_timestamps[node] = timestamp
         self._death_incarnations[node] = incarnation_at_death
@@ -712,7 +710,7 @@ class IncarnationTracker:
         if death_timestamp is None:
             return False
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         time_since_death = now - death_timestamp
 
         if time_since_death > self.zombie_detection_window_seconds:
@@ -722,11 +720,9 @@ class IncarnationTracker:
         death_incarnation = self._death_incarnations.get(node, 0)
         required_incarnation = death_incarnation + self.minimum_rejoin_incarnation_bump
 
-        if claimed_incarnation < required_incarnation:
-            self._zombie_rejections += 1
-            return True
-
-        return False
+        is_zombie = claimed_incarnation < required_incarnation
+        self._zombie_rejections += is_zombie
+        return is_zombie
 
     def get_required_rejoin_incarnation(self, node: tuple[str, int]) -> int:
         """
@@ -747,15 +743,24 @@ class IncarnationTracker:
         Returns:
             Number of records cleaned up
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.zombie_detection_window_seconds
-        to_remove = [
-            node
-            for node, timestamp in self._death_timestamps.items()
-            if timestamp < cutoff
-        ]
+        # Keys and values iterate in the same order, so compress selects the expired keys.
+        to_remove = list(
+            compress(
+                self._death_timestamps.keys(),
+                map(lt, self._death_timestamps.values(), repeat(cutoff)),
+            )
+        )
 
         for node in to_remove:
             self.clear_death_record(node)
 
         return len(to_remove)
+
+_REHOMED = (
+    MessageFreshness,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

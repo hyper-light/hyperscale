@@ -57,7 +57,12 @@ class BrowserSession:
         color_scheme: Optional[str] = None,
         options: Dict[str, Any] = {},
         timeout: int | float = 60,
+        browser: Optional[Browser] = None,
     ):
+        """
+        Open this session's context and pages: in ``browser`` when given
+        (a browser the engine's sessions share), else in one it launches.
+        """
         self.metadata = BrowserMetadata(
             browser_type=browser_type,
             device_type=device_type,
@@ -67,18 +72,17 @@ class BrowserSession:
             color_scheme=color_scheme,
         )
 
-        match self.metadata.browser_type:
-            case "safari" | "webkit":
-                self.browser = await self.playwright.webkit.launch()
-
-            case "firefox":
-                self.browser = await self.playwright.firefox.launch()
-
-            case "chrome" | "chromium":
-                self.browser = await self.playwright.chromium.launch()
-
-            case _:
-                self.browser = await self.playwright.chromium.launch()
+        # Chromium unless the session names another engine.
+        browser_types = {
+            "safari": self.playwright.webkit,
+            "webkit": self.playwright.webkit,
+            "firefox": self.playwright.firefox,
+        }
+        self.browser = (
+            browser
+            if browser is not None
+            else await browser_types.get(self.metadata.browser_type, self.playwright.chromium).launch()
+        )
 
         if self.metadata.device_type:
             device = self.playwright.devices[self.metadata.device_type]

@@ -1,4 +1,14 @@
 SLO-Aware Health Routing Architecture
+
+> **As built (checked 2026-10-06; D-5 decided 2026-10-07).** The "What exists / What's missing" analysis below predates the build. The SLO pieces live in `hyperscale/distributed/slo/` (not `resources/slo/`): `TDigest` (`tdigest.py`), `TimeWindowedTDigest` (`time_windowed_digest.py`), `LatencySLO`, `SLOComplianceScore`, `SLOHealthClassifier` and `ResourceAwareSLOPredictor`. Gate datacenter health is the worse of the managers' view and SLO compliance (`SLOHealthClassifier`), and resource pressure enters through the predictor-adjusted SLO factor. The `LatencyDigestTracker` / `LatencyType` design below is **not** what was built; the decision below records what was and why.
+
+> **Decision D-5 (2026-10-07): one latency type, keyed per datacenter and per worker.** The manager records one sample, the round trip of each workflow dispatch to its worker's answer (this doc's RESPONSE, `nodes/manager/dispatch.py`; a dispatch never answered counts at the timeout it waited), into two `TimeWindowedTDigest`s (`nodes/manager/state.py`): the datacenter's, whose `SLOSummary` rides the manager heartbeat to the gate's `SLOHealthClassifier` and AD-36 routing factor; and, while the worker is registered, the worker's own, which `hyperscale cluster --metrics` reports per worker (`dispatch_latency`, D-68) so an operator can tell which worker answers slowly. A worker's digest opens when it registers and closes when it unregisters, so worker churn leaves nothing behind. Windows and compression are this doc's own numbers, unchanged: `SLO_WINDOW_DURATION_SECONDS` 60 s × `SLO_MAX_WINDOWS` 5 = the 300 s `SLO_EVALUATION_WINDOW_SECONDS`, `SLO_TDIGEST_DELTA` 100. Recording both costs about 0.1 µs more per dispatch than the one digest did (measured 464 ns per record before, 561-574 ns after, with the digest now pruning when a window opens rather than on every add), against a dispatch that is a TCP round trip.
+>
+> The other types are dropped because nothing would read them:
+> * **DISPATCH** (gate → manager job submission): one sample per job, so a datacenter would rarely reach `SLO_MIN_SAMPLE_COUNT` (100) inside the 300 s evaluation window and the classifier would never grade it. The gate-to-datacenter path is already measured where routing reads it: Vivaldi RTT UCB (AD-35) and AD-45's observed latency.
+> * **E2E** (job or workflow run time): a workload's design sets it, often minutes for a load test. No latency target fits it, and grading a datacenter by it marked every datacenter running a load test as violating its SLO, which is the defect the dispatch sample replaced. Clients already receive each job's timings in its results.
+> * **NETWORK** (Vivaldi probe RTT): AD-36 routing reads the coordinates' RTT UCB directly, and the federated health probes' RTT feeds the cross-DC correlation detector (`_on_dc_latency`). A third digest of the same probes would have no reader.
+
 Current State Analysis
 What exists:
 
@@ -121,8 +131,8 @@ SLO scoring factor integrated into existing routing score
 │  ─────────────────────────────────────────────────────                  │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
 │  │ LatencyDigestTracker                                             │   │
-│  │   - T-Digest per (datacenter, operation_type)                   │   │
-│  │   - Operations: dispatch, response, e2e, network                │   │
+│  │   - T-Digest per datacenter and per worker (D-5)                │   │
+│  │   - Operation: dispatch round trip to the worker's answer       │   │
 │  │   - Windowed: reset digest every 5 minutes (or merge & decay)   │   │
 │  │   - Query: p50, p95, p99 in O(log δ)                           │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
@@ -626,10 +636,11 @@ from hyperscale.distributed.resources.slo.slo_models import (
 
 class LatencyType:
     """Types of latency we track."""
-    DISPATCH = "dispatch"  # Time to dispatch job to manager
-    RESPONSE = "response"  # Time for manager to respond
-    E2E = "e2e"  # End-to-end job latency
-    NETWORK = "network"  # Pure network RTT (from Vivaldi probes)
+    # D-5 (2026-10-07): only RESPONSE was built -- the manager's dispatch
+    # round trip to its worker's answer, per datacenter and per worker.
+    # DISPATCH, E2E and NETWORK were dropped: nothing would read them
+    # (see the decision at the top of this doc).
+    RESPONSE = "response"  # Time for a worker to answer a dispatch
 
 
 @dataclass(slots=True)

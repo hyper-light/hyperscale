@@ -3,12 +3,16 @@ Piggyback update for SWIM gossip dissemination.
 """
 
 import sys
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..core.constants import DELIM_COLON, encode_int
-from ..core.types import UpdateType
+from hyperscale.distributed.swim.core.constants import DELIM_COLON, encode_int
+from hyperscale.distributed.swim.core.types import UpdateType
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from typing import Self
@@ -21,6 +25,18 @@ _UPDATE_TYPE_CACHE: dict[str, bytes] = {
     'join': b'join',
     'leave': b'leave',
 }
+
+# Lifeguard accuser annotation (wire format, see ``PiggybackUpdate.accuser``):
+# a suspect entry is followed by its own entry
+# ``by:<incarnation>:<accuser_host>:<accuser_port>``. An older node decodes it
+# as an update of an unknown type and drops it on its forward-compatible
+# path (``gossip_unknown_updates_suppressed``), so it never disturbs the
+# suspect entry the older node does act on; a newer node attaches it to the
+# entry before it. Appending a trailing ``:accuser`` field to the suspect
+# entry itself, as role and node_id were added, is not compatible: an older
+# parser's last field (node_id) takes the rest of the entry.
+ACCUSER_UPDATE_TYPE = "by"
+ACCUSER_ENTRY_PREFIX = b"|by:"
 
 # Module-level cache for host encoding (shared across all instances)
 _HOST_BYTES_CACHE: dict[str, bytes] = {}
@@ -53,14 +69,16 @@ class PiggybackUpdate:
     # Stable identity bound to ``node`` when known. Address reuse means
     # address+incarnation alone cannot fence stale predecessor gossip.
     node_id: str | None = None
+    # The member whose own failed probes raised a SUSPECT (the Lifeguard
+    # suspicion's ``From``), carried unchanged through relays so a
+    # receiver counts it as ONE independent confirmation however many
+    # relayers pass it on. None when unknown (an older sender): never a
+    # confirmation.
+    accuser: tuple[str, int] | None = None
     
     def should_broadcast(self) -> bool:
         """Check if this update should still be piggybacked."""
         return self.broadcast_count < self.max_broadcasts
-    
-    def mark_broadcast(self) -> None:
-        """Mark that this update was piggybacked."""
-        self.broadcast_count += 1
     
     def to_bytes(self) -> bytes:
         """
@@ -70,11 +88,11 @@ class PiggybackUpdate:
         Format: type:incarnation:host:port[:role[:node_id]]
         Role and node_id are optional. If node_id is present without
         role, the role field is emitted empty to preserve field order.
+        A known accuser follows as its own ``by:`` entry
+        (``ACCUSER_UPDATE_TYPE``).
         """
-        # Use cached update type bytes
-        type_bytes = _UPDATE_TYPE_CACHE.get(self.update_type)
-        if type_bytes is None:
-            type_bytes = self.update_type.encode()
+        # Every UpdateType is cached; only those are ever queued or sent.
+        type_bytes = _UPDATE_TYPE_CACHE[self.update_type]
 
         # Use cached host encoding (module-level shared cache)
         host = self.node[0]
@@ -101,7 +119,14 @@ class PiggybackUpdate:
         if self.node_id:
             result += DELIM_COLON + self.node_id.encode()
 
-        return result
+        return result + (
+            ACCUSER_ENTRY_PREFIX
+            + encode_int(self.incarnation) + DELIM_COLON
+            + self.accuser[0].encode() + DELIM_COLON
+            + encode_int(self.accuser[1])
+            if self.accuser
+            else b""
+        )
     
     @classmethod
     def from_bytes(cls, data: bytes) -> 'PiggybackUpdate | None':
@@ -133,7 +158,7 @@ class PiggybackUpdate:
                 update_type=update_type,
                 node=(host, port),
                 incarnation=incarnation,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 role=role,
                 node_id=node_id,
             )

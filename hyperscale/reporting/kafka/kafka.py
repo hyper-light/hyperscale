@@ -5,7 +5,7 @@ from hyperscale.reporting.common import (
     WorkflowMetricSet,
     StepMetricSet,
 )
-from typing import Any, Dict
+from typing import Dict
 
 from .kafka_config import KafkaConfig
 
@@ -35,7 +35,7 @@ class Kafka:
         self.compression_type = config.compression_type
         self.timeout = config.timeout
         self.enable_idempotence = config.idempotent or True
-        self.options: Dict[str, Any] = config.options or {}
+        self.options: Dict[str, object] = config.options or {}
         self._producer = None
 
         self.session_uuid = str(uuid.uuid4())

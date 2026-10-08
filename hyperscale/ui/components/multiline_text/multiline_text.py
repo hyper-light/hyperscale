@@ -36,6 +36,9 @@ class MultilineText:
         self._last_rendered_frames: list[str] = []
         self._last_state: list[str] = []
 
+        # The first row shown when the text is taller than the component.
+        self.offset = 0
+
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
     @property
@@ -71,7 +74,9 @@ class MultilineText:
 
     async def update(self, text: list[str]):
         await self._update_lock.acquire()
-        self._updates.put_nowait(text)
+        # Lines wider than the component would push the section's border
+        # and every section beside it out of place.
+        self._updates.put_nowait([line[: self._max_width] for line in text])
 
         if self._update_lock.locked():
             self._update_lock.release()
@@ -90,7 +95,10 @@ class MultilineText:
 
             rerender = True
 
-        elif self._config.text:
+        elif self._last_rendered_frames is None:
+            # Nothing rendered yet: the configured text. Once anything has
+            # rendered, a frame without an update keeps the last text --
+            # it never reverts to the configured one.
             self._last_state = self._config.text
             frames = await self._rerender(self._config.text)
             self._last_rendered_frames = frames
@@ -108,13 +116,13 @@ class MultilineText:
         return self._last_rendered_frames, rerender
 
     async def _rerender(self, text: list[str]):
-        status_text = list(text)
+        # The rows shown first, then each row's padding: padding computed
+        # before paging lands on the wrong rows once the page has moved.
+        status_text = self._cycle_text_rows(list(text))
 
         remainders: list[int] = [
             max(self._max_width - len(line), 0) for line in status_text
         ]
-
-        status_text = self._cycle_text_rows(status_text)
 
         for idx, line in enumerate(status_text):
             status_text[idx] = await stylize(
@@ -171,9 +179,13 @@ class MultilineText:
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
+        # Each update is the whole text, so only the newest one queued is
+        # drawn: a refit (which queues the configured text) followed by
+        # the replay of the last update shows that update, not one frame
+        # of the configured text first.
         text: list[str] | None = None
-        if self._updates.empty() is False:
-            text = await self._updates.get()
+        while self._updates.empty() is False:
+            text = self._updates.get_nowait()
 
         if self._update_lock.locked():
             self._update_lock.release()
@@ -208,9 +220,9 @@ class MultilineText:
         pass
 
     async def stop(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()
 
     async def abort(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()

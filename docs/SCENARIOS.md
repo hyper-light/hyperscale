@@ -15,6 +15,11 @@ The phases referenced below are from
 scenarios need fault primitives that ship in later phases; those are
 flagged with `(Phase N)` in their headings.
 
+**Coverage status (checked 2026-10-06).** This is a taxonomy of what must be
+tested, not a list of what is. Where a section's coverage or the code's
+behavior is known, a *Status* line says what exists; the full regrade is
+`docs/REMAINING_LEDGER.md` (dev-docs ledger, D-90 to D-95).
+
 ---
 
 ## 1. Leadership / Election
@@ -133,6 +138,11 @@ Need `Clock` injection.
 - **VM pause.** Long sleep mid-RPC; on resume, all timers fire at once.
 - **Lease boundary races.** Lease expires *exactly* as heartbeat lands.
 
+*Status:* covered — forward/backward step at a lease boundary
+(`tests/unit/simulation/sim/test_multiprocess_lease_clock_step.py`), skew
+fencing (`test_multiprocess_clock_fence.py`), VM pause
+(`test_multiprocess_pause.py`). Monotonic drift is a documented skip.
+
 ## 6. Membership churn
 
 - **Registration storm.** 50 workers register within 1 s. Manager
@@ -171,6 +181,30 @@ Need `Clock` injection.
 - **Adversarial workflows.** Panic, infinite loop (timeout-killed),
   giant memory allocation (OOM-killed).
 
+*Status:* built. 100-job instant burst
+(`tests/unit/simulation/sim/test_multiprocess_fanout.py`), dependency chains
+and dispatch exhaustion (`test_multiprocess_workflow_lifecycle.py`), mid-flight
+cancel (`test_multiprocess_job_cancellation.py`), submit during a blackout
+(`test_multiprocess_l2_submission_blackout.py`), long-running with AD-26
+extension (`test_multiprocess_l2_extension.py`). Sustained 10 jobs/s for 60 s
+(`test_multiprocess_sustained_submission.py`: paced from the first acceptance,
+every sojourn within two rounds, in-flight within Little's bound, drained
+tables independent of the job count). Staggered starts through three gates
+(`test_multiprocess_staggered_submission.py`: offsets anchored on the first
+acceptance, all gates in flight at once, exactly once). Cross-DC chain
+(`test_multiprocess_cross_dc_chain.py`): a job's workflows are placed
+together, so B runs in another datacenter than its A only when A's
+datacenter is lost between them -- AD-36 moves B to the replacement and
+re-runs A there for context alone; A's counted result stays the lost
+datacenter's. Adversarial workflows (`test_multiprocess_adversarial_workflows.py`):
+a raising step fails its job; a step that swallows every cancellation is
+ended by the job's AD-34 timeout; a hog is killed by AD-41 at its memory
+budget (SIM scripts the hog's memory at the worker: executor monitors do
+not run on the SimulationLoop) -- each FAILED with its cause named, and the
+next job completes within the cancellation windows. Open (core/jobs): a
+raised step's error reaches the client only as "No results returned"
+(strict xfail in that file).
+
 ## 8. Resource pressure / pool fidelity
 
 - **CPU saturation.** Pump synthetic CPU. LHM rises. Leader steps down
@@ -186,7 +220,9 @@ Need `Clock` injection.
 
 ## 9. Adversarial messages
 
-- **Replay.** Resend an old message; `_replay_guard` drops.
+- **Replay.** Resend an old message; `ReplayGuard.validate_frame` drops
+  it (every TCP/UDP frame carries a Snowflake frame id inside the AES-GCM
+  body; duplicates are keyed on the nonce, 2026-10-06).
 - **Wrong cluster_id / environment_id.** `WorkerRegistration` rejected
   (AD-28).
 - **Wrong mTLS claims.** `RoleValidator.validate_claims` rejects.
@@ -198,6 +234,14 @@ Need `Clock` injection.
 - **Mixed protocol versions.** Older worker, newer manager. Capability
   negotiation does the right thing.
 
+*Status:* covered — replay `tests/unit/distributed/protocol/test_frame_replay_protection.py`;
+malformed pickle `tests/unit/distributed/messaging/test_restricted_unpickler_vopr.py`;
+mTLS claims `tests/unit/distributed/discovery/test_mtls_strict_claims.py`;
+oversized/malformed frames `tests/unit/distributed/protocol/test_frame_decoding_vopr.py`;
+wrong cluster `tests/unit/simulation/sim/test_cluster_mismatch_vopr.py`;
+versions `tests/unit/distributed/models/test_rolling_upgrade_wire_compatibility.py`
+(all 104 wire messages, both directions) and `tests/unit/distributed/protocol/test_version_skew*.py`.
+
 ## 10. Persistence / recovery
 
 - **Manager restart with WAL replay.** In-flight job state recovered.
@@ -208,11 +252,59 @@ Need `Clock` injection.
   threshold catches up via snapshot, not log.
 - **WAL corruption.** Detected at startup; node refuses to come up.
 
+*Status:* the first four are covered (`tests/unit/distributed/ledger/test_wal_reclamation.py`,
+`tests/unit/distributed/idempotency/test_manager_ledger_recovery.py`,
+`tests/unit/distributed/swim/test_incarnation_persistence_degraded.py`,
+`tests/unit/distributed/raft/test_raft_snapshot_install.py`). WAL corruption
+is met (2026-10-06, b75eb7ea): `NodeWAL` cuts only a torn tail (nothing
+written after the damaged frame) and refuses anything else, logging
+`WALUntrustworthy` and raising `WALUntrustworthyError` out of node start
+with the file left as found (`hyperscale/distributed/ledger/wal/node_wal.py`,
+AD-38 Part 3.2); the Raft store applies the same torn-last-frame rule and
+sets an untrustworthy disk aside (D1). Test:
+`tests/unit/distributed/ledger/wal/test_node_wal_damage_vopr.py`.
+
 ## 11. Continuous safety invariants
 
 These run every `invariant_poll_interval` (default 100 ms) for the entire
 lifetime of any scenario above. Any violation fails the scenario
 immediately, regardless of which fault path is being exercised.
+
+*Status (2026-10-07):* every `ClusterHarness` scenario runs the catalog
+(`continuous_catalog()` in `tests/simulation/harness/invariants.py`; checks in
+`tests/simulation/harness/invariant_checks/`) every
+`HarnessTimeouts.invariant_poll_interval` (0.1 s). Each item below names its
+check; where the item as written is wrong for a correct cluster, the check's
+module records why and what it checks instead. Mutation checks:
+`tests/unit/simulation/harness/test_continuous_invariants.py`; live
+evaluation: `tests/simulation/scenarios/l2_single_dc/test_continuous_invariant_catalog.py`.
+"At most one leader per DC" is not continuous (the VOPR oracles judge leader
+exclusivity post-hoc, `tests/simulation/oracle/cluster_trace_oracle.py`).
+
+- Job leaders: `AtMostOneJobLeaderPerJob`.
+- Fence tokens: `MonotonicFenceTokens` -- manager lease and dispatch tokens,
+  worker accepted tokens, gate tokens, against a per-instance high-water mark.
+- Sub-workflow tokens: `UniqueSubWorkflowTokens` -- no token runs on two
+  workers, the worker running it is the one it names, no job lists it twice.
+- Terminal reach: `JobMakesProgress` -- a job with work in flight progresses
+  within AD-34's stuck bound (`stuck_threshold` + AD-26 extension seconds +
+  `JOB_TIMEOUT_CHECK_INTERVAL`), past which its leader must time it out.
+- Cancelled cores: `CancelledJobsFreeCores` -- within the worker's own
+  cancellation bound (poll interval + query timeout + cancel wait + one
+  execution-update wait, from `WorkerConfig`), counted only while no network
+  fault or pause is in force and the job's leader is live.
+- Resource counters: `ResourceCounterConsistency` -- on the worker the bound
+  is an identity (free + assigned cores = total; `available_cores` caches
+  the free count); on a manager, reserved cores are still inside the
+  reported available count, so `available + reserved` may exceed the total
+  there and the check is that each stays within `[0, total]`.
+- Member counts: `MemberCountConvergence` -- per datacenter's managers and
+  across gates, once stabilized and with no view-splitting fault in force,
+  within one gossip dissemination: `(max(1, int(lambda * ln(n + 1))) + 1)`
+  protocol periods plus one probe timeout.
+- Cluster isolation: `ClusterIdIsolation` -- one `CLUSTER_ID` across the
+  nodes, and every SWIM member any node holds is a node of the cluster.
+
 
 - **At most one leader per DC** at any moment.
 - **At most one job-leader per job** at any moment.

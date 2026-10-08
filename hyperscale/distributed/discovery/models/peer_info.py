@@ -1,48 +1,21 @@
 """
 Peer information models for the discovery system.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import total_ordering
+from hyperscale.distributed.runtime import Clock, RealClock
 
+from .peer_health import PeerHealth
 
-@total_ordering
-class PeerHealth(Enum):
-    """
-    Health status of a peer.
-
-    Ordering: HEALTHY > UNKNOWN > DEGRADED > UNHEALTHY > EVICTED
-    Higher values indicate better health.
-    """
-    EVICTED = ("evicted", 0)       # Removed from pool
-    UNHEALTHY = ("unhealthy", 1)   # Failed consecutive probes
-    DEGRADED = ("degraded", 2)     # High error rate or latency
-    UNKNOWN = ("unknown", 3)       # Not yet probed
-    HEALTHY = ("healthy", 4)       # Responding normally
-
-    def __init__(self, label: str, order: int) -> None:
-        self._label = label
-        self._order = order
-
-    @property
-    def value(self) -> str:
-        """Return the string value for serialization."""
-        return self._label
-
-    def __lt__(self, other: object) -> bool:
-        if not isinstance(other, PeerHealth):
-            return NotImplemented
-        return self._order < other._order
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, PeerHealth):
-            return NotImplemented
-        return self._order == other._order
-
-    def __hash__(self) -> int:
-        return hash(self._label)
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -101,7 +74,7 @@ class PeerInfo:
     """Total errors from this peer."""
 
     # ===== Timing =====
-    discovered_at: float = field(default_factory=time.monotonic)
+    discovered_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     """Timestamp when peer was discovered."""
 
     last_seen_at: float = 0.0
@@ -137,7 +110,7 @@ class PeerInfo:
         """
         self.total_requests += 1
         self.consecutive_failures = 0
-        self.last_seen_at = time.monotonic()
+        self.last_seen_at = _DEFAULT_CLOCK.monotonic()
 
         # Update EWMA latency
         if self.ewma_latency_ms == 0.0:
@@ -159,7 +132,7 @@ class PeerInfo:
         self.total_requests += 1
         self.total_errors += 1
         self.consecutive_failures += 1
-        self.last_failure_at = time.monotonic()
+        self.last_failure_at = _DEFAULT_CLOCK.monotonic()
 
         # Update error rate
         error_increment = 1.0 / max(1, self.total_requests)
@@ -170,43 +143,21 @@ class PeerInfo:
 
     def _update_health(self) -> None:
         """Update health status based on metrics."""
+        self.health, self.health_weight = self._health_for_metrics()
+
+    def _health_for_metrics(self) -> tuple[PeerHealth, float]:
+        """``(health, selection weight)``: UNHEALTHY after three consecutive failures, else by error rate."""
         if self.consecutive_failures >= 3:
-            self.health = PeerHealth.UNHEALTHY
-            self.health_weight = 0.1
-        elif self.error_rate > 0.10:
-            self.health = PeerHealth.DEGRADED
-            self.health_weight = 0.5
-        elif self.error_rate > 0.05:
-            self.health = PeerHealth.DEGRADED
-            self.health_weight = 0.7
-        else:
-            self.health = PeerHealth.HEALTHY
-            self.health_weight = 1.0
+            return (PeerHealth.UNHEALTHY, 0.1)
+        return self._health_for_error_rate()
 
-    def should_evict(
-        self,
-        error_rate_threshold: float,
-        consecutive_failure_limit: int,
-        latency_threshold_ms: float,
-    ) -> bool:
-        """
-        Check if this peer should be evicted from the connection pool.
-
-        Args:
-            error_rate_threshold: Max acceptable error rate
-            consecutive_failure_limit: Max consecutive failures
-            latency_threshold_ms: Max acceptable latency
-
-        Returns:
-            True if peer should be evicted
-        """
-        if self.consecutive_failures >= consecutive_failure_limit:
-            return True
-        if self.error_rate > error_rate_threshold:
-            return True
-        if self.ewma_latency_ms > latency_threshold_ms:
-            return True
-        return False
+    def _health_for_error_rate(self) -> tuple[PeerHealth, float]:
+        """``(health, selection weight)`` by error rate: DEGRADED past 5% (heavier past 10%), else HEALTHY."""
+        if self.error_rate > 0.10:
+            return (PeerHealth.DEGRADED, 0.5)
+        if self.error_rate > 0.05:
+            return (PeerHealth.DEGRADED, 0.7)
+        return (PeerHealth.HEALTHY, 1.0)
 
     def matches_locality(self, datacenter_id: str, region_id: str) -> tuple[bool, bool]:
         """
@@ -225,8 +176,19 @@ class PeerInfo:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, PeerInfo):
             return False
+        return self._same_identity(other)
+
+    def _same_identity(self, other: "PeerInfo") -> bool:
+        """Whether ``other`` has this peer's id, host and port."""
         return (
             self.peer_id == other.peer_id and
             self.host == other.host and
             self.port == other.port
         )
+
+_REHOMED = (
+    PeerHealth,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

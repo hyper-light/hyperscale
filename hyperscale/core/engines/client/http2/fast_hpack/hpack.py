@@ -6,7 +6,15 @@ hpack/hpack
 Implements the HPACK header compression algorithm as detailed by the IETF.
 """
 
+from .decoder_header_table import (
+    ENTRY_OVERHEAD,
+    STATIC_ENTRIES,
+    STATIC_LENGTH,
+    STATIC_NAME_LENGTHS,
+    DecoderHeaderTable,
+)
 from .huffman import HuffmanEncoder
+from .huffman_byte_decoder import ACCEPTING_SLOT, HuffmanByteDecoder
 from .table import HeaderTable
 
 # Precompute 2^i for 1-8 for use in prefix calcs.
@@ -4497,55 +4505,159 @@ class Encoder:
         return bytes(field)
 
 
+_HUFFMAN_BYTE_DECODER = HuffmanByteDecoder(_HUFFMAN_TABLE)
+_HUFFMAN_START_ROW = _HUFFMAN_BYTE_DECODER.start_row
+_compose_huffman_transition = _HUFFMAN_BYTE_DECODER.compose
+
+# RFC 7541 6: the leading bits that select a header field representation.
+_INDEXED_FIELD = 0x80
+_LITERAL_WITH_INDEXING = 0x40
+_TABLE_SIZE_UPDATE = 0x20
+# RFC 7541 5.2: the H bit of a string literal.
+_HUFFMAN_ENCODED = 0x80
+# RFC 7541 5.1: each representation's integer prefix, as a mask.
+_INDEX_PREFIX = 0x7F
+_NAME_INDEX_WITH_INDEXING_PREFIX = 0x3F
+_TABLE_SIZE_PREFIX = 0x1F
+_NAME_INDEX_WITHOUT_INDEXING_PREFIX = 0x0F
+_STRING_LENGTH_PREFIX = 0x7F
+# RFC 7541 2.3.3: the dynamic table's indices follow the static table's.
+_FIRST_DYNAMIC_INDEX = STATIC_LENGTH + 1
+
+
+# Fields a response may not hold (RFC 9113 8.2.2, 8.3): HTTP/2 has no
+# connection-specific fields -- TE is allowed in requests alone -- and a
+# response's one pseudo-header field is :status.
+_CONNECTION_SPECIFIC_FIELDS = frozenset(
+    ("connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te")
+)
+# In the static table (RFC 7541 Appendix A) the request pseudo-header
+# fields come first, through _LAST_REQUEST_PSEUDO_INDEX, and Transfer-Encoding
+# is its one connection-specific field: a static index is checked by two
+# comparisons.
+_LAST_REQUEST_PSEUDO_INDEX = max(
+    index for index, (name, _) in enumerate(STATIC_ENTRIES, 1) if name[:1] == ":" and name != ":status"
+)
+_TRANSFER_ENCODING_INDEX = next(
+    index for index, (name, _) in enumerate(STATIC_ENTRIES, 1) if name == "transfer-encoding"
+)
+assert all(
+    ((name[:1] == ":" and name != ":status") or name in _CONNECTION_SPECIFIC_FIELDS)
+    == (index <= _LAST_REQUEST_PSEUDO_INDEX or index == _TRANSFER_ENCODING_INDEX)
+    for index, (name, _) in enumerate(STATIC_ENTRIES, 1)
+)
+
+
+def _decode_integer(data, position, prefix_mask):
+    """
+    Decodes the integer (RFC 7541 5.1) whose prefix is the bits of
+    ``data[position]`` under ``prefix_mask``. Returns the integer and the
+    position after it.
+    """
+    number = data[position] & prefix_mask
+    position += 1
+
+    if number < prefix_mask:
+        return number, position
+
+    shift = 0
+    while True:
+        next_byte = data[position]
+        position += 1
+        number += (next_byte & 0x7F) << shift
+
+        if next_byte < 0x80:
+            return number, position
+
+        shift += 7
+
+
+def _decode_literal_name(data, position):
+    """
+    Decodes the string literal (RFC 7541 5.2) at ``position`` that names a
+    literal header field. Returns its text -- its octets, as bytes, when
+    they are not UTF-8 -- its length in octets and the position after it.
+    """
+    first = data[position]
+    length = first & _STRING_LENGTH_PREFIX
+    if length == _STRING_LENGTH_PREFIX:
+        length, position = _decode_integer(data, position, _STRING_LENGTH_PREFIX)
+    else:
+        position += 1
+
+    end = position + length
+    if end > len(data):
+        raise Exception("String literal overruns the header block")
+
+    if first & _HUFFMAN_ENCODED:
+        text = _HUFFMAN_BYTE_DECODER.decode_text(data[position:end])
+        if text.isascii():
+            return text, len(text), end
+
+        octets = text.encode("latin-1")
+
+    else:
+        octets = data[position:end]
+
+    try:
+        return str(octets, "utf-8"), len(octets), end
+
+    except UnicodeDecodeError:
+        # Kept as octets so the header table stays in step with the
+        # encoder's; decode() raises once the whole block is applied.
+        return bytes(octets), len(octets), end
+
+
+def _octets(text):
+    return text if type(text) is bytes else text.encode()
+
+
+def _raise_on_undecodable(headers):
+    for name, value in headers:
+        for text in (name, value):
+            if type(text) is not str:
+                # Raises the UnicodeDecodeError a non-UTF-8 header raises.
+                str(text, "utf-8")
+
+
 class Decoder:
-    __slots__ = ("header_table", "max_header_list_size", "max_allowed_table_size")
     """
-    An HPACK decoder object.
+    An HPACK decoder (RFC 7541).
 
-    .. versionchanged:: 2.3.0
-       Added ``max_header_list_size`` argument.
+    The header table holds decoded names and values, so an indexed header is
+    a lookup, and Huffman strings decode a byte per step. Names and values
+    are UTF-8: ``decode(data, raw=True)`` returns them as ``str``, and raises
+    UnicodeDecodeError -- after applying the whole block to the header table,
+    which stays in step with the encoder's -- when one is not UTF-8.
 
-    :param max_header_list_size: The maximum decompressed size we will allow
-        for any single header block. This is a protection against DoS attacks
-        that attempt to force the application to expand a relatively small
-        amount of data into a really large header list, allowing enormous
-        amounts of memory to be allocated.
-
-        If this amount of data is exceeded, a `OversizedHeaderListError
-        <hpack.OversizedHeaderListError>` exception will be raised. At this
-        point the connection should be shut down, as the HPACK state will no
-        longer be usable.
-
-        Defaults to 64kB.
-    :type max_header_list_size: ``int``
+    :param max_header_list_size: The largest decompressed header list the
+        peer is told to send (SETTINGS_MAX_HEADER_LIST_SIZE). Defaults to
+        64kB.
     """
+
+    __slots__ = (
+        "header_table",
+        "max_header_list_size",
+        "max_allowed_table_size",
+        "malformed_field",
+    )
 
     def __init__(self, max_header_list_size=2**16):
-        #: The maximum decompressed size we will allow for any single header
-        #: block. This is a protection against DoS attacks that attempt to
-        #: force the application to expand a relatively small amount of data
-        #: into a really large header list, allowing enormous amounts of memory
-        #: to be allocated.
-        #:
-        #: If this amount of data is exceeded, a `OversizedHeaderListError
-        #: <hpack.OversizedHeaderListError>` exception will be raised. At this
-        #: point the connection should be shut down, as the HPACK state will no
-        #: longer be usable.
-        #:
-        #: Defaults to 64kB.
-        #:
-        #: .. versionadded:: 2.3.0
-        self.header_table = HeaderTable()
+        self.header_table = DecoderHeaderTable()
         self.max_header_list_size = max_header_list_size
 
-        #: Maximum allowed header table size.
-        #:
-        #: A HTTP/2 implementation should set this to the most recent value of
-        #: SETTINGS_HEADER_TABLE_SIZE that it sent *and has received an ACK
-        #: for*. Once this setting is set, the actual header table size will be
-        #: checked at the end of each decoding run and whenever it is changed,
-        #: to confirm that it fits in this size.
+        #: Maximum allowed header table size: the most recent
+        #: SETTINGS_HEADER_TABLE_SIZE sent *and acknowledged*. A dynamic table
+        #: size update larger than this is a decoding error.
         self.max_allowed_table_size = self.header_table.maxsize
+
+        #: The first field of the last block decoded that a response may
+        #: not hold, described; else None: a name or value with characters
+        #: a field may not hold (RFC 9113 8.2.1), a pseudo-header field
+        #: other than :status (8.3), or a connection-specific field
+        #: (8.2.2). The block still decodes whole, keeping the dynamic table
+        #: in step with the encoder's.
+        self.malformed_field = None
 
     @property
     def header_table_size(self):
@@ -4560,208 +4672,279 @@ class Decoder:
 
     def decode(self, data, raw=False):
         """
-        Takes an HPACK-encoded header block and decodes it into a header set.
+        Decodes an HPACK header block into a list of ``(name, value)``
+        tuples, in order: ``str`` when ``raw`` is true, else bytes.
 
-        :param data: A bytestring representing a complete HPACK-encoded header
-                     block.
-        :param raw: (optional) Whether to return the headers as tuples of raw
-                    byte strings or to decode them as UTF-8 before returning
-                    them. The default value is False, which returns tuples of
-                    Unicode strings
-        :returns: A list of two-tuples of ``(name, value)`` representing the
-                  HPACK-encoded headers, in the order they were decoded.
-        :raises HPACKDecodingError: If an error is encountered while decoding
-                                    the header block.
+        Each representation is handled inline, a Huffman value included -- a
+        call per header field is a measurable share of a response.
         """
-
-        data_mem = memoryview(data)
+        header_table = self.header_table
+        entries = header_table.entries
+        entry_sizes = header_table.entry_sizes
+        start_row = _HUFFMAN_START_ROW
+        compose = _compose_huffman_transition
         headers = []
-        data_len = len(data)
-        inflated_size = 0
-        current_index = 0
+        append_header = headers.append
+        position = 0
+        data_length = len(data)
+        undecodable_literal = False
+        malformed_field = None
+        last_request_pseudo_index = _LAST_REQUEST_PSEUDO_INDEX
+        transfer_encoding_index = _TRANSFER_ENCODING_INDEX
 
-        while current_index < data_len:
-            # Work out what kind of header we're decoding.
-            # If the high bit is 1, it's an indexed field.
-            current = data[current_index]
-            indexed = True if current & 0x80 else False
+        while position < data_length:
+            representation = data[position]
 
-            # Otherwise, if the second-highest bit is 1 it's a field that does
-            # alter the header table.
-            literal_index = True if current & 0x40 else False
+            if representation & _INDEXED_FIELD:
+                index = representation & _INDEX_PREFIX
+                position += 1
 
-            # Otherwise, if the third-highest bit is 1 it's an encoding context
-            # update.
-            encoding_update = True if current & 0x20 else False
+                if index == _INDEX_PREFIX:
+                    index, position = _decode_integer(data, position - 1, _INDEX_PREFIX)
 
-            if indexed:
-                index, consumed = self._decode_integer(data_mem[current_index:], 7)
-                header = self.header_table.get_by_index(index)
+                # Dynamic entries first: a steady-state response indexes
+                # mostly those. An index past the table's end is the
+                # decoding error the table raises for it.
+                if index > STATIC_LENGTH:
+                    try:
+                        append_header(entries[index - _FIRST_DYNAMIC_INDEX])
 
-            elif literal_index:
-                # It's a literal header that does affect the header table.
-                header, consumed = self._decode_literal(data_mem[current_index:], True)
-            elif encoding_update:
-                new_size, consumed = self._decode_integer(data_mem[current_index:], 5)
+                    except IndexError:
+                        raise Exception(f"Invalid table index {index}") from None
+
+                elif index:
+                    append_header(STATIC_ENTRIES[index - 1])
+
+                    # A request's pseudo-header field, or Transfer-Encoding,
+                    # has no place in a response (RFC 9113 8.3, 8.2.2).
+                    if (
+                        index <= last_request_pseudo_index or index == transfer_encoding_index
+                    ) and malformed_field is None:
+                        malformed_field = f"field {STATIC_ENTRIES[index - 1][0]} in a response"
+
+                else:
+                    raise Exception(f"Invalid table index {index}")
+
+                continue
+
+            if representation & _LITERAL_WITH_INDEXING:
+                name_prefix = _NAME_INDEX_WITH_INDEXING_PREFIX
+
+            elif representation & _TABLE_SIZE_UPDATE:
+                new_size, position = _decode_integer(data, position, _TABLE_SIZE_PREFIX)
                 if new_size > self.max_allowed_table_size:
                     raise Exception("Encoder exceeded max allowable table size")
 
-                self.header_table_size = new_size
-                header = None
+                header_table.maxsize = new_size
+                continue
+
             else:
-                # It's a literal header that does not affect the header table.
-                header, consumed = self._decode_literal(data_mem[current_index:], False)
+                # Literal without indexing or never indexed: not added to the
+                # table (RFC 7541 6.2.2, 6.2.3).
+                name_prefix = _NAME_INDEX_WITHOUT_INDEXING_PREFIX
 
-            if header:
-                headers.append(header)
-                name, value = header
-                inflated_size += 32 + len(name) + len(value)
+            # A literal header field (RFC 7541 6.2): an indexed name or a
+            # name string, then the value string.
+            field_malformed = None
+            field_undecodable = False
+            name_index = representation & name_prefix
+            if name_index == name_prefix:
+                name_index, position = _decode_integer(data, position, name_prefix)
+            else:
+                position += 1
 
-            current_index += consumed
+            if 0 < name_index <= STATIC_LENGTH:
+                name = STATIC_ENTRIES[name_index - 1][0]
+                name_length = STATIC_NAME_LENGTHS[name_index - 1]
+                if name_index <= last_request_pseudo_index or name_index == transfer_encoding_index:
+                    field_malformed = f"field {name} in a response"
 
-        return [
-            (str(header[0], "utf-8"), str(header[1], "utf-8")) if raw else header
-            for header in headers
-        ]
+            elif name_index:
+                try:
+                    name = entries[name_index - _FIRST_DYNAMIC_INDEX][0]
 
-    def _decode_integer(self, data, prefix_bits):
-        """
-        This decodes an integer according to the wacky integer encoding rules
-        defined in the HPACK spec. Returns a tuple of the decoded integer and the
-        number of bytes that were consumed from ``data`` in order to get that
-        integer.
-        """
-        if prefix_bits < 1 or prefix_bits > 8:
-            raise ValueError(
-                "Prefix bits must be between 1 and 8, got %s" % prefix_bits
-            )
+                except IndexError:
+                    raise Exception(f"Invalid table index {name_index}") from None
 
-        max_number = _PREFIX_BIT_MAX_NUMBERS[prefix_bits]
-        index = 1
-        shift = 0
-        mask = 0xFF >> (8 - prefix_bits)
+                if type(name) is bytes:
+                    field_undecodable = True
+                    name_length = len(name)
 
-        number = data[0] & mask
-        if number == max_number:
-            while True:
-                next_byte = data[index]
-                index += 1
-
-                if next_byte >= 128:
-                    number += (next_byte - 128) << shift
                 else:
-                    number += next_byte << shift
+                    name_length = len(name) if name.isascii() else len(name.encode())
+
+            else:
+                name, name_length, position = _decode_literal_name(data, position)
+                if type(name) is bytes:
+                    undecodable_literal = True
+                    field_undecodable = True
+
+                # RFC 9113 8.2.1: a name holds no control characters, space,
+                # DEL, non-ASCII or uppercase characters, and no colon but a
+                # pseudo-header's leading one. Static names are all valid, and
+                # a dynamic one was checked as the literal that added it.
+                elif (
+                    not name
+                    or not name.isascii()
+                    or not name.isprintable()
+                    or " " in name
+                    or (":" in name and name.rfind(":") > 0)
+                    or (not name.islower() and name != name.lower())
+                ):
+                    field_malformed = f"invalid field name {name!r}"
+
+                elif name[:1] == ":" and name != ":status":
+                    field_malformed = f"pseudo-header field {name} in a response"
+
+                elif name in _CONNECTION_SPECIFIC_FIELDS:
+                    field_malformed = f"connection-specific field {name}"
+
+            first = data[position]
+            value_length = first & _STRING_LENGTH_PREFIX
+            if value_length == _STRING_LENGTH_PREFIX:
+                value_length, position = _decode_integer(data, position, _STRING_LENGTH_PREFIX)
+            else:
+                position += 1
+
+            if (end := position + value_length) > data_length:
+                raise Exception("String literal overruns the header block")
+
+            if first & _HUFFMAN_ENCODED:
+                row = start_row
+                value = ""
+                for input_byte in data[position:end]:
+                    row, fragment = row[input_byte] or compose(row, input_byte)
+                    value += fragment
+
+                if not row[ACCEPTING_SLOT]:
+                    raise Exception("Invalid Huffman-encoded string")
+
+                # Latin-1 text, a character per octet: ASCII is the value
+                # itself, and anything else is its octets decoded as UTF-8.
+                value_length = len(value)
+                if not value.isascii():
+                    octets = value.encode("latin-1")
+                    try:
+                        value = str(octets, "utf-8")
+
+                    except UnicodeDecodeError:
+                        undecodable_literal = True
+                        field_undecodable = True
+                        value = octets
+
+            else:
+                octets = data[position:end]
+                try:
+                    value = str(octets, "utf-8")
+
+                except UnicodeDecodeError:
+                    # Kept as octets so the header table stays in step with
+                    # the encoder's; raised once the whole block is applied.
+                    undecodable_literal = True
+                    field_undecodable = True
+                    value = bytes(octets)
+
+            # RFC 9113 8.2.1: a value holds no NUL, CR or LF, and neither
+            # starts nor ends with whitespace. A printable value holds none of
+            # the three, so one test clears nearly every value; one that is
+            # not printable -- a tab inside is allowed -- is tested in full.
+            if undecodable_literal is False and value and (
+                value[0] == " "
+                or value[-1] == " "
+                or (
+                    not value.isprintable()
+                    and (
+                        "\r" in value
+                        or "\n" in value
+                        or "\x00" in value
+                        or value[0] == "\t"
+                        or value[-1] == "\t"
+                    )
+                )
+            ):
+                field_malformed = f"invalid value for field {name!r}"
+
+            if field_malformed is not None:
+                if malformed_field is None:
+                    malformed_field = field_malformed
+
+                # Added below unless too large for the table: either way the
+                # table is then checked as holding it, which is safe.
+                if name_prefix != _NAME_INDEX_WITHOUT_INDEXING_PREFIX:
+                    header_table.holds_malformed_entry = True
+
+            position = end
+            header = (name, value)
+            append_header(header)
+
+            if name_prefix == _NAME_INDEX_WITHOUT_INDEXING_PREFIX:
+                continue
+
+            # Added to the dynamic table, evicting from its oldest end to fit;
+            # an entry larger than the table empties it (RFC 7541 4.4).
+            maximum_size = header_table.maximum_size
+            if (size := ENTRY_OVERHEAD + name_length + value_length) > maximum_size:
+                header_table.clear()
+                continue
+
+            entries.appendleft(header)
+            entry_sizes.appendleft(size)
+            current_size = header_table.current_size + size
+
+            if field_undecodable:
+                header_table.undecodable_entry_count += 1
+
+            while current_size > maximum_size and entries:
+                evicted_name, evicted_value = entries.pop()
+                current_size -= entry_sizes.pop()
+
+                if not (type(evicted_name) is str and type(evicted_value) is str):
+                    header_table.undecodable_entry_count -= 1
+
+            header_table.current_size = current_size
+
+        if malformed_field is None and header_table.holds_malformed_entry:
+            # The table holds an entry a response may not hold, which an
+            # indexed field may be: every field of the block is checked.
+            for checked_name, checked_value in headers:
+                if type(checked_name) is not str or type(checked_value) is not str:
+                    continue
+
+                if (
+                    not checked_name
+                    or not checked_name.isascii()
+                    or not checked_name.isprintable()
+                    or " " in checked_name
+                    or (":" in checked_name and checked_name.rfind(":") > 0)
+                    or (not checked_name.islower() and checked_name != checked_name.lower())
+                ):
+                    malformed_field = f"invalid field name {checked_name!r}"
                     break
-                shift += 7
 
-        return number, index
+                if checked_name[:1] == ":" and checked_name != ":status":
+                    malformed_field = f"pseudo-header field {checked_name} in a response"
+                    break
 
-    def _decode_literal(self, data, should_index):
-        """
-        Decodes a header represented with a literal.
-        """
-        total_consumed = 0
+                if checked_name in _CONNECTION_SPECIFIC_FIELDS:
+                    malformed_field = f"connection-specific field {checked_name}"
+                    break
 
-        # When should_index is true, if the low six bits of the first byte are
-        # nonzero, the header name is indexed.
-        # When should_index is false, if the low four bits of the first byte
-        # are nonzero the header name is indexed.
-        if should_index:
-            indexed_name = data[0] & 0x3F
-            name_len = 6
-            not_indexable = False
-        else:
-            high_byte = data[0]
-            indexed_name = high_byte & 0x0F
-            name_len = 4
-            not_indexable = high_byte & 0x10
+                if checked_value and (
+                    "\r" in checked_value
+                    or "\n" in checked_value
+                    or "\x00" in checked_value
+                    or checked_value[0] in " \t"
+                    or checked_value[-1] in " \t"
+                ):
+                    malformed_field = f"invalid value for field {checked_name!r}"
+                    break
 
-        if indexed_name:
-            # Indexed header name.
-            index, consumed = self._decode_integer(data, name_len)
-            name = self.header_table.get_by_index(index)[0]
+        self.malformed_field = malformed_field
 
-            total_consumed = consumed
-            length = 0
-        else:
-            # Literal header name. The first byte was consumed, so we need to
-            # move forward.
-            data = data[1:]
+        if not raw:
+            return [(_octets(name), _octets(value)) for name, value in headers]
 
-            length, consumed = self._decode_integer(data, 7)
-            name = data[consumed : consumed + length]
+        if undecodable_literal or header_table.undecodable_entry_count:
+            _raise_on_undecodable(headers)
 
-            if data[0] & 0x80:
-                if not name:
-                    name = b""
-
-                state = 0
-                flags = 0
-                decoded_bytes = bytearray()
-                # This loop is unrolled somewhat. Because we use a nibble, not a byte, we
-                # need to handle each nibble twice. We unroll that: it makes the loop body
-                # a bit longer, but that's ok.
-                for input_byte in name:
-                    index = (state * 16) + (input_byte >> 4)
-                    state, flags, output_byte = _HUFFMAN_TABLE[index]
-
-                    if flags & (1 << 1):
-                        decoded_bytes.append(output_byte)
-
-                    index = (state * 16) + (input_byte & 0x0F)
-                    state, flags, output_byte = _HUFFMAN_TABLE[index]
-
-                    if flags & (1 << 1):
-                        decoded_bytes.append(output_byte)
-
-                name = bytes(decoded_bytes)
-
-            total_consumed = consumed + length + 1  # Since we moved forward 1.
-
-        data = data[consumed + length :]
-
-        # The header value is definitely length-based.
-        length, consumed = self._decode_integer(data, 7)
-        value = data[consumed : consumed + length]
-
-        if data[0] & 0x80:
-            if not value:
-                value = b""
-
-            state = 0
-            flags = 0
-            decoded_bytes = bytearray()
-
-            # This loop is unrolled somewhat. Because we use a nibble, not a byte, we
-            # need to handle each nibble twice. We unroll that: it makes the loop body
-            # a bit longer, but that's ok.
-            for input_byte in value:
-                index = (state * 16) + (input_byte >> 4)
-                state, flags, output_byte = _HUFFMAN_TABLE[index]
-
-                if flags & (1 << 1):
-                    decoded_bytes.append(output_byte)
-
-                index = (state * 16) + (input_byte & 0x0F)
-                state, flags, output_byte = _HUFFMAN_TABLE[index]
-
-                if flags & (1 << 1):
-                    decoded_bytes.append(output_byte)
-
-            value = bytes(decoded_bytes)
-
-        # Updated the total consumed length.
-        total_consumed += length + consumed
-
-        # If we have been told never to index the header field, encode that in
-        # the tuple we use.
-        if not_indexable:
-            header = (name, value)
-        else:
-            header = (name, value)
-
-        # If we've been asked to index this, add it to the header table.
-        if should_index:
-            self.header_table.add(name, value)
-
-        return header, total_consumed
+        return headers

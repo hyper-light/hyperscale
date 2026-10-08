@@ -16,112 +16,59 @@ This integrates with:
 - LocalHealthMultiplier: Combines local and peer health for timeouts
 - IndirectProbeManager: Avoids overloaded peers as proxies
 - ProbeScheduler: May reorder probing to prefer healthy peers
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
-import time
 from dataclasses import dataclass, field
 from enum import IntEnum
+from itertools import compress
+from operator import attrgetter, methodcaller
+from types import MappingProxyType
 from typing import Callable
-
 from hyperscale.distributed.health.tracker import HealthPiggyback
+from hyperscale.distributed.runtime import Clock, RealClock
+
+from .peer_health_info import _DEFAULT_CLOCK
+from .peer_load_level import _OVERLOAD_STATE_TO_LEVEL
+from .peer_health_awareness_config import PeerHealthAwarenessConfig
+from .peer_health_info import PeerHealthInfo
+from .peer_load_level import PeerLoadLevel
 
 
-class PeerLoadLevel(IntEnum):
-    """
-    Peer load level classification for behavior adaptation.
-
-    Higher values indicate more load - more accommodation needed.
-    """
-    UNKNOWN = 0   # No health info yet (treat as healthy)
-    HEALTHY = 1   # Normal operation
-    BUSY = 2      # Slightly elevated load
-    STRESSED = 3  # Significant load - reduce traffic
-    OVERLOADED = 4  # Critically loaded - minimal traffic only
+def _unadapted_timeout_multiplier(config: PeerHealthAwarenessConfig) -> float:
+    """The multiplier for a HEALTHY or UNKNOWN peer: no timeout adaptation."""
+    return 1.0
 
 
-# Map overload_state string to PeerLoadLevel
-_OVERLOAD_STATE_TO_LEVEL: dict[str, PeerLoadLevel] = {
-    "healthy": PeerLoadLevel.HEALTHY,
-    "busy": PeerLoadLevel.BUSY,
-    "stressed": PeerLoadLevel.STRESSED,
-    "overloaded": PeerLoadLevel.OVERLOADED,
-}
+def _not_accepting_work(peer_info: PeerHealthInfo) -> bool:
+    """Whether the peer reported it is not accepting work."""
+    return not peer_info.accepting_work
 
 
-@dataclass(slots=True)
-class PeerHealthInfo:
-    """
-    Cached health information for a single peer.
+# Load levels that stretch timeouts, each read from its configured multiplier.
+_LOAD_LEVEL_TIMEOUT_MULTIPLIER: MappingProxyType[PeerLoadLevel, Callable[[PeerHealthAwarenessConfig], float]] = (
+    MappingProxyType(
+        {
+            PeerLoadLevel.OVERLOADED: attrgetter("timeout_multiplier_overloaded"),
+            PeerLoadLevel.STRESSED: attrgetter("timeout_multiplier_stressed"),
+            PeerLoadLevel.BUSY: attrgetter("timeout_multiplier_busy"),
+        }
+    )
+)
 
-    Used to make adaptation decisions without requiring
-    full HealthPiggyback lookups.
-    """
-    node_id: str
-    load_level: PeerLoadLevel
-    accepting_work: bool
-    capacity: int
-    throughput: float
-    expected_throughput: float
-    last_update: float
-
-    @property
-    def is_overloaded(self) -> bool:
-        """Check if peer is in overloaded state."""
-        return self.load_level >= PeerLoadLevel.OVERLOADED
-
-    @property
-    def is_stressed(self) -> bool:
-        """Check if peer is stressed or worse."""
-        return self.load_level >= PeerLoadLevel.STRESSED
-
-    @property
-    def is_healthy(self) -> bool:
-        """Check if peer is healthy."""
-        return self.load_level <= PeerLoadLevel.HEALTHY
-
-    def is_stale(self, max_age_seconds: float = 30.0) -> bool:
-        """Check if this info is stale."""
-        return (time.monotonic() - self.last_update) > max_age_seconds
-
-    @classmethod
-    def from_piggyback(cls, piggyback: HealthPiggyback) -> "PeerHealthInfo":
-        """Create PeerHealthInfo from HealthPiggyback."""
-        load_level = _OVERLOAD_STATE_TO_LEVEL.get(
-            piggyback.overload_state,
-            PeerLoadLevel.UNKNOWN,
-        )
-
-        return cls(
-            node_id=piggyback.node_id,
-            load_level=load_level,
-            accepting_work=piggyback.accepting_work,
-            capacity=piggyback.capacity,
-            throughput=piggyback.throughput,
-            expected_throughput=piggyback.expected_throughput,
-            last_update=time.monotonic(),
-        )
-
-
-@dataclass(slots=True)
-class PeerHealthAwarenessConfig:
-    """Configuration for peer health awareness."""
-
-    # Timeout multipliers based on peer load
-    # Applied on top of base probe timeout
-    timeout_multiplier_busy: float = 1.25  # 25% longer for busy peers
-    timeout_multiplier_stressed: float = 1.75  # 75% longer for stressed peers
-    timeout_multiplier_overloaded: float = 2.5  # 150% longer for overloaded peers
-
-    # Staleness threshold for peer health info
-    stale_threshold_seconds: float = 30.0
-
-    # Maximum peers to track (prevent memory growth)
-    max_tracked_peers: int = 1000
-
-    # Enable behavior adaptations
-    enable_timeout_adaptation: bool = True
-    enable_proxy_avoidance: bool = True
-    enable_gossip_reduction: bool = True
+# Share of normal gossip piggybacked to a peer at each reduced load level.
+_LOAD_LEVEL_GOSSIP_REDUCTION: MappingProxyType[PeerLoadLevel, float] = MappingProxyType(
+    {
+        PeerLoadLevel.OVERLOADED: 0.25,  # Only 25% of normal gossip
+        PeerLoadLevel.STRESSED: 0.50,  # Only 50% of normal gossip
+        PeerLoadLevel.BUSY: 0.75,  # 75% of normal gossip
+    }
+)
 
 
 @dataclass(slots=True)
@@ -201,19 +148,14 @@ class PeerHealthAwareness:
         if peer_info.is_stressed:
             self._overloaded_updates += 1
 
-        # Invoke callbacks for state transitions
+        # Invoke callbacks for state transitions. The update is stored: a
+        # failing callback raises to the caller rather than vanishing.
         if peer_info.is_stressed and not previous_overloaded:
             if self._on_peer_overloaded:
-                try:
-                    self._on_peer_overloaded(health.node_id)
-                except Exception:
-                    pass  # Don't let callback errors affect processing
+                self._on_peer_overloaded(health.node_id)
         elif not peer_info.is_stressed and previous_overloaded:
             if self._on_peer_recovered:
-                try:
-                    self._on_peer_recovered(health.node_id)
-                except Exception:
-                    pass
+                self._on_peer_recovered(health.node_id)
 
     def get_peer_info(self, node_id: str) -> PeerHealthInfo | None:
         """
@@ -269,14 +211,9 @@ class PeerHealthAwareness:
         if not peer_info:
             return 1.0
 
-        if peer_info.load_level == PeerLoadLevel.OVERLOADED:
-            return self.config.timeout_multiplier_overloaded
-        if peer_info.load_level == PeerLoadLevel.STRESSED:
-            return self.config.timeout_multiplier_stressed
-        if peer_info.load_level == PeerLoadLevel.BUSY:
-            return self.config.timeout_multiplier_busy
-
-        return 1.0
+        return _LOAD_LEVEL_TIMEOUT_MULTIPLIER.get(
+            peer_info.load_level, _unadapted_timeout_multiplier
+        )(self.config)
 
     def get_probe_timeout(self, node_id: str, base_timeout: float) -> float:
         """
@@ -339,46 +276,35 @@ class PeerHealthAwareness:
             return 1.0
 
         # Reduce gossip based on load
-        if peer_info.load_level == PeerLoadLevel.OVERLOADED:
-            return 0.25  # Only 25% of normal gossip
-        elif peer_info.load_level == PeerLoadLevel.STRESSED:
-            return 0.50  # Only 50% of normal gossip
-        elif peer_info.load_level == PeerLoadLevel.BUSY:
-            return 0.75  # 75% of normal gossip
-
-        return 1.0
+        return _LOAD_LEVEL_GOSSIP_REDUCTION.get(peer_info.load_level, 1.0)
 
     def get_healthy_peers(self) -> list[str]:
         """Get list of peers in healthy state."""
-        return [
-            node_id
-            for node_id, peer_info in self._peers.items()
-            if peer_info.is_healthy and not peer_info.is_stale(self.config.stale_threshold_seconds)
-        ]
+        return self._fresh_peers_matching(attrgetter("is_healthy"))
 
     def get_stressed_peers(self) -> list[str]:
         """Get list of peers in stressed or overloaded state."""
-        return [
-            node_id
-            for node_id, peer_info in self._peers.items()
-            if peer_info.is_stressed and not peer_info.is_stale(self.config.stale_threshold_seconds)
-        ]
+        return self._fresh_peers_matching(attrgetter("is_stressed"))
 
     def get_overloaded_peers(self) -> list[str]:
         """Get list of peers in overloaded state."""
-        return [
-            node_id
-            for node_id, peer_info in self._peers.items()
-            if peer_info.is_overloaded and not peer_info.is_stale(self.config.stale_threshold_seconds)
-        ]
+        return self._fresh_peers_matching(attrgetter("is_overloaded"))
 
     def get_peers_not_accepting_work(self) -> list[str]:
         """Get list of peers not accepting work."""
+        return self._fresh_peers_matching(_not_accepting_work)
+
+    def _fresh_peers_matching(self, predicate: Callable[[PeerHealthInfo], bool]) -> list[str]:
+        """Node ids of non-stale peers whose info satisfies ``predicate``."""
         return [
             node_id
             for node_id, peer_info in self._peers.items()
-            if not peer_info.accepting_work and not peer_info.is_stale(self.config.stale_threshold_seconds)
+            if self._is_fresh_match(peer_info, predicate)
         ]
+
+    def _is_fresh_match(self, peer_info: PeerHealthInfo, predicate: Callable[[PeerHealthInfo], bool]) -> bool:
+        """Whether ``peer_info`` satisfies ``predicate`` and is not stale (staleness checked only on a match)."""
+        return predicate(peer_info) and not peer_info.is_stale(self.config.stale_threshold_seconds)
 
     def filter_proxy_candidates(self, candidates: list[str]) -> list[str]:
         """
@@ -393,11 +319,7 @@ class PeerHealthAwareness:
         if not self.config.enable_proxy_avoidance:
             return candidates
 
-        return [
-            node_id
-            for node_id in candidates
-            if self.should_use_as_proxy(node_id)
-        ]
+        return list(filter(self.should_use_as_proxy, candidates))
 
     def rank_by_health(self, node_ids: list[str]) -> list[str]:
         """
@@ -441,11 +363,13 @@ class PeerHealthAwareness:
         Returns:
             Number of entries removed
         """
-        stale_nodes = [
-            node_id
-            for node_id, peer_info in self._peers.items()
-            if peer_info.is_stale(self.config.stale_threshold_seconds)
-        ]
+        # Keys and values iterate in the same order, so compress selects the stale peers.
+        stale_nodes = list(
+            compress(
+                self._peers.keys(),
+                map(methodcaller("is_stale", self.config.stale_threshold_seconds), self._peers.values()),
+            )
+        )
 
         for node_id in stale_nodes:
             del self._peers[node_id]
@@ -483,3 +407,12 @@ class PeerHealthAwareness:
             "current_stressed": stressed_count,
             "max_tracked_peers": self.config.max_tracked_peers,
         }
+
+_REHOMED = (
+    PeerLoadLevel,
+    PeerHealthInfo,
+    PeerHealthAwarenessConfig,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -98,7 +98,7 @@ async def validate_35_1_high_volume_reporter() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "High-volume reporter expected job reporter tasks"
         )
     finally:
@@ -118,7 +118,7 @@ async def validate_35_1_reporter_batching() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter batching expected job reporter tasks"
         )
     finally:
@@ -138,7 +138,7 @@ async def validate_35_1_reporter_backlog() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter backlog expected job reporter tasks"
         )
     finally:
@@ -158,7 +158,7 @@ async def validate_35_1_reporter_memory() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter memory expected job reporter tasks"
         )
     finally:
@@ -178,7 +178,7 @@ async def validate_35_2_concurrent_reporters() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Concurrent reporters expected job reporter tasks"
         )
     finally:
@@ -198,7 +198,7 @@ async def validate_35_2_reporter_priority() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter priority expected job reporter tasks"
         )
     finally:
@@ -218,7 +218,7 @@ async def validate_35_2_reporter_failure_isolation() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter failure isolation expected job reporter tasks"
         )
     finally:
@@ -238,7 +238,7 @@ async def validate_35_2_reporter_resource_limits() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter resource limits expected job reporter tasks"
         )
     finally:
@@ -258,7 +258,7 @@ async def validate_35_3_reporter_unreachable() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter unreachable expected job reporter tasks"
         )
     finally:
@@ -278,7 +278,7 @@ async def validate_35_3_reporter_reconnection() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter reconnection expected job reporter tasks"
         )
     finally:
@@ -298,7 +298,7 @@ async def validate_35_3_reporter_timeout() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter timeout expected job reporter tasks"
         )
     finally:
@@ -318,7 +318,7 @@ async def validate_35_3_reporter_crash_recovery() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter crash recovery expected job reporter tasks"
         )
     finally:

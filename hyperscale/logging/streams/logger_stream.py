@@ -4,12 +4,11 @@ import functools
 import io
 import os
 import pathlib
+import stat
 import struct
 import sys
-import threading
 import zlib
 from typing import (
-    Any,
     AsyncIterator,
     Callable,
     Dict,
@@ -30,6 +29,11 @@ from hyperscale.logging.exceptions import (
     WALWriteError,
 )
 from hyperscale.logging.lsn import HybridLamportClock, LSN
+from hyperscale.core.runtime import (
+    FileHandle,
+    Filesystem,
+    RealFilesystem,
+)
 from hyperscale.logging.queue import (
     ConsumerStatus,
     LogConsumer,
@@ -38,6 +42,7 @@ from hyperscale.logging.queue import (
 from hyperscale.logging.snowflake import SnowflakeGenerator
 
 from .protocol import LoggerProtocol
+from .regular_file_stream_writer import RegularFileStreamWriter
 from .retention_policy import (
     RetentionPolicy,
     RetentionPolicyConfig,
@@ -49,6 +54,17 @@ BINARY_HEADER_SIZE_V1 = 16
 BINARY_HEADER_SIZE = 24
 DEFAULT_QUEUE_MAX_SIZE = 10000
 DEFAULT_BATCH_MAX_SIZE = 100
+# FSYNC_BATCH: the longest the first entry of a batch waits before its batch
+# is synced, so an entry's durability latency is at most this plus one
+# flush. Established group-commit practice bounds an added batching delay to
+# the order of one flush: PostgreSQL's commit_delay guidance is half the
+# flush time pg_test_fsync measures, Kafka's producer linger.ms defaults to
+# 5 ms (4.0, KIP-1030). Rotational and networked-volume flushes run 10-20 ms,
+# the slowest substrate a stream must run on without assuming its disk, so
+# 10 ms gathers about one such flush's arrivals into a batch while keeping
+# durability latency within two flushes there. Latency-critical callers use
+# DurabilityMode.FSYNC.
+DEFAULT_BATCH_TIMEOUT_MS = 10.0
 
 try:
     import uvloop as uvloop
@@ -57,6 +73,13 @@ try:
 
 except Exception:
     has_uvloop = False
+
+
+# Module-level storage seam (Phase 7). Streams BORROW this (or an
+# injected instance) — they never shut the filesystem down.
+# ``swap_defaults`` walks the ``hyperscale.logging`` prefix and
+# rebinds it to the SIM filesystem.
+_DEFAULT_FILESYSTEM: Filesystem = RealFilesystem()
 
 
 def patch_transport_close(
@@ -85,7 +108,7 @@ class LoggerStream:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -95,6 +118,8 @@ class LoggerStream:
         instance_id: int = 0,
         queue_max_size: int = DEFAULT_QUEUE_MAX_SIZE,
         batch_max_size: int = DEFAULT_BATCH_MAX_SIZE,
+        batch_timeout_ms: float = DEFAULT_BATCH_TIMEOUT_MS,
+        filesystem: Filesystem | None = None,
     ) -> None:
         self._name = name if name is not None else "default"
         self._default_template = template
@@ -107,11 +132,17 @@ class LoggerStream:
             self._default_retention_policy.parse()
 
         self._init_lock = asyncio.Lock()
-        self._stream_writers: Dict[StreamType, asyncio.StreamWriter] = {}
+        self._stream_writers: Dict[
+            StreamType, asyncio.StreamWriter | RegularFileStreamWriter
+        ] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._compressor: zstandard.ZstdCompressor | None = None
 
-        self._files: Dict[str, io.FileIO] = {}
+        # Borrowed, never shut down here — see _DEFAULT_FILESYSTEM.
+        self._filesystem = (
+            filesystem if filesystem is not None else _DEFAULT_FILESYSTEM
+        )
+        self._files: Dict[str, FileHandle] = {}
         self._file_locks: Dict[str, asyncio.Lock] = {}
         self._cwd: str | None = None
         self._default_logfile_path: str | None = None
@@ -128,7 +159,7 @@ class LoggerStream:
         self._stdout: io.TextIOBase | None = None
         self._transports: List[asyncio.Transport] = []
 
-        self._models: Dict[str, Callable[..., Entry]] = {}
+        self._models: dict[str, tuple[type[Entry], dict[str, object]]] = {}
         self._queue: asyncio.Queue[asyncio.Future[None]] = asyncio.Queue(
             maxsize=queue_max_size
         )
@@ -156,12 +187,12 @@ class LoggerStream:
 
         self._pending_batch: list[tuple[str, asyncio.Future[None]]] = []
         self._batch_lock: asyncio.Lock | None = None
-        self._batch_timeout_ms: int = 10
+        self._batch_timeout_ms: float = batch_timeout_ms
         self._batch_max_size: int = batch_max_size
         self._batch_timer_handle: asyncio.TimerHandle | None = None
         self._batch_flush_task: asyncio.Task[None] | None = None
 
-        self._read_files: Dict[str, io.FileIO] = {}
+        self._read_files: Dict[str, FileHandle] = {}
         self._read_locks: Dict[str, asyncio.Lock] = {}
 
     @property
@@ -210,8 +241,24 @@ class LoggerStream:
         if self._stdout is None or self._stdout.closed:
             self._stdout = await self._dup_stdout()
 
+        self._stream_writers[StreamType.STDOUT] = await self._create_stream_writer(
+            self._stdout
+        )
+
+    async def _create_stream_writer(
+        self, stream_file: io.TextIOWrapper
+    ) -> asyncio.StreamWriter | RegularFileStreamWriter:
+        """A writer for a duplicated standard stream: asyncio's pipe
+        transport for a pipe, socket or terminal, or a buffered off-loop
+        writer for a regular file, which the pipe transport rejects."""
+        file_mode = (
+            await self._loop.run_in_executor(None, os.fstat, stream_file.fileno())
+        ).st_mode
+        if stat.S_ISREG(file_mode):
+            return RegularFileStreamWriter(stream_file.fileno(), self._loop)
+
         transport, protocol = await self._loop.connect_write_pipe(
-            lambda: LoggerProtocol(), self._stdout
+            lambda: LoggerProtocol(), stream_file
         )
 
         if has_uvloop:
@@ -220,7 +267,7 @@ class LoggerStream:
             except Exception:
                 pass
 
-        self._stream_writers[StreamType.STDOUT] = asyncio.StreamWriter(
+        return asyncio.StreamWriter(
             transport,
             protocol,
             None,
@@ -240,21 +287,8 @@ class LoggerStream:
         if self._stderr is None or self._stderr.closed:
             self._stderr = await self._dup_stderr()
 
-        transport, protocol = await self._loop.connect_write_pipe(
-            lambda: LoggerProtocol(), self._stderr
-        )
-
-        if has_uvloop:
-            try:
-                transport.close = patch_transport_close(transport, self._loop)
-            except Exception:
-                pass
-
-        self._stream_writers[StreamType.STDERR] = asyncio.StreamWriter(
-            transport,
-            protocol,
-            None,
-            self._loop,
+        self._stream_writers[StreamType.STDERR] = await self._create_stream_writer(
+            self._stderr
         )
 
     def _get_file_lock(self, logfile_path: str) -> asyncio.Lock:
@@ -275,14 +309,14 @@ class LoggerStream:
         retention_policy: RetentionPolicyConfig | None = None,
     ):
         if self._cwd is None:
-            self._cwd = await self._loop.run_in_executor(None, os.getcwd)
+            self._cwd = os.getcwd()
 
         logfile_path = self._to_logfile_path(filename, directory=directory)
         file_lock = self._get_file_lock(logfile_path)
 
         await file_lock.acquire()
         try:
-            await self._loop.run_in_executor(None, self._open_file, logfile_path)
+            await self._open_file(logfile_path)
         finally:
             file_lock.release()
 
@@ -294,46 +328,39 @@ class LoggerStream:
         if is_default:
             self._default_logfile_path = logfile_path
 
-    def _open_file(self, logfile_path: str):
+    async def _open_file(self, logfile_path: str):
         resolved_path = pathlib.Path(logfile_path).absolute().resolve()
-        logfile_directory = str(resolved_path.parent)
         path = str(resolved_path)
 
-        if not os.path.exists(logfile_directory):
-            os.makedirs(logfile_directory)
-
-        if not os.path.exists(path):
-            resolved_path.touch()
-
-        self._files[logfile_path] = open(path, "ab+")
+        await self._filesystem.mkdir(
+            resolved_path.parent, parents=True, exist_ok=True
+        )
+        # "ab+" creates the file when absent — no separate touch.
+        self._files[logfile_path] = await self._filesystem.open(path, "ab+")
 
     async def _rotate(self, logfile_path: str, retention_policy: RetentionPolicy):
         file_lock = self._get_file_lock(logfile_path)
 
         await file_lock.acquire()
         try:
-            await self._loop.run_in_executor(
-                None,
-                self._rotate_logfile,
-                retention_policy,
-                logfile_path,
-            )
+            await self._rotate_logfile(retention_policy, logfile_path)
         finally:
             file_lock.release()
 
-    def _get_logfile_metadata(self, logfile_path: str) -> Dict[str, float]:
+    async def _get_logfile_metadata(self, logfile_path: str) -> Dict[str, float]:
         resolved_path = pathlib.Path(logfile_path)
         logfile_metadata_path = os.path.join(
             str(resolved_path.parent.absolute().resolve()), ".logging.json"
         )
 
-        if not os.path.exists(logfile_metadata_path):
+        if not await self._filesystem.exists(logfile_metadata_path):
             return {}
 
-        with open(logfile_metadata_path, "rb") as metadata_file:
-            return msgspec.json.decode(metadata_file.read())
+        return msgspec.json.decode(
+            await self._filesystem.read_bytes(logfile_metadata_path)
+        )
 
-    def _update_logfile_metadata(
+    async def _update_logfile_metadata(
         self,
         logfile_path: str,
         logfile_metadata: Dict[str, float],
@@ -343,10 +370,13 @@ class LoggerStream:
             str(resolved_path.parent.absolute().resolve()), ".logging.json"
         )
 
-        with open(logfile_metadata_path, "wb") as metadata_file:
-            metadata_file.write(msgspec.json.encode(logfile_metadata))
+        # atomic_write (vs the previous plain overwrite): a torn
+        # metadata json crashed the next rotation's decode.
+        await self._filesystem.atomic_write(
+            logfile_metadata_path, msgspec.json.encode(logfile_metadata)
+        )
 
-    def _rotate_logfile(
+    async def _rotate_logfile(
         self,
         retention_policy: RetentionPolicy,
         logfile_path: str,
@@ -354,7 +384,7 @@ class LoggerStream:
         resolved_path = pathlib.Path(logfile_path)
         path = str(resolved_path.absolute().resolve())
 
-        logfile_metadata = self._get_logfile_metadata(logfile_path)
+        logfile_metadata = await self._get_logfile_metadata(logfile_path)
 
         current_time = datetime.datetime.now(datetime.UTC)
         current_timestamp = current_time.timestamp()
@@ -366,23 +396,22 @@ class LoggerStream:
                 current_time
                 - datetime.datetime.fromtimestamp(created_time, datetime.UTC)
             ).seconds,
-            "file_size": os.path.getsize(logfile_path),
+            "file_size": await self._filesystem.file_size(logfile_path),
             "logfile_path": resolved_path,
         }
 
         if retention_policy.matches_policy(policy_data):
             logfile_metadata[logfile_path] = created_time
-            self._update_logfile_metadata(logfile_path, logfile_metadata)
+            await self._update_logfile_metadata(logfile_path, logfile_metadata)
             return
 
-        self._files[logfile_path].close()
+        await self._files[logfile_path].close()
 
-        with open(logfile_path, "rb") as logfile:
-            logfile_data = logfile.read()
+        logfile_data = await self._filesystem.read_bytes(logfile_path)
 
         if len(logfile_data) == 0:
             logfile_metadata[logfile_path] = created_time
-            self._update_logfile_metadata(logfile_path, logfile_metadata)
+            await self._update_logfile_metadata(logfile_path, logfile_metadata)
             return
 
         archived_filename = f"{resolved_path.stem}_{current_timestamp}_archived.zst"
@@ -391,15 +420,32 @@ class LoggerStream:
             archived_filename,
         )
 
-        with open(archive_path, "wb") as archived_file:
-            archived_file.write(self._compressor.compress(logfile_data))
+        # Compression is CPU work, kept off-loop on the default
+        # executor exactly as before. NOTE: this is the one executor
+        # dependency left in the stream — under SIM (where executors
+        # are banned) rotation therefore requires logging to run
+        # without retention policies, and violating that fails LOUDLY
+        # via SimulationConstraintError rather than silently.
+        compressed = await self._loop.run_in_executor(
+            None, self._compressor.compress, logfile_data
+        )
+        await self._filesystem.atomic_write(archive_path, compressed)
 
-        self._files[logfile_path] = open(path, "wb+")
+        self._files[logfile_path] = await self._filesystem.open(path, "wb+")
 
         logfile_metadata[logfile_path] = current_timestamp
-        self._update_logfile_metadata(logfile_path, logfile_metadata)
+        await self._update_logfile_metadata(logfile_path, logfile_metadata)
 
     async def close(self, shutdown_subscribed: bool = False):
+        # A stream that never built its pipeline — ``initialize`` under
+        # the global disable flag marks it initialized without creating a
+        # consumer, provider, or writers — has nothing to close. Guarding
+        # on state (not on the config flag) also keeps a stream that was
+        # *enabled* at setup closing normally even if logging was
+        # disabled midway through its lifetime.
+        if self._consumer is None:
+            return
+
         self._closing = True
 
         await self._stop_consumer(shutdown_subscribed)
@@ -451,11 +497,35 @@ class LoggerStream:
         if not self._pending_batch or not self._batch_lock:
             return
 
+        # Closing still syncs what is pending before it says so.
         async with self._batch_lock:
-            for _, future in self._pending_batch:
-                if not future.done():
-                    future.set_result(None)
-            self._pending_batch.clear()
+            await self._sync_pending_batch()
+
+    async def _sync_pending_batch(self) -> None:
+        """Fsync every file the pending batch wrote to, then resolve each
+        waiter with its own file's outcome; the batch is cleared either
+        way. Called holding the batch lock."""
+        pending_batch = list(self._pending_batch)
+        self._pending_batch.clear()
+        sync_errors: dict[str, Exception] = {}
+        for logfile_path in dict.fromkeys(path for path, _ in pending_batch):
+            logfile = self._files.get(logfile_path)
+            if logfile is None or logfile.closed:
+                continue
+            try:
+                await self._filesystem.fsync(logfile)
+            except Exception as sync_error:
+                sync_errors[logfile_path] = WALWriteError(
+                    f"Failed to fsync WAL file '{logfile_path}': {sync_error}"
+                )
+                sync_errors[logfile_path].__cause__ = sync_error
+        for logfile_path, future in pending_batch:
+            if future.done():
+                continue
+            if (sync_error := sync_errors.get(logfile_path)) is not None:
+                future.set_exception(sync_error)
+            else:
+                future.set_result(None)
 
     async def _close_all_files(self) -> None:
         await asyncio.gather(
@@ -471,7 +541,7 @@ class LoggerStream:
         for logfile_path, logfile in self._files.items():
             if logfile and not logfile.closed:
                 try:
-                    logfile.close()
+                    logfile.close_sync()
                 except Exception:
                     pass
 
@@ -493,7 +563,7 @@ class LoggerStream:
         directory: str | None = None,
     ):
         if self._cwd is None:
-            self._cwd = await self._loop.run_in_executor(None, os.getcwd)
+            self._cwd = os.getcwd()
 
         logfile_path = self._to_logfile_path(filename, directory=directory)
         await self._close_file(logfile_path)
@@ -505,15 +575,11 @@ class LoggerStream:
 
         await file_lock.acquire()
         try:
-            await self._loop.run_in_executor(
-                None,
-                self._close_file_at_path,
-                logfile_path,
-            )
+            await self._close_file_at_path(logfile_path)
 
             read_file = self._read_files.get(logfile_path)
             if read_file and not read_file.closed:
-                await self._loop.run_in_executor(None, read_file.close)
+                await read_file.close()
         finally:
             file_lock.release()
 
@@ -522,10 +588,10 @@ class LoggerStream:
         self._read_files.pop(logfile_path, None)
         self._read_locks.pop(logfile_path, None)
 
-    def _close_file_at_path(self, logfile_path: str):
+    async def _close_file_at_path(self, logfile_path: str):
         logfile = self._files.get(logfile_path)
         if logfile and not logfile.closed:
-            logfile.close()
+            await logfile.close()
 
     def _to_logfile_path(
         self,
@@ -647,7 +713,7 @@ class LoggerStream:
         if not entries:
             return
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 self.log(
                     entry,
@@ -660,6 +726,8 @@ class LoggerStream:
             ],
             return_exceptions=True,
         )
+        if failures := [result for result in results if isinstance(result, BaseException)]:
+            raise BaseExceptionGroup("batched log writes failed", failures)
 
     async def batch(
         self,
@@ -672,7 +740,7 @@ class LoggerStream:
         if not entries:
             return
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 self.log(
                     entry,
@@ -685,6 +753,8 @@ class LoggerStream:
             ],
             return_exceptions=True,
         )
+        if failures := [result for result in results if isinstance(result, BaseException)]:
+            raise BaseExceptionGroup("batched log writes failed", failures)
 
     async def log_prepared(
         self,
@@ -812,13 +882,13 @@ class LoggerStream:
         log_file: str,
         line_number: int,
         function_name: str,
-        stream_writer: asyncio.StreamWriter,
+        stream_writer: asyncio.StreamWriter | RegularFileStreamWriter,
     ) -> None:
         context = {
             "filename": log_file,
             "function_name": function_name,
             "line_number": line_number,
-            "thread_id": threading.get_native_id(),
+            "thread_id": os.getpid(),
             "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         }
 
@@ -847,7 +917,7 @@ class LoggerStream:
             "function_name": function_name,
             "line_number": line_number,
             "error": str(err),
-            "thread_id": threading.get_native_id(),
+            "thread_id": os.getpid(),
             "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         }
 
@@ -894,7 +964,7 @@ class LoggerStream:
         self, filename: str | None, directory: str | None
     ) -> str:
         if self._cwd is None:
-            self._cwd = await self._loop.run_in_executor(None, os.getcwd)
+            self._cwd = os.getcwd()
 
         if filename and directory:
             return self._to_logfile_path(filename, directory=directory)
@@ -938,9 +1008,7 @@ class LoggerStream:
 
         await file_lock.acquire()
         try:
-            await self._loop.run_in_executor(
-                None,
-                self._write_to_file,
+            await self._write_to_file(
                 log,
                 logfile_path,
                 lsn,
@@ -959,12 +1027,13 @@ class LoggerStream:
             file_lock.release()
 
         if self._durability == DurabilityMode.FSYNC_BATCH:
-            await self._schedule_batch_fsync(logfile_path)
+            # Durable when the batch holding it has synced, not before.
+            await (await self._schedule_batch_fsync(logfile_path))
 
         await asyncio.sleep(0)
         return lsn
 
-    def _write_to_file(
+    async def _write_to_file(
         self,
         log: Log[T],
         logfile_path: str,
@@ -979,8 +1048,16 @@ class LoggerStream:
 
         data = self._encode_log(log, lsn)
 
-        logfile.write(data)
-        self._sync_file(logfile, durability)
+        # DurabilityMode maps onto one write_flush unit: NONE writes
+        # only, FLUSH / FSYNC_BATCH flush to the OS, FSYNC also
+        # fsyncs — a single off-loop job either way, the same hop
+        # count as the previous executor-run _write_to_file.
+        await self._filesystem.write_flush(
+            logfile,
+            data,
+            flush=durability != DurabilityMode.NONE,
+            fsync=durability == DurabilityMode.FSYNC,
+        )
 
     async def _generate_lsn(self, log: Log[T]) -> int | None:
         if not self._enable_lsn:
@@ -1005,16 +1082,6 @@ class LoggerStream:
             return self._encode_binary(log, lsn)
 
         return msgspec.json.encode(log) + b"\n"
-
-    def _sync_file(self, logfile: io.FileIO, durability: DurabilityMode) -> None:
-        match durability:
-            case DurabilityMode.NONE:
-                pass
-            case DurabilityMode.FLUSH | DurabilityMode.FSYNC_BATCH:
-                logfile.flush()
-            case DurabilityMode.FSYNC:
-                logfile.flush()
-                os.fsync(logfile.fileno())
 
     def _encode_binary(self, log: Log[T], lsn: int | None) -> bytes:
         payload = msgspec.json.encode(log)
@@ -1084,7 +1151,7 @@ class LoggerStream:
             filename=code.co_filename,
             function_name=code.co_name,
             line_number=frame.f_lineno,
-            thread_id=threading.get_native_id(),
+            thread_id=os.getpid(),
             timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
         )
 
@@ -1109,13 +1176,10 @@ class LoggerStream:
         logfile_path: str,
         from_offset: int,
     ) -> AsyncIterator[tuple[int, Log[T], int | None]]:
-        read_file = await self._loop.run_in_executor(
-            None,
-            functools.partial(open, logfile_path, "rb"),
-        )
+        read_file = await self._filesystem.open(logfile_path, "rb")
 
         try:
-            await self._loop.run_in_executor(None, read_file.seek, from_offset)
+            await read_file.seek(from_offset)
             offset = from_offset
             entries_yielded = 0
 
@@ -1132,10 +1196,10 @@ class LoggerStream:
                 if entries_yielded % 100 == 0:
                     await asyncio.sleep(0)
         finally:
-            await self._loop.run_in_executor(None, read_file.close)
+            await read_file.close()
 
     async def _read_single_entry(
-        self, read_file: io.FileIO, offset: int
+        self, read_file: FileHandle, offset: int
     ) -> tuple[int, Log[T], int | None, int] | None:
         if self._log_format == "binary":
             return await self._read_binary_entry(read_file, offset)
@@ -1143,11 +1207,9 @@ class LoggerStream:
         return await self._read_json_entry(read_file, offset)
 
     async def _read_binary_entry(
-        self, read_file: io.FileIO, offset: int
+        self, read_file: FileHandle, offset: int
     ) -> tuple[int, Log[T], int | None, int] | None:
-        header = await self._loop.run_in_executor(
-            None, read_file.read, BINARY_HEADER_SIZE
-        )
+        header = await read_file.read(BINARY_HEADER_SIZE)
 
         if len(header) == 0:
             return None
@@ -1156,7 +1218,7 @@ class LoggerStream:
             raise ValueError(f"Truncated header at offset {offset}")
 
         length = struct.unpack("<I", header[4:8])[0]
-        payload = await self._loop.run_in_executor(None, read_file.read, length)
+        payload = await read_file.read(length)
 
         if len(payload) < length:
             raise ValueError(f"Truncated payload at offset {offset}")
@@ -1167,15 +1229,15 @@ class LoggerStream:
         return offset, log, lsn, entry_size
 
     async def _read_json_entry(
-        self, read_file: io.FileIO, offset: int
+        self, read_file: FileHandle, offset: int
     ) -> tuple[int, Log[T], int | None, int] | None:
-        line = await self._loop.run_in_executor(None, read_file.readline)
+        line = await read_file.readline()
 
         if not line:
             return None
 
         log = msgspec.json.decode(line.rstrip(b"\n"), type=Log)
-        new_offset = await self._loop.run_in_executor(None, read_file.tell)
+        new_offset = read_file.tell()
         entry_size = new_offset - offset
 
         return offset, log, log.lsn, entry_size
@@ -1275,12 +1337,4 @@ class LoggerStream:
                 self._batch_timer_handle.cancel()
                 self._batch_timer_handle = None
 
-            logfile = self._files.get(logfile_path)
-            if logfile and not logfile.closed:
-                await self._loop.run_in_executor(None, os.fsync, logfile.fileno())
-
-            for _, future in self._pending_batch:
-                if not future.done():
-                    future.set_result(None)
-
-            self._pending_batch.clear()
+            await self._sync_pending_batch()

@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+
+from hyperscale.core.jobs.protocols.node_id_derivation import (
+    derive_protocol_node_id,
+)
 import inspect
 import pickle
 import signal
 import socket
-import ssl
-import time
-import uuid
 from collections import defaultdict, deque
 from typing import (
     Any,
-    AsyncIterable,
     Awaitable,
     Callable,
     Coroutine,
@@ -26,6 +26,8 @@ from typing import (
 
 import cloudpickle
 import zstandard
+
+from hyperscale.core.runtime import TransportFactory
 
 from .constants import MAX_DECOMPRESSED_SIZE
 from hyperscale.core.engines.client.time_parser import TimeParser
@@ -67,9 +69,33 @@ class UDPProtocol(Generic[T, K]):
         host: str,
         port: int,
         env: Env,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+        transport_factory: TransportFactory | None = None,
+        owns_process_signals: bool = True,
     ) -> None:
-        self._node_id_base = uuid.uuid4().int >> 64
+        self._node_id_base = derive_protocol_node_id(host, port)
         self.node_id: int | None = None
+
+        # Phase 6 SIM seam. ``transport_factory`` is ``None`` in REAL
+        # mode — this server binds a real UDP socket and installs signal
+        # handlers exactly as before. Under SIM a transport factory (the
+        # multi-process ``CrossProcessTransport`` for a worker-pool
+        # executor, or the single-process ``InProcessTransport``) routes
+        # the datagram endpoint with no socket, no signal handlers, no
+        # ``run_in_executor``; ``loop`` pins the server to the caller's
+        # ``SimulationLoop``. Multi-process is preserved: each executor
+        # still runs in its own OS process — the factory only replaces
+        # the kernel-socket byte transit with the deterministic
+        # coordinator boundary.
+        self._transport_factory = transport_factory
+        # Whether this server claims SIGINT/SIGTERM for its own abort: not
+        # under SIM, and not when a host owns them and aborts this server
+        # as part of aborting itself (``owns_process_signals`` False, as in
+        # a `hyperscale run worker` node) -- a loop keeps one handler per
+        # signal, so claiming them would turn the host's Ctrl-C into an
+        # abort of this server alone.
+        self._claims_process_signals = owns_process_signals and transport_factory is None
 
         self._logger = Logger()
 
@@ -82,23 +108,22 @@ class UDPProtocol(Generic[T, K]):
 
         self._events: Dict[str, Coroutine] = {}
 
-        self.queue: Dict[str, Deque[Tuple[int, float, Any]]] = defaultdict(deque)
         self.tasks: TaskRunner | None = None
         self.connected = False
         self._running = False
 
         self._transport: asyncio.DatagramTransport = None
-        self._loop: Union[asyncio.AbstractEventLoop, None] = None
-        self.queue: Dict[str, Deque[Tuple[str, int, float, Any]]] = defaultdict(deque)
+        # Under SIM the loop is injected so lazy ``get_event_loop`` never
+        # resolves the wrong (non-simulation) loop; REAL leaves it None
+        # and resolves lazily exactly as before.
+        self._loop: Union[asyncio.AbstractEventLoop, None] = loop
         self._waiters: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        # One waiter per send() in flight, by the id its reply echoes.
+        self._request_waiters: Dict[int, asyncio.Future] = {}
         self._pending_responses: Deque[asyncio.Task] = deque()
-        self._last_call: Deque[str] = deque()
 
         self._sent_values = deque()
 
-        self._udp_cert_path: Union[str, None] = None
-        self._udp_key_path: Union[str, None] = None
-        self._udp_ssl_context: Union[ssl.SSLContext, None] = None
         self._request_timeout = TimeParser(env.MERCURY_SYNC_REQUEST_TIMEOUT).time
 
         self._encryptor = AESGCMFernet(env)
@@ -163,7 +188,12 @@ class UDPProtocol(Generic[T, K]):
         worker_socket: socket.socket | None = None,
         worker_server: asyncio.DatagramTransport | None = None,
     ):
-        if not self._abort_handle_created:
+        if self._loop is None:
+            self._loop = asyncio.get_event_loop()
+
+        # Signal handlers are process-global and need a real loop
+        # selector — skip under SIM (see start_server).
+        if self._claims_process_signals and not self._abort_handle_created:
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(
@@ -175,14 +205,11 @@ class UDPProtocol(Generic[T, K]):
 
             self._abort_handle_created = True
 
-        if self._loop is None:
-            self._loop = asyncio.get_event_loop()
-
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
 
         if self.node_id is None:
-            self.node_id = uuid.uuid4().int >> 64
+            self.node_id = derive_protocol_node_id(self.host, self.port)
 
         if self.id_generator is None:
             self.id_generator = SnowflakeGenerator(self.node_id)
@@ -196,14 +223,11 @@ class UDPProtocol(Generic[T, K]):
         if self._decompressor is None:
             self._decompressor = zstandard.ZstdDecompressor()
 
-        if cert_path and key_path:
-            self._udp_ssl_context = self._create_udp_ssl_context(
-                cert_path=cert_path,
-                key_path=key_path,
-            )
-
         instance_id: int | None = None
-        start_time = time.monotonic()
+        # Loop time, not wall time: identical on a real loop (loop.time
+        # IS the monotonic clock) and virtual under SIM, so the connect
+        # budget follows the simulated timeline instead of host load.
+        start_time = self._loop.time()
         attempt = 0
 
         # Connect retry with exponential backoff
@@ -214,7 +238,7 @@ class UDPProtocol(Generic[T, K]):
         max_interval = 5.0  # Cap retry interval
 
         while True:
-            elapsed = time.monotonic() - start_time
+            elapsed = self._loop.time() - start_time
             if elapsed >= self._max_connect_time:
                 raise TimeoutError(
                     f"Failed to connect to {address} after {self._max_connect_time}s ({attempt} attempts)"
@@ -232,23 +256,41 @@ class UDPProtocol(Generic[T, K]):
             attempt_timeout = min(base_timeout * (1.5 ** min(attempt, 5)), max_timeout)
             retry_interval = min(base_interval * (1.5 ** min(attempt, 5)), max_interval)
 
+            # The attempt's own name, which the peer echoes in its reply
+            # (every node version does): it routes that reply, and only that
+            # reply, to this attempt. A late reply to an earlier attempt, or
+            # another node's, carries another name.
+            connect_name = f"connect:{self.id_generator.generate()}"
+
             try:
-                result: Tuple[int, Message[None]] = await asyncio.wait_for(
-                    self.send(
-                        None,
-                        None,
-                        target_address=address,
-                        request_type="connect",
-                    ),
-                    timeout=attempt_timeout,
-                )
+                try:
+                    result: Tuple[int, Message[None]] = await asyncio.wait_for(
+                        self.send(
+                            connect_name,
+                            None,
+                            target_address=address,
+                            request_type="connect",
+                        ),
+                        timeout=attempt_timeout,
+                    )
+
+                finally:
+                    # The name served this one attempt: its waiters go with it.
+                    self._waiters.pop(connect_name, None)
 
                 shard_id, response = result
 
                 # Use full 64-bit node_id from message instead of 10-bit snowflake instance
                 instance_id = response.node_id
 
-                self._node_host_map[instance_id] = address
+                # The responder's own address, not the one dialed: every
+                # concurrent connect waits on one reply queue, so this reply
+                # can answer another call's request, and recording it against
+                # the address dialed here would swap two nodes' addresses.
+                self._node_host_map[instance_id] = (
+                    response.service_host,
+                    response.service_port,
+                )
                 self._nodes.put_no_wait(instance_id)
 
                 # Successfully connected
@@ -257,7 +299,7 @@ class UDPProtocol(Generic[T, K]):
             except (Exception, asyncio.CancelledError, socket.error, OSError):
                 attempt += 1
                 # Don't sleep if we've exceeded the max time
-                remaining = self._max_connect_time - (time.monotonic() - start_time)
+                remaining = self._max_connect_time - (self._loop.time() - start_time)
                 if remaining > 0:
                     await asyncio.sleep(min(retry_interval, remaining))
 
@@ -305,7 +347,11 @@ class UDPProtocol(Generic[T, K]):
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
 
-        if not self._abort_handle_created:
+        # Signal handlers are process-global and rely on a real loop
+        # selector — banned and meaningless under SIM (the coordinator,
+        # not signals, drives shutdown). Skip when running under a
+        # transport factory.
+        if self._claims_process_signals and not self._abort_handle_created:
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(
@@ -388,10 +434,22 @@ class UDPProtocol(Generic[T, K]):
             for task in tasks.values():
                 self.tasks.add(task)
 
-        if cert_path and key_path:
-            self._server_ssl_context = self._create_udp_ssl_context(
-                cert_path=cert_path, key_path=key_path
+        # Datagrams carry no TLS -- Python's ssl has no DTLS -- and are
+        # encrypted at the message layer (AES-GCM) instead; ``cert_path``
+        # and ``key_path`` configure the TCP side of a node.
+        if self._transport_factory is not None:
+            # SIM: register the datagram endpoint with the transport
+            # factory (cross-process coordinator boundary, or in-process
+            # registry) instead of binding a real UDP socket.
+            # ``register_datagram_endpoint`` fires ``connection_made`` and
+            # returns the send transport. No socket, no ``run_in_executor``
+            # bind, no fileno cleanup loop (that cleanup polls a real
+            # socket, which does not exist here).
+            self._transport = self._transport_factory.register_datagram_endpoint(
+                (self.host, self.port), UDPSocketProtocol(self.read)
             )
+            self.connected = True
+            return
 
         run_start = True
 
@@ -462,10 +520,10 @@ class UDPProtocol(Generic[T, K]):
                     run_start = False
                     self.connected = True
 
-            except (Exception, asyncio.CancelledError, socket.error, OSError):
-                pass
-
-            await asyncio.sleep(self._retry_interval)
+            except (Exception, socket.error, OSError):
+                # Only a failed attempt waits before retrying; cancellation
+                # is not a failed attempt and propagates.
+                await asyncio.sleep(self._retry_interval)
 
         default_config = {
             "node_id": self._node_id_base,
@@ -509,32 +567,6 @@ class UDPProtocol(Generic[T, K]):
             if task.trigger == "ON_START":
                 self.tasks.run(task.name)
 
-    def _create_udp_ssl_context(
-        self,
-        cert_path: str | None = None,
-        key_path: str | None = None,
-    ) -> ssl.SSLContext:
-        if self._udp_cert_path is None:
-            self._udp_cert_path = cert_path
-
-        if self._udp_key_path is None:
-            self._udp_key_path = key_path
-
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS)
-        ssl_ctx.options |= ssl.OP_NO_TLSv1
-        ssl_ctx.options |= ssl.OP_NO_TLSv1_1
-        ssl_ctx.options |= ssl.OP_SINGLE_DH_USE
-        ssl_ctx.options |= ssl.OP_SINGLE_ECDH_USE
-        ssl_ctx.load_cert_chain(cert_path, keyfile=key_path)
-        ssl_ctx.load_verify_locations(cafile=cert_path)
-        # Hostname verification: disabled by default for local testing,
-        # set MERCURY_SYNC_TLS_VERIFY_HOSTNAME=true in production
-        ssl_ctx.check_hostname = self.env.MERCURY_SYNC_TLS_VERIFY_HOSTNAME.lower() == "true"
-        ssl_ctx.verify_mode = ssl.VerifyMode.CERT_REQUIRED
-        ssl_ctx.set_ciphers("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")
-
-        return ssl_ctx
-
     async def _cleanup(self):
         while self._running:
             self._sleep_task = asyncio.create_task(
@@ -543,17 +575,31 @@ class UDPProtocol(Generic[T, K]):
 
             await self._sleep_task
 
-            for pending in list(self._pending_responses):
-                if pending.done() or pending.cancelled():
-                    try:
-                        await pending
+            # Keep the futures still running; let go of the finished ones --
+            # exactly those (popping from the right, as this did, dropped a
+            # running future and kept a finished one) -- and log the
+            # failures they hold rather than discarding them.
+            finished = [pending for pending in self._pending_responses if pending.done()]
+            if not finished:
+                continue
 
-                    except (Exception, socket.error):
-                        # await self._reset_connection()
-                        pass
+            self._pending_responses = deque(
+                pending for pending in self._pending_responses if not pending.done()
+            )
+            for pending in finished:
+                if pending.cancelled() or (pending_error := pending.exception()) is None:
+                    continue
 
-                    if len(self._pending_responses) > 0:
-                        self._pending_responses.pop()
+                async with self._logger.context(
+                    name=f"graph_server_{self._node_id_base}"
+                ) as ctx:
+                    await ctx.log_prepared(
+                        message=(
+                            f"Node {self._node_id_base} at {self.host}:{self.port} failed "
+                            f"handling a message ({type(pending_error).__name__}): {pending_error}"
+                        ),
+                        name="error",
+                    )
 
     async def _sendto_with_retry(
         self,
@@ -581,18 +627,29 @@ class UDPProtocol(Generic[T, K]):
         target_address: Tuple[str, int] | None = None,
         request_type: Literal["request", "connect"] | None = None,
     ) -> Tuple[int, K]:
-        self._last_call.append(target)
-
-        if node_id is None:
-            node_id = await self._nodes.get()
-
-        address = self._node_host_map.get(node_id)
-
-        if address is None and target_address:
+        if request_type == "connect":
+            # A connect goes to the address dialed, never to a node already
+            # known; its reply carries its own name, so it takes no part in
+            # guessing a nameless reply's request.
             address = target_address
+
+        else:
+            if node_id is None:
+                node_id = await self._nodes.get()
+
+            address = self._node_host_map.get(node_id)
+
+            if address is None and target_address:
+                address = target_address
 
         if request_type is None:
             request_type = "request"
+
+        # The request's id, which the server echoes in its reply: that reply,
+        # and no other request's, completes this one -- however many requests
+        # to the same target are in flight. Every attempt carries it, so a
+        # late reply to an earlier attempt still answers this request.
+        request_id = self.id_generator.generate()
 
         # Build message once - we'll regenerate shard_id on each retry
         message = Message(
@@ -601,6 +658,7 @@ class UDPProtocol(Generic[T, K]):
             data=data,
             service_host=self.host,
             service_port=self.port,
+            request_id=request_id,
         )
 
         for attempt in range(self._retries + 1):
@@ -617,9 +675,13 @@ class UDPProtocol(Generic[T, K]):
             encrypted_message = self._encryptor.encrypt(item)
             compressed = self._compressor.compress(encrypted_message)
 
+            waiter = self._loop.create_future()
+            self._request_waiters[request_id] = waiter
+
             try:
                 await self._sendto_with_retry(compressed, address)
             except BlockingIOError:
+                self._request_waiters.pop(request_id, None)
                 # Socket buffer full after all retries - return error response
                 return (
                     self.id_generator.generate(),
@@ -633,9 +695,6 @@ class UDPProtocol(Generic[T, K]):
                 )
 
             try:
-                waiter = self._loop.create_future()
-                self._waiters[target].put_nowait(waiter)
-
                 result: Tuple[int, Message[K]] = await asyncio.wait_for(
                     waiter,
                     timeout=self._request_timeout,
@@ -656,153 +715,14 @@ class UDPProtocol(Generic[T, K]):
                 if attempt < self._retries:
                     await asyncio.sleep(self._retry_interval * (2 ** attempt))
             except Exception:
-                import traceback
-                print(traceback.format_exc())
                 await asyncio.sleep(self._retry_interval)
+
+            finally:
+                # Answered, timed out or cancelled: this attempt's waiter goes.
+                if self._request_waiters.get(request_id) is waiter:
+                    del self._request_waiters[request_id]
 
         return (
-            self.id_generator.generate(),
-            Message(
-                self.node_id,
-                target,
-                service_host=self.host,
-                service_port=self.port,
-                error="Request timed out.",
-            ),
-        )
-
-    async def send_bytes(
-        self,
-        target: str,
-        data: bytes,
-        node_id: int | None = None,
-        target_address: Tuple[str, int] | None = None,
-    ) -> bytes:
-        self._last_call.append(target)
-
-        if node_id is None:
-            node_id = await self._nodes.get()
-
-        address = self._node_host_map.get(node_id)
-
-        if address is None and target_address:
-            address = target_address
-
-        encrypted_message = self._encryptor.encrypt(data)
-        compressed = self._compressor.compress(encrypted_message)
-
-        for attempt in range(self._retries + 1):
-            try:
-                await self._sendto_with_retry(compressed, address)
-            except BlockingIOError:
-                # Socket buffer full after all retries
-                return (self.id_generator.generate(), b"Send failed: socket buffer full.")
-
-            try:
-                waiter = self._loop.create_future()
-                self._waiters[target].put_nowait(waiter)
-
-                result: Tuple[int, bytes] = await asyncio.wait_for(
-                    waiter,
-                    timeout=self._request_timeout,
-                )
-
-                (shard_id, response) = result
-
-                return (shard_id, response)
-
-            except asyncio.TimeoutError:
-                # Worker may not be ready yet - retry with exponential backoff
-                if attempt < self._retries:
-                    await asyncio.sleep(self._retry_interval * (2 ** attempt))
-            except (Exception, socket.error):
-                await asyncio.sleep(self._retry_interval)
-
-        return (self.id_generator.generate(), b"Request timed out.")
-
-    async def stream(
-        self,
-        target: str,
-        data: T,
-        node_id: int | None = None,
-        target_address: Tuple[str, int] | None = None,
-        request_type: Literal["request", "connect"] | None = None,
-    ) -> AsyncIterable[Tuple[int, Dict[str, Any]]]:
-        self._last_call.append(target)
-
-        if node_id is None:
-            node_id = await self._nodes.get()
-
-        address = self._node_host_map.get(node_id)
-
-        if address is None and target_address:
-            address = target_address
-
-        if request_type is None:
-            request_type = "request"
-
-        # Build message once - we'll regenerate shard_id on each retry
-        message = Message(
-            self.node_id,
-            target,
-            data=data,
-            service_host=self.host,
-            service_port=self.port,
-        )
-
-        for attempt in range(self._retries + 1):
-            # Generate new shard_id for each attempt to avoid replay detection
-            item = cloudpickle.dumps(
-                (
-                    request_type,
-                    self.id_generator.generate(),
-                    message,
-                ),
-                pickle.HIGHEST_PROTOCOL,
-            )
-
-            encrypted_message = self._encryptor.encrypt(item)
-            compressed = self._compressor.compress(encrypted_message)
-
-            try:
-                await self._sendto_with_retry(compressed, address)
-            except BlockingIOError:
-                # Socket buffer full after all retries
-                yield (
-                    self.id_generator.generate(),
-                    Message(
-                        self.node_id,
-                        target,
-                        service_host=self.host,
-                        service_port=self.port,
-                        error="Send failed: socket buffer full.",
-                    ),
-                )
-                return
-
-            try:
-                waiter = self._loop.create_future()
-                self._waiters[target].put_nowait(waiter)
-
-                await asyncio.wait_for(waiter, timeout=self._request_timeout)
-
-                for queued_item in self.queue[target]:
-                    (shard_id, response) = queued_item
-
-                    yield (shard_id, response)
-
-                self.queue.clear()
-                return  # Success, exit the retry loop
-
-            except asyncio.TimeoutError:
-                # Worker may not be ready yet - retry with exponential backoff
-                if attempt < self._retries:
-                    await asyncio.sleep(self._retry_interval * (2 ** attempt))
-            except (Exception, socket.error):
-                await asyncio.sleep(self._retry_interval)
-
-        # All retries exhausted
-        yield (
             self.id_generator.generate(),
             Message(
                 self.node_id,
@@ -901,8 +821,6 @@ class UDPProtocol(Generic[T, K]):
             result: Tuple[str, int, Message] = restricted_loads(decrypted)
 
         except (SecurityError, Exception):
-            import traceback
-            print(traceback.format_exc())
             # Sanitized error - don't leak details about what was blocked
             self._pending_responses.append(
                 asyncio.ensure_future(
@@ -991,23 +909,6 @@ class UDPProtocol(Generic[T, K]):
                 )
             )
 
-        elif message_type == "stream":
-            # Inject sender's node_id into JobContext if present
-            stream_data = message.data
-            if isinstance(stream_data, JobContext):
-                stream_data.node_id = message.node_id
-
-            self._pending_responses.append(
-                asyncio.ensure_future(
-                    self._read_iterator(
-                        message.name,
-                        message,
-                        self._events.get(message.name)(shard_id, stream_data),
-                        addr,
-                    )
-                )
-            )
-
         else:
             self._pending_responses.append(
                 asyncio.ensure_future(
@@ -1026,27 +927,52 @@ class UDPProtocol(Generic[T, K]):
         try:
             await self._add_node_from_shard_id(shard_id, message)
 
-            if message.name is None and bool(self._last_call):
-                message.name = self._last_call.pop()
-
-            event_waiter = self._waiters[message.name]
-
-            if bool(event_waiter):
-                waiter: asyncio.Future = await event_waiter.get()
-
-                try:
-                    waiter.set_result(
+            if (request_id := message.request_id) is not None:
+                # A send()'s reply: it completes that request's waiter, if the
+                # request still waits, and nothing else.
+                if (request_waiter := self._request_waiters.pop(request_id, None)) is not None and not request_waiter.done():
+                    request_waiter.set_result(
                         (
                             shard_id,
                             message,
                         )
                     )
 
-                except asyncio.InvalidStateError:
-                    pass
+                return
 
-        except Exception:
-            pass
+            # A reply nothing waits for any more -- a late one to a finished
+            # connect attempt -- finds no waiters and adds no entry for its
+            # name. One with waiters goes, without waiting, to the first that
+            # still waits: a duplicate reply finds none and is dropped,
+            # rather than leaving a task blocked on the queue for good.
+            event_waiter = self._waiters.get(message.name)
+
+            if event_waiter is not None:
+                while not event_waiter.empty():
+                    waiter: asyncio.Future = event_waiter.get_nowait()
+
+                    if not waiter.done():
+                        waiter.set_result(
+                            (
+                                shard_id,
+                                message,
+                            )
+                        )
+
+                        break
+
+        except Exception as response_error:
+            async with self._logger.context(
+                name=f"graph_server_{self._node_id_base}"
+            ) as ctx:
+                await ctx.log_prepared(
+                    message=(
+                        f"Node {self._node_id_base} at {self.host}:{self.port} failed "
+                        f"taking a {message.name} reply ({type(response_error).__name__}): "
+                        f"{response_error}"
+                    ),
+                    name="error",
+                )
 
     async def _return_error(
         self,
@@ -1067,20 +993,19 @@ class UDPProtocol(Generic[T, K]):
 
         try:
             await self._sendto_with_retry(compressed, addr)
-        except BlockingIOError:
-            # Error responses are best-effort, don't propagate failure
-            pass
-
-    async def _reset_connection(self):
-        try:
-            await self.close()
-            await self.start_server(
-                cert_path=self._udp_cert_path,
-                key_path=self._udp_key_path,
-            )
-
-        except Exception:
-            pass
+        except BlockingIOError as send_error:
+            # Error responses are best-effort: the failure is logged, not
+            # raised.
+            async with self._logger.context(
+                name=f"graph_server_{self._node_id_base}"
+            ) as ctx:
+                await ctx.log_prepared(
+                    message=(
+                        f"Node {self._node_id_base} at {self.host}:{self.port} could not "
+                        f"send an error reply to {addr[0]}:{addr[1]}: {send_error}"
+                    ),
+                    name="error",
+                )
 
     async def _read_connect(
         self,
@@ -1099,6 +1024,7 @@ class UDPProtocol(Generic[T, K]):
                     data=None,
                     service_host=self.host,
                     service_port=self.port,
+                    request_id=message.request_id,
                 ),
             ),
             pickle.HIGHEST_PROTOCOL,
@@ -1109,9 +1035,18 @@ class UDPProtocol(Generic[T, K]):
 
         try:
             await self._sendto_with_retry(compressed, addr)
-        except BlockingIOError:
-            # Connect responses are critical but best-effort, log and continue
-            pass
+        except BlockingIOError as send_error:
+            # Connect responses are critical but best-effort: log and go on.
+            async with self._logger.context(
+                name=f"graph_server_{self._node_id_base}"
+            ) as ctx:
+                await ctx.log_prepared(
+                    message=(
+                        f"Node {self._node_id_base} at {self.host}:{self.port} could not "
+                        f"send a connect reply to {addr[0]}:{addr[1]}: {send_error}"
+                    ),
+                    name="error",
+                )
 
     async def _read(
         self,
@@ -1134,6 +1069,7 @@ class UDPProtocol(Generic[T, K]):
                         data=response,
                         service_host=self.host,
                         service_port=self.port,
+                        request_id=message.request_id,
                     ),
                 ),
                 pickle.HIGHEST_PROTOCOL,
@@ -1144,42 +1080,19 @@ class UDPProtocol(Generic[T, K]):
 
             await self._sendto_with_retry(compressed, addr)
 
-        except (Exception, socket.error):
-            pass
-            # await self._reset_connection()
-
-    async def _read_iterator(
-        self,
-        shard_id: int,
-        message: Message[T],
-        coroutine: AsyncIterable[K],
-        addr: Tuple[str, int],
-    ) -> Coroutine[Any, Any, None]:
-        await self._add_node_from_shard_id(shard_id, message)
-
-        async for response in coroutine:
-            try:
-                item = cloudpickle.dumps(
-                    (
-                        "response",
-                        self.id_generator.generate(),
-                        Message(
-                            node_id=self.node_id,
-                            name=message.name,
-                            data=response,
-                            service_host=self.host,
-                            service_port=self.port,
-                        ),
+        except (Exception, socket.error) as read_error:
+            # The requester sees a timeout; the failure itself is logged.
+            async with self._logger.context(
+                name=f"graph_server_{self._node_id_base}"
+            ) as ctx:
+                await ctx.log_prepared(
+                    message=(
+                        f"Node {self._node_id_base} at {self.host}:{self.port} failed "
+                        f"answering {message.name} from {addr[0]}:{addr[1]} "
+                        f"({type(read_error).__name__}): {read_error}"
                     ),
-                    pickle.HIGHEST_PROTOCOL,
+                    name="error",
                 )
-
-                encrypted_message = self._encryptor.encrypt(item)
-                compressed = self._compressor.compress(encrypted_message)
-                await self._sendto_with_retry(compressed, addr)
-
-            except Exception:
-                pass
 
     async def _add_node_from_shard_id(self, shard_id: int, message: Message[T | None]):
         # Use full 64-bit node_id from message instead of 10-bit snowflake instance

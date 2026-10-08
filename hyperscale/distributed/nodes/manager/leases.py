@@ -12,7 +12,7 @@ from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarn
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
-    from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.nodes.manager.models.manager_config import ManagerConfig
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
@@ -77,7 +77,7 @@ class ManagerLeaseCoordinator:
         """
         return self._state._job_leader_addrs.get(job_id)
 
-    def claim_job_leadership(
+    async def claim_job_leadership(
         self,
         job_id: str,
         tcp_addr: tuple[str, int],
@@ -98,36 +98,40 @@ class ManagerLeaseCoordinator:
         """
         current_leader = self._state._job_leaders.get(job_id)
 
-        can_claim = (
-            current_leader is None or current_leader == self._node_id or force_takeover
+        if not self._can_claim_job(current_leader, force_takeover):
+            return False
+
+        current_token = self._state._job_fencing_tokens.get(job_id, 0)
+        next_token = self._next_claim_fence_token(current_token, force_takeover)
+        self._state.apply_job_leadership(
+            job_id=job_id,
+            leader_id=self._node_id,
+            leader_addr=tcp_addr,
+            fencing_token=next_token,
         )
 
-        if can_claim:
-            current_token = self._state._job_fencing_tokens.get(job_id, 0)
-            next_token = current_token + 1 if force_takeover else max(1, current_token)
-            self._state.apply_job_leadership(
-                job_id=job_id,
-                leader_id=self._node_id,
-                leader_addr=tcp_addr,
-                fencing_token=next_token,
-            )
-
-            action = "Took over" if force_takeover else "Claimed"
-            self._task_runner.run(
-                self._logger.log,
-                ServerDebug(
-                    message=(
-                        f"{action} leadership for job {job_id[:8]}... "
-                        f"(fence={self._state._job_fencing_tokens.get(job_id, 0)})"
-                    ),
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
+        action = "Took over" if force_takeover else "Claimed"
+        await self._logger.log(
+            ServerDebug(
+                message=(
+                    f"{action} leadership for job {job_id[:8]}... "
+                    f"(fence={self._state._job_fencing_tokens.get(job_id, 0)})"
                 ),
-            )
-            return True
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
+        )
+        return True
 
-        return False
+    def _can_claim_job(self, current_leader: str | None, force_takeover: bool) -> bool:
+        """No current leader, we already lead, or a forced takeover."""
+        return current_leader is None or current_leader == self._node_id or force_takeover
+
+    @staticmethod
+    def _next_claim_fence_token(current_token: int, force_takeover: bool) -> int:
+        """A takeover bumps the fence token; a plain claim keeps it (at least 1)."""
+        return current_token + 1 if force_takeover else max(1, current_token)
 
     def apply_job_leadership(
         self,
@@ -135,7 +139,6 @@ class ManagerLeaseCoordinator:
         leader_id: str,
         leader_addr: tuple[str, int],
         fencing_token: int,
-        layer_version: int | None = None,
     ) -> bool:
         """
         Apply a leadership claim that already passed its authoritative protocol.
@@ -149,63 +152,7 @@ class ManagerLeaseCoordinator:
             leader_id=leader_id,
             leader_addr=leader_addr,
             fencing_token=fencing_token,
-            layer_version=layer_version,
         )
-
-    def release_job_leadership(self, job_id: str) -> None:
-        """
-        Release leadership for a job.
-
-        Args:
-            job_id: Job ID to release
-        """
-        if self._state.release_job_leadership_if_owner(job_id, self._node_id):
-
-            self._task_runner.run(
-                self._logger.log,
-                ServerDebug(
-                    message=f"Released leadership for job {job_id[:8]}...",
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
-
-    def transfer_job_leadership(
-        self,
-        job_id: str,
-        new_leader_id: str,
-        new_leader_addr: tuple[str, int],
-    ) -> bool:
-        """
-        Transfer job leadership to another manager.
-
-        Only succeeds if we are the current leader.
-
-        Args:
-            job_id: Job ID to transfer
-            new_leader_id: New leader node ID
-            new_leader_addr: New leader TCP address
-
-        Returns:
-            True if transfer successful
-        """
-        if self._state._job_leaders.get(job_id) != self._node_id:
-            return False
-
-        self._state._job_leaders[job_id] = new_leader_id
-        self._state._job_leader_addrs[job_id] = new_leader_addr
-
-        self._task_runner.run(
-            self._logger.log,
-            ServerDebug(
-                message=f"Transferred leadership for job {job_id[:8]}... to {new_leader_id[:8]}...",
-                node_host=self._config.host,
-                node_port=self._config.tcp_port,
-                node_id=self._node_id,
-            ),
-        )
-        return True
 
     def get_fence_token(self, job_id: str) -> int:
         """
@@ -225,18 +172,6 @@ class ManagerLeaseCoordinator:
             new_value = current + 1
             self._state._job_fencing_tokens[job_id] = new_value
             return new_value
-
-    def set_fence_token(self, job_id: str, value: int) -> None:
-        """
-        Set fencing token for a job to a specific value.
-
-        Used during job initialization or explicit token assignment.
-
-        Args:
-            job_id: Job ID
-            value: Token value to set
-        """
-        self._state._job_fencing_tokens[job_id] = value
 
     def update_fence_token_if_higher(self, job_id: str, new_token: int) -> bool:
         """
@@ -271,35 +206,6 @@ class ManagerLeaseCoordinator:
         current = self._state._job_fencing_tokens.get(job_id, 0)
         return token >= current
 
-    def get_layer_version(self, job_id: str) -> int:
-        """
-        Get current layer version for a job.
-
-        Args:
-            job_id: Job ID
-
-        Returns:
-            Current layer version (0 if not set)
-        """
-        return self._state._job_layer_version.get(job_id, 0)
-
-    def increment_layer_version(self, job_id: str) -> int:
-        """
-        Increment and return layer version for a job.
-
-        Used when completing a workflow layer to advance to next.
-
-        Args:
-            job_id: Job ID
-
-        Returns:
-            New layer version value
-        """
-        current = self._state._job_layer_version.get(job_id, 0)
-        new_value = current + 1
-        self._state._job_layer_version[job_id] = new_value
-        return new_value
-
     def get_global_fence_token(self) -> int:
         """
         Get the global (non-job-specific) fence token.
@@ -325,29 +231,6 @@ class ManagerLeaseCoordinator:
             if leader_id == self._node_id
         ]
 
-    def initialize_job_context(self, job_id: str) -> None:
-        """
-        Initialize empty context for a new job.
-
-        Args:
-            job_id: Job ID to initialize context for
-        """
-        from hyperscale.core.state.context import Context
-
-        self._state._job_contexts[job_id] = Context()
-
-    def get_job_context(self, job_id: str):
-        """
-        Get context for a job.
-
-        Args:
-            job_id: Job ID
-
-        Returns:
-            Context object or None if not found
-        """
-        return self._state._job_contexts.get(job_id)
-
     def clear_job_leases(self, job_id: str) -> None:
         """
         Clear all lease-related state for a job.
@@ -358,5 +241,3 @@ class ManagerLeaseCoordinator:
         self._state._job_leaders.pop(job_id, None)
         self._state._job_leader_addrs.pop(job_id, None)
         self._state._job_fencing_tokens.pop(job_id, None)
-        self._state._job_layer_version.pop(job_id, None)
-        self._state._job_contexts.pop(job_id, None)

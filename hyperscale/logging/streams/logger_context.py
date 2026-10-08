@@ -1,8 +1,9 @@
 import asyncio
 import os
-from typing import Any, Literal, TypeVar
+from typing import Literal, TypeVar
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
+from hyperscale.logging.config.logging_config import LoggingConfig
 
 from .logger_stream import LoggerStream
 from .retention_policy import (
@@ -27,7 +28,7 @@ class LoggerContext:
             str,
             tuple[
                 type[T],
-                dict[str, Any],
+                dict[str, object],
             ],
         ]
         | None = None,
@@ -57,6 +58,16 @@ class LoggerContext:
 
     async def __aenter__(self):
         await self.stream.initialize()
+
+        # Honor the global logging kill-switch (the same gate ``Logger.log``
+        # applies before opening a context). ``initialize`` above no-ops
+        # when disabled; the cwd fetch below is a ``run_in_executor`` call
+        # and ``open_file`` is real file I/O — both are banned on the
+        # ``SimulationLoop``, and both are wasted work on a disabled
+        # logger in REAL mode. The stream's own log methods are
+        # level/disable-gated, so handing back the bare stream is safe.
+        if LoggingConfig().disabled:
+            return self.stream
 
         if self.stream._cwd is None:
             loop = asyncio.get_event_loop()

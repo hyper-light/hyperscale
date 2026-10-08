@@ -1,11 +1,15 @@
 import asyncio
 import socket
-from asyncio.sslproto import SSLProtocol
+from typing import Sequence
 
 from hyperscale.core.engines.client.shared.protocols import (
     _DEFAULT_LIMIT,
     Reader,
     Writer,
+)
+from hyperscale.core.engines.client.shared.protocols.happy_eyeballs import (
+    SocketConfig,
+    connect_first_responding,
 )
 
 from .protocol import TCPProtocol
@@ -22,16 +26,32 @@ class TCPConnectionFactory:
     async def create(
         self, hostname=None, socket_config=None, *, limit=_DEFAULT_LIMIT, ssl=None
     ):
+        reader, writer, _ = await self.create_racing(
+            hostname,
+            (socket_config,),
+            limit=limit,
+            ssl=ssl,
+        )
+
+        return reader, writer
+
+    async def create_racing(
+        self,
+        hostname=None,
+        socket_configs: Sequence[SocketConfig] = (),
+        *,
+        limit=_DEFAULT_LIMIT,
+        ssl=None,
+    ):
         self.loop = asyncio.get_event_loop()
 
-        family, type_, proto, _, address = socket_config
+        # RFC 8305: the first address to answer gets the connection.
+        self.socket, winner_index = await connect_first_responding(
+            self.loop,
+            socket_configs,
+        )
 
-        self.socket = socket.socket(family=family, type=type_, proto=proto)
-        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        await self.loop.run_in_executor(None, self.socket.connect, address)
-
-        self.socket.setblocking(False)
+        family = socket_configs[winner_index][0]
 
         reader = Reader(limit=limit, loop=self.loop)
         reader_protocol = TCPProtocol(reader, loop=self.loop)
@@ -49,22 +69,18 @@ class TCPConnectionFactory:
 
         self._writer = Writer(self.transport, reader_protocol, reader, self.loop)
 
-        return reader, self._writer
+        return reader, self._writer, winner_index
 
     def close(self):
         try:
-            if hasattr(self.transport, "_ssl_protocol") and isinstance(
-                self.transport._ssl_protocol, SSLProtocol
-            ):
-                self.transport._ssl_protocol.pause_writing()
+
+            self.transport.abort()
 
         except Exception:
             pass
 
         try:
-            if self.transport and not self.transport.is_closing():
-                self.transport.pause_reading()
-                self.transport.close()
+            self.transport.close()
 
         except Exception:
             pass
@@ -82,3 +98,10 @@ class TCPConnectionFactory:
 
         except Exception:
             pass
+
+    def reset(self):
+        self.close()
+        self.transport = None
+        self._connection = None
+        self.socket: socket.socket = None
+        self._writer = None

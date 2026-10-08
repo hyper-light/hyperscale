@@ -8,274 +8,67 @@ Each model includes contextual fields that identify:
 - The manager/datacenter context (manager_id, datacenter)
 - The relevant job/workflow being operated on
 - Operation-specific details (cores, workers, etc.)
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from hyperscale.logging.models import Entry, LogLevel
 
+from .allocator_critical import AllocatorCritical
+from .allocator_debug import AllocatorDebug
+from .allocator_error import AllocatorError
+from .allocator_info import AllocatorInfo
+from .allocator_trace import AllocatorTrace
+from .allocator_warning import AllocatorWarning
+from .dispatcher_critical import DispatcherCritical
+from .dispatcher_debug import DispatcherDebug
+from .dispatcher_error import DispatcherError
+from .dispatcher_info import DispatcherInfo
+from .dispatcher_trace import DispatcherTrace
+from .dispatcher_warning import DispatcherWarning
+from .job_manager_critical import JobManagerCritical
+from .job_manager_debug import JobManagerDebug
+from .job_manager_error import JobManagerError
+from .job_manager_info import JobManagerInfo
+from .job_manager_trace import JobManagerTrace
+from .job_manager_warning import JobManagerWarning
+from .worker_pool_critical import WorkerPoolCritical
+from .worker_pool_debug import WorkerPoolDebug
+from .worker_pool_error import WorkerPoolError
+from .worker_pool_info import WorkerPoolInfo
+from .worker_pool_trace import WorkerPoolTrace
+from .worker_pool_warning import WorkerPoolWarning
 
-# =============================================================================
-# WorkerPool Logging Models
-# =============================================================================
+_REHOMED = (
+    WorkerPoolTrace,
+    WorkerPoolDebug,
+    WorkerPoolInfo,
+    WorkerPoolWarning,
+    WorkerPoolError,
+    WorkerPoolCritical,
+    DispatcherTrace,
+    DispatcherDebug,
+    DispatcherInfo,
+    DispatcherWarning,
+    DispatcherError,
+    DispatcherCritical,
+    AllocatorTrace,
+    AllocatorDebug,
+    AllocatorInfo,
+    AllocatorWarning,
+    AllocatorError,
+    AllocatorCritical,
+    JobManagerTrace,
+    JobManagerDebug,
+    JobManagerInfo,
+    JobManagerWarning,
+    JobManagerError,
+    JobManagerCritical,
+)
 
-class WorkerPoolTrace(Entry, kw_only=True):
-    """Trace-level logging for WorkerPool operations."""
-    manager_id: str
-    datacenter: str
-    worker_count: int
-    healthy_worker_count: int
-    total_cores: int
-    available_cores: int
-    level: LogLevel = LogLevel.TRACE
-
-
-class WorkerPoolDebug(Entry, kw_only=True):
-    """Debug-level logging for WorkerPool operations."""
-    manager_id: str
-    datacenter: str
-    worker_count: int
-    healthy_worker_count: int
-    total_cores: int
-    available_cores: int
-    level: LogLevel = LogLevel.DEBUG
-
-
-class WorkerPoolInfo(Entry, kw_only=True):
-    """Info-level logging for WorkerPool operations."""
-    manager_id: str
-    datacenter: str
-    worker_count: int
-    healthy_worker_count: int
-    total_cores: int
-    available_cores: int
-    level: LogLevel = LogLevel.INFO
-
-
-class WorkerPoolWarning(Entry, kw_only=True):
-    """Warning-level logging for WorkerPool operations."""
-    manager_id: str
-    datacenter: str
-    worker_count: int
-    healthy_worker_count: int
-    total_cores: int
-    available_cores: int
-    level: LogLevel = LogLevel.WARN
-
-
-class WorkerPoolError(Entry, kw_only=True):
-    """Error-level logging for WorkerPool operations."""
-    manager_id: str
-    datacenter: str
-    worker_count: int
-    healthy_worker_count: int
-    total_cores: int
-    available_cores: int
-    level: LogLevel = LogLevel.ERROR
-
-
-class WorkerPoolCritical(Entry, kw_only=True):
-    """Critical-level logging for WorkerPool operations."""
-    manager_id: str
-    datacenter: str
-    worker_count: int
-    healthy_worker_count: int
-    total_cores: int
-    available_cores: int
-    level: LogLevel = LogLevel.CRITICAL
-
-
-# =============================================================================
-# WorkflowDispatcher Logging Models
-# =============================================================================
-
-class DispatcherTrace(Entry, kw_only=True):
-    """Trace-level logging for WorkflowDispatcher operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str
-    workflow_id: str
-    pending_count: int
-    dispatched_count: int
-    level: LogLevel = LogLevel.TRACE
-
-
-class DispatcherDebug(Entry, kw_only=True):
-    """Debug-level logging for WorkflowDispatcher operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str
-    workflow_id: str
-    pending_count: int
-    dispatched_count: int
-    level: LogLevel = LogLevel.DEBUG
-
-
-class DispatcherInfo(Entry, kw_only=True):
-    """Info-level logging for WorkflowDispatcher operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str
-    workflow_id: str
-    pending_count: int
-    dispatched_count: int
-    level: LogLevel = LogLevel.INFO
-
-
-class DispatcherWarning(Entry, kw_only=True):
-    """Warning-level logging for WorkflowDispatcher operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str
-    workflow_id: str
-    pending_count: int
-    dispatched_count: int
-    level: LogLevel = LogLevel.WARN
-
-
-class DispatcherError(Entry, kw_only=True):
-    """Error-level logging for WorkflowDispatcher operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str
-    workflow_id: str
-    pending_count: int
-    dispatched_count: int
-    level: LogLevel = LogLevel.ERROR
-
-
-class DispatcherCritical(Entry, kw_only=True):
-    """Critical-level logging for WorkflowDispatcher operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str
-    workflow_id: str
-    pending_count: int
-    dispatched_count: int
-    level: LogLevel = LogLevel.CRITICAL
-
-
-# =============================================================================
-# CoreAllocator Logging Models
-# =============================================================================
-
-class AllocatorTrace(Entry, kw_only=True):
-    """Trace-level logging for CoreAllocator operations."""
-    worker_id: str
-    workflow_id: str
-    total_cores: int
-    available_cores: int
-    active_workflows: int
-    level: LogLevel = LogLevel.TRACE
-
-
-class AllocatorDebug(Entry, kw_only=True):
-    """Debug-level logging for CoreAllocator operations."""
-    worker_id: str
-    workflow_id: str
-    total_cores: int
-    available_cores: int
-    active_workflows: int
-    level: LogLevel = LogLevel.DEBUG
-
-
-class AllocatorInfo(Entry, kw_only=True):
-    """Info-level logging for CoreAllocator operations."""
-    worker_id: str
-    workflow_id: str
-    total_cores: int
-    available_cores: int
-    active_workflows: int
-    level: LogLevel = LogLevel.INFO
-
-
-class AllocatorWarning(Entry, kw_only=True):
-    """Warning-level logging for CoreAllocator operations."""
-    worker_id: str
-    workflow_id: str
-    total_cores: int
-    available_cores: int
-    active_workflows: int
-    level: LogLevel = LogLevel.WARN
-
-
-class AllocatorError(Entry, kw_only=True):
-    """Error-level logging for CoreAllocator operations."""
-    worker_id: str
-    workflow_id: str
-    total_cores: int
-    available_cores: int
-    active_workflows: int
-    level: LogLevel = LogLevel.ERROR
-
-
-class AllocatorCritical(Entry, kw_only=True):
-    """Critical-level logging for CoreAllocator operations."""
-    worker_id: str
-    workflow_id: str
-    total_cores: int
-    available_cores: int
-    active_workflows: int
-    level: LogLevel = LogLevel.CRITICAL
-
-
-# =============================================================================
-# JobManager Logging Models
-# =============================================================================
-
-class JobManagerTrace(Entry, kw_only=True):
-    """Trace-level logging for JobManager operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str = ""
-    workflow_id: str = ""
-    sub_workflow_token: str = ""
-    level: LogLevel = LogLevel.TRACE
-
-
-class JobManagerDebug(Entry, kw_only=True):
-    """Debug-level logging for JobManager operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str = ""
-    workflow_id: str = ""
-    sub_workflow_token: str = ""
-    level: LogLevel = LogLevel.DEBUG
-
-
-class JobManagerInfo(Entry, kw_only=True):
-    """Info-level logging for JobManager operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str = ""
-    workflow_id: str = ""
-    sub_workflow_token: str = ""
-    level: LogLevel = LogLevel.INFO
-
-
-class JobManagerWarning(Entry, kw_only=True):
-    """Warning-level logging for JobManager operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str = ""
-    workflow_id: str = ""
-    sub_workflow_token: str = ""
-    level: LogLevel = LogLevel.WARN
-
-
-class JobManagerError(Entry, kw_only=True):
-    """Error-level logging for JobManager operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str = ""
-    workflow_id: str = ""
-    sub_workflow_token: str = ""
-    level: LogLevel = LogLevel.ERROR
-
-
-class JobManagerCritical(Entry, kw_only=True):
-    """Critical-level logging for JobManager operations."""
-    manager_id: str
-    datacenter: str
-    job_id: str = ""
-    workflow_id: str = ""
-    sub_workflow_token: str = ""
-    level: LogLevel = LogLevel.CRITICAL
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -121,9 +121,10 @@ async def validate_10_1_route_learning_update() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        tracker = gate._dispatch_time_tracker
-        assert callable(getattr(tracker, "record_completion", None)), (
-            "Route learning update expected record_completion"
+        # AD-45 learns from dispatch acceptance, not from final results:
+        # a job's run time is set by its workflows, not its datacenter.
+        assert gate._dispatch_coordinator._observed_latency_tracker is gate._observed_latency_tracker, (
+            "Route learning update expected the dispatch coordinator to record into the gate's tracker"
         )
     finally:
         await runtime.stop_cluster()
@@ -359,7 +360,7 @@ async def validate_10_3_reporter_tasks_cleanup() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
         state = gate._modular_state
-        assert isinstance(state._job_reporter_tasks, dict), (
+        assert gate._reporter_submission_timeout_seconds > 0, (
             "Reporter tasks cleanup expected job reporter tasks"
         )
     finally:
@@ -475,8 +476,8 @@ async def validate_10_4_route_learning_failure() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        assert gate._dispatch_time_tracker is not None, (
-            "Route learning failure expected dispatch time tracker"
+        assert gate._observed_latency_tracker is not None, (
+            "Route learning failure expected the observed latency tracker"
         )
     finally:
         await runtime.stop_cluster()

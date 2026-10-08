@@ -11,13 +11,20 @@ Covers:
 - Edge cases: Leadership changes, job leadership claims
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.worker.heartbeat import WorkerHeartbeatHandler
 from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
 from hyperscale.distributed.models import ManagerHeartbeat, ManagerInfo
+
+
+def _select_lowest_id(healthy_manager_ids: set[str]) -> str | None:
+    """Stand-in for AD-28 selection: a deterministic choice."""
+    return min(healthy_manager_ids)
+
 
 
 def create_manager_heartbeat(
@@ -73,7 +80,7 @@ class TestWorkerHeartbeatHandlerInitialization:
 
     def test_happy_path_instantiation(self) -> None:
         """Test normal instantiation."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         logger = MagicMock()
 
         handler = WorkerHeartbeatHandler(
@@ -88,7 +95,7 @@ class TestWorkerHeartbeatHandlerInitialization:
 
     def test_without_logger(self) -> None:
         """Test instantiation without logger."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         handler = WorkerHeartbeatHandler(registry=registry)
 
@@ -100,7 +107,7 @@ class TestWorkerHeartbeatHandlerCallbacks:
 
     def test_set_callbacks(self) -> None:
         """Test setting callbacks."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_new_manager = MagicMock()
@@ -116,7 +123,7 @@ class TestWorkerHeartbeatHandlerCallbacks:
 
     def test_set_partial_callbacks(self) -> None:
         """Test setting only some callbacks."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_new_manager = MagicMock()
@@ -130,9 +137,10 @@ class TestWorkerHeartbeatHandlerCallbacks:
 class TestWorkerHeartbeatHandlerProcessHeartbeat:
     """Test processing manager heartbeats."""
 
-    def test_process_heartbeat_new_manager(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_heartbeat_new_manager(self) -> None:
         """Test processing heartbeat from new manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         logger = MagicMock()
         handler = WorkerHeartbeatHandler(registry=registry, logger=logger)
 
@@ -147,10 +155,10 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
             datacenter="dc-1",
         )
 
-        confirm_peer = MagicMock()
+        confirm_peer = AsyncMock()
         task_runner_run = MagicMock()
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),
             confirm_peer=confirm_peer,
@@ -169,9 +177,10 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         # Callback should be triggered
         assert task_runner_run.called
 
-    def test_process_heartbeat_existing_manager(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_heartbeat_existing_manager(self) -> None:
         """Test processing heartbeat from existing manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         # Add existing manager
@@ -194,10 +203,10 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
             datacenter="dc-1",
         )
 
-        confirm_peer = MagicMock()
+        confirm_peer = AsyncMock()
         task_runner_run = MagicMock()
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),
             confirm_peer=confirm_peer,
@@ -213,9 +222,10 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         # Manager should still exist
         assert "mgr-1" in registry._known_managers
 
-    def test_process_heartbeat_leadership_change(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_heartbeat_leadership_change(self) -> None:
         """Test processing heartbeat with leadership change."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         logger = MagicMock()
         handler = WorkerHeartbeatHandler(registry=registry, logger=logger)
 
@@ -242,10 +252,10 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
             datacenter="dc-1",
         )
 
-        confirm_peer = MagicMock()
+        confirm_peer = AsyncMock()
         task_runner_run = MagicMock()
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),
             confirm_peer=confirm_peer,
@@ -262,9 +272,10 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         updated_manager = registry.get_manager("mgr-1")
         assert updated_manager.is_leader is True
 
-    def test_process_heartbeat_with_job_leaderships(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_heartbeat_with_job_leaderships(self) -> None:
         """Test processing heartbeat with job leadership claims."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_job_leadership = MagicMock()
@@ -279,10 +290,10 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
             job_leaderships={"job-1": (1, 1), "job-2": (1, 1)},
         )
 
-        confirm_peer = MagicMock()
+        confirm_peer = AsyncMock()
         task_runner_run = MagicMock()
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),
             confirm_peer=confirm_peer,
@@ -299,9 +310,10 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         assert "job-2" in call_args[0]
         assert call_args[1] == ("192.168.1.100", 8000)  # TCP addr
 
-    def test_process_heartbeat_no_job_leaderships(self) -> None:
+    @pytest.mark.asyncio
+    async def test_process_heartbeat_no_job_leaderships(self) -> None:
         """Test processing heartbeat without job leadership claims."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_job_leadership = MagicMock()
@@ -316,10 +328,10 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
             job_leaderships={},  # Empty
         )
 
-        confirm_peer = MagicMock()
+        confirm_peer = AsyncMock()
         task_runner_run = MagicMock()
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),
             confirm_peer=confirm_peer,
@@ -338,7 +350,7 @@ class TestWorkerHeartbeatHandlerPeerConfirmation:
 
     def test_on_peer_confirmed_known_manager(self) -> None:
         """Test peer confirmation for known manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         logger = MagicMock()
         handler = WorkerHeartbeatHandler(registry=registry, logger=logger)
 
@@ -367,7 +379,7 @@ class TestWorkerHeartbeatHandlerPeerConfirmation:
 
     def test_on_peer_confirmed_unknown_peer(self) -> None:
         """Test peer confirmation for unknown peer."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         task_runner_run = MagicMock()
@@ -388,9 +400,10 @@ class TestWorkerHeartbeatHandlerPeerConfirmation:
 class TestWorkerHeartbeatHandlerTCPAddressInference:
     """Test TCP address inference from heartbeat."""
 
-    def test_tcp_address_from_heartbeat(self) -> None:
+    @pytest.mark.asyncio
+    async def test_tcp_address_from_heartbeat(self) -> None:
         """Test TCP address is taken from heartbeat."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         heartbeat = create_manager_heartbeat(
@@ -401,10 +414,10 @@ class TestWorkerHeartbeatHandlerTCPAddressInference:
             datacenter="dc-1",
         )
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),  # UDP source
-            confirm_peer=MagicMock(),
+            confirm_peer=AsyncMock(),
             node_host="192.168.1.1",
             node_port=8000,
             node_id_short="wkr",
@@ -415,9 +428,10 @@ class TestWorkerHeartbeatHandlerTCPAddressInference:
         assert manager.tcp_host == "10.0.0.100"
         assert manager.tcp_port == 9000
 
-    def test_tcp_address_inferred_from_source(self) -> None:
+    @pytest.mark.asyncio
+    async def test_tcp_address_inferred_from_source(self) -> None:
         """Test TCP address inferred from source when not in heartbeat."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         heartbeat = create_manager_heartbeat(
@@ -428,10 +442,10 @@ class TestWorkerHeartbeatHandlerTCPAddressInference:
             datacenter="dc-1",
         )
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),
-            confirm_peer=MagicMock(),
+            confirm_peer=AsyncMock(),
             node_host="192.168.1.1",
             node_port=8000,
             node_id_short="wkr",
@@ -446,9 +460,10 @@ class TestWorkerHeartbeatHandlerTCPAddressInference:
 class TestWorkerHeartbeatHandlerEdgeCases:
     """Test edge cases."""
 
-    def test_new_manager_becomes_primary_when_none_set(self) -> None:
+    @pytest.mark.asyncio
+    async def test_new_manager_becomes_primary_when_none_set(self) -> None:
         """Test new leader becomes primary when none set."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         assert registry._primary_manager_id is None
@@ -461,10 +476,10 @@ class TestWorkerHeartbeatHandlerEdgeCases:
             datacenter="dc-1",
         )
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),
-            confirm_peer=MagicMock(),
+            confirm_peer=AsyncMock(),
             node_host="192.168.1.1",
             node_port=8000,
             node_id_short="wkr",
@@ -473,9 +488,10 @@ class TestWorkerHeartbeatHandlerEdgeCases:
 
         assert registry._primary_manager_id == "mgr-1"
 
-    def test_multiple_heartbeats_same_manager(self) -> None:
+    @pytest.mark.asyncio
+    async def test_multiple_heartbeats_same_manager(self) -> None:
         """Test processing multiple heartbeats from same manager."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         for i in range(5):
@@ -487,10 +503,10 @@ class TestWorkerHeartbeatHandlerEdgeCases:
                 datacenter=f"dc-{i}",  # Changing datacenter
             )
 
-            handler.process_manager_heartbeat(
+            await handler.process_manager_heartbeat(
                 heartbeat=heartbeat,
                 source_addr=("192.168.1.100", 8001),
-                confirm_peer=MagicMock(),
+                confirm_peer=AsyncMock(),
                 node_host="192.168.1.1",
                 node_port=8000,
                 node_id_short="wkr",
@@ -500,9 +516,10 @@ class TestWorkerHeartbeatHandlerEdgeCases:
         # Should still have one manager
         assert len(registry._known_managers) == 1
 
-    def test_special_characters_in_node_id(self) -> None:
+    @pytest.mark.asyncio
+    async def test_special_characters_in_node_id(self) -> None:
         """Test processing heartbeat with special characters in node ID."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         heartbeat = create_manager_heartbeat(
@@ -513,10 +530,10 @@ class TestWorkerHeartbeatHandlerEdgeCases:
             datacenter="dc-1",
         )
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),
-            confirm_peer=MagicMock(),
+            confirm_peer=AsyncMock(),
             node_host="192.168.1.1",
             node_port=8000,
             node_id_short="wkr",
@@ -525,9 +542,10 @@ class TestWorkerHeartbeatHandlerEdgeCases:
 
         assert "mgr-🚀-test-ñ" in registry._known_managers
 
-    def test_heartbeat_with_many_job_leaderships(self) -> None:
+    @pytest.mark.asyncio
+    async def test_heartbeat_with_many_job_leaderships(self) -> None:
         """Test heartbeat with many job leadership claims."""
-        registry = WorkerRegistry(None)
+        registry = WorkerRegistry(None, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
         handler = WorkerHeartbeatHandler(registry=registry)
 
         on_job_leadership = MagicMock()
@@ -544,10 +562,10 @@ class TestWorkerHeartbeatHandlerEdgeCases:
             job_leaderships=job_leaderships,
         )
 
-        handler.process_manager_heartbeat(
+        await handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=("192.168.1.100", 8001),
-            confirm_peer=MagicMock(),
+            confirm_peer=AsyncMock(),
             node_host="192.168.1.1",
             node_port=8000,
             node_id_short="wkr",

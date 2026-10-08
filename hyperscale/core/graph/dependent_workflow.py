@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import List, Self
 
 from .workflow import Workflow
 
@@ -13,6 +13,6 @@ class DependentWorkflow:
         self.dependencies = dependencies
 
 
-    def __call__(self, *args: Any, **kwds: Any) -> Any:
+    def __call__(self, *args: object, **kwds: object) -> Self:
         self.dependent_workflow = self.dependent_workflow
         return self

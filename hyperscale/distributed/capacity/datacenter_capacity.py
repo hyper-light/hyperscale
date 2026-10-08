@@ -4,8 +4,9 @@ Datacenter capacity aggregation for gate routing (AD-43).
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
+from itertools import chain
+from operator import attrgetter, itemgetter
 
 from hyperscale.distributed.models.distributed import ManagerHeartbeat
 
@@ -14,6 +15,19 @@ from hyperscale.distributed.models.distributed import ManagerHeartbeat
 class DatacenterCapacity:
     """
     Aggregated capacity metrics for a datacenter.
+
+    Cores are the datacenter's: every manager tracks every worker (workers
+    register with each manager, AD-48), so each heartbeat already reports
+    the whole pool and the most authoritative one is taken -- summing them
+    multiplied the datacenter by its manager count. Pending and active work
+    is per manager (each counts only the jobs it leads), so it is summed.
+    ``last_updated`` is when the newest heartbeat arrived; without any, the
+    capacity is unknown and reads as infinitely stale.
+
+    ``release_schedule`` is when held cores come free (AD-43 Part 4):
+    ``(seconds from when the capacity was read, cores)``, soonest first --
+    every manager's executing workflows, from after the authoritative
+    heartbeat (whose available cores count the cores freed before it).
     """
 
     datacenter_id: str
@@ -22,23 +36,24 @@ class DatacenterCapacity:
     pending_workflow_count: int
     pending_duration_seconds: float
     active_remaining_seconds: float
-    estimated_wait_seconds: float
-    utilization: float
-    health_bucket: str
     last_updated: float
+    release_schedule: tuple[tuple[float, int], ...] = ()
 
     @classmethod
     def aggregate(
         cls,
         datacenter_id: str,
-        heartbeats: list[ManagerHeartbeat],
-        health_bucket: str,
-        last_updated: float | None = None,
-    ):
+        heartbeats: list[tuple[ManagerHeartbeat, float]],
+        now: float,
+    ) -> DatacenterCapacity:
         """
-        Aggregate capacity metrics from manager heartbeats.
+        Aggregate a datacenter's capacity from its managers' heartbeats,
+        each paired with the gate's monotonic time it arrived, as of
+        ``now`` (the gate's monotonic time).
+
+        The authoritative heartbeat is the leader's with the highest term
+        (a deposed leader's last claim loses), else the most recent one.
         """
-        updated_time = last_updated if last_updated is not None else time.monotonic()
         if not heartbeats:
             return cls(
                 datacenter_id=datacenter_id,
@@ -47,96 +62,115 @@ class DatacenterCapacity:
                 pending_workflow_count=0,
                 pending_duration_seconds=0.0,
                 active_remaining_seconds=0.0,
-                estimated_wait_seconds=float("inf"),
-                utilization=0.0,
-                health_bucket=health_bucket,
-                last_updated=updated_time,
+                last_updated=float("-inf"),
             )
 
-        total_cores = sum(heartbeat.total_cores for heartbeat in heartbeats)
-        available_cores = sum(heartbeat.available_cores for heartbeat in heartbeats)
-        pending_count = sum(
-            heartbeat.pending_workflow_count for heartbeat in heartbeats
+        authoritative_heartbeat, authoritative_received_at = max(
+            heartbeats,
+            key=lambda entry: (entry[0].is_leader, entry[0].term, entry[1]),
         )
-        pending_duration = sum(
-            heartbeat.pending_duration_seconds for heartbeat in heartbeats
-        )
-        active_remaining = sum(
-            heartbeat.active_remaining_seconds for heartbeat in heartbeats
-        )
-
-        estimated_wait = _estimate_wait_time(
-            available_cores,
-            total_cores,
-            pending_duration,
-            pending_count,
-        )
-        utilization = _calculate_utilization(available_cores, total_cores)
-
+        manager_heartbeats = list(map(itemgetter(0), heartbeats))
         return cls(
             datacenter_id=datacenter_id,
-            total_cores=total_cores,
-            available_cores=available_cores,
-            pending_workflow_count=pending_count,
-            pending_duration_seconds=pending_duration,
-            active_remaining_seconds=active_remaining,
-            estimated_wait_seconds=estimated_wait,
-            utilization=utilization,
-            health_bucket=health_bucket,
-            last_updated=updated_time,
+            total_cores=authoritative_heartbeat.total_cores,
+            available_cores=authoritative_heartbeat.available_cores,
+            pending_workflow_count=sum(
+                map(attrgetter("pending_workflow_count"), manager_heartbeats)
+            ),
+            pending_duration_seconds=sum(
+                map(attrgetter("pending_duration_seconds"), manager_heartbeats)
+            ),
+            active_remaining_seconds=sum(
+                map(attrgetter("active_remaining_seconds"), manager_heartbeats)
+            ),
+            last_updated=max(map(itemgetter(1), heartbeats)),
+            release_schedule=tuple(
+                sorted(
+                    chain.from_iterable(
+                        cls._releases_after(heartbeat, received_at, now, authoritative_received_at)
+                        for heartbeat, received_at in heartbeats
+                    )
+                )
+            ),
         )
+
+    @staticmethod
+    def _releases_after(
+        heartbeat: ManagerHeartbeat,
+        received_at: float,
+        now: float,
+        authoritative_received_at: float,
+    ) -> list[tuple[float, int]]:
+        """A manager's releases after the authoritative heartbeat, as
+        ``(seconds from now, cores)`` (AD-43 Part 4)."""
+        return [
+            (max(received_at + release_offset - now, 0.0), released_cores)
+            for release_offset, released_cores in heartbeat.cores_freeing_schedule
+            if received_at + release_offset > authoritative_received_at
+        ]
 
     def can_serve_immediately(self, cores_required: int) -> bool:
         """
-        Check whether the datacenter can serve the cores immediately.
+        Check whether the datacenter can serve the cores immediately -- all
+        of them, or every core it has when the job wants more.
         """
+        if self.total_cores > 0:
+            cores_required = min(cores_required, self.total_cores)
         return self.available_cores >= cores_required
 
     def estimated_wait_for_cores(self, cores_required: int) -> float:
         """
-        Estimate the wait time for a given core requirement.
+        Estimate the wait for a given core requirement: the later of two
+        bounds it cannot beat. Its cores must come free -- the release
+        schedule walked until enough have (AD-43 Part 4) -- and the work
+        ahead of it, executing and queued, must drain at one core-second
+        per core. The drain bound alone took one workflow holding every
+        core for a hundred seconds as ten seconds of work on ten cores.
+
+        A job uses at most every core of the datacenter (a manager's
+        dispatcher starts it on what is free and grows it as more comes
+        free), so a requirement beyond them waits for them all. A shortfall
+        the schedule does not explain (a manager that reports none) waits at
+        least for every release it does report -- stopping short of them let
+        a larger job wait less than a smaller one -- and the drain bound.
         """
         if cores_required <= 0:
             return 0.0
-        if self.available_cores >= cores_required:
-            return 0.0
         if self.total_cores <= 0:
             return float("inf")
+        # Capped before the free cores are compared, as
+        # ``can_serve_immediately`` caps: a requirement beyond the
+        # datacenter waits exactly as one for all of it does, so with every
+        # core free it waits for nothing.
+        return self._wait_for_capped_cores(min(cores_required, self.total_cores))
 
-        total_work_remaining = (
-            self.active_remaining_seconds + self.pending_duration_seconds
+    def _wait_for_capped_cores(self, cores_required: int) -> float:
+        """The wait for ``cores_required`` (at most every core): the later
+        of the release-schedule and drain bounds, none when they are free."""
+        if self.available_cores >= cores_required:
+            return 0.0
+
+        return max(
+            self._cores_free_after(cores_required),
+            (self.active_remaining_seconds + self.pending_duration_seconds)
+            / self.total_cores,
         )
-        throughput = self.total_cores
-        if throughput <= 0:
-            return float("inf")
 
-        return total_work_remaining / throughput
+    def _cores_free_after(self, cores_required: int) -> float:
+        """Seconds until the release schedule frees ``cores_required``
+        (AD-43 Part 4), or until its last release when it never does."""
+        free_cores = self.available_cores
+        cores_free_after = 0.0
+        for release_offset, released_cores in self.release_schedule:
+            free_cores += released_cores
+            cores_free_after = release_offset
+            if free_cores >= cores_required:
+                break
+
+        return cores_free_after
 
     def is_stale(self, now: float, staleness_threshold_seconds: float) -> bool:
         """
         Check whether capacity data is stale relative to a threshold.
         """
-        if staleness_threshold_seconds <= 0:
-            return False
         return (now - self.last_updated) > staleness_threshold_seconds
-
-
-def _estimate_wait_time(
-    available_cores: int,
-    total_cores: int,
-    pending_duration: float,
-    pending_count: int,
-) -> float:
-    if available_cores > 0:
-        return 0.0
-    if total_cores <= 0:
-        return float("inf")
-
-    average_duration = pending_duration / max(1, pending_count)
-    return (pending_count * average_duration) / total_cores
-
-
-def _calculate_utilization(available_cores: int, total_cores: int) -> float:
-    if total_cores <= 0:
-        return 1.0
-    return 1.0 - (available_cores / total_cores)

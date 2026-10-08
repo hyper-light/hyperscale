@@ -109,9 +109,7 @@ class WeightedRendezvousHash:
         Returns:
             peer_id of the selected peer, or None if no peers
         """
-        if not self._peers:
-            return None
-
+        # With no peers the loop never runs: ``best_peer`` stays None.
         best_peer: str | None = None
         best_score = float("-inf")
 
@@ -136,13 +134,11 @@ class WeightedRendezvousHash:
         Returns:
             List of peer_ids, ordered by preference (best first)
         """
-        if not self._peers:
-            return []
-
-        scored: list[tuple[float, str]] = []
-        for peer_id, weight in self._peers.items():
-            score = self._compute_score(key, peer_id, weight)
-            scored.append((score, peer_id))
+        # With no peers ``scored`` is empty, and so is the ranking.
+        scored: list[tuple[float, str]] = [
+            (self._compute_score(key, peer_id, weight), peer_id)
+            for peer_id, weight in self._peers.items()
+        ]
 
         # Sort by score descending (highest first)
         scored.sort(reverse=True)

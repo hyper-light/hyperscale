@@ -49,11 +49,13 @@ class MercurySyncSFTPConnction:
     def __init__(
         self,
         pool_size: int | None = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ):
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._dns_lock: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -97,6 +99,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -118,6 +121,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -136,7 +140,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="get",
+                    operation="get",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -154,6 +159,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -174,6 +180,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -192,7 +199,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="put",
+                    operation="put",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -211,6 +219,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -232,6 +241,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -250,7 +260,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="copy",
+                    operation="copy",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -269,6 +280,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -290,6 +302,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -308,7 +321,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="mget",
+                    operation="mget",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -326,6 +340,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -346,6 +361,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -364,7 +380,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="mput",
+                    operation="mput",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -383,6 +400,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -404,6 +422,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -422,7 +441,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="mcopy",
+                    operation="mcopy",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -436,6 +456,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -450,6 +471,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -468,7 +490,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="glob",
+                    operation="glob",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -482,6 +505,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -496,6 +520,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -514,7 +539,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="glob_sftpname",
+                    operation="glob_sftpname",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -530,6 +556,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -548,6 +575,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -566,7 +594,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="makedirs",
+                    operation="makedirs",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -580,6 +609,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -594,6 +624,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -612,7 +643,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="rmtree",
+                    operation="rmtree",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -628,6 +660,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -646,6 +679,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -664,7 +698,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="stat",
+                    operation="stat",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -680,6 +715,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -698,6 +734,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -716,7 +753,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="lstat",
+                    operation="lstat",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -732,6 +770,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -750,6 +789,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -768,7 +808,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="setstat",
+                    operation="setstat",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -784,6 +825,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -802,6 +844,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -820,7 +863,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="truncate",
+                    operation="truncate",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -838,6 +882,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -858,6 +903,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -876,7 +922,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="chown",
+                    operation="chown",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -890,6 +937,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -904,6 +952,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -922,7 +971,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="statvfs",
+                    operation="statvfs",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -938,6 +988,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -956,6 +1007,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -974,7 +1026,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="utime",
+                    operation="utime",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -990,6 +1043,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1008,6 +1062,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1026,7 +1081,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="exists",
+                    operation="exists",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1042,6 +1098,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1060,6 +1117,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1078,7 +1136,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="lexists",
+                    operation="lexists",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1094,6 +1153,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1112,6 +1172,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1130,7 +1191,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="getatime",
+                    operation="getatime",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1146,6 +1208,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1164,6 +1227,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1182,7 +1246,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="getatime_ns",
+                    operation="getatime_ns",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1198,6 +1263,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1216,6 +1282,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1234,7 +1301,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="getcrtime",
+                    operation="getcrtime",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1250,6 +1318,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1268,6 +1337,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1286,7 +1356,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="getcrtime_ns",
+                    operation="getcrtime_ns",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1302,6 +1373,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1320,6 +1392,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1338,7 +1411,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="getmtime",
+                    operation="getmtime",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1354,6 +1428,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1372,6 +1447,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1390,7 +1466,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="getmtime_ns",
+                    operation="getmtime_ns",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1406,6 +1483,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1424,6 +1502,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1442,7 +1521,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="getsize",
+                    operation="getsize",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1458,6 +1538,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1476,6 +1557,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1494,7 +1576,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="isdir",
+                    operation="isdir",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1510,6 +1593,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1528,6 +1612,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1546,7 +1631,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="isfile",
+                    operation="isfile",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1562,6 +1648,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1580,6 +1667,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1598,7 +1686,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="islink",
+                    operation="islink",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1612,6 +1701,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1626,6 +1716,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1644,7 +1735,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="remove",
+                    operation="remove",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1658,6 +1750,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1672,6 +1765,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1690,7 +1784,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="unlink",
+                    operation="unlink",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1706,6 +1801,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1724,6 +1820,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1742,7 +1839,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="rename",
+                    operation="rename",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1758,6 +1856,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1776,6 +1875,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1794,7 +1894,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="posix_rename",
+                    operation="posix_rename",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1808,6 +1909,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1822,6 +1924,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1840,7 +1943,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="scandir",
+                    operation="scandir",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1855,6 +1959,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1870,6 +1975,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1888,7 +1994,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="mkdir",
+                    operation="mkdir",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1902,6 +2009,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1916,6 +2024,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1934,7 +2043,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="rmdir",
+                    operation="rmdir",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -1950,6 +2060,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -1968,6 +2079,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -1986,7 +2098,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="realpath",
+                    operation="realpath",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -2001,6 +2114,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -2016,6 +2130,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -2034,7 +2149,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="getcwd",
+                    operation="getcwd",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -2048,6 +2164,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -2062,6 +2179,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -2080,7 +2198,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="readlink",
+                    operation="readlink",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -2095,6 +2214,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -2110,6 +2230,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -2128,7 +2249,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="symlink",
+                    operation="symlink",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -2143,6 +2265,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -2158,6 +2281,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -2176,7 +2300,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="link",
+                    operation="link",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -2192,6 +2317,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
+        cwd: str | None = None,
     ):
         async with self._semaphore:
             try:
@@ -2210,6 +2336,7 @@ class MercurySyncSFTPConnction:
                         disable_host_check=insecure,
                         username=username,
                         password=password,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -2228,7 +2355,8 @@ class MercurySyncSFTPConnction:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    action="chdir",
+                    operation="chdir",
+                    cwd=cwd,
                     error=err,
                     timings={},
                 )
@@ -2238,7 +2366,14 @@ class MercurySyncSFTPConnction:
         optimized_param: URL | Data | File,
     ):
         if isinstance(optimized_param, URL):
-            self._url_cache[optimized_param.optimized.hostname] = optimized_param
+            optimized_url = optimized_param.optimized
+
+            # Plain-string requests for the same address reuse this lookup:
+            # cache the resolved URL itself, under the address as given, and
+            # only once the lookup actually resolved it.
+            if optimized_url is not None and optimized_url.ip_addresses:
+                self._url_cache[optimized_param.data] = optimized_url
+
             self._optimized[optimized_param.call_name] = optimized_param
 
         else:
@@ -2254,6 +2389,7 @@ class MercurySyncSFTPConnction:
         username: str | None = None,
         password: str | None = None,
         disable_host_check: bool = False,
+        cwd: str | None = None,
     ):
         timings: dict[
             SFTPTimings,
@@ -2274,11 +2410,17 @@ class MercurySyncSFTPConnction:
         if command_args is None:
             command_args = ()
 
+        response_cwd = cwd
+
         timings["request_start"] = time.monotonic()
 
         connection: SFTPConnection | None = None
         
         try:
+            # Held from here on, so every exit -- including cancellation --
+            # returns it.
+            connection = self._connections.pop()
+
             timings["connect_start"] = time.monotonic()
 
             default_connection_options = self._connection_options.to_dict()
@@ -2301,13 +2443,16 @@ class MercurySyncSFTPConnction:
                 connection,
                 url,
             ) = await self._connect(
+                connection,
                 request_url,
                 **default_connection_options,
             )
 
             if err:
                 timings["connect_end"] = time.monotonic()
-                self._connections.append(SFTPConnection())
+
+                connection.reset()
+                self._connections.append(connection)
                 
                 return SFTPResponse(
                     url=URLMetadata(
@@ -2317,6 +2462,7 @@ class MercurySyncSFTPConnction:
                         query=url.query,
                     ),
                     operation=command_type,
+                    cwd=response_cwd,
                     timings=timings,
                     error=err,
                 )
@@ -2324,15 +2470,19 @@ class MercurySyncSFTPConnction:
             timings["connect_end"] = time.monotonic()
             timings["initialization_start"] = time.monotonic()
 
-            handler = await connection.create_session(
-                env=self.env,
-                sftp_version=self.sftp_version,
-            )
+            # One SFTP session serves every request on its connection until
+            # it ends (its writer is cleared) or the connection is reset.
+            if (handler := connection.session) is None or handler._writer is None:
+                handler = await connection.create_session(
+                    env=self.env,
+                    sftp_version=self.sftp_version,
+                )
 
             timings["initialization_end"] = time.monotonic()
 
             command = SFTPCommand(
                 handler,
+                base_directory=cwd,
                 path_encoding=self.path_encoding,
             )
 
@@ -2405,7 +2555,7 @@ class MercurySyncSFTPConnction:
                     result = await command.lexists(*command_args, options)
 
                 case "link":
-                    result = await command.link(*command_args, options)
+                    result = await command.link(*command_args)
 
                 case "listdir":
                     result = await command.scandir(path=command_args[0])
@@ -2471,7 +2621,7 @@ class MercurySyncSFTPConnction:
                     result = await command.symlink(*command_args)
 
                 case "truncate":
-                    result = await command.truncate(*command_args)
+                    result = await command.truncate(*command_args, options)
 
                 case "unlink":
                     result = await command.unlink(*command_args)
@@ -2479,16 +2629,16 @@ class MercurySyncSFTPConnction:
                 case "utime":
                     result = await command.utime(*command_args, options)
 
-            elapsed, transferred = result
-            
-            timings["exectution_end"] = elapsed
-            timings["close_start"] = time.monotonic()
+            _, transferred = result
 
-            command.exit()
-            await command.wait_closed()
+            timings["execution_end"] = time.monotonic()
 
-            timings["close_end"] = time.monotonic()
-            
+            if command_type == "chdir" and transferred:
+                # A chdir's response carries the directory it resolved.
+                response_cwd = next(iter(transferred.values())).file_path.decode(self.path_encoding)
+
+            # The session stays open for the connection's next request; a
+            # failed request resets the connection, session included.
             self._connections.append(connection)
 
             timings["request_end"] = time.monotonic()
@@ -2501,17 +2651,21 @@ class MercurySyncSFTPConnction:
                     query=url.query,
                 ),
                 operation=command_type,
+                cwd=response_cwd,
                 transferred=transferred,
                 timings=timings,
 
             )
 
-        except Exception as err:
+        except (
+            BaseException,
+            Exception,
+        ) as err:
             timings["request_end"] = time.monotonic()
 
-            self._connections.append(
-                SFTPConnection()
-            )
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
 
             if isinstance(request_url, str):
@@ -2529,6 +2683,7 @@ class MercurySyncSFTPConnction:
                     query=request_url.query,
                 ),
                 operation=command_type,
+                cwd=response_cwd,
                 timings=timings,
                 error=err,
             )
@@ -2536,6 +2691,7 @@ class MercurySyncSFTPConnction:
 
     async def _connect(
         self,
+        sftp_connection: SFTPConnection,
         request_url: str | URL,
         **kwargs: dict[str, Any],
 
@@ -2556,70 +2712,74 @@ class MercurySyncSFTPConnction:
                 protocol=self.address_protocol,
             )
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+        # The address as given decides what a lookup resolves: the hostname
+        # alone is shared by every port on a host, and is None for an
+        # address without a scheme.
+        cache_key = request_url.data if has_optimized_url else request_url
+
+        url = self._url_cache.get(cache_key)
+        dns_lock = self._dns_lock[cache_key]
+        dns_waiter = self._dns_waiters[cache_key]
 
         do_dns_lookup = url is None and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup_ssh()
+            try:
+                async with dns_lock:
+                    url = parsed_url
+                    await url.lookup_ssh()
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                    self._url_cache[cache_key] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
-
-            dns_lock.release()
+                if cache_key not in self._url_cache:
+                    del self._dns_waiters[cache_key]
 
         elif do_dns_lookup:
-            await dns_waiter
-            url = self._url_cache.get(parsed_url.hostname)
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
+            url = self._url_cache.get(cache_key)
 
         elif has_optimized_url:
             url = request_url.optimized
 
-
-        sftp_connection = self._connections.pop()
-
         connection_error: Exception | None = None
 
-        if url.address is None:
-            for address, ip_info in url:
-                try:
-                    await sftp_connection.make_connection(
-                        ip_info,
-                        **kwargs,
-                    )
+        try:
+            # Reuses the connection's SSH connection; otherwise opens a new
+            # one across the host's addresses.
+            address, socket_config, new_connection = await sftp_connection.connect_to_any(
+                cache_key,
+                url.ip_addresses,
+                url.address_rotation,
+                **kwargs,
+            )
 
-                    url.address = address
-                    url.socket_config = ip_info
-                    break
+            if new_connection:
+                url.address = address
+                url.socket_config = socket_config
 
-                except Exception as err:
-                    connection_error = err
+        except Exception as err:
+            connection_error = err
 
-        else:
-            try:
-                await sftp_connection.make_connection(
-                    url.socket_config,
-                    **kwargs,
-                )
+        try:
+            return (
+                connection_error,
+                sftp_connection,
+                parsed_url,
+            )
 
-
-            except Exception as err:
-                connection_error = err
-
-        return (
-            connection_error,
-            sftp_connection,
-            parsed_url,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
     
     def close(self):
         for connection in self._connections:

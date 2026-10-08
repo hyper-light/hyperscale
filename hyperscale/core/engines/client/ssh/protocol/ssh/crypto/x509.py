@@ -31,8 +31,8 @@ from cryptography import x509
 
 from OpenSSL import crypto
 
-from ..asn1 import IA5String, der_decode, der_encode
-from ..misc import ip_address
+from hyperscale.core.engines.client.ssh.protocol.ssh.asn1 import IA5String, der_decode, der_encode
+from hyperscale.core.engines.client.ssh.protocol.ssh.misc import ip_address
 
 from .misc import PyCAKey, PyCAPrivateKey, PyCAPublicKey, hashes
 

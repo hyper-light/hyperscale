@@ -1,13 +1,6 @@
-from enum import Enum
 from typing import Dict, Literal
 
-
-class StartCharTyping(Enum):
-    EMPTY = ""
-    BLOCK_BRACE = "["
-    PAREN = "("
-    DOT_BLOCK = "⡇"
-
+from .start_char_typing import StartCharTyping as StartCharTyping
 
 StartCharName = Literal[
     "empty",

@@ -1919,25 +1919,30 @@ class SSHX509Certificate(SSHCertificate):
                             trust_store: Set['SSHX509Certificate']) -> None:
         """Look up certificates by issuer hash to build a trust store"""
 
-        issuer_hash = cert.issuer_hash
+        # Certificates whose issuers are still to be looked up.
+        pending = [cert]
 
-        for path in trusted_cert_paths:
-            idx = 0
+        while pending:
+            cert = pending.pop()
+            issuer_hash = cert.issuer_hash
 
-            try:
-                while True:
-                    cert_path = Path(path, issuer_hash + '.' + str(idx))
-                    idx += 1
+            for path in trusted_cert_paths:
+                idx = 0
 
-                    c = cast('SSHX509Certificate', read_certificate(cert_path))
+                try:
+                    while True:
+                        cert_path = Path(path, issuer_hash + '.' + str(idx))
+                        idx += 1
 
-                    if c.subject != cert.issuer or c in trust_store:
-                        continue
+                        c = cast('SSHX509Certificate', read_certificate(cert_path))
 
-                    trust_store.add(c)
-                    self._expand_trust_store(c, trusted_cert_paths, trust_store)
-            except (OSError, KeyImportError):
-                pass
+                        if c.subject != cert.issuer or c in trust_store:
+                            continue
+
+                        trust_store.add(c)
+                        pending.append(c)
+                except (OSError, KeyImportError):
+                    pass
 
     @classmethod
     def construct(cls, packet: SSHPacket, algorithm: bytes,

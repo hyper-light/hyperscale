@@ -4,6 +4,7 @@ from typing import Callable, Dict, Union, Literal
 import psutil
 from pydantic import BaseModel, StrictFloat, StrictInt, StrictStr
 
+
 PrimaryType = Union[str, int, float, bytes, bool]
 
 
@@ -13,10 +14,14 @@ class Env(BaseModel):
     MERCURY_SYNC_PROCESS_JOB_CPU_LIMIT: StrictFloat | StrictInt = 85
     MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT: StrictInt | StrictFloat = 2048
     MERCURY_SYNC_CONNECT_RETRIES: StrictInt = 10
-    MERCURY_SYNC_CONNECT_SECONDS: StrictStr = "5s"
+    MERCURY_SYNC_CONNECT_SECONDS: StrictStr = "30s"
     MERCURY_SYNC_CLEANUP_INTERVAL: StrictStr = "1m"
     MERCURY_SYNC_MAX_CONCURRENCY: StrictInt = 2048
-    MERCURY_SYNC_AUTH_SECRET: StrictStr = "hyperscale-dev-secret-change-in-prod"
+    # No default: a published default would let anyone who read it run code
+    # on an unconfigured cluster. Every node must be given one strong, random
+    # secret (MERCURY_SYNC_AUTH_SECRET or --acm-secret); the encryptor refuses
+    # None, short and known-weak values.
+    MERCURY_SYNC_AUTH_SECRET: StrictStr | None = None
     MERCURY_SYNC_AUTH_SECRET_PREVIOUS: StrictStr | None = None  # For key rotation
     MERCURY_SYNC_LOGS_DIRECTORY: StrictStr = os.getcwd()
     MERCURY_SYNC_REQUEST_TIMEOUT: StrictStr = "1s"
@@ -30,7 +35,10 @@ class Env(BaseModel):
     MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_SHUTDOWN_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "replace"
-    MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
+    # Secure by default: peer certificates are checked against the
+    # connected host. Set to "false" only for local certs without
+    # matching SAN entries.
+    MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "true"
     MERCURY_SYNC_MAX_CONNECT_TIME: StrictStr = "120s"  # Maximum time to wait for client connection
 
     @classmethod
@@ -50,9 +58,14 @@ class Env(BaseModel):
             "MERCURY_SYNC_SEND_RETRIES": int,
             "MERCURY_SYNC_LOG_LEVEL": str,
             "MERCURY_SYNC_TASK_RUNNER_MAX_THREADS": int,
-            "MERCURY_SYNC_MAX_WORKFLOWS": int,
+            "MERCURY_SYNC_MAX_RUNNING_WORKFLOWS": int,
+            "MERCURY_SYNC_MAX_PENDING_WORKFLOWS": int,
             "MERCURY_SYNC_CONTEXT_POLL_RATE": str,
             "MERCURY_SYNC_SHUTDOWN_POLL_RATE": str,
             "MERCURY_SYNC_DUPLICATE_JOB_POLICY": str,
+            "MERCURY_SYNC_TLS_VERIFY_HOSTNAME": str,
             "MERCURY_SYNC_MAX_CONNECT_TIME": str,
+            "MERCURY_SYNC_AUTH_SECRET_PREVIOUS": str,
+            "MERCURY_SYNC_MONITOR_SAMPLE_WINDOW": str,
+            "MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL": str,
         }

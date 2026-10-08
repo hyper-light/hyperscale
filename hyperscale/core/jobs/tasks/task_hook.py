@@ -1,5 +1,4 @@
 import asyncio
-import uuid
 from collections import defaultdict
 import time
 from typing import (
@@ -15,6 +14,11 @@ from typing import (
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 
 from .cancel import cancel
+
+# SIM seam — MUST share Run.start's monotonic axis (see run.py): age =
+# now - run.start is only meaningful when both readings come from the
+# same clock.
+_DEFAULT_MONOTONIC_SOURCE = time.monotonic
 from .models import RunStatus
 from .run import Run
 
@@ -23,9 +27,18 @@ T = TypeVar("T")
 
 class Task(Generic[T]):
     def __init__(
-        self, task: Callable[[], T]
+        self,
+        task: Callable[[], T],
+        id_generator: SnowflakeGenerator,
     ) -> None:
-        self.task_id = Task.create_id()
+        # Shared, monotone id source owned and injected by the
+        # constructing TaskRunner — required, so every Task in a runner
+        # draws from ONE ordered stream (separate generators with the
+        # same instance would collide at the same millisecond, and a
+        # module-level fallback would be hidden mutable global state).
+        # Set before any id is drawn.
+        self._id_generator = id_generator
+        self.task_id = self.create_id()
         self.name: str = task.name
         self.schedule: Optional[int | float] = task.schedule
         self.trigger: Literal["MANUAL", "ON_START"] = task.trigger
@@ -53,10 +66,13 @@ class Task(Generic[T]):
 
         return RunStatus.IDLE
     
-    @classmethod
-    def create_id(cls):
-        return uuid.uuid4().int >> 64
-    
+    def create_id(self) -> int:
+        # Snowflake id: monotone + totally ordered, so ``latest()`` /
+        # ``max(self._runs)`` and the count-eviction ``sorted(...)`` are
+        # correct (a random ``uuid4`` id broke that ordering — latest()
+        # could return a stale run and eviction could drop the newest).
+        return self._id_generator.generate()
+
 
     def get_run_status(self, run_id: str):
         if run := self._runs.get(run_id):
@@ -139,7 +155,7 @@ class Task(Generic[T]):
 
     async def _execute_age_policy(self):
         removed_runs: List[Run] = []
-        current_time = time.monotonic()
+        current_time = _DEFAULT_MONOTONIC_SOURCE()
         for run_id, run in list(self._runs.items()):
             if current_time - run.start > self.max_age:
                 removed_runs.append(run)
@@ -161,7 +177,7 @@ class Task(Generic[T]):
             timeout = self.timeout
 
         if run_id is None:
-            run_id = Task.create_id()
+            run_id = self.create_id()
             
         run = Run(run_id, self.call, timeout=timeout)
 
@@ -171,9 +187,15 @@ class Task(Generic[T]):
 
         return run
 
-    def stop(self):
-        # Snapshot to avoid dict mutation during iteration
-        for run_id in list(self._schedule_running_statuses.keys()):
+    def stop(self, run_id: int):
+        """Stop the schedule started under ``run_id`` -- only that one:
+        concurrent runs of one task must not stop each other's
+        schedules (one workflow completing used to kill every
+        workflow's status pusher, and later every workflow's
+        aggregation, on the node). A schedule that already ended, or
+        never ran, is left alone: setting its flag would only leave
+        the flag behind."""
+        if run_id in self._schedule_running_statuses:
             self._schedule_running_statuses[run_id] = False
 
     def run_schedule(
@@ -184,7 +206,7 @@ class Task(Generic[T]):
         **kwargs,
     ):
         if run_id is None:
-            run_id = Task.create_id()
+            run_id = self.create_id()
 
         if timeout is None:
             timeout = self.timeout
@@ -204,37 +226,66 @@ class Task(Generic[T]):
     async def _run_schedule(self, run: Run, *args, **kwargs):
         self._runs[run.run_id] = run
 
-        if self.repeat == "ALWAYS":
-            while self._schedule_running_statuses[run.run_id]:
-                run.execute(*args, **kwargs)
+        # The loop's control key is the ORIGINAL schedule id — the one
+        # ``run_schedule`` registered and the only one ``stop`` can
+        # know about. The loop rebinds ``run`` to a fresh id every
+        # iteration for per-execution bookkeeping; checking THAT id
+        # (the old code) made every ALWAYS schedule unstoppable: stop
+        # flipped the ids existing at stop time, then the next
+        # iteration minted a fresh id set True and the loop checked
+        # the fresh one. Every completed workflow leaked its 10-20Hz
+        # status pollers forever — the measured per-worker cumulative
+        # drag (wall cost per virtual decade growing linearly with
+        # jobs served, resetting only on worker death) plus unbounded
+        # growth of ``_runs`` / ``_schedule_running_statuses``.
+        schedule_control_id = run.run_id
 
-                await asyncio.sleep(self.schedule)
-                run = Run(
-                    Task.create_id(),
-                    self.call,
-                    timeout=self.timeout,
-                )
+        try:
+            if self.repeat == "ALWAYS":
+                while self._schedule_running_statuses[schedule_control_id]:
+                    run.execute(*args, **kwargs)
 
-                self._runs[run.run_id] = run
-                self._schedule_running_statuses[run.run_id] = True
+                    await asyncio.sleep(self.schedule)
+                    previous_run_id = run.run_id
+                    run = Run(
+                        self.create_id(),
+                        self.call,
+                        timeout=self.timeout,
+                    )
 
-        elif isinstance(self.repeat, int):
-            for _ in range(self.repeat):
-                if self._schedule_running_statuses[run.run_id] is False:
-                    await run.cancel()
-                    break
+                    self._runs[run.run_id] = run
+                    # Per-iteration status keys are never the control key;
+                    # drop the previous iteration's entry so the dict holds
+                    # O(active schedules), not O(iterations ever).
+                    if previous_run_id != schedule_control_id:
+                        self._schedule_running_statuses.pop(previous_run_id, None)
 
-                run.execute(*args, **kwargs)
+            elif isinstance(self.repeat, int):
+                for _ in range(self.repeat):
+                    if self._schedule_running_statuses[schedule_control_id] is False:
+                        await run.cancel()
+                        break
 
-                await asyncio.sleep(self.schedule)
-                run = Run(
-                    Task.create_id(),
-                    self.call,
-                    timeout=self.timeout,
-                )
+                    run.execute(*args, **kwargs)
 
-                self._runs[run.run_id] = run
-                self._schedule_running_statuses[run.run_id] = True
+                    await asyncio.sleep(self.schedule)
+                    previous_run_id = run.run_id
+                    run = Run(
+                        self.create_id(),
+                        self.call,
+                        timeout=self.timeout,
+                    )
+
+                    self._runs[run.run_id] = run
+                    if previous_run_id != schedule_control_id:
+                        self._schedule_running_statuses.pop(previous_run_id, None)
+
+        finally:
+            # However the schedule ended -- stopped, done, cancelled or
+            # failed -- neither its flag nor its future stays behind
+            # (every finished schedule's future used to).
+            self._schedule_running_statuses.pop(schedule_control_id, None)
+            self._schedules.pop(schedule_control_id, None)
 
     async def _run(self, run: Run, *args, **kwargs):
         run.update_status(RunStatus.PENDING)

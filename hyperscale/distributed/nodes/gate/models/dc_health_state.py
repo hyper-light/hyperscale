@@ -2,32 +2,23 @@
 Datacenter health state tracking.
 
 Tracks datacenter manager health, registration, and backpressure.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-
-from hyperscale.distributed.models import (
-    ManagerHeartbeat,
-    DatacenterRegistrationState,
-)
-from hyperscale.distributed.health import (
-    ManagerHealthState,
-    ManagerHealthConfig,
-)
+from operator import attrgetter
+from hyperscale.distributed.models import ManagerHeartbeat, DatacenterRegistrationState
+from hyperscale.distributed.health import ManagerHealthState, ManagerHealthConfig
 from hyperscale.distributed.reliability import BackpressureLevel
 from hyperscale.distributed.slo import SLOSummary
 
-
-@dataclass(slots=True)
-class ManagerTracking:
-    """Tracks a single manager's state."""
-
-    address: tuple[str, int]
-    datacenter_id: str
-    last_heartbeat: ManagerHeartbeat | None = None
-    last_status_time: float = 0.0
-    health_state: ManagerHealthState | None = None
-    backpressure_level: BackpressureLevel = BackpressureLevel.NONE
+from .manager_tracking import ManagerTracking
 
 
 @dataclass(slots=True)
@@ -115,16 +106,9 @@ class DCHealthState:
         registered yet, or when none have reported any workflow
         latency observations.
         """
-        per_manager = self.manager_status.get(datacenter_id)
-        if not per_manager:
-            return SLOSummary.empty()
-
-        freshest: ManagerHeartbeat | None = None
-        for heartbeat in per_manager.values():
-            if heartbeat.slo_sample_count <= 0:
-                continue
-            if freshest is None or heartbeat.slo_updated_at > freshest.slo_updated_at:
-                freshest = heartbeat
+        freshest = self._freshest_slo_heartbeat(
+            self.manager_status.get(datacenter_id, {}).values()
+        )
         if freshest is None:
             return SLOSummary.empty()
 
@@ -138,6 +122,18 @@ class DCHealthState:
             updated_at=freshest.slo_updated_at,
         )
 
+    @staticmethod
+    def _freshest_slo_heartbeat(
+        heartbeats: Iterable[ManagerHeartbeat],
+    ) -> ManagerHeartbeat | None:
+        """AD-42: the first heartbeat with the latest ``slo_updated_at`` among those
+        reporting latency samples, or None when none has."""
+        return max(
+            (heartbeat for heartbeat in heartbeats if heartbeat.slo_sample_count > 0),
+            key=attrgetter("slo_updated_at"),
+            default=None,
+        )
+
     def get_all_dc_slo_summaries(self) -> dict[str, SLOSummary]:
         """Return a dc_id → SLOSummary map across every DC the
         gate currently knows about. Empty entries are skipped."""
@@ -145,3 +141,10 @@ class DCHealthState:
             datacenter_id: self.get_dc_slo_summary(datacenter_id)
             for datacenter_id in self.manager_status
         }
+
+_REHOMED = (
+    ManagerTracking,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

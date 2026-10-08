@@ -88,9 +88,12 @@ class UDPProtocol(FlowControlMixin, Protocol):
         self._transport = None
 
     def error_received(self, exc):
-        raise exc
+        # An ICMP error (e.g. port unreachable) fails the waiting read.
+        reader = self._stream_reader
+        if reader is not None:
+            reader.set_exception(exc)
 
-    def datagram_received(self, data):
+    def datagram_received(self, data, addr):
         reader = self._stream_reader
         if reader is not None:
             reader.feed_data(data)

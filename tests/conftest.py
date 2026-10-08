@@ -54,7 +54,7 @@ def mock_server() -> MockServerInterface:
 
 
 @pytest.fixture
-def temp_log_directory() -> Generator[str, None]:
+def temp_log_directory() -> Generator[str, None, None]:
     with tempfile.TemporaryDirectory() as temp_directory:
         yield temp_directory
 

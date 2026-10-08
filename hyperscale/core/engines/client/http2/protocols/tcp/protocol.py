@@ -108,8 +108,11 @@ class TCPProtocol(FlowControlMixin, Protocol):
         self._transport = None
 
     def data_received(self, data):
-        reader = self._stream_reader
-        if reader is not None:
+        # The reader's weak reference followed here rather than through the
+        # _stream_reader property: this runs on every read.
+        if (reader_reference := self._stream_reader_wr) is not None and (
+            reader := reader_reference()
+        ) is not None:
             reader.feed_data(data)
 
     def eof_received(self):

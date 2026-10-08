@@ -3,13 +3,23 @@ Gossip buffer for SWIM membership update dissemination.
 """
 
 import heapq
+from itertools import compress, repeat
+from operator import attrgetter, lt, methodcaller, not_
 import math
-import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Callable
 
-from ..core.types import UpdateType
-from .piggyback_update import PiggybackUpdate
+from hyperscale.distributed.swim.core.types import UpdateType
+from .gossip_buffer_stats import GossipBufferStats
+from .piggyback_update import ACCUSER_UPDATE_TYPE, PiggybackUpdate
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
+# Same-incarnation precedence of membership statuses.
+_STATUS_PRIORITY: dict[str, int] = {'alive': 0, 'join': 0, 'suspect': 1, 'dead': 2, 'leave': 2}
 
 
 # UDP MTU considerations:
@@ -58,9 +68,9 @@ class GossipBuffer:
     _overflow_count: int = 0  # Times we had to evict due to capacity
     
     # Callbacks
-    _on_overflow: Any = None  # Callable[[int, int], None] - (evicted, capacity)
+    _on_overflow: Callable[[int, int], None] | None = None  # (evicted, capacity)
     
-    def set_overflow_callback(self, callback: Any) -> None:
+    def set_overflow_callback(self, callback: Callable[[int, int], None]) -> None:
         """Set callback to be called when buffer overflows and eviction occurs."""
         self._on_overflow = callback
 
@@ -72,13 +82,18 @@ class GossipBuffer:
         n_members: int = 1,
         role: str | None = None,
         node_id: str | None = None,
+        accuser: tuple[str, int] | None = None,
     ) -> bool:
         """
         Add or update a membership update in the buffer.
 
         If an update for the same node exists with lower incarnation,
-        it is replaced. Updates with equal or higher incarnation are
-        only replaced if the new status has higher priority.
+        it is replaced. At equal incarnation the new update replaces it
+        when its status has higher priority, or — same status — when it
+        names a different accuser: a suspicion relayed from one accuser
+        must give way to this node's own (or another member's) independent
+        accusation, or that Lifeguard confirmation is never disseminated.
+        Re-queueing the SAME accusation never resets the broadcast count.
 
         Args:
             update_type: Type of update (alive, suspect, dead, etc.)
@@ -87,6 +102,7 @@ class GossipBuffer:
             n_members: Number of members (for broadcast count calculation)
             role: Optional node role (AD-35 Task 12.4.3)
             node_id: Stable identity currently bound to ``node`` when known.
+            accuser: The member whose own probes raised a suspect update.
 
         Returns:
             True if update was added, False if rejected due to limits.
@@ -101,51 +117,26 @@ class GossipBuffer:
             if len(self.updates) >= self.max_updates:
                 self._evict_oldest()
         
-        # Calculate max broadcasts: lambda * log(n+1)
-        max_broadcasts = max(1, int(
-            self.broadcast_multiplier * math.log(n_members + 1)
-        ))
-        
         existing = self.updates.get(node)
-        
-        if existing is None:
-            # New update (AD-35: include role)
+        # Lexicographic: incarnation, then status priority, then a changed
+        # accuser. AD-35: the replacement carries the role.
+        if existing is None or (
+            incarnation,
+            _STATUS_PRIORITY.get(update_type, 0),
+            accuser != existing.accuser,
+        ) > (existing.incarnation, _STATUS_PRIORITY.get(existing.update_type, 0), False):
             self.updates[node] = PiggybackUpdate(
                 update_type=update_type,
                 node=node,
                 incarnation=incarnation,
-                timestamp=time.monotonic(),
-                max_broadcasts=max_broadcasts,
+                timestamp=_DEFAULT_CLOCK.monotonic(),
+                # Calculate max broadcasts: lambda * log(n+1)
+                max_broadcasts=max(1, int(self.broadcast_multiplier * math.log(n_members + 1))),
                 role=role,
                 node_id=node_id,
+                accuser=accuser,
             )
             return True
-        elif incarnation > existing.incarnation:
-            # Higher incarnation replaces (AD-35: include role)
-            self.updates[node] = PiggybackUpdate(
-                update_type=update_type,
-                node=node,
-                incarnation=incarnation,
-                timestamp=time.monotonic(),
-                max_broadcasts=max_broadcasts,
-                role=role,
-                node_id=node_id,
-            )
-            return True
-        elif incarnation == existing.incarnation:
-            # Same incarnation - check status priority
-            priority = {'alive': 0, 'join': 0, 'suspect': 1, 'dead': 2, 'leave': 2}
-            if priority.get(update_type, 0) > priority.get(existing.update_type, 0):
-                self.updates[node] = PiggybackUpdate(
-                    update_type=update_type,
-                    node=node,
-                    incarnation=incarnation,
-                    timestamp=time.monotonic(),
-                    max_broadcasts=max_broadcasts,
-                    role=role,
-                    node_id=node_id,
-                )
-                return True
         
         return False
     
@@ -171,12 +162,28 @@ class GossipBuffer:
         # Use nsmallest for efficient top-k selection: O(n log k) vs O(n log n)
         return heapq.nsmallest(max_count, candidates, key=lambda u: u.broadcast_count)
     
-    def mark_broadcasts(self, updates: list[PiggybackUpdate]) -> None:
-        """Mark updates as having been broadcast and remove if done."""
+    def mark_broadcasts(
+        self,
+        updates: list[PiggybackUpdate],
+        destination: tuple[str, int] | None = None,
+    ) -> None:
+        """Charge each update one broadcast and remove it once its budget is spent.
+
+        A copy sent to ``destination`` is charged only when ``destination``
+        is not the update's own subject. The lambda*log(n) budget counts
+        RELAYS: the subject cannot pass news about itself on to anyone, and
+        a dead subject draws most of every survivor's traffic (its own
+        in-flight probe round, the suspicion notice, a proxy probe per
+        indirect-probe requester) -- measured: 3 of a manager's 5 DEAD
+        copies went to the dead gate itself and none to the one survivor
+        that never heard. The subject still receives the copy (an alive
+        subject refutes from it); it just never spends the budget.
+        """
         for update in updates:
             if update.node in self.updates:
-                self.updates[update.node].mark_broadcast()
-                if not self.updates[update.node].should_broadcast():
+                tracked_update = self.updates[update.node]
+                tracked_update.broadcast_count += tracked_update.node != destination
+                if not tracked_update.should_broadcast():
                     del self.updates[update.node]
     
     # Maximum allowed max_count to prevent excessive iteration
@@ -191,6 +198,7 @@ class GossipBuffer:
         self,
         max_count: int = 5,
         max_size: int | None = None,
+        destination: tuple[str, int] | None = None,
     ) -> bytes:
         """
         Get piggybacked updates as bytes to append to a message.
@@ -201,6 +209,9 @@ class GossipBuffer:
         Args:
             max_count: Maximum number of updates to include (1-100).
             max_size: Maximum total size in bytes (defaults to max_piggyback_size).
+            destination: The address the message is sent to, when known; an
+                update about that address is not charged a broadcast (see
+                ``mark_broadcasts``).
 
         Returns:
             Encoded piggyback data respecting size limits.
@@ -241,13 +252,14 @@ class GossipBuffer:
         if not result_parts:
             return b''
 
-        self.mark_broadcasts(included_updates)
+        self.mark_broadcasts(included_updates, destination)
         return self.MEMBERSHIP_SEPARATOR + self.ENTRY_SEPARATOR.join(result_parts)
     
     def encode_piggyback_with_base(
         self,
         base_message: bytes,
         max_count: int = 5,
+        destination: tuple[str, int] | None = None,
     ) -> bytes:
         """
         Encode piggyback data considering the base message size.
@@ -257,6 +269,7 @@ class GossipBuffer:
         Args:
             base_message: The core message (probe, ack, etc.)
             max_count: Maximum number of updates to include.
+            destination: The address the message is sent to, when known.
         
         Returns:
             Encoded piggyback data that fits within UDP limits.
@@ -265,7 +278,7 @@ class GossipBuffer:
         if remaining <= 0:
             return b''
         
-        return self.encode_piggyback(max_count, max_size=remaining)
+        return self.encode_piggyback(max_count, max_size=remaining, destination=destination)
     
     # Maximum updates to decode from a single piggyback message
     MAX_DECODE_UPDATES = 100
@@ -283,7 +296,7 @@ class GossipBuffer:
         Returns:
             List of decoded updates (bounded by max_updates).
         """
-        if not data or not data.startswith(cls.MEMBERSHIP_SEPARATOR):
+        if not data.startswith(cls.MEMBERSHIP_SEPARATOR):
             return []
 
         # Bound max_updates to prevent abuse
@@ -296,10 +309,19 @@ class GossipBuffer:
             if len(updates) >= bounded_max:
                 # Stop decoding - we've hit the limit
                 break
-            if part:
-                update = PiggybackUpdate.from_bytes(part)
-                if update:
-                    updates.append(update)
+            # An empty or malformed part decodes to None and is skipped.
+            if (update := PiggybackUpdate.from_bytes(part)) is None:
+                continue
+            # A ``by:`` entry names the accuser of the entry before it
+            # (``ACCUSER_UPDATE_TYPE``; senders emit it straight after its
+            # suspect entry, so the last decoded update is that entry
+            # whenever the section is well-formed). Leading the section it has nothing
+            # to annotate and stays an unknown-type update, which
+            # ``process_piggyback_data`` suppresses.
+            if update.update_type == ACCUSER_UPDATE_TYPE and updates:
+                updates[-1].accuser = update.node
+                continue
+            updates.append(update)
         return updates
     
     def clear(self) -> None:
@@ -348,10 +370,9 @@ class GossipBuffer:
         if evicted > 0:
             self._overflow_count += 1
             if self._on_overflow:
-                try:
-                    self._on_overflow(evicted, self.max_updates)
-                except Exception:
-                    pass  # Don't let callback errors affect buffer operations
+                # Eviction is complete: a failing callback raises to the
+                # caller with the buffer already consistent.
+                self._on_overflow(evicted, self.max_updates)
         
         return evicted
     
@@ -362,13 +383,16 @@ class GossipBuffer:
         Returns:
             Number of stale updates removed.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.stale_age_seconds
         
-        to_remove = []
-        for node, update in self.updates.items():
-            if update.timestamp < cutoff:
-                to_remove.append(node)
+        # Keys and values iterate in the same order, so compress selects the stale keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(lt, map(attrgetter("timestamp"), self.updates.values()), repeat(cutoff)),
+            )
+        )
         
         for node in to_remove:
             del self.updates[node]
@@ -383,10 +407,13 @@ class GossipBuffer:
         Returns:
             Number of completed updates removed.
         """
-        to_remove = []
-        for node, update in self.updates.items():
-            if not update.should_broadcast():
-                to_remove.append(node)
+        # Keys and values iterate in the same order, so compress selects the completed keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(not_, map(methodcaller("should_broadcast"), self.updates.values())),
+            )
+        )
         
         for node in to_remove:
             del self.updates[node]
@@ -409,7 +436,7 @@ class GossipBuffer:
             'pending_updates': len(self.updates),
         }
     
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> GossipBufferStats:
         """Get buffer statistics for monitoring."""
         return {
             'pending_updates': len(self.updates),

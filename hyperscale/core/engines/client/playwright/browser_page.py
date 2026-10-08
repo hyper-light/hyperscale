@@ -108,6 +108,7 @@ except Exception:
         pass
 
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
+from hyperscale.core.testing.models import URL
 
 from .browser_frame import BrowserFrame
 from .browser_js_handle import BrowserJSHandle
@@ -1990,7 +1991,7 @@ class BrowserPage:
 
     async def goto(
         self,
-        url: str,
+        url: str | URL,
         wait_util: Optional[
             Literal[
                 "commit",
@@ -2008,7 +2009,11 @@ class BrowserPage:
             timeout = self.timeouts.request_timeout * 1000
 
         command = GoToCommand(
-            url=url, timeout=timeout, wait_util=wait_util, referrer=referrer
+            # A step's URL argument loads its address; a string is the address.
+            url=getattr(url, "data", url),
+            timeout=timeout,
+            wait_util=wait_util,
+            referrer=referrer,
         )
 
         result: Optional[Response] = None

@@ -31,6 +31,7 @@ class MockEnv:
         self.MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL = 0.1
         self.MERCURY_SYNC_PROCESS_JOB_CPU_LIMIT = 85
         self.MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT = 2048
+        self.WORKER_POOL_STARTUP_TIMEOUT_SECONDS = 60.0
 
 
 class TestWorkerLifecycleManagerInitialization:
@@ -295,7 +296,17 @@ class TestWorkerLifecycleManagerRemoteManager:
 
             result = await manager.initialize_remote_manager(updates_controller, 1.0)
 
-            mock_rgm.assert_called_once_with(updates_controller, 4, status_update_poll_interval=1.0)
+            # Phase 6 SIM seams forwarded to the RemoteGraphManager
+            # (``None`` in REAL mode — behavior unchanged).
+            mock_rgm.assert_called_once_with(
+                updates_controller,
+                4,
+                status_update_poll_interval=1.0,
+                loop=None,
+                transport_factory=None,
+                # The worker's host command owns SIGINT/SIGTERM.
+                owns_process_signals=False,
+            )
             assert result is mock_instance
             assert manager._remote_manager is mock_instance
 

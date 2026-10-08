@@ -42,7 +42,7 @@ class SMTPResponse(CallResult):
     server: str
     email: str
     recipient_responses: Dict[str, Tuple[int, str, Exception | None]] = None
-    last_smtp_code: int | None = None,
+    last_smtp_code: int | None = None
     last_smtp_message: str | bytes | None = None
     last_smtp_options: dict[
         str | bytes,

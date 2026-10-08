@@ -38,6 +38,21 @@ class LeaderHeartbeatHandler(BaseHandler):
         self._server.increment_metric("heartbeats_received")
         term = await self._server.parse_term_safe(message, source_addr)
 
+        # Parse the monotonic beat sequence + authoritative lease grant
+        # (fixes 2/4, 4/4) from ``leader-heartbeat:{term}:{seq}:{lease_ms}``.
+        # A sequence-less beat (older/other sender) leaves them as
+        # "absent" so the lease still renews on receipt.
+        heartbeat_seq = -1
+        lease_duration = None
+        heartbeat_fields = message.split(b":")
+        if len(heartbeat_fields) >= 4:
+            try:
+                heartbeat_seq = int(heartbeat_fields[2])
+                lease_duration = int(heartbeat_fields[3]) / 1000.0
+            except (ValueError, IndexError):
+                heartbeat_seq = -1
+                lease_duration = None
+
         # Check if we received our own heartbeat (shouldn't happen)
         if target:
             self_addr = self._server.get_self_udp_addr()
@@ -66,9 +81,27 @@ class LeaderHeartbeatHandler(BaseHandler):
                 if should_yield:
                     await self._handle_split_brain(target, term, self_addr)
 
-            await self._server.leader_election.handle_heartbeat(target, term)
+            await self._server.leader_election.handle_heartbeat(
+                target, term, heartbeat_seq, lease_duration
+            )
+            await self._acknowledge_heartbeat(target, term)
 
         return self._ack()
+
+    async def _acknowledge_heartbeat(self, leader: tuple[str, int], term: int) -> None:
+        """Tell ``leader`` which of its beats renewed this node's lease, so the
+        beat counts toward its quorum lease (Raft thesis 6.2/6.4.1)."""
+        acknowledgement = self._server.leader_election.heartbeat_acknowledgement(leader, term)
+        if acknowledgement is None:
+            return
+        base_timeout = await self._server.get_current_timeout()
+        timeout = self._server.get_lhm_adjusted_timeout(base_timeout)
+        self._server.task_runner.run(
+            self._server.send,
+            leader,
+            acknowledgement,
+            timeout=timeout,
+        )
 
     async def _handle_split_brain(
         self,

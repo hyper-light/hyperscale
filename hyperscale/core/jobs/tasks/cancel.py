@@ -18,5 +18,11 @@ async def cancel(task: asyncio.Task):
 
         return task
 
-    except (asyncio.CancelledError, asyncio.InvalidStateError):
+    except asyncio.CancelledError:
+        # The cancelled task's own CancelledError ends here; one
+        # cancelling the caller -- the task running this -- goes on.
+        if asyncio.current_task().cancelling():
+            raise
+
+    except asyncio.InvalidStateError:
         pass

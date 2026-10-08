@@ -5,6 +5,17 @@ from typing import Any, Awaitable, Callable, Optional
 
 from .models import RunStatus, TaskRun
 
+# Runtime-default monotonic source — the SIM seam rebinding point
+# (same contract as _DEFAULT_TIME_SOURCE in hyperscale.core.snowflake,
+# monotonic axis). ``Run.start`` feeds TaskHook's AGE-based cleanup:
+# with real readings under SIM, a background task older than
+# ``max_age`` REAL seconds was cancelled at a host-load-dependent
+# VIRTUAL instant — the cancellation/status machinery lost a leg at a
+# run-dependent time and zombie-workflow drains landed on different
+# retry rungs across otherwise byte-identical runs (the chaos VOPR's
+# residual L2 twin forks, seeds 36/40/66). REAL mode keeps realtime.
+_DEFAULT_MONOTONIC_SOURCE = time.monotonic
+
 
 class Run:
     __slots__ = (
@@ -32,18 +43,13 @@ class Run:
 
         self.error: Optional[str] = None
         self.trace: Optional[str] = None
-        self.start = time.monotonic()
+        self.start = _DEFAULT_MONOTONIC_SOURCE()
         self.end = 0
         self.elapsed = 0
         self.timeout = timeout
 
-        bound_instance = call.__self__
-
         self.call = call
         self.result: Any | None = None
-
-        self.call = self.call.__get__(bound_instance, self.call.__class__)
-        setattr(bound_instance, self.call.__name__, self.call)
 
         self._task: Optional[asyncio.Task] = None
 
@@ -89,7 +95,7 @@ class Run:
 
     def update_status(self, status: RunStatus):
         self.status = status
-        self.elapsed = time.monotonic() - self.start
+        self.elapsed = _DEFAULT_MONOTONIC_SOURCE() - self.start
 
     async def complete(self):
         if self.running and self.task_running:
@@ -127,7 +133,7 @@ class Run:
 
         # Always update status, even if timeout occurred
         self.status = RunStatus.CANCELLED
-        self.end = time.monotonic()
+        self.end = _DEFAULT_MONOTONIC_SOURCE()
         self.elapsed = self.end - self.start
 
     def abort(self):
@@ -163,7 +169,7 @@ class Run:
             self.trace = traceback.format_exc()
             self.status = RunStatus.FAILED
 
-        self.end = time.monotonic()
+        self.end = _DEFAULT_MONOTONIC_SOURCE()
         self.elapsed = self.end - self.start
 
         return self.result

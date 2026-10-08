@@ -32,7 +32,9 @@
 
 """
 
-from typing import Dict, Sequence, Tuple, Type, TypeVar, Union
+import sys
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+from typing import Type, TypeVar, Union, cast
 
 _DERClass = Type['DERType']
 _DERClassVar = TypeVar('_DERClassVar', bound='_DERClass')
@@ -210,21 +212,22 @@ class TaggedDERObject:
         self.value = value
 
     def __repr__(self) -> str:
-        if self.asn1_class == CONTEXT_SPECIFIC:
-            return f'TaggedDERObject({self.tag}, {self.value!r})'
-        else:
-            return f'TaggedDERObject({_asn1_class[self.asn1_class]}, ' \
-                   f'{self.tag}, {self.value!r})'
+        return _represent(self)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, TaggedDERObject): # pragma: no cover
             return NotImplemented
 
-        return (self.asn1_class == other.asn1_class and
-                self.tag == other.tag and self.value == other.value)
+        # DER is canonical: two DER values are equal when their encodings
+        # are, and comparing encodings never recurses into nested values.
+        return self is other or der_encode(self) == der_encode(other)
 
     def __hash__(self) -> int:
-        return hash((self.asn1_class, self.tag, self.value))
+        # Unhashable when any value inside is, as a hash of the nested
+        # values would be.
+        _check_hashable(self.value)
+
+        return hash(der_encode(self))
 
     def encode_identifier(self) -> bytes:
         """Encode the DER identifier for this object as a byte string"""
@@ -236,6 +239,166 @@ class TaggedDERObject:
         """Encode the content for this object as a DER byte string"""
 
         return der_encode(value.value)
+
+@DERTag(NULL, (type(None),))
+class _Null(DERType):
+    """A null value"""
+
+    @staticmethod
+    def encode(value: object) -> bytes:
+        """Encode a DER null value"""
+
+        # pylint: disable=unused-argument
+
+        return b''
+
+    @classmethod
+    def decode(cls, constructed: bool, content: bytes) -> None:
+        """Decode a DER null value"""
+
+        if constructed:
+            raise ASN1DecodeError('NULL should not be constructed')
+
+        if content:
+            raise ASN1DecodeError('NULL should not have associated content')
+
+        return None
+
+
+@DERTag(BOOLEAN, (bool,))
+class _Boolean(DERType):
+    """A boolean value"""
+
+    @staticmethod
+    def encode(value: object) -> bytes:
+        """Encode a DER boolean value"""
+
+        return b'\xff' if value else b'\0'
+
+    @classmethod
+    def decode(cls, constructed: bool, content: bytes) -> bool:
+        """Decode a DER boolean value"""
+
+        if constructed:
+            raise ASN1DecodeError('BOOLEAN should not be constructed')
+
+        if content not in {b'\x00', b'\xff'}:
+            raise ASN1DecodeError('BOOLEAN content must be 0x00 or 0xff')
+
+        return bool(content[0])
+
+
+@DERTag(INTEGER, (int,))
+class _Integer(DERType):
+    """An integer value"""
+
+    @staticmethod
+    def encode(value: object) -> bytes:
+        """Encode a DER integer value"""
+
+        i = cast(int, value)
+        l = i.bit_length()
+        l = l // 8 + 1 if l % 8 == 0 else (l + 7) // 8
+        result = i.to_bytes(l, 'big', signed=True)
+        return result[1:] if result.startswith(b'\xff\x80') else result
+
+    @classmethod
+    def decode(cls, constructed: bool, content: bytes) -> int:
+        """Decode a DER integer value"""
+
+        if constructed:
+            raise ASN1DecodeError('INTEGER should not be constructed')
+
+        return int.from_bytes(content, 'big', signed=True)
+
+
+@DERTag(OCTET_STRING, (bytes, bytearray))
+class _OctetString(DERType):
+    """An octet string value"""
+
+    @staticmethod
+    def encode(value: object) -> bytes:
+        """Encode a DER octet string"""
+
+        return cast(bytes, value)
+
+    @classmethod
+    def decode(cls, constructed: bool, content: bytes) -> bytes:
+        """Decode a DER octet string"""
+
+        if constructed:
+            raise ASN1DecodeError('OCTET STRING should not be constructed')
+
+        return content
+
+
+@DERTag(UTF8_STRING, (str,))
+class _UTF8String(DERType):
+    """A UTF-8 string value"""
+
+    @staticmethod
+    def encode(value: object) -> bytes:
+        """Encode a DER UTF-8 string"""
+
+        return cast(str, value).encode('utf-8')
+
+    @classmethod
+    def decode(cls, constructed: bool, content: bytes) -> str:
+        """Decode a DER UTF-8 string"""
+
+        if constructed:
+            raise ASN1DecodeError('UTF8 STRING should not be constructed')
+
+        return content.decode('utf-8')
+
+
+# SEQUENCE and SET values are encoded and decoded by der_encode and
+# _decode_values, which walk nested values with explicit stacks: these
+# methods hand their members to those walks rather than recursing.
+
+@DERTag(SEQUENCE, (list, tuple), constructed=True)
+class _Sequence(DERType):
+    """A sequence of values"""
+
+    @staticmethod
+    def encode(value: object) -> bytes:
+        """Encode a sequence of DER values"""
+
+        seq_value = cast(Sequence[object], value)
+        return b''.join([der_encode(item) for item in seq_value])
+
+    @classmethod
+    def decode(cls, constructed: bool, content: bytes) -> Sequence[object]:
+        """Decode a sequence of DER values"""
+
+        if not constructed:
+            raise ASN1DecodeError('SEQUENCE should always be constructed')
+
+        members, _ = _decode_values(content, 0, len(content), True)
+        return tuple(members)
+
+
+@DERTag(SET, (set, frozenset), constructed=True)
+class _Set(DERType):
+    """A set of DER values"""
+
+    @staticmethod
+    def encode(value: object) -> bytes:
+        """Encode a set of DER values"""
+
+        set_value = cast(Union[FrozenSet[object], Set[object]], value)
+        return b''.join(sorted([der_encode(item) for item in set_value]))
+
+    @classmethod
+    def decode(cls, constructed: bool, content: bytes) -> FrozenSet[object]:
+        """Decode a set of DER values"""
+
+        if not constructed:
+            raise ASN1DecodeError('SET should always be constructed')
+
+        members, _ = _decode_values(content, 0, len(content), True)
+        return frozenset(members)
+
 
 @DERTag(BIT_STRING)
 class BitString(DERType):
@@ -500,40 +663,97 @@ def der_encode(value: object) -> bytes:
 
     """
 
-    t = type(value)
-    if t in (RawDERObject, TaggedDERObject):
-        value: RawDERObject | TaggedDERObject = value
-        identifier = value.encode_identifier()
-        content = value.encode(value)
-    elif t in _der_class_by_type:
-        cls = _der_class_by_type[t]
-        identifier = cls.identifier
-        content = cls.encode(value)
-    else:
-        raise ASN1EncodeError(f'Cannot DER encode type {t.__name__}')
+    # Encodings made so far, in order: a constructed value's content is the
+    # run of encodings its members leave at the end.
+    encoded: List[bytes] = []
 
-    length = len(content)
+    # Values to encode, last first, as (value, identifier, member count,
+    # sort members). A constructed value is visited twice: first (with no
+    # identifier) to queue its members, then to assemble their encodings.
+    pending: List[Tuple[object, Optional[bytes], int, bool]] = \
+        [(value, None, 0, False)]
+
+    # Mutable containers being encoded: one that contains itself has no
+    # finite encoding.
+    open_containers: Set[int] = set()
+
+    while pending:
+        item, identifier, member_count, sort_members = pending.pop()
+
+        if identifier is not None:
+            start = len(encoded) - member_count
+            members = encoded[start:]
+            del encoded[start:]
+
+            content = b''.join(sorted(members) if sort_members else members)
+            encoded.append(identifier + _encode_length(len(content)) + content)
+            open_containers.discard(id(item))
+            continue
+
+        item_type = type(item)
+
+        if item_type is TaggedDERObject:
+            tagged = cast(TaggedDERObject, item)
+            pending.append((tagged, tagged.encode_identifier(), 1, False))
+            pending.append((tagged.value, None, 0, False))
+        elif item_type is RawDERObject:
+            raw = cast(RawDERObject, item)
+            identifier = raw.encode_identifier()
+            content = raw.encode(raw)
+            encoded.append(identifier + _encode_length(len(content)) + content)
+        elif item_type in _der_class_by_type:
+            cls = _der_class_by_type[item_type]
+
+            if cls is _Sequence or cls is _Set:
+                if item_type is list or item_type is set:
+                    if id(item) in open_containers:
+                        raise ASN1EncodeError('Cannot DER encode a value '
+                                              'that contains itself')
+
+                    open_containers.add(id(item))
+
+                members = list(cast(Sequence[object], item))
+                pending.append((item, cls.identifier, len(members), cls is _Set))
+                pending.extend((member, None, 0, False)
+                               for member in reversed(members))
+            else:
+                content = cls.encode(item)
+                encoded.append(cls.identifier + _encode_length(len(content)) +
+                               content)
+        else:
+            raise ASN1EncodeError(f'Cannot DER encode type {item_type.__name__}')
+
+    return encoded[0]
+
+
+def _encode_length(length: int) -> bytes:
+    """Encode the length of a DER value's content"""
+
     if length < 0x80:
-        len_bytes = bytes((length,))
-    else:
-        len_bytes = length.to_bytes((length.bit_length() + 7) // 8, 'big')
-        len_bytes = bytes((0x80 | len(len_bytes),)) + len_bytes
+        return bytes((length,))
 
-    return identifier + len_bytes + content
+    len_bytes = length.to_bytes((length.bit_length() + 7) // 8, 'big')
+    return bytes((0x80 | len(len_bytes),)) + len_bytes
 
 
-def der_decode_partial(data: bytes) -> Tuple[object, int]:
-    """Decode a value in DER format and return the number of bytes consumed"""
+def _decode_header(data: bytes, offset: int,
+                   limit: int) -> Tuple[int, bool, int, int, int]:
+    """Decode the identifier and length of the DER value at offset
 
-    if len(data) < 2:
+       The value must end by limit. This returns its ASN.1 class, whether
+       it is constructed, its tag, and where its content starts and ends.
+
+    """
+
+    if limit - offset < 2:
         raise ASN1DecodeError('Incomplete data')
 
-    tag = data[0]
+    tag = data[offset]
     asn1_class, constructed, tag = tag >> 6, bool(tag & 0x20), tag & 0x1f
-    offset = 1
+    offset += 1
     if tag == 0x1f:
         tag = 0
-        for b in data[offset:]:
+        for b in data[offset:limit]:
             offset += 1
 
             if b < 0x80:
@@ -545,33 +765,234 @@ def der_decode_partial(data: bytes) -> Tuple[object, int]:
         else:
             raise ASN1DecodeError('Incomplete tag')
 
-    if offset >= len(data):
+    if offset >= limit:
         raise ASN1DecodeError('Incomplete data')
 
     length = data[offset]
     offset += 1
     if length > 0x80:
         len_size = length & 0x7f
-        length = int.from_bytes(data[offset:offset+len_size], 'big')
+        length = int.from_bytes(data[offset:min(offset+len_size, limit)], 'big')
         offset += len_size
     elif length == 0x80:
         raise ASN1DecodeError('Indefinite length not allowed')
 
     end = offset + length
-    content = data[offset:end]
 
-    if end > len(data):
+    if end > limit:
         raise ASN1DecodeError('Incomplete data')
 
-    if asn1_class == UNIVERSAL and tag in _der_class_by_tag:
-        cls = _der_class_by_tag[tag]
-        value = cls.decode(constructed, content)
-    elif constructed:
-        value = TaggedDERObject(tag, der_decode(content), asn1_class)
-    else:
-        value = RawDERObject(tag, content, asn1_class)
+    return asn1_class, constructed, tag, offset, end
 
-    return value, end
+
+# The outermost frame of a decode: one value, or every value up to the
+# limit (a SEQUENCE's or SET's content).
+_ONE_VALUE = object()
+_ALL_VALUES = object()
+
+
+def _decode_values(data: bytes, offset: int, limit: int,
+                   take_all: bool) -> Tuple[Any, int]:
+    """Decode the DER value at offset, or every value from offset to limit
+
+       This returns the value (or a list of the values) and the offset
+       after the last one. Nested values are decoded with an explicit
+       stack of frames rather than by recursion.
+
+    """
+
+    # The constructed values being decoded, innermost last, each as
+    # [kind, ASN.1 class, tag, content end, member values]. The kind is
+    # _Sequence, _Set, TaggedDERObject (an explicit tag: one value that
+    # fills its content), or a marker for the outermost frame.
+    frames: List[List[Any]] = \
+        [[_ALL_VALUES if take_all else _ONE_VALUE, UNIVERSAL, 0, limit, []]]
+
+    # Decoded values nest no deeper than the interpreter allows recursion,
+    # so that operations on them (hashing nested tuples) stay within the
+    # interpreter's limits.
+    depth_limit = sys.getrecursionlimit()
+
+    while True:
+        frame = frames[-1]
+        kind = frame[0]
+
+        if offset == frame[3] and \
+                (kind is _ALL_VALUES or kind is _Sequence or kind is _Set):
+            # Every member of this content is decoded.
+            frames.pop()
+            members = frame[4]
+
+            if kind is _ALL_VALUES:
+                return members, offset
+
+            value: Any = tuple(members) if kind is _Sequence \
+                else frozenset(members)
+        else:
+            asn1_class, constructed, tag, start, end = \
+                _decode_header(data, offset, frame[3])
+
+            if asn1_class == UNIVERSAL and tag in _der_class_by_tag:
+                cls = _der_class_by_tag[tag]
+
+                if cls is _Sequence or cls is _Set:
+                    if not constructed:
+                        name = 'SEQUENCE' if cls is _Sequence else 'SET'
+                        raise ASN1DecodeError(f'{name} should always be '
+                                              'constructed')
+
+                    if len(frames) > depth_limit:
+                        raise ASN1DecodeError('Data is nested too deeply')
+
+                    frames.append([cls, asn1_class, tag, end, []])
+                    offset = start
+                    continue
+
+                value = cls.decode(constructed, data[start:end])
+            elif constructed:
+                if len(frames) > depth_limit:
+                    raise ASN1DecodeError('Data is nested too deeply')
+
+                frames.append([TaggedDERObject, asn1_class, tag, end, []])
+                offset = start
+                continue
+            else:
+                value = RawDERObject(tag, data[start:end], asn1_class)
+
+            offset = end
+
+        # Hand the value to the frames that enclose it, closing each
+        # explicit tag it completes.
+        while True:
+            frame = frames[-1]
+            kind = frame[0]
+
+            if kind is _ONE_VALUE:
+                return value, offset
+
+            if kind is TaggedDERObject:
+                if offset < frame[3]:
+                    raise ASN1DecodeError('Data contains unexpected bytes '
+                                          'at end')
+
+                frames.pop()
+                value = TaggedDERObject(frame[2], value, frame[1])
+                continue
+
+            frame[4].append(value)
+            break
+
+
+def der_decode_partial(data: bytes) -> Tuple[object, int]:
+    """Decode a value in DER format and return the number of bytes consumed"""
+
+    return _decode_values(data, 0, len(data), False)
+
+
+def _check_hashable(value: object) -> None:
+    """Raise TypeError if any value inside value is unhashable
+
+       Values are checked in the order a nested hash would visit them, so
+       the error names the same first unhashable type.
+
+    """
+
+    pending: List[object] = [value]
+
+    while pending:
+        item = pending.pop()
+        item_type = type(item)
+
+        if item_type is TaggedDERObject:
+            pending.append(cast(TaggedDERObject, item).value)
+        elif item_type is tuple or item_type is frozenset:
+            pending.extend(reversed(list(cast(Sequence[object], item))))
+        elif item_type is list or item_type is set:
+            raise TypeError(f"unhashable type: '{item_type.__name__}'")
+        else:
+            hash(item)
+
+
+# What _represent emits for each pending entry: text, a value to
+# represent, or the end of a list (no longer open).
+_TEXT = 0
+_VALUE = 1
+_CLOSE_LIST = 2
+
+_EMPTY_REPRESENTATIONS = {tuple: '()', list: '[]', frozenset: 'frozenset()',
+                          set: 'set()'}
+
+
+def _represent(value: object) -> str:
+    """repr() of a DER value, built without recursing into nested values"""
+
+    pieces: List[str] = []
+    pending: List[Tuple[int, Any]] = [(_VALUE, value)]
+
+    # Lists being represented: one that contains itself shows as [...],
+    # as repr() shows it.
+    open_lists: Set[int] = set()
+
+    while pending:
+        entry, item = pending.pop()
+
+        if entry == _TEXT:
+            pieces.append(item)
+            continue
+
+        if entry == _CLOSE_LIST:
+            open_lists.discard(item)
+            continue
+
+        item_type = type(item)
+
+        if item_type is TaggedDERObject:
+            if item.asn1_class == CONTEXT_SPECIFIC:
+                prefix = f'TaggedDERObject({item.tag}, '
+            else:
+                prefix = f'TaggedDERObject({_asn1_class[item.asn1_class]}, ' \
+                         f'{item.tag}, '
+
+            pending.append((_TEXT, ')'))
+            pending.append((_VALUE, item.value))
+            pending.append((_TEXT, prefix))
+        elif item_type in _EMPTY_REPRESENTATIONS:
+            if item_type is list:
+                if id(item) in open_lists:
+                    pieces.append('[...]')
+                    continue
+
+                open_lists.add(id(item))
+                pending.append((_CLOSE_LIST, id(item)))
+
+            members = list(item)
+
+            if not members:
+                pieces.append(_EMPTY_REPRESENTATIONS[item_type])
+                continue
+
+            if item_type is tuple:
+                opening, closing = '(', ',)' if len(members) == 1 else ')'
+            elif item_type is list:
+                opening, closing = '[', ']'
+            elif item_type is frozenset:
+                opening, closing = 'frozenset({', '})'
+            else:
+                opening, closing = '{', '}'
+
+            pending.append((_TEXT, closing))
+
+            for index in range(len(members) - 1, -1, -1):
+                pending.append((_VALUE, members[index]))
+
+                if index:
+                    pending.append((_TEXT, ', '))
+
+            pending.append((_TEXT, opening))
+        else:
+            pieces.append(repr(item))
+
+    return ''.join(pieces)
 
 
 def der_decode(data: bytes) -> object:

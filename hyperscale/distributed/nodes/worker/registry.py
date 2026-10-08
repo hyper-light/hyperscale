@@ -5,11 +5,19 @@ Handles manager registration, health tracking, and peer management.
 """
 
 import asyncio
-import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import ManagerInfo
 from hyperscale.distributed.swim.core import ErrorStats, CircuitState
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+from .models.manager_circuit_lookup_error import ManagerCircuitLookupError
+from .models.manager_circuit_status import ManagerCircuitStatus
+from .models.manager_circuit_summary import ManagerCircuitSummary
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -29,6 +37,10 @@ class WorkerRegistry:
         recovery_jitter_min: float = 0.0,
         recovery_jitter_max: float = 1.0,
         recovery_semaphore_size: int = 5,
+        *,
+        select_manager: Callable[[set[str]], str | None],
+        circuit_breaker_config: dict[str, int | float],
+        forget_manager_backpressure: Callable[[str], None],
     ) -> None:
         """
         Initialize worker registry.
@@ -38,8 +50,19 @@ class WorkerRegistry:
             recovery_jitter_min: Minimum jitter for recovery operations
             recovery_jitter_max: Maximum jitter for recovery operations
             recovery_semaphore_size: Concurrent recovery limit
+            select_manager: AD-28 selection over a set of healthy manager
+                ids (weighted rendezvous + power of two choices + EWMA);
+                returns the chosen id or None when it cannot choose
+            circuit_breaker_config: The configured breaker for each manager
+                link (``Env.get_circuit_breaker_config``)
+            forget_manager_backpressure: Drops a removed manager's AD-23
+                backpressure signal (``WorkerState.remove_manager_backpressure``),
+                so a dead manager's last level never pins the worker
         """
         self._logger: "Logger" = logger
+        self._select_manager: Callable[[set[str]], str | None] = select_manager
+        self._circuit_breaker_config = circuit_breaker_config
+        self._forget_manager_backpressure: Callable[[str], None] = forget_manager_backpressure
         self._recovery_jitter_min: float = recovery_jitter_min
         self._recovery_jitter_max: float = recovery_jitter_max
         self._recovery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
@@ -56,6 +79,12 @@ class WorkerRegistry:
 
         # Manager tracking
         self._known_managers: dict[str, ManagerInfo] = {}
+        # The manager id directly confirmed at each TCP address. A
+        # restarted manager comes back at the same address under a new
+        # id; only direct evidence (its registration exchange, its own
+        # heartbeat) moves the address to the new id, so hearsay manager
+        # lists cannot resurrect a dead incarnation.
+        self._manager_id_by_addr: dict[tuple[str, int], str] = {}
         self._manager_leave_udp_addrs: dict[tuple[str, int], None] = {}
         self._healthy_manager_ids: set[str] = set()
         self._primary_manager_id: str | None = None
@@ -76,7 +105,42 @@ class WorkerRegistry:
         self._counter_lock: asyncio.Lock = asyncio.Lock()
 
     def add_manager(self, manager_id: str, manager_info: ManagerInfo) -> None:
-        """Add or update a known manager."""
+        """Add or update a manager learned second-hand (a peer's manager
+        list). Ignored when its address is directly confirmed as another
+        manager -- the listing describes an incarnation that address no
+        longer runs."""
+        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+        confirmed_id = self._manager_id_by_addr.get(manager_addr)
+        if confirmed_id is not None and confirmed_id != manager_id:
+            return
+        self._known_managers[manager_id] = manager_info
+        self._record_manager_leave_udp_addr(manager_info)
+
+    def is_confirmed_at(self, manager_id: str, manager_addr: tuple[str, int]) -> bool:
+        """Whether ``manager_id`` is the directly confirmed manager at
+        ``manager_addr``."""
+        return self._manager_id_by_addr.get(manager_addr) == manager_id
+
+    def confirm_manager(self, manager_id: str, manager_info: ManagerInfo) -> None:
+        """Record a manager from direct evidence (its registration
+        exchange or its own heartbeat). Any other manager id known at the
+        same TCP address is a previous incarnation of that process: it is
+        superseded -- its breakers, health, locks and info dropped, and the
+        primary role handed over if it held it -- so sends to the address
+        resolve to the live incarnation."""
+        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+        superseded_ids = [
+            known_id
+            for known_id, known_manager in self._known_managers.items()
+            if known_id != manager_id
+            and (known_manager.tcp_host, known_manager.tcp_port) == manager_addr
+        ]
+        for superseded_id in superseded_ids:
+            was_primary = self._primary_manager_id == superseded_id
+            self.remove_manager_state(superseded_id, manager_addr)
+            if was_primary:
+                self._primary_manager_id = manager_id
+        self._manager_id_by_addr[manager_addr] = manager_id
         self._known_managers[manager_id] = manager_info
         self._record_manager_leave_udp_addr(manager_info)
 
@@ -113,7 +177,11 @@ class WorkerRegistry:
         return list(self._manager_leave_udp_addrs.keys())
 
     def get_manager_by_addr(self, addr: tuple[str, int]) -> ManagerInfo | None:
-        """Get manager info by TCP address."""
+        """Get manager info by TCP address (the directly confirmed
+        incarnation when there is one)."""
+        if (confirmed_id := self._manager_id_by_addr.get(addr)) is not None:
+            if (confirmed := self._known_managers.get(confirmed_id)) is not None:
+                return confirmed
         for manager in self._known_managers.values():
             if (manager.tcp_host, manager.tcp_port) == addr:
                 return manager
@@ -129,7 +197,7 @@ class WorkerRegistry:
         async with self._counter_lock:
             self._healthy_manager_ids.discard(manager_id)
             if manager_id not in self._manager_unhealthy_since:
-                self._manager_unhealthy_since[manager_id] = time.monotonic()
+                self._manager_unhealthy_since[manager_id] = _DEFAULT_CLOCK.monotonic()
         self._signal_healthy_set_changed()
 
     def _signal_healthy_set_changed(self) -> None:
@@ -188,49 +256,40 @@ class WorkerRegistry:
         """Remove all per-manager tracking when a manager is reaped.
 
         Drops the per-manager lock, epoch counter, circuit breaker, address
-        circuit breaker, and health/registry entries. Without this cleanup the
+        circuit breaker, backpressure signal, and health/registry entries. Without this cleanup the
         per-manager state dicts would grow unbounded under manager churn.
         """
-        self._known_managers.pop(manager_id, None)
+        removed_manager = self._known_managers.pop(manager_id, None)
+        self._forget_confirmed_addr(manager_id, removed_manager)
         self._healthy_manager_ids.discard(manager_id)
         self._manager_unhealthy_since.pop(manager_id, None)
         self._manager_circuits.pop(manager_id, None)
         self._manager_state_locks.pop(manager_id, None)
         self._manager_state_epoch.pop(manager_id, None)
+        self._forget_manager_backpressure(manager_id)
         if manager_addr is not None:
             self._manager_addr_circuits.pop(manager_addr, None)
         self._signal_healthy_set_changed()
 
-    def get_or_create_circuit(
-        self,
-        manager_id: str,
-        error_threshold: int = 5,
-        error_rate_threshold: float = 0.5,
-        half_open_after: float = 30.0,
-    ) -> ErrorStats:
-        """Get or create a circuit breaker for a manager."""
+    def _forget_confirmed_addr(
+        self, manager_id: str, removed_manager: ManagerInfo | None
+    ) -> None:
+        """Drop the removed manager's address confirmation if it still names it."""
+        if removed_manager is not None:
+            removed_addr = (removed_manager.tcp_host, removed_manager.tcp_port)
+            if self._manager_id_by_addr.get(removed_addr) == manager_id:
+                del self._manager_id_by_addr[removed_addr]
+
+    def get_or_create_circuit(self, manager_id: str) -> ErrorStats:
+        """Get or create the configured circuit breaker for a manager."""
         if manager_id not in self._manager_circuits:
-            self._manager_circuits[manager_id] = ErrorStats(
-                error_threshold=error_threshold,
-                error_rate_threshold=error_rate_threshold,
-                half_open_after=half_open_after,
-            )
+            self._manager_circuits[manager_id] = ErrorStats(**self._circuit_breaker_config)
         return self._manager_circuits[manager_id]
 
-    def get_or_create_circuit_by_addr(
-        self,
-        addr: tuple[str, int],
-        error_threshold: int = 5,
-        error_rate_threshold: float = 0.5,
-        half_open_after: float = 30.0,
-    ) -> ErrorStats:
-        """Get or create a circuit breaker by manager address."""
+    def get_or_create_circuit_by_addr(self, addr: tuple[str, int]) -> ErrorStats:
+        """Get or create the configured circuit breaker by manager address."""
         if addr not in self._manager_addr_circuits:
-            self._manager_addr_circuits[addr] = ErrorStats(
-                error_threshold=error_threshold,
-                error_rate_threshold=error_rate_threshold,
-                half_open_after=half_open_after,
-            )
+            self._manager_addr_circuits[addr] = ErrorStats(**self._circuit_breaker_config)
         return self._manager_addr_circuits[addr]
 
     def is_circuit_open(self, manager_id: str) -> bool:
@@ -245,17 +304,12 @@ class WorkerRegistry:
             return circuit.circuit_state == CircuitState.OPEN
         return False
 
-    def get_circuit_status(self, manager_id: str | None = None) -> dict[str, Any]:
+    def get_circuit_status(
+        self, manager_id: str | None = None
+    ) -> ManagerCircuitStatus | ManagerCircuitLookupError | ManagerCircuitSummary:
         """Get circuit breaker status for a specific manager or summary."""
         if manager_id:
-            if not (circuit := self._manager_circuits.get(manager_id)):
-                return {"error": f"No circuit breaker for manager {manager_id}"}
-            return {
-                "manager_id": manager_id,
-                "circuit_state": circuit.circuit_state.name,
-                "error_count": circuit.error_count,
-                "error_rate": circuit.error_rate,
-            }
+            return self._manager_circuit_status(manager_id)
 
         return {
             "managers": {
@@ -265,14 +319,31 @@ class WorkerRegistry:
                 }
                 for mid, cb in self._manager_circuits.items()
             },
-            "open_circuits": [
-                mid
-                for mid, cb in self._manager_circuits.items()
-                if cb.circuit_state == CircuitState.OPEN
-            ],
+            "open_circuits": self._open_circuit_manager_ids(),
             "healthy_managers": len(self._healthy_manager_ids),
             "primary_manager": self._primary_manager_id,
         }
+
+    def _manager_circuit_status(
+        self, manager_id: str
+    ) -> ManagerCircuitStatus | ManagerCircuitLookupError:
+        """One manager's circuit breaker status, or an error without one."""
+        if not (circuit := self._manager_circuits.get(manager_id)):
+            return {"error": f"No circuit breaker for manager {manager_id}"}
+        return {
+            "manager_id": manager_id,
+            "circuit_state": circuit.circuit_state.name,
+            "error_count": circuit.error_count,
+            "error_rate": circuit.error_rate,
+        }
+
+    def _open_circuit_manager_ids(self) -> list[str]:
+        """Ids of managers whose circuit breaker is OPEN."""
+        return [
+            mid
+            for mid, cb in self._manager_circuits.items()
+            if cb.circuit_state == CircuitState.OPEN
+        ]
 
     async def select_new_primary_manager(self) -> str | None:
         """
@@ -284,19 +355,42 @@ class WorkerRegistry:
             Selected manager ID or None
         """
         # Prefer the leader if we know one
+        if (leader_id := self._select_known_leader()) is not None:
+            return leader_id
+
+        return self._select_healthy_primary()
+
+    def _select_known_leader(self) -> str | None:
+        """Make the first known healthy leader primary and return it, if any."""
         for manager_id in self._healthy_manager_ids:
-            if manager := self._known_managers.get(manager_id):
-                if manager.is_leader:
-                    self._primary_manager_id = manager_id
-                    return manager_id
-
-        # Otherwise pick any healthy manager
-        if self._healthy_manager_ids:
-            self._primary_manager_id = next(iter(self._healthy_manager_ids))
-            return self._primary_manager_id
-
-        self._primary_manager_id = None
+            if self._is_known_leader(manager_id):
+                self._primary_manager_id = manager_id
+                return manager_id
         return None
+
+    def _is_known_leader(self, manager_id: str) -> bool:
+        """Whether a manager is known and reports itself leader."""
+        manager = self._known_managers.get(manager_id)
+        return bool(manager and manager.is_leader)
+
+    def _select_healthy_primary(self) -> str | None:
+        """Choose and set a primary among healthy managers via AD-28 selection."""
+        # Otherwise let AD-28 selection choose: rendezvous ranking spreads
+        # workers across managers deterministically and the EWMA latency
+        # comparison steers away from slow ones. If it cannot choose
+        # (e.g. a manager not yet known to discovery), fall back to a
+        # deterministic pick rather than set-iteration order.
+        healthy_manager_ids = set(self._healthy_manager_ids)
+        if not healthy_manager_ids:
+            self._primary_manager_id = None
+            return None
+
+        selected = self._select_manager(healthy_manager_ids)
+        if selected not in healthy_manager_ids:
+            selected = min(healthy_manager_ids)
+
+        self._primary_manager_id = selected
+        return selected
 
     def find_manager_by_udp_addr(self, udp_addr: tuple[str, int]) -> str | None:
         """Find manager ID by UDP address."""

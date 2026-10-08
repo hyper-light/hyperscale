@@ -11,7 +11,7 @@ class RequestPriority(IntEnum):
     """Priority levels for request classification.
 
     Lower values indicate higher priority.
-    Maps directly to AD-37 MessageClass via MESSAGE_CLASS_TO_PRIORITY.
+    Corresponds one-to-one to AD-37 MessageClass (CONTROL is CRITICAL, TELEMETRY LOW).
     """
 
     CRITICAL = 0  # CONTROL: SWIM probes/acks, cancellation, leadership - never shed

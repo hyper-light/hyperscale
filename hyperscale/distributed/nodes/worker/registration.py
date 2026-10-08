@@ -20,6 +20,7 @@ from hyperscale.distributed.protocol.version import (
     NegotiatedCapabilities,
     NodeCapabilities,
     ProtocolVersion,
+    get_features_for_version,
 )
 from hyperscale.distributed.reliability import (
     RetryConfig,
@@ -31,7 +32,14 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
     ServerError,
     ServerInfo,
+    ServerWarning,
 )
+from collections.abc import Awaitable, Callable
+
+# Per-attempt bound on one worker_register round trip. Named so callers
+# that must outwait a whole registration (e.g. `hyperscale join`) derive
+# their budget from it instead of repeating the number.
+REGISTRATION_ATTEMPT_TIMEOUT_SECONDS = 5.0
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -92,7 +100,7 @@ class WorkerRegistrationHandler:
         available_memory_mb: int,
         cluster_id: str,
         environment_id: str,
-        send_func: callable,
+        send_func: Callable[[tuple[str, int], bytes, float], Awaitable[bytes | Exception]],
         max_retries: int = 3,
         base_delay: float = 0.5,
     ) -> bool:
@@ -120,17 +128,7 @@ class WorkerRegistrationHandler:
         circuit = self._registry.get_or_create_circuit_by_addr(manager_addr)
 
         if circuit.circuit_state == CircuitState.OPEN:
-            if self._logger:
-                await self._logger.log(
-                    ServerError(
-                        message=f"Cannot register with {manager_addr}: circuit breaker is OPEN",
-                        node_host=node_info.host,
-                        node_port=node_info.port,
-                        node_id=node_info.node_id[:8]
-                        if node_info.node_id
-                        else "unknown",
-                    )
-                )
+            await self._log_circuit_open(manager_addr, node_info)
             return False
 
         capabilities_str = ",".join(sorted(self._node_capabilities.capabilities))
@@ -157,7 +155,11 @@ class WorkerRegistrationHandler:
         executor = RetryExecutor(retry_config)
 
         async def attempt_registration() -> bool:
-            result = await send_func(manager_addr, registration.dump(), timeout=5.0)
+            result = await send_func(
+                manager_addr,
+                registration.dump(),
+                REGISTRATION_ATTEMPT_TIMEOUT_SECONDS,
+            )
             if isinstance(result, Exception):
                 raise result
             return True
@@ -169,18 +171,43 @@ class WorkerRegistrationHandler:
 
         except Exception as error:
             circuit.record_error()
-            if self._logger:
-                await self._logger.log(
-                    ServerError(
-                        message=f"Failed to register with manager {manager_addr} after {max_retries + 1} attempts: {error}",
-                        node_host=node_info.host,
-                        node_port=node_info.port,
-                        node_id=node_info.node_id[:8]
-                        if node_info.node_id
-                        else "unknown",
-                    )
-                )
+            await self._log_registration_failure(manager_addr, max_retries, error, node_info)
             return False
+
+    async def _log_circuit_open(self, manager_addr: tuple[str, int], node_info: NodeInfo) -> None:
+        """Log a registration refused because the manager's circuit is OPEN."""
+        if self._logger:
+            await self._logger.log(
+                ServerError(
+                    message=f"Cannot register with {manager_addr}: circuit breaker is OPEN",
+                    node_host=node_info.host,
+                    node_port=node_info.port,
+                    node_id=self._short_node_id(node_info),
+                )
+            )
+
+    async def _log_registration_failure(
+        self,
+        manager_addr: tuple[str, int],
+        max_retries: int,
+        error: Exception,
+        node_info: NodeInfo,
+    ) -> None:
+        """Log a registration that failed after every retry."""
+        if self._logger:
+            await self._logger.log(
+                ServerError(
+                    message=f"Failed to register with manager {manager_addr} after {max_retries + 1} attempts: {error}",
+                    node_host=node_info.host,
+                    node_port=node_info.port,
+                    node_id=self._short_node_id(node_info),
+                )
+            )
+
+    @staticmethod
+    def _short_node_id(node_info: NodeInfo) -> str:
+        """The node id's first eight characters, or "unknown" without one."""
+        return node_info.node_id[:8] if node_info.node_id else "unknown"
 
     async def process_registration_response(
         self,
@@ -188,9 +215,9 @@ class WorkerRegistrationHandler:
         node_host: str,
         node_port: int,
         node_id_short: str,
-        add_unconfirmed_peer: callable,
-        add_to_probe_scheduler: callable,
-        mark_registered: callable | None = None,
+        add_unconfirmed_peer: Callable[[tuple[str, int]], Awaitable[None]],
+        add_to_probe_scheduler: Callable[[tuple[str, int]], None],
+        mark_registered: Callable[[tuple[str, int]], None] | None = None,
     ) -> tuple[bool, str | None]:
         """
         Process registration response from manager.
@@ -213,78 +240,171 @@ class WorkerRegistrationHandler:
             Tuple of (accepted, primary_manager_id)
         """
         try:
-            response = RegistrationResponse.load(data)
-
-            if not response.accepted:
-                if self._logger:
-                    await self._logger.log(
-                        ServerWarning(
-                            message=(
-                                "Manager rejected worker registration: "
-                                f"{response.error or 'no error provided'}"
-                            ),
-                            node_host=node_host,
-                            node_port=node_port,
-                            node_id=node_id_short,
-                        )
-                    )
-                return (False, None)
-
-            # Update known managers
-            await self._update_known_managers(
-                response.healthy_managers,
+            return await self._apply_registration_response(
+                RegistrationResponse.load(data),
+                node_host,
+                node_port,
+                node_id_short,
                 add_unconfirmed_peer,
                 add_to_probe_scheduler,
-                mark_registered=mark_registered,
+                mark_registered,
             )
-            for manager in response.healthy_managers:
-                await self._registry.mark_manager_healthy(manager.node_id)
-
-            # Find primary manager (prefer leader)
-            primary_manager_id = response.manager_id
-            for manager in response.healthy_managers:
-                if manager.is_leader:
-                    primary_manager_id = manager.node_id
-                    break
-
-            self._registry.set_primary_manager(primary_manager_id)
-
-            # Store negotiated capabilities (AD-25)
-            manager_version = ProtocolVersion(
-                response.protocol_version_major,
-                response.protocol_version_minor,
-            )
-
-            negotiated_features = (
-                set(response.capabilities.split(","))
-                if response.capabilities
-                else set()
-            )
-            negotiated_features.discard("")
-
-            self._negotiated_capabilities = NegotiatedCapabilities(
-                local_version=CURRENT_PROTOCOL_VERSION,
-                remote_version=manager_version,
-                common_features=negotiated_features,
-                compatible=True,
-            )
-
-            return (True, primary_manager_id)
 
         except Exception as error:
-            if self._logger:
-                await self._logger.log(
-                    ServerError(
-                        message=(
-                            "Failed to process manager registration response: "
-                            f"{type(error).__name__}: {error}"
-                        ),
-                        node_host=node_host,
-                        node_port=node_port,
-                        node_id=node_id_short,
-                    )
-                )
+            await self._log_registration_response_failure(error, node_host, node_port, node_id_short)
             return (False, None)
+
+    async def _apply_registration_response(
+        self,
+        response: RegistrationResponse,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        add_unconfirmed_peer: Callable[[tuple[str, int]], Awaitable[None]],
+        add_to_probe_scheduler: Callable[[tuple[str, int]], None],
+        mark_registered: Callable[[tuple[str, int]], None] | None,
+    ) -> tuple[bool, str | None]:
+        """Adopt an accepted registration response's managers, primary and capabilities."""
+        if not response.accepted:
+            await self._log_registration_rejected(response, node_host, node_port, node_id_short)
+            return (False, None)
+
+        # AD-25: a manager of another MAJOR protocol version is refused,
+        # whether or not it checked this worker's (an older one may not).
+        manager_version = ProtocolVersion(response.protocol_version_major, response.protocol_version_minor)
+        if not CURRENT_PROTOCOL_VERSION.is_compatible_with(manager_version):
+            await self._log_incompatible_manager(manager_version, node_host, node_port, node_id_short)
+            return (False, None)
+
+        # The responder is direct evidence for its own address; the
+        # rest of its manager list is hearsay.
+        self._confirm_responder(response)
+
+        # Update known managers
+        await self._update_known_managers(
+            response.healthy_managers,
+            add_unconfirmed_peer,
+            add_to_probe_scheduler,
+            mark_registered=mark_registered,
+        )
+        await self._mark_managers_healthy(response.healthy_managers)
+
+        # Find primary manager (prefer leader)
+        primary_manager_id = self._primary_from_response(response)
+
+        self._registry.set_primary_manager(primary_manager_id)
+
+        # Store negotiated capabilities (AD-25)
+        self._store_negotiated_capabilities(response)
+
+        return (True, primary_manager_id)
+
+    async def _log_registration_rejected(
+        self,
+        response: RegistrationResponse,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log a manager's rejection of this worker's registration."""
+        if self._logger:
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        "Manager rejected worker registration: "
+                        f"{response.error or 'no error provided'}"
+                    ),
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                )
+            )
+
+    async def _log_incompatible_manager(
+        self,
+        manager_version: ProtocolVersion,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log a manager refused for its incompatible MAJOR protocol version (AD-25)."""
+        if self._logger:
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        f"Refused manager registration: incompatible protocol version {manager_version} "
+                        f"(ours: {CURRENT_PROTOCOL_VERSION})"
+                    ),
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                )
+            )
+
+    async def _log_registration_response_failure(
+        self,
+        error: Exception,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> None:
+        """Log a registration response that could not be processed."""
+        if self._logger:
+            await self._logger.log(
+                ServerError(
+                    message=(
+                        "Failed to process manager registration response: "
+                        f"{type(error).__name__}: {error}"
+                    ),
+                    node_host=node_host,
+                    node_port=node_port,
+                    node_id=node_id_short,
+                )
+            )
+
+    def _confirm_responder(self, response: RegistrationResponse) -> None:
+        """Confirm the responding manager from its own healthy-manager entry."""
+        for manager in response.healthy_managers:
+            if manager.node_id == response.manager_id:
+                self._registry.confirm_manager(manager.node_id, manager)
+
+    async def _mark_managers_healthy(self, managers: list[ManagerInfo]) -> None:
+        """Mark every listed manager healthy in the registry."""
+        for manager in managers:
+            await self._registry.mark_manager_healthy(manager.node_id)
+
+    @staticmethod
+    def _primary_from_response(response: RegistrationResponse) -> str:
+        """The listed leader, else the responding manager."""
+        primary_manager_id = response.manager_id
+        for manager in response.healthy_managers:
+            if manager.is_leader:
+                primary_manager_id = manager.node_id
+                break
+        return primary_manager_id
+
+    def _store_negotiated_capabilities(self, response: RegistrationResponse) -> None:
+        """Record the protocol version and features negotiated with the manager
+        (AD-25): the features both sides name -- the manager's list
+        intersected with this worker's own, so a newer manager's features
+        this worker lacks are ignored."""
+        manager_version = ProtocolVersion(
+            response.protocol_version_major,
+            response.protocol_version_minor,
+        )
+
+        manager_features = (
+            set(response.capabilities.split(","))
+            if response.capabilities
+            else set()
+        )
+
+        self._negotiated_capabilities = NegotiatedCapabilities(
+            local_version=CURRENT_PROTOCOL_VERSION,
+            remote_version=manager_version,
+            common_features=manager_features & get_features_for_version(CURRENT_PROTOCOL_VERSION),
+            compatible=CURRENT_PROTOCOL_VERSION.is_compatible_with(manager_version),
+        )
 
     async def process_manager_registration(
         self,
@@ -292,9 +412,9 @@ class WorkerRegistrationHandler:
         node_id_full: str,
         total_cores: int,
         available_cores: int,
-        add_unconfirmed_peer: callable,
-        add_to_probe_scheduler: callable,
-        mark_registered: callable | None = None,
+        add_unconfirmed_peer: Callable[[tuple[str, int]], Awaitable[None]],
+        add_to_probe_scheduler: Callable[[tuple[str, int]], None],
+        mark_registered: Callable[[tuple[str, int]], None] | None = None,
     ) -> bytes:
         """
         Process registration request from a manager.
@@ -319,49 +439,12 @@ class WorkerRegistrationHandler:
         try:
             registration = ManagerToWorkerRegistration.load(data)
 
-            # Add this manager to known managers
-            self._registry.add_manager(
-                registration.manager.node_id,
-                registration.manager,
+            await self._apply_manager_registration(
+                registration,
+                add_unconfirmed_peer,
+                add_to_probe_scheduler,
+                mark_registered,
             )
-
-            # Add to discovery service (AD-28)
-            self._discovery_service.add_peer(
-                peer_id=registration.manager.node_id,
-                host=registration.manager.tcp_host,
-                port=registration.manager.tcp_port,
-                role="manager",
-                datacenter_id=registration.manager.datacenter or "",
-            )
-
-            # Update known managers from registration
-            if registration.known_managers:
-                await self._update_known_managers(
-                    registration.known_managers,
-                    add_unconfirmed_peer,
-                    add_to_probe_scheduler,
-                    mark_registered=mark_registered,
-                )
-
-            # Update primary if this is the leader
-            if registration.is_leader:
-                self._registry.set_primary_manager(registration.manager.node_id)
-
-            # Add manager's UDP address to SWIM (AD-29)
-            manager_udp_addr = (
-                registration.manager.udp_host,
-                registration.manager.udp_port,
-            )
-            if manager_udp_addr[0] and manager_udp_addr[1]:
-                await add_unconfirmed_peer(manager_udp_addr)
-                add_to_probe_scheduler(manager_udp_addr)
-                # Explicit registration handshake (manager → worker
-                # direction): the manager has just registered with us
-                # and we know about it as an authoritative cluster
-                # member. Mark it registered so SUSPECT can fire if
-                # SWIM later detects it dead.
-                if mark_registered is not None:
-                    mark_registered(manager_udp_addr)
 
             return ManagerToWorkerRegistrationAck(
                 accepted=True,
@@ -377,12 +460,54 @@ class WorkerRegistrationHandler:
                 error=str(error),
             ).dump()
 
+    async def _apply_manager_registration(
+        self,
+        registration: ManagerToWorkerRegistration,
+        add_unconfirmed_peer: Callable[[tuple[str, int]], Awaitable[None]],
+        add_to_probe_scheduler: Callable[[tuple[str, int]], None],
+        mark_registered: Callable[[tuple[str, int]], None] | None,
+    ) -> None:
+        """Adopt a registering manager, its known managers and its SWIM address."""
+        # The registering manager is direct evidence for its address.
+        self._registry.confirm_manager(
+            registration.manager.node_id,
+            registration.manager,
+        )
+
+        # Add to discovery service (AD-28)
+        self._add_manager_to_discovery(registration.manager)
+
+        # Update known managers from registration
+        if registration.known_managers:
+            await self._update_known_managers(
+                registration.known_managers,
+                add_unconfirmed_peer,
+                add_to_probe_scheduler,
+                mark_registered=mark_registered,
+            )
+
+        # Update primary if this is the leader
+        if registration.is_leader:
+            self._registry.set_primary_manager(registration.manager.node_id)
+
+        # Add manager's UDP address to SWIM (AD-29). Explicit
+        # registration handshake (manager → worker direction): the
+        # manager has just registered with us and we know about it as
+        # an authoritative cluster member. Mark it registered so
+        # SUSPECT can fire if SWIM later detects it dead.
+        await self._track_manager_udp(
+            registration.manager,
+            add_unconfirmed_peer,
+            add_to_probe_scheduler,
+            mark_registered,
+        )
+
     async def _update_known_managers(
         self,
         managers: list[ManagerInfo],
-        add_unconfirmed_peer: callable,
-        add_to_probe_scheduler: callable,
-        mark_registered: callable | None = None,
+        add_unconfirmed_peer: Callable[[tuple[str, int]], Awaitable[None]],
+        add_to_probe_scheduler: Callable[[tuple[str, int]], None],
+        mark_registered: Callable[[tuple[str, int]], None] | None = None,
     ) -> None:
         """
         Update known managers from a list.
@@ -406,18 +531,45 @@ class WorkerRegistrationHandler:
             self._registry.add_manager(manager.node_id, manager)
 
             # Track as unconfirmed peer (AD-29)
-            if manager.udp_host and manager.udp_port:
-                manager_udp_addr = (manager.udp_host, manager.udp_port)
-                await add_unconfirmed_peer(manager_udp_addr)
-                add_to_probe_scheduler(manager_udp_addr)
-                if mark_registered is not None:
-                    mark_registered(manager_udp_addr)
+            await self._track_manager_udp(
+                manager,
+                add_unconfirmed_peer,
+                add_to_probe_scheduler,
+                mark_registered,
+            )
 
             # Add to discovery service (AD-28)
-            self._discovery_service.add_peer(
-                peer_id=manager.node_id,
-                host=manager.tcp_host,
-                port=manager.tcp_port,
-                role="manager",
-                datacenter_id=manager.datacenter or "",
-            )
+            self._add_manager_to_discovery(manager)
+
+    async def _track_manager_udp(
+        self,
+        manager: ManagerInfo,
+        add_unconfirmed_peer: Callable[[tuple[str, int]], Awaitable[None]],
+        add_to_probe_scheduler: Callable[[tuple[str, int]], None],
+        mark_registered: Callable[[tuple[str, int]], None] | None,
+    ) -> None:
+        """Add a manager with a UDP address as an unconfirmed, probed SWIM peer (AD-29)."""
+        if manager.udp_host and manager.udp_port:
+            manager_udp_addr = (manager.udp_host, manager.udp_port)
+            await add_unconfirmed_peer(manager_udp_addr)
+            add_to_probe_scheduler(manager_udp_addr)
+            self._mark_manager_registered(manager_udp_addr, mark_registered)
+
+    @staticmethod
+    def _mark_manager_registered(
+        manager_udp_addr: tuple[str, int],
+        mark_registered: Callable[[tuple[str, int]], None] | None,
+    ) -> None:
+        """Mark the peer registered when reached through a registration handshake."""
+        if mark_registered is not None:
+            mark_registered(manager_udp_addr)
+
+    def _add_manager_to_discovery(self, manager: ManagerInfo) -> None:
+        """Add a manager to the discovery service (AD-28)."""
+        self._discovery_service.add_peer(
+            peer_id=manager.node_id,
+            host=manager.tcp_host,
+            port=manager.tcp_port,
+            role="manager",
+            datacenter_id=manager.datacenter or "",
+        )

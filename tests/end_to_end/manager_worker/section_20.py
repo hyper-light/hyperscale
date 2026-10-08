@@ -5,6 +5,10 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
 from tests.end_to_end.workflows.base_scenario_workflow import BaseScenarioWorkflow
+from tests.end_to_end.workflow_lifecycle_checks import (
+    assert_retry_budgets_released,
+    assert_workflow_lifecycle_sound,
+)
 from tests.framework.results.scenario_outcome import ScenarioOutcome
 from tests.framework.results.scenario_result import ScenarioResult
 from tests.framework.runner.scenario_runner import ScenarioRunner
@@ -158,10 +162,8 @@ async def validate_20_2_workflow_exception() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Workflow exception expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Workflow exception expected workflow retries")
+        assert_retry_budgets_released(manager, "Workflow exception expected workflow retries")
     finally:
         await runtime.stop_cluster()
 
@@ -178,10 +180,8 @@ async def validate_20_2_serialization_error() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Serialization error expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Serialization error expected workflow retries")
+        assert_retry_budgets_released(manager, "Serialization error expected workflow retries")
     finally:
         await runtime.stop_cluster()
 
@@ -198,10 +198,8 @@ async def validate_20_2_resource_error() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Resource error expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Resource error expected workflow retries")
+        assert_retry_budgets_released(manager, "Resource error expected workflow retries")
     finally:
         await runtime.stop_cluster()
 
@@ -218,10 +216,8 @@ async def validate_20_3_retry_dispatch() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Retry dispatch expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Retry dispatch expected workflow retries")
+        assert_retry_budgets_released(manager, "Retry dispatch expected workflow retries")
     finally:
         await runtime.stop_cluster()
 
@@ -299,9 +295,8 @@ async def validate_20_4_retry_budget_exhaustion() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Retry budget exhaustion expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Retry budget exhaustion expected workflow retries")
+        assert_retry_budgets_released(manager, "Retry budget exhaustion expected workflow retries")
         assert isinstance(state._job_origin_gates, dict), (
             "Retry budget exhaustion expected job origin gates"
         )
@@ -504,10 +499,7 @@ async def validate_20_6_ack_without_execution() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "ACK without execution expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "ACK without execution expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -524,10 +516,8 @@ async def validate_20_6_redispatch_after_partial_execution() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Re-dispatch expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Re-dispatch expected workflow retries")
+        assert_retry_budgets_released(manager, "Re-dispatch expected workflow retries")
     finally:
         await runtime.stop_cluster()
 
@@ -604,10 +594,8 @@ async def validate_20_8_retry_budget_reset_on_failover() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Retry budget reset expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Retry budget reset expected workflow retries")
+        assert_retry_budgets_released(manager, "Retry budget reset expected workflow retries")
     finally:
         await runtime.stop_cluster()
 
@@ -644,10 +632,8 @@ async def validate_20_8_overlapping_retry_windows() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Overlapping retries expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Overlapping retries expected workflow retries")
+        assert_retry_budgets_released(manager, "Overlapping retries expected workflow retries")
     finally:
         await runtime.stop_cluster()
 
@@ -781,10 +767,7 @@ async def validate_20_11_snapshot_with_in_flight_dispatches() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "Snapshot with dispatches expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "Snapshot with dispatches expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -821,10 +804,7 @@ async def validate_20_11_stale_state_version_rejection() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "Stale state version expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "Stale state version expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 

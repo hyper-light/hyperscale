@@ -1,5 +1,6 @@
 import asyncio
-from typing import Literal, Any
+from typing import Literal
+from .json_value import JSONValue
 from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.engines.client.http import MercurySyncHTTPConnection
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
@@ -15,6 +16,8 @@ from .terminal_ui import (
     create_ping_ui,
     map_status_to_error,
 )
+from .ping_result_output import PingResultOutput
+from .ping_result_serializer import PingResultSerializer
 
 
 
@@ -22,7 +25,7 @@ async def make_http_request(
     url: str,
     params: dict[str, str],
     cookies: list[HTTPCookie],
-    headers: dict[str, Any],
+    headers: dict[str, JSONValue],
     method: Literal[
         "get",
         "post",
@@ -32,12 +35,13 @@ async def make_http_request(
         "head",
         "options"
     ],
-    data: Any | None,
+    data: JSONValue,
     redirects: int, 
     timeout: int | float,
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
+    verify_tls: bool = True,
 ):
     
     timeouts = Timeouts(request_timeout=timeout)
@@ -45,12 +49,15 @@ async def make_http_request(
         timeouts=timeouts,
     )
 
-    http = setup_client(http, 1)
+    http = setup_client(http, 1, verify_tls=verify_tls)
 
     terminal = create_ping_ui(
         url,
         method,
     )
+
+    result_serializer = PingResultSerializer('http', url, method.upper())
+    result_output = PingResultOutput(output_file, result_serializer)
 
     try:
         if quiet is False:
@@ -143,6 +150,8 @@ async def make_http_request(
                     timeout=timeout,
                 )
 
+        await result_output.record(result_serializer.from_http_response, response)
+
         if quiet is False:
             response_text = response.reason
             response_status = response.status
@@ -203,6 +212,7 @@ async def make_http_request(
             await update_text("Aborted")
 
     except Exception as err:
+        await result_output.record_failure(err)
         error_message = str(err)
         if str(err) == "":
             error_message = "Encountered unknown error"
@@ -212,3 +222,5 @@ async def make_http_request(
     
     if quiet is False:
         await terminal.stop()
+
+    result_output.raise_on_write_failure()

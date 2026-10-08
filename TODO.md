@@ -1,7 +1,7 @@
 # Hyperscale Distributed Bug Fixes TODO
 
 **Generated**: 2026-01-14  
-**Progress**: 64/64 completed (100%)
+**Progress**: 64/64 marked completed (2026-01-14). **Re-checked 2026-10-06** against the code: tasks 19 and 41 are superseded (the code they added is deleted by design) and task 33 is built but not wired; notes are inline below. Open work now lives in `docs/REMAINING_LEDGER.md`.
 
 ---
 
@@ -55,29 +55,29 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 8**: Fix Manager health state race condition
 - [x] **Task 9**: Fix Manager circuit breaker auto-transition bug (verified - already correct in ErrorStats)
 - [x] **Task 10**: Fix Manager dispatch counter race
-- [x] **Task 19**: Add client-side fallback to query gate for leader on missed transfers
+- [x] **Task 19**: Add client-side fallback to query gate for leader on missed transfers (*superseded 2026-10-05:* the client tracker's dead leader-query paths were deleted; a client asking any gate is forwarded to the job's leader, and pushes relay through peer gates -- REMAINING_WORK_PLAN Phase 6 and Phase 4 D2)
 - [x] **Task 22**: Fix dead peer reaping - remove from _gate_peer_unhealthy_since (verified - already handled)
 - [x] **Task 23**: Fix peer cleanup to fully purge UDP-TCP mapping (verified - already handled)
 - [x] **Task 13**: Add JobFinalResult peer-forwarding for gate resilience (verified - already implemented in tcp_state_sync.py)
 - [x] **Task 14**: Add immediate status replay after client reconnect/register_callback (verified - already implemented)
 - [x] **Task 16**: Add job_status_push retry/peer-forward on failure (verified - already implemented in stats_coordinator.py)
 - [x] **Task 17**: Invoke progress callbacks on batch updates (verified - already implemented in stats_coordinator.py)
-- [x] **Task 18**: Add client poll-on-reconnect or replay mechanism (verified - already implemented with last_sequence)
+- [x] **Task 18**: Add client poll-on-reconnect or replay mechanism (2026-10: the gate half existed, the client never re-registered; now it asks for a replay when a completed job's results stay missing -- architecture.md Component 4 "As built")
 - [x] **Task 36**: Implement mixed final status resolution across DCs (verified - already implemented in _resolve_global_result_status)
 - [x] **Task 40**: Integrate job lease acquisition/renewal in gate submission (verified - already implemented in tcp_job.py)
 - [x] **Task 43**: Manager validate cluster/environment on registration (verified - already implemented in handle_register)
 - [x] **Task 45**: WorkflowProgressAck structure compatibility (verified - structure matches producer/consumer)
 - [x] **Task 48**: Workflow reassignment updates dispatch state (verified - already implemented in _apply_workflow_reassignment_state)
-- [x] **Task 49**: Worker state sync applies to local state (verified - already implemented in sync.py _apply_worker_state)
+- [x] **Task 49**: Worker state sync applies to local state (verified - implemented in `nodes/manager/sync.py` `_apply_worker_sync_response`)
 - [x] **Task 50**: Manager job leader transfer notification to workers (verified - already implemented in _notify_workers_job_leader_transfer)
 - [x] **Task 54**: Peer state sync reconciles fence tokens (verified - already implemented in update_fence_token_if_higher)
 - [x] **Task 59**: Reporter results end-to-end path (implemented reporter_result_push handler in gate)
 - [x] **Task 31**: Add ordering/dedup for JobProgress beyond fence token (added check_and_record_progress to state.py, integrated in tcp_job.py)
 - [x] **Task 32**: Add explicit progress percentage calculation in gate (added _calculate_progress_percentage to tcp_job.py, added progress_percentage field to GlobalJobStatus)
-- [x] **Task 33**: Add recovery path for manager dies with pending stats (added export_checkpoint/import_checkpoint to StatsBuffer, wired into ManagerStateSync and ManagerStateSnapshot)
+- [ ] **Task 33**: Add recovery path for manager dies with pending stats (*2026-10-06: built, not wired.* `StatsBuffer.export_checkpoint`/`import_checkpoint` exist and `ManagerStatsCoordinator.export_stats_checkpoint`/`import_stats_checkpoint` wrap them (`nodes/manager/manager_stats_coordinator.py:319-347`), but nothing calls either wrapper, and `ManagerStateSnapshot.pending_stats_checkpoint` (`models/manager_state_snapshot.py:40`) is never written or read)
 - [x] **Task 34**: Add ReporterResultPush forwarding path in gate (verified - already implemented via Task 59)
 - [x] **Task 38**: Add reporter task creation and result dispatch in gate (added _dispatch_to_reporters to server.py, called from _complete_job)
-- [x] **Task 41**: Add LeaseTransfer sender in gate code (added _send_lease_transfer to leadership_coordinator.py, called during transfer_leadership)
+- [x] **Task 41**: Add LeaseTransfer sender in gate code (*superseded 2026-10-06:* the datacenter lease subsystem -- `DatacenterLeaseManager`, `LeaseTransfer`/`LeaseTransferAck`, the sender and the gate's `lease_transfer` handler -- was never acquired and is deleted; at-most-once DC dispatch comes from gate job leadership + fencing + AD-40 idempotency)
 - [x] **Task 62**: Connection storm mitigation - add explicit connection caps (added is_at_capacity to ServerState, reject in connection_made)
 - [x] **Task 63**: Protocol size violations - send structured error response (added to_error_response to FrameTooLargeError, send before close)
 - [x] **Task 60**: Routing SLO-constraint gating - filter by SLO targets (added SLO exclusion reasons, latency/throughput filtering to CandidateFilter)
@@ -124,10 +124,10 @@ After implementing fixes, verify:
 - [x] SpilloverEvaluator triggers when needed
 - [x] JobProgress is ordered and deduplicated
 - [x] Progress percentage is calculated correctly
-- [x] Manager stats survive failure
+- [ ] Manager stats survive failure (task 33: not wired)
 - [x] ReporterResultPush reaches clients
 - [x] Reporter tasks are created properly
-- [x] LeaseTransfer happens on gate handoff
+- [x] ~~LeaseTransfer happens on gate handoff~~ (lease transfer deleted 2026-10-06; takeover commits a `GateJobReplica` with a strictly higher fence to a gate quorum by two-phase commit, `nodes/gate/replication_coordinator.py`)
 - [x] SLO constraints gate routing
 - [x] Latency percentiles are tracked
 - [x] Connection limits prevent storms

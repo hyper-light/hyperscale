@@ -1,13 +1,12 @@
 import asyncio
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional, Type, TypeVar
 
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.jobs.models.env import Env
+from hyperscale.core.snowflake.constants import MAX_INSTANCE
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 
-from .cancel import cancel
 from .task_hook import Task
 
 T = TypeVar("T")
@@ -24,6 +23,12 @@ class TaskRunner:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._run_cleanup: bool = False
         self.instance_id = instance_id
+        # One monotone snowflake generator for this runner, injected
+        # into every Task it builds so all task/run ids come from a
+        # single ordered stream (was ``uuid.uuid4().int >> 64`` —
+        # random, which broke Task.latest()/max() ordering and the
+        # count-eviction sort).
+        self._id_generator = SnowflakeGenerator(instance_id & MAX_INSTANCE)
 
     def all_tasks(self):
         for task in self.tasks.values():
@@ -34,10 +39,12 @@ class TaskRunner:
         self._cleanup_task = asyncio.ensure_future(self._cleanup())
 
     def create_task_id(self):
-        return uuid.uuid4().int>>64
+        # Deterministic, monotone snowflake id from this runner's shared
+        # generator (was uuid4 — random and non-ordered).
+        return self._id_generator.generate()
 
     def add(self, task: Type[T]):
-        runnable = Task(task)
+        runnable = Task(task, self._id_generator)
         self.tasks[runnable.name] = runnable
 
     def run(
@@ -68,10 +75,14 @@ class TaskRunner:
     def stop(
         self,
         task_name: str,
+        run_id: int,
     ):
+        """Stop the task's schedule started under ``run_id`` -- only
+        that one: concurrent runs must not stop each other's
+        schedules."""
         task = self.tasks.get(task_name)
         if task:
-            task.stop()
+            task.stop(run_id)
 
     def get_task_status(self, task_name: str):
         if task := self.tasks.get(task_name):

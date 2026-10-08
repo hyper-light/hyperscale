@@ -2,7 +2,6 @@ import asyncio
 import base64
 import time
 import uuid
-from random import randrange
 from typing import (
     Dict,
     List,
@@ -21,6 +20,7 @@ from urllib.parse import (
 import orjson
 
 from hyperscale.core.engines.client.http2 import MercurySyncHTTP2Connection
+from hyperscale.core.engines.client.http2.fast_hpack import ConnectionEncoder
 from hyperscale.core.engines.client.http2.pipe import HTTP2Pipe
 from hyperscale.core.engines.client.http2.protocols import HTTP2Connection
 from hyperscale.core.engines.client.shared.models import (
@@ -35,6 +35,7 @@ from hyperscale.core.engines.client.shared.models import (
     Metadata,
     URLMetadata,
 )
+from hyperscale.core.engines.client.shared.models.url import DEFAULT_PORTS
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.testing.models import (
     URL,
@@ -70,7 +71,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
     def __init__(
         self,
         pool_size: int = 10**3,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ) -> None:
         super(MercurySyncGraphQLHTTP2Connection, self).__init__(
@@ -196,41 +197,25 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
 
     async def _optimize_url(self, url: URL):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
                     pipe,
-                    url,
-                    upgrade_ssl,
+                    optimized_url,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
+                    self._connect_to_url_location(None, url),
+                    timeout=self.timeouts.request_timeout,
                 )
+                connection.reset()
                 self._connections.append(connection)
                 self._pipes.append(pipe)
 
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    pipe,
-                    url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                self._connections.append(connection)
-                self._pipes.append(pipe)
-
-            self._url_cache[url.optimized.hostname] = url
+            # Plain-string requests for the same address reuse this lookup:
+            # the resolved URL, under the key the connect path reads. One
+            # that never resolved is left for the connect path to look up.
+            if optimized_url.ip_addresses:
+                self._url_cache[optimized_url.target] = optimized_url
 
         except Exception:
             pass
@@ -298,21 +283,9 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         if redirect and (
             location := result.headers.get('location')
         ):
-            upgrade_ssl = False
-            
-            if "http" not in location and "https" not in location:
-                parsed_url: ParseResult = urlparse(url)
-
-                if parsed_url.params:
-                    location += parsed_url.params
-
-                location = urljoin(
-                    f'{parsed_url.scheme}://{parsed_url.hostname}',
-                    location
-                )
-
-            if "https" in location and "https" not in url:
-                upgrade_ssl = True
+            # Each location resolves against the address it came from (RFC
+            # 3986: absolute, host-relative and path-relative alike).
+            location = urljoin(url.data if isinstance(url, URL) else url, location)
 
             for _ in range(redirects):
                 result, redirect, timings = await self._execute(
@@ -324,18 +297,16 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                     params=params,
                     data=data,
                     timings=timings,
-                    upgrade_ssl=upgrade_ssl,
                     redirect_url=location,
                 )
 
                 if redirect is False:
                     break
 
-                location = result.headers.get("location")
+                if (next_location := result.headers.get("location")) is None:
+                    break
 
-                upgrade_ssl = False
-                if "https" in location and "https" not in url:
-                    upgrade_ssl = True
+                location = urljoin(location, next_location)
 
         timings["request_end"] = time.monotonic()
         result.timings.update(timings)
@@ -365,7 +336,6 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             ]
             | Mutation
         ) = None,
-        upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
             Literal[
@@ -385,41 +355,27 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             request_url = redirect_url
 
         connection: HTTP2Connection = None
+        reading_response = False
 
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
-            (error, connection, pipe, url, upgrade_ssl) = await asyncio.wait_for(
+            (error, connection, pipe, url) = await asyncio.wait_for(
                 self._connect_to_url_location(
-                    request_url, ssl_redirect_url=request_url if upgrade_ssl else None
+                    connection,
+                    request_url,
                 ),
-                timeout=self.timeouts.connect_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
-            if upgrade_ssl:
-                ssl_redirect_url = request_url.replace("http://", "https://")
-
-                (error, connection, pipe, url, _) = await asyncio.wait_for(
-                    self._connect_to_url_location(
-                        request_url, ssl_redirect_url=ssl_redirect_url
-                    ),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                request_url = ssl_redirect_url
-
-            if error:
+            if error or connection is None or connection.stream.reader is None:
                 timings["connect_end"] = time.monotonic()
 
-                self._connections.append(
-                    HTTP2Connection(
-                        stream_id=randrange(1, 2**20 + 2, 2),
-                        reset_connections=self._reset_connections,
-                    )
-                )
-
-                self._pipes.append(HTTP2Pipe(self._concurrency))
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
+                    self._pipes.append(HTTP2Pipe(self._concurrency))
 
                 return (
                     GraphQLHTTP2Response(
@@ -449,6 +405,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                 encoded_headers = self._encode_headers(
                     url,
                     method,
+                    pipe._encoder,
                     auth=auth,
                     cookies=cookies,
                     data=data,
@@ -467,13 +424,14 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                         encoded_data,
                         connection,
                     ),
-                    timeout=self.timeouts.write_timeout,
+                    timeout=self.timeouts.request_timeout,
                 )
 
             else:
                 encoded_headers = self._encode_headers(
                     url,
                     method,
+                    pipe._encoder,
                     auth=auth,
                     cookies=cookies,
                     data=data,
@@ -481,9 +439,11 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                     params=params,
                 )
 
+                # The query rides in the path and no body follows: the
+                # HEADERS frame must end the stream, or the server waits.
                 connection = pipe.send_request_headers(
                     encoded_headers,
-                    data,
+                    None,
                     connection,
                 )
 
@@ -492,21 +452,44 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             if timings["read_start"] is None:
                 timings["read_start"] = time.monotonic()
 
-            (status, response_headers, body, error) = await asyncio.wait_for(
+            reading_response = True
+            (status, response_headers, body, error, trailers) = await asyncio.wait_for(
                 pipe.receive_response(connection),
-                timeout=self.timeouts.read_timeout,
+                timeout=self.timeouts.request_timeout,
             )
+            reading_response = False
+            connection.consecutive_read_timeouts = 0
+
+            if error:
+                # A failed read fails the request, a redirect's included -- its
+                # status may have arrived before the error did -- and leaves
+                # the connection in an unknown state: reset, with a new pipe.
+                connection.reset()
+                self._connections.append(connection)
+                self._pipes.append(HTTP2Pipe(self._concurrency))
+
+                timings["read_end"] = time.monotonic()
+
+                return (
+                    GraphQLHTTP2Response(
+                        url=URLMetadata(
+                            host=url.hostname,
+                            path=url.path,
+                        ),
+                        method=method,
+                        status=400,
+                        status_message=str(error),
+                        timings=timings,
+                    ),
+                    False,
+                    timings,
+                )
 
             if status >= 300 and status < 400:
                 timings["read_end"] = time.monotonic()
 
-                self._connections.append(
-                    HTTP2Connection(
-                        stream_id=randrange(1, 2**20 + 2, 2),
-                        reset_connections=self._reset_connections,
-                    )
-                )
-                self._pipes.append(HTTP2Pipe(self._concurrency))
+                self._connections.append(connection)
+                self._pipes.append(pipe)
 
                 return (
                     GraphQLHTTP2Response(
@@ -517,20 +500,18 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                         method=method,
                         status=status,
                         headers=response_headers,
+                        trailers=trailers,
                         timings=timings,
                     ),
                     True,
                     timings,
                 )
 
-            if error:
-                raise error
-
             cookies: HTTPCookies | None = None
-            cookies_data: bytes | None = response_headers.get(b"set-cookie")
+            cookies_data: str | None = response_headers.get("set-cookie")
             if cookies_data:
                 cookies = HTTPCookies()
-                cookies.update(cookies_data)
+                cookies.update(cookies_data.encode())
 
             self._connections.append(connection)
             self._pipes.append(pipe)
@@ -547,6 +528,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                     method=method,
                     status=status,
                     headers=response_headers,
+                    trailers=trailers,
                     content=body,
                     timings=timings,
                 ),
@@ -554,15 +536,28 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                 timings,
             )
 
-        except Exception as request_exception:
-            self._connections.append(
-                HTTP2Connection(
-                    stream_id=randrange(1, 2**20 + 2, 2),
-                    reset_connections=self._reset_connections,
-                )
-            )
+        except (
+            BaseException,
+            Exception,
+        ) as request_exception:
+            if connection:
+                if (
+                    reading_response
+                    and isinstance(request_exception, asyncio.TimeoutError)
+                    and connection.consecutive_read_timeouts == 0
+                ):
+                    # A slow response, not a dead connection: cancel only this
+                    # stream and keep the connection. A second timeout in a row
+                    # on it means the connection itself is dead.
+                    pipe.cancel_stream(connection)
+                    connection.consecutive_read_timeouts += 1
+                    self._connections.append(connection)
+                    self._pipes.append(pipe)
 
-            self._pipes.append(HTTP2Pipe(self._concurrency))
+                else:
+                    connection.reset()
+                    self._connections.append(connection)
+                    self._pipes.append(HTTP2Pipe(self._concurrency))
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -611,7 +606,8 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         ),
     ):
         if isinstance(data, Mutation):
-            return data.optimized, data.content_type
+            # The body itself: the headers carry its content type.
+            return data.optimized
 
         source = Source(data.get("query"))
         document_node = parse(source)
@@ -636,6 +632,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         self,
         url: HTTPUrl,
         method: Literal["GET", "POST"],
+        header_encoder: ConnectionEncoder,
         auth: tuple[str, str] | Auth | None = None,
         cookies: Optional[List[HTTPCookie] | HTTPCookies] = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
@@ -664,20 +661,36 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         query_string: str | Query = data.get("query")
 
         if method == "GET" and isinstance(query_string, Query):
-            url_path += query_string
+            # The model's query parameter, URL-encoded when it was optimized:
+            # appending the model itself raised TypeError.
+            query = query_string.optimized[1:]
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
         elif method == "GET":
-            query_string = "".join(query_string.replace("query", "").split())
-            url_path += f"?query={{{query_string}}}"
+            # The query document unaltered and URL-encoded, as GraphQL over
+            # HTTP carries it in a GET -- after "&" when the address has a
+            # query of its own, else after "?" (RFC 3986 3.4).
+            query = urlencode({"query": query_string})
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
         elif params:
-            url_params = urlencode(params)
-            url_path += f"?{url_params}"
+            # The params follow any query the address has of its own.
+            query = urlencode(params)
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
+
+        # :authority names the target as RFC 9113 8.3.1 does: the host, an
+        # IPv6 address in brackets, and the port unless it is the scheme's
+        # default.
+        hostname = url.hostname
+        scheme = url.scheme
+        authority = f"[{hostname}]" if ":" in hostname else hostname
+        if url.port != DEFAULT_PORTS.get(scheme):
+            authority = f"{authority}:{url.port}"
 
         encoded_headers: List[Tuple[bytes, bytes]] = [
             (b":method", method.encode()),
-            (b":authority", url.hostname.encode()),
-            (b":scheme", url.scheme.encode()),
+            (b":authority", authority.encode()),
+            (b":scheme", scheme.encode()),
             (b":path", url_path.encode()),
         ]
 
@@ -706,20 +719,18 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             )
 
         else:
-            encoded_headers: List[Tuple[bytes, bytes]] = [
-                (b":method", method.encode()),
-                (b":authority", url.hostname.encode()),
-                (b":scheme", url.scheme.encode()),
-                (b":path", url_path.encode()),
-                (b"user-agent", b"hyperscale/client"),
-            ]
+            # No headers given: the client's own user agent, after any
+            # authorization above -- rebuilding the list dropped it.
+            encoded_headers.append((b"user-agent", b"hyperscale/client"))
 
         if isinstance(data, Mutation) or (
             data and method == "POST"
         ):
             encoded_headers.extend(
                 [
-                    (b"Content-Type", b"application/graphql-response+json"),
+                    # The body is a JSON request: application/graphql-response+json
+                    # names GraphQL over HTTP's response, not its request.
+                    (b"content-type", b"application/json"),
                 ]
             )
 
@@ -737,25 +748,24 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                     cookie_name, cookie_value = cookie_data
                     encoded_cookies.append(f"{cookie_name}={cookie_value}")
 
-            encoded_headers.append(("cookie", "; ".join(encoded_cookies)))
+            # A header field as the HPACK encoder takes one: bytes.
+            encoded_headers.append((b"cookie", "; ".join(encoded_cookies).encode()))
 
-        encoded_headers: bytes = self._encoder.encode(encoded_headers)
-        encoded_headers: List[bytes] = [
-            encoded_headers[i : i + self._settings.max_frame_size]
-            for i in range(0, len(encoded_headers), self._settings.max_frame_size)
-        ]
-
-        return encoded_headers[0]
+        # The whole header block: the pipe frames it, in CONTINUATION frames
+        # past the peer's largest frame.
+        return header_encoder.encode(encoded_headers)
     
     def _encode_auth_headers(
         self,
         auth: tuple[str, str] | tuple[str],
     ):
+        # The Basic scheme ahead of the credentials (RFC 7617 2), as the
+        # HTTP/1 client sends them.
         if len(auth) > 1:
             credentials_string = f"{auth[0]}:{auth[1]}"
             return (
                 b"authorization",
-                base64.b64encode(
+                b"Basic " + base64.b64encode(
                     credentials_string.encode()
                 )
             )
@@ -763,7 +773,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         else:
             return (
                 b"authorization",
-                base64.b64encode(
+                b"Basic " + base64.b64encode(
                     auth[0].encode()
                 )
             )

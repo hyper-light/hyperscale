@@ -2,7 +2,6 @@ import asyncio
 import itertools
 import math
 from typing import (
-    Any,
     Dict,
     Literal,
 )
@@ -18,6 +17,7 @@ from hyperscale.ui.styling.colors import (
 from .cell_alignment import CellAlignment, CellAlignmentMap, CellAlignmentType
 from .charset_position_type import CharsetPositionType
 from .table_border_lines import TableBorderCharset, TableBorderLines
+from .table_cell import TableCell
 
 
 HeaderColorMap = Dict[str, Colorizer]
@@ -63,7 +63,7 @@ class TableAssembler:
         header_alignment: CellAlignment = "LEFT",
         cell_alignment: CellAlignment = "LEFT",
         field_format_map: Dict[str, str] | None = None,
-        field_default_map: Dict[str, Any] | None = None,
+        field_default_map: Dict[str, TableCell] | None = None,
         header_color_map: HeaderColorMap | None = None,
         data_color_map: DataColorMap | None = None,
         border_color: ColorName | ExtendedColorName | None = None,
@@ -76,6 +76,9 @@ class TableAssembler:
         self.columns_size = column_size
         self.columns_count = columns_count
         self.max_width = max_width
+        # Each visible column's width, where a table sizes its columns to
+        # their content; None gives every column ``columns_size``.
+        self.column_sizes: list[int] | None = None
 
         if field_format_map is None:
             field_format_map = {}
@@ -903,7 +906,7 @@ class TableAssembler:
 
         self._height_offset = 0
 
-    def calculate_height_offset(self, data: list[list[Any]]):
+    def calculate_height_offset(self, data: list[list[TableCell]]):
         spacer_lines_count = len(data) - 1
 
         height_offset = self._calculate_height_offset_for_line(
@@ -930,7 +933,7 @@ class TableAssembler:
     async def create_table_lines(
         self,
         headers: list[str],
-        data: list[list[Any]],
+        data: list[list[TableCell]],
     ) -> list[str]:
         headers_count = len(headers)
         if headers_count < self.columns_count:
@@ -975,7 +978,7 @@ class TableAssembler:
     async def _create_data_and_spacer_lines(
         self,
         headers: list[str],
-        data: list[list[Any]],
+        data: list[list[TableCell]],
     ):
         data_and_spacer_lines: list[str] = []
 
@@ -1015,6 +1018,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                 )
                 for idx in range(self.columns_count)
             ]
@@ -1035,6 +1039,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                 )
                 for idx in range(self.columns_count)
             ]
@@ -1055,6 +1060,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                 )
                 for idx in range(self.columns_count)
             ]
@@ -1075,6 +1081,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                 )
                 for idx in range(self.columns_count)
             ]
@@ -1096,6 +1103,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                     header_key=header,
                     color_map=self._header_color_map,
                     is_header=True,
@@ -1109,7 +1117,7 @@ class TableAssembler:
     async def _create_data_line(
         self,
         headers: list[str],
-        row: list[Any],
+        row: list[TableCell],
     ) -> str | None:
         data_cells = await asyncio.gather(
             *[
@@ -1123,6 +1131,7 @@ class TableAssembler:
                     position_type=self._calculate_position_type(
                         idx,
                     ),
+                    column_size=self.column_size(idx),
                     header_key=headers[idx],
                     color_map=self._data_color_map,
                 )
@@ -1136,6 +1145,7 @@ class TableAssembler:
         self,
         charset: TableBorderCharset | None,
         position_type: CharsetPositionType,
+        column_size: int,
     ):
         if charset is None or (charset.charset_type in self._border_charset.hide_lines):
             return None
@@ -1145,7 +1155,7 @@ class TableAssembler:
             position_type,
         )
 
-        fill_size = self.columns_size - border_length
+        fill_size = column_size - border_length
 
         match position_type:
             case CharsetPositionType.START:
@@ -1174,12 +1184,13 @@ class TableAssembler:
 
     async def _create_cell(
         self,
-        data: Any,
+        data: TableCell,
         charset: TableBorderCharset,
         position_type: CharsetPositionType,
         header_key: str | None = None,
         color_map: HeaderColorMap | DataColorMap | None = None,
         is_header: bool = False,
+        column_size: int = 0,
     ):
         if data is None:
             data = self._field_default_map.get(header_key)
@@ -1199,6 +1210,7 @@ class TableAssembler:
         ) = self._calculate_padding(
             data_length,
             border_length,
+            column_size,
             is_header=is_header,
         )
 
@@ -1246,7 +1258,7 @@ class TableAssembler:
 
     def _convert_cell_to_string(
         self,
-        data: Any,
+        data: TableCell,
         header_key: str,
     ) -> str:
         if data is None:
@@ -1328,16 +1340,17 @@ class TableAssembler:
         self,
         header_length: int,
         border_length: int,
+        column_size: int,
         is_header: bool = False,
     ):
-        padding_total = self.columns_size - header_length - border_length
+        padding_total = column_size - header_length - border_length
         adjusted_header_length = 0
 
         if padding_total < 0:
             difference = abs(padding_total)
             adjusted_header_length = header_length - difference
 
-            padding_total = self.columns_size - adjusted_header_length - border_length
+            padding_total = column_size - adjusted_header_length - border_length
 
         padding_left = 0
         padding_right = 0
@@ -1391,7 +1404,7 @@ class TableAssembler:
 
     async def _format_cell(
         self,
-        raw_value: Any,
+        raw_value: TableCell,
         converted_data: str,
         left_border_char: str | None = None,
         right_border_char: str | None = None,
@@ -1436,7 +1449,7 @@ class TableAssembler:
 
     async def _colorize_data(
         self,
-        raw_value: Any,
+        raw_value: TableCell,
         data: str,
         color_map: HeaderColorMap | DataColorMap,
         color_key: str,
@@ -1474,8 +1487,28 @@ class TableAssembler:
 
         return len(charset.end_char)
 
+    def column_size(self, index: int) -> int:
+        """The width of the visible column at ``index``."""
+        if self.column_sizes is None:
+            return self.columns_size
+
+        return self.column_sizes[index]
+
+    def cell_text(self, data: TableCell, header_key: str) -> str:
+        """A cell's text as the table draws it: its column's default for a
+        missing value, then formatted."""
+        return self._convert_cell_to_string(self._field_default_map.get(header_key) if data is None else data, header_key)
+
+    def cell_border_length(self, index: int, count: int) -> int:
+        """The border characters a data cell at ``index`` of ``count``
+        visible columns takes besides its text."""
+        return self._calculate_border_length(self._border_charset.data_row, self._position_type_of(index, count))
+
     def _calculate_position_type(self, idx: int):
-        last_idx = self.columns_count - 1
+        return self._position_type_of(idx, self.columns_count)
+
+    def _position_type_of(self, idx: int, count: int):
+        last_idx = count - 1
 
         if idx == 0:
             return CharsetPositionType.START
@@ -1495,7 +1528,7 @@ class TableAssembler:
     def _get_value_or_default(
         self,
         header: str,
-        row: list[Any],
+        row: list[TableCell],
         idx: int,
     ):
         row_length = len(row)

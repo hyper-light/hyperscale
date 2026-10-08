@@ -5,6 +5,10 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
 from tests.end_to_end.workflows.base_scenario_workflow import BaseScenarioWorkflow
+from tests.end_to_end.workflow_lifecycle_checks import (
+    assert_retry_budgets_released,
+    assert_workflow_lifecycle_sound,
+)
 from tests.framework.results.scenario_outcome import ScenarioOutcome
 from tests.framework.results.scenario_result import ScenarioResult
 from tests.framework.runner.scenario_runner import ScenarioRunner
@@ -118,10 +122,8 @@ async def validate_55_2_manager_dispatch_retry_jitter() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Dispatch retry jitter expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Dispatch retry jitter expected workflow retries")
+        assert_retry_budgets_released(manager, "Dispatch retry jitter expected workflow retries")
     finally:
         await runtime.stop_cluster()
 
@@ -158,10 +160,7 @@ async def validate_55_4_result_ack_idempotency() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_lifecycle_states, dict), (
-            "Result ack idempotency expected workflow lifecycle states"
-        )
+        assert_workflow_lifecycle_sound(manager, "Result ack idempotency expected workflow lifecycle states")
     finally:
         await runtime.stop_cluster()
 
@@ -238,10 +237,8 @@ async def validate_55_8_retry_escalation_tiers() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Retry escalation expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Retry escalation expected workflow retries")
+        assert_retry_budgets_released(manager, "Retry escalation expected workflow retries")
     finally:
         await runtime.stop_cluster()
 

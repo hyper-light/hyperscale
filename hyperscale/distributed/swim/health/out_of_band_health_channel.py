@@ -20,62 +20,38 @@ Integration:
 - HealthAwareServer can optionally enable OOB channel
 - OOB probes are sent when normal probes fail or timeout
 - OOB channel is checked before declaring a node dead
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 import socket
-import time
 from dataclasses import dataclass, field
+from itertools import compress, filterfalse, repeat
+from operator import gt, methodcaller, sub
 from typing import Callable
-
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.logging.hyperscale_logging_models import ServerError
 
+from .oob_health_channel_config import MAX_OOB_MESSAGE_SIZE
+from .oob_health_channel_config import OOB_MAX_PROBES_PER_SECOND
+from .oob_health_channel_config import OOB_PROBE_COOLDOWN
+from .oob_health_channel_config import OOBHealthChannelConfig
+from .oob_probe_result import OOBProbeResult
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 # Message format: single byte type + payload
 OOB_PROBE = b"\x01"  # Health probe request
+
 OOB_ACK = b"\x02"  # Health probe acknowledgment
+
 OOB_NACK = b"\x03"  # Health probe negative acknowledgment (overloaded)
-
-# Maximum OOB message size (minimal for fast processing)
-MAX_OOB_MESSAGE_SIZE = 64
-
-# Rate limiting for OOB channel
-OOB_MAX_PROBES_PER_SECOND = 100
-OOB_PROBE_COOLDOWN = 0.01  # 10ms between probes to same target
-
-
-@dataclass(slots=True)
-class OOBHealthChannelConfig:
-    """Configuration for out-of-band health channel."""
-
-    # Port offset from main UDP port (e.g., if main is 8000, OOB is 8000 + offset)
-    port_offset: int = 100
-
-    # Timeout for OOB probes (shorter than regular probes)
-    probe_timeout_seconds: float = 0.5
-
-    # Maximum probes per second (global rate limit)
-    max_probes_per_second: int = OOB_MAX_PROBES_PER_SECOND
-
-    # Cooldown between probes to same target
-    per_target_cooldown_seconds: float = OOB_PROBE_COOLDOWN
-
-    # Buffer size for receiving
-    receive_buffer_size: int = MAX_OOB_MESSAGE_SIZE
-
-    # Enable NACK responses when overloaded
-    send_nack_when_overloaded: bool = True
-
-
-@dataclass(slots=True)
-class OOBProbeResult:
-    """Result of an out-of-band probe."""
-
-    target: tuple[str, int]
-    success: bool
-    is_overloaded: bool  # True if received NACK
-    latency_ms: float
-    error: str | None = None
 
 
 @dataclass(slots=True)
@@ -119,7 +95,7 @@ class OutOfBandHealthChannel:
     # Rate limiting
     _last_probe_time: dict[tuple[str, int], float] = field(default_factory=dict)
     _global_probe_count: int = 0
-    _global_probe_window_start: float = field(default_factory=time.monotonic)
+    _global_probe_window_start: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
     # Callback for when we receive a probe (to generate response)
     _is_overloaded: Callable[[], bool] | None = None
@@ -130,6 +106,7 @@ class OutOfBandHealthChannel:
     _acks_sent: int = 0
     _nacks_sent: int = 0
     _timeouts: int = 0
+    _reply_send_failures: int = 0
 
     _logger: LoggerProtocol | None = None
     _node_id: str = ""
@@ -148,7 +125,6 @@ class OutOfBandHealthChannel:
 
     async def _log_error(self, message: str) -> None:
         if self._logger:
-            from hyperscale.logging.hyperscale_logging_models import ServerError
 
             await self._logger.log(
                 ServerError(
@@ -179,29 +155,45 @@ class OutOfBandHealthChannel:
             )
 
         self._running = True
-        self._receive_task = asyncio.create_task(self._receive_loop())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop the OOB channel was started on rather than implicitly
+        # going through ``get_running_loop`` at task-creation time.
+        self._receive_task = asyncio.get_running_loop().create_task(
+            self._receive_loop()
+        )
 
     async def stop(self) -> None:
         """Stop the OOB health channel."""
         self._running = False
 
         if self._receive_task:
-            self._receive_task.cancel()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                pass
+            await self._cancel_and_await_receive_task()
             self._receive_task = None
 
         # Cancel pending probes
-        for future in self._pending_probes.values():
-            if not future.done():
-                future.cancel()
+        for future in filterfalse(methodcaller("done"), self._pending_probes.values()):
+            future.cancel()
         self._pending_probes.clear()
 
+        self._close_socket()
+
+    def _close_socket(self) -> None:
+        """Close and drop the channel socket, if one is open."""
         if self._socket:
             self._socket.close()
             self._socket = None
+
+    async def _cancel_and_await_receive_task(self) -> None:
+        """Cancel the receive task and wait for it, re-raising a cancel aimed at the caller meanwhile."""
+        self._receive_task.cancel()
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
+        try:
+            await self._receive_task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
 
     async def probe(self, target: tuple[str, int]) -> OOBProbeResult:
         """
@@ -213,31 +205,45 @@ class OutOfBandHealthChannel:
         Returns:
             OOBProbeResult with success/failure and latency
         """
-        if not self._running or not self._socket:
+        # Channel-running and rate limiting checks
+        if (refusal := self._probe_refusal(target)) is not None:
             return OOBProbeResult(
                 target=target,
                 success=False,
                 is_overloaded=False,
                 latency_ms=0.0,
-                error="OOB channel not running",
-            )
-
-        # Rate limiting checks
-        if not self._check_rate_limit(target):
-            return OOBProbeResult(
-                target=target,
-                success=False,
-                is_overloaded=False,
-                latency_ms=0.0,
-                error="Rate limited",
+                error=refusal,
             )
 
         # Create future for response
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending_probes[target] = future
 
-        start_time = time.monotonic()
+        start_time = _DEFAULT_CLOCK.monotonic()
 
+        return await self._send_probe_and_await_reply(target, future, start_time)
+
+    def _probe_refusal(self, target: tuple[str, int]) -> str | None:
+        """Why a probe to ``target`` cannot be sent now (channel down, rate limited), or None."""
+        if self._channel_closed():
+            return "OOB channel not running"
+
+        # Rate limiting checks
+        if not self._check_rate_limit(target):
+            return "Rate limited"
+        return None
+
+    def _channel_closed(self) -> bool:
+        """Whether the channel is stopped or has no socket."""
+        return not self._running or not self._socket
+
+    async def _send_probe_and_await_reply(
+        self,
+        target: tuple[str, int],
+        future: asyncio.Future,
+        start_time: float,
+    ) -> OOBProbeResult:
+        """Send the probe and await its reply; failures become results, and the pending entry always goes."""
         try:
             # Send probe
             message = OOB_PROBE + f"{self.host}:{self.port}".encode()
@@ -247,45 +253,10 @@ class OutOfBandHealthChannel:
                 target,
             )
             self._probes_sent += 1
-            self._last_probe_time[target] = time.monotonic()
+            self._last_probe_time[target] = _DEFAULT_CLOCK.monotonic()
 
             # Wait for response
-            try:
-                response = await asyncio.wait_for(
-                    future,
-                    timeout=self.config.probe_timeout_seconds,
-                )
-
-                latency = (time.monotonic() - start_time) * 1000
-                is_overloaded = response == OOB_NACK
-
-                return OOBProbeResult(
-                    target=target,
-                    success=True,
-                    is_overloaded=is_overloaded,
-                    latency_ms=latency,
-                )
-
-            except asyncio.TimeoutError:
-                self._timeouts += 1
-                return OOBProbeResult(
-                    target=target,
-                    success=False,
-                    is_overloaded=False,
-                    latency_ms=(time.monotonic() - start_time) * 1000,
-                    error="Timeout",
-                )
-
-            except asyncio.CancelledError:
-                # Probe was cancelled (e.g., during shutdown)
-                # Return graceful failure instead of propagating
-                return OOBProbeResult(
-                    target=target,
-                    success=False,
-                    is_overloaded=False,
-                    latency_ms=(time.monotonic() - start_time) * 1000,
-                    error="Cancelled",
-                )
+            return await self._await_probe_reply(target, future, start_time)
 
         except asyncio.CancelledError:
             # Cancelled during send - graceful failure
@@ -293,7 +264,7 @@ class OutOfBandHealthChannel:
                 target=target,
                 success=False,
                 is_overloaded=False,
-                latency_ms=(time.monotonic() - start_time) * 1000,
+                latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
                 error="Cancelled",
             )
 
@@ -302,12 +273,56 @@ class OutOfBandHealthChannel:
                 target=target,
                 success=False,
                 is_overloaded=False,
-                latency_ms=(time.monotonic() - start_time) * 1000,
+                latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
                 error=str(e),
             )
 
         finally:
             self._pending_probes.pop(target, None)
+
+    async def _await_probe_reply(
+        self,
+        target: tuple[str, int],
+        future: asyncio.Future,
+        start_time: float,
+    ) -> OOBProbeResult:
+        """Await the ACK/NACK for a sent probe; a timeout or cancel is a failed result."""
+        try:
+            response = await _DEFAULT_CLOCK.wait_for(
+                future,
+                timeout=self.config.probe_timeout_seconds,
+            )
+
+            latency = (_DEFAULT_CLOCK.monotonic() - start_time) * 1000
+            is_overloaded = response == OOB_NACK
+
+            return OOBProbeResult(
+                target=target,
+                success=True,
+                is_overloaded=is_overloaded,
+                latency_ms=latency,
+            )
+
+        except asyncio.TimeoutError:
+            self._timeouts += 1
+            return OOBProbeResult(
+                target=target,
+                success=False,
+                is_overloaded=False,
+                latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
+                error="Timeout",
+            )
+
+        except asyncio.CancelledError:
+            # Probe was cancelled (e.g., during shutdown)
+            # Return graceful failure instead of propagating
+            return OOBProbeResult(
+                target=target,
+                success=False,
+                is_overloaded=False,
+                latency_ms=(_DEFAULT_CLOCK.monotonic() - start_time) * 1000,
+                error="Cancelled",
+            )
 
     async def _receive_loop(self) -> None:
         """Receive loop for OOB messages."""
@@ -382,7 +397,7 @@ class OutOfBandHealthChannel:
             if len(data) > 1:
                 reply_addr_str = data[1:].decode()
                 if ":" in reply_addr_str:
-                    host, port = reply_addr_str.split(":", 1)
+                    host, port = reply_addr_str.rsplit(":", 1)
                     reply_addr = (host, int(port))
                 else:
                     reply_addr = addr
@@ -398,8 +413,12 @@ class OutOfBandHealthChannel:
                 response,
                 reply_addr,
             )
-        except Exception:
-            pass  # Best effort
+        except Exception as send_error:
+            # The prober sees a timeout: count and log the real cause.
+            self._reply_send_failures += 1
+            await self._log_error(
+                f"OOB health reply to {reply_addr[0]}:{reply_addr[1]} failed: {send_error!r}"
+            )
 
     def _handle_response(self, msg_type: bytes, addr: tuple[str, int]) -> None:
         """Handle response to our probe."""
@@ -409,7 +428,7 @@ class OutOfBandHealthChannel:
 
     def _check_rate_limit(self, target: tuple[str, int]) -> bool:
         """Check if we can send a probe (rate limiting)."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Per-target cooldown
         last_probe = self._last_probe_time.get(target, 0)
@@ -434,12 +453,14 @@ class OutOfBandHealthChannel:
         Returns:
             Number of entries removed
         """
-        now = time.monotonic()
-        stale = [
-            target
-            for target, last_time in self._last_probe_time.items()
-            if now - last_time > max_age_seconds
-        ]
+        now = _DEFAULT_CLOCK.monotonic()
+        # Keys and values iterate in the same order, so compress selects the stale targets.
+        stale = list(
+            compress(
+                self._last_probe_time.keys(),
+                map(gt, map(sub, repeat(now), self._last_probe_time.values()), repeat(max_age_seconds)),
+            )
+        )
 
         for target in stale:
             del self._last_probe_time[target]
@@ -456,6 +477,7 @@ class OutOfBandHealthChannel:
             "acks_sent": self._acks_sent,
             "nacks_sent": self._nacks_sent,
             "timeouts": self._timeouts,
+            "reply_send_failures": self._reply_send_failures,
             "pending_probes": len(self._pending_probes),
             "rate_limit_entries": len(self._last_probe_time),
         }
@@ -473,3 +495,11 @@ def get_oob_port_for_swim_port(swim_port: int, offset: int = 100) -> int:
         The OOB channel port number
     """
     return swim_port + offset
+
+_REHOMED = (
+    OOBHealthChannelConfig,
+    OOBProbeResult,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

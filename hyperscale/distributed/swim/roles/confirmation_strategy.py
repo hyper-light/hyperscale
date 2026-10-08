@@ -23,8 +23,6 @@ class RoleBasedConfirmationStrategy:
     enable_proactive_confirmation: bool  # Whether to actively probe
     confirmation_attempts: int  # Number of retries (if proactive)
     attempt_interval_seconds: float  # Delay between retries
-    latency_aware: bool  # Use Vivaldi for timeout adjustment
-    use_vivaldi: bool  # Enable Vivaldi coordinate tracking
     load_multiplier_max: float  # Max timeout multiplier under load
 
 
@@ -36,8 +34,6 @@ GATE_STRATEGY = RoleBasedConfirmationStrategy(
     enable_proactive_confirmation=True,  # Actively probe gates
     confirmation_attempts=5,  # 5 retries for cross-DC gates
     attempt_interval_seconds=5.0,  # 5 seconds between attempts
-    latency_aware=True,  # Use Vivaldi RTT for timeout
-    use_vivaldi=True,  # Enable coordinate system
     load_multiplier_max=3.0,  # Max 3x under load
 )
 
@@ -47,8 +43,6 @@ MANAGER_STRATEGY = RoleBasedConfirmationStrategy(
     enable_proactive_confirmation=True,  # Actively probe managers
     confirmation_attempts=3,  # 3 retries
     attempt_interval_seconds=5.0,  # 5 seconds between attempts
-    latency_aware=True,  # Use Vivaldi RTT for timeout
-    use_vivaldi=True,  # Enable coordinate system
     load_multiplier_max=5.0,  # Max 5x under load
 )
 
@@ -58,8 +52,6 @@ WORKER_STRATEGY = RoleBasedConfirmationStrategy(
     enable_proactive_confirmation=False,  # NEVER probe workers
     confirmation_attempts=0,  # No retries
     attempt_interval_seconds=0.0,  # N/A
-    latency_aware=False,  # Workers are same-DC, no Vivaldi needed
-    use_vivaldi=False,  # Disable coordinate system for workers
     load_multiplier_max=10.0,  # Max 10x under extreme load
 )
 

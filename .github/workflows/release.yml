@@ -22,26 +22,28 @@ env:
   PYTHON_VERSION: "3.13"
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
+  # Publication is gated on the test tiers. Without this the only
+  # workflow in the repo published without running a single test.
+  tests:
+    uses: ./.github/workflows/ci.yml
+
   # This workflow contains a single job called "build"
   publish_to_pypi:
+    needs: [ "tests" ]
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-    - uses: actions/checkout@master
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v3
+    - uses: actions/checkout@v4
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
       with:
-        python-version: '3.12'
-    - name: Install pypa/setuptools
-      run: >-
-        python -m
-        pip install wheel build setuptools
-    - name: Build a binary wheel
-      run: >-
-        python -m build
+        python-version: ${{ env.PYTHON_VERSION }}
+        enable-cache: true
+    - name: Build the sdist and wheel
+      run: uv build
     - name: Publish distribution 📦 to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
@@ -52,7 +54,13 @@ jobs:
     needs: [ "publish_to_pypi" ]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@master
+    - uses: actions/checkout@v4
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+    - name: Read the published version
+      # The image installs exactly the version this commit published.
+      id: project
+      run: echo "version=$(uv version --short)" >> "$GITHUB_OUTPUT"
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
     - name: Set up Docker Buildx
@@ -65,10 +73,14 @@ jobs:
     - name: Build and push
       uses: docker/build-push-action@v5
       with:
+        context: .
         platforms: linux/amd64,linux/arm64
         push: true
         file: docker/images/Dockerfile
-        tags: hyperlightorg/hyperscale:latest
+        tags: |
+          hyperlightorg/hyperscale:latest
+          hyperlightorg/hyperscale:${{ steps.project.outputs.version }}
         build-args: |
-          VERSION=${{env.PYTHON_VERSION}}
-          BASE=${{env.IMAGE_OS}}
+          PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+          OS_BASE=${{ env.IMAGE_OS }}
+          HYPERSCALE_VERSION=${{ steps.project.outputs.version }}

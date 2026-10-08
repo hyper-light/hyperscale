@@ -23,6 +23,7 @@ from __future__ import annotations
 """SFTP handlers"""
 
 import asyncio
+from contextlib import aclosing
 from fnmatch import fnmatch
 import os
 from os import SEEK_SET, SEEK_CUR, SEEK_END
@@ -556,32 +557,53 @@ class _SFTPParallelIO(Generic[_T]):
 
         self._start_tasks()
 
-        while self._pending:
-            done, self._pending = await asyncio.wait(
-                self._pending, return_when=asyncio.FIRST_COMPLETED)
+        try:
+            while self._pending:
+                done, self._pending = await asyncio.wait(
+                    self._pending, return_when=asyncio.FIRST_COMPLETED)
 
-            exceptions = []
+                exceptions = []
 
-            for task in done:
-                try:
-                    offset, size, count, result = task.result()
-                    yield offset, result
+                for task in done:
+                    try:
+                        offset, size, count, result = task.result()
+                        yield offset, result
 
-                    if count and count < size:
-                        self._pending.add(asyncio.ensure_future(
-                            self._start_task(offset+count, size-count)))
-                except SFTPEOFError:
-                    self._bytes_left = 0
-                except (OSError, SFTPError) as exc:
-                    exceptions.append(exc)
+                        if count and count < size:
+                            self._pending.add(asyncio.ensure_future(
+                                self._start_task(offset+count, size-count)))
+                    except SFTPEOFError:
+                        self._bytes_left = 0
+                    except (OSError, SFTPError) as exc:
+                        exceptions.append(exc)
 
-            if exceptions:
-                for task in self._pending:
-                    task.cancel()
+                if exceptions:
+                    raise exceptions[0]
 
-                raise exceptions[0]
+                self._start_tasks()
 
-            self._start_tasks()
+        finally:
+            # However the transfer ends -- done, failed, or cancelled by
+            # the caller's timeout -- no request task outlives it.
+            await self._cancel_pending()
+
+    async def _cancel_pending(self) -> None:
+        """Cancel the I/O requests still in flight and wait for them"""
+
+        pending = self._pending
+        self._pending = set()
+
+        for task in pending:
+            task.cancel()
+
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _block_position(block: Tuple[int, bytes]) -> int:
+    """The position of a block read in parallel"""
+
+    return block[0]
 
 
 class _SFTPFileReader(_SFTPParallelIO[bytes]):
@@ -614,10 +636,30 @@ class _SFTPFileReader(_SFTPParallelIO[bytes]):
     async def run(self):
         """Reassemble and return data from parallel reads"""
 
+        arrivals: List[Tuple[int, bytes]] = []
+
+        async with aclosing(self.iter()) as blocks:
+            async for offset, data in blocks:
+                arrivals.append((offset - self._start, data))
+
+        # Reads cover disjoint ranges, so in position order they normally
+        # tile the file: join them, copying the data once.
+        by_position = sorted(arrivals, key=_block_position)
+        end = 0
+
+        for pos, data in by_position:
+            if pos != end:
+                break
+
+            end += len(data)
+        else:
+            return b''.join([data for _, data in by_position])
+
+        # A gap or an overlap: lay the blocks out in arrival order, gaps
+        # zero-filled and later data overwriting earlier.
         result = bytearray()
 
-        async for offset, data in self.iter():
-            pos = offset - self._start
+        for pos, data in arrivals:
             pad = pos - len(result)
 
             if pad > 0:
@@ -660,8 +702,9 @@ class _SFTPFileWriter(_SFTPParallelIO[int]):
     async def run(self):
         """Perform parallel writes"""
 
-        async for _ in self.iter():
-            pass
+        async with aclosing(self.iter()) as writes:
+            async for _ in writes:
+                pass
 
         return self._data
 
@@ -1464,6 +1507,31 @@ class SFTPAttrs(Record):
             nlink=self.nlink,
         )
 
+    @classmethod
+    def from_file_attributes(cls, attributes: FileAttributes) -> 'SFTPAttrs':
+        """The SFTP wire form of hyperscale's FileAttributes (the inverse
+        of to_file_attributes)."""
+        return cls(
+            type=attributes.type if attributes.type is not None else FILEXFER_TYPE_UNKNOWN,
+            size=attributes.size,
+            alloc_size=attributes.alloc_size,
+            uid=attributes.uid,
+            gid=attributes.gid,
+            owner=attributes.owner,
+            group=attributes.group,
+            permissions=attributes.permissions,
+            atime=attributes.atime,
+            atime_ns=attributes.atime_ns,
+            crtime=attributes.crtime,
+            crtime_ns=attributes.crtime_ns,
+            mtime=attributes.mtime,
+            mtime_ns=attributes.mtime_ns,
+            ctime=attributes.ctime,
+            ctime_ns=attributes.ctime_ns,
+            mime_type=attributes.mime_type,
+            nlink=attributes.nlink,
+        )
+
     def _format_ns(self, k: str):
         """Convert epoch seconds & nanoseconds to a string date & time"""
 
@@ -2031,9 +2099,14 @@ class SFTPGlob:
     async def _scandir(self, path) -> AsyncIterator[SFTPName]:
         """Cache results of calls to scandir"""
 
-        if cached := self._scandir_cache.get(path):
+        # A listing already made is served from the cache alone (an empty
+        # one included): listing the directory again would yield every
+        # entry twice.
+        if (cached := self._scandir_cache.get(path)) is not None:
             for entry in cached:
                 yield entry
+
+            return
 
         entries: List[SFTPName] = []
 
@@ -2046,9 +2119,10 @@ class SFTPGlob:
 
         self._scandir_cache[path] = entries
 
-    async def _match_exact(self, path: bytes, pattern: Sequence[bytes],
-                           patlist: _SFTPPatList) -> None:
-        """Match on an exact portion of a path"""
+    async def _match_exact(
+        self, path: bytes, pattern: Sequence[bytes], patlist: _SFTPPatList
+    ) -> AsyncIterator[Tuple[bytes, SFTPAttrs, _SFTPPatList]]:
+        """Match on an exact portion of a path, yielding what to match below it"""
 
         newpath = posixpath.join(path, *pattern)
         newpatlist = patlist[1:]
@@ -2060,19 +2134,20 @@ class SFTPGlob:
 
         if newpatlist:
             if attrs.type == FILEXFER_TYPE_DIRECTORY:
-                await self._match(newpath, attrs, newpatlist)
+                yield newpath, attrs, newpatlist
         else:
             self._report_match(newpath, attrs)
 
-    async def _match_pattern(self, path: bytes, attrs: SFTPAttrs,
-                             pattern: bytes, patlist: _SFTPPatList) -> None:
-        """Match on a pattern portion of a path"""
+    async def _match_pattern(
+        self, path: bytes, attrs: SFTPAttrs, pattern: bytes, patlist: _SFTPPatList
+    ) -> AsyncIterator[Tuple[bytes, SFTPAttrs, _SFTPPatList]]:
+        """Match on a pattern portion of a path, yielding what to match below it"""
 
         newpatlist = patlist[1:]
 
         if pattern == b'**':
             if newpatlist:
-                await self._match(path, attrs, newpatlist)
+                yield path, attrs, newpatlist
             else:
                 self._report_match(path, attrs)
 
@@ -2087,23 +2162,43 @@ class SFTPGlob:
                 attrs = entry.attrs
 
                 if pattern == b'**' and attrs.type == FILEXFER_TYPE_DIRECTORY:
-                    await self._match(newpath, attrs, patlist)
+                    yield newpath, attrs, patlist
                 elif newpatlist:
                     if attrs.type == FILEXFER_TYPE_DIRECTORY:
-                        await self._match(newpath, attrs, newpatlist)
+                        yield newpath, attrs, newpatlist
                 else:
                     self._report_match(newpath, attrs)
 
-    async def _match(self, path: bytes, attrs: SFTPAttrs,
-                     patlist: _SFTPPatList) -> None:
-        """Recursively match against a glob pattern"""
+    def _match_portion(
+        self, path: bytes, attrs: SFTPAttrs, patlist: _SFTPPatList
+    ) -> AsyncIterator[Tuple[bytes, SFTPAttrs, _SFTPPatList]]:
+        """Start matching the first portion of a glob pattern at a path"""
 
         pattern = patlist[0]
 
         if isinstance(pattern, list):
-            await self._match_exact(path, pattern, patlist)
+            return self._match_exact(path, pattern, patlist)
         else:
-            await self._match_pattern(path, attrs, pattern, patlist)
+            return self._match_pattern(path, attrs, pattern, patlist)
+
+    async def _match(self, path: bytes, attrs: SFTPAttrs,
+                     patlist: _SFTPPatList) -> None:
+        """Match against a glob pattern, depth first"""
+
+        # Each portion match reports the names it completes and yields
+        # what remains to match below them. Running the newest one first
+        # keeps the depth-first order of the names without recursion.
+        portion_matches = [self._match_portion(path, attrs, patlist)]
+
+        while portion_matches:
+            try:
+                submatch = await anext(portion_matches[-1])
+
+            except StopAsyncIteration:
+                portion_matches.pop()
+
+            else:
+                portion_matches.append(self._match_portion(*submatch))
 
     async def match(
         self,

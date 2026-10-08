@@ -5,9 +5,36 @@ Handlers depend on this protocol rather than HealthAwareServer directly,
 enabling testability and decoupling.
 """
 
-from typing import Protocol, runtime_checkable, Any
+import asyncio
+from collections.abc import Coroutine
+from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
 
-from hyperscale.distributed.swim.core.types import UpdateType
+from hyperscale.distributed.swim.core.types import (
+    UpdateType,
+)
+
+if TYPE_CHECKING:
+    from hyperscale.distributed.server.context.context_value_lease import (
+        ContextValueLease,
+    )
+    from hyperscale.distributed.swim.core.audit_log import AuditLog
+    from hyperscale.distributed.swim.core.node_state import NodeState
+    from hyperscale.distributed.swim.detection.hierarchical_failure_detector import (
+        HierarchicalFailureDetector,
+    )
+    from hyperscale.distributed.swim.detection.incarnation_tracker import (
+        IncarnationTracker,
+    )
+    from hyperscale.distributed.swim.detection.indirect_probe_manager import (
+        IndirectProbeManager,
+    )
+    from hyperscale.distributed.swim.detection.probe_scheduler import ProbeScheduler
+    from hyperscale.distributed.swim.leadership.local_leader_election import (
+        LocalLeaderElection,
+    )
+    from hyperscale.distributed.taskex import TaskRunner
+
+GatherResultT = TypeVar("GatherResultT")
 
 
 @runtime_checkable
@@ -40,7 +67,7 @@ class ServerInterface(Protocol):
 
     # === State Access ===
 
-    def read_nodes(self) -> dict[tuple[str, int], Any]:
+    def read_nodes(self) -> dict[tuple[str, int], "NodeState"]:
         """Read the nodes dictionary from context."""
         ...
 
@@ -130,11 +157,7 @@ class ServerInterface(Protocol):
         """Decrease LHM score (success event)."""
         ...
 
-    def get_lhm_adjusted_timeout(
-        self,
-        base_timeout: float,
-        target_node_id: str | None = None,
-    ) -> float:
+    def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
         """Get timeout adjusted for current LHM."""
         ...
 
@@ -226,42 +249,42 @@ class ServerInterface(Protocol):
     # === Component Access ===
 
     @property
-    def leader_election(self) -> Any:
+    def leader_election(self) -> "LocalLeaderElection":
         """Get leader election component."""
         ...
 
     @property
-    def hierarchical_detector(self) -> Any:
+    def hierarchical_detector(self) -> "HierarchicalFailureDetector":
         """Get hierarchical failure detector."""
         ...
 
     @property
-    def task_runner(self) -> Any:
+    def task_runner(self) -> "TaskRunner":
         """Get task runner for background operations."""
         ...
 
     @property
-    def probe_scheduler(self) -> Any:
+    def probe_scheduler(self) -> "ProbeScheduler":
         """Get probe scheduler."""
         ...
 
     @property
-    def incarnation_tracker(self) -> Any:
+    def incarnation_tracker(self) -> "IncarnationTracker":
         """Get incarnation tracker."""
         ...
 
     @property
-    def audit_log(self) -> Any:
+    def audit_log(self) -> "AuditLog":
         """Get audit log."""
         ...
 
     @property
-    def indirect_probe_manager(self) -> Any:
+    def indirect_probe_manager(self) -> "IndirectProbeManager":
         """Get indirect probe manager."""
         ...
 
     @property
-    def pending_probe_acks(self) -> dict[tuple[str, int], Any]:
+    def pending_probe_acks(self) -> dict[tuple[str, int], asyncio.Future[bool]]:
         """Get pending probe ack futures."""
         ...
 
@@ -337,7 +360,7 @@ class ServerInterface(Protocol):
 
     async def safe_queue_put(
         self,
-        queue: Any,
+        queue: object,
         item: tuple[int, bytes],
         node: tuple[str, int],
     ) -> bool:
@@ -383,13 +406,10 @@ class ServerInterface(Protocol):
 
     # === Context Management ===
 
-    async def context_with_value(self, target: tuple[str, int]) -> Any:
+    async def context_with_value(self, target: tuple[str, int]) -> "ContextValueLease":
         """Get async context manager for target-scoped operations."""
         ...
 
-    async def write_context(self, key: Any, value: Any) -> None:
-        """Write value to context."""
-        ...
 
     def notify_node_join(self, node: tuple[str, int]) -> None:
         """Fire the server's registered on-node-join callbacks for ``node``.
@@ -418,10 +438,6 @@ class ServerInterface(Protocol):
         """
         ...
 
-    def get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
-        """Return the registered node identity currently bound to ``addr``."""
-        ...
-
     # === Leadership Broadcasting ===
 
     async def broadcast_leadership_message(self, message: bytes) -> None:
@@ -441,10 +457,10 @@ class ServerInterface(Protocol):
 
     async def gather_with_errors(
         self,
-        coros: list[Any],
+        coros: list[Coroutine[object, object, GatherResultT]],
         operation: str,
         timeout: float,
-    ) -> tuple[list[Any], list[Exception]]:
+    ) -> tuple[list[GatherResultT], list[Exception]]:
         """Gather coroutines with error collection."""
         ...
 

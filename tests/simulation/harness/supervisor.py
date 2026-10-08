@@ -34,6 +34,10 @@ from tests.simulation.harness.timeouts import HarnessTimeouts
 
 
 _HARNESS_RUN_ID_ENV = "HYPERSCALE_HARNESS_RUN_ID"
+# The pid of the harness process that owns a run: a tagged process whose
+# owner still lives belongs to a concurrent run (another session on the
+# same machine), not to a dead one, and is never reaped.
+_HARNESS_OWNER_PID_ENV = "HYPERSCALE_HARNESS_OWNER_PID"
 
 
 @dataclass(slots=True)
@@ -75,6 +79,7 @@ class Supervisor:
     async def __aenter__(self) -> "Supervisor":
         self._run_id = uuid.uuid4().hex
         os.environ[_HARNESS_RUN_ID_ENV] = self._run_id
+        os.environ[_HARNESS_OWNER_PID_ENV] = str(os.getpid())
 
         await self._preflight_zombie_reap()
 
@@ -160,6 +165,7 @@ class Supervisor:
         self._report_async_leaks(truly_leaked)
 
         os.environ.pop(_HARNESS_RUN_ID_ENV, None)
+        os.environ.pop(_HARNESS_OWNER_PID_ENV, None)
 
     async def _signal_servers_stop(self) -> None:
         """Phase 1: fire ``server.stop()`` for every started node in parallel.
@@ -184,8 +190,10 @@ class Supervisor:
     async def _signal_server_stop(self, handle: ServerHandle) -> None:
         """Invoke ``stop`` once for a single handle. Errors recorded, not raised.
 
-        ``drain_timeout=0`` because the harness tear-down does not need to
-        wait for in-flight messages — quiescence handles that holistically.
+        ``drain_timeout=0`` skips protocol-level graceful drain. The
+        server's common stop path still performs its bounded quiescence
+        barrier before returning; supervisor-level task quiescence is
+        the final cross-node audit.
         """
         try:
             await handle.instance.stop(drain_timeout=0.0, broadcast_leave=False)
@@ -463,9 +471,30 @@ class Supervisor:
             )
 
     async def _verify_ports_released(self) -> None:
-        held = await self.ports.verify_all_released()
+        """Drain harness reservations back to the process-global pool.
+
+        ``verify_all_released`` is best-effort: TCP TIME_WAIT residue or
+        a TCP/UDP probe race can leave a freshly-closed port briefly
+        non-bindable even after a fully successful teardown. Holding
+        the entire allocator's logical reservations hostage to those
+        transient stragglers — which is what skipping ``release_all``
+        used to do — leaks the *bindable* ports back to the process
+        pool too, because they stay flagged as reserved in
+        ``_PROCESS_RESERVED_PORTS_BY_HOST``. Across a long sequential
+        test run the harness range exhausts and every subsequent
+        cluster setup raises ``PortConflictError``.
+
+        Release every logical reservation back to the process pool
+        unconditionally. Surface the still-held set as a cleanup error
+        so genuine teardown regressions remain observable; the next
+        allocator pass will simply walk past any port that is still
+        non-bindable (the candidate scan already calls ``_is_bindable``
+        on every probe) and converge on the actual free ports.
+        """
+        held = await self.ports.verify_all_released(settle_seconds=0.0)
         if held:
             self.cleanup_errors.append(f"ports still held after teardown: {held}")
+        self.ports.release_all()
 
     async def _preflight_zombie_reap(self) -> None:
         """Find and kill processes left over from earlier harness runs.
@@ -526,6 +555,8 @@ class Supervisor:
                 continue
             if foreign_id == self._run_id:
                 continue
+            if _owner_is_alive(proc, env.get(_HARNESS_OWNER_PID_ENV)):
+                continue
             zombies.append(proc)
         return zombies
 
@@ -542,6 +573,18 @@ class Supervisor:
     @staticmethod
     def _now() -> float:
         return time.monotonic()
+
+
+def _owner_is_alive(proc: psutil.Process, owner_pid_text: str | None) -> bool:
+    """Whether ``proc``'s owning harness process still runs: its tagged
+    owner pid exists and was created no later than ``proc`` (a pid the
+    OS reused after the owner died belongs to a younger process)."""
+    if not owner_pid_text:
+        return False
+    try:
+        return psutil.Process(int(owner_pid_text)).create_time() <= proc.create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        return False
 
 
 def _describe_leaked_task(task: asyncio.Task) -> str:

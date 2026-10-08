@@ -17,9 +17,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
 from hyperscale.distributed.models import ManagerInfo
 from hyperscale.distributed.swim.core import CircuitState
+
+
+def _select_lowest_id(healthy_manager_ids: set[str]) -> str | None:
+    """Stand-in for AD-28 selection: a deterministic choice."""
+    return min(healthy_manager_ids)
 
 
 class TestWorkerRegistryInitialization:
@@ -28,7 +34,7 @@ class TestWorkerRegistryInitialization:
     def test_happy_path_instantiation(self):
         """Test normal registry initialization."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         assert registry._logger == logger
         assert isinstance(registry._known_managers, dict)
@@ -44,6 +50,7 @@ class TestWorkerRegistryInitialization:
             recovery_jitter_min=0.5,
             recovery_jitter_max=2.0,
             recovery_semaphore_size=10,
+            forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id,
         )
 
         assert registry._recovery_jitter_min == 0.5
@@ -57,7 +64,7 @@ class TestWorkerRegistryManagerOperations:
     def test_add_manager(self):
         """Test adding a manager."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         manager_info = MagicMock(spec=ManagerInfo)
         manager_info.tcp_host = "192.168.1.1"
@@ -74,7 +81,7 @@ class TestWorkerRegistryManagerOperations:
     def test_get_manager(self):
         """Test getting a manager by ID."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         manager_info = MagicMock(spec=ManagerInfo)
         registry.add_manager("mgr-1", manager_info)
@@ -85,7 +92,7 @@ class TestWorkerRegistryManagerOperations:
     def test_get_manager_not_found(self):
         """Test getting a non-existent manager."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         result = registry.get_manager("non-existent")
         assert result is None
@@ -93,7 +100,7 @@ class TestWorkerRegistryManagerOperations:
     def test_get_manager_by_addr(self):
         """Test getting a manager by TCP address."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         manager_info = MagicMock(spec=ManagerInfo)
         manager_info.tcp_host = "192.168.1.1"
@@ -106,7 +113,7 @@ class TestWorkerRegistryManagerOperations:
     def test_get_manager_by_addr_not_found(self):
         """Test getting manager by non-existent address."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         result = registry.get_manager_by_addr(("192.168.1.1", 8000))
         assert result is None
@@ -115,7 +122,7 @@ class TestWorkerRegistryManagerOperations:
     async def test_leave_udp_addrs_survive_unhealthy_reap(self):
         """Manager LEAVE targets survive health downgrade and state reaping."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         manager_info = ManagerInfo(
             node_id="mgr-1",
@@ -138,7 +145,7 @@ class TestWorkerRegistryHealthTracking:
     @pytest.mark.asyncio
     async def test_mark_manager_healthy(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         await registry.mark_manager_healthy("mgr-1")
 
@@ -148,7 +155,7 @@ class TestWorkerRegistryHealthTracking:
     @pytest.mark.asyncio
     async def test_mark_manager_unhealthy(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         await registry.mark_manager_healthy("mgr-1")
         await registry.mark_manager_unhealthy("mgr-1")
@@ -159,7 +166,7 @@ class TestWorkerRegistryHealthTracking:
     @pytest.mark.asyncio
     async def test_mark_manager_unhealthy_records_timestamp(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         before = time.monotonic()
         await registry.mark_manager_unhealthy("mgr-1")
@@ -171,7 +178,7 @@ class TestWorkerRegistryHealthTracking:
     @pytest.mark.asyncio
     async def test_mark_manager_healthy_clears_unhealthy(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         await registry.mark_manager_unhealthy("mgr-1")
         await registry.mark_manager_healthy("mgr-1")
@@ -181,7 +188,7 @@ class TestWorkerRegistryHealthTracking:
     @pytest.mark.asyncio
     async def test_get_healthy_manager_tcp_addrs(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         mgr1 = MagicMock(spec=ManagerInfo)
         mgr1.tcp_host = "192.168.1.1"
@@ -204,7 +211,7 @@ class TestWorkerRegistryHealthTracking:
 
     def test_get_healthy_manager_tcp_addrs_empty(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         addrs = registry.get_healthy_manager_tcp_addrs()
         assert addrs == []
@@ -216,7 +223,7 @@ class TestWorkerRegistryPrimaryManager:
     def test_set_primary_manager(self):
         """Test setting primary manager."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         registry.set_primary_manager("mgr-1")
 
@@ -225,7 +232,7 @@ class TestWorkerRegistryPrimaryManager:
     def test_get_primary_manager_tcp_addr(self):
         """Test getting primary manager TCP address."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         mgr = MagicMock(spec=ManagerInfo)
         mgr.tcp_host = "192.168.1.1"
@@ -240,7 +247,7 @@ class TestWorkerRegistryPrimaryManager:
     def test_get_primary_manager_tcp_addr_no_primary(self):
         """Test getting primary when none set."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         addr = registry.get_primary_manager_tcp_addr()
         assert addr is None
@@ -248,7 +255,7 @@ class TestWorkerRegistryPrimaryManager:
     def test_get_primary_manager_tcp_addr_not_found(self):
         """Test getting primary when manager not in registry."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         registry.set_primary_manager("non-existent")
 
@@ -258,7 +265,7 @@ class TestWorkerRegistryPrimaryManager:
     @pytest.mark.asyncio
     async def test_select_new_primary_manager_leader(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         mgr1 = MagicMock(spec=ManagerInfo)
         mgr1.is_leader = False
@@ -278,7 +285,7 @@ class TestWorkerRegistryPrimaryManager:
     @pytest.mark.asyncio
     async def test_select_new_primary_manager_no_leader(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         mgr1 = MagicMock(spec=ManagerInfo)
         mgr1.is_leader = False
@@ -291,10 +298,49 @@ class TestWorkerRegistryPrimaryManager:
         assert selected == "mgr-1"
 
     @pytest.mark.asyncio
+    async def test_no_leader_uses_the_injected_ad28_selection(self):
+        chosen: list[set[str]] = []
+
+        def select_highest(healthy_manager_ids: set[str]) -> str | None:
+            chosen.append(set(healthy_manager_ids))
+            return max(healthy_manager_ids)
+
+        registry = WorkerRegistry(MagicMock(), forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=select_highest)
+        for manager_id in ("mgr-1", "mgr-2", "mgr-3"):
+            manager = MagicMock(spec=ManagerInfo)
+            manager.is_leader = False
+            registry.add_manager(manager_id, manager)
+            await registry.mark_manager_healthy(manager_id)
+
+        selected = await registry.select_new_primary_manager()
+
+        assert selected == "mgr-3"
+        assert chosen == [{"mgr-1", "mgr-2", "mgr-3"}]
+        assert registry._primary_manager_id == "mgr-3"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("selector_result", [None, "mgr-not-healthy"])
+    async def test_unusable_selection_falls_back_to_a_deterministic_healthy_manager(
+        self,
+        selector_result,
+    ):
+        registry = WorkerRegistry(
+            MagicMock(),
+            forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=lambda healthy_manager_ids: selector_result,
+        )
+        for manager_id in ("mgr-2", "mgr-1"):
+            manager = MagicMock(spec=ManagerInfo)
+            manager.is_leader = False
+            registry.add_manager(manager_id, manager)
+            await registry.mark_manager_healthy(manager_id)
+
+        assert await registry.select_new_primary_manager() == "mgr-1"
+
+    @pytest.mark.asyncio
     async def test_select_new_primary_manager_none_healthy(self):
         """Test selecting new primary when none healthy."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         selected = await registry.select_new_primary_manager()
 
@@ -307,7 +353,7 @@ class TestWorkerRegistryLockManagement:
     def test_get_or_create_manager_lock(self):
         """Test getting or creating a manager lock."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         lock1 = registry.get_or_create_manager_lock("mgr-1")
         lock2 = registry.get_or_create_manager_lock("mgr-1")
@@ -318,7 +364,7 @@ class TestWorkerRegistryLockManagement:
     def test_different_managers_get_different_locks(self):
         """Test that different managers get different locks."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         lock1 = registry.get_or_create_manager_lock("mgr-1")
         lock2 = registry.get_or_create_manager_lock("mgr-2")
@@ -332,7 +378,7 @@ class TestWorkerRegistryEpochManagement:
     def test_increment_manager_epoch(self):
         """Test incrementing manager epoch."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         assert registry.get_manager_epoch("mgr-1") == 0
 
@@ -346,7 +392,7 @@ class TestWorkerRegistryEpochManagement:
     def test_get_manager_epoch_default(self):
         """Test getting epoch for unknown manager."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         epoch = registry.get_manager_epoch("unknown")
         assert epoch == 0
@@ -358,33 +404,40 @@ class TestWorkerRegistryCircuitBreakers:
     def test_get_or_create_circuit(self):
         """Test getting or creating a circuit breaker."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         circuit1 = registry.get_or_create_circuit("mgr-1")
         circuit2 = registry.get_or_create_circuit("mgr-1")
 
         assert circuit1 is circuit2
 
-    def test_get_or_create_circuit_with_custom_thresholds(self):
-        """Test creating circuit with custom thresholds."""
+    def test_circuits_take_the_configured_thresholds(self):
+        """Every manager link's breaker is the configured one
+        (``CIRCUIT_BREAKER_*``), by id and by address alike."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
-
-        circuit = registry.get_or_create_circuit(
-            "mgr-1",
-            error_threshold=10,
-            error_rate_threshold=0.8,
-            half_open_after=60.0,
+        configured = Env(
+            CIRCUIT_BREAKER_MAX_ERRORS=10,
+            CIRCUIT_BREAKER_WINDOW_SECONDS=45.0,
+            CIRCUIT_BREAKER_HALF_OPEN_AFTER=60.0,
+        )
+        registry = WorkerRegistry(
+            logger,
+            forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=configured.get_circuit_breaker_config(),
+            select_manager=_select_lowest_id,
         )
 
-        assert circuit.error_threshold == 10
-        assert circuit.error_rate_threshold == 0.8
-        assert circuit.half_open_after == 60.0
+        for circuit in (
+            registry.get_or_create_circuit("mgr-1"),
+            registry.get_or_create_circuit_by_addr(("192.168.1.1", 8000)),
+        ):
+            assert circuit.max_errors == 10
+            assert circuit.window_seconds == 45.0
+            assert circuit.half_open_after == 60.0
 
     def test_get_or_create_circuit_by_addr(self):
         """Test getting or creating circuit by address."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         addr = ("192.168.1.1", 8000)
         circuit1 = registry.get_or_create_circuit_by_addr(addr)
@@ -395,7 +448,7 @@ class TestWorkerRegistryCircuitBreakers:
     def test_is_circuit_open_closed(self):
         """Test checking closed circuit."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         registry.get_or_create_circuit("mgr-1")
 
@@ -404,14 +457,14 @@ class TestWorkerRegistryCircuitBreakers:
     def test_is_circuit_open_no_circuit(self):
         """Test checking circuit for unknown manager."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         assert registry.is_circuit_open("unknown") is False
 
     def test_is_circuit_open_by_addr_closed(self):
         """Test checking closed circuit by address."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         addr = ("192.168.1.1", 8000)
         registry.get_or_create_circuit_by_addr(addr)
@@ -421,7 +474,7 @@ class TestWorkerRegistryCircuitBreakers:
     def test_get_circuit_status_specific(self):
         """Test getting circuit status for specific manager."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         registry.get_or_create_circuit("mgr-1")
 
@@ -435,7 +488,7 @@ class TestWorkerRegistryCircuitBreakers:
     def test_get_circuit_status_not_found(self):
         """Test getting circuit status for unknown manager."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         status = registry.get_circuit_status("unknown")
 
@@ -444,7 +497,7 @@ class TestWorkerRegistryCircuitBreakers:
     @pytest.mark.asyncio
     async def test_get_circuit_status_summary(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         registry.get_or_create_circuit("mgr-1")
         registry.get_or_create_circuit("mgr-2")
@@ -465,7 +518,7 @@ class TestWorkerRegistryUDPLookup:
     def test_find_manager_by_udp_addr(self):
         """Test finding manager by UDP address."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         mgr = MagicMock(spec=ManagerInfo)
         mgr.udp_host = "192.168.1.1"
@@ -479,7 +532,7 @@ class TestWorkerRegistryUDPLookup:
     def test_find_manager_by_udp_addr_not_found(self):
         """Test finding manager by unknown UDP address."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         found = registry.find_manager_by_udp_addr(("192.168.1.1", 8001))
         assert found is None
@@ -492,7 +545,7 @@ class TestWorkerRegistryConcurrency:
     async def test_concurrent_lock_access(self):
         """Test concurrent access to manager locks."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         access_order = []
 
@@ -517,7 +570,7 @@ class TestWorkerRegistryConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_manager_registration(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         async def register_manager(manager_id: str):
             mgr = MagicMock(spec=ManagerInfo)
@@ -537,7 +590,7 @@ class TestWorkerRegistryEdgeCases:
     @pytest.mark.asyncio
     async def test_many_managers(self):
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         for i in range(100):
             mgr = MagicMock(spec=ManagerInfo)
@@ -555,7 +608,7 @@ class TestWorkerRegistryEdgeCases:
     def test_special_characters_in_manager_id(self):
         """Test manager IDs with special characters."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         special_id = "mgr-🚀-test-ñ-中文"
         mgr = MagicMock(spec=ManagerInfo)
@@ -570,7 +623,7 @@ class TestWorkerRegistryEdgeCases:
     def test_replace_manager(self):
         """Test replacing manager info."""
         logger = MagicMock()
-        registry = WorkerRegistry(logger)
+        registry = WorkerRegistry(logger, forget_manager_backpressure=lambda manager_id: None, circuit_breaker_config=Env().get_circuit_breaker_config(), select_manager=_select_lowest_id)
 
         mgr1 = MagicMock(spec=ManagerInfo)
         mgr1.tcp_host = "192.168.1.1"

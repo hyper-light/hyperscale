@@ -15,6 +15,10 @@ under the explicit override hierarchy:
         → use ``parse(workflow.duration) ×
           HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER`` (default 1.5).
 
+A job submitted without a timeout of its own gets the budget of its
+longest chain of dependent workflows, each taking the deadline above
+(``workflow_dependencies.resolve_job_deadline_seconds``).
+
 The single source of truth lives here so the gate, manager dispatcher,
 and timeout-strategy code all derive deadlines identically. No
 duplicate parsing, no drift between layers.
@@ -50,6 +54,15 @@ def _workflow_class_timeout_overridden(workflow: Workflow) -> bool:
     return instance_value != base_default
 
 
+def _explicit_submission_timeout_applies(
+    submission_timeout_seconds: float,
+    submission_timeout_explicit: bool,
+) -> bool:
+    """Whether rule 1 of the AD-26 / AD-34 Phase H2 hierarchy applies: the
+    submission marked its timeout explicit and gave a positive one."""
+    return submission_timeout_explicit and submission_timeout_seconds > 0.0
+
+
 def resolve_worker_deadline_seconds(
     workflow: Workflow,
     submission_timeout_seconds: float,
@@ -75,7 +88,7 @@ def resolve_worker_deadline_seconds(
         The deadline in seconds that the worker's
         ``WorkflowExecutor.set_workflow_timeout`` should record.
     """
-    if submission_timeout_explicit and submission_timeout_seconds > 0.0:
+    if _explicit_submission_timeout_applies(submission_timeout_seconds, submission_timeout_explicit):
         return submission_timeout_seconds
 
     duration_seconds = TimeParser(workflow.duration).time

@@ -1,5 +1,9 @@
 from dataclasses import dataclass, field
-from time import monotonic
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -12,10 +16,13 @@ class ResourceMetrics:
     memory_uncertainty: float
     memory_percent: float
     file_descriptor_count: int
-    timestamp_monotonic: float = field(default_factory=monotonic)
+    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     sample_count: int = 1
     process_count: int = 1
+    # The largest single process's descriptor count: RLIMIT_NOFILE is per
+    # process, so this, not the tree's sum, is what nears the ceiling.
+    largest_process_file_descriptor_count: int = 0
 
     def is_stale(self, max_age_seconds: float = 30.0) -> bool:
         """Return True if metrics are older than max_age_seconds."""
-        return (monotonic() - self.timestamp_monotonic) > max_age_seconds
+        return (_DEFAULT_CLOCK.monotonic() - self.timestamp_monotonic) > max_age_seconds

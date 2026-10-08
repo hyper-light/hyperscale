@@ -27,7 +27,7 @@ class Cookies(OptimizedArg, Generic[T]):
 
         self.call_name: Optional[str] = None
         self.data = validated_cookies.value
-        self.optimized: Optional[str | Tuple[str, str]] = None
+        self.optimized: Optional[str | Tuple[bytes, bytes]] = None
 
     async def optimize(
         self,
@@ -71,7 +71,9 @@ class Cookies(OptimizedArg, Generic[T]):
                 self.optimized = f"cookie: {encoded}{NEW_LINE}"
 
             case RequestType.GRAPHQL_HTTP2 | RequestType.HTTP2 | RequestType.HTTP3:
-                self.optimized = ("cookie", encoded)
+                # A header field as the HPACK and QPACK encoders take one:
+                # its name and value in bytes.
+                self.optimized = (b"cookie", encoded.encode())
 
             case _:
                 pass

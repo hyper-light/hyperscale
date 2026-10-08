@@ -18,6 +18,11 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
     from .registry import WorkerRegistry
@@ -85,28 +90,38 @@ class WorkerBackpressureManager:
         """
         self._running = True
         while self._running:
-            try:
-                await asyncio.sleep(self._poll_interval)
-
-                # Sample current resource usage
-                cpu_percent = self._get_cpu_percent()
-                memory_percent = self._get_memory_percent()
-
-                # Update detector state - escalation is immediate
-                self._overload_detector.get_state(cpu_percent, memory_percent)
-
-            except asyncio.CancelledError:
+            if await self._guarded_overload_poll():
                 break
-            except Exception as error:
-                if self._logger:
-                    await self._logger.log(
-                        ServerWarning(
-                            message=f"Error in overload_poll_loop: {error}",
-                            node_host="worker",
-                            node_port=0,
-                            node_id="worker",
-                        )
-                    )
+
+    async def _guarded_overload_poll(self) -> bool:
+        """One overload sample (AD-18); True when the loop was cancelled and must stop."""
+        try:
+            await _DEFAULT_CLOCK.sleep(self._poll_interval)
+
+            # Sample current resource usage
+            cpu_percent = self._get_cpu_percent()
+            memory_percent = self._get_memory_percent()
+
+            # Update detector state - escalation is immediate
+            self._overload_detector.get_state(cpu_percent, memory_percent)
+
+        except asyncio.CancelledError:
+            return True
+        except Exception as error:
+            await self._log_overload_poll_error(error)
+        return False
+
+    async def _log_overload_poll_error(self, error: Exception) -> None:
+        """Log a failed overload sample when a logger is set."""
+        if self._logger:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Error in overload_poll_loop: {error}",
+                    node_host="worker",
+                    node_port=0,
+                    node_id="worker",
+                )
+            )
 
     def stop(self) -> None:
         """Stop the polling loop."""
@@ -220,12 +235,15 @@ class WorkerBackpressureManager:
 
         if level == BackpressureLevel.NONE:
             return 0.0
-        elif level == BackpressureLevel.THROTTLE:
-            return max(delay_ms, self._throttle_delay_ms) / 1000.0
-        elif level == BackpressureLevel.BATCH:
-            return max(delay_ms * 2, self._batch_delay_ms) / 1000.0
-        else:
-            return max(delay_ms * 4, self._reject_delay_ms) / 1000.0
+        delay_multiplier, minimum_delay_ms = self._throttle_delay_parameters(level)
+        return max(delay_ms * delay_multiplier, minimum_delay_ms) / 1000.0
+
+    def _throttle_delay_parameters(self, level: BackpressureLevel) -> tuple[int, int]:
+        """The (delay multiplier, minimum delay ms) for a non-NONE level (AD-37)."""
+        return {
+            BackpressureLevel.THROTTLE: (1, self._throttle_delay_ms),
+            BackpressureLevel.BATCH: (2, self._batch_delay_ms),
+        }.get(level, (4, self._reject_delay_ms))
 
     def get_backpressure_state_name(self) -> str:
         """

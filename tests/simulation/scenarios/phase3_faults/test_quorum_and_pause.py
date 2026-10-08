@@ -34,14 +34,13 @@ from tests.simulation.harness import (
 )
 
 
-def _l2_spec(base_port: int) -> ClusterSpec:
+def _l2_spec() -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "main": DCSpec(managers=3, workers=2, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -63,7 +62,7 @@ async def test_quorum_loss_and_recovery() -> None:
     Restarting one of the killed managers brings the cluster back to a
     2-out-of-3 state and election succeeds.
     """
-    spec = _l2_spec(base_port=21000)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -134,7 +133,7 @@ async def test_manager_pause_and_resume() -> None:
     SIGSTOP would freeze the node's receive path too. Phase 6 SIM mode
     will offer faithful pause semantics.
     """
-    spec = _l2_spec(base_port=21100)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -196,7 +195,7 @@ async def test_cascade_two_managers() -> None:
     Tests that the cluster doesn't enter a wedged state when failures
     cascade faster than re-election can complete.
     """
-    spec = _l2_spec(base_port=21200)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

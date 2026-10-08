@@ -191,7 +191,7 @@ class TestMessageParserEmbeddedState:
     def test_invalid_base64_state_ignored(
         self, mock_server: MockServerInterface
     ) -> None:
-        """Invalid base64 state is silently ignored."""
+        """Invalid base64 state is counted and not applied."""
         processed_states = []
 
         def callback(state_data: bytes, source: tuple[str, int]) -> None:
@@ -202,9 +202,10 @@ class TestMessageParserEmbeddedState:
 
         result = parser.parse(("192.168.1.1", 8000), data, 0)
 
-        # Should not crash, state ignored
+        # The message parses; the undecodable state is counted, not applied.
         assert len(processed_states) == 0
         assert result.context.message_type == b"ack"
+        assert mock_server._metrics._counters["malformed_embedded_state"] == 1
 
 
 class TestMessageParserNegativePath:

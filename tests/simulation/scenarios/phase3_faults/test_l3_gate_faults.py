@@ -80,7 +80,7 @@ _L3_STABILIZATION_SECONDS = 90.0
 _L3_RUNNING_TIMEOUT_SECONDS = 60.0
 
 
-def _l3_spec(base_port: int) -> ClusterSpec:
+def _l3_spec() -> ClusterSpec:
     """3 gates + 1 DC × (2 managers + 1 worker × 2 cores).
 
     Mirrors ``phase4_network/test_partition_gap_scenarios.py``'s L3
@@ -109,7 +109,6 @@ def _l3_spec(base_port: int) -> ClusterSpec:
             gate_swim_global_min_timeout=5.0,
             gate_swim_global_max_timeout=15.0,
         ),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=_L3_STABILIZATION_SECONDS),
     )
 
@@ -236,7 +235,7 @@ async def test_l3_gate_dies_dc_routing_fails_over() -> None:
     must reach a terminal ``completed`` status — not hang and not
     silently fail.
     """
-    spec = _l3_spec(base_port=22500)
+    spec = _l3_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -266,7 +265,7 @@ async def test_l3_gate_dies_dc_routing_fails_over_with_test_stats() -> None:
     """Kill one gate while a test workflow is in flight; the surviving
     L3 route must deliver terminal status with aggregated stats intact.
     """
-    spec = _l3_spec(base_port=22900)
+    spec = _l3_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -311,7 +310,7 @@ async def test_l3_job_leadership_transfer_at_gate_tier() -> None:
       5. ``wait_for_completion`` — completion callback must still
          route back to the original client through the new leader.
     """
-    spec = _l3_spec(base_port=22700)
+    spec = _l3_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

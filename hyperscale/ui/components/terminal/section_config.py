@@ -1,6 +1,7 @@
+from collections.abc import Callable
 from typing import Literal
 
-from pydantic import BaseModel, StrictInt, StrictStr
+from pydantic import BaseModel, StrictBool, StrictInt, StrictStr
 
 from hyperscale.ui.config.mode import TerminalDisplayMode
 from hyperscale.ui.styling.colors import ColorName, ExtendedColorName
@@ -38,6 +39,11 @@ VerticalAlignment = Literal["top", "center", "bottom"]
 class SectionConfig(BaseModel):
     width: HorizontalSectionSize = "auto"
     height: VerticalSectionSize = "medium"
+    # The rows the section takes of a canvas this many rows tall, in place
+    # of ``height``'s share of it (``max_height`` still caps them): a layout
+    # that must fit any terminal sizes its rows from the canvas, again on
+    # every resize.
+    height_rows: Callable[[int], int] | None = None
     left_padding: StrictInt = 0
     right_padding: StrictInt = 0
     top_padding: StrictInt = 0
@@ -46,6 +52,11 @@ class SectionConfig(BaseModel):
     max_width: StrictInt | None = None
     top_border: StrictStr | None = None
     bottom_border: StrictStr | None = None
+    # A single horizontal rule below the section in place of a bottom
+    # border string: drawn in the mode's rule glyph (RULE_GLYPHS) in
+    # ``border_color``, so a borderless section is set off from the next
+    # one by a line rather than boxed in.
+    bottom_rule: StrictBool = False
     left_border: StrictStr | None = None
     inside_border: StrictStr | None = None
     right_border: StrictStr | None = None

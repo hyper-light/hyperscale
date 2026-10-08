@@ -3,10 +3,9 @@ Worker state dissemination for cross-manager visibility (AD-48).
 """
 
 import asyncio
-import time
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Awaitable, Callable
 
-from hyperscale.distributed.models import WorkerRegistration, WorkerState
+from hyperscale.distributed.models import WorkerRegistration, WorkerState, WorkerStatus
 from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
     WorkerListResponse,
@@ -23,16 +22,24 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerError,
 )
 
+from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.models import (ManagerInfo, ManagerToWorkerRegistration)
+
+from .models.worker_disseminator_stats import WorkerDisseminatorStats
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
-    from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.nodes.manager.models.manager_config import ManagerConfig
     from hyperscale.distributed.jobs.worker_pool import WorkerPool
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
 SendTcpFunc = Callable[
     [tuple[str, int], str, bytes, float],
-    Coroutine[Any, Any, bytes | None],
+    Awaitable[bytes | Exception | None],
 ]
 
 
@@ -76,6 +83,18 @@ class WorkerDisseminator:
             self._worker_incarnations[worker_id] = next_incarnation
             return next_incarnation
 
+    @staticmethod
+    def _raise_transport_error(reply: bytes | Exception | None) -> bytes | None:
+        """Raise a transport error that send_tcp returned instead of raising; pass the reply through."""
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    @staticmethod
+    def _worker_registration_of(worker: WorkerStatus | None) -> WorkerRegistration | None:
+        """The worker's registration, or a falsy value when the worker or its registration is absent."""
+        return worker and worker.registration
+
     def get_worker_incarnation(self, worker_id: str) -> int:
         return self._worker_incarnations.get(worker_id, 0)
 
@@ -104,7 +123,7 @@ class WorkerDisseminator:
             incarnation=incarnation,
             total_cores=registration.total_cores,
             available_cores=registration.available_cores,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             datacenter=self._datacenter,
         )
 
@@ -115,8 +134,7 @@ class WorkerDisseminator:
 
         await self._broadcast_to_peers(update)
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerDebug(
                 message=f"Broadcast worker registration: {worker_id[:8]}...",
                 node_host=self._config.host,
@@ -138,7 +156,7 @@ class WorkerDisseminator:
         udp_port = 0
         total_cores = 0
 
-        if worker and worker.registration:
+        if self._worker_registration_of(worker):
             host = worker.registration.node.host
             tcp_port = worker.registration.node.port
             udp_port = worker.registration.node.udp_port or tcp_port
@@ -153,7 +171,7 @@ class WorkerDisseminator:
             incarnation=incarnation,
             total_cores=total_cores,
             available_cores=0,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             datacenter=self._datacenter,
         )
 
@@ -164,8 +182,7 @@ class WorkerDisseminator:
 
         await self._broadcast_to_peers(update)
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerDebug(
                 message=f"Broadcast worker {reason}: {worker_id[:8]}...",
                 node_host=self._config.host,
@@ -180,36 +197,9 @@ class WorkerDisseminator:
         reason: str,
     ) -> None:
         """Broadcast planned worker drain intent to peer managers."""
-        updates: list[WorkerStateUpdate] = []
+        updates = await self._build_drain_updates(worker_ids)
 
-        for worker_id in worker_ids:
-            worker = self._worker_pool.get_worker(worker_id)
-            if worker is None or worker.registration is None:
-                continue
-
-            incarnation = await self._get_next_incarnation(worker_id)
-            node = worker.registration.node
-            updates.append(
-                WorkerStateUpdate(
-                    worker_id=worker_id,
-                    owner_manager_id=self._node_id,
-                    host=node.host,
-                    tcp_port=node.port,
-                    udp_port=node.udp_port or node.port,
-                    state="draining",
-                    incarnation=incarnation,
-                    total_cores=worker.total_cores,
-                    available_cores=0,
-                    timestamp=time.monotonic(),
-                    datacenter=self._datacenter,
-                )
-            )
-
-        for update in updates:
-            self._gossip_buffer.add_update(
-                update,
-                number_of_managers=len(self._state._active_manager_peers) + 1,
-            )
+        self._add_updates_to_gossip(updates)
 
         if updates:
             await asyncio.gather(
@@ -217,8 +207,7 @@ class WorkerDisseminator:
                 return_exceptions=True,
             )
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=(
                         f"Broadcast worker drain intent for {len(updates)} workers "
@@ -230,8 +219,55 @@ class WorkerDisseminator:
                 ),
             )
 
+    async def _build_drain_updates(self, worker_ids: set[str]) -> list[WorkerStateUpdate]:
+        """Draining updates for every registered worker in ``worker_ids``, in iteration order."""
+        updates: list[WorkerStateUpdate] = []
+
+        for worker_id in worker_ids:
+            if (update := await self._drain_update_for(worker_id)) is not None:
+                updates.append(update)
+
+        return updates
+
+    def _registered_worker(self, worker_id: str) -> WorkerStatus | None:
+        """The pooled worker when it exists and carries a registration, else None."""
+        worker = self._worker_pool.get_worker(worker_id)
+        if worker is None or worker.registration is None:
+            return None
+        return worker
+
+    async def _drain_update_for(self, worker_id: str) -> WorkerStateUpdate | None:
+        """A "draining" update at the next incarnation, or None for an unknown/unregistered worker."""
+        worker = self._registered_worker(worker_id)
+        if worker is None:
+            return None
+
+        incarnation = await self._get_next_incarnation(worker_id)
+        node = worker.registration.node
+        return WorkerStateUpdate(
+            worker_id=worker_id,
+            owner_manager_id=self._node_id,
+            host=node.host,
+            tcp_port=node.port,
+            udp_port=node.udp_port or node.port,
+            state="draining",
+            incarnation=incarnation,
+            total_cores=worker.total_cores,
+            available_cores=0,
+            timestamp=_DEFAULT_CLOCK.monotonic(),
+            datacenter=self._datacenter,
+        )
+
+    def _add_updates_to_gossip(self, updates: list[WorkerStateUpdate]) -> None:
+        """Queue each update for gossip, sized to the current manager count."""
+        for update in updates:
+            self._gossip_buffer.add_update(
+                update,
+                number_of_managers=len(self._state._active_manager_peers) + 1,
+            )
+
     async def _broadcast_to_peers(self, update: WorkerStateUpdate) -> None:
-        peers = list(self._state._active_manager_peers)
+        peers = sorted(self._state._active_manager_peers)
         if not peers:
             return
 
@@ -239,18 +275,19 @@ class WorkerDisseminator:
 
         async def send_to_peer(peer_addr: tuple[str, int]) -> None:
             try:
-                await asyncio.wait_for(
+                reply = await _DEFAULT_CLOCK.wait_for(
                     self._send_tcp(
                         peer_addr,
                         "worker_state_update",
                         update_bytes,
-                        5.0,
+                        self._config.tcp_timeout_standard_seconds,
                     ),
-                    timeout=5.0,
+                    timeout=self._config.tcp_timeout_standard_seconds,
                 )
+                # send_tcp returns transport errors rather than raising.
+                self._raise_transport_error(reply)
             except asyncio.TimeoutError:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Timeout broadcasting worker state to {peer_addr}",
                         node_host=self._config.host,
@@ -259,8 +296,7 @@ class WorkerDisseminator:
                     ),
                 )
             except Exception as broadcast_error:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Failed to broadcast worker state to {peer_addr}: {broadcast_error}",
                         node_host=self._config.host,
@@ -283,8 +319,7 @@ class WorkerDisseminator:
             return False
 
         if not self.should_accept_worker_update(update.worker_id, update.incarnation):
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerDebug(
                     message=f"Rejected stale worker update for {update.worker_id[:8]}... (inc={update.incarnation})",
                     node_host=self._config.host,
@@ -300,8 +335,7 @@ class WorkerDisseminator:
         if update.is_alive_state():
             await self._worker_pool.register_remote_worker(update)
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=(
                         f"Registered remote worker {update.worker_id[:8]}... "
@@ -315,8 +349,7 @@ class WorkerDisseminator:
         else:
             await self._worker_pool.deregister_remote_worker(update.worker_id)
 
-            self._task_runner.run(
-                self._logger.log,
+            await self._logger.log(
                 ServerInfo(
                     message=f"Deregistered remote worker {update.worker_id[:8]}... (reason={update.state})",
                     node_host=self._config.host,
@@ -333,12 +366,11 @@ class WorkerDisseminator:
         return True
 
     async def request_worker_list_from_peers(self) -> None:
-        peers = list(self._state._active_manager_peers)
+        peers = sorted(self._state._active_manager_peers)
         if not peers:
             return
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerInfo(
                 message=f"Requesting worker lists from {len(peers)} peer managers",
                 node_host=self._config.host,
@@ -354,37 +386,22 @@ class WorkerDisseminator:
 
         async def request_from_peer(peer_addr: tuple[str, int]) -> None:
             try:
-                response = await asyncio.wait_for(
+                response = await _DEFAULT_CLOCK.wait_for(
                     self._send_tcp(
                         peer_addr,
                         "list_workers",
                         request.dump(),
-                        10.0,
+                        self._config.state_sync_timeout_seconds,
                     ),
-                    timeout=10.0,
+                    timeout=self._config.state_sync_timeout_seconds,
                 )
+                # send_tcp returns transport errors rather than raising.
+                self._raise_transport_error(response)
 
-                if response:
-                    worker_list = WorkerListResponse.from_bytes(response)
-                    if worker_list:
-                        for worker_update in worker_list.workers:
-                            await self.handle_worker_state_update(
-                                worker_update, peer_addr
-                            )
-
-                        self._task_runner.run(
-                            self._logger.log,
-                            ServerDebug(
-                                message=f"Received {len(worker_list.workers)} workers from peer {peer_addr}",
-                                node_host=self._config.host,
-                                node_port=self._config.tcp_port,
-                                node_id=self._node_id,
-                            ),
-                        )
+                await self._apply_peer_worker_list_response(response, peer_addr)
 
             except asyncio.TimeoutError:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Timeout requesting worker list from {peer_addr}",
                         node_host=self._config.host,
@@ -393,8 +410,7 @@ class WorkerDisseminator:
                     ),
                 )
             except Exception as request_error:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Failed to request worker list from {peer_addr}: {request_error}",
                         node_host=self._config.host,
@@ -406,6 +422,39 @@ class WorkerDisseminator:
         await asyncio.gather(
             *[request_from_peer(peer) for peer in peers],
             return_exceptions=True,
+        )
+
+    async def _apply_peer_worker_list_response(
+        self,
+        response: bytes | None,
+        peer_addr: tuple[str, int],
+    ) -> None:
+        """Decode a peer's non-empty worker-list reply and apply it (AD-48).
+        ``list_workers`` answers with the model's ``dump``: decoded any other
+        way, every reply read as empty, and a manager that started after the
+        workers registered never learned one. A reply that does not decode
+        raises, for the request to report."""
+        if response:
+            await self._apply_peer_worker_list(WorkerListResponse.load(response), peer_addr)
+
+    async def _apply_peer_worker_list(
+        self,
+        worker_list: WorkerListResponse,
+        peer_addr: tuple[str, int],
+    ) -> None:
+        """Apply every worker update a peer listed, then log the count."""
+        for worker_update in worker_list.workers:
+            await self.handle_worker_state_update(
+                worker_update, peer_addr
+            )
+
+        await self._logger.log(
+            ServerDebug(
+                message=f"Received {len(worker_list.workers)} workers from peer {peer_addr}",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
         )
 
     async def push_registration_to_remote_workers(
@@ -444,10 +493,6 @@ class WorkerDisseminator:
         if not remote_workers:
             return
 
-        from hyperscale.distributed.models import (
-            ManagerInfo,
-            ManagerToWorkerRegistration,
-        )
 
         manager_info = ManagerInfo(
             node_id=self._node_id,
@@ -470,18 +515,19 @@ class WorkerDisseminator:
 
         async def push_to_worker(worker_addr: tuple[str, int]) -> None:
             try:
-                await asyncio.wait_for(
+                reply = await _DEFAULT_CLOCK.wait_for(
                     self._send_tcp(
                         worker_addr,
                         "manager_register",
                         payload,
-                        5.0,
+                        self._config.tcp_timeout_standard_seconds,
                     ),
-                    timeout=5.0,
+                    timeout=self._config.tcp_timeout_standard_seconds,
                 )
+                # send_tcp returns transport errors rather than raising.
+                self._raise_transport_error(reply)
             except asyncio.TimeoutError:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=(
                             f"Manager-to-worker register push to {worker_addr} "
@@ -493,8 +539,7 @@ class WorkerDisseminator:
                     ),
                 )
             except Exception as push_error:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=(
                             f"Manager-to-worker register push to {worker_addr} "
@@ -506,48 +551,57 @@ class WorkerDisseminator:
                     ),
                 )
 
-        addresses: list[tuple[str, int]] = []
-        for worker in remote_workers:
-            if worker.registration is None:
-                continue
-            node = worker.registration.node
-            addresses.append((node.host, node.port))
+        addresses = self._remote_worker_addresses(remote_workers)
 
         if not addresses:
             return
 
         await asyncio.gather(
-            *[push_to_worker(addr) for addr in addresses],
+            *map(push_to_worker, addresses),
             return_exceptions=True,
+        )
+
+    @staticmethod
+    def _remote_worker_addresses(remote_workers: list[WorkerStatus]) -> list[tuple[str, int]]:
+        """TCP addresses of the remote workers that carry a registration, in pool order."""
+        return [
+            (worker.registration.node.host, worker.registration.node.port)
+            for worker in remote_workers
+            if worker.registration is not None
+        ]
+
+    @staticmethod
+    def _is_local_registered_worker(worker: WorkerStatus) -> bool:
+        """Whether a pooled worker is registered with this manager rather than learned from a peer."""
+        return worker.registration and not getattr(worker, "is_remote", False)
+
+    def _local_worker_state_update(self, worker: WorkerStatus) -> WorkerStateUpdate:
+        """The worker-list entry for one locally registered worker (registration is present)."""
+        return WorkerStateUpdate(
+            worker_id=worker.worker_id,
+            owner_manager_id=self._node_id,
+            host=worker.registration.node.host,
+            tcp_port=worker.registration.node.port,
+            udp_port=worker.registration.node.udp_port or worker.registration.node.port,
+            state=(
+                "draining"
+                if worker.health == WorkerState.DRAINING
+                else "registered"
+            ),
+            incarnation=self.get_worker_incarnation(worker.worker_id),
+            total_cores=worker.total_cores,
+            available_cores=worker.available_cores,
+            timestamp=_DEFAULT_CLOCK.monotonic(),
+            datacenter=self._datacenter,
         )
 
     def build_worker_list_response(self) -> WorkerListResponse:
         workers = self._worker_pool.iter_workers()
 
         updates = [
-            WorkerStateUpdate(
-                worker_id=worker.worker_id,
-                owner_manager_id=self._node_id,
-                host=worker.registration.node.host if worker.registration else "",
-                tcp_port=worker.registration.node.port if worker.registration else 0,
-                udp_port=(
-                    worker.registration.node.udp_port or worker.registration.node.port
-                    if worker.registration
-                    else 0
-                ),
-                state=(
-                    "draining"
-                    if worker.health == WorkerState.DRAINING
-                    else "registered"
-                ),
-                incarnation=self.get_worker_incarnation(worker.worker_id),
-                total_cores=worker.total_cores,
-                available_cores=worker.available_cores,
-                timestamp=time.monotonic(),
-                datacenter=self._datacenter,
-            )
+            self._local_worker_state_update(worker)
             for worker in workers
-            if worker.registration and not getattr(worker, "is_remote", False)
+            if self._is_local_registered_worker(worker)
         ]
 
         return WorkerListResponse(
@@ -564,7 +618,7 @@ class WorkerDisseminator:
         if not reassignments:
             return
 
-        peers = list(self._state._active_manager_peers)
+        peers = sorted(self._state._active_manager_peers)
         if not peers:
             return
 
@@ -572,7 +626,7 @@ class WorkerDisseminator:
             originating_manager_id=self._node_id,
             failed_worker_id=failed_worker_id,
             reason=reason,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             datacenter=self._datacenter,
             reassignments=reassignments,
         )
@@ -581,18 +635,19 @@ class WorkerDisseminator:
 
         async def send_to_peer(peer_addr: tuple[str, int]) -> None:
             try:
-                await asyncio.wait_for(
+                reply = await _DEFAULT_CLOCK.wait_for(
                     self._send_tcp(
                         peer_addr,
                         "workflow_reassignment",
                         batch_bytes,
-                        5.0,
+                        self._config.tcp_timeout_standard_seconds,
                     ),
-                    timeout=5.0,
+                    timeout=self._config.tcp_timeout_standard_seconds,
                 )
+                # send_tcp returns transport errors rather than raising.
+                self._raise_transport_error(reply)
             except asyncio.TimeoutError:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Timeout broadcasting workflow reassignment to {peer_addr}",
                         node_host=self._config.host,
@@ -601,8 +656,7 @@ class WorkerDisseminator:
                     ),
                 )
             except Exception as broadcast_error:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerWarning(
                         message=f"Failed to broadcast workflow reassignment to {peer_addr}: {broadcast_error}",
                         node_host=self._config.host,
@@ -612,12 +666,11 @@ class WorkerDisseminator:
                 )
 
         await asyncio.gather(
-            *[send_to_peer(peer) for peer in peers],
+            *map(send_to_peer, peers),
             return_exceptions=True,
         )
 
-        self._task_runner.run(
-            self._logger.log,
+        await self._logger.log(
             ServerDebug(
                 message=(
                     f"Broadcast {len(reassignments)} workflow reassignments "
@@ -632,7 +685,7 @@ class WorkerDisseminator:
     def get_gossip_buffer(self) -> WorkerStateGossipBuffer:
         return self._gossip_buffer
 
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> WorkerDisseminatorStats:
         return {
             "tracked_worker_incarnations": len(self._worker_incarnations),
             "gossip_buffer_stats": self._gossip_buffer.get_stats(),

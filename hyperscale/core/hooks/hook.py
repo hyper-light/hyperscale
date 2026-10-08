@@ -1,9 +1,8 @@
 import inspect
-import threading
+import os
 import uuid
 from inspect import signature
 from typing import (
-    Any,
     Awaitable,
     Callable,
     Dict,
@@ -35,7 +34,7 @@ from .wrap_metric import wrap_metric
 class Hook:
     def __init__(
         self,
-        call: Callable[..., Awaitable[Any] | Awaitable[CallResult]],
+        call: Callable[..., Awaitable[object]],
         dependencies: List[str],
         timeouts: Optional[Timeouts] = None,
         tags: Optional[List[str]] = None,
@@ -44,7 +43,7 @@ class Hook:
             timeouts = Timeouts()
 
         id_generator = SnowflakeGenerator(
-            (uuid.uuid1().int + threading.get_native_id()) >> 64
+            (uuid.uuid1().int + os.getpid()) >> 64
         )
 
         call_signature = signature(call)

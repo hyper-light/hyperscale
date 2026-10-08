@@ -4,9 +4,10 @@ Retry budget manager for distributed workflow dispatch (AD-44).
 
 import asyncio
 
-from hyperscale.distributed.env import Env
+from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import RetryBudgetExhausted
 
-from .reliability_config import ReliabilityConfig, create_reliability_config_from_env
+from .reliability_config import ReliabilityConfig
 from .retry_budget_state import RetryBudgetState
 
 
@@ -14,14 +15,26 @@ class RetryBudgetManager:
     """
     Manages retry budgets for jobs and workflows.
 
-    Uses an asyncio lock to protect shared budget state.
+    Uses an asyncio lock to protect shared budget state. Every refused
+    retry is logged (``RetryBudgetExhausted``) and counted; the per-job
+    consumed and refused counts are the AD-44 ``retry_budget_consumed_total``
+    and ``retry_budget_exhausted_total`` metrics, held while the job's
+    budget is.
     """
 
-    __slots__ = ("_budgets", "_config", "_lock")
+    __slots__ = ("_budgets", "_config", "_lock", "_logger", "_node_id", "_datacenter")
 
-    def __init__(self, config: ReliabilityConfig | None = None) -> None:
-        env_config = config or create_reliability_config_from_env(Env())
-        self._config = env_config
+    def __init__(
+        self,
+        config: ReliabilityConfig,
+        logger: Logger,
+        node_id: str,
+        datacenter: str,
+    ) -> None:
+        self._config = config
+        self._logger = logger
+        self._node_id = node_id
+        self._datacenter = datacenter
         self._budgets: dict[str, RetryBudgetState] = {}
         self._lock = asyncio.Lock()
 
@@ -40,7 +53,8 @@ class RetryBudgetManager:
 
     async def check_and_consume(self, job_id: str, workflow_id: str):
         """
-        Check retry budget and consume on approval.
+        Check retry budget and consume on approval; a refusal for a spent
+        budget is counted and logged.
 
         Returns:
             (allowed, reason)
@@ -53,13 +67,44 @@ class RetryBudgetManager:
             can_retry, reason = budget.can_retry(workflow_id)
             if can_retry:
                 budget.consume_retry(workflow_id)
+                return True, reason
 
-            return can_retry, reason
+            scope, consumed, total = budget.record_refusal(workflow_id)
+
+        await self._logger.log(
+            RetryBudgetExhausted(
+                message=f"Retry of workflow {workflow_id} of job {job_id} refused: {reason}",
+                node_id=self._node_id,
+                datacenter=self._datacenter,
+                job_id=job_id,
+                workflow_id=workflow_id,
+                scope=scope,
+                consumed=consumed,
+                budget=total,
+            )
+        )
+        return False, reason
 
     async def cleanup(self, job_id: str):
         """Remove retry budget state for a completed job."""
         async with self._lock:
             self._budgets.pop(job_id, None)
+
+    def consumed_by_job(self) -> dict[str, int]:
+        """Retries each job with a budget held here consumed (AD-44
+        ``retry_budget_consumed_total{job_id}``)."""
+        return {job_id: budget.consumed for job_id, budget in self._budgets.items()}
+
+    def exhausted_by_job(self) -> dict[str, int]:
+        """Retries each job with a budget held here was refused for a spent
+        budget (AD-44 ``retry_budget_exhausted_total{job_id}``)."""
+        return {job_id: budget.refused for job_id, budget in self._budgets.items()}
+
+    def refused_retries(self, job_id: str) -> int:
+        """Retries of a job refused for a spent budget so far; 0 for a job
+        with no budget held here (D-67 reads it as the job's noise)."""
+        budget = self._budgets.get(job_id)
+        return budget.refused if budget is not None else 0
 
     def _resolve_total_budget(self, total: int):
         requested = total if total > 0 else self._config.retry_budget_default

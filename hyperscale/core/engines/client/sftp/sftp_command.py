@@ -29,6 +29,8 @@ from .models import (
     TransferResult,
 )
 from .protocols.sftp import (
+    SFTPAttrs,
+    SFTPNoSuchFile,
     SFTPGlob,
     SFTPBadMessage,
     SFTPPermissionDenied,
@@ -37,6 +39,7 @@ from .protocols.sftp import (
     SFTPClientFile,
     SFTPError,
     SFTPNotADirectory,
+    SFTPEOFError,
     SFTPLimits,
     mode_to_pflags,
     utime_to_attrs,
@@ -45,6 +48,7 @@ from .protocols.sftp import (
     valid_attr_flags,
     SFTPClientHandler,
 )
+from .sftp_glob_filesystem import SFTPGlobFilesystem
 
 
 
@@ -62,11 +66,29 @@ class SFTPCommand:
             base_directory: bytes = base_directory.encode(encoding=path_encoding)
 
         self._base_directory: bytes | None = base_directory
+        # Paths already under the base directory (e.g. glob results) stand.
+        self._base_prefix: bytes | None = (
+            base_directory.rstrip(b'/') + b'/' if base_directory else None
+        )
 
         self._handler = handler
         self._path_encoding = path_encoding
         self._depth_sem = asyncio.Semaphore(value=128)
         self._copy_handler = copy_handler
+
+    def _resolve_path(self, path: bytes) -> bytes:
+        """
+        A path against this request's working directory: relative paths
+        resolve under it; absolute ones, and ones already under it, stand.
+        """
+        if (
+            not self._base_directory
+            or path == self._base_directory
+            or path.startswith(self._base_prefix)
+        ):
+            return path
+
+        return posixpath.join(self._base_directory, path)
 
     @property
     def version(self) -> int:
@@ -175,11 +197,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('rb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(
-                        srcpath, 
-                        options.flags,
-                        attributes,
-                    )
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs())
 
                     src = SFTPClientFile(
                         srcpath,
@@ -188,7 +206,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -213,7 +231,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -247,17 +265,16 @@ class SFTPCommand:
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
         if isinstance(data, str):
-            data: bytes = await data.encode()
+            data: bytes = data.encode()
 
         elif isinstance(data, File):
             (
                 dstpath,
                 data,
                 attributes,
-            ) = await data.optimized
+            ) = data.optimized
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         if attributes is None:
             attributes = self._create_default_attributes(encoded_data=data)
@@ -300,11 +317,7 @@ class SFTPCommand:
             pflags, _ = mode_to_pflags('wb')
 
             if self._handler.version < 5:
-                handle = await self._handler.open(
-                    dstpath, 
-                    options.flags,
-                    attributes,
-                )
+                handle = await self._handler.open(dstpath, pflags, SFTPAttrs.from_file_attributes(attributes))
 
                 dst = SFTPClientFile(
                     dstpath,
@@ -313,7 +326,7 @@ class SFTPCommand:
                     bool(pflags & FXF_APPEND),
                     None,
                     'strict',
-                    0,
+                    -1,
                     -1,
                 )
 
@@ -337,7 +350,7 @@ class SFTPCommand:
                     ),
                     None,
                     'strict',
-                    0,
+                    -1,
                     -1,
                 )
 
@@ -452,11 +465,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('rb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(
-                        srcpath,
-                        options.flags,
-                        attributes,
-                    )
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs())
 
                     src = SFTPClientFile(
                         srcpath,
@@ -465,7 +474,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -490,7 +499,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -504,11 +513,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('wb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(
-                        srcpath,
-                        options.flags,
-                        attributes,
-                    )
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs.from_file_attributes(attributes))
 
                     dst = SFTPClientFile(
                         srcpath,
@@ -517,7 +522,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -541,7 +546,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -569,7 +574,7 @@ class SFTPCommand:
 
         operation_start = time.monotonic()
 
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
         found = await self._glob_remote_paths(
             pattern,
             glob,
@@ -644,7 +649,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('rb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(srcpath, options.flags, attributes)
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs())
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
@@ -652,7 +657,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -677,7 +682,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -707,7 +712,7 @@ class SFTPCommand:
         transferred: dict[bytes, TransferResult] = {}
 
         if isinstance(data, (FileGlob, Directory)):
-            found = await data.optimized
+            found = data.optimized
 
         else:
 
@@ -719,8 +724,7 @@ class SFTPCommand:
             if isinstance(data, str):
                 data = data.encode()
 
-            if self._base_directory and self._base_directory not in dstpath:
-                dstpath = posixpath.join(self._base_directory, dstpath)
+            dstpath = self._resolve_path(dstpath)
 
             if attributes is None:
                 attributes = self._create_default_attributes(encoded_data=data)
@@ -772,15 +776,10 @@ class SFTPCommand:
 
             else:
                 pflags, _ = mode_to_pflags('wb')
-                handle = await self._handler.open(
-                    dstpath,
-                    pflags,
-                    block_size=0,
-                )
 
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(dstpath, options.flags, attrs)
+                    handle = await self._handler.open(dstpath, pflags, SFTPAttrs.from_file_attributes(attrs))
                     dst = SFTPClientFile(
                         dstpath,
                         self._handler,
@@ -788,7 +787,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -812,7 +811,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -839,7 +838,7 @@ class SFTPCommand:
     ):
       
         transferred: dict[bytes, TransferResult] = {}
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
         found = await self._glob_remote_paths(
             pattern,
             glob,
@@ -925,7 +924,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('rb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(srcpath, options.flags, attributes)
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs())
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
@@ -933,7 +932,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -958,7 +957,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -972,7 +971,7 @@ class SFTPCommand:
                 pflags, _ = mode_to_pflags('wb')
 
                 if self._handler.version < 5:
-                    handle = await self._handler.open(srcpath, options.flags, attributes)
+                    handle = await self._handler.open(srcpath, pflags, SFTPAttrs.from_file_attributes(attributes))
                     dst = SFTPClientFile(
                         srcpath,
                         copy_handler,
@@ -980,7 +979,7 @@ class SFTPCommand:
                         bool(pflags & FXF_APPEND),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -1004,7 +1003,7 @@ class SFTPCommand:
                         ),
                         None,
                         'strict',
-                        0,
+                        -1,
                         -1,
                     )
 
@@ -1028,7 +1027,7 @@ class SFTPCommand:
         self,
         pattern: str | pathlib.Path,
     ):
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
 
         start = time.monotonic()
 
@@ -1056,7 +1055,7 @@ class SFTPCommand:
         self,
         pattern: str | pathlib.PurePath,
     ):
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
 
         start = time.monotonic()
 
@@ -1092,21 +1091,21 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         transferred: dict[bytes, TransferResult] = {}
-        operation_start = time.monotonic() - start
+        operation_start = time.monotonic()
 
         if attributes is None:
-            attributes = self._create_default_attributes()
+            # No attributes given: change nothing (asyncssh's empty SFTPAttrs()).
+            attributes = FileAttributes()
 
         start = time.monotonic()
 
         await self._make_directories(
             dstpath,
             attributes,
-            exist_ok=options.exist_ok,
+            options,
         )
         transferred[dstpath] = TransferResult(
             file_path=dstpath,
@@ -1123,7 +1122,7 @@ class SFTPCommand:
         self, 
         pattern: str | pathlib.Path,
     ):
-        glob = SFTPGlob(self._handler, False)
+        glob = SFTPGlob(SFTPGlobFilesystem(self._handler, self._scandir), False)
 
         start = time.monotonic()
 
@@ -1137,7 +1136,10 @@ class SFTPCommand:
             for path, attrs in discovered if attrs.type != FILEXFER_TYPE_SYMLINK
         ])
 
-        candidates: list[tuple[bytes, FileAttributes]] = []
+        # The matched directories go too, once everything in them has.
+        candidates: list[tuple[bytes, FileAttributes]] = [
+            (path, attrs) for path, attrs in found if attrs.type == FILEXFER_TYPE_DIRECTORY
+        ]
 
         while len(found):
             (
@@ -1171,25 +1173,25 @@ class SFTPCommand:
                     attrs,
                 ))
 
-        tasks = []
-        for path, attrs, in candidates:
-            
-            if attrs.type == FILEXFER_TYPE_DIRECTORY:
-                tasks.append(asyncio.ensure_future(
-                    self._handler.rmdir(path),
-                ))
-
-            else:
-                tasks.append(asyncio.ensure_future(
-                    self._handler.remove(path),
-                ))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Files together, then directories deepest first: a directory can
+        # only be removed once everything in it has been.
+        results = await asyncio.gather(
+            *[
+                self._handler.remove(path)
+                for path, attrs in candidates
+                if attrs.type != FILEXFER_TYPE_DIRECTORY
+            ],
+            return_exceptions=True,
+        )
 
         for res in results:
             if isinstance(res, Exception):
                 raise res
-            
+
+        for path, attrs in reversed(candidates):
+            if attrs.type == FILEXFER_TYPE_DIRECTORY:
+                await self._handler.rmdir(path)
+
         elapsed = time.monotonic() - start
         return (
             elapsed,
@@ -1213,8 +1215,7 @@ class SFTPCommand:
 
         srcpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in srcpath:
-            srcpath = posixpath.join(self._base_directory, srcpath)
+        srcpath = self._resolve_path(srcpath)
 
         attributes = (
             await self._handler.stat(
@@ -1240,8 +1241,7 @@ class SFTPCommand:
 
         srcpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in srcpath:
-            srcpath = posixpath.join(self._base_directory, srcpath)
+        srcpath = self._resolve_path(srcpath)
         
         matches = await glob.match(
             srcpath,
@@ -1279,12 +1279,13 @@ class SFTPCommand:
         last = len(parts) - 1
 
         exists = True
+        directory_attributes = SFTPAttrs.from_file_attributes(attrs)
 
         for i, part in enumerate(parts):
             curpath = posixpath.join(curpath, part)
 
             try:
-                await self._handler.mkdir(path, attrs)
+                await self._handler.mkdir(curpath, directory_attributes)
                 exists = False
 
             except (SFTPFailure, SFTPFileAlreadyExists):
@@ -1294,7 +1295,7 @@ class SFTPCommand:
                     follow_symlinks=options.follow_symlinks,
                 )
 
-                if filetype != FILEXFER_TYPE_DIRECTORY:
+                if filetype.type != FILEXFER_TYPE_DIRECTORY:
                     curpath_str = curpath.decode('utf-8', 'backslashreplace')
 
                     exc = SFTPNotADirectory if self._handler.version >= 6 \
@@ -1305,11 +1306,13 @@ class SFTPCommand:
                 if i == last:
                     raise
 
-            if exists and not options.exist_ok:
-                exc = SFTPFileAlreadyExists if self._handler.version >= 6 else SFTPFailure
+        # Only a path that already existed in full is an error, and only
+        # without exist_ok.
+        if exists and not options.exist_ok:
+            exc = SFTPFileAlreadyExists if self._handler.version >= 6 else SFTPFailure
 
-                raise exc(curpath.decode('utf-8', 'backslashreplace') +
-                        ' already exists')
+            raise exc(curpath.decode('utf-8', 'backslashreplace') +
+                    ' already exists')
 
         return path
 
@@ -1323,8 +1326,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
 
@@ -1358,8 +1360,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
 
@@ -1391,17 +1392,17 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         if attributes is None:
-            attributes = self._create_default_attributes()
+            # No attributes given: change nothing (asyncssh's empty SFTPAttrs()).
+            attributes = FileAttributes()
 
         start = time.monotonic()
 
         await self._handler.setstat(
-            path,
-            attributes,
+            dstpath,
+            SFTPAttrs.from_file_attributes(attributes),
             follow_symlinks=options.follow_symlinks,
         )
         
@@ -1428,8 +1429,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
         sftpvfs_attrs = await self._handler.statvfs(path)
@@ -1510,16 +1510,30 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
         
-        attrs = await self._handler.stat(
-            dstpath,
-            flags=options.flags,
-            follow_symlinks=options.follow_symlinks,
-        )
+        try:
+            attrs = await self._handler.stat(
+                dstpath,
+                flags=options.flags,
+                follow_symlinks=options.follow_symlinks,
+            )
+
+        except SFTPNoSuchFile:
+            # Not existing is an answer, not an error: no type, no attributes.
+            elapsed = time.monotonic() - start
+            return (
+                elapsed,
+                {
+                    dstpath: TransferResult(
+                        file_path=dstpath,
+                        file_type=None,
+                        file_transfer_elapsed=elapsed,
+                    ),
+                }
+            )
 
         elapsed = time.monotonic() - start
         return (
@@ -1545,15 +1559,29 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
         
-        attrs = await self._handler.lstat(
-            dstpath,
-            flags=options.flags,
-        )
+        try:
+            attrs = await self._handler.lstat(
+                dstpath,
+                flags=options.flags,
+            )
+
+        except SFTPNoSuchFile:
+            # Not existing is an answer, not an error: no type, no attributes.
+            elapsed = time.monotonic() - start
+            return (
+                elapsed,
+                {
+                    dstpath: TransferResult(
+                        file_path=dstpath,
+                        file_type=None,
+                        file_transfer_elapsed=elapsed,
+                    ),
+                }
+            )
 
         elapsed = time.monotonic() - start
         return (
@@ -1580,8 +1608,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
 
@@ -1621,8 +1648,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         attrs = await self._handler.stat(
             dstpath,
@@ -1662,8 +1688,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
 
@@ -1703,8 +1728,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         attrs = await self._handler.stat(
             dstpath,
@@ -1715,7 +1739,7 @@ class SFTPCommand:
         start = time.monotonic()
 
         crtime_ns: float | None = None
-        if attrs.atime is not None:
+        if attrs.crtime is not None:
             crtime_ns = tuple_to_nsec(attrs.crtime, attrs.crtime_ns)
 
         elapsed = time.monotonic() - start
@@ -1744,8 +1768,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
 
@@ -1784,8 +1807,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
 
@@ -1824,8 +1846,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
         
         start = time.monotonic()
         attrs = await self._handler.stat(
@@ -1859,8 +1880,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
         
         start = time.monotonic()
         attrs = await self._handler.stat(
@@ -1892,8 +1912,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
         
         start = time.monotonic()
         attrs = await self._handler.stat(
@@ -1925,8 +1944,7 @@ class SFTPCommand:
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
         
         start = time.monotonic()
         attrs = await self._handler.stat(
@@ -1957,8 +1975,7 @@ class SFTPCommand:
             path = str(path)
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
         await self._handler.remove(dstpath)
@@ -1996,12 +2013,10 @@ class SFTPCommand:
             newpath = str(newpath)
 
         srcpath: bytes = oldpath.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in srcpath:
-            srcpath = posixpath.join(self._base_directory, srcpath)
+        srcpath = self._resolve_path(srcpath)
 
         dstpath: bytes = newpath.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
         await self._handler.rename(srcpath, dstpath, options.flags)
@@ -2031,12 +2046,10 @@ class SFTPCommand:
             newpath = str(newpath)
 
         srcpath: bytes = oldpath.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in srcpath:
-            srcpath = posixpath.join(self._base_directory, srcpath)
+        srcpath = self._resolve_path(srcpath)
 
         dstpath: bytes = newpath.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
 
@@ -2062,8 +2075,7 @@ class SFTPCommand:
             path = str(path)
 
         dirpath: bytes = path.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in dirpath:
-            dirpath = posixpath.join(self._base_directory, dirpath)
+        dirpath = self._resolve_path(dirpath)
 
         entries: dict[bytes, TransferResult] = {}
         
@@ -2100,12 +2112,19 @@ class SFTPCommand:
         handle = await self._handler.opendir(dirpath)
         at_end = False
 
+        try:
+            while not at_end:
+                names, at_end = await self._handler.readdir(handle)
 
-        while not at_end:
-            names, at_end = await self._handler.readdir(handle)
+                for entry in names:
+                    yield entry
 
-            for entry in names:
-                yield entry
+        except SFTPEOFError:
+            # Servers may end a listing with an EOF status instead.
+            pass
+
+        finally:
+            await self._handler.close(handle)
 
     async def mkdir(
         self,
@@ -2116,14 +2135,14 @@ class SFTPCommand:
             path = str(path)
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         if attributes is None:
-            attributes = self._create_default_attributes()
+            # No attributes given: change nothing (asyncssh's empty SFTPAttrs()).
+            attributes = FileAttributes()
 
         start = time.monotonic()   
-        await self._handler.mkdir(path, attributes)
+        await self._handler.mkdir(dstpath, SFTPAttrs.from_file_attributes(attributes))
 
         elapsed = time.monotonic() - start
         return (
@@ -2145,8 +2164,7 @@ class SFTPCommand:
             path = str(path)
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()   
         await self._handler.rmdir(path)
@@ -2179,8 +2197,7 @@ class SFTPCommand:
             path = str(path)
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
 
         start = time.monotonic()
@@ -2205,8 +2222,7 @@ class SFTPCommand:
                     composed = str(composed)
 
                 composed_path_bytes: bytes = composed.encode(encoding=self._path_encoding)
-                if self._base_directory and self._base_directory not in composed_path_bytes:
-                    composed_path_bytes = posixpath.join(self._base_directory, composed_path_bytes)
+                composed_path_bytes = self._resolve_path(composed_path_bytes)
 
                 composed_paths.append(composed_path_bytes)
 
@@ -2289,8 +2305,7 @@ class SFTPCommand:
                 composed = str(composed)
 
             composed_path_bytes: bytes = composed.encode(encoding=self._path_encoding)
-            if self._base_directory and self._base_directory not in composed_path_bytes:
-                composed_path_bytes = posixpath.join(self._base_directory, composed_path_bytes)
+            composed_path_bytes = self._resolve_path(composed_path_bytes)
 
             composed_paths.append(composed_path_bytes)
 
@@ -2312,10 +2327,23 @@ class SFTPCommand:
         path: str | pathlib.PurePath,
         options: SFTPOptions,
     ):
+        # Resolve and validate only: a working directory belongs to the
+        # requests that pass it, never to this session.
         (elapsed, result) = await self.realpath(path, options)
 
-        for res in result.values():
-            self._base_directory = res.file_path
+        for resolved in result.values():
+            attrs = await self._handler.stat(
+                resolved.file_path,
+                options.flags,
+                follow_symlinks=True,
+            )
+
+            if attrs.type != FILEXFER_TYPE_DIRECTORY:
+                exc = SFTPNotADirectory if self._handler.version >= 6 else SFTPFailure
+                raise exc(
+                    resolved.file_path.decode(self._path_encoding, 'backslashreplace')
+                    + ' is not a directory'
+                )
 
         return (
             elapsed,
@@ -2331,8 +2359,7 @@ class SFTPCommand:
             path = str(path)
 
         linkpath: bytes = path.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in linkpath:
-            linkpath = posixpath.join(self._base_directory, linkpath)
+        linkpath = self._resolve_path(linkpath)
 
         start = time.monotonic()
         names, _ = await self._handler.readlink(linkpath)
@@ -2373,8 +2400,7 @@ class SFTPCommand:
         srcpath = oldpath.encode(encoding=self._path_encoding)
 
         dstpath: bytes = newpath.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
         await self._handler.symlink(srcpath, dstpath)
@@ -2405,12 +2431,10 @@ class SFTPCommand:
             newpath = str(newpath)
 
         srcpath: bytes = oldpath.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in srcpath:
-            srcpath = posixpath.join(self._base_directory, srcpath)
+        srcpath = self._resolve_path(srcpath)
 
         dstpath: bytes = newpath.encode(encoding=self._path_encoding)
-        if self._base_directory and self._base_directory not in dstpath:
-            dstpath = posixpath.join(self._base_directory, dstpath)
+        dstpath = self._resolve_path(dstpath)
 
         start = time.monotonic()
         await self._handler.link(srcpath, dstpath)
@@ -2433,22 +2457,20 @@ class SFTPCommand:
         encoded_data: bytes | None = None,
     ):
 
-        created = time.monotonic()
-        created_ns = time.monotonic_ns()
+        # Wire form: whole seconds since the epoch plus a nanosecond fraction.
+        created, created_ns = divmod(time.time_ns(), 1_000_000_000)
 
         return FileAttributes(
             type=TransferResult.to_file_type_int("FILE"),
             size=len(encoded_data) if encoded_data else 0,
-            uid=1000,
-            gid=1000,
-            permissions=644,
+            permissions=0o644,
             crtime=created,
             crtime_ns=created_ns,
             atime=created,
             atime_ns=created_ns,
             ctime=created,
             ctime_ns=created_ns,
-            created=created,
+            mtime=created,
             mtime_ns=created_ns,
             mime_type="application/octet-stream",
         )

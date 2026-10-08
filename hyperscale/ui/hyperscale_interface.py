@@ -9,6 +9,11 @@ from .generate_ui_sections import generate_ui_sections
 from .hyperscale_interface_config import HyperscaleInterfaceConfig
 from .interface_updates_controller import InterfaceUpdatesController
 
+# The padding the run's terminal renders with by default: columns left and
+# right of the canvas, rows above and below it.
+HORIZONTAL_PADDING = 4
+VERTICAL_PADDING = 1
+
 
 class HyperscaleInterface:
     def __init__(
@@ -21,7 +26,7 @@ class HyperscaleInterface:
             config = HyperscaleInterfaceConfig()
 
         if padding is None:
-            padding = (4, 1)
+            padding = (HORIZONTAL_PADDING, VERTICAL_PADDING)
 
         self._config = config
         self._terminal: Terminal | None = None
@@ -61,7 +66,7 @@ class HyperscaleInterface:
         terminal_mode: TerminalMode = "full",
     ):
         if terminal_mode in ["ci", "full"]:
-            sections: list[Section] = generate_ui_sections(workflows)
+            sections: list[Section] = generate_ui_sections(workflows, terminal_mode)
             self._terminal = Terminal(sections)
 
     def reset_active(self):

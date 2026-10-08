@@ -18,6 +18,11 @@ from hyperscale.graph import Workflow, step
 
 from hyperscale.testing import URL, HTTPResponse
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 
 class LongRunningTestWorkflow(Workflow):
     """One-step test workflow: sleep briefly, then return ``HTTPResponse``.
@@ -35,5 +40,5 @@ class LongRunningTestWorkflow(Workflow):
         self,
         url: URL = 'https://httpbin.org/get',
     ) -> HTTPResponse:
-        await asyncio.sleep(1)
+        await _DEFAULT_CLOCK.sleep(1)
         return await self.client.http.get(url)

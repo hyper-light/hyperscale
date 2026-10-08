@@ -33,6 +33,9 @@ class TotalRate:
 
         self._elapsed: int | float = 0
         self._start: float | None = None
+        # The elapsed time a run's final total was counted over, once it
+        # arrives: the rate shows the total over that, not this clock's time.
+        self._final_elapsed: float | None = None
 
         self._max_width: int | None = None
         self._total_rate_width = 0
@@ -94,13 +97,17 @@ class TotalRate:
 
     async def update(
         self,
-        update: tuple[int | float | None, bool],
+        update: tuple[int | float | None, bool] | tuple[int | float, bool, float],
     ):
         await self._update_lock.acquire()
 
-        amount, run_timer = update
+        amount, run_timer, *final_elapsed = update
+        if final_elapsed:
+            self._final_elapsed = final_elapsed[0]
 
-        if self._start is None:
+        # The rate's clock starts with the first running count, not with
+        # the first paint (which happens during worker startup).
+        if self._start is None and run_timer:
             self._start = time.monotonic()
 
         if run_timer:
@@ -145,9 +152,6 @@ class TotalRate:
         return self._last_frame, rerender
 
     async def _rerender(self, count: int | float):
-        if self._start is None:
-            self._start = time.monotonic()
-
         rate = self._format_rate(count)
 
         rate = f"{rate}/s"
@@ -190,9 +194,15 @@ class TotalRate:
             reverse=True,
         )
 
-        self._elapsed = time.monotonic() - self._start
+        if self._final_elapsed is not None:
+            self._elapsed = self._final_elapsed
 
-        last_rate = count / self._elapsed
+        else:
+            self._elapsed = (
+                time.monotonic() - self._start if self._start is not None else 0
+            )
+
+        last_rate = count / self._elapsed if self._elapsed > 0 else 0
 
         adjustment_idx = 0
         for place_unit, adjustment in sorted_places:
@@ -285,9 +295,9 @@ class TotalRate:
         pass
 
     async def stop(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()
 
     async def abort(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()

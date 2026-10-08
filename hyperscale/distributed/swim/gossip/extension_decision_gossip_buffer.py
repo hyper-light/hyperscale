@@ -15,48 +15,36 @@ the dissemination cost is sub-linear in cluster size. Idempotency
 on ``event_id`` (workflow_id | fence_token | timestamp) keeps the
 buffer's working set bounded even when multiple peers redundantly
 re-disseminate the same event.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 from __future__ import annotations
 
 import heapq
+from itertools import compress, repeat
+from operator import attrgetter, lt, methodcaller, not_
 import math
-import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Callable
+from hyperscale.distributed.health.extension_ledger import ExtensionDecisionEvent
+from hyperscale.distributed.runtime import Clock, RealClock
 
-from hyperscale.distributed.health.extension_ledger import (
-    ExtensionDecisionEvent,
-)
+from .gossip_buffer import MAX_UDP_PAYLOAD
+from .gossip_buffer_stats import GossipBufferStats
+from .extension_decision_piggyback_update import ExtensionDecisionPiggybackUpdate
 
+_DEFAULT_CLOCK: Clock = RealClock()
 
 MAX_EXTENSION_DECISION_PIGGYBACK_SIZE: int = 800
 
 EXTENSION_DECISION_SEPARATOR: bytes = b"#|x"
 
 ENTRY_SEPARATOR: bytes = b"|"
-
-
-@dataclass(slots=True, kw_only=True)
-class ExtensionDecisionPiggybackUpdate:
-    """A single ``ExtensionDecisionEvent`` queued for SWIM piggyback.
-
-    Tracks broadcast count per AD-48 so each event leaves the
-    buffer once it's been disseminated λ × log(n+1) times. Mirrors
-    ``WorkerStatePiggybackUpdate`` exactly so the two channels
-    share the same bookkeeping discipline.
-    """
-
-    event: ExtensionDecisionEvent
-    timestamp: float
-    broadcast_count: int = 0
-    max_broadcasts: int = 10
-
-    def should_broadcast(self) -> bool:
-        return self.broadcast_count < self.max_broadcasts
-
-    def mark_broadcast(self) -> None:
-        self.broadcast_count += 1
 
 
 @dataclass(slots=True)
@@ -92,9 +80,9 @@ class ExtensionDecisionGossipBuffer:
     _oversized_updates_count: int = 0
     _overflow_count: int = 0
 
-    _on_overflow: Any = None
+    _on_overflow: Callable[[int, int], None] | None = None
 
-    def set_overflow_callback(self, callback: Any) -> None:
+    def set_overflow_callback(self, callback: Callable[[int, int], None]) -> None:
         self._on_overflow = callback
 
     def add_event(
@@ -127,7 +115,7 @@ class ExtensionDecisionGossipBuffer:
         if existing is None:
             self.updates[event_id] = ExtensionDecisionPiggybackUpdate(
                 event=event,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
             )
             return True
@@ -135,7 +123,7 @@ class ExtensionDecisionGossipBuffer:
         if event.leader_term > existing.event.leader_term:
             self.updates[event_id] = ExtensionDecisionPiggybackUpdate(
                 event=event,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
             )
             return True
@@ -214,7 +202,6 @@ class ExtensionDecisionGossipBuffer:
         max_count: int = 5,
     ) -> bytes:
         """Encode bounded by the remaining UDP-payload budget."""
-        from .gossip_buffer import MAX_UDP_PAYLOAD
 
         remaining = MAX_UDP_PAYLOAD - len(base_message)
         if remaining <= 0:
@@ -276,33 +263,34 @@ class ExtensionDecisionGossipBuffer:
         if evicted > 0:
             self._overflow_count += 1
             if self._on_overflow is not None:
-                try:
-                    self._on_overflow(evicted, self.max_updates)
-                except Exception:
-                    pass
+                self._on_overflow(evicted, self.max_updates)
 
         return evicted
 
     def cleanup_stale(self) -> int:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.stale_age_seconds
 
-        to_remove = [
-            event_id
-            for event_id, update in self.updates.items()
-            if update.timestamp < cutoff
-        ]
+        # Keys and values iterate in the same order, so compress selects the stale keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(lt, map(attrgetter("timestamp"), self.updates.values()), repeat(cutoff)),
+            )
+        )
         for event_id in to_remove:
             del self.updates[event_id]
             self._stale_removed_count += 1
         return len(to_remove)
 
     def cleanup_broadcast_complete(self) -> int:
-        to_remove = [
-            event_id
-            for event_id, update in self.updates.items()
-            if not update.should_broadcast()
-        ]
+        # Keys and values iterate in the same order, so compress selects the completed keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(not_, map(methodcaller("should_broadcast"), self.updates.values())),
+            )
+        )
         for event_id in to_remove:
             del self.updates[event_id]
         return len(to_remove)
@@ -316,7 +304,7 @@ class ExtensionDecisionGossipBuffer:
             "pending_updates": len(self.updates),
         }
 
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> GossipBufferStats:
         return {
             "pending_updates": len(self.updates),
             "total_evicted": self._evicted_count,
@@ -327,3 +315,10 @@ class ExtensionDecisionGossipBuffer:
             "max_piggyback_size": self.max_piggyback_size,
             "max_updates": self.max_updates,
         }
+
+_REHOMED = (
+    ExtensionDecisionPiggybackUpdate,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

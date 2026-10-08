@@ -2,32 +2,20 @@
 Gate peer state tracking.
 
 Tracks peer gate connections, health, and discovery state.
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass, field
+from hyperscale.distributed.models import GateHeartbeat, GateInfo
+from hyperscale.distributed.health import GateHealthState, GateHealthConfig, LatencyTracker
 
-from hyperscale.distributed.models import (
-    GateHeartbeat,
-    GateInfo,
-)
-from hyperscale.distributed.health import (
-    GateHealthState,
-    GateHealthConfig,
-    LatencyTracker,
-)
-
-
-@dataclass(slots=True)
-class GatePeerTracking:
-    """Tracks a single gate peer's state."""
-
-    udp_addr: tuple[str, int]
-    tcp_addr: tuple[str, int]
-    epoch: int = 0
-    is_active: bool = False
-    heartbeat: GateHeartbeat | None = None
-    health_state: GateHealthState | None = None
+from .gate_peer_tracking import GatePeerTracking
 
 
 @dataclass(slots=True)
@@ -101,3 +89,10 @@ class GatePeerState:
         """Remove lock and epoch when peer disconnects to prevent memory leak."""
         self.peer_locks.pop(peer_addr, None)
         self.peer_epochs.pop(peer_addr, None)
+
+_REHOMED = (
+    GatePeerTracking,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

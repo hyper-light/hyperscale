@@ -10,7 +10,11 @@ class ProtocolMap:
         self.address_families = {
             RequestType.HTTP: SocketType.DEFAULT,
             RequestType.HTTP2: SocketType.HTTP2,
-            RequestType.HTTP3: SocketType.HTTP3,
+            # The family a prepared URL resolves in, as a plain-string HTTP/3
+            # request does: the QUIC socket is dual-stack and reaches IPv4
+            # addresses mapped, while resolving IPv6 alone fails every
+            # IPv4-only host.
+            RequestType.HTTP3: SocketType.DEFAULT,
             RequestType.WEBSOCKET: SocketType.DEFAULT,
             RequestType.GRAPHQL: SocketType.DEFAULT,
             RequestType.GRAPHQL_HTTP2: SocketType.HTTP2,
@@ -26,7 +30,7 @@ class ProtocolMap:
             RequestType.HTTP3: SocketProtocol.HTTP3,
             RequestType.WEBSOCKET: SocketProtocol.DEFAULT,
             RequestType.GRAPHQL: SocketProtocol.DEFAULT,
-            RequestType.GRAPHQL_HTTP2: SocketType.HTTP2,
+            RequestType.GRAPHQL_HTTP2: SocketProtocol.HTTP2,
             RequestType.GRPC: SocketProtocol.HTTP2,
             RequestType.SCP: SocketProtocol.SSH,
             RequestType.UDP: SocketProtocol.UDP,

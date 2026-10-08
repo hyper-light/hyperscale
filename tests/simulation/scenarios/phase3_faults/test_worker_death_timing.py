@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hyperscale.distributed.jobs.dispatch_outcome import DispatchOutcome
 from hyperscale.distributed.models import WorkflowDispatch
 from hyperscale.distributed.testing.workflows import LongRunningWorkflow, SimpleWorkflow
 from tests.simulation.harness import (
@@ -31,14 +32,13 @@ from tests.simulation.harness import (
 )
 
 
-def _l1_spec(base_port: int, workers: int = 2) -> ClusterSpec:
+def _l1_spec(workers: int = 2) -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "local": DCSpec(managers=1, workers=workers, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -81,7 +81,7 @@ def _worker_handle_by_node_id(
 @pytest.mark.simulation
 async def test_worker_dies_mid_dispatch_before_ack() -> None:
     """TCP dispatch loses the target worker before ack; manager dispatches remaining work."""
-    spec = _l1_spec(base_port=36000)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -95,7 +95,7 @@ async def test_worker_dies_mid_dispatch_before_ack() -> None:
         async def reset_dispatch_to_selected_worker(
             worker_id: str,
             dispatch: WorkflowDispatch,
-        ) -> bool:
+        ) -> tuple[DispatchOutcome, str]:
             nonlocal fault_landed
             if not fault_landed:
                 selected_worker = _worker_handle_by_node_id(
@@ -129,7 +129,7 @@ async def test_worker_dies_mid_dispatch_before_ack() -> None:
 @pytest.mark.simulation
 async def test_worker_dies_post_ack_before_workload_finishes() -> None:
     """Worker accepts dispatch, then dies before producing a final result."""
-    spec = _l1_spec(base_port=37500)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -144,7 +144,7 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
         async def send_dispatch_then_kill(
             worker_id: str,
             dispatch: WorkflowDispatch,
-        ) -> bool:
+        ) -> tuple[DispatchOutcome, str]:
             nonlocal execution_deferred, fault_landed
             selected_worker = _worker_handle_by_node_id(
                 cluster,
@@ -173,7 +173,7 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
 
             selected_worker.instance._task_runner.run = defer_workflow_execution
             try:
-                accepted = await original_send_dispatch(worker_id, dispatch)
+                outcome, detail = await original_send_dispatch(worker_id, dispatch)
             finally:
                 if (
                     selected_worker.instance._task_runner.run
@@ -183,11 +183,15 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
                         original_task_runner_run
                     )
 
-            if accepted and selected_dispatch_deferred and not fault_landed:
+            if (
+                outcome == DispatchOutcome.ACCEPTED
+                and selected_dispatch_deferred
+                and not fault_landed
+            ):
                 fault_landed = True
                 await cluster.faults.kill(selected_worker)
 
-            return accepted
+            return outcome, detail
 
         dispatcher._send_dispatch = send_dispatch_then_kill
         try:
@@ -222,7 +226,7 @@ async def test_worker_dies_mid_execute() -> None:
     is restart-from-scratch (per SCENARIOS.md §2 contract), so the
     completion budget covers one full re-execution plus dispatch.
     """
-    spec = _l1_spec(base_port=38250)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -237,13 +241,13 @@ async def test_worker_dies_mid_execute() -> None:
         async def capture_dispatch_target(
             worker_id: str,
             dispatch: WorkflowDispatch,
-        ) -> bool:
+        ) -> tuple[DispatchOutcome, str]:
             nonlocal dispatched_worker_id
-            accepted = await original_send_dispatch(worker_id, dispatch)
-            if accepted and dispatched_worker_id is None:
+            outcome, detail = await original_send_dispatch(worker_id, dispatch)
+            if outcome == DispatchOutcome.ACCEPTED and dispatched_worker_id is None:
                 dispatched_worker_id = worker_id
                 dispatch_ack_event.set()
-            return accepted
+            return outcome, detail
 
         dispatcher._send_dispatch = capture_dispatch_target
 
@@ -272,7 +276,7 @@ async def test_worker_dies_mid_execute() -> None:
 @pytest.mark.simulation
 async def test_worker_dies_post_execute_before_result_push() -> None:
     """Worker finishes execution but dies before pushing its final result."""
-    spec = _l1_spec(base_port=39000)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -287,7 +291,7 @@ async def test_worker_dies_post_execute_before_result_push() -> None:
         async def drop_first_final_result_from_selected_worker(
             worker_id: str,
             dispatch: WorkflowDispatch,
-        ) -> bool:
+        ) -> tuple[DispatchOutcome, str]:
             nonlocal patched_worker_id, fault_landed
             if patched_worker_id is None:
                 selected_worker = _worker_handle_by_node_id(
@@ -344,7 +348,7 @@ async def test_worker_dies_post_execute_before_result_push() -> None:
 @pytest.mark.simulation
 async def test_worker_rejoins_same_process_refutes_stale_incarnation() -> None:
     """Paused worker resumes with the same identity and clears stale suspicion."""
-    spec = _l1_spec(base_port=40500)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -379,7 +383,7 @@ async def test_worker_rejoins_same_process_refutes_stale_incarnation() -> None:
 @pytest.mark.simulation
 async def test_worker_rejoins_new_incarnation_after_restart() -> None:
     """Killed worker restarts at the same ports with a fresh node incarnation."""
-    spec = _l1_spec(base_port=42000)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

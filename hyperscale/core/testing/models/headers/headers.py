@@ -1,5 +1,4 @@
 from typing import (
-    Any,
     Dict,
     Generator,
     Generic,
@@ -22,6 +21,7 @@ from .headers_validator import HeaderValidator
 from .utils import create_sec_websocket_key
 
 T = TypeVar("T")
+DefaultT = TypeVar("DefaultT")
 
 
 class Headers(Generic[T], OptimizedArg):
@@ -139,7 +139,7 @@ class Headers(Generic[T], OptimizedArg):
     def __getitem__(self, key: str) -> HTTPEncodableValue:
         return self.data[key]
 
-    def __iter__(self) -> Generator[str, Any, None]:
+    def __iter__(self) -> Generator[str, None, None]:
         for key in self.data:
             yield key
 
@@ -155,6 +155,6 @@ class Headers(Generic[T], OptimizedArg):
     def get(
         self,
         key: str,
-        default: Optional[Any] = None,
-    ) -> Optional[HTTPEncodableValue]:
+        default: DefaultT | None = None,
+    ) -> HTTPEncodableValue | DefaultT:
         return self.data.get(key, default)

@@ -1,22 +1,12 @@
 import asyncio
+import itertools
 import signal
 from collections import defaultdict
 from typing import Callable, TypeVar
 from typing import List, Callable, Dict, Any
+from .last_args import LastArgs as LastArgs
+from .last_kwargs import LastKwargs as LastKwargs
 from .state_types import ActionData, Action
-
-
-
-class LastArgs:
-    
-    def __init__(self):
-        self.data: dict[str, list[Any]] = defaultdict(list)
-
-class LastKwargs:
-    
-    def __init__(self):
-        self.data: dict[str, dict[str, Any]] = defaultdict(dict)
-
 
 
 K = TypeVar("K")
@@ -34,6 +24,13 @@ class SubscriptionSet:
 
     def add_topic(self, topic: str, update_funcs: List[Callable[[ActionData], None]]):
         self.updates[topic].extend(update_funcs)
+
+    def remove_updates(self, update_funcs: List[Callable[[ActionData], None]]):
+        """Unsubscribe ``update_funcs`` from every topic: a stopped
+        terminal's components must neither receive nor hold updates."""
+        removed = set(update_funcs)
+        for topic, topic_updates in list(self.updates.items()):
+            self.updates[topic] = list(itertools.filterfalse(removed.__contains__, topic_updates))
 
     
     async def rerender_last(

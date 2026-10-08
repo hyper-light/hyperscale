@@ -32,9 +32,10 @@ from tests.simulation.harness import (
     manager_has_n_peers,
     wait_until,
 )
+from tests.simulation.harness.harness_auth_secret import HARNESS_AUTH_SECRET
 
 
-def _l2_spec(base_port: int) -> ClusterSpec:
+def _l2_spec() -> ClusterSpec:
     """Single-DC 3-manager topology for quorum partition scenarios."""
     return ClusterSpec(
         gates=0,
@@ -42,12 +43,11 @@ def _l2_spec(base_port: int) -> ClusterSpec:
             "main": DCSpec(managers=3, workers=1, cores_per_worker=1),
         },
         env=EnvOverrides(request_timeout="4s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=75.0),
     )
 
 
-def _l3_gate_spec(base_port: int) -> ClusterSpec:
+def _l3_gate_spec() -> ClusterSpec:
     """Three gates fronting one small DC for gate-tier partition coverage."""
     return ClusterSpec(
         gates=3,
@@ -55,7 +55,6 @@ def _l3_gate_spec(base_port: int) -> ClusterSpec:
             "main": DCSpec(managers=1, workers=1, cores_per_worker=1),
         },
         env=EnvOverrides(request_timeout="4s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=90.0),
     )
 
@@ -72,7 +71,7 @@ def _find_leader(managers: list[ServerHandle]) -> ServerHandle:
 @pytest.mark.simulation
 async def test_three_way_manager_partition_then_heal() -> None:
     """A three-way split heals back to full peer convergence."""
-    spec = _l2_spec(base_port=23700)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -113,7 +112,7 @@ async def test_three_way_manager_partition_then_heal() -> None:
 @pytest.mark.simulation
 async def test_gate_tier_partition_then_heal() -> None:
     """A partitioned gate rejoins and the gate cluster reconverges."""
-    spec = _l3_gate_spec(base_port=23800)
+    spec = _l3_gate_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -150,7 +149,7 @@ async def test_gate_tier_partition_then_heal() -> None:
 @pytest.mark.simulation
 async def test_quorum_isolating_partition_rejects_submits() -> None:
     """A quorum-isolated manager refuses writes instead of queuing them."""
-    spec = _l2_spec(base_port=23900)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -171,7 +170,7 @@ async def test_quorum_isolating_partition_rejects_submits() -> None:
 
         await cluster.faults.partition([isolated_manager], majority_side)
         await wait_until(
-            lambda: not isolated_manager.instance._has_quorum_available(),
+            lambda: not isolated_manager.instance._leadership.has_quorum(),
             timeout=45.0,
             poll=0.5,
             description="isolated manager observes quorum loss",
@@ -180,7 +179,7 @@ async def test_quorum_isolating_partition_rejects_submits() -> None:
         client = HyperscaleClient(
             host=cluster.spec.host,
             port=cluster.reserve_client_port(),
-            env=Env(MERCURY_SYNC_LOG_LEVEL="error"),
+            env=Env(MERCURY_SYNC_AUTH_SECRET=HARNESS_AUTH_SECRET, MERCURY_SYNC_LOG_LEVEL="error"),
             managers=[(isolated_manager.host, isolated_manager.tcp_port)],
         )
         await client.start()

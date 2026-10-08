@@ -1,6 +1,23 @@
 import asyncio
+import copy
 import inspect
+from types import MethodType
 import time
+
+# Runtime-default monotonic source — the SIM seam rebinding point
+# (contract of hyperscale.core.jobs.tasks.run). THE decisive reading is
+# _wait_for_workflow_completion's workflow-timeout ledger: it measured
+# the timeout in REAL seconds while polling on the (virtual) loop, so a
+# stuck workflow's execute_workflow returned after `timeout` WALL
+# seconds — at a host-speed-dependent VIRTUAL instant. That single
+# reading was the chaos VOPR's final replay-divergence mechanism (the
+# L2 zombie-drain fork, seeds 36/40/66: identical runs to the half-
+# millisecond for 550+ virtual seconds, then the drain landing 28-33
+# virtual seconds apart purely on wall speed). The workflow-timer
+# telemetry reads share the seam so elapsed values are deterministic
+# too. REAL mode keeps realtime.
+_DEFAULT_MONOTONIC_SOURCE = time.monotonic
+
 from collections import defaultdict, deque
 from typing import (
     Any,
@@ -16,6 +33,7 @@ from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models import (
+    WorkflowThrottleUpdate,
     CancellationUpdate,
     InstanceRoleType,
     PendingWorkflowRun,
@@ -26,7 +44,9 @@ from hyperscale.core.jobs.models import (
 )
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.models.env import Env
+from hyperscale.core.jobs.protocols.node_id_derivation import derive_protocol_node_id
 from hyperscale.core.jobs.workers import Provisioner, StagePriority
+from hyperscale.core.runtime import TransportFactory
 from hyperscale.core.state import (
     Context,
     ContextHook,
@@ -56,6 +76,7 @@ from hyperscale.ui.actions import (
     update_active_workflow_message,
     update_workflow_execution_stats,
     update_workflow_executions_counter,
+    update_workflow_executions_final_rate,
     update_workflow_executions_rates,
     update_workflow_executions_total_rate,
     update_workflow_progress_seconds,
@@ -90,7 +111,24 @@ class RemoteGraphManager:
         updates: InterfaceUpdatesController,
         workers: int,
         status_update_poll_interval: float = 0.05,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+        transport_factory: TransportFactory | None = None,
+        owns_process_signals: bool = True,
     ) -> None:
+        # Phase 6 SIM seams, forwarded to the leader ``RemoteGraphController``
+        # this manager constructs in ``start``. ``None`` in REAL mode — the
+        # controller binds a real UDP socket exactly as before. Under SIM the
+        # worker node runs as a coordinator child: ``transport_factory`` is
+        # its ``CrossProcessTransport`` and ``loop`` its ``SimulationLoop``,
+        # so the pool leader transacts over the deterministic cross-process
+        # boundary like every other server in the simulation.
+        self._injected_loop = loop
+        self._transport_factory = transport_factory
+        # Forwarded to the leader controller: False when a host owns
+        # SIGINT/SIGTERM (see UDPProtocol).
+        self._owns_process_signals = owns_process_signals
+
         self._updates = updates
         self._workers: List[Tuple[str, int]] | None = None
 
@@ -100,6 +138,7 @@ class RemoteGraphManager:
             defaultdict(list)
         )
         self._workflow_last_elapsed: Dict[str, float] = {}
+        self._workflow_last_completed: Dict[str, int] = {}
 
         self._threads = workers
         self._status_update_poll_interval = status_update_poll_interval
@@ -135,7 +174,7 @@ class RemoteGraphManager:
         ] = []
 
         self._workflow_configs: Dict[str, Dict[str, Any]] = {}
-        self._loop = asyncio.get_event_loop()
+        self._loop = loop if loop is not None else asyncio.get_event_loop()
         self._logger = Logger()
         self._status_lock: asyncio.Lock | None = None
 
@@ -168,16 +207,22 @@ class RemoteGraphManager:
                 )
             )
 
+            if self._provisioner is None:
+                self._provisioner = Provisioner()
+
             if self._controller is None:
                 self._controller = RemoteGraphController(
                     None,
                     host,
                     port,
                     env,
+                    loop=self._injected_loop,
+                    transport_factory=self._transport_factory,
+                    owns_process_signals=self._owns_process_signals,
+                    # An executor's ready handshake returns its slot if
+                    # its predecessor at that address was retired.
+                    on_start_acknowledged=self._provisioner.readmit_node,
                 )
-
-            if self._provisioner is None:
-                self._provisioner = Provisioner()
 
             if self._status_lock is None:
                 self._status_lock = asyncio.Lock()
@@ -524,8 +569,17 @@ class RemoteGraphManager:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
-                # Process completed tasks
-                for task in done:
+                # Process completed tasks in WORKFLOW-NAME order:
+                # ``done`` is a set of Task objects hashed by id(), so
+                # when >=2 workflows complete in one wake (a pause
+                # thaw, a delay-window flush, a worker kill timing out
+                # several at once) bare set iteration processes them in
+                # address order — permuting result/log/ready-signal
+                # ordering across otherwise identical runs (the chaos
+                # VOPR's replay-divergence flake).
+                for task in sorted(
+                    done, key=lambda done_task: running_tasks[done_task]
+                ):
                     workflow_name = running_tasks.pop(task)
                     pending = pending_workflows[workflow_name]
 
@@ -775,17 +829,17 @@ class RemoteGraphManager:
         self,
         run_id: int,
         workflow: Workflow,
-        workflow_context: Dict[str, Any],
+        workflow_context: Dict[str, Dict[str, Any]],
         vus: int,
         threads: int,
     ):
+        """Run one workflow for a job executing elsewhere (a distributed
+        worker). ``workflow_context`` is the job's context by workflow
+        namespace: the run starts from all of it, as it would sharing one
+        context in a single process -- ``Provide`` hooks write the
+        namespaces they target, ``Use`` hooks read the namespaces they
+        name."""
         await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.QUEUED)
-
-        await self._controller.create_context_from_external_store(
-            workflow.name,
-            run_id,
-            workflow_context,
-        )
 
         default_config = {
             "workflow": workflow.name,
@@ -832,7 +886,10 @@ class RemoteGraphManager:
                 name="info",
             )
 
+            # A fresh run context, then the job's: seeding first and creating
+            # second dropped the received context before the run began.
             self._controller.create_run_contexts(run_id)
+            await self._controller.seed_run_context(run_id, workflow_context)
 
             # Allocate specific node IDs for this workflow
             # Get available nodes and allocate them for this execution
@@ -979,21 +1036,14 @@ class RemoteGraphManager:
 
                 workflow_slug = workflow.name.lower()
 
-                await asyncio.gather(
-                    *[
-                        update_active_workflow_message(
-                            workflow_slug, f"Starting - {workflow.name}"
-                        ),
-                        update_workflow_run_timer(workflow_slug, True),
-                    ]
+                await update_active_workflow_message(
+                    workflow_slug, f"Starting - {workflow.name}"
                 )
 
                 await ctx.log_prepared(
                     message=f"Submitting Workflow {workflow.name} with run id {run_id}",
                     name="trace",
                 )
-
-                self._workflow_timers[workflow.name] = time.monotonic()
 
                 # Register for event-driven completion tracking
                 completion_state = self._controller.register_workflow_completion(
@@ -1002,7 +1052,12 @@ class RemoteGraphManager:
                     threads,
                 )
 
-                # Submit workflow to workers with explicit node targeting
+                # The run's time budget starts at submission: setup and the
+                # synchronized start count against it, as setup always has.
+                submitted_at = _DEFAULT_MONOTONIC_SOURCE()
+
+                # Submit workflow to workers with explicit node targeting.
+                # Returns once the workers have set up and started together.
                 await self._controller.submit_workflow_to_workers(
                     run_id,
                     workflow,
@@ -1010,6 +1065,19 @@ class RemoteGraphManager:
                     threads,
                     workflow_vus,
                     node_ids,
+                )
+
+                # The run's clocks start with its load: setup and the
+                # synchronized start fall outside its elapsed time and rate.
+                self._workflow_timers[workflow.name] = _DEFAULT_MONOTONIC_SOURCE()
+
+                # Each run measures its rate intervals from its own start.
+                self._workflow_last_elapsed.pop(workflow.name, None)
+                self._workflow_last_completed.pop(workflow.name, None)
+
+                await asyncio.gather(
+                    update_workflow_run_timer(workflow_slug, True),
+                    update_workflow_executions_total_rate(workflow_slug, 0, True),
                 )
 
                 await ctx.log_prepared(
@@ -1029,6 +1097,7 @@ class RemoteGraphManager:
                     workflow_timeout,
                     completion_state,
                     threads,
+                    submitted_at,
                 )
 
                 # Get results from controller
@@ -1036,22 +1105,6 @@ class RemoteGraphManager:
                     run_id,
                     workflow.name,
                 )
-
-                import sys as _sys
-                _sys.stderr.write(
-                    f"[REMOTE-RUN wf_name={workflow.name} run_id={run_id}] "
-                    f"results_type={type(results).__name__} "
-                    f"results_len={len(results) if hasattr(results, '__len__') else 'n/a'} "
-                    f"results_keys={list(results.keys()) if hasattr(results, 'keys') else 'n/a'} "
-                    f"timeout_error={timeout_error!r}\n"
-                )
-                if hasattr(results, 'items'):
-                    for key, val in list(results.items())[:5]:
-                        _sys.stderr.write(
-                            f"[REMOTE-RUN-ITEM key={key!r}] val_type={type(val).__name__} "
-                            f"val_repr={repr(val)[:120]}\n"
-                        )
-                _sys.stderr.flush()
 
                 # Cleanup completion state
                 self._controller.cleanup_workflow_completion(run_id, workflow.name)
@@ -1087,14 +1140,6 @@ class RemoteGraphManager:
                     if result_set is not None
                 ]
                 distributed_results = results if is_test_workflow else []
-                import sys as _sys
-                _sys.stderr.write(
-                    f"[REMOTE-RUN-FILTERED wf_name={workflow.name}] "
-                    f"results_type={type(results).__name__} "
-                    f"results_len={len(results)} "
-                    f"first_repr={repr(results[0])[:200] if results else 'empty'}\n"
-                )
-                _sys.stderr.flush()
 
                 execution_result: WorkflowStats = {}
 
@@ -1129,6 +1174,21 @@ class RemoteGraphManager:
                     )
 
                     raise Exception('No results returned')
+
+                if is_test_workflow:
+                    # The run's final total over the time it was counted in,
+                    # as the stats report it (every action, divided by the
+                    # run's elapsed time, as k6 reports its rate): actions that
+                    # finished after the last streamed update count too.
+                    final_executed = execution_result["stats"]["executed"]
+                    await asyncio.gather(
+                        update_workflow_executions_counter(workflow_slug, final_executed),
+                        update_workflow_executions_final_rate(
+                            workflow_slug,
+                            final_executed,
+                            execution_result["elapsed"],
+                        ),
+                    )
 
                 await ctx.log_prepared(
                     message=f"Updating context for {workflow.name} run {run_id}",
@@ -1213,8 +1273,6 @@ class RemoteGraphManager:
 
                     reporters.extend(custom_reporters)
 
-                await asyncio.sleep(1)
-
                 selected_reporters = ", ".join(
                     [config.reporter_type.name for config in configs]
                 )
@@ -1254,13 +1312,11 @@ class RemoteGraphManager:
                         return_exceptions=True,
                     )
 
-                await asyncio.sleep(1)
-
+                # Delivered to the TUI before this returns, and painted by its
+                # next render (Terminal.stop renders the final frame).
                 await update_active_workflow_message(
                     workflow_slug, f"Complete - {workflow.name}"
                 )
-
-                await asyncio.sleep(1)
 
                 await ctx.log_prepared(
                     message=f"Workflow {workflow.name} run {run_id} complete",
@@ -1288,20 +1344,35 @@ class RemoteGraphManager:
         timeout: int,
         completion_state: WorkflowCompletionState,
         threads: int,
+        budget_started_at: float,
     ) -> Exception | None:
         """
         Wait for workflow completion while processing status updates.
 
         Uses event-driven completion signaling from the controller.
         Processes status updates from the queue to update UI.
+        ``timeout`` is measured from ``budget_started_at``, the run's
+        submission.
         """
 
         timeout_error: Exception | None = None
-        start_time = time.monotonic()
+        start_time = budget_started_at
 
         while not completion_state.completion_event.is_set():
-            remaining_timeout = timeout - (time.monotonic() - start_time)
-            if remaining_timeout <= 0:
+            remaining_timeout = timeout - (_DEFAULT_MONOTONIC_SOURCE() - start_time)
+            # Epsilon expiry + progress floor (the frozen-instant
+            # contract; hyperscale.distributed.protocol.time_quantum
+            # documents the class — this is the core tier, which cannot
+            # import it, so the constant is local). The remainder is a
+            # COMPOSED float: at the timeout boundary it can be a
+            # positive sub-quantum artifact, and arming wait_for with
+            # min(poll, artifact) re-fires at the SAME quantized
+            # instant — this loop then spins forever (measured: the
+            # chaos VOPR's seed-40 worker at virtual 171.681, 500001
+            # same-instant wakeups). Sub-epsilon remainders ARE the
+            # timeout; real waits are floored at 1ms so the clock
+            # always advances.
+            if remaining_timeout <= 1e-6:
                 timeout_error = asyncio.TimeoutError(
                     f"Workflow {workflow_name} exceeded timeout of {timeout} seconds"
                 )
@@ -1311,7 +1382,10 @@ class RemoteGraphManager:
             try:
                 await asyncio.wait_for(
                     completion_state.completion_event.wait(),
-                    timeout=min(self._status_update_poll_interval, remaining_timeout),
+                    timeout=max(
+                        min(self._status_update_poll_interval, remaining_timeout),
+                        0.001,
+                    ),
                 )
             except asyncio.TimeoutError:
                 pass  # Expected - just check for status updates
@@ -1364,7 +1438,7 @@ class RemoteGraphManager:
                 break
 
             # Update UI with stats
-            elapsed = time.monotonic() - self._workflow_timers.get(workflow_name, time.monotonic())
+            elapsed = _DEFAULT_MONOTONIC_SOURCE() - self._workflow_timers.get(workflow_name, _DEFAULT_MONOTONIC_SOURCE())
             completed_count = update.completed_count
 
             await asyncio.gather(
@@ -1384,15 +1458,22 @@ class RemoteGraphManager:
             )
 
             if self._workflow_last_elapsed.get(workflow_name) is None:
-                self._workflow_last_elapsed[workflow_name] = time.monotonic()
+                self._workflow_last_elapsed[workflow_name] = _DEFAULT_MONOTONIC_SOURCE()
+                self._workflow_last_completed[workflow_name] = completed_count
 
-            last_sampled = (
-                time.monotonic() - self._workflow_last_elapsed[workflow_name]
-            )
+            sampled_at = _DEFAULT_MONOTONIC_SOURCE()
+            last_sampled = sampled_at - self._workflow_last_elapsed[workflow_name]
 
             if last_sampled > 1:
+                # Each point is the rate over its own sample interval. The
+                # average since the workflow's timer started also counts
+                # dispatch and setup, so it draws a ramp under a flat load.
+                interval_completed = (
+                    completed_count - self._workflow_last_completed[workflow_name]
+                )
+
                 self._workflow_completion_rates[workflow_name].append(
-                    (int(elapsed), int(completed_count / elapsed) if elapsed > 0 else 0)
+                    (int(elapsed), int(interval_completed / last_sampled))
                 )
 
                 await update_workflow_executions_rates(
@@ -1403,23 +1484,37 @@ class RemoteGraphManager:
                     workflow_slug, update.step_stats
                 )
 
-                self._workflow_last_elapsed[workflow_name] = time.monotonic()
+                self._workflow_last_elapsed[workflow_name] = sampled_at
+                self._workflow_last_completed[workflow_name] = completed_count
 
             # Store update for external consumers
             self._graph_updates[run_id][workflow_name].put_nowait(update)
 
     def _setup_state_actions(self, workflow: Workflow) -> Dict[str, ContextHook]:
-        state_actions: Dict[str, ContextHook] = {
-            name: hook
-            for name, hook in inspect.getmembers(
-                workflow,
-                predicate=lambda member: isinstance(member, ContextHook),
-            )
-        }
+        """This run's state hooks: a copy of each of the class's, bound to
+        ``workflow``.
 
-        for action in state_actions.values():
-            action._call = action._call.__get__(workflow, workflow.__class__)
-            setattr(workflow, action.name, action._call)
+        A hook is a class attribute every instance shares, and a run sets
+        its call and arguments. Binding the shared hook let concurrent runs
+        of one class take each other's instance and arguments, and from
+        Python 3.14 re-binding an already-bound method returns it unchanged,
+        so a later run called the first run's instance. Hooks are read from
+        the class: binding leaves the bound call on the instance, which
+        would hide the hook from a second setup of the same instance.
+        """
+        state_actions: Dict[str, ContextHook] = {}
+        for name, hook in inspect.getmembers(
+            type(workflow),
+            predicate=lambda member: isinstance(member, ContextHook),
+        ):
+            run_hook = copy.copy(hook)
+            run_hook.context_args = {}
+            run_hook._call = MethodType(
+                hook._call.__func__ if isinstance(hook._call, MethodType) else hook._call,
+                workflow,
+            )
+            setattr(workflow, run_hook.name, run_hook._call)
+            state_actions[name] = run_hook
 
         return state_actions
 
@@ -1468,6 +1563,17 @@ class RemoteGraphManager:
 
     def start_server_cleanup(self):
         self._controller.start_controller_cleanup()
+
+    async def throttle_workflow(
+        self,
+        run_id: int,
+        workflow: str,
+        scale: float | None,
+    ) -> list[WorkflowThrottleUpdate]:
+        """AD-41 THROTTLE: cut the running workflow's concurrency to
+        ``scale`` of its operating point on every node running it, or --
+        ``scale`` None -- restore it. Each node's answer."""
+        return await self._controller.submit_workflow_throttle(run_id, workflow, scale)
 
     async def cancel_workflow(
         self,
@@ -1636,6 +1742,21 @@ class RemoteGraphManager:
         """
         return self._latest_availability
 
+    def retire_executor(self, executor_address: Tuple[str, int]) -> None:
+        """
+        Stop handing out the executor at ``executor_address``.
+
+        Called from the server pool's reap of the executor's process. The
+        executor's node id is derived from its listen address, so a
+        replacement spawned at the same address takes the slot back —
+        through the provisioner's ``readmit_node`` — only once its own
+        start acknowledgement reaches this leader.
+        """
+        executor_host, executor_port = executor_address
+        self._provisioner.retire_node(
+            derive_protocol_node_id(executor_host, executor_port)
+        )
+
     def set_on_cores_available(self, callback: Any) -> None:
         """
         Set callback for instant notification when cores become available.
@@ -1787,11 +1908,15 @@ class RemoteGraphManager:
                 *[hook.call(**hook.context_args) for hook in provide_actions]
             )
 
+            # A provided value goes to the provider's own namespace -- read by
+            # a consumer naming its source, @state('Provider') -- and to every
+            # namespace it targets -- read by a consumer of its own
+            # namespace, @state().
             await asyncio.gather(
                 *[
-                    context[target].set(hook_name, result)
+                    context[namespace].set(hook_name, result)
                     for hook_name, result in context_results
-                    for target in hook_targets[hook_name]
+                    for namespace in dict.fromkeys((workflow, *hook_targets[hook_name]))
                 ]
             )
 
@@ -1810,19 +1935,22 @@ class RemoteGraphManager:
                 )
             )
 
-            await self._controller.submit_stop_request()
+            if self._controller:
+                await self._controller.submit_stop_request()
 
     async def close(self):
-        self._controller.stop()
-        await self._controller.close()
+        if self._controller:
+            self._controller.stop()
+            await self._controller.close()
 
         # Clear all tracking data to prevent memory leaks
         self._cleanup_tracking_data()
 
     def abort(self):
         try:
-            self._logger.abort()
-            self._controller.abort()
+            if self._controller:
+                self._logger.abort()
+                self._controller.abort()
 
         except Exception:
             pass
@@ -1836,6 +1964,7 @@ class RemoteGraphManager:
         self._workflow_timers.clear()
         self._workflow_completion_rates.clear()
         self._workflow_last_elapsed.clear()
+        self._workflow_last_completed.clear()
         self._graph_updates.clear()
         self._workflow_statuses.clear()
         self._cancellation_updates.clear()

@@ -80,18 +80,6 @@ from hyperscale.distributed.discovery.selection.adaptive_selector import (
     SelectionResult as SelectionResult,
 )
 
-# Pool
-from hyperscale.distributed.discovery.pool.connection_pool import (
-    ConnectionPool as ConnectionPool,
-    ConnectionPoolConfig as ConnectionPoolConfig,
-    PooledConnection as PooledConnection,
-)
-from hyperscale.distributed.discovery.pool.sticky_connection import (
-    StickyConnectionManager as StickyConnectionManager,
-    StickyConfig as StickyConfig,
-    StickyBinding as StickyBinding,
-)
-
 # Security
 from hyperscale.distributed.discovery.security.role_validator import (
     RoleValidator as RoleValidator,

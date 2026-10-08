@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.models import (
     NodeInfo,
     NodeRole,
@@ -40,10 +41,30 @@ from tests.simulation.harness import (
 
 _LARGE_WORKER_COUNT = 50
 _COMPACT_WORKER_BLOCK = 32
-_SLOW_CHURN_CYCLES = 30
+# docs/SCENARIOS.md section 6: "1 worker every 10 s for 5 min". The stream
+# runs for the scenario's five minutes; each churn event is placed by the
+# previous one's observed outcome (removal, then restoration), so events
+# are never closer than the interval -- the count is whatever the
+# cluster's real detection latency fits in the stream, not a fixed 30
+# (which assumed a 10 s cycle and ran ~27 s cycles past 13 minutes).
+_SLOW_CHURN_STREAM_SECONDS = 300.0
 _SLOW_CHURN_INTERVAL_SECONDS = 10.0
 _SCALE_DOWN_WINDOW_SECONDS = 10.0
 _LARGE_CLUSTER_RUNNING_TIMEOUT_SECONDS = 120.0
+_REQUEST_TIMEOUT_SECONDS = 5.0
+
+# Mass crash: a datacenter with no workers left is a capacity wait, not a
+# failure (AD-54 "Failed dispatch"): the workflow returns to PENDING and
+# the job fails with its cause at its AD-34 deadline. The leader checks
+# deadlines once per ``JOB_TIMEOUT_CHECK_INTERVAL``, so the failure is
+# surfaced up to one interval after the deadline and reaches the client
+# with one push (one request timeout).
+_MASS_CRASH_JOB_TIMEOUT_SECONDS = 120.0
+_MASS_CRASH_COMPLETION_BUDGET_SECONDS = (
+    _MASS_CRASH_JOB_TIMEOUT_SECONDS
+    + Env().JOB_TIMEOUT_CHECK_INTERVAL
+    + _REQUEST_TIMEOUT_SECONDS
+)
 
 # ---------------------------------------------------------------------------
 # Derived budgets for the graceful_scale_down scenarios.
@@ -96,35 +117,7 @@ _WORKFLOW_COMPLETION_BUDGET_SECONDS = (
 )
 
 
-# Each scenario gets a contiguous, non-overlapping port range. A single
-# manager + W workers reserves ``2 + W * _COMPACT_WORKER_BLOCK`` ports
-# (manager TCP/UDP pair + W worker blocks). The base_ports below are
-# spaced with enough headroom that a slow teardown from one scenario
-# cannot leak a socket into the next scenario's range — see the
-# assertion at the bottom of this module which guards against future
-# regressions when worker counts or block sizes change.
-_BASE_REGISTRATION_STORM = 43500
-_BASE_GRACEFUL_SCALE_DOWN = 45500
-_BASE_MASS_CRASH = 47500
-_BASE_SLOW_CHURN = 49500
-_BASE_BEYOND_MAX = 50500
-
-
-def _scenario_port_ceiling(base_port: int, workers: int) -> int:
-    """Return the first port *past* the range a scenario will reserve.
-
-    A single manager reserves two ports (TCP/UDP pair) and each worker
-    reserves ``_COMPACT_WORKER_BLOCK`` ports for its TCP/UDP pair plus
-    the derived per-subprocess UDP ports the worker pool spawns. The
-    ceiling exists so neighbouring scenarios can detect overlap at
-    import time rather than racing each other for the same socket on
-    sequential test execution.
-    """
-    return base_port + 2 + workers * _COMPACT_WORKER_BLOCK
-
-
 def _single_manager_spec(
-    base_port: int,
     workers: int,
     *,
     max_workers_per_manager: int | None = None,
@@ -143,11 +136,10 @@ def _single_manager_spec(
             ),
         },
         env=EnvOverrides(
-            request_timeout="5s",
+            request_timeout=f"{_REQUEST_TIMEOUT_SECONDS:g}s",
             log_level="error",
             max_workers_per_manager=max_workers_per_manager,
         ),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=180.0),
     )
 
@@ -155,9 +147,16 @@ def _single_manager_spec(
 def _long_workload(
     timeout_seconds: float,
     allowed_terminal_statuses: set[str] | None = None,
+    completion_budget_seconds: float | None = None,
 ) -> WorkloadSpec:
     expectations: list[Expectation] = [
-        ExpectCompletionWithin(seconds=timeout_seconds),
+        ExpectCompletionWithin(
+            seconds=(
+                timeout_seconds
+                if completion_budget_seconds is None
+                else completion_budget_seconds
+            )
+        ),
     ]
     if allowed_terminal_statuses is None:
         expectations.insert(
@@ -221,7 +220,7 @@ def _fake_worker_registration(
 @pytest.mark.simulation
 async def test_registration_storm_50_workers() -> None:
     """A manager accepts 50 concurrent real worker registrations without dropping them."""
-    spec = _single_manager_spec(base_port=_BASE_REGISTRATION_STORM, workers=0)
+    spec = _single_manager_spec(workers=0)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -288,10 +287,7 @@ async def test_graceful_scale_down_50_workers_membership_reaps() -> None:
     victim to send LEAVE, plus ``_MEMBERSHIP_REAP_SLACK_SECONDS`` for
     LEAVE-handler propagation and callback chain settling.
     """
-    spec = _single_manager_spec(
-        base_port=_BASE_GRACEFUL_SCALE_DOWN,
-        workers=_LARGE_WORKER_COUNT + 1,
-    )
+    spec = _single_manager_spec(workers=_LARGE_WORKER_COUNT + 1)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -362,10 +358,7 @@ async def test_graceful_scale_down_50_workers_orphaned_workflow_completes() -> N
     dependence on ``LongRunningWorkflow.duration`` and the drain
     pre-announcement contract is auditable.
     """
-    spec = _single_manager_spec(
-        base_port=_BASE_GRACEFUL_SCALE_DOWN,
-        workers=_LARGE_WORKER_COUNT + 1,
-    )
+    spec = _single_manager_spec(workers=_LARGE_WORKER_COUNT + 1)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -396,7 +389,7 @@ async def test_graceful_scale_down_50_workers_orphaned_workflow_completes() -> N
 @pytest.mark.simulation
 async def test_mass_crash_50_workers() -> None:
     """Fifty workers crash at once; the manager drains them and terminates active work."""
-    spec = _single_manager_spec(base_port=_BASE_MASS_CRASH, workers=_LARGE_WORKER_COUNT)
+    spec = _single_manager_spec(workers=_LARGE_WORKER_COUNT)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -406,7 +399,11 @@ async def test_mass_crash_50_workers() -> None:
         workers = cluster.workers("local")
 
         async with cluster.workload(
-            _long_workload(120.0, {"failed", "cancelled", "timeout"})
+            _long_workload(
+                _MASS_CRASH_JOB_TIMEOUT_SECONDS,
+                {"failed", "cancelled", "timeout"},
+                completion_budget_seconds=_MASS_CRASH_COMPLETION_BUDGET_SECONDS,
+            )
         ) as driver:
             await driver.submit()
             await driver.wait_until_running(
@@ -428,7 +425,7 @@ async def test_mass_crash_50_workers() -> None:
 @pytest.mark.simulation
 async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
     """A time-spaced churn stream repeatedly removes and restores one worker."""
-    spec = _single_manager_spec(base_port=_BASE_SLOW_CHURN, workers=2)
+    spec = _single_manager_spec(workers=2)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -470,7 +467,9 @@ async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
                 flush=True,
             )
 
-        for churn_index in range(_SLOW_CHURN_CYCLES):
+        stream_started_at = time.monotonic()
+        churn_index = 0
+        while time.monotonic() - stream_started_at < _SLOW_CHURN_STREAM_SECONDS:
             await cluster.faults.kill(victim)
             await wait_until(
                 lambda: manager.instance._manager_state.get_worker_count() <= 1,
@@ -492,17 +491,14 @@ async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
                     f"iter_{i}_restore_timeout"
                 ),
             )
+            churn_index += 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.simulation
 async def test_beyond_max_workers_per_manager_cap_rejected_cleanly() -> None:
     """A manager with a configured worker cap rejects registrations beyond it."""
-    spec = _single_manager_spec(
-        base_port=_BASE_BEYOND_MAX,
-        workers=1,
-        max_workers_per_manager=1,
-    )
+    spec = _single_manager_spec(workers=1, max_workers_per_manager=1)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -533,29 +529,3 @@ async def test_beyond_max_workers_per_manager_cap_rejected_cleanly() -> None:
         assert response.error is not None
         assert "MAX_WORKERS_PER_MANAGER=1" in response.error
         assert manager.instance._manager_state.get_worker_count() == 1
-
-
-# --- Port range overlap guard ---------------------------------------------
-# Each scenario reserves a contiguous block of ports; running the suite
-# sequentially can leak sockets from one scenario into the next if their
-# ranges overlap. Validate at import time so a future increase in
-# ``_LARGE_WORKER_COUNT`` or ``_COMPACT_WORKER_BLOCK`` fails loudly
-# instead of producing flaky ECONNREFUSED errors at runtime when a
-# manager silently fails to bind because the previous scenario still
-# owns the port.
-_SCENARIO_PORT_RANGES = [
-    ("registration_storm",   _BASE_REGISTRATION_STORM,   _LARGE_WORKER_COUNT),
-    ("graceful_scale_down",  _BASE_GRACEFUL_SCALE_DOWN,  _LARGE_WORKER_COUNT + 1),
-    ("mass_crash",           _BASE_MASS_CRASH,           _LARGE_WORKER_COUNT),
-    ("slow_churn",           _BASE_SLOW_CHURN,           2),
-    ("beyond_max",           _BASE_BEYOND_MAX,           1),
-]
-for _i in range(len(_SCENARIO_PORT_RANGES) - 1):
-    _name_a, _base_a, _workers_a = _SCENARIO_PORT_RANGES[_i]
-    _name_b, _base_b, _workers_b = _SCENARIO_PORT_RANGES[_i + 1]
-    _ceiling_a = _scenario_port_ceiling(_base_a, _workers_a)
-    assert _ceiling_a <= _base_b, (
-        f"port-range overlap: {_name_a} reserves [{_base_a},{_ceiling_a}), "
-        f"{_name_b} starts at {_base_b}. Increase {_name_b.upper()}'s "
-        "base_port or reduce earlier scenario worker counts."
-    )

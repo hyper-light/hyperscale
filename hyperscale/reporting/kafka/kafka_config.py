@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict, StrictStr, StrictInt, StrictBool
-from typing import Any, Dict
+from typing import Dict
 
 from hyperscale.reporting.common.types import ReporterTypes
 
@@ -17,5 +17,5 @@ class KafkaConfig(BaseModel):
     compression_type: StrictStr | None = None
     timeout: StrictInt = 1000
     idempotent: StrictBool = True
-    options: Dict[StrictStr, Any] = {}
+    options: Dict[StrictStr, object] = {}
     reporter_type: ReporterTypes = ReporterTypes.Kafka

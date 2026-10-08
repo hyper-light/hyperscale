@@ -54,24 +54,11 @@ class Stream:
 
         self.window_frame = Frame(stream_id, 0x08, window_increment=65536)
 
-    def update_stream_id(self):
-        self.stream_id += 2  # self.concurrency
-        if self.stream_id % 2 == 0:
-            self.stream_id += 1
-
-        self.window_frame.stream_id = self.stream_id
-        self.frame_buffer = FrameBuffer()
-
-        self.window_frame = Frame(self.stream_id, 0x08, window_increment=65536)
-
     def write(self, data: bytes):
         self.writer._transport.write(data)
 
     def read(self, msg_length: int = READ_NUM_BYTES):
         return self.reader.read(msg_length)
-
-    def get_raw_buffer(self) -> bytearray:
-        return self.reader._buffer
 
     def write_window_update_frame(
         self, stream_id: int = None, window_increment: int = None

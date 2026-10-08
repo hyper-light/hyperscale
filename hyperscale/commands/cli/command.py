@@ -451,6 +451,13 @@ class Command(Generic[T]):
             if Context in arg.value_type
         ]
 
+        keyword_args.update({
+            keyword_arg.name: await keyword_arg.to_default()
+            for keyword_arg in keyword_args_map.values()
+            if keyword_args.get(keyword_arg.name) is None 
+            and keyword_arg.default is not None
+        })
+
         for keyword_arg_name in context_keyword_args:
             keyword_args[keyword_arg_name] = context
 
@@ -612,7 +619,6 @@ class Command(Generic[T]):
         if value is None and keyword_arg.loads_from_envar:
             result = await keyword_arg.parse()
             value, last_error = self._return_value_and_error(result)
-            
 
         if value is None and isinstance(last_error, Exception):
             return (

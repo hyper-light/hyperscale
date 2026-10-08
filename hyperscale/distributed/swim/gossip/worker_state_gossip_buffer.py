@@ -6,15 +6,23 @@ managers using the same O(log n) piggyback strategy as membership gossip.
 """
 
 import heapq
+from itertools import compress, repeat
+from operator import attrgetter, lt, methodcaller, not_
 import math
-import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Callable
 
 from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
     WorkerStatePiggybackUpdate,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+from .gossip_buffer import MAX_UDP_PAYLOAD
+from .gossip_buffer_stats import GossipBufferStats
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 MAX_WORKER_STATE_PIGGYBACK_SIZE = 600
 
@@ -46,9 +54,9 @@ class WorkerStateGossipBuffer:
     _oversized_updates_count: int = 0
     _overflow_count: int = 0
 
-    _on_overflow: Any = None
+    _on_overflow: Callable[[int, int], None] | None = None
 
-    def set_overflow_callback(self, callback: Any) -> None:
+    def set_overflow_callback(self, callback: Callable[[int, int], None]) -> None:
         self._on_overflow = callback
 
     def add_update(
@@ -81,7 +89,7 @@ class WorkerStateGossipBuffer:
         if existing is None:
             self.updates[worker_id] = WorkerStatePiggybackUpdate(
                 update=update,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
             )
             return True
@@ -89,7 +97,7 @@ class WorkerStateGossipBuffer:
         if update.incarnation > existing.update.incarnation:
             self.updates[worker_id] = WorkerStatePiggybackUpdate(
                 update=update,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 max_broadcasts=max_broadcasts,
             )
             return True
@@ -98,7 +106,7 @@ class WorkerStateGossipBuffer:
             if update.is_dead_state() and existing.update.is_alive_state():
                 self.updates[worker_id] = WorkerStatePiggybackUpdate(
                     update=update,
-                    timestamp=time.monotonic(),
+                    timestamp=_DEFAULT_CLOCK.monotonic(),
                     max_broadcasts=max_broadcasts,
                 )
                 return True
@@ -167,7 +175,6 @@ class WorkerStateGossipBuffer:
         base_message: bytes,
         max_count: int = 5,
     ) -> bytes:
-        from .gossip_buffer import MAX_UDP_PAYLOAD
 
         remaining = MAX_UDP_PAYLOAD - len(base_message)
         if remaining <= 0:
@@ -225,22 +232,21 @@ class WorkerStateGossipBuffer:
         if evicted > 0:
             self._overflow_count += 1
             if self._on_overflow:
-                try:
-                    self._on_overflow(evicted, self.max_updates)
-                except Exception:
-                    pass
+                self._on_overflow(evicted, self.max_updates)
 
         return evicted
 
     def cleanup_stale(self) -> int:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.stale_age_seconds
 
-        to_remove = [
-            worker_id
-            for worker_id, update in self.updates.items()
-            if update.timestamp < cutoff
-        ]
+        # Keys and values iterate in the same order, so compress selects the stale keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(lt, map(attrgetter("timestamp"), self.updates.values()), repeat(cutoff)),
+            )
+        )
 
         for worker_id in to_remove:
             del self.updates[worker_id]
@@ -249,11 +255,13 @@ class WorkerStateGossipBuffer:
         return len(to_remove)
 
     def cleanup_broadcast_complete(self) -> int:
-        to_remove = [
-            worker_id
-            for worker_id, update in self.updates.items()
-            if not update.should_broadcast()
-        ]
+        # Keys and values iterate in the same order, so compress selects the completed keys.
+        to_remove = list(
+            compress(
+                self.updates.keys(),
+                map(not_, map(methodcaller("should_broadcast"), self.updates.values())),
+            )
+        )
 
         for worker_id in to_remove:
             del self.updates[worker_id]
@@ -270,7 +278,7 @@ class WorkerStateGossipBuffer:
             "pending_updates": len(self.updates),
         }
 
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> GossipBufferStats:
         return {
             "pending_updates": len(self.updates),
             "total_evicted": self._evicted_count,

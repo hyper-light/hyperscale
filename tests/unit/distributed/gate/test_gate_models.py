@@ -4,8 +4,6 @@ Integration tests for Gate Models (Section 15.3.2).
 Tests gate-specific data models:
 - GatePeerState, GatePeerTracking
 - DCHealthState, ManagerTracking
-- JobForwardingState, ForwardingMetrics
-- LeaseState, LeaseTracking
 """
 
 import asyncio
@@ -18,10 +16,6 @@ from hyperscale.distributed.nodes.gate.models import (
     GatePeerTracking,
     DCHealthState,
     ManagerTracking,
-    JobForwardingState,
-    ForwardingMetrics,
-    LeaseState,
-    LeaseTracking,
 )
 from hyperscale.distributed.reliability import BackpressureLevel
 
@@ -395,276 +389,6 @@ class TestDCHealthStateEdgeCases:
 
 
 # =============================================================================
-# ForwardingMetrics Tests
-# =============================================================================
-
-
-class TestForwardingMetricsHappyPath:
-    """Tests for ForwardingMetrics happy path."""
-
-    def test_create_default(self):
-        """Create metrics with defaults."""
-        metrics = ForwardingMetrics()
-
-        assert metrics.count == 0
-        assert metrics.last_throughput == 0.0
-        assert metrics.interval_seconds == 10.0
-
-    def test_record_forward(self):
-        """Record forward increments count."""
-        metrics = ForwardingMetrics()
-
-        metrics.record_forward()
-        assert metrics.count == 1
-
-        metrics.record_forward()
-        assert metrics.count == 2
-
-    def test_calculate_throughput_within_interval(self):
-        """Calculate throughput within interval returns last value."""
-        metrics = ForwardingMetrics(interval_seconds=10.0)
-        # Just created, so within interval
-        metrics.record_forward()
-        metrics.record_forward()
-
-        # Should return 0.0 (last value) since interval hasn't elapsed
-        throughput = metrics.calculate_throughput()
-        assert throughput == 0.0
-        # Count should remain since interval not elapsed
-        assert metrics.count == 2
-
-    def test_calculate_throughput_after_interval(self):
-        """Calculate throughput after interval calculates and resets."""
-        metrics = ForwardingMetrics(interval_seconds=0.0)  # Immediate interval
-        metrics.record_forward()
-        metrics.record_forward()
-        metrics.record_forward()
-
-        # Force interval start to past
-        metrics.interval_start = time.monotonic() - 1.0
-        metrics.count = 10
-
-        throughput = metrics.calculate_throughput()
-
-        assert throughput > 0.0  # Should be ~10/elapsed
-        assert metrics.count == 0  # Reset after calculation
-
-
-class TestForwardingMetricsEdgeCases:
-    """Tests for ForwardingMetrics edge cases."""
-
-    def test_zero_interval(self):
-        """Zero interval causes immediate calculation."""
-        metrics = ForwardingMetrics(interval_seconds=0.0)
-        metrics.record_forward()
-
-        throughput = metrics.calculate_throughput()
-        # Very high throughput due to tiny elapsed time
-        assert throughput >= 0.0
-
-    def test_many_forwards(self):
-        """Handle many forward records."""
-        metrics = ForwardingMetrics()
-
-        for _ in range(10000):
-            metrics.record_forward()
-
-        assert metrics.count == 10000
-
-
-# =============================================================================
-# JobForwardingState Tests
-# =============================================================================
-
-
-class TestJobForwardingStateHappyPath:
-    """Tests for JobForwardingState happy path."""
-
-    def test_create_default(self):
-        """Create state with defaults."""
-        state = JobForwardingState()
-
-        assert state.forward_timeout == 3.0
-        assert state.max_forward_attempts == 3
-        assert state.throughput_metrics is not None
-
-    def test_record_forward_delegates(self):
-        """Record forward delegates to metrics."""
-        state = JobForwardingState()
-
-        state.record_forward()
-        state.record_forward()
-
-        assert state.throughput_metrics.count == 2
-
-    def test_get_throughput_delegates(self):
-        """Get throughput delegates to metrics."""
-        state = JobForwardingState()
-
-        throughput = state.get_throughput()
-        assert throughput >= 0.0
-
-
-# =============================================================================
-# LeaseTracking Tests
-# =============================================================================
-
-
-class TestLeaseTrackingHappyPath:
-    """Tests for LeaseTracking happy path."""
-
-    def test_create(self):
-        """Create lease tracking."""
-
-        # Mock lease
-        class MockLease:
-            pass
-
-        lease = MockLease()
-        tracking = LeaseTracking(
-            job_id="job-123",
-            datacenter_id="dc-east",
-            lease=lease,
-            fence_token=42,
-        )
-
-        assert tracking.job_id == "job-123"
-        assert tracking.datacenter_id == "dc-east"
-        assert tracking.lease is lease
-        assert tracking.fence_token == 42
-
-
-# =============================================================================
-# LeaseState Tests
-# =============================================================================
-
-
-class TestLeaseStateHappyPath:
-    """Tests for LeaseState happy path."""
-
-    def test_create_default(self):
-        """Create lease state with defaults."""
-        state = LeaseState()
-
-        assert state.leases == {}
-        assert state.fence_token == 0
-        assert state.lease_timeout == 30.0
-
-    def test_get_lease_key(self):
-        """Get lease key formats correctly."""
-        state = LeaseState()
-
-        key = state.get_lease_key("job-123", "dc-east")
-        assert key == "job-123:dc-east"
-
-    def test_set_and_get_lease(self):
-        """Set and get lease operations work."""
-        state = LeaseState()
-
-        class MockLease:
-            pass
-
-        lease = MockLease()
-        state.set_lease("job-123", "dc-east", lease)
-
-        result = state.get_lease("job-123", "dc-east")
-        assert result is lease
-
-    def test_get_nonexistent_lease(self):
-        """Get nonexistent lease returns None."""
-        state = LeaseState()
-
-        result = state.get_lease("unknown", "unknown")
-        assert result is None
-
-    def test_remove_lease(self):
-        """Remove lease removes it."""
-        state = LeaseState()
-
-        class MockLease:
-            pass
-
-        state.set_lease("job-123", "dc-east", MockLease())
-        state.remove_lease("job-123", "dc-east")
-
-        result = state.get_lease("job-123", "dc-east")
-        assert result is None
-
-    def test_remove_nonexistent_lease_is_safe(self):
-        """Remove nonexistent lease doesn't raise."""
-        state = LeaseState()
-        state.remove_lease("unknown", "unknown")  # Should not raise
-
-    def test_next_fence_token(self):
-        """Next fence token increments and returns."""
-        state = LeaseState()
-
-        token1 = state.next_fence_token()
-        token2 = state.next_fence_token()
-        token3 = state.next_fence_token()
-
-        assert token1 == 1
-        assert token2 == 2
-        assert token3 == 3
-        assert state.fence_token == 3
-
-
-class TestLeaseStateEdgeCases:
-    """Tests for LeaseState edge cases."""
-
-    def test_many_leases(self):
-        """Handle many leases."""
-        state = LeaseState()
-
-        class MockLease:
-            pass
-
-        for i in range(1000):
-            state.set_lease(f"job-{i}", f"dc-{i % 5}", MockLease())
-
-        assert len(state.leases) == 1000
-
-    def test_overwrite_lease(self):
-        """Overwriting lease replaces previous."""
-        state = LeaseState()
-
-        class Lease1:
-            pass
-
-        class Lease2:
-            pass
-
-        state.set_lease("job-1", "dc-1", Lease1())
-        state.set_lease("job-1", "dc-1", Lease2())
-
-        result = state.get_lease("job-1", "dc-1")
-        assert isinstance(result, Lease2)
-
-    def test_fence_token_overflow(self):
-        """Fence token handles large values."""
-        state = LeaseState()
-        state.fence_token = 2**62
-
-        token = state.next_fence_token()
-        assert token == 2**62 + 1
-
-    def test_special_characters_in_ids(self):
-        """Handle special characters in IDs."""
-        state = LeaseState()
-
-        class MockLease:
-            pass
-
-        # IDs with special chars
-        state.set_lease("job:colon", "dc-dash", MockLease())
-        key = state.get_lease_key("job:colon", "dc-dash")
-        assert key == "job:colon:dc-dash"
-
-        result = state.get_lease("job:colon", "dc-dash")
-        assert result is not None
-
-
-# =============================================================================
 # Slots and Memory Tests
 # =============================================================================
 
@@ -688,21 +412,6 @@ class TestModelsUseSlots:
         """DCHealthState uses slots."""
         assert hasattr(DCHealthState, "__slots__")
 
-    def test_forwarding_metrics_uses_slots(self):
-        """ForwardingMetrics uses slots."""
-        assert hasattr(ForwardingMetrics, "__slots__")
-
-    def test_job_forwarding_state_uses_slots(self):
-        """JobForwardingState uses slots."""
-        assert hasattr(JobForwardingState, "__slots__")
-
-    def test_lease_tracking_uses_slots(self):
-        """LeaseTracking uses slots."""
-        assert hasattr(LeaseTracking, "__slots__")
-
-    def test_lease_state_uses_slots(self):
-        """LeaseState uses slots."""
-        assert hasattr(LeaseState, "__slots__")
 
 
 class TestModelsAreDataclasses:
@@ -715,10 +424,6 @@ class TestModelsAreDataclasses:
             GatePeerState,
             ManagerTracking,
             DCHealthState,
-            ForwardingMetrics,
-            JobForwardingState,
-            LeaseTracking,
-            LeaseState,
         ]
         for cls in classes:
             assert is_dataclass(cls), f"{cls.__name__} is not a dataclass"

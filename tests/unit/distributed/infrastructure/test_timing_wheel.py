@@ -17,8 +17,6 @@ import pytest
 from hyperscale.distributed.swim.detection.timing_wheel import (
     TimingWheel,
     TimingWheelConfig,
-    TimingWheelBucket,
-    WheelEntry,
 )
 from hyperscale.distributed.swim.detection.suspicion_state import SuspicionState
 
@@ -87,125 +85,6 @@ def make_state(node: tuple[str, int], incarnation: int = 1) -> SuspicionState:
         min_timeout=1.0,
         max_timeout=10.0,
     )
-
-
-# =============================================================================
-# Test TimingWheelBucket
-# =============================================================================
-
-
-class TestTimingWheelBucket:
-    """Tests for the TimingWheelBucket class."""
-
-    @pytest.mark.asyncio
-    async def test_add_entry_happy_path(self, sample_node: tuple[str, int], sample_state: SuspicionState):
-        """Adding an entry should store it successfully."""
-        bucket = TimingWheelBucket()
-        entry = WheelEntry(
-            node=sample_node,
-            state=sample_state,
-            expiration_time=time.monotonic() + 5.0,
-            epoch=1,
-        )
-
-        await bucket.add(entry)
-
-        assert len(bucket) == 1
-        retrieved = await bucket.get(sample_node)
-        assert retrieved is entry
-
-    @pytest.mark.asyncio
-    async def test_add_overwrites_existing_entry(self, sample_node: tuple[str, int], sample_state: SuspicionState):
-        """Adding an entry with same node overwrites the previous one."""
-        bucket = TimingWheelBucket()
-
-        entry1 = WheelEntry(node=sample_node, state=sample_state, expiration_time=1.0, epoch=1)
-        entry2 = WheelEntry(node=sample_node, state=sample_state, expiration_time=2.0, epoch=2)
-
-        await bucket.add(entry1)
-        await bucket.add(entry2)
-
-        assert len(bucket) == 1
-        retrieved = await bucket.get(sample_node)
-        assert retrieved.epoch == 2
-
-    @pytest.mark.asyncio
-    async def test_remove_entry_happy_path(self, sample_node: tuple[str, int], sample_state: SuspicionState):
-        """Removing an entry should return it and clear from bucket."""
-        bucket = TimingWheelBucket()
-        entry = WheelEntry(node=sample_node, state=sample_state, expiration_time=1.0, epoch=1)
-
-        await bucket.add(entry)
-        removed = await bucket.remove(sample_node)
-
-        assert removed is entry
-        assert len(bucket) == 0
-
-    @pytest.mark.asyncio
-    async def test_remove_nonexistent_returns_none(self, sample_node: tuple[str, int]):
-        """Removing a nonexistent entry returns None."""
-        bucket = TimingWheelBucket()
-
-        removed = await bucket.remove(sample_node)
-
-        assert removed is None
-
-    @pytest.mark.asyncio
-    async def test_pop_all_clears_bucket(self):
-        """pop_all should return all entries and clear the bucket."""
-        bucket = TimingWheelBucket()
-
-        entries = []
-        for i in range(5):
-            node = make_node(i)
-            state = make_state(node)
-            entry = WheelEntry(node=node, state=state, expiration_time=1.0, epoch=i)
-            entries.append(entry)
-            await bucket.add(entry)
-
-        assert len(bucket) == 5
-
-        popped = await bucket.pop_all()
-
-        assert len(popped) == 5
-        assert len(bucket) == 0
-
-    @pytest.mark.asyncio
-    async def test_get_returns_none_for_missing(self, sample_node: tuple[str, int]):
-        """get should return None for missing entries."""
-        bucket = TimingWheelBucket()
-
-        result = await bucket.get(sample_node)
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_concurrent_add_remove_maintains_consistency(self):
-        """Concurrent add/remove operations should not corrupt bucket state."""
-        bucket = TimingWheelBucket()
-        num_operations = 100
-
-        async def add_entries():
-            for i in range(num_operations):
-                node = make_node(i)
-                state = make_state(node)
-                entry = WheelEntry(node=node, state=state, expiration_time=1.0, epoch=i)
-                await bucket.add(entry)
-                await asyncio.sleep(0)
-
-        async def remove_entries():
-            for i in range(num_operations):
-                node = make_node(i)
-                await bucket.remove(node)
-                await asyncio.sleep(0)
-
-        # Run concurrently - some removes may happen before adds
-        await asyncio.gather(add_entries(), remove_entries())
-
-        # Bucket should be in consistent state (may have entries remaining)
-        # Key assertion: no exceptions raised, bucket still functional
-        await bucket.pop_all()
-        assert len(bucket) == 0
 
 
 # =============================================================================
@@ -290,42 +169,6 @@ class TestTimingWheelHappyPath:
         assert stats["entries_moved"] == 1
 
     @pytest.mark.asyncio
-    async def test_entry_placement_in_fine_wheel(self, default_config: TimingWheelConfig):
-        """Entries with short timeout should go to fine wheel."""
-        wheel = TimingWheel(config=default_config)
-
-        node = make_node(1)
-        state = make_state(node)
-        # Expiration within fine_wheel_threshold_ms (2000ms = 2s)
-        expiration = time.monotonic() + 1.5
-
-        await wheel.add(node, state, expiration)
-
-        # Check that it's in the fine wheel via internal state
-        async with wheel._lock:
-            location = wheel._node_locations.get(node)
-            assert location is not None
-            assert location[0] == "fine"
-
-    @pytest.mark.asyncio
-    async def test_entry_placement_in_coarse_wheel(self, default_config: TimingWheelConfig):
-        """Entries with long timeout should go to coarse wheel."""
-        wheel = TimingWheel(config=default_config)
-
-        node = make_node(1)
-        state = make_state(node)
-        # Expiration beyond fine_wheel_threshold_ms
-        expiration = time.monotonic() + 10.0
-
-        await wheel.add(node, state, expiration)
-
-        # Check that it's in the coarse wheel via internal state
-        async with wheel._lock:
-            location = wheel._node_locations.get(node)
-            assert location is not None
-            assert location[0] == "coarse"
-
-    @pytest.mark.asyncio
     async def test_expiration_callback_invoked(self, fast_config: TimingWheelConfig):
         """Expired entries should trigger the callback."""
         expired_nodes: list[tuple[str, int]] = []
@@ -359,12 +202,10 @@ class TestTimingWheelHappyPath:
         wheel = TimingWheel(config=default_config)
 
         assert wheel._running is False
-        assert wheel._advance_task is None
 
         wheel.start()
 
         assert wheel._running is True
-        assert wheel._advance_task is not None
 
         await wheel.stop()
 
@@ -573,45 +414,18 @@ class TestTimingWheelEdgeCases:
             await wheel.stop()
 
     @pytest.mark.asyncio
-    async def test_bucket_wrap_around(self, default_config: TimingWheelConfig):
-        """Wheel should handle bucket index wrap-around correctly."""
+    async def test_short_deadline_entry_is_tracked(self, default_config: TimingWheelConfig):
+        """A near-future deadline should be scheduled and tracked correctly."""
         wheel = TimingWheel(config=default_config)
-
-        # Force position near end of wheel
-        wheel._fine_position = default_config.fine_wheel_size - 1
 
         node = make_node(1)
         state = make_state(node)
-        # This should wrap around to early buckets
+        # Near-future expiration
         expiration = time.monotonic() + 0.3
 
         await wheel.add(node, state, expiration)
 
         assert await wheel.contains(node) is True
-
-    @pytest.mark.asyncio
-    async def test_update_moves_between_wheels(self, default_config: TimingWheelConfig):
-        """Updating expiration should move entry between coarse and fine wheels."""
-        wheel = TimingWheel(config=default_config)
-
-        node = make_node(1)
-        state = make_state(node)
-
-        # Start in coarse wheel (far future)
-        expiration = time.monotonic() + 30.0
-        await wheel.add(node, state, expiration)
-
-        async with wheel._lock:
-            location = wheel._node_locations.get(node)
-            assert location[0] == "coarse"
-
-        # Move to fine wheel (near future)
-        new_expiration = time.monotonic() + 1.0
-        await wheel.update_expiration(node, new_expiration)
-
-        async with wheel._lock:
-            location = wheel._node_locations.get(node)
-            assert location[0] == "fine"
 
     @pytest.mark.asyncio
     async def test_clear_removes_all_entries(self, default_config: TimingWheelConfig):
@@ -663,35 +477,6 @@ class TestTimingWheelEdgeCases:
         adjusted = await wheel.apply_lhm_adjustment(1.0)
 
         assert adjusted == 0
-
-    @pytest.mark.asyncio
-    async def test_cascade_from_coarse_to_fine(self, fast_config: TimingWheelConfig):
-        """Entries should cascade from coarse to fine wheel as time passes."""
-        expired_nodes: list[tuple[str, int]] = []
-
-        def on_expired(node: tuple[str, int], state: SuspicionState) -> None:
-            expired_nodes.append(node)
-
-        wheel = TimingWheel(config=fast_config, on_expired=on_expired)
-
-        node = make_node(1)
-        state = make_state(node)
-        # Start in coarse wheel
-        expiration = time.monotonic() + 0.5
-
-        await wheel.add(node, state, expiration)
-
-        wheel.start()
-
-        try:
-            # Wait for cascade and expiration
-            await asyncio.sleep(0.8)
-
-            assert node in expired_nodes
-            stats = wheel.get_stats()
-            assert stats["cascade_count"] >= 1
-        finally:
-            await wheel.stop()
 
     @pytest.mark.asyncio
     async def test_remove_during_cascade(self, fast_config: TimingWheelConfig):

@@ -1,31 +1,21 @@
+"""
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
+"""
+
 from enum import Enum, IntEnum
 
+from .transition_result import TransitionResult
+from .wal_entry_state import WALEntryState
 
-class WALEntryState(IntEnum):
-    """
-    State machine for WAL entries tracking durability progress.
+_REHOMED = (
+    WALEntryState,
+    TransitionResult,
+)
 
-    Transitions: PENDING -> REGIONAL -> GLOBAL -> APPLIED -> COMPACTED
-    """
-
-    PENDING = 0
-    REGIONAL = 1
-    GLOBAL = 2
-    APPLIED = 3
-    COMPACTED = 4
-
-
-class TransitionResult(Enum):
-    SUCCESS = "success"
-    ALREADY_AT_STATE = "already_at_state"
-    ALREADY_PAST_STATE = "already_past_state"
-    ENTRY_NOT_FOUND = "entry_not_found"
-    INVALID_TRANSITION = "invalid_transition"
-
-    @property
-    def is_ok(self) -> bool:
-        return self in (
-            TransitionResult.SUCCESS,
-            TransitionResult.ALREADY_AT_STATE,
-            TransitionResult.ALREADY_PAST_STATE,
-        )
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

@@ -262,10 +262,13 @@ class H3Stream:
 
 
 class ResponseFrameCollection:
-    __slots__ = ("headers_frame", "body")
+    __slots__ = ("headers_frame", "trailers_frame", "body")
 
     def __init__(self) -> None:
         self.headers_frame: HeadersReceived = None
+        # The trailer section, kept apart from the header section (RFC 9110
+        # 6.5).
+        self.trailers_frame: HeadersReceived = None
         self.body = bytearray()
 
 
@@ -294,9 +297,6 @@ class QuicStreamAdapter(asyncio.Transport):
         self.protocol.quic.send_stream_data(self.stream_id, b"", end_stream=True)
         self.protocol._transmit_soon()
 
-def custom_exception_handler(*args):
-    pass
-
 
 class QuicProtocol(asyncio.DatagramProtocol):
     __slots__ = (
@@ -317,7 +317,6 @@ class QuicProtocol(asyncio.DatagramProtocol):
         "_connection_terminated_handler",
         "_stream_handler",
         "pushes",
-        "request_events",
         "_request_waiter",
         "_stream",
         "_is_done",
@@ -353,9 +352,6 @@ class QuicProtocol(asyncio.DatagramProtocol):
     ):
         self.loop = loop
 
-
-        loop.set_exception_handler(custom_exception_handler)
-
         self._request_waiter: Dict[int, asyncio.Future[Deque[H3Event]]] = {}
         self._closed = asyncio.Event()
         self._connected = False
@@ -378,7 +374,6 @@ class QuicProtocol(asyncio.DatagramProtocol):
             self._stream_handler = lambda r, w: None
 
         self.pushes: Dict[int, Deque[H3Event]] = {}
-        self.request_events: Dict[int, Deque[H3Event]] = {}
         self._request_waiter: Dict[int, asyncio.Future[Deque[H3Event]]] = {}
         self._stream: Dict[int, H3Stream] = {}
         self._is_done = False
@@ -553,6 +548,12 @@ class QuicProtocol(asyncio.DatagramProtocol):
             await self._connected_waiter
 
     # asyncio.Transport
+
+    def connection_lost(self, exc: Optional[Exception]) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+            self._timer_at = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = cast(asyncio.DatagramTransport, transport)
@@ -833,7 +834,31 @@ class QuicProtocol(asyncio.DatagramProtocol):
                 if self.responses.get(http_event.stream_id) is None:
                     self.responses[http_event.stream_id] = ResponseFrameCollection()
 
-                self.responses[http_event.stream_id].headers_frame = http_event
+                response_frames = self.responses[http_event.stream_id]
+
+                if response_frames.headers_frame is None:
+                    response_frames.headers_frame = http_event
+
+                else:
+                    # A later HEADERS frame is the response's trailer section
+                    # (RFC 9114 4.1), kept apart from its header section (RFC
+                    # 9110 6.5).
+                    response_frames.trailers_frame = http_event
+
+                if http_event.stream_ended:
+                    # A response can end on HEADERS -- one with no content
+                    # (HEAD, 204, 304), or its trailers -- and is whole here,
+                    # as one ending on DATA is below: it, its request's
+                    # waiter and its H3 stream leave their maps.
+                    request_waiter = self._request_waiter.pop(http_event.stream_id, None)
+                    finished_response = self.responses.pop(http_event.stream_id)
+                    self._stream.pop(http_event.stream_id, None)
+
+                    if request_waiter is None:
+                        raise Exception("Err. - Stream failed")
+
+                    elif request_waiter.done() is False:
+                        request_waiter.set_result(finished_response)
 
                 if http_event.push_id in self.pushes:
                     # push
@@ -844,13 +869,21 @@ class QuicProtocol(asyncio.DatagramProtocol):
                     self.responses[http_event.stream_id] = ResponseFrameCollection()
 
                 self.responses[http_event.stream_id].body.extend(http_event.data)
-                request_waiter = self._request_waiter.get(http_event.stream_id)
 
-                if http_event.stream_ended and request_waiter is None:
-                    raise Exception("Err. - Stream failed")
+                if http_event.stream_ended:
+                    # The response is whole: it, its request's waiter and its
+                    # H3 stream leave their maps here, so a connection that
+                    # lives on keeps nothing of a finished request. A waiter
+                    # already done -- given up on -- takes no response.
+                    request_waiter = self._request_waiter.pop(http_event.stream_id, None)
+                    finished_response = self.responses.pop(http_event.stream_id)
+                    self._stream.pop(http_event.stream_id, None)
 
-                elif http_event.stream_ended and request_waiter.done() is False:
-                    request_waiter.set_result(self.responses.pop(http_event.stream_id))
+                    if request_waiter is None:
+                        raise Exception("Err. - Stream failed")
+
+                    elif request_waiter.done() is False:
+                        request_waiter.set_result(finished_response)
 
                 if http_event.push_id in self.pushes:
                     # push
@@ -1014,16 +1047,33 @@ class QuicProtocol(asyncio.DatagramProtocol):
             elif isinstance(event, ConnectionTerminated):
                 self._connection_terminated_handler()
 
+                # Each waiter's error says why the connection closed -- a
+                # failed handshake names the certificate problem, say -- and
+                # each gets its own: a raised exception keeps the traceback
+                # of where it was raised.
+                termination_reason = (
+                    f"QUIC connection closed (error code {event.error_code:#x}): "
+                    f"{event.reason_phrase or 'no reason given'}"
+                )
+
                 # abort connection waiter
                 if self._connected_waiter is not None:
                     waiter = self._connected_waiter
                     self._connected_waiter = None
-                    waiter.set_exception(ConnectionError)
+                    waiter.set_exception(ConnectionError(termination_reason))
 
                 # abort ping waiters
                 for waiter in self._ping_waiters.values():
-                    waiter.set_exception(ConnectionError)
+                    waiter.set_exception(ConnectionError(termination_reason))
                 self._ping_waiters.clear()
+
+                # abort request waiters: a request in flight fails now, with
+                # the reason, rather than waiting out its timeout. One already
+                # done -- answered, or given up on -- is left as it is.
+                for waiter in self._request_waiter.values():
+                    if waiter.done() is False:
+                        waiter.set_exception(ConnectionError(termination_reason))
+                self._request_waiter.clear()
 
                 self._closed.set()
             elif isinstance(event, HandshakeCompleted):
@@ -1084,6 +1134,18 @@ class QuicProtocol(asyncio.DatagramProtocol):
                     allowed_pseudo_headers=frozenset((b":status",)),
                     required_pseudo_headers=frozenset((b":status",)),
                 )
+
+                # Interim (1xx) responses come before the final response,
+                # each in its own HEADERS frame (RFC 9114 4.1), and a client
+                # may ignore them (RFC 9110 15.2): the stream still waits for
+                # the response's own header section, so the next HEADERS
+                # frame is that, not trailers. Validation put :status first.
+                response_status = headers[0][1]
+                if response_status and response_status[0] == 0x31 and len(response_status) == 3:  # 0x31: "1"
+                    if stream_ended:
+                        raise MessageError("The response ended on an interim (1xx) response")
+
+                    return http_events
 
             else:
                 validate_headers(

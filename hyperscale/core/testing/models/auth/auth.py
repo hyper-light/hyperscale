@@ -54,12 +54,14 @@ class Auth(OptimizedArg, Generic[T]):
                 self.optimized = f'Authorization: Basic {encoded_credentials}{NEW_LINE}'
 
             case RequestType.GRAPHQL_HTTP2 | RequestType.HTTP2 | RequestType.HTTP3:
+                # The Basic scheme ahead of the credentials (RFC 7617 2), as
+                # the HTTP/1 form above sends them.
                 if len(self.data) > 1:
 
                     credentials_string = f"{self.data[0]}:{self.data[1]}"
                     encoded_credentials = (
                         b"authorization",
-                        base64.b64encode(
+                        b"Basic " + base64.b64encode(
                             credentials_string.encode()
                         )
                     )
@@ -67,7 +69,7 @@ class Auth(OptimizedArg, Generic[T]):
                 else:
                     encoded_credentials = (
                         b"authorization",
-                        base64.b64encode(
+                        b"Basic " + base64.b64encode(
                             self.data[0].encode()
                         )
                     )

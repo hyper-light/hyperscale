@@ -4,7 +4,6 @@ Spillover evaluation logic for capacity-aware routing (AD-43).
 
 from __future__ import annotations
 
-import time
 
 from hyperscale.distributed.env.env import Env
 
@@ -12,21 +11,26 @@ from .datacenter_capacity import DatacenterCapacity
 from .spillover_config import SpilloverConfig
 from .spillover_decision import SpilloverDecision
 
+from hyperscale.distributed.runtime import Clock
+
 
 class SpilloverEvaluator:
     """
     Evaluate whether a job should spillover to another datacenter.
     """
 
-    def __init__(self, config: SpilloverConfig) -> None:
+    def __init__(self, config: SpilloverConfig, clock: Clock) -> None:
+        """``clock`` is the one capacity reports are stamped with (the
+        aggregator's): staleness is measured on it."""
         self._config = config
+        self._clock = clock
 
     @classmethod
-    def from_env(cls, env: Env):
+    def from_env(cls, env: Env, clock: Clock):
         """
         Build a SpilloverEvaluator using environment configuration.
         """
-        return cls(SpilloverConfig.from_env(env))
+        return cls(SpilloverConfig.from_env(env), clock)
 
     def evaluate(
         self,
@@ -53,6 +57,20 @@ class SpilloverEvaluator:
                 primary_wait=primary_wait,
             )
 
+        return self._evaluate_fresh_primary(
+            job_cores_required, primary_capacity, fallback_capacities, primary_rtt_ms, primary_wait
+        )
+
+    def _evaluate_fresh_primary(
+        self,
+        job_cores_required: int,
+        primary_capacity: DatacenterCapacity,
+        fallback_capacities: list[tuple[DatacenterCapacity, float]],
+        primary_rtt_ms: float,
+        primary_wait: float,
+    ) -> SpilloverDecision:
+        """Keep the job on a fresh primary that serves it now or soon
+        enough (AD-43), else weigh spilling it over."""
         if primary_capacity.can_serve_immediately(job_cores_required):
             return self._no_spillover(
                 reason="primary_has_capacity",
@@ -67,10 +85,25 @@ class SpilloverEvaluator:
                 primary_wait=primary_wait,
             )
 
+        return self._evaluate_spillover(
+            job_cores_required, primary_capacity, fallback_capacities, primary_rtt_ms, primary_wait
+        )
+
+    def _evaluate_spillover(
+        self,
+        job_cores_required: int,
+        primary_capacity: DatacenterCapacity,
+        fallback_capacities: list[tuple[DatacenterCapacity, float]],
+        primary_rtt_ms: float,
+        primary_wait: float,
+    ) -> SpilloverDecision:
+        """Spill over to the nearest fallback that can take the job now,
+        when it improves the primary's wait enough (AD-43)."""
         candidate = self._select_spillover_candidate(
             job_cores_required=job_cores_required,
             fallback_capacities=fallback_capacities,
             primary_rtt_ms=primary_rtt_ms,
+            primary_job_cores=max(min(job_cores_required, primary_capacity.total_cores), 1),
         )
         if candidate is None:
             return self._no_spillover(
@@ -107,23 +140,57 @@ class SpilloverEvaluator:
         job_cores_required: int,
         fallback_capacities: list[tuple[DatacenterCapacity, float]],
         primary_rtt_ms: float,
+        primary_job_cores: int,
     ) -> tuple[DatacenterCapacity, float, float] | None:
+        """
+        The nearest fresh fallback with every core the job would use there
+        free now, where that is at least what the primary would give it
+        (``primary_job_cores``: the job's requirement capped at the
+        primary's cores, and at least one). A datacenter serves a job
+        larger than itself "immediately" when all its cores are free;
+        without the second bound an idle datacenter smaller than the cores
+        the primary already had free took the job for good.
+        """
         best_candidate: tuple[DatacenterCapacity, float, float] | None = None
         best_score = float("inf")
         for capacity, rtt_ms in fallback_capacities:
-            if not capacity.can_serve_immediately(job_cores_required):
-                continue
-            if self._is_capacity_stale(capacity):
-                continue
-
-            latency_penalty = rtt_ms - primary_rtt_ms
-            if latency_penalty > self._config.max_latency_penalty_ms:
-                continue
-
+            latency_penalty = self._fallback_latency_penalty(
+                capacity, rtt_ms, job_cores_required, primary_rtt_ms, primary_job_cores
+            )
             if latency_penalty < best_score:
                 best_score = latency_penalty
                 best_candidate = (capacity, rtt_ms, latency_penalty)
         return best_candidate
+
+    def _fallback_latency_penalty(
+        self,
+        capacity: DatacenterCapacity,
+        rtt_ms: float,
+        job_cores_required: int,
+        primary_rtt_ms: float,
+        primary_job_cores: int,
+    ) -> float:
+        """A fallback's latency penalty over the primary; infinite -- never
+        selected -- when it cannot take the job or is too far (AD-43)."""
+        if not self._can_take_job(capacity, job_cores_required, primary_job_cores):
+            return float("inf")
+
+        latency_penalty = rtt_ms - primary_rtt_ms
+        return float("inf") if latency_penalty > self._config.max_latency_penalty_ms else latency_penalty
+
+    def _can_take_job(
+        self,
+        capacity: DatacenterCapacity,
+        job_cores_required: int,
+        primary_job_cores: int,
+    ) -> bool:
+        """A fresh fallback with every core the job would use there free
+        now, at least as many as the primary would give it."""
+        return (
+            capacity.available_cores
+            >= min(job_cores_required, capacity.total_cores)
+            >= primary_job_cores
+        ) and not self._is_capacity_stale(capacity)
 
     def _no_spillover(
         self,
@@ -142,5 +209,5 @@ class SpilloverEvaluator:
         )
 
     def _is_capacity_stale(self, capacity: DatacenterCapacity) -> bool:
-        now = time.monotonic()
+        now = self._clock.monotonic()
         return capacity.is_stale(now, self._config.capacity_staleness_threshold_seconds)

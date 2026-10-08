@@ -134,11 +134,6 @@ class HTTPResponse(CallResult):
         return params
 
     @property
-    def reason(self) -> str | None:
-        if self.headers:
-            return self.headers.get("reason")
-
-    @property
     def data(self, model: Type[T] | None = None):
         
         if model:

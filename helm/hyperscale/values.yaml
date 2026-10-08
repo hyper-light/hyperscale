@@ -1,109 +1,118 @@
-# Default values for hyperscale.
-# This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
-
-replicaCount: 1
+# Hyperscale cluster topology.
+#
+# Every node runs one of the CLI's node commands -- `hyperscale run gate`,
+# `hyperscale run manager`, `hyperscale run worker`. Gates and managers are
+# StatefulSets advertising their stable pod DNS names (their peers are
+# configured by them), with a volume each for durable state (job ledger,
+# WAL, idempotency). Workers are a Deployment per datacenter, advertising
+# their pod IPs.
 
 image:
-  repository: nginx
+  # Build from this repository with docker/images/Dockerfile.source and
+  # load it into the cluster (KIND: `kind load docker-image`).
+  repository: hyperscale
+  tag: dev
   pullPolicy: IfNotPresent
-  # Overrides the image tag whose default is the chart appVersion.
-  tag: ""
 
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-serviceAccount:
-  # Specifies whether a service account should be created
-  create: true
-  # Automatically mount a ServiceAccount's API credentials?
-  automount: true
-  # Annotations to add to the service account
-  annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
-  name: ""
+# The cluster's DNS domain; peers are configured by their pod DNS names
+# (<pod>.<service>.<namespace>.svc.<clusterDomain>).
+clusterDomain: cluster.local
 
-podAnnotations:
-  appVersion: "0.1.5"
-podLabels:
-  appVersion: "0.1.5"
+# The secret every node encrypts cluster traffic with
+# (MERCURY_SYNC_AUTH_SECRET). Leave both empty to have the chart generate
+# a random one, kept across upgrades.
+clusterSecret:
+  # Name of an existing Secret holding the value under `key`.
+  existingSecret: ""
+  key: auth-secret
+  # Or the value itself (at least 16 characters).
+  value: ""
 
-podSecurityContext: {}
-  # fsGroup: 2000
+# Node log level (the commands' --log-level).
+logLevel: info
 
-securityContext: {}
-  # capabilities:
-  #   drop:
-  #   - ALL
-  # readOnlyRootFilesystem: true
-  # runAsNonRoot: true
-  # runAsUser: 1000
+# Seconds a node has to boot and to shut down (the commands'
+# --boot-timeout / --shutdown-timeout). Pods are given the shutdown
+# budget plus `terminationGraceMargin` before they are killed.
+bootTimeoutSeconds: 300
+shutdownTimeoutSeconds: 60
+terminationGraceMargin: 30
 
-service:
-  type: ClusterIP
-  port: 80
+# Any Env setting, as an environment variable on every node
+# (e.g. MANAGER_HEARTBEAT_INTERVAL: "5.0").
+env: {}
 
-ingress:
-  enabled: false
-  className: ""
-  annotations: {}
-    # kubernetes.io/ingress.class: nginx
-    # kubernetes.io/tls-acme: "true"
-  hosts:
-    - host: chart-example.local
-      paths:
-        - path: /
-          pathType: ImplementationSpecific
-  tls: []
-  #  - secretName: chart-example-tls
-  #    hosts:
-  #      - chart-example.local
+gates:
+  replicas: 1
+  # The gate tier's datacenter id (the command's --datacenter).
+  datacenter: global
+  ports:
+    tcp: 8431
+    udp: 8441
+  persistence:
+    size: 1Gi
+    storageClassName: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
-resources: {}
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user. This also increases chances charts run on environments with little
-  # resources, such as Minikube. If you do want to specify resources, uncomment the following
-  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-  # limits:
-  #   cpu: 100m
-  #   memory: 128Mi
-  # requests:
-  #   cpu: 100m
-  #   memory: 128Mi
+datacenters:
+  - name: dc-a
+    managers:
+      replicas: 3
+      ports:
+        tcp: 8231
+        udp: 8241
+      persistence:
+        size: 1Gi
+        storageClassName: ""
+      resources: {}
+      nodeSelector: {}
+      tolerations: []
+      affinity: {}
+    workers:
+      replicas: 2
+      # Executor processes per worker (the command's --workers); request
+      # at least this many CPUs.
+      cores: 2
+      ports:
+        tcp: 8111
+        udp: 8121
+      resources:
+        requests:
+          cpu: "2"
+          memory: 1Gi
+      nodeSelector: {}
+      tolerations: []
+      affinity: {}
 
-livenessProbe:
-  httpGet:
-    path: /
-    port: http
-readinessProbe:
-  httpGet:
-    path: /
-    port: http
+# `helm test`: a pod in the cluster submits one workflow through the gates
+# and waits for it to complete.
+probe:
+  # The TCP port the probe receives job updates on (UDP: port + 1).
+  port: 8500
+  # How long the job may take, including waiting for the cluster to
+  # accept it while nodes boot.
+  timeoutSeconds: 300
 
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 100
-  targetCPUUtilizationPercentage: 80
-  # targetMemoryUtilizationPercentage: 80
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
 
-# Additional volumes on the output Deployment definition.
-volumes: []
-# - name: foo
-#   secret:
-#     secretName: mysecret
-#     optional: false
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
 
-# Additional volumeMounts on the output Deployment definition.
-volumeMounts: []
-# - name: foo
-#   mountPath: "/etc/foo"
-#   readOnly: true
-
-nodeSelector: {}
-
-tolerations: []
-
-affinity: {}
+podAnnotations: {}
+podLabels: {}

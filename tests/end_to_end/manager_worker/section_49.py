@@ -5,6 +5,10 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
 from tests.end_to_end.workflows.base_scenario_workflow import BaseScenarioWorkflow
+from tests.end_to_end.workflow_lifecycle_checks import (
+    assert_retry_budgets_released,
+    assert_workflow_lifecycle_sound,
+)
 from tests.framework.results.scenario_outcome import ScenarioOutcome
 from tests.framework.results.scenario_result import ScenarioResult
 from tests.framework.runner.scenario_runner import ScenarioRunner
@@ -98,10 +102,8 @@ async def validate_49_1_retry_budget_reset_on_failover() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Retry budget reset expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Retry budget reset expected workflow retries")
+        assert_retry_budgets_released(manager, "Retry budget reset expected workflow retries")
     finally:
         await runtime.stop_cluster()
 
@@ -138,10 +140,8 @@ async def validate_49_3_overlapping_retry_windows() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Overlapping retries expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Overlapping retries expected workflow retries")
+        assert_retry_budgets_released(manager, "Overlapping retries expected workflow retries")
     finally:
         await runtime.stop_cluster()
 

@@ -3,7 +3,7 @@ Leader eligibility determination for LHM-aware leadership.
 """
 
 from dataclasses import dataclass
-from ..core.types import Status
+from hyperscale.distributed.swim.core.types import Status
 
 
 @dataclass(slots=True)

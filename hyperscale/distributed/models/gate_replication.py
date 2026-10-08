@@ -49,158 +49,22 @@ state held by a peer after the leader dies mid-prepare is dropped via
 explicit abort (happy path) or expires via the prepared-state TTL
 (fallback). This prevents split-brain where two gates could both take
 over a half-prepared job.
+
+This module is the wire namespace of the models below. Each lives in a
+file of its own and is re-homed here -- its ``__module__`` set to this
+module -- so its pickled form names this module, exactly as before the
+split: mixed-version clusters keep talking and data written earlier
+keeps loading.
 """
 
-from dataclasses import dataclass, field
-from enum import Enum
-
-from .message import Message
-
-
-class GateJobReplicaStatus(Enum):
-    """Per-peer acknowledgment status for a replica 2PC step."""
-
-    PREPARED = "PREPARED"
-    """Peer durably accepted the prepare; ready to commit on signal."""
-
-    COMMITTED = "COMMITTED"
-    """Peer committed the replica into its ``GateJobManager``."""
-
-    ABORTED = "ABORTED"
-    """Peer dropped a previously-prepared replica."""
-
-    ALREADY_COMMITTED = "ALREADY_COMMITTED"
-    """Peer observed a commit for ``(job_id, sequence)`` already;
-    re-prepare or re-commit is a no-op acknowledgment."""
-
-    REJECTED = "REJECTED"
-    """Peer refused the request (lower sequence than already committed,
-    malformed payload, or peer is shutting down)."""
-
-
-@dataclass(slots=True)
-class GateJobReplica(Message):
-    """The takeover capsule.
-
-    Carries everything a peer gate needs to assume leadership of a job
-    when the accepting gate dies. Designed for idempotent apply: peers
-    track ``(job_id, sequence)`` and ignore re-deliveries.
-
-    Fields map directly into ``GateJobManager`` / ``GateRuntimeState``
-    state on the peer:
-
-    * ``status_seed``, ``submitted_at`` → ``GlobalJobStatus`` written
-      into ``_jobs[job_id]``.
-    * ``target_dcs`` → ``_job_target_dcs[job_id]``.
-    * ``callback_addr`` → ``_job_callbacks[job_id]`` and
-      ``_progress_callbacks[job_id]``.
-    * ``fence_token`` → ``_job_fence_tokens[job_id]`` and the
-      leadership-tracker fencing token via
-      ``apply_leadership``.
-    * ``workflow_ids`` → ``_job_workflow_ids[job_id]``.
-    * ``submission_payload`` → ``_job_submissions[job_id]`` (raw
-      serialized ``JobSubmission`` so peers do not need to deserialize
-      the submission unless they actually take over and dispatch).
-    * ``leader_id`` + ``leader_addr`` →
-      ``_job_leadership_tracker.apply_leadership``.
-    * ``origin_gate_addr`` is the gate that accepted the client
-      submission (== ``leader_addr`` at submission time, but tracked
-      separately so it survives later leader changes).
-    """
-
-    job_id: str
-    sequence: int
-    fence_token: int
-    leader_id: str
-    leader_addr: tuple[str, int]
-    origin_gate_addr: tuple[str, int]
-    callback_addr: tuple[str, int] | None
-    target_dcs: list[str]
-    target_dc_count: int
-    status_seed: str
-    submitted_at: float
-    workflow_ids: list[str] = field(default_factory=list)
-    submission_payload: bytes = b""
-
-
-@dataclass(slots=True)
-class GateJobReplicaPrepare(Message):
-    """Leader → peer: store ``replica`` in the prepared registry."""
-
-    replica: GateJobReplica
-
-
-@dataclass(slots=True)
-class GateJobReplicaCommit(Message):
-    """Leader → peer: promote prepared replica ``(job_id, sequence)``
-    into the committed ``GateJobManager`` state.
-
-    Carries the full replica too so a peer that missed the prepare
-    (network drop, late join) can commit directly from this message.
-    The peer treats this as ``prepare`` immediately followed by
-    ``commit`` if it has no prepared state for ``(job_id, sequence)``.
-    """
-
-    replica: GateJobReplica
-
-
-@dataclass(slots=True)
-class GateJobReplicaAbort(Message):
-    """Leader → peer: drop prepared state for ``(job_id, sequence)``.
-
-    Fired when the leader's prepare phase failed to reach quorum and
-    the leader has rejected the client submission. Peers that
-    previously responded ``PREPARED`` MUST drop their prepared entry
-    on receipt. No-op when the peer has already committed (a separate
-    leader-level coordination problem that should not occur in a
-    correctly-running cluster).
-    """
-
-    job_id: str
-    sequence: int
-
-
-@dataclass(slots=True)
-class GateJobReplicaAck(Message):
-    """Peer → leader: acknowledgment for any 2PC step."""
-
-    job_id: str
-    sequence: int
-    status: str
-    """One of ``GateJobReplicaStatus`` values."""
-    responder_id: str
-    """Full node id of the peer for routing / audit trails."""
-
-
-@dataclass(slots=True)
-class GateJobReplicaFetchRequest(Message):
-    """Peer → peer: request cached committed replicas.
-
-    Used by the orphan coordinator's state-repair path: when a peer
-    sees a job in its leadership tracker (from an earlier
-    announcement) but the local ``GateJobManager`` has no state for
-    it, the peer queries other gates for the committed replica before
-    declaring the job unrecoverable.
-
-    ``leader_addr`` uses the same fetch path for the SWIM-leader repair
-    case where the leader knows a gate died but does not yet know every
-    job led by that gate locally.
-    """
-
-    job_id: str | None = None
-    leader_addr: tuple[str, int] | None = None
-
-
-@dataclass(slots=True)
-class GateJobReplicaFetchResponse(Message):
-    """Peer → peer: cached committed replica payload."""
-
-    job_id: str | None = None
-    leader_addr: tuple[str, int] | None = None
-    replica: GateJobReplica | None = None
-    replicas: list[GateJobReplica] = field(default_factory=list)
-    found: bool = False
-
+from .gate_job_replica import GateJobReplica
+from .gate_job_replica_abort import GateJobReplicaAbort
+from .gate_job_replica_ack import GateJobReplicaAck
+from .gate_job_replica_commit import GateJobReplicaCommit
+from .gate_job_replica_fetch_request import GateJobReplicaFetchRequest
+from .gate_job_replica_fetch_response import GateJobReplicaFetchResponse
+from .gate_job_replica_prepare import GateJobReplicaPrepare
+from .gate_job_replica_status import GateJobReplicaStatus
 
 __all__ = [
     "GateJobReplica",
@@ -212,3 +76,17 @@ __all__ = [
     "GateJobReplicaPrepare",
     "GateJobReplicaStatus",
 ]
+
+_WIRE_MODELS = (
+    GateJobReplicaStatus,
+    GateJobReplica,
+    GateJobReplicaPrepare,
+    GateJobReplicaCommit,
+    GateJobReplicaAbort,
+    GateJobReplicaAck,
+    GateJobReplicaFetchRequest,
+    GateJobReplicaFetchResponse,
+)
+
+for _wire_model in _WIRE_MODELS:
+    _wire_model.__module__ = __name__

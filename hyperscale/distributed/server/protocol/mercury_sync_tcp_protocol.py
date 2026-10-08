@@ -19,13 +19,21 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
         self,
         conn: T,
         mode: Literal['client', 'server'] = 'client',
+        server_state: ServerState["MercurySyncTCPProtocol"] | None = None,
     ):
         super().__init__()
         self.transport: asyncio.Transport = None
         self.loop = asyncio.get_event_loop()
         self.conn = conn
         self.flow: FlowControl = None
-        self.server_state = ServerState[MercurySyncTCPProtocol]()
+        # An accepted connection joins its server's shared state (its cap,
+        # and the set the server closes on abort and shutdown); a dialed
+        # connection keeps its own.
+        self.server_state = (
+            server_state
+            if server_state is not None
+            else ServerState[MercurySyncTCPProtocol]()
+        )
         self.connections = self.server_state.connections
         self.mode: Literal['client', 'server']  = mode
 
@@ -56,9 +64,8 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
         return (bytes(self._receive_buffer), self._receive_buffer_closed)
 
     def connection_made(self, transport: asyncio.Transport):
-        if self.server_state.is_at_capacity():
-            self.server_state.reject_connection()
-            transport.close()
+        if not self.server_state.admits_connection():
+            self.server_state.refuse_connection(transport)
             return
 
         self.connections.add(self)
@@ -74,6 +81,7 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
             self._receive_buffer += data
         except BufferOverflowError:
             # Buffer overflow attack - close connection immediately
+            self.conn._tcp_drop_counter.increment_message_too_large()
             self._receive_buffer.clear()
             self.transport.close()
             return
@@ -84,6 +92,7 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
                 message = self._receive_buffer.maybe_extract_framed()
             except FrameTooLargeError as frame_error:
                 # Frame too large - send structured error response before closing (Task 63)
+                self.conn._tcp_drop_counter.increment_message_too_large()
                 try:
                     error_response = frame_error.to_error_response()
                     self.transport.write(error_response)
@@ -104,6 +113,7 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
 
     def connection_lost(self, exc: Exception | None):
         self.connections.discard(self)
+        self._release_client_transport()
 
         if self.flow is not None:
             self.flow.resume_writing()
@@ -113,6 +123,11 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
             # self._unset_keepalive_if_required()
 
         self.on_con_lost.set_result(True)
+
+    def _release_client_transport(self) -> None:
+        """Hand a dialed (client-mode) connection's transport back to its connection pool."""
+        if self.mode == 'client' and self.transport is not None:
+            self.conn.lose_client_tcp(self.transport)
 
     def _unset_keepalive_if_required(self) -> None:
         if self.timeout_keep_alive_task is not None:

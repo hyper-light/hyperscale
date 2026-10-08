@@ -1,7 +1,7 @@
 import asyncio
 import functools
 import uuid
-from typing import Dict, Literal
+from typing import Callable, Dict, Literal
 from hyperscale.reporting.common import (
     ReporterTypes,
     WorkflowMetricSet,
@@ -53,6 +53,7 @@ class Prometheus:
     def __init__(self, config: PrometheusConfig) -> None:
         self.pushgateway_host = config.pushgateway_host
         self.pushgateway_port = config.pushgateway_port
+        self.pushgateway_address = f"{config.pushgateway_host}:{config.pushgateway_port}"
         self.auth_request_method = config.auth_request_method
         self.auth_request_timeout = config.auth_request_timeout
         self.auth_request_data = config.auth_request_data
@@ -92,13 +93,23 @@ class Prometheus:
         if self.username and self.password:
             self._has_auth = True
 
-    def _generate_auth(self) -> basic_auth_handler:
+    def _generate_auth(
+        self,
+        url: str,
+        method: str,
+        timeout: float | None,
+        headers: list[tuple[str, str]],
+        data: bytes,
+    ) -> Callable[[], None]:
+        """The pushgateway handler ``push_to_gateway`` calls with the push's
+        own url, method, timeout, headers and body: those of the push itself,
+        which the handler must send unchanged, with Basic Auth added."""
         return basic_auth_handler(
-            self.pushgateway_address,
-            self.auth_request_method,
-            self.auth_request_timeout,
-            {"Content-Type": "application/json"},
-            self.auth_request_data,
+            url,
+            method,
+            timeout,
+            headers,
+            data,
             username=self.username,
             password=self.password,
         )

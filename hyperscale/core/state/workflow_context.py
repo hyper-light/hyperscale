@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, Dict
+from typing import Dict
 
 
 class WorkflowContext:
@@ -14,7 +14,7 @@ class WorkflowContext:
     """
     
     def __init__(self) -> None:
-        self._context: Dict[str, Any] = {}
+        self._context: Dict[str, object] = {}
         self._timestamps: Dict[str, int] = {}
         self._sources: Dict[str, str] = {}  # key -> source_node for tiebreaking
         self._write_lock = asyncio.Lock()
@@ -25,13 +25,13 @@ class WorkflowContext:
     def __repr__(self) -> str:
         return str(self._context)
 
-    def get(self, key: str, default: Any = None):
+    def get(self, key: str, default: object = None):
         return self._context.get(key, default)
 
     def __getitem__(self, key: str):
         return self._context[key]
 
-    def dict(self) -> Dict[str, Any]:
+    def dict(self) -> Dict[str, object]:
         """Return the context as a dictionary."""
         return self._context
     
@@ -46,7 +46,7 @@ class WorkflowContext:
     async def set(
         self,
         key: str,
-        value: Any,
+        value: object,
         timestamp: int | None = None,
         source_node: str | None = None,
     ):

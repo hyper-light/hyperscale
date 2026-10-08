@@ -13,14 +13,43 @@ Key responsibilities:
 """
 
 import asyncio
-import time
+import dataclasses
 from contextlib import asynccontextmanager
+from types import MappingProxyType
 from typing import AsyncIterator
 
 from hyperscale.distributed.models import (
+    DatacenterSubstitution,
     GlobalJobStatus,
     JobFinalResult,
     JobStatus,
+)
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
+_TERMINAL_JOB_STATUSES = frozenset(
+    {
+        JobStatus.COMPLETED.value,
+        JobStatus.FAILED.value,
+        JobStatus.CANCELLED.value,
+        JobStatus.TIMEOUT.value,
+    }
+)
+
+# A datacenter's reported final status, normalized: timeouts and both
+# spellings of cancelled fold to one value; anything unrecognized is FAILED.
+_NORMALIZED_FINAL_JOB_STATUSES = MappingProxyType(
+    {
+        "timeout": JobStatus.TIMEOUT.value,
+        "timed_out": JobStatus.TIMEOUT.value,
+        "cancelled": JobStatus.CANCELLED.value,
+        "canceled": JobStatus.CANCELLED.value,
+        JobStatus.COMPLETED.value: JobStatus.COMPLETED.value,
+        JobStatus.FAILED.value: JobStatus.FAILED.value,
+    }
 )
 
 
@@ -48,9 +77,20 @@ class GateJobManager:
         # job_id -> {datacenter_id -> JobFinalResult}
         self._job_dc_results: dict[str, dict[str, JobFinalResult]] = {}
 
-        # Track which DCs were assigned for each job (to know when complete)
-        # job_id -> set of datacenter IDs
+        # The datacenters each job runs in -- those its final results are
+        # awaited from: job_id -> set of datacenter IDs
         self._job_target_dcs: dict[str, set[str]] = {}
+
+        # Datacenters each job lost while it ran there, each with the one
+        # its unfinished workflows re-ran in (AD-36 Part 13):
+        # job_id -> lost datacenter -> substitution
+        self._job_datacenter_substitutions: dict[
+            str, dict[str, DatacenterSubstitution]
+        ] = {}
+
+        # Datacenters each job no longer runs in that must stop running
+        # it -- lost, or dispatched to without an answer: job_id -> set
+        self._job_released_datacenters: dict[str, set[str]] = {}
 
         # Client push notification callbacks
         # job_id -> callback address for push notifications
@@ -59,6 +99,10 @@ class GateJobManager:
         # Per-job fence token tracking for rejecting stale updates
         # job_id -> highest fence_token seen for this job
         self._job_fence_tokens: dict[str, int] = {}
+
+        # When this gate first found each terminal job terminal (its
+        # retention runs from there): job_id -> monotonic instant
+        self._job_terminal_since: dict[str, float] = {}
 
         # Per-job locks for concurrent access safety
         self._job_locks: dict[str, asyncio.Lock] = {}
@@ -105,10 +149,20 @@ class GateJobManager:
         job = self._jobs.pop(job_id, None)
         self._job_dc_results.pop(job_id, None)
         self._job_target_dcs.pop(job_id, None)
+        self._job_datacenter_substitutions.pop(job_id, None)
+        self._job_released_datacenters.pop(job_id, None)
         self._job_callbacks.pop(job_id, None)
         self._job_fence_tokens.pop(job_id, None)
+        self._job_terminal_since.pop(job_id, None)
         # Don't delete the lock - it may still be in use
         return job
+
+    def terminal_since(self, job_id: str, now: float) -> float:
+        """When this gate first found the terminal job ``job_id`` terminal
+        -- ``now``, the first time it is asked. A job's retention runs from
+        its end: its timestamp is its submission, so a job that ran longer
+        than the retention was swept the moment it ended."""
+        return self._job_terminal_since.setdefault(job_id, now)
 
     def has_job(self, job_id: str) -> bool:
         """Check if a job exists."""
@@ -153,6 +207,174 @@ class GateJobManager:
         if job_id not in self._job_target_dcs:
             self._job_target_dcs[job_id] = set()
         self._job_target_dcs[job_id].add(dc_id)
+
+    def move_target_dc(self, job_id: str, from_dc: str, to_dc: str) -> None:
+        """Pass one of the job's datacenter slots to another datacenter --
+        before the job is sent there, so a result it delivers is the
+        job's, and none from the datacenter it passed from is."""
+        target_dcs = self._job_target_dcs.setdefault(job_id, set())
+        target_dcs.discard(from_dc)
+        target_dcs.add(to_dc)
+
+    def discard_target_dc(self, job_id: str, dc_id: str) -> None:
+        """Drop a datacenter slot the job could not be placed in."""
+        if (target_dcs := self._job_target_dcs.get(job_id)) is not None:
+            target_dcs.discard(dc_id)
+
+    # =========================================================================
+    # Placement (AD-36 Part 13: mid-flight failover)
+    # =========================================================================
+
+    def get_datacenter_substitutions(self, job_id: str) -> list[DatacenterSubstitution]:
+        """The job's lost datacenters and their replacements, in the
+        order they were lost."""
+        return list(self._job_datacenter_substitutions.get(job_id, {}).values())
+
+    def set_datacenter_substitutions(
+        self, job_id: str, substitutions: list[DatacenterSubstitution]
+    ) -> None:
+        """Replace the job's substitutions (a committed replica's)."""
+        if substitutions:
+            self._job_datacenter_substitutions[job_id] = {
+                substitution.lost_datacenter: substitution
+                for substitution in substitutions
+            }
+        else:
+            self._job_datacenter_substitutions.pop(job_id, None)
+
+    def release_datacenter(self, job_id: str, datacenter: str) -> None:
+        """A datacenter the job no longer runs in, that must stop running
+        it."""
+        self._job_released_datacenters.setdefault(job_id, set()).add(datacenter)
+
+    def get_released_datacenters(self, job_id: str) -> set[str]:
+        return self._job_released_datacenters.get(job_id, set())
+
+    def set_released_datacenters(self, job_id: str, datacenters: set[str]) -> None:
+        """Replace the job's released datacenters (a committed replica's)."""
+        if datacenters:
+            self._job_released_datacenters[job_id] = set(datacenters)
+        else:
+            self._job_released_datacenters.pop(job_id, None)
+
+    def expected_workflow_datacenters(self, job_id: str, workflow_id: str) -> set[str]:
+        """The datacenters whose results make up a workflow's one
+        aggregate: the job's datacenters -- except where a lost datacenter
+        delivered the workflow's result before it was lost, which keeps
+        that result slot from the replacement it passed the rest to. A
+        chain of losses follows the chain: the earliest datacenter along
+        it that delivered the workflow holds the slot."""
+        target_dcs = self._job_target_dcs.get(job_id, set())
+        if not (substitutions := self._job_datacenter_substitutions.get(job_id)):
+            return target_dcs
+
+        substitution_by_replacement = self._substitution_by_replacement(substitutions)
+        expected_datacenters: set[str] = {
+            self._workflow_slot_holder(
+                target_dc,
+                workflow_id,
+                len(substitutions),
+                substitution_by_replacement,
+            )
+            for target_dc in target_dcs
+        }
+        # A lost datacenter nothing re-ran for delivered every workflow's
+        # result: it holds each slot still.
+        expected_datacenters.update(self._unreplaced_slot_holders(substitutions, workflow_id))
+        return expected_datacenters
+
+    @staticmethod
+    def _substitution_by_replacement(
+        substitutions: dict[str, DatacenterSubstitution],
+    ) -> dict[str, DatacenterSubstitution]:
+        """Each substitution keyed by the datacenter that replaced the lost one."""
+        return {
+            substitution.replacement_datacenter: substitution
+            for substitution in substitutions.values()
+        }
+
+    def _workflow_slot_holder(
+        self,
+        target_dc: str,
+        workflow_id: str,
+        substitution_count: int,
+        substitution_by_replacement: dict[str, DatacenterSubstitution],
+    ) -> str:
+        """Follow the chain of losses back from ``target_dc``: the earliest
+        datacenter along it that delivered the workflow holds its slot."""
+        slot_holder = chain_datacenter = target_dc
+        # A replacement is never a datacenter the job held before, so a
+        # chain is no longer than the substitutions.
+        for _ in range(substitution_count):
+            if (
+                substitution := substitution_by_replacement.get(chain_datacenter)
+            ) is None:
+                break
+            slot_holder = self._slot_holder_after(substitution, workflow_id, slot_holder)
+            chain_datacenter = substitution.lost_datacenter
+        return slot_holder
+
+    @staticmethod
+    def _slot_holder_after(
+        substitution: DatacenterSubstitution,
+        workflow_id: str,
+        slot_holder: str,
+    ) -> str:
+        """The lost datacenter takes the slot when it delivered the workflow before it was lost."""
+        return (
+            substitution.lost_datacenter
+            if workflow_id in substitution.completed_workflow_ids
+            else slot_holder
+        )
+
+    def _unreplaced_slot_holders(
+        self,
+        substitutions: dict[str, DatacenterSubstitution],
+        workflow_id: str,
+    ) -> list[str]:
+        """Lost datacenters nothing re-ran for that delivered the workflow."""
+        return [
+            substitution.lost_datacenter
+            for substitution in substitutions.values()
+            if self._delivered_without_replacement(substitution, workflow_id)
+        ]
+
+    @staticmethod
+    def _delivered_without_replacement(
+        substitution: DatacenterSubstitution,
+        workflow_id: str,
+    ) -> bool:
+        """Whether a lost datacenter with no replacement delivered the workflow."""
+        return (
+            not substitution.replacement_datacenter
+            and workflow_id in substitution.completed_workflow_ids
+        )
+
+    def rerun_origin(self, job_id: str, datacenter: str) -> str | None:
+        """The datacenter whose share ``datacenter`` re-runs: the first
+        lost datacenter of the chain of losses ending at it (None when it
+        replaced none)."""
+        if not (substitutions := self._job_datacenter_substitutions.get(job_id)):
+            return None
+        return self._chain_origin(
+            datacenter,
+            len(substitutions),
+            self._substitution_by_replacement(substitutions),
+        )
+
+    @staticmethod
+    def _chain_origin(
+        datacenter: str,
+        substitution_count: int,
+        substitution_by_replacement: dict[str, DatacenterSubstitution],
+    ) -> str | None:
+        """Walk the chain of losses ending at ``datacenter`` back to its first lost datacenter."""
+        origin: str | None = None
+        for _ in range(substitution_count):
+            if (substitution := substitution_by_replacement.get(datacenter)) is None:
+                break
+            origin = datacenter = substitution.lost_datacenter
+        return origin
 
     # =========================================================================
     # DC Results Management
@@ -234,129 +456,111 @@ class GateJobManager:
 
     def _normalize_job_status(self, status: str) -> str:
         normalized = status.strip().lower()
-        if normalized in ("timeout", "timed_out"):
-            return JobStatus.TIMEOUT.value
-        if normalized in ("cancelled", "canceled"):
-            return JobStatus.CANCELLED.value
-        if normalized in (JobStatus.COMPLETED.value, JobStatus.FAILED.value):
-            return normalized
-        return JobStatus.FAILED.value
-
-    def _should_resolve_final_status(
-        self, missing_dcs: set[str], normalized_statuses: list[str]
-    ) -> bool:
-        if not missing_dcs:
-            return True
-        terminal_overrides = {
-            JobStatus.FAILED.value,
-            JobStatus.CANCELLED.value,
-            JobStatus.TIMEOUT.value,
-        }
-        return any(status in terminal_overrides for status in normalized_statuses)
+        return _NORMALIZED_FINAL_JOB_STATUSES.get(normalized, JobStatus.FAILED.value)
 
     def aggregate_job_status(self, job_id: str) -> GlobalJobStatus | None:
         """
-        Aggregate status across all datacenters for a job.
+        The job as stored, with the datacenters' final results tallied in
+        -- how many completed and failed, and their errors -- and its
+        elapsed time: a copy, so reading it changes nothing.
 
-        Returns updated GlobalJobStatus or None if job doesn't exist.
-        Caller should hold the job lock.
+        Its status and totals are the stored ones: progress keeps the
+        totals and rate live, and only the job's terminal paths decide its
+        status. A client's status poll resolved the status here and stored
+        it -- marking the job terminal without finalizing it, so the paths
+        that finalize then passed over a job already terminal and its
+        requestor never got its result; calling datacenters that had not
+        reported yet timed out -- and overwrote the live totals and rate
+        with sums of final results, zero until datacenters finished.
+
+        Returns None if the job doesn't exist. Caller should hold the job
+        lock.
         """
         job = self._jobs.get(job_id)
         if not job:
             return None
 
-        dc_results = self._job_dc_results.get(job_id, {})
-        target_dcs = self._job_target_dcs.get(job_id, set())
-        expected_dcs = target_dcs or set(dc_results.keys())
-        missing_dcs = expected_dcs - set(dc_results.keys())
+        completed_datacenters, failed_datacenters, errors = self._tally_final_results(job_id)
 
-        # Aggregate totals
-        total_completed = 0
-        total_failed = 0
-        completed_dcs = 0
-        failed_dcs = 0
-        errors: list[str] = []
-        rates: list[float] = []
-        normalized_statuses: list[str] = []
-
-        for dc_id, result in dc_results.items():
-            total_completed += result.total_completed
-            total_failed += result.total_failed
-
-            status_value = self._normalize_job_status(result.status)
-            normalized_statuses.append(status_value)
-            if status_value == JobStatus.COMPLETED.value:
-                completed_dcs += 1
-            else:
-                failed_dcs += 1
-
-            if result.errors:
-                errors.extend([f"{dc_id}: {error}" for error in result.errors])
-            elif status_value != JobStatus.COMPLETED.value:
-                errors.append(
-                    f"{dc_id}: reported status {result.status} without error details"
-                )
-
-            rate_value = getattr(result, "rate", 0.0)
-            if isinstance(rate_value, (int, float)) and rate_value > 0:
-                rates.append(float(rate_value))
-
-        should_resolve = bool(expected_dcs) and self._should_resolve_final_status(
-            missing_dcs, normalized_statuses
+        return dataclasses.replace(
+            job,
+            completed_datacenters=completed_datacenters,
+            failed_datacenters=failed_datacenters,
+            errors=errors,
+            elapsed_seconds=self._elapsed_seconds_now(job),
         )
 
-        if should_resolve and missing_dcs:
-            for dc_id in sorted(missing_dcs):
-                failed_dcs += 1
-                normalized_statuses.append(JobStatus.TIMEOUT.value)
-                errors.append(f"{dc_id}: missing final result")
-
-        # Update job with aggregated values
-        job.total_completed = total_completed
-        job.total_failed = total_failed
-        job.completed_datacenters = completed_dcs
-        job.failed_datacenters = failed_dcs
-        job.errors = errors
-        job.overall_rate = sum(rates) if rates else 0.0
-
-        # Calculate elapsed time
-        if job.timestamp > 0:
-            job.elapsed_seconds = time.monotonic() - job.timestamp
-
-        # Determine overall status
-        if should_resolve and normalized_statuses:
-            resolution_details = ""
-            if JobStatus.FAILED.value in normalized_statuses:
-                job.status = JobStatus.FAILED.value
-                resolution_details = "failed_dc_reported"
-            elif JobStatus.CANCELLED.value in normalized_statuses:
-                job.status = JobStatus.CANCELLED.value
-                resolution_details = "cancelled_dc_reported"
-            elif JobStatus.TIMEOUT.value in normalized_statuses:
-                job.status = JobStatus.TIMEOUT.value
-                resolution_details = "timeout_dc_reported"
-            elif all(
-                status == JobStatus.COMPLETED.value for status in normalized_statuses
-            ):
-                job.status = JobStatus.COMPLETED.value
-                resolution_details = "all_completed"
+    def _tally_final_results(self, job_id: str) -> tuple[int, int, list[str]]:
+        """Count the datacenters' completed and failed final results and gather their errors."""
+        completed_datacenters = 0
+        failed_datacenters = 0
+        errors: list[str] = []
+        for datacenter_id, result in self._job_dc_results.get(job_id, {}).items():
+            if (
+                status_value := self._normalize_job_status(result.status)
+            ) == JobStatus.COMPLETED.value:
+                completed_datacenters += 1
             else:
-                job.status = JobStatus.FAILED.value
-                resolution_details = "mixed_terminal_status"
+                failed_datacenters += 1
 
-            if missing_dcs:
-                resolution_details = (
-                    f"{resolution_details};missing_dcs={len(missing_dcs)}"
-                )
+            errors.extend(self._final_result_errors(datacenter_id, result, status_value))
 
-            if resolution_details:
-                job.resolution_details = resolution_details
+        return completed_datacenters, failed_datacenters, errors
 
-        return job
+    def _final_result_errors(
+        self,
+        datacenter_id: str,
+        result: JobFinalResult,
+        status_value: str,
+    ) -> list[str]:
+        """A final result's errors, or a stand-in for a non-completed result reported without any."""
+        if result.errors:
+            return self._prefixed_errors(datacenter_id, result.errors)
+        if status_value != JobStatus.COMPLETED.value:
+            return [
+                f"{datacenter_id}: reported status {result.status} without error details"
+            ]
+        return []
+
+    @staticmethod
+    def _prefixed_errors(datacenter_id: str, errors: list[str]) -> list[str]:
+        """Each error prefixed with the datacenter that reported it."""
+        return [f"{datacenter_id}: {error}" for error in errors]
+
+    @staticmethod
+    def _elapsed_seconds_now(job: GlobalJobStatus) -> float:
+        """Time since the job started, or its stored elapsed time when it has no start."""
+        return (
+            _DEFAULT_CLOCK.monotonic() - job.timestamp
+            if job.timestamp > 0
+            else job.elapsed_seconds
+        )
 
     # =========================================================================
     # Cleanup
     # =========================================================================
+
+    def _expired_terminal_job_ids(self, max_age_seconds: float) -> list[str]:
+        """Jobs terminal for longer than ``max_age_seconds``, judged at one instant."""
+        now = _DEFAULT_CLOCK.monotonic()
+        return [
+            job_id
+            for job_id, job in list(self._jobs.items())
+            if self._is_terminal_job_expired(job_id, job, now, max_age_seconds)
+        ]
+
+    def _is_terminal_job_expired(
+        self,
+        job_id: str,
+        job: GlobalJobStatus,
+        now: float,
+        max_age_seconds: float,
+    ) -> bool:
+        """Whether the job is terminal and has been for longer than ``max_age_seconds``."""
+        if job.status not in _TERMINAL_JOB_STATUSES:
+            return False
+        age = now - self.terminal_since(job_id, now)
+        return age > max_age_seconds
 
     def cleanup_old_jobs(self, max_age_seconds: float) -> list[str]:
         """
@@ -365,20 +569,7 @@ class GateJobManager:
         Returns list of cleaned up job IDs.
         Note: Caller should be careful about locking - this iterates all jobs.
         """
-        now = time.monotonic()
-        terminal_statuses = {
-            JobStatus.COMPLETED.value,
-            JobStatus.FAILED.value,
-            JobStatus.CANCELLED.value,
-            JobStatus.TIMEOUT.value,
-        }
-        to_remove: list[str] = []
-
-        for job_id, job in list(self._jobs.items()):
-            if job.status in terminal_statuses:
-                age = now - job.timestamp
-                if age > max_age_seconds:
-                    to_remove.append(job_id)
+        to_remove = self._expired_terminal_job_ids(max_age_seconds)
 
         for job_id in to_remove:
             self.delete_job(job_id)

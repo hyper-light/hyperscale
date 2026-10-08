@@ -3,12 +3,24 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass, field
-from time import monotonic
 
 import psutil
 
 from hyperscale.distributed.resources.adaptive_kalman_filter import AdaptiveKalmanFilter
 from hyperscale.distributed.resources.resource_metrics import ResourceMetrics
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
+# Kalman noise for resource measurements (CPU in percent, memory in
+# bytes): shared by every resource estimator so node-level and
+# per-workflow estimates carry comparable uncertainty.
+CPU_PROCESS_NOISE = 15.0
+CPU_MEASUREMENT_NOISE = 50.0
+MEMORY_PROCESS_NOISE = 1e6
+MEMORY_MEASUREMENT_NOISE = 1e7
 
 
 @dataclass(slots=True)
@@ -16,10 +28,10 @@ class ProcessResourceMonitor:
     """Monitor resource usage for a process tree with Kalman filtering."""
 
     root_pid: int = field(default_factory=os.getpid)
-    cpu_process_noise: float = 15.0
-    cpu_measurement_noise: float = 50.0
-    memory_process_noise: float = 1e6
-    memory_measurement_noise: float = 1e7
+    cpu_process_noise: float = CPU_PROCESS_NOISE
+    cpu_measurement_noise: float = CPU_MEASUREMENT_NOISE
+    memory_process_noise: float = MEMORY_PROCESS_NOISE
+    memory_measurement_noise: float = MEMORY_MEASUREMENT_NOISE
 
     _process: psutil.Process | None = field(default=None, init=False)
     _cpu_filter: AdaptiveKalmanFilter = field(init=False)
@@ -47,6 +59,11 @@ class ProcessResourceMonitor:
         self._total_memory = psutil.virtual_memory().total
         self._cpu_count = psutil.cpu_count() or 1
 
+    @property
+    def total_memory_bytes(self) -> int:
+        """Physical memory of this host, as sampled at construction."""
+        return self._total_memory
+
     async def sample(self) -> ResourceMetrics:
         """Sample the process tree and return filtered metrics."""
         async with self._lock:
@@ -66,18 +83,21 @@ class ProcessResourceMonitor:
 
         try:
             processes = self._collect_processes()
-            raw_cpu, raw_memory, total_fds, live_count = self._aggregate_samples(
-                processes
-            )
-            metrics = self._build_metrics(raw_cpu, raw_memory, total_fds, live_count)
+            raw_cpu, raw_memory, total_fds, largest_process_fds, live_count = self._aggregate_samples(processes)
+            metrics = self._build_metrics(raw_cpu, raw_memory, total_fds, largest_process_fds, live_count)
             self._last_metrics = metrics
             return metrics
         except psutil.NoSuchProcess:
-            return (
-                self._last_metrics
-                if self._last_metrics is not None
-                else self._empty_metrics()
-            )
+            return self._last_or_empty_metrics()
+
+    def _last_or_empty_metrics(self) -> ResourceMetrics:
+        """The last successful sample, or empty metrics before any: what a
+        sample of a vanished process tree reports."""
+        return (
+            self._last_metrics
+            if self._last_metrics is not None
+            else self._empty_metrics()
+        )
 
     def _collect_processes(self) -> list[psutil.Process]:
         children = self._process.children(recursive=True)
@@ -85,10 +105,11 @@ class ProcessResourceMonitor:
 
     def _aggregate_samples(
         self, processes: list[psutil.Process]
-    ) -> tuple[float, int, int, int]:
+    ) -> tuple[float, int, int, int, int]:
         raw_cpu = 0.0
         raw_memory = 0
         total_fds = 0
+        largest_process_fds = 0
         live_count = 0
 
         for process in processes:
@@ -99,9 +120,10 @@ class ProcessResourceMonitor:
             raw_cpu += cpu
             raw_memory += memory
             total_fds += file_descriptors
+            largest_process_fds = max(largest_process_fds, file_descriptors)
             live_count += 1
 
-        return raw_cpu, raw_memory, total_fds, live_count
+        return raw_cpu, raw_memory, total_fds, largest_process_fds, live_count
 
     def _sample_process(self, process: psutil.Process) -> tuple[float, int, int] | None:
         try:
@@ -123,6 +145,7 @@ class ProcessResourceMonitor:
         raw_cpu: float,
         raw_memory: int,
         total_fds: int,
+        largest_process_fds: int,
         live_count: int,
     ) -> ResourceMetrics:
         cpu_estimate, cpu_uncertainty = self._cpu_filter.update(raw_cpu)
@@ -144,9 +167,10 @@ class ProcessResourceMonitor:
             memory_uncertainty=memory_uncertainty,
             memory_percent=memory_percent,
             file_descriptor_count=total_fds,
-            timestamp_monotonic=monotonic(),
+            timestamp_monotonic=_DEFAULT_CLOCK.monotonic(),
             sample_count=self._cpu_filter.get_sample_count(),
             process_count=live_count,
+            largest_process_file_descriptor_count=largest_process_fds,
         )
 
     def _empty_metrics(self) -> ResourceMetrics:
@@ -157,7 +181,7 @@ class ProcessResourceMonitor:
             memory_uncertainty=0.0,
             memory_percent=0.0,
             file_descriptor_count=0,
-            timestamp_monotonic=monotonic(),
+            timestamp_monotonic=_DEFAULT_CLOCK.monotonic(),
             sample_count=0,
             process_count=0,
         )

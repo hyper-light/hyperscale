@@ -1,9 +1,11 @@
+import hashlib
 import os
 import struct
+from base64 import b64encode
 from base64 import encodebytes as base64encode
 from typing import Any, Tuple
 
-from .constants import HEADER_LENGTH_INDEX
+from .constants import HEADER_LENGTH_INDEX, WEBSOCKET_ACCEPT_GUID
 
 
 def create_sec_websocket_key():
@@ -49,3 +51,39 @@ async def get_message_buffer_size(header_bits: Tuple[int], connection: Any):
         length = length_bits
 
     return length
+
+
+def websocket_accept(key: str) -> bytes:
+    """The Sec-WebSocket-Accept a server must answer ``key`` with (RFC 6455, 4.2.2)."""
+    return b64encode(hashlib.sha1(key.encode() + WEBSOCKET_ACCEPT_GUID).digest())
+
+
+def mask_payload(payload: bytes, mask: bytes) -> bytes:
+    """``payload`` XORed with the repeating four-byte ``mask`` (RFC 6455, 5.3), one big-integer XOR."""
+    length = len(payload)
+    if length == 0:
+        return b""
+
+    repeated = (mask * ((length + 3) // 4))[:length]
+    return (int.from_bytes(payload, "little") ^ int.from_bytes(repeated, "little")).to_bytes(length, "little")
+
+
+def encode_frame(opcode: int, payload: bytes, final: bool = True) -> bytes:
+    """
+    One client frame (RFC 6455, 5.2), masked as every client frame must be,
+    with a fresh mask from a strong entropy source (5.3).
+    """
+    length = len(payload)
+    first_byte = (0x80 if final else 0x00) | opcode
+
+    if length < 126:
+        header = bytes((first_byte, 0x80 | length))
+
+    elif length < 65536:
+        header = bytes((first_byte, 0x80 | 126)) + length.to_bytes(2, "big")
+
+    else:
+        header = bytes((first_byte, 0x80 | 127)) + length.to_bytes(8, "big")
+
+    mask = os.urandom(4)
+    return header + mask + mask_payload(payload, mask)

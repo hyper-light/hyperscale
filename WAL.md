@@ -1,5 +1,13 @@
 # Raft Consensus for Manager & Gate Clusters
 
+> **As built (checked against the code 2026-10-06).** This is the original build plan. What exists differs in four deliberate ways; see `docs/REMAINING_LEDGER.md` (R-G21, R-G24, R-G25) and `docs/architecture/D1_RAFT_PERSISTENCE.md`.
+> - **Phases 1, 2 and 5 are built:** `raft/raft_node.py`, `raft/raft_log.py` (bounded, `max_entries=50_000`), `raft/raft_consensus.py` / `raft/gate_raft_consensus.py` (constructed in `nodes/manager/raft_integration.py:87` and `nodes/gate/raft_integration.py:87`), and the `raft_*` / `gate_raft_*` TCP handlers (`nodes/manager/server.py:14401-14460`, `nodes/gate/server.py:9811-9889`).
+> - **Phases 3-4 were collapsed (2026-10-05):** `RaftJobManager`/`GateRaftJobManager` were never called and are deleted. Raft replicates the event-sourced job ledger, not each JobManager mutation: the 43 command types, both command dataclasses and both state machines became one msgspec `LedgerAppendCommand` (`raft/models/ledger_append_command.py:10`) applied by one `LedgerStateMachine` (`raft/ledger_state_machine.py:19`), proposed by `LedgerReplicator` (manager `server.py:696`, gate `server.py:1168`). "Replace ALL direct mutations with Raft-routed equivalents" (Phase 5) is therefore not the design.
+> - **Phase 6 persistence is `RaftStore`, not `raft_wal.py` (D1):** every Raft group of a node persists to one node-level, group-committed, CRC-framed msgspec store with an identity stamp and a torn-last-frame-only recovery rule (`raft/store/raft_store.py`), opened by `hyperscale run manager|gate` (`commands/run/shared.py:218`, used at `commands/run/manager.py:143` and `commands/run/gate.py:132`). `RaftWAL` was dead code and is deleted. Snapshots are live (`raft/snapshot_manager.py`, `raft/install_snapshot.py`). `ReplicatedStatsStore` and `ReplicatedMembershipLog` were never constructed and are deleted; cluster membership is AD-52 `ClusterMembership`.
+> - **The complexity constraint is now 3, not 5** (CLAUDE.md, enforced by the ratchet `tests/simulation/lints/test_complexity_ceiling.py`), except that per-message hot paths -- Raft per-heartbeat, SWIM per-datagram, transport -- stay inlined by the owner's 2026-10-06 path-heat decision; 22 `raft/` functions are still over the ceiling.
+>
+> Tests live in `tests/unit/distributed/raft/` (including `test_raft_store_vopr.py`) and `tests/integration/raft/`, not `tests/unit/raft/`.
+
 ## Hard Constraints
 
 - **No partial implementation.** Every phase must be fully integrated, callable, and used before moving on.
@@ -13,7 +21,7 @@
 ## Codebase State
 
 - Active code lives in `hyperscale/distributed/` (NOT `distributed_rewrite/`)
-- No Raft code exists on main -- must be built from scratch
+- No Raft code exists on main -- must be built from scratch *(as of the plan; Raft is now built, see the note above)*
 - Production WAL exists in `distributed/ledger/wal/` (WALWriter with group commit, CRC32, backpressure, recovery)
 - Nodes decomposed: `nodes/manager/` (18 files), `nodes/gate/` (21 files)
 - State classes: `ManagerState` (state.py), `GateRuntimeState` (state.py)
@@ -144,6 +152,22 @@ Add fields to GateRaftCommand, handlers to GateStateMachine, methods to GateRaft
 **New File**: `distributed/raft/raft_wal.py`
 
 Adapter wrapping existing WALWriter for Raft-specific entries. Binary format: `[4:crc32][4:length][8:term][8:index][N:command]`. Bounded write queue with backpressure. Recovery reads + validates on startup.
+
+**Damage rule (shared with the job `NodeWAL`, AD-38 Part 3.2).** Recovery
+accepts damage only as a torn tail. A torn tail is a damaged frame with
+nothing but zeros (or the end of the file) after it, and with no whole
+frame (a possible length and a checksum that holds) beginning after it.
+The tail is cut only after a second read agrees. Any other damage makes
+the store untrustworthy. A frame whose length field was damaged can claim
+to run past the end of the file, so the scan for whole frames after it
+is what tells it from a torn tail. Without that scan, the acknowledged
+records after it would be cut silently.
+
+Each store handles an untrustworthy file differently:
+- The Raft store (`raft/store/raft_store_codec.py`) sets itself aside
+  and rejoins as a new member, because peers re-replicate its groups.
+- The job `NodeWAL` refuses to start, because no wired path rebuilds a
+  node's ledger from peers and LOCAL entries are never replicated.
 
 ### Snapshot Support
 

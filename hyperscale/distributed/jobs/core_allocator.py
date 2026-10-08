@@ -16,11 +16,16 @@ Design principles:
 - All public methods are async and acquire the lock
 - Internal methods assume lock is held
 - No TOCTOU races: check-and-allocate is atomic
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 from dataclasses import dataclass, field
-
 from hyperscale.distributed.jobs.logging_models import (
     AllocatorTrace,
     AllocatorDebug,
@@ -30,15 +35,11 @@ from hyperscale.distributed.jobs.logging_models import (
     AllocatorCritical,
 )
 from hyperscale.logging import Logger
+from hyperscale.distributed.runtime import Clock, RealClock
 
+from .allocation_result import AllocationResult
 
-@dataclass(slots=True)
-class AllocationResult:
-    """Result of a core allocation attempt."""
-
-    success: bool
-    allocated_cores: list[int] = field(default_factory=list)
-    error: str | None = None
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class CoreAllocator:
@@ -90,6 +91,13 @@ class CoreAllocator:
         # Available core count (cached for fast access)
         self._available_cores = total_cores
 
+        # Bumped with every change to which cores are free: a report of
+        # the free count stamped with it is ordered against every other
+        # (and against the allocation a dispatch got), so a manager can
+        # tell a newer report from a stale one and which allocations a
+        # report already reflects.
+        self._availability_version = 0
+
         # Single lock protects ALL core state
         self._lock = asyncio.Lock()
 
@@ -101,6 +109,12 @@ class CoreAllocator:
     def total_cores(self) -> int:
         """Get total core count."""
         return self._total_cores
+
+    @property
+    def availability_version(self) -> int:
+        """The version of ``available_cores``: read the two together, with
+        no await between, for a consistent report."""
+        return self._availability_version
 
     @property
     def available_cores(self) -> int:
@@ -131,6 +145,15 @@ class CoreAllocator:
         Returns:
             AllocationResult with success status and allocated core indices
         """
+        if (refusal := await self._refuse_invalid_request(workflow_id, cores_needed)) is not None:
+            return refusal
+
+        async with self._lock:
+            return self._allocate_locked(workflow_id, cores_needed)
+
+    async def _refuse_invalid_request(self, workflow_id: str, cores_needed: int) -> AllocationResult | None:
+        """The refusal of a request no allocation could satisfy (a
+        non-positive count, or more cores than exist); None when valid."""
         if cores_needed <= 0:
             await self._log_warning(
                 f"Allocation request with invalid cores_needed={cores_needed}",
@@ -151,42 +174,56 @@ class CoreAllocator:
                 error=f"Requested {cores_needed} cores but only {self._total_cores} total available",
             )
 
-        async with self._lock:
-            # Check if workflow already has cores allocated
-            if workflow_id in self._workflow_cores:
-                return AllocationResult(
-                    success=False,
-                    error=f"Workflow {workflow_id} already has cores allocated",
-                )
+        return None
 
-            # Find free cores
-            free_cores = [
-                i for i, wf_id in self._core_assignments.items()
-                if wf_id is None
-            ]
-
-            if len(free_cores) < cores_needed:
-                return AllocationResult(
-                    success=False,
-                    error=f"Insufficient cores: need {cores_needed}, have {len(free_cores)}",
-                )
-
-            # Allocate cores (atomic with the check above)
-            allocated = free_cores[:cores_needed]
-            for core_idx in allocated:
-                self._core_assignments[core_idx] = workflow_id
-
-            self._workflow_cores[workflow_id] = allocated
-            self._available_cores = self._count_free_cores()
-
-            # Update event state
-            if self._available_cores == 0:
-                self._cores_available.clear()
-
+    def _allocate_locked(self, workflow_id: str, cores_needed: int) -> AllocationResult:
+        """Check and allocate in one step under the lock (no TOCTOU race)."""
+        # Check if workflow already has cores allocated
+        if workflow_id in self._workflow_cores:
             return AllocationResult(
-                success=True,
-                allocated_cores=allocated,
+                success=False,
+                error=f"Workflow {workflow_id} already has cores allocated",
             )
+
+        # Find free cores
+        free_cores = self._free_core_indices()
+
+        if len(free_cores) < cores_needed:
+            return AllocationResult(
+                success=False,
+                error=f"Insufficient cores: need {cores_needed}, have {len(free_cores)}",
+            )
+
+        # Allocate cores (atomic with the check above)
+        return self._record_allocation(workflow_id, free_cores[:cores_needed])
+
+    def _free_core_indices(self) -> list[int]:
+        """The indices of every free core, in order. Must be called with
+        lock held."""
+        return [
+            i for i, wf_id in self._core_assignments.items()
+            if wf_id is None
+        ]
+
+    def _record_allocation(self, workflow_id: str, allocated: list[int]) -> AllocationResult:
+        """Assign the cores to the workflow and bump the availability
+        version. Must be called with lock held."""
+        for core_idx in allocated:
+            self._core_assignments[core_idx] = workflow_id
+
+        self._workflow_cores[workflow_id] = allocated
+        self._available_cores = self._count_free_cores()
+        self._availability_version += 1
+
+        # Update event state
+        if self._available_cores == 0:
+            self._cores_available.clear()
+
+        return AllocationResult(
+            success=True,
+            allocated_cores=allocated,
+            availability_version=self._availability_version,
+        )
 
     async def free(self, workflow_id: str) -> list[int]:
         """
@@ -229,20 +266,15 @@ class CoreAllocator:
 
             # Free the first `count` cores
             to_free = allocated[:count]
-            for core_idx in to_free:
-                if self._core_assignments.get(core_idx) == workflow_id:
-                    self._core_assignments[core_idx] = None
+            self._release_cores(workflow_id, to_free)
 
             # Update workflow's remaining cores
-            self._workflow_cores[workflow_id] = allocated[count:]
-            if not self._workflow_cores[workflow_id]:
-                del self._workflow_cores[workflow_id]
+            self._keep_remaining_cores(workflow_id, allocated[count:])
 
             self._available_cores = self._count_free_cores()
 
             # Signal that cores are available
-            if to_free:
-                self._cores_available.set()
+            self._signal_freed(to_free)
 
             return to_free
 
@@ -298,7 +330,7 @@ class CoreAllocator:
             True if cores are available, False on timeout
         """
         try:
-            await asyncio.wait_for(
+            await _DEFAULT_CLOCK.wait_for(
                 self._cores_available.wait(),
                 timeout=timeout,
             )
@@ -340,17 +372,35 @@ class CoreAllocator:
         """
         allocated = self._workflow_cores.pop(workflow_id, [])
 
-        for core_idx in allocated:
-            if self._core_assignments.get(core_idx) == workflow_id:
-                self._core_assignments[core_idx] = None
+        self._release_cores(workflow_id, allocated)
 
         self._available_cores = self._count_free_cores()
 
         # Signal that cores are available
-        if allocated:
-            self._cores_available.set()
+        self._signal_freed(allocated)
 
         return allocated
+
+    def _release_cores(self, workflow_id: str, cores: list[int]) -> None:
+        """Free each of ``cores`` the workflow still holds. Must be called
+        with lock held."""
+        for core_idx in cores:
+            if self._core_assignments.get(core_idx) == workflow_id:
+                self._core_assignments[core_idx] = None
+
+    def _keep_remaining_cores(self, workflow_id: str, remaining: list[int]) -> None:
+        """Record the cores a workflow still holds, forgetting it once it
+        holds none. Must be called with lock held."""
+        self._workflow_cores[workflow_id] = remaining
+        if not self._workflow_cores[workflow_id]:
+            del self._workflow_cores[workflow_id]
+
+    def _signal_freed(self, freed: list[int]) -> None:
+        """Bump the availability version and wake waiters once any core
+        was freed. Must be called with lock held."""
+        if freed:
+            self._availability_version += 1
+            self._cores_available.set()
 
     def _count_free_cores(self) -> int:
         """Count free cores. Must be called with lock held."""
@@ -393,3 +443,10 @@ class CoreAllocator:
     async def _log_critical(self, message: str, workflow_id: str = "") -> None:
         """Log a critical-level message."""
         await self._logger.log(AllocatorCritical(message=message, **self._get_log_context(workflow_id)))
+
+_REHOMED = (
+    AllocationResult,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

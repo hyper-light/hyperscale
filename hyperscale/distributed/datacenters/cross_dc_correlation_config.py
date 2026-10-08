@@ -1,0 +1,170 @@
+"""``CrossDCCorrelationConfig`` -- pickled under the namespace
+``hyperscale.distributed.datacenters.cross_dc_correlation`` (see that module)."""
+
+from dataclasses import dataclass
+
+from hyperscale.distributed.env.env import Env
+
+
+@dataclass(slots=True)
+class CrossDCCorrelationConfig:
+    """Configuration for cross-DC correlation detection."""
+
+    # Time window for detecting simultaneous failures (seconds)
+    correlation_window_seconds: float = 30.0
+
+    # Minimum DCs failing within window to trigger LOW correlation
+    low_threshold: int = 2
+
+    # Minimum DCs failing within window to trigger MEDIUM correlation
+    medium_threshold: int = 3
+
+    # Minimum DCs failing within window to trigger HIGH correlation (count-based)
+    # HIGH requires BOTH this count AND the fraction threshold
+    # Default of 4 means: need at least 4 DCs failing AND >= 50% of known DCs
+    # This prevents false positives when few DCs exist
+    high_count_threshold: int = 4
+
+    # Minimum fraction of known DCs failing to trigger HIGH correlation
+    # HIGH requires BOTH this fraction AND the count threshold above
+    high_threshold_fraction: float = 0.5
+
+    # Backoff duration after correlation detected (seconds)
+    correlation_backoff_seconds: float = 60.0
+
+    # Maximum failures to track per DC before cleanup
+    max_failures_per_dc: int = 100
+
+    # ==========================================================================
+    # Anti-flapping configuration
+    # ==========================================================================
+
+    # Minimum time a failure must persist before counting (debounce)
+    # This filters out transient network blips
+    failure_confirmation_seconds: float = 5.0
+
+    # Minimum time DC must be healthy before considered recovered (hysteresis)
+    # Prevents premature "all clear" signals
+    recovery_confirmation_seconds: float = 30.0
+
+    # Minimum failures in flap_detection_window to be considered flapping
+    flap_threshold: int = 3
+
+    # Time window for detecting flapping behavior
+    flap_detection_window_seconds: float = 120.0
+
+    # Cooldown after flapping detected before DC can be considered stable
+    flap_cooldown_seconds: float = 300.0
+
+    # Weight for recent failures vs older ones (exponential decay)
+    # Higher = more weight on recent events
+    recency_weight: float = 0.9
+
+    # ==========================================================================
+    # Latency-based correlation configuration
+    # ==========================================================================
+
+    # Enable latency-based correlation detection
+    enable_latency_correlation: bool = True
+
+    # Latency threshold for elevated state (ms)
+    # If average latency exceeds this, DC is considered degraded (not failed)
+    latency_elevated_threshold_ms: float = 100.0
+
+    # Latency threshold for critical state (ms)
+    # If average latency exceeds this, DC latency is considered critical
+    latency_critical_threshold_ms: float = 500.0
+
+    # Minimum latency samples required before making decisions
+    min_latency_samples: int = 3
+
+    # Latency sample window (seconds)
+    latency_sample_window_seconds: float = 60.0
+
+    # If this fraction of DCs have elevated latency, it's likely network, not DC
+    latency_correlation_fraction: float = 0.5
+
+    # ==========================================================================
+    # Extension request correlation configuration
+    # ==========================================================================
+
+    # Enable extension request correlation detection
+    enable_extension_correlation: bool = True
+
+    # Minimum extension requests to consider DC under load (not failed)
+    extension_count_threshold: int = 2
+
+    # If this fraction of DCs have high extensions, treat as load spike
+    extension_correlation_fraction: float = 0.5
+
+    # Extension request tracking window (seconds)
+    extension_window_seconds: float = 120.0
+
+    # ==========================================================================
+    # Local Health Multiplier (LHM) correlation configuration
+    # ==========================================================================
+
+    # Enable LHM correlation detection
+    enable_lhm_correlation: bool = True
+
+    # LHM score threshold to consider DC stressed (out of max 8)
+    lhm_stressed_threshold: int = 3
+
+    # If this fraction of DCs have high LHM, treat as systemic issue
+    lhm_correlation_fraction: float = 0.5
+
+    @classmethod
+    def from_env(cls, env: Env) -> "CrossDCCorrelationConfig":
+        """
+        Cross-DC correlation configuration (Phase 7) from ``env``.
+
+        Controls cascade eviction prevention when multiple DCs fail
+        simultaneously (likely network partition, not actual DC failures).
+
+        HIGH correlation requires BOTH:
+        - Fraction of DCs >= high_threshold_fraction (e.g., 50%)
+        - Count of DCs >= high_count_threshold (e.g., 4)
+
+        This prevents false positives when few DCs exist.
+
+        Anti-flapping mechanisms:
+        - Failure confirmation: failures must persist before counting
+        - Recovery confirmation: recovery must be sustained before healthy
+        - Flap detection: too many state changes marks DC as flapping
+
+        Secondary correlation signals:
+        - Latency correlation: elevated latency across DCs = network issue
+        - Extension correlation: many extensions across DCs = load spike
+        - LHM correlation: high LHM scores across DCs = systemic stress
+        """
+        return cls(
+            # Primary thresholds
+            correlation_window_seconds=env.CROSS_DC_CORRELATION_WINDOW,
+            low_threshold=env.CROSS_DC_CORRELATION_LOW_THRESHOLD,
+            medium_threshold=env.CROSS_DC_CORRELATION_MEDIUM_THRESHOLD,
+            high_count_threshold=env.CROSS_DC_CORRELATION_HIGH_COUNT_THRESHOLD,
+            high_threshold_fraction=env.CROSS_DC_CORRELATION_HIGH_FRACTION,
+            correlation_backoff_seconds=env.CROSS_DC_CORRELATION_BACKOFF,
+            # Anti-flapping
+            failure_confirmation_seconds=env.CROSS_DC_FAILURE_CONFIRMATION,
+            recovery_confirmation_seconds=env.CROSS_DC_RECOVERY_CONFIRMATION,
+            flap_threshold=env.CROSS_DC_FLAP_THRESHOLD,
+            flap_detection_window_seconds=env.CROSS_DC_FLAP_DETECTION_WINDOW,
+            flap_cooldown_seconds=env.CROSS_DC_FLAP_COOLDOWN,
+            # Latency-based correlation
+            enable_latency_correlation=env.CROSS_DC_ENABLE_LATENCY_CORRELATION,
+            latency_elevated_threshold_ms=env.CROSS_DC_LATENCY_ELEVATED_THRESHOLD_MS,
+            latency_critical_threshold_ms=env.CROSS_DC_LATENCY_CRITICAL_THRESHOLD_MS,
+            min_latency_samples=env.CROSS_DC_MIN_LATENCY_SAMPLES,
+            latency_sample_window_seconds=env.CROSS_DC_LATENCY_SAMPLE_WINDOW,
+            latency_correlation_fraction=env.CROSS_DC_LATENCY_CORRELATION_FRACTION,
+            # Extension-based correlation
+            enable_extension_correlation=env.CROSS_DC_ENABLE_EXTENSION_CORRELATION,
+            extension_count_threshold=env.CROSS_DC_EXTENSION_COUNT_THRESHOLD,
+            extension_correlation_fraction=env.CROSS_DC_EXTENSION_CORRELATION_FRACTION,
+            extension_window_seconds=env.CROSS_DC_EXTENSION_WINDOW,
+            # LHM-based correlation
+            enable_lhm_correlation=env.CROSS_DC_ENABLE_LHM_CORRELATION,
+            lhm_stressed_threshold=env.CROSS_DC_LHM_STRESSED_THRESHOLD,
+            lhm_correlation_fraction=env.CROSS_DC_LHM_CORRELATION_FRACTION,
+        )

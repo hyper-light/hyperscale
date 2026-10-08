@@ -816,7 +816,7 @@ class TestMultipleWorkers:
 
         # Worker 2 should get full first extension
         assert response_w2.granted
-        assert response_w2.extension_seconds == 15.0  # First extension
+        assert response_w2.extension_seconds == 30.0  # First extension grants full base (default base_deadline=30)
 
         # Worker 1 state unchanged
         state_w1 = manager.get_worker_extension_state("worker-1")
@@ -905,8 +905,8 @@ class TestExtensionTrackerConfig:
         )
         response = manager.handle_extension_request(request, current_deadline=1000.0)
 
-        # First extension = base / 2 = 120 / 2 = 60
-        assert response.extension_seconds == 60.0
+        # First extension grants the full base (AD-26 line 32: count=0 -> base/2^0 = base)
+        assert response.extension_seconds == 120.0
         assert response.remaining_extensions == 2  # Started with 3, used 1
 
 

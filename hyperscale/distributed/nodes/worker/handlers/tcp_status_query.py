@@ -7,7 +7,7 @@ Handles workflow status queries from managers for orphan scanning.
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..server import WorkerServer
+    from hyperscale.distributed.nodes.worker.server import WorkerServer
 
 
 class WorkflowStatusQueryHandler:

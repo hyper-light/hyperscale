@@ -1,5 +1,5 @@
 import asyncio
-import os
+from contextlib import ExitStack
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import (
     ProcessError,
@@ -24,6 +24,8 @@ from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
 from hyperscale.ui.actions import update_active_workflow_message
 
 from .local_server_pool import LocalServerPool
+from .run_secret import env_with_run_secret
+from .shutdown_signals import ShutdownSignals
 
 
 async def abort(
@@ -67,12 +69,9 @@ class LocalRunner:
         env: Env | None = None,
         workers: int | None = None,
     ) -> None:
-        if env is None:
-            env = Env(
-                MERCURY_SYNC_AUTH_SECRET=os.getenv(
-                    "MERCURY_SYNC_AUTH_SECRET", "hyperscale-dev-secret-change-in-prod"
-                ),
-            )
+        # A configured secret wins; otherwise this run gets a random secret
+        # of its own, shared with the workers it spawns through ``self._env``.
+        env = env_with_run_secret(env if env is not None else Env())
 
         if workers is None:
             workers = psutil.cpu_count(logical=False)
@@ -159,7 +158,15 @@ class LocalRunner:
             if timeout is None:
                 timeout = self._worker_connect_timeout
 
+            # SIGINT/SIGTERM cancel this run (see ShutdownSignals) from here until
+            # it has fully shut down. Components register abort handlers of their
+            # own as they start, so the routing is re-claimed after each of them.
+            shutdown_signals = ShutdownSignals(asyncio.current_task())
+            signal_routing = ExitStack()
+
             try:
+                signal_routing.enter_context(shutdown_signals)
+
                 await update_active_workflow_message(
                     "initializing",
                     "Starting worker servers...",
@@ -172,6 +179,7 @@ class LocalRunner:
                     name="info",
                 )
                 await self._server_pool.setup()
+                shutdown_signals.route()
 
                 await self._remote_manger.start(
                     self.host,
@@ -180,6 +188,7 @@ class LocalRunner:
                     cert_path=cert_path,
                     key_path=key_path,
                 )
+                shutdown_signals.route()
 
                 await self._server_pool.run_pool(
                     (self.host, self.port),
@@ -346,69 +355,76 @@ class LocalRunner:
 
                 return err
 
+            finally:
+                signal_routing.close()
+
     async def abort(
         self,
         error: Exception | None = None,
         terminal_mode: TerminalMode = "full",
     ):
-        async with self._logger.context(
-            name="local_runner",
-        ) as ctx:
-            if error is None:
-                await ctx.log_prepared(
-                    f"Runner type {self._runner_type} received a call to abort and is now aborting all running tests",
-                    name="fatal",
-                )
+        try:
+            async with self._logger.context(
+                        name="local_runner",
+                    ) as ctx:
+                        if error is None:
+                            await ctx.log_prepared(
+                                f"Runner type {self._runner_type} received a call to abort and is now aborting all running tests",
+                                name="fatal",
+                            )
+            
+                        else:
+                            await ctx.log_prepared(
+                                f"Runner type {self._runner_type} encountered exception {str(error)} is now aborting all running tests",
+                                name="fatal",
+                            )
+            
+                        try:
+                            if terminal_mode in ["ci", "full"]:
+                                await ctx.log_prepared(
+                                    "Aborting Hyperscale Terminal UI", name="debug"
+                                )
+                                await self._interface.abort()
+            
+                        except Exception as e:
+                            await ctx.log_prepared(
+                                f"Encountered error {str(e)} aborting Hyperscale Terminal UI",
+                                name="trace",
+                            )
+            
+            
+                        except asyncio.CancelledError:
+                            pass
+            
+                        try:
+                            self._remote_manger.abort()
+                            await ctx.log_prepared(
+                                "Aborting Hyperscale Remote Manager", name="debug"
+                            )
+            
+                        except Exception as e:
+                            await ctx.log_prepared(
+                                f"Encountered error {str(e)} aborting Hyperscale Remote Manager",
+                                name="trace",
+                            )
+            
+                        except asyncio.CancelledError:
+                            pass
+            
+                        try:
+                            await ctx.log_prepared("Aborting Hyperscale Server Pool", name="debug")
+                            self._server_pool.abort()
+                        except Exception as e:
+                            await ctx.log_prepared(
+                                f"Encountered error {str(e)} aborting Hyperscale Server Pool",
+                                name="debug",
+                            )
+            
+                        except asyncio.CancelledError:
+                            pass
 
-            else:
-                await ctx.log_prepared(
-                    f"Runner type {self._runner_type} encountered exception {str(error)} is now aborting all running tests",
-                    name="fatal",
-                )
-
-            try:
-                if terminal_mode in ["ci", "full"]:
-                    await ctx.log_prepared(
-                        "Aborting Hyperscale Terminal UI", name="debug"
-                    )
-                    await self._interface.abort()
-
-            except Exception as e:
-                await ctx.log_prepared(
-                    f"Encountered error {str(e)} aborting Hyperscale Terminal UI",
-                    name="trace",
-                )
-
-
-            except asyncio.CancelledError:
-                pass
-
-            try:
-                self._remote_manger.abort()
-                await ctx.log_prepared(
-                    "Aborting Hyperscale Remote Manager", name="debug"
-                )
-
-            except Exception as e:
-                await ctx.log_prepared(
-                    f"Encountered error {str(e)} aborting Hyperscale Remote Manager",
-                    name="trace",
-                )
-
-            except asyncio.CancelledError:
-                pass
-
-            try:
-                await ctx.log_prepared("Aborting Hyperscale Server Pool", name="debug")
-                self._server_pool.abort()
-            except Exception as e:
-                await ctx.log_prepared(
-                    f"Encountered error {str(e)} aborting Hyperscale Server Pool",
-                    name="debug",
-                )
-
-            except asyncio.CancelledError:
-                pass
+        except KeyboardInterrupt:
+            pass
 
     def _bin_and_check_socket_range(self):
         base_worker_port = self.port + self._workers

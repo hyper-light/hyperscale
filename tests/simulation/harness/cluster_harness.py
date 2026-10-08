@@ -14,6 +14,8 @@ until the production-side Clock/Random/Transport refactor lands.
 
 import asyncio
 import pathlib
+import shutil
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -22,6 +24,7 @@ from hyperscale.distributed.nodes.gate import GateServer
 from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
+from tests.simulation.harness.cleanup_report import CleanupReport
 from tests.simulation.harness.cluster_spec import ClusterSpec
 from tests.simulation.harness.conditions import (
     lhm_at_baseline,
@@ -36,15 +39,17 @@ from tests.simulation.harness.diagnostics import DiagnosticDumper
 from tests.simulation.harness.env_overrides import EnvOverrides
 from tests.simulation.harness.execution_mode import ExecutionMode
 from tests.simulation.harness.fault_matrix import FaultMatrix
+from tests.simulation.harness.harness_auth_secret import HARNESS_AUTH_SECRET
 from tests.simulation.harness import fault_transport
 from tests.simulation.harness.invariants import (
     InvariantChecker,
     LivenessInvariant,
     SafetyInvariant,
-    at_most_one_job_leader_per_job,
     cluster_membership_progress,
+    continuous_catalog,
 )
 from tests.simulation.harness.port_allocator import PortAllocator
+from tests.simulation.harness.scenario_signal_router import ScenarioSignalRouter
 from tests.simulation.harness.server_handle import ServerHandle, ServerKind
 from tests.simulation.harness.submission import WorkloadSpec
 from tests.simulation.harness.supervisor import Supervisor
@@ -94,6 +99,10 @@ class ClusterHarness:
     _next_worker_index_by_dc: dict[str, int] = field(init=False, default_factory=dict)
     _expected_worker_count_by_dc: dict[str, int] = field(init=False, default_factory=dict)
     _entered: bool = field(init=False, default=False)
+    _signal_router: ScenarioSignalRouter = field(init=False)
+    # Per-run directory holding every node's WAL and logs (``<node_id>/``):
+    # nodes otherwise fall back to the working directory. Removed on exit.
+    _node_data_root: pathlib.Path = field(init=False)
 
     async def __aenter__(self) -> "ClusterHarness":
         if self.mode is ExecutionMode.SIM:
@@ -102,7 +111,13 @@ class ClusterHarness:
                 "use ExecutionMode.REAL until then."
             )
 
-        self._ports = PortAllocator(host=self.spec.host, base_port=self.spec.base_port)
+        # In-process nodes register abort handlers for SIGINT/SIGTERM as
+        # they start; the scenario claims them back so a signal stops it.
+        self._signal_router = ScenarioSignalRouter(asyncio.current_task())
+        self._signal_router.claim()
+        self._node_data_root = pathlib.Path(tempfile.mkdtemp(prefix="hyperscale-harness-"))
+
+        self._ports = PortAllocator(host=self.spec.host)
         self._expected_worker_count_by_dc = {
             dc_id: dc_spec.workers
             for dc_id, dc_spec in self.spec.datacenters.items()
@@ -122,22 +137,20 @@ class ClusterHarness:
             poll_interval=self.spec.timeouts.invariant_poll_interval,
             on_violation=self._on_invariant_violation,
         )
-        self._invariants.add_safety(at_most_one_job_leader_per_job())
         self._invariants.add_liveness(
             cluster_membership_progress(
                 staleness_budget=self.spec.timeouts.stabilization_default,
             )
         )
-        for safety in self.extra_safety_invariants:
+        for safety in [*continuous_catalog(), *self.extra_safety_invariants]:
             self._invariants.add_safety(safety)
         for liveness in self.extra_liveness_invariants:
             self._invariants.add_liveness(liveness)
 
         self._faults = FaultMatrix(harness=self)
 
-        await self._supervisor.__aenter__()
-
         try:
+            await self._supervisor.__aenter__()
             self._build_servers()
             await self._start_servers()
             # Phase 4: install FaultInjectingTransport on every started
@@ -145,28 +158,65 @@ class ClusterHarness:
             # subsequent send. Servers without the wrapper would still
             # be reachable from rule-blocked peers.
             fault_transport.install(self)
+            self._signal_router.claim()
             await self._invariants.start()
             await self._stabilize()
         except BaseException:
-            await self._invariants.stop()
-            await self._supervisor.shutdown()
+            try:
+                await self._invariants.stop()
+                await self._supervisor.shutdown()
+            finally:
+                await self._remove_node_data_root()
+                self._release_signal_routing()
             raise
 
         self._entered = True
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        try:
+            await self._teardown(exc_val)
+        finally:
+            await self._remove_node_data_root()
+            self._release_signal_routing()
+
+    async def _teardown(self, exc_val: BaseException | None) -> None:
         await self._invariants.stop()
         invariant_violation = self._invariants.violation
         try:
             await self._supervisor.shutdown()
         finally:
-            errors = self._supervisor.cleanup_errors
-            if invariant_violation is not None and exc_type is None:
-                raise invariant_violation
-            if errors and exc_type is None:
-                joined = "\n  - ".join(errors)
-                raise RuntimeError(f"harness cleanup reported errors:\n  - {joined}")
+            # Never drop a teardown finding: a failed body carries them as
+            # notes on its own exception; a passing body fails with them.
+            cleanup_report = CleanupReport(
+                cleanup_errors=tuple(self._supervisor.cleanup_errors),
+                invariant_violation=None if invariant_violation is exc_val else invariant_violation,
+            )
+            if exc_val is not None:
+                cleanup_report.attach_to(exc_val)
+            elif (teardown_failure := cleanup_report.failure()) is not None:
+                raise teardown_failure
+
+    def node_data_directory(self, node_id: str) -> pathlib.Path:
+        """The node's WAL directory under this run's data root (its logs
+        live in ``logs/`` beneath it); stable across the node's restarts."""
+        return self._node_data_root / node_id
+
+    async def _remove_node_data_root(self) -> None:
+        """Delete the run's node data directory once every node stopped."""
+        await asyncio.get_running_loop().run_in_executor(None, shutil.rmtree, self._node_data_root)
+
+    def reclaim_signals(self) -> None:
+        """Claim SIGINT/SIGTERM back for the scenario after a node starts
+        (its components register their own handlers as it boots)."""
+        self._signal_router.claim()
+
+    def _release_signal_routing(self) -> None:
+        """With the cluster torn down: drop every signal handler the
+        scenario or its nodes registered, then let a signal that stopped
+        the scenario take its default effect."""
+        self._signal_router.release()
+        self._signal_router.redeliver()
 
     async def dump_diagnostics(self, reason: str = "manual") -> None:
         """Write a complete diagnostic snapshot. Safe to call any time after __aenter__."""
@@ -193,6 +243,11 @@ class ClusterHarness:
 
     async def _on_invariant_violation(self, reason: str) -> None:
         await self._diagnostics.dump(reason=f"invariant: {reason}")
+
+    @property
+    def stabilized(self) -> bool:
+        """True once ``__aenter__`` has brought the cluster to steady state."""
+        return self._entered
 
     @property
     def supervisor(self) -> Supervisor:
@@ -265,6 +320,7 @@ class ClusterHarness:
         handle.started = True
         self._supervisor.start_worker_pid_tracking(handle)
         fault_transport.reinstall_for(handle, self)
+        self._signal_router.claim()
         return handle
 
     def address_to_node_id(
@@ -305,11 +361,10 @@ class ClusterHarness:
                 self._allocate_pair() for _ in range(dc_spec.managers)
             ]
 
-        # Each worker owns a 500-port block: TCP at block base, UDP at
-        # block+10, plus headroom for the derived `udp + cores ** 2`
-        # subprocess UDP and any helper ports the local pool spawns.
-        # Mirrors the stride pattern used by the integration tests
-        # (see tests/integration/gates/test_gate_cross_dc_dispatch.py).
+        # Each worker owns a logical spacing envelope. The allocator probes
+        # and tracks the concrete TCP/UDP ports the worker runtime binds,
+        # while reserving the full envelope in-process so no later harness
+        # allocation can overlap it.
         worker_addrs_by_dc: dict[str, list[tuple[int, int]]] = {}
         for dc_id, dc_spec in self.spec.datacenters.items():
             worker_addrs_by_dc[dc_id] = [
@@ -358,7 +413,11 @@ class ClusterHarness:
                 _peer_udp=peer_udp,
             ) -> GateServer:
                 env = self._build_env(node_id=_node_id, dc_id="global", dc_spec=None)
-                return GateServer(
+                return fault_transport.construct(
+                    self,
+                    _node_id,
+                    GateServer,
+                    wal_data_dir=self.node_data_directory(_node_id),
                     host=self.spec.host,
                     tcp_port=_tcp,
                     udp_port=_udp,
@@ -410,7 +469,11 @@ class ClusterHarness:
                     env = self._build_env(
                         node_id=_node_id, dc_id=_dc_id, dc_spec=_dc_spec,
                     )
-                    return ManagerServer(
+                    return fault_transport.construct(
+                        self,
+                        _node_id,
+                        ManagerServer,
+                        wal_data_dir=self.node_data_directory(_node_id),
                         host=self.spec.host,
                         tcp_port=_tcp,
                         udp_port=_udp,
@@ -487,7 +550,10 @@ class ClusterHarness:
                 dc_spec=_dc_spec,
                 worker_cores=_dc_spec.cores_per_worker,
             )
-            return WorkerServer(
+            return fault_transport.construct(
+                self,
+                _node_id,
+                WorkerServer,
                 host=self.spec.host,
                 tcp_port=_tcp,
                 udp_port=_udp,
@@ -654,23 +720,6 @@ class ClusterHarness:
     def _allocate_gate_addrs(self, _index: int) -> tuple[int, int]:
         return self._ports.reserve_pair()
 
-    def _reserve_specific(self, port: int) -> None:
-        """Reserve a specific port we have already implicitly committed to.
-
-        Used for worker-derived ports (`udp + cores ** 2`). The PortAllocator
-        does not know about these by default; this teaches it so the
-        post-teardown verifier checks them too.
-        """
-        # Reach into PortAllocator's reserved set deliberately. Adding a public
-        # method would invite misuse from scenario code.
-        if not self._ports._is_bindable(port):  # type: ignore[attr-defined]
-            from tests.simulation.harness.errors import PortConflictError
-
-            raise PortConflictError(
-                f"derived worker port {port} is already held by another process"
-            )
-        self._ports._reserved.add(port)  # type: ignore[attr-defined]
-
     def _build_env(
         self,
         node_id: str,
@@ -680,7 +729,10 @@ class ClusterHarness:
     ) -> Env:
         """Compose Env from cluster + DC + per-node overrides + worker cores."""
         layered = self._layered_overrides(dc_spec=dc_spec, node_id=node_id)
-        kwargs: dict[str, object] = {}
+        kwargs: dict[str, object] = {
+            "MERCURY_SYNC_AUTH_SECRET": HARNESS_AUTH_SECRET,
+            "MERCURY_SYNC_LOGS_DIRECTORY": str(self.node_data_directory(node_id) / "logs"),
+        }
         if layered.request_timeout is not None:
             kwargs["MERCURY_SYNC_REQUEST_TIMEOUT"] = layered.request_timeout
         if layered.log_level is not None:

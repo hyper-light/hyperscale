@@ -1,5 +1,4 @@
 from typing import (
-    Any,
     Dict,
     List,
     Literal,
@@ -22,15 +21,32 @@ FailedResults = Dict[Literal["failed"], int]
 ContextCount = Dict[Literal["context", "count"], str | int]
 ContextResults = List[ContextCount]
 
+# A sample digest's exact, mergeable state (see reporting/sample_digest.py):
+# plain ints, floats and dicts, so any node unpickles it.
+SampleDigestState = Dict[
+    Literal[
+        "count",
+        "sum_units",
+        "square_sum_units",
+        "minimum",
+        "maximum",
+        "zero_count",
+        "positive_buckets",
+        "negative_buckets",
+    ],
+    int | float | Dict[int, int],
+]
+
 ResultSet = Dict[
     Literal[
         "workflow",
         "step",
         "timings",
+        "digests",
         "counts",
         "contexts",
     ],
-    str | StatsResults | CountResults | ContextResults,
+    str | StatsResults | Dict[str, SampleDigestState] | CountResults | ContextResults,
 ]
 
 CheckSet = Dict[
@@ -65,9 +81,10 @@ MetricsSet = Dict[
         "step",
         "metric_type",
         "stats",
+        "digest",
         "tags",
     ],
-    str | MetricType | MetricValue | List[str],
+    str | MetricType | MetricValue | SampleDigestState | List[str],
 ]
 
 WorkflowStats = Dict[
@@ -83,7 +100,8 @@ WorkflowStats = Dict[
 ]
 
 
-WorkflowContextResult = Dict[str, Any | Exception]
+# A workflow context: user-set values, opaque here (an Exception when it failed).
+WorkflowContextResult = Dict[str, object]
 
 
 WorkflowResultsSet = WorkflowStats | WorkflowContextResult

@@ -11,102 +11,38 @@ Key design decisions:
 2. Job-specific suspicion is independent - a node can be slow for job A but fine for job B
 3. Result routing uses job layer - for accuracy, check job-specific status
 4. Reconciliation handles disagreements - global alive + job dead = escalate
+
+This module is the pickling namespace of the classes and functions
+below. Each lives in a file of its own and is re-homed here -- its
+``__module__`` set to this module -- so its pickled form names this
+module, exactly as before the split: mixed-version clusters keep
+talking and data written earlier keeps loading.
 """
 
 import asyncio
 import inspect
-import time
 from collections import deque
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable
+from hyperscale.distributed.runtime import Clock, RealClock
+from hyperscale.distributed.health.extension_tracker import ExtensionTracker, ExtensionTrackerConfig
 
 from .timing_wheel import TimingWheel, TimingWheelConfig
 from .job_suspicion_manager import JobSuspicionManager, JobSuspicionConfig
 from .suspicion_state import SuspicionState
-from hyperscale.distributed.health.extension_tracker import (
-    ExtensionTracker,
-    ExtensionTrackerConfig,
-)
+from .hierarchical_failure_detector_shared import _DEFAULT_CLOCK
+from .hierarchical_failure_detector_shared import NodeAddress
+from .hierarchical_failure_detector_shared import JobId
+from .failure_event import FailureEvent
+from .failure_source import FailureSource
+from .hierarchical_config import HierarchicalConfig
+from .node_status import NodeStatus
 
 if TYPE_CHECKING:
-    from hyperscale.distributed.swim.health.peer_health_awareness import (
-        PeerHealthAwareness,
-    )
+    from hyperscale.distributed.swim.health.peer_health_awareness import PeerHealthAwareness
     from hyperscale.distributed.taskex import TaskRunner
-
-
-# Type aliases
-NodeAddress = tuple[str, int]
-JobId = str
-
-
-class NodeStatus(Enum):
-    """Status of a node from the perspective of failure detection."""
-
-    ALIVE = auto()  # Not suspected at any layer
-    SUSPECTED_GLOBAL = auto()  # Suspected at global layer (machine may be down)
-    SUSPECTED_JOB = auto()  # Suspected for specific job(s) only
-    DEAD_GLOBAL = auto()  # Declared dead at global layer
-    DEAD_JOB = auto()  # Declared dead for specific job
-
-
-class FailureSource(Enum):
-    """Source of a failure detection event."""
-
-    GLOBAL = auto()  # From global timing wheel
-    JOB = auto()  # From job-specific detection
-
-
-@dataclass
-class HierarchicalConfig:
-    """Configuration for hierarchical failure detection."""
-
-    # Global layer config
-    global_min_timeout: float = 5.0
-    global_max_timeout: float = 30.0
-    global_no_witness_timeout: float | None = None
-    global_required_confirmations: int = 2
-
-    # Job layer config
-    job_min_timeout: float = 1.0
-    job_max_timeout: float = 10.0
-
-    # Timing wheel settings (AD-30): coarse_tick_ms=1000, fine_tick_ms=100,
-    # fine_wheel_size=10. See ``TimingWheelConfig`` for the invariant.
-    coarse_tick_ms: int = 1000
-    fine_tick_ms: int = 100
-
-    # Job polling settings
-    poll_interval_far_ms: int = 1000
-    poll_interval_near_ms: int = 50
-
-    # Reconciliation settings
-    reconciliation_interval_s: float = 5.0
-
-    # Resource limits
-    max_global_suspicions: int = 10000
-    max_job_suspicions_per_job: int = 1000
-    max_total_job_suspicions: int = 50000
-
-    # AD-26: Adaptive healthcheck extension settings
-    extension_base_deadline: float = 30.0
-    extension_min_grant: float = 1.0
-    extension_max_extensions: int = 5
-    extension_warning_threshold: int = 1
-    extension_grace_period: float = 10.0
-    max_extension_trackers: int = 10000  # Hard cap to prevent memory exhaustion
-
-
-@dataclass
-class FailureEvent:
-    """Event emitted when a node is declared dead."""
-
-    node: NodeAddress
-    source: FailureSource
-    job_id: JobId | None  # Only set for JOB source
-    incarnation: int
-    timestamp: float = field(default_factory=time.monotonic)
 
 
 class HierarchicalFailureDetector:
@@ -156,8 +92,11 @@ class HierarchicalFailureDetector:
             ]
             | None
         ) = None,
+        *,
+        clock: Clock | None = None,
     ) -> None:
         self._on_expiration_diagnostic = on_expiration_diagnostic
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
         if config is None:
             config = HierarchicalConfig()
 
@@ -254,6 +193,8 @@ class HierarchicalFailureDetector:
         self._global_deaths: int = 0
         self._job_deaths: int = 0
         self._reconciliations: int = 0
+        # Errors the ``on_error`` hook failed to report.
+        self._error_report_failures: int = 0
         self._job_suspicions_cleared_by_global: int = 0
 
         # AD-26: Per-node extension trackers for adaptive healthcheck extensions
@@ -301,14 +242,22 @@ class HierarchicalFailureDetector:
         going dark) would extend the time we wait to detect it.
         """
         if self._peer_health_awareness is not None:
-            host, port = node
-            node_id = f"{host}:{port}"
-            try:
-                return self._peer_health_awareness.get_load_multiplier(node_id)
-            except Exception:
-                # PeerHealthAwareness errors must never block suspicion
-                # decisions; degrade silently to neutral.
-                return 1.0
+            return self._peer_awareness_load_multiplier(node)
+        return self._explicit_peer_load_multiplier(node)
+
+    def _peer_awareness_load_multiplier(self, node: NodeAddress) -> float:
+        """``node``'s load multiplier from PeerHealthAwareness (AD-19/AD-50); neutral on error."""
+        host, port = node
+        node_id = f"{host}:{port}"
+        try:
+            return self._peer_health_awareness.get_load_multiplier(node_id)
+        except Exception:
+            # PeerHealthAwareness errors must never block suspicion
+            # decisions; degrade silently to neutral.
+            return 1.0
+
+    def _explicit_peer_load_multiplier(self, node: NodeAddress) -> float:
+        """``node``'s load multiplier from the explicit callable; neutral when unset or on error."""
         if self._get_peer_load_multiplier_explicit is not None:
             try:
                 return self._get_peer_load_multiplier_explicit(node)
@@ -340,28 +289,24 @@ class HierarchicalFailureDetector:
 
         self._running = True
         self._global_wheel.start()
-        self._reconciliation_task = asyncio.create_task(self._reconciliation_loop())
+        # Phase 6b: explicit ``loop.create_task`` so the task binds to
+        # the loop ``start`` was called from rather than implicitly going
+        # through ``get_running_loop`` at task-creation time.
+        self._reconciliation_task = asyncio.get_running_loop().create_task(
+            self._reconciliation_loop()
+        )
 
     async def stop(self) -> None:
         """Stop the failure detector."""
         self._running = False
 
-        if self._reconciliation_task and not self._reconciliation_task.done():
-            self._reconciliation_task.cancel()
-            try:
-                await self._reconciliation_task
-            except asyncio.CancelledError:
-                pass
+        await self._stop_reconciliation_task()
 
         # Cancel-and-await every pending clear task in parallel; merely
         # cancelling them leaves them alive in asyncio.all_tasks() when the
         # caller (e.g. simulation harness leak detector) inspects right
         # after stop().
-        pending_clear = [t for t in self._pending_clear_tasks if not t.done()]
-        for task in pending_clear:
-            task.cancel()
-        if pending_clear:
-            await asyncio.gather(*pending_clear, return_exceptions=True)
+        await self._cancel_pending_clear_tasks()
         self._pending_clear_tasks.clear()
 
         await self._global_wheel.stop()
@@ -369,6 +314,35 @@ class HierarchicalFailureDetector:
 
         self._extension_trackers_cleaned += len(self._extension_trackers)
         self._extension_trackers.clear()
+
+    async def _stop_reconciliation_task(self) -> None:
+        """Cancel a live reconciliation task and wait for it to end."""
+        if self._reconciliation_task and not self._reconciliation_task.done():
+            await self._await_cancelled_reconciliation_task()
+
+    async def _await_cancelled_reconciliation_task(self) -> None:
+        """Cancel the reconciliation task and wait it out, re-raising only a cancel aimed at the caller."""
+        self._reconciliation_task.cancel()
+        cancels_requested_before_wait = asyncio.current_task().cancelling()
+        try:
+            await self._reconciliation_task
+        except asyncio.CancelledError:
+            # The task we cancelled ended; a cancel aimed at this task
+            # while it waited goes on.
+            if asyncio.current_task().cancelling() > cancels_requested_before_wait:
+                raise
+
+    async def _cancel_pending_clear_tasks(self) -> None:
+        """Cancel every unfinished fallback task and wait for all of them together."""
+        pending_clear = self._live_pending_clear_tasks()
+        for task in pending_clear:
+            task.cancel()
+        if pending_clear:
+            await asyncio.gather(*pending_clear, return_exceptions=True)
+
+    def _live_pending_clear_tasks(self) -> list[asyncio.Task]:
+        """The fallback tasks not yet finished."""
+        return [t for t in self._pending_clear_tasks if not t.done()]
 
     # =========================================================================
     # Global Layer Operations
@@ -378,7 +352,7 @@ class HierarchicalFailureDetector:
         self,
         node: NodeAddress,
         incarnation: int,
-        from_node: NodeAddress,
+        from_node: NodeAddress | None,
     ) -> bool:
         """
         Start or update a global (machine-level) suspicion.
@@ -396,140 +370,194 @@ class HierarchicalFailureDetector:
             existing_state = await self._global_wheel.get_state(node)
 
             if existing_state:
-                if incarnation < existing_state.incarnation:
-                    return False  # Stale
-                elif incarnation == existing_state.incarnation:
-                    # Only refresh the timer when a *new* confirmation
-                    # arrives. Same from_node calling repeatedly (e.g.
-                    # successive probe timeouts on a single-manager DC)
-                    # would otherwise call ``update_expiration`` with the
-                    # original ``start_time + timeout`` even after that
-                    # moment has passed — and the timing wheel's
-                    # past-due clamp can only do so much. The expiration
-                    # is already correctly set; leave it alone unless
-                    # the confirmation count actually changed.
-                    if existing_state.add_confirmation(from_node):
-                        new_timeout = existing_state.calculate_timeout()
-                        new_expiration = existing_state.start_time + new_timeout
-                        await self._global_wheel.update_expiration(
-                            node, new_expiration
-                        )
-                    return True
-                else:
-                    # incarnation > existing_state.incarnation
-                    #
-                    # A higher-incarnation observation while we already
-                    # hold a live suspicion is *refutation evidence*, not
-                    # a fresh suspicion: the only authoritative source of
-                    # incarnation increase is the peer itself (Lifeguard
-                    # §4.2 "Refutation"). Removing the live bracket and
-                    # creating a new one — the previous behaviour —
-                    # silently extended detection time by the full new
-                    # bracket period (observed ~17s second bracket
-                    # appearing right when the first should have
-                    # expired), since the original suspicion's expiry
-                    # callback never ran. Refutation belongs in
-                    # ``refute_global``; here we simply absorb the
-                    # higher incarnation into the existing state and
-                    # leave the timer untouched.
-                    existing_state.incarnation = incarnation
-                    return True
-
-            # AD-30 suspicion-bracket composition with bounded
-            # prob-OR aggregation.
-            #
-            # AD-30 specifies the suspicion bracket scales with three
-            # independent measurement-reliability multipliers:
-            #
-            #     self_lhm        — global self-health (Lifeguard LHM)
-            #     peer_load       — target's reported load class
-            #     vivaldi_quality — our network-coordinate confidence
-            #
-            # The original ``×`` composition (each multiplier ≥ 1
-            # multiplied together) compounds explosively at scale —
-            # observed brackets of 10× to 30× under modest concurrent
-            # signal elevation, with positive-feedback pathologies.
-            # The cure is *not* to remove any of these inputs — each
-            # is in AD-30 for documented architectural reasons (LHM
-            # extends refutation time when the prober itself is
-            # degraded, per Lifeguard §4) — but to replace the
-            # composition operator with one that is bounded by
-            # construction.
-            #
-            # Treat each multiplier ``m_i ≥ 1`` as the inverse of an
-            # independent reliability probability:
-            #
-            #     r_i = 1 / m_i              ∈ (0, 1]   reliable-prob
-            #     u_i = 1 − r_i              ∈ [0, 1)   unreliable-prob
-            #
-            # Independent reliabilities compose multiplicatively
-            # (probability law); equivalently:
-            #
-            #     R = ∏ r_i = 1 / (m_lhm · m_peer · m_vivaldi)
-            #     U = 1 − R                  ∈ [0, 1)
-            #
-            # ``U`` is mathematically bounded below 1.0 regardless of
-            # input magnitudes — even pathological inputs (e.g.
-            # ``self_lhm=10⁶``) cannot push ``U`` to or beyond 1.0.
-            # Bracket extension is linear in ``U`` against the
-            # operator-configured headroom ``(base_max − base_min)``,
-            # so the post-adjustment maximum is strictly bounded by
-            # ``2·base_max − base_min``. Explosion is impossible at
-            # any cluster scale. AD-30's three signals are preserved
-            # in full; only the operator changed.
-            #
-            # The Lifeguard confirmation term remains intact via
-            # ``SuspicionState.calculate_timeout`` on top of this
-            # bracket, using a bounded global confirmation target
-            # instead of total cluster size.
-            self_lhm = (
-                self._get_lhm_multiplier() if self._get_lhm_multiplier else 1.0
-            )
-            peer_load = self._compute_peer_load_multiplier(node)
-            vivaldi_quality = self._compute_vivaldi_quality_multiplier(node)
-
-            # Defensive clamp: producers are documented to return
-            # multipliers ≥ 1.0, but a value < 1.0 would invert the
-            # composition (treat "extra-healthy" as "extra-noisy").
-            self_lhm_multiplier = max(1.0, self_lhm)
-            peer_load_multiplier = max(1.0, peer_load)
-            vivaldi_quality_multiplier = max(1.0, vivaldi_quality)
-
-            combined_reliability = 1.0 / (
-                self_lhm_multiplier
-                * peer_load_multiplier
-                * vivaldi_quality_multiplier
-            )
-            combined_unreliability = 1.0 - combined_reliability
-
-            base_max = self._config.global_max_timeout
-            base_min = self._config.global_min_timeout
-            adjusted_max = base_max + (base_max - base_min) * combined_unreliability
-            required_confirmations = self._get_required_global_confirmations(node)
-
-            if required_confirmations <= 0:
-                no_witness_timeout = self._get_no_witness_global_timeout(
-                    adjusted_max,
+                return await self._update_existing_suspicion(
+                    node,
+                    existing_state,
+                    incarnation,
+                    from_node,
                 )
-                state_min_timeout = no_witness_timeout
-                state_max_timeout = no_witness_timeout
-            else:
-                state_min_timeout = base_min
-                state_max_timeout = adjusted_max
 
-            state = SuspicionState(
-                node=node,
-                incarnation=incarnation,
-                start_time=time.monotonic(),
-                min_timeout=state_min_timeout,
-                max_timeout=state_max_timeout,
-                n_members=self._get_current_n_members(),
-                required_confirmations=required_confirmations,
+            return await self._start_global_suspicion(node, incarnation, from_node)
+
+    async def _update_existing_suspicion(
+        self,
+        node: NodeAddress,
+        existing_state: SuspicionState,
+        incarnation: int,
+        from_node: NodeAddress | None,
+    ) -> bool:
+        """Apply a suspicion of an already-suspected node: stale, a confirmation, or a higher incarnation."""
+        if incarnation < existing_state.incarnation:
+            return False  # Stale
+        elif incarnation == existing_state.incarnation:
+            # Only refresh the timer when a *new* confirmation
+            # arrives. Same from_node calling repeatedly (e.g.
+            # successive probe timeouts on a single-manager DC)
+            # would otherwise call ``update_expiration`` with the
+            # original ``start_time + timeout`` even after that
+            # moment has passed — and the timing wheel's
+            # past-due clamp can only do so much. The expiration
+            # is already correctly set; leave it alone unless
+            # the confirmation count actually changed.
+            await self._refresh_suspicion_confirmation(node, existing_state, from_node)
+            return True
+        else:
+            # incarnation > existing_state.incarnation
+            #
+            # A higher-incarnation observation while we already
+            # hold a live suspicion is *refutation evidence*, not
+            # a fresh suspicion: the only authoritative source of
+            # incarnation increase is the peer itself (Lifeguard
+            # §4.2 "Refutation"). Removing the live bracket and
+            # creating a new one — the previous behaviour —
+            # silently extended detection time by the full new
+            # bracket period (observed ~17s second bracket
+            # appearing right when the first should have
+            # expired), since the original suspicion's expiry
+            # callback never ran. Refutation belongs in
+            # ``refute_global``; here we simply absorb the
+            # higher incarnation into the existing state and
+            # leave the timer untouched.
+            existing_state.incarnation = incarnation
+            return True
+
+    async def _refresh_suspicion_confirmation(
+        self,
+        node: NodeAddress,
+        state: SuspicionState,
+        from_node: NodeAddress | None,
+    ) -> bool:
+        """Add ``from_node``'s confirmation; when new, move the expiry to the shortened timeout."""
+        if state.add_confirmation(from_node):
+            new_timeout = state.calculate_timeout()
+            new_expiration = state.start_time + new_timeout
+            await self._global_wheel.update_expiration(
+                node, new_expiration
             )
-            state.add_confirmation(from_node)
+            return True
+        return False
 
-            expiration = time.monotonic() + state.calculate_timeout()
-            return await self._global_wheel.add(node, state, expiration)
+    async def _start_global_suspicion(
+        self,
+        node: NodeAddress,
+        incarnation: int,
+        from_node: NodeAddress | None,
+    ) -> bool:
+        """Open a new global suspicion of ``node`` under the AD-30 bounded bracket."""
+        # AD-30 suspicion-bracket composition with bounded
+        # prob-OR aggregation.
+        #
+        # AD-30 specifies the suspicion bracket scales with three
+        # independent measurement-reliability multipliers:
+        #
+        #     self_lhm        — global self-health (Lifeguard LHM)
+        #     peer_load       — target's reported load class
+        #     vivaldi_quality — our network-coordinate confidence
+        #
+        # The original ``×`` composition (each multiplier ≥ 1
+        # multiplied together) compounds explosively at scale —
+        # observed brackets of 10× to 30× under modest concurrent
+        # signal elevation, with positive-feedback pathologies.
+        # The cure is *not* to remove any of these inputs — each
+        # is in AD-30 for documented architectural reasons (LHM
+        # extends refutation time when the prober itself is
+        # degraded, per Lifeguard §4) — but to replace the
+        # composition operator with one that is bounded by
+        # construction.
+        #
+        # Treat each multiplier ``m_i ≥ 1`` as the inverse of an
+        # independent reliability probability:
+        #
+        #     r_i = 1 / m_i              ∈ (0, 1]   reliable-prob
+        #     u_i = 1 − r_i              ∈ [0, 1)   unreliable-prob
+        #
+        # Independent reliabilities compose multiplicatively
+        # (probability law); equivalently:
+        #
+        #     R = ∏ r_i = 1 / (m_lhm · m_peer · m_vivaldi)
+        #     U = 1 − R                  ∈ [0, 1)
+        #
+        # ``U`` is mathematically bounded below 1.0 regardless of
+        # input magnitudes — even pathological inputs (e.g.
+        # ``self_lhm=10⁶``) cannot push ``U`` to or beyond 1.0.
+        # Bracket extension is linear in ``U`` against the
+        # operator-configured headroom ``(base_max − base_min)``,
+        # so the post-adjustment maximum is strictly bounded by
+        # ``2·base_max − base_min``. Explosion is impossible at
+        # any cluster scale. AD-30's three signals are preserved
+        # in full; only the operator changed.
+        #
+        # The Lifeguard confirmation term remains intact via
+        # ``SuspicionState.calculate_timeout`` on top of this
+        # bracket, using a bounded global confirmation target
+        # instead of total cluster size.
+        self_lhm = self._self_lhm_multiplier()
+        peer_load = self._compute_peer_load_multiplier(node)
+        vivaldi_quality = self._compute_vivaldi_quality_multiplier(node)
+
+        # Defensive clamp: producers are documented to return
+        # multipliers ≥ 1.0, but a value < 1.0 would invert the
+        # composition (treat "extra-healthy" as "extra-noisy").
+        self_lhm_multiplier = max(1.0, self_lhm)
+        peer_load_multiplier = max(1.0, peer_load)
+        vivaldi_quality_multiplier = max(1.0, vivaldi_quality)
+
+        combined_reliability = 1.0 / (
+            self_lhm_multiplier
+            * peer_load_multiplier
+            * vivaldi_quality_multiplier
+        )
+        combined_unreliability = 1.0 - combined_reliability
+
+        base_max = self._config.global_max_timeout
+        base_min = self._config.global_min_timeout
+        adjusted_max = base_max + (base_max - base_min) * combined_unreliability
+        required_confirmations = self._get_required_global_confirmations(node)
+
+        state_min_timeout, state_max_timeout = self._global_suspicion_bracket(
+            required_confirmations,
+            base_min,
+            adjusted_max,
+        )
+
+        state = SuspicionState(
+            node=node,
+            incarnation=incarnation,
+            start_time=self._clock.monotonic(),
+            min_timeout=state_min_timeout,
+            max_timeout=state_max_timeout,
+            n_members=self._get_current_n_members(),
+            required_confirmations=required_confirmations,
+            originator=from_node,
+        )
+        # Deliberately NOT add_confirmation(from_node): the
+        # originator's evidence IS the suspicion (Lifeguard) — a
+        # self-vote satisfying required_confirmations=1 collapsed
+        # the bracket to min_timeout on zero independent evidence.
+        state.add_confirmation(from_node)
+
+        expiration = self._clock.monotonic() + state.calculate_timeout()
+        return await self._global_wheel.add(node, state, expiration)
+
+    def _self_lhm_multiplier(self) -> float:
+        """This node's Lifeguard LHM multiplier; neutral when no callback is set."""
+        return (
+            self._get_lhm_multiplier() if self._get_lhm_multiplier else 1.0
+        )
+
+    def _global_suspicion_bracket(
+        self,
+        required_confirmations: int,
+        base_min: float,
+        adjusted_max: float,
+    ) -> tuple[float, float]:
+        """``(min, max)`` suspicion timeouts: the no-witness bracket when no confirmer exists."""
+        if required_confirmations <= 0:
+            no_witness_timeout = self._get_no_witness_global_timeout(
+                adjusted_max,
+            )
+            return no_witness_timeout, no_witness_timeout
+        return base_min, adjusted_max
 
     def _get_no_witness_global_timeout(self, adjusted_max_timeout: float) -> float:
         """Return the finite direct-probe bracket for no-witness suspicions."""
@@ -580,12 +608,8 @@ class HierarchicalFailureDetector:
         async with self._lock:
             state = await self._global_wheel.get_state(node)
             if state and state.incarnation == incarnation:
-                if state.add_confirmation(from_node):
-                    # Update expiration
-                    new_timeout = state.calculate_timeout()
-                    new_expiration = state.start_time + new_timeout
-                    await self._global_wheel.update_expiration(node, new_expiration)
-                    return True
+                # Update expiration
+                return await self._refresh_suspicion_confirmation(node, state, from_node)
             return False
 
     async def refute_global(
@@ -636,11 +660,16 @@ class HierarchicalFailureDetector:
             state = await self._global_wheel.get_state(node)
             if state is None:
                 return False
-            if incarnation is not None and state.incarnation != incarnation:
+            if self._is_other_incarnation(state, incarnation):
                 return False
             await self._global_wheel.remove(node)
             self.reset_extension_tracker(node)
             return True
+
+    @staticmethod
+    def _is_other_incarnation(state: SuspicionState, incarnation: int | None) -> bool:
+        """Whether an incarnation fence is given and names another incarnation than the suspicion's."""
+        return incarnation is not None and state.incarnation != incarnation
 
     async def commit_global_death(
         self,
@@ -660,18 +689,7 @@ class HierarchicalFailureDetector:
             self._globally_dead.add(node)
             self._global_deaths += 1
 
-        if self._on_global_death_sync is not None:
-            try:
-                self._on_global_death_sync(node, incarnation)
-            except Exception as sync_error:
-                if self._on_error is not None:
-                    try:
-                        self._on_error(
-                            f"on_global_death_sync failed for {node}",
-                            sync_error,
-                        )
-                    except Exception:
-                        pass
+        self._run_global_death_sync(node, incarnation)
 
         self.remove_extension_tracker(node)
 
@@ -688,6 +706,43 @@ class HierarchicalFailureDetector:
             node,
         )
         return True
+
+    def _run_global_death_sync(self, node: NodeAddress, incarnation: int) -> None:
+        """Run the synchronous global-death hook, reporting its failure to the error hook."""
+        if self._on_global_death_sync is not None:
+            try:
+                self._on_global_death_sync(node, incarnation)
+            except Exception as sync_error:
+                self._report_error_when_hook_set(
+                    f"on_global_death_sync failed for {node}",
+                    sync_error,
+                )
+
+    def _report_error_when_hook_set(self, message: str, error: Exception) -> None:
+        """Hand an error to the error hook when one is set (not None), counting the hook's own failure."""
+        if self._on_error is not None:
+            try:
+                self._on_error(
+                    message,
+                    error,
+                )
+            except Exception:
+                # The error hook itself failed: nowhere left to
+                # report it but this detector's stats.
+                self._error_report_failures += 1
+
+    def _report_error_when_hook_truthy(self, message: str, error: Exception) -> None:
+        """Hand an error to the error hook when it is truthy, counting the hook's own failure."""
+        if self._on_error:
+            try:
+                self._on_error(
+                    message,
+                    error,
+                )
+            except Exception:
+                # The error hook itself failed: nowhere left to
+                # report it but this detector's stats.
+                self._error_report_failures += 1
 
     # =========================================================================
     # AD-26: Adaptive Healthcheck Extensions
@@ -770,23 +825,35 @@ class HierarchicalFailureDetector:
                 )
             )
 
-            if granted:
-                self._extensions_granted += 1
-
-                # Extend the suspicion timer in the timing wheel
-                current_expiration = state.start_time + state.calculate_timeout()
-                new_expiration = tracker.get_new_deadline(
-                    current_deadline=current_expiration,
-                    grant=extension_seconds,
-                )
-                await self._global_wheel.update_expiration(node, new_expiration)
-
-                if is_warning:
-                    self._extension_warnings_sent += 1
-            else:
-                self._extensions_denied += 1
+            await self._apply_extension_decision(node, state, tracker, granted, extension_seconds, is_warning)
 
             return (granted, extension_seconds, denial_reason, is_warning)
+
+    async def _apply_extension_decision(
+        self,
+        node: NodeAddress,
+        state: SuspicionState,
+        tracker: ExtensionTracker,
+        granted: bool,
+        extension_seconds: float,
+        is_warning: bool,
+    ) -> None:
+        """Count an AD-26 decision; a grant pushes the suspicion's expiry out by the granted time."""
+        if granted:
+            self._extensions_granted += 1
+
+            # Extend the suspicion timer in the timing wheel
+            current_expiration = state.start_time + state.calculate_timeout()
+            new_expiration = tracker.get_new_deadline(
+                current_deadline=current_expiration,
+                grant=extension_seconds,
+            )
+            await self._global_wheel.update_expiration(node, new_expiration)
+
+            if is_warning:
+                self._extension_warnings_sent += 1
+        else:
+            self._extensions_denied += 1
 
     def reset_extension_tracker(self, node: NodeAddress) -> None:
         """
@@ -927,6 +994,17 @@ class HierarchicalFailureDetector:
             if node in self._globally_dead:
                 return False
 
+        return await self._start_monitoring_suspicion(job_id, node, incarnation, min_timeout, max_timeout)
+
+    async def _start_monitoring_suspicion(
+        self,
+        job_id: JobId,
+        node: NodeAddress,
+        incarnation: int,
+        min_timeout: float | None,
+        max_timeout: float | None,
+    ) -> bool:
+        """Start a monitoring-driven job suspicion (AD-30), defaulting the timeouts to the job layer's."""
         # Use node itself as the confirmer (self-suspicion from monitoring)
         result = await self._job_manager.start_suspicion(
             job_id=job_id,
@@ -988,6 +1066,10 @@ class HierarchicalFailureDetector:
         if await self._global_wheel.contains(node):
             return NodeStatus.SUSPECTED_GLOBAL
 
+        return self._job_layer_status(node)
+
+    def _job_layer_status(self, node: NodeAddress) -> NodeStatus:
+        """SUSPECTED_JOB when any job suspects ``node``, else ALIVE."""
         # Check if suspected for any job
         jobs = self._job_manager.get_jobs_suspecting(node)
         if jobs:
@@ -1017,15 +1099,34 @@ class HierarchicalFailureDetector:
 
         This is called synchronously by the timing wheel.
         """
-        import sys as _sys
-        _sys.stderr.write(
-            f"[HFD-GLOBAL-EXPIRE target={node} incarnation={state.incarnation} "
-            f"on_death={self._on_global_death is not None} "
-            f"on_death_sync={self._on_global_death_sync is not None}]\n"
-        )
-        _sys.stderr.flush()
-        actual_age_seconds = time.monotonic() - state.start_time
+        actual_age_seconds = self._clock.monotonic() - state.start_time
         expected_timeout = state.calculate_timeout()
+        self._report_expiration_diagnostic(node, state, actual_age_seconds, expected_timeout)
+
+        # Invoke ``on_global_death`` callback. The callback is a candidate
+        # expiry notification, not the commit point: the owning SWIM state
+        # machine must first accept the DEAD write. Once it does, it calls
+        # ``commit_global_death`` to publish HFD-side global-death state.
+        # Routing through TaskRunner gives us proper lifecycle tracking and
+        # cleanup; the fallback path tracks the task in
+        # ``_pending_clear_tasks`` so HFD.stop can drain it.
+        if self._on_global_death:
+            self._dispatch_global_death(node, state)
+        else:
+            self._dispatch_async_work(
+                self.commit_global_death,
+                node,
+                state.incarnation,
+            )
+
+    def _report_expiration_diagnostic(
+        self,
+        node: NodeAddress,
+        state: SuspicionState,
+        actual_age_seconds: float,
+        expected_timeout: float,
+    ) -> None:
+        """Hand an expiry's age and bracket to the diagnostic hook, reporting the hook's failure."""
         if self._on_expiration_diagnostic is not None:
             try:
                 self._on_expiration_diagnostic(
@@ -1037,43 +1138,25 @@ class HierarchicalFailureDetector:
                     state.min_timeout,
                     state.max_timeout,
                 )
-            except Exception:
-                pass
-
-        # Invoke ``on_global_death`` callback. The callback is a candidate
-        # expiry notification, not the commit point: the owning SWIM state
-        # machine must first accept the DEAD write. Once it does, it calls
-        # ``commit_global_death`` to publish HFD-side global-death state.
-        # Routing through TaskRunner gives us proper lifecycle tracking and
-        # cleanup; the fallback path tracks the task in
-        # ``_pending_clear_tasks`` so HFD.stop can drain it.
-        if self._on_global_death:
-            import sys as _sys
-            _sys.stderr.write(
-                f"[HFD-DISPATCH-DEATH target={node} callback={self._on_global_death!r}]\n"
-            )
-            _sys.stderr.flush()
-            try:
-                self._dispatch_callback(
-                    self._on_global_death,
-                    node,
-                    state.incarnation,
-                    error_context=f"on_global_death callback failed for {node}",
+            except Exception as diagnostic_error:
+                self._report_error_when_hook_set(
+                    f"on_expiration_diagnostic failed for {node}",
+                    diagnostic_error,
                 )
-            except Exception as callback_error:
-                if self._on_error:
-                    try:
-                        self._on_error(
-                            f"on_global_death callback failed for {node}",
-                            callback_error,
-                        )
-                    except Exception:
-                        pass
-        else:
-            self._dispatch_async_work(
-                self.commit_global_death,
+
+    def _dispatch_global_death(self, node: NodeAddress, state: SuspicionState) -> None:
+        """Dispatch the global-death callback, reporting a dispatch failure to the error hook."""
+        try:
+            self._dispatch_callback(
+                self._on_global_death,
                 node,
                 state.incarnation,
+                error_context=f"on_global_death callback failed for {node}",
+            )
+        except Exception as callback_error:
+            self._report_error_when_hook_truthy(
+                f"on_global_death callback failed for {node}",
+                callback_error,
             )
 
     def _handle_job_expiration(
@@ -1102,26 +1185,26 @@ class HierarchicalFailureDetector:
         # discipline as ``_handle_global_expiration`` — async callbacks
         # must be dispatched, never invoked sync-and-discarded.
         if self._on_job_death:
-            try:
-                self._dispatch_callback(
-                    self._on_job_death,
-                    job_id,
-                    node,
-                    incarnation,
-                    error_context=(
-                        f"on_job_death callback failed for job {job_id}, "
-                        f"node {node}"
-                    ),
-                )
-            except Exception as callback_error:
-                if self._on_error:
-                    try:
-                        self._on_error(
-                            f"on_job_death callback failed for job {job_id}, node {node}",
-                            callback_error,
-                        )
-                    except Exception:
-                        pass
+            self._dispatch_job_death(job_id, node, incarnation)
+
+    def _dispatch_job_death(self, job_id: JobId, node: NodeAddress, incarnation: int) -> None:
+        """Dispatch the job-death callback, reporting a dispatch failure to the error hook."""
+        try:
+            self._dispatch_callback(
+                self._on_job_death,
+                job_id,
+                node,
+                incarnation,
+                error_context=(
+                    f"on_job_death callback failed for job {job_id}, "
+                    f"node {node}"
+                ),
+            )
+        except Exception as callback_error:
+            self._report_error_when_hook_truthy(
+                f"on_job_death callback failed for job {job_id}, node {node}",
+                callback_error,
+            )
 
     async def _clear_job_suspicions_for_node(self, node: NodeAddress) -> None:
         """Clear all job suspicions for a globally-dead node."""
@@ -1156,7 +1239,11 @@ class HierarchicalFailureDetector:
             return
 
         coro = coro_func(*args)
-        task = asyncio.create_task(coro)
+        # Phase 6b: explicit ``loop.create_task`` so the fallback task
+        # binds to the loop ``_dispatch_async_work`` was called from
+        # rather than implicitly going through ``get_running_loop`` at
+        # task-creation time.
+        task = asyncio.get_running_loop().create_task(coro)
         self._pending_clear_tasks.add(task)
         task.add_done_callback(self._pending_clear_tasks.discard)
         if task.done():
@@ -1187,11 +1274,6 @@ class HierarchicalFailureDetector:
         # the supported replacement and behaves identically for our
         # use case (detecting native ``async def`` callbacks).
         if inspect.iscoroutinefunction(callback):
-            import sys as _sys
-            _sys.stderr.write(
-                f"[HFD-DISPATCH-ASYNC callback={callback!r} has_task_runner={self._task_runner is not None}]\n"
-            )
-            _sys.stderr.flush()
             self._dispatch_async_work(callback, *args)
             return
 
@@ -1200,19 +1282,31 @@ class HierarchicalFailureDetector:
             # Sync callable that happens to return a coroutine (e.g. a
             # functools.partial wrapping an async func, or a lambda).
             # Schedule the already-constructed coroutine.
-            if self._task_runner is not None:
-                # TaskRunner.run requires a callable. Wrap the live
-                # coroutine in a zero-arg coroutine function.
-                async def _wrap(_coro=result):
-                    return await _coro
+            self._schedule_coroutine(result)
 
-                self._task_runner.run(_wrap)
-                return
-            task = asyncio.create_task(result)
-            self._pending_clear_tasks.add(task)
-            task.add_done_callback(self._pending_clear_tasks.discard)
-            if task.done():
-                self._pending_clear_tasks.discard(task)
+    def _schedule_coroutine(self, result: Coroutine) -> None:
+        """Schedule a live coroutine through TaskRunner, else as a tracked fallback task."""
+        if self._task_runner is not None:
+            # TaskRunner.run requires a callable. Wrap the live
+            # coroutine in a zero-arg coroutine function.
+            async def _wrap(_coro=result):
+                return await _coro
+
+            self._task_runner.run(_wrap)
+            return
+        self._track_fallback_task(result)
+
+    def _track_fallback_task(self, result: Coroutine) -> None:
+        """Run a coroutine as a loop task tracked in ``_pending_clear_tasks`` so stop can drain it."""
+        # Phase 6b: explicit ``loop.create_task`` so the fallback
+        # task binds to the loop ``_dispatch_callback`` was called
+        # from rather than implicitly going through
+        # ``get_running_loop`` at task-creation time.
+        task = asyncio.get_running_loop().create_task(result)
+        self._pending_clear_tasks.add(task)
+        task.add_done_callback(self._pending_clear_tasks.discard)
+        if task.done():
+            self._pending_clear_tasks.discard(task)
 
     def _record_event(self, event: FailureEvent) -> None:
         """Record a failure event for history/debugging."""
@@ -1231,20 +1325,23 @@ class HierarchicalFailureDetector:
         - Stale global death markers (node may have rejoined)
         """
         while self._running:
-            try:
-                await asyncio.sleep(self._config.reconciliation_interval_s)
-                await self._reconcile()
-            except asyncio.CancelledError:
+            if not await self._reconciliation_iteration():
                 break
-            except Exception as reconciliation_error:
-                if self._on_error:
-                    try:
-                        self._on_error(
-                            f"Reconciliation loop error (cycle {self._reconciliations})",
-                            reconciliation_error,
-                        )
-                    except Exception:
-                        pass
+
+    async def _reconciliation_iteration(self) -> bool:
+        """One reconciliation after its interval; False once cancelled, an error reported and the loop kept."""
+        try:
+            await self._clock.sleep(self._config.reconciliation_interval_s)
+            await self._reconcile()
+            return True
+        except asyncio.CancelledError:
+            return False
+        except Exception as reconciliation_error:
+            self._report_error_when_hook_truthy(
+                f"Reconciliation loop error (cycle {self._reconciliations})",
+                reconciliation_error,
+            )
+            return True
 
     async def _reconcile(self) -> None:
         """Perform reconciliation between layers."""
@@ -1253,31 +1350,37 @@ class HierarchicalFailureDetector:
         async with self._lock:
             # Clear job suspicions for globally-dead nodes
             for node in list(self._globally_dead):
-                jobs = self._job_manager.get_jobs_suspecting(node)
-                for job_id in jobs:
-                    await self._job_manager.refute_suspicion(job_id, node, 2**31)
-                    self._job_suspicions_cleared_by_global += 1
+                await self._clear_job_suspicions_for_node(node)
 
             # AD-26: Clean up extension trackers for nodes that are no longer suspected
             # and have been reset (idle). This prevents memory leaks from accumulating
             # trackers for nodes that have come and gone.
-            stale_tracker_nodes: list[NodeAddress] = []
-            for node, tracker in self._extension_trackers.items():
-                # Only remove if:
-                # 1. Node is not currently suspected (no active suspicion)
-                # 2. Tracker has been reset (extension_count == 0)
-                # 3. Node is not globally dead (those are cleaned up on death)
-                is_suspected = await self._global_wheel.contains(node)
-                if (
-                    not is_suspected
-                    and tracker.extension_count == 0
-                    and node not in self._globally_dead
-                ):
-                    stale_tracker_nodes.append(node)
+            stale_tracker_nodes = await self._stale_extension_tracker_nodes()
 
             for node in stale_tracker_nodes:
                 self._extension_trackers.pop(node, None)
                 self._extension_trackers_cleaned += 1
+
+    async def _stale_extension_tracker_nodes(self) -> list[NodeAddress]:
+        """Nodes whose AD-26 extension tracker is idle and unneeded."""
+        stale_tracker_nodes: list[NodeAddress] = []
+        for node, tracker in self._extension_trackers.items():
+            # Only remove if:
+            # 1. Node is not currently suspected (no active suspicion)
+            # 2. Tracker has been reset (extension_count == 0)
+            # 3. Node is not globally dead (those are cleaned up on death)
+            is_suspected = await self._global_wheel.contains(node)
+            if self._is_stale_tracker(node, tracker, is_suspected):
+                stale_tracker_nodes.append(node)
+        return stale_tracker_nodes
+
+    def _is_stale_tracker(self, node: NodeAddress, tracker: ExtensionTracker, is_suspected: bool) -> bool:
+        """Whether a tracker belongs to an unsuspected, live node and was reset."""
+        return (
+            not is_suspected
+            and tracker.extension_count == 0
+            and node not in self._globally_dead
+        )
 
     # =========================================================================
     # LHM Integration
@@ -1320,6 +1423,8 @@ class HierarchicalFailureDetector:
             "jobs_with_suspicions": job_stats["jobs_with_suspicions"],
             # Reconciliation
             "reconciliations": self._reconciliations,
+            "error_report_failures": self._error_report_failures,
+            "wheel_error_report_failures": global_stats["error_report_failures"],
             "job_suspicions_cleared_by_global": self._job_suspicions_cleared_by_global,
             # Timing wheel internals
             "wheel_entries_added": global_stats["entries_added"],
@@ -1369,6 +1474,15 @@ class HierarchicalFailureDetector:
             return True
         return self._global_wheel.contains_sync(node)
 
+    def get_global_suspicion_incarnation(self, node: NodeAddress) -> int | None:
+        """The incarnation a live global suspicion of ``node`` accuses, else None.
+
+        Synchronous, like ``is_suspected_global``: it reads the timing
+        wheel directly, for SWIM send paths.
+        """
+        state = self._global_wheel.get_state_sync(node)
+        return state.incarnation if state else None
+
     def get_time_remaining_global(self, node: NodeAddress) -> float | None:
         """
         Get remaining timeout for global suspicion.
@@ -1403,3 +1517,13 @@ class HierarchicalFailureDetector:
 
     # Debug attribute (set by HealthAwareServer)
     _node_port: int = 0
+
+_REHOMED = (
+    NodeStatus,
+    FailureSource,
+    HierarchicalConfig,
+    FailureEvent,
+)
+
+for _rehomed in _REHOMED:
+    _rehomed.__module__ = __name__

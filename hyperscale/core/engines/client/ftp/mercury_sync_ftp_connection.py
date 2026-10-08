@@ -1,4 +1,5 @@
 import asyncio
+import posixpath
 import ssl
 import re
 import socket
@@ -31,11 +32,13 @@ class MercurySyncFTPConnection:
         pool_size: int | None = None,
         cert_path: str | None = None,
         key_path: str | None = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ):
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._cert_path = cert_path
@@ -99,6 +102,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
 
     ):
         async with self._semaphore:
@@ -111,6 +115,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         data=password,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -120,6 +125,7 @@ class MercurySyncFTPConnection:
                     action='CREATE_ACCOUNT',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def change_directory(
@@ -129,6 +135,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -140,6 +147,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -149,6 +157,7 @@ class MercurySyncFTPConnection:
                     action='CHANGE_DIRECTORY',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
     
     async def list_path(
@@ -158,6 +167,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -169,6 +179,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -178,6 +189,7 @@ class MercurySyncFTPConnection:
                     action='LIST',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def list_directory(
@@ -187,6 +199,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -198,6 +211,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -207,6 +221,7 @@ class MercurySyncFTPConnection:
                     action='LIST_DIRECTORY',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def list_details(
@@ -217,6 +232,7 @@ class MercurySyncFTPConnection:
         options: list[str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -229,6 +245,7 @@ class MercurySyncFTPConnection:
                         destination_path=path,
                         options=options,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -238,6 +255,7 @@ class MercurySyncFTPConnection:
                     action='LIST_DETAILS',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def make_directory(
@@ -247,6 +265,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -258,6 +277,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -267,6 +287,7 @@ class MercurySyncFTPConnection:
                     action='MAKE_DIRECTORY',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
 
     async def pwd(
@@ -275,6 +296,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
             try:
@@ -285,6 +307,7 @@ class MercurySyncFTPConnection:
                         action='PWD',
                         auth=auth,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -294,6 +317,7 @@ class MercurySyncFTPConnection:
                     action='PWD',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
 
     async def receive(
@@ -305,6 +329,7 @@ class MercurySyncFTPConnection:
         chunk_size: int = 8192,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -322,6 +347,7 @@ class MercurySyncFTPConnection:
                         destination_path=path,
                         chunk_size=chunk_size,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -331,6 +357,7 @@ class MercurySyncFTPConnection:
                     action=action,
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def remove(
@@ -341,6 +368,7 @@ class MercurySyncFTPConnection:
         filetype: Literal['FILE', 'DIRECTORY'] = 'FILE',
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -357,6 +385,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -366,6 +395,7 @@ class MercurySyncFTPConnection:
                     action=action,
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
     
     async def rename(
@@ -376,6 +406,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -389,6 +420,7 @@ class MercurySyncFTPConnection:
                         source_path=from_name,
                         destination_path=to_name,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -398,6 +430,7 @@ class MercurySyncFTPConnection:
                     action='RENAME',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
 
     async def send(
@@ -410,6 +443,7 @@ class MercurySyncFTPConnection:
         filetype: Literal['BINARY', 'LINES'] = 'BINARY',
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -428,6 +462,7 @@ class MercurySyncFTPConnection:
                         action=action,
                         chunk_size=chunk_size,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -437,6 +472,7 @@ class MercurySyncFTPConnection:
                     action=action,
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
     async def size(
@@ -446,6 +482,7 @@ class MercurySyncFTPConnection:
         auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
+        cwd: str | None = None,
     ):
          async with self._semaphore:
 
@@ -458,6 +495,7 @@ class MercurySyncFTPConnection:
                         auth=auth,
                         destination_path=path,
                         secure_connection=secure_connection,
+                        cwd=cwd,
                     ),
                     timeout=timeout,
                 )
@@ -467,19 +505,18 @@ class MercurySyncFTPConnection:
                     action='SIZE',
                     error=err,
                     timings={},
+                    cwd=cwd,
                 )
             
-    async def close(self) -> Exception:
-        results = await asyncio.gather(*[
-            self._quit(control_connection) for control_connection in self._control_connections
-        ])
+    def close(self):
+        for control_connection in self._control_connections:
+            if control_connection.session_open and control_connection.writer:
+                control_connection.write(b'QUIT' + CRLF)
+
+            control_connection.close()
 
         for data_connection in self._data_connections:
             data_connection.close()
-
-        for _, err in results:
-            if err:
-                return err
 
     async def _optimize(
         self,
@@ -493,36 +530,27 @@ class MercurySyncFTPConnection:
 
     async def _optimize_url(self, url: URL):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
-                    url,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                self._control_connections.append(connection)
-
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
                     _,
-                    connection,
-                    url,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._control_connections.append(connection)
 
-            self._url_cache[url.optimized.hostname] = url
+            optimized_url = url.optimized
+
+            # Plain-string requests for the same address reuse this lookup:
+            # cache the resolved URL itself, under the key the connect path
+            # reads, and only once the lookup actually resolved it.
+            if optimized_url is not None and optimized_url.ip_addresses:
+                self._url_cache[url.data] = optimized_url
+
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -555,6 +583,7 @@ class MercurySyncFTPConnection:
         options: list[str] | None = None,
         chunk_size: int = 8192,
         secure_connection: bool = True,
+        cwd: str | None = None,
     ):
         timings: dict[
             Literal[
@@ -579,6 +608,18 @@ class MercurySyncFTPConnection:
             "request_end": None,
         }
         timings["request_start"] = time.monotonic()
+
+        # The request's own working directory: its relative paths resolve
+        # against it here, so no session's server-side directory is relied
+        # on. Absolute paths stand as given.
+        if cwd is not None:
+            if source_path is not None:
+                source_path = posixpath.join(cwd, source_path)
+
+            if destination_path is not None:
+                destination_path = posixpath.join(cwd, destination_path)
+
+        response_cwd = cwd
         
         control_connection: FTPConnection | None = None
         data_connection: FTPConnection | None = None
@@ -592,85 +633,56 @@ class MercurySyncFTPConnection:
                 err,
                 control_connection,
                 url
-            ) = await self._connect_to_url_location(url)
+            ) = await self._connect_to_url_location(control_connection, url)
 
-            if err:
-                timings["connect_end"] = time.monotonic()
-                self._control_connections.append(
-                    FTPConnection(reset_connections=self.reset_connections)
-                )
-
-                return FTPResponse(
-                    action=action,
-                    error=err,
-                    timings=timings,
-                )
-
-            (
-                _,
-                err,
-            ) = await self._get_response(control_connection)
-
-            if err:
-                timings["connect_end"] = time.monotonic()
-                self._control_connections.append(
-                    FTPConnection(reset_connections=self.reset_connections)
-                )
-
-                return FTPResponse(
-                    action=action,
-                    error=err,
-                    timings=timings,
-                )
-            
-            await control_connection.login_lock.acquire()
-            if control_connection.check_logged_in(auth) is False:
-                
+            if err is None and control_connection.session_open is False:
                 (
-                    control_connection,
-                    err
-                ) = await self._login(
-                    control_connection,
-                    auth=auth,
-                )
-                
-            control_connection.login_lock.release()
+                    _,
+                    err,
+                ) = await self._get_response(control_connection)
+
+                control_connection.session_open = err is None
+
+            if err is None:
+                async with control_connection.login_lock:
+                    if control_connection.check_logged_in(auth) is False:
+                        (
+                            _,
+                            err
+                        ) = await self._login(
+                            control_connection,
+                            auth=auth,
+                        )
+
+                        if err is None:
+                            control_connection.mark_logged_in(auth)
+
+            if err is None and secure_connection:
+                async with control_connection.secure_lock:
+                    if control_connection.check_is_secure(url.hostname) is False:
+                        (
+                            _,
+                            err
+                        ) = await self._secure_connection(control_connection)
+
+                        if err is None:
+                            control_connection.mark_secure(url.hostname)
 
             if err:
                 timings["connect_end"] = time.monotonic()
-                self._control_connections.append(
-                    FTPConnection(reset_connections=self.reset_connections)
-                )
+
+                control_connection.reset()
+                self._control_connections.append(control_connection)
 
                 return FTPResponse(
                     action=action,
+                    cwd=response_cwd,
                     error=err,
                     timings=timings,
                 )
-            
-            if secure_connection:
-                await control_connection.secure_lock.acquire()
 
-                if control_connection.check_is_secure() is False:
-
-                    (
-                        control_connection,
-                        err
-                    ) = await self._secure_connection(control_connection)
-            
-                control_connection.secure_lock.release()
-            
-            if err:
-                timings["connect_end"] = time.monotonic()
-                self._control_connections.append(
-                    FTPConnection(reset_connections=self.reset_connections)
-                )
-
-                return FTPResponse(
-                    action=action,
-                    error=err,
-                    timings=timings,
-                )
+            if control_connection.data_connection is None:
+                control_connection.data_connection = self._data_connections.pop()
             
             if isinstance(data, Data):
                 data: bytes = data.optimized
@@ -705,12 +717,16 @@ class MercurySyncFTPConnection:
                 case 'CHANGE_DIRECTORY':
                     (
                         result,
+                        resolved_directory,
                         err,
-                    ) = await self._change_directory(
+                    ) = await self._resolve_directory(
                         control_connection,
                         destination_path,
                         timings=timings,
                     )
+
+                    if resolved_directory is not None:
+                        response_cwd = resolved_directory
                 
                 case 'LIST':
                     (
@@ -864,23 +880,30 @@ class MercurySyncFTPConnection:
                     )
 
                 case _:
-                    return (
-                        None,
-                        Exception('Unsupported action')
+                    self._control_connections.append(control_connection)
+
+                    return FTPResponse(
+                        action=action,
+                        cwd=response_cwd,
+                        error=Exception('Unsupported action'),
+                        timings=timings,
                     )
               
             timings["request_end"] = time.monotonic()  
 
-            if data_connection:
-                self._data_connections.append(
-                    FTPConnection(reset_connections=self.reset_connections)
-                )
+            if err:
+                control_connection.reset()
+
+            elif control_connection.data_connection.reader is not None:
+                # A passive data connection carries one transfer.
+                control_connection.data_connection.reset()
 
             self._control_connections.append(control_connection)
 
             if err:
                 return FTPResponse(
                     action=action,
+                    cwd=response_cwd,
                     error=err,
                     data=result,
                     timings=timings,
@@ -888,26 +911,24 @@ class MercurySyncFTPConnection:
             
             return FTPResponse(
                 action=action,
+                cwd=response_cwd,
                 data=result,
                 timings=timings,
             )
         
-        except Exception as err:
+        except (
+            BaseException,
+            Exception,
+        ) as err:
             timings["request_end"] = time.monotonic()
-            
-            if data_connection:
-                self._data_connections.append(
-                    FTPConnection(reset_connections=self.reset_connections)
-                )
-            
-            self._control_connections.append(
-                FTPConnection(
-                    reset_connections=self.reset_connections,
-                )
-            )
+
+            if control_connection:
+                control_connection.reset()
+                self._control_connections.append(control_connection)
 
             return FTPResponse(
                 action=action,
+                cwd=response_cwd,
                 error=err,
                 timings=timings,
             )
@@ -1340,7 +1361,7 @@ class MercurySyncFTPConnection:
                 err,
             )
         
-        if not response[:3] != b'257':
+        if response[:3] != b'257':
             timings['read_end'] = time.monotonic()
             return (
                 None,
@@ -1355,22 +1376,11 @@ class MercurySyncFTPConnection:
                 None, # Not compliant to RFC 959, but UNIX ftpd does this
             )
         
-        dirname = b''
+        closing_quote = response.find(b'"', 5)
+        while closing_quote != -1 and response[closing_quote + 1:closing_quote + 2] == b'"':
+            closing_quote = response.find(b'"', closing_quote + 2)
 
-        idx = 5
-        response_length = len(response)
-
-        while idx < response_length:
-            current_char = response[idx]
-            idx = idx+1
-
-            if current_char == b'"':
-                if idx >= response_length or response[idx] != b'"':
-                    break
-
-                idx = idx+1
-
-            dirname = dirname + current_char
+        dirname = response[5:closing_quote if closing_quote != -1 else None].replace(b'""', b'"')
 
         timings['read_end'] = time.monotonic()
         return (
@@ -1495,7 +1505,7 @@ class MercurySyncFTPConnection:
                 err,
             )
         
-        if not response[:3] != b'257':
+        if response[:3] != b'257':
             timings['read_end'] = time.monotonic()
             return (
                 None,
@@ -1510,22 +1520,11 @@ class MercurySyncFTPConnection:
                 None, # Not compliant to RFC 959, but UNIX ftpd does this
             )
         
-        dirname = b''
+        closing_quote = response.find(b'"', 5)
+        while closing_quote != -1 and response[closing_quote + 1:closing_quote + 2] == b'"':
+            closing_quote = response.find(b'"', closing_quote + 2)
 
-        idx = 5
-        response_length = len(response)
-
-        while idx < response_length:
-            current_char = response[idx]
-            idx = idx+1
-
-            if current_char == b'"':
-                if idx >= response_length or response[idx] != b'"':
-                    break
-
-                idx = idx+1
-
-            dirname = dirname + current_char
+        dirname = response[5:closing_quote if closing_quote != -1 else None].replace(b'""', b'"')
 
         timings['read_end'] = time.monotonic()
         return (
@@ -1802,6 +1801,7 @@ class MercurySyncFTPConnection:
             command,
             data,
             block_size=block_size,
+            timings=timings,
         )
 
         if err:
@@ -1859,6 +1859,7 @@ class MercurySyncFTPConnection:
             command,
             data,
             block_size=block_size,
+            timings=timings,
         )
         
         if err:
@@ -1900,8 +1901,24 @@ class MercurySyncFTPConnection:
         if timings['write_start'] is None:
             timings['write_start'] = time.monotonic()
 
-        command = f'SIZE {path}'.encode()
-        connection.write(command + CRLF)
+        if connection.transfer_type != 'TYPE I':
+            connection.write(b'TYPE I' + CRLF)
+
+            (
+                _,
+                err,
+            ) = await self._get_response(connection)
+
+            if err:
+                timings['write_end'] = time.monotonic()
+                return (
+                    None,
+                    err,
+                )
+
+            connection.transfer_type = 'TYPE I'
+
+        connection.write(b'SIZE ' + path.encode() + CRLF)
 
         timings['write_end'] = time.monotonic()
         if timings['read_start'] is None:
@@ -1919,10 +1936,14 @@ class MercurySyncFTPConnection:
                 err,
             )
         
-        size = 0
-        if result[:3] == b'213':
-            size_bytes = result[3:].strip()
-            size = int(size_bytes)
+        if result[:3] != b'213':
+            timings['read_end'] = time.monotonic()
+            return (
+                None,
+                Exception(result.decode()),
+            )
+
+        size = int(result[3:].strip())
 
         timings['read_end'] = time.monotonic()
         return (
@@ -1978,21 +1999,24 @@ class MercurySyncFTPConnection:
             float | None,
         ] = None,   
     ):
-        connection.write(b'TYPE I' + CRLF)
+        if connection.transfer_type != 'TYPE I':
+            connection.write(b'TYPE I' + CRLF)
 
-        (
-            _,
-            err
-        ) = await self._get_response(connection)  
+            (
+                _,
+                err
+            ) = await self._get_response(connection)
 
-        if err:
-            timings['write_end'] = time.monotonic()
-            return (
-                connection,
-                None,
-                None,
-                err,
-            )
+            if err:
+                timings['write_end'] = time.monotonic()
+                return (
+                    connection,
+                    None,
+                    None,
+                    err,
+                )
+
+            connection.transfer_type = 'TYPE I'
         
         (
             data_connection,
@@ -2017,7 +2041,11 @@ class MercurySyncFTPConnection:
         for offset in range(0, total_bytes, block_size):
             chunk = data[offset: offset + block_size]
             data_connection.write(chunk)
-        
+
+        # The server stores the upload once its data connection closes:
+        # close it gracefully, which sends what is still buffered first.
+        data_connection.writer.close()
+
         timings['write_end'] = time.monotonic()
         if timings['read_start'] is None:
             timings['read_start'] = time.monotonic()
@@ -2073,21 +2101,24 @@ class MercurySyncFTPConnection:
             float | None,
         ] = None,   
     ):
-        connection.write(b'TYPE A' + CRLF)
+        if connection.transfer_type != 'TYPE A':
+            connection.write(b'TYPE A' + CRLF)
 
-        (
-            _,
-            err
-        ) = await self._get_response(connection)  
+            (
+                _,
+                err
+            ) = await self._get_response(connection)
 
-        if err:
-            timings['write_end'] = time.monotonic()
-            return (
-                connection,
-                None,
-                None,
-                err,
-            )
+            if err:
+                timings['write_end'] = time.monotonic()
+                return (
+                    connection,
+                    None,
+                    None,
+                    err,
+                )
+
+            connection.transfer_type = 'TYPE A'
         
         (
             data_connection,
@@ -2117,7 +2148,11 @@ class MercurySyncFTPConnection:
         for offset in range(0, total_bytes, block_size):
             chunk = data[offset: offset + block_size]
             data_connection.write(chunk)
-        
+
+        # The server stores the upload once its data connection closes:
+        # close it gracefully, which sends what is still buffered first.
+        data_connection.writer.close()
+
         timings['write_end'] = time.monotonic()
         if timings['read_start'] is None:
             timings['read_start'] = time.monotonic()
@@ -2172,21 +2207,24 @@ class MercurySyncFTPConnection:
             float | None,
         ] = None, 
     ):
-        connection.write(b'TYPE I' + CRLF)
+        if connection.transfer_type != 'TYPE I':
+            connection.write(b'TYPE I' + CRLF)
 
-        (
-            _,
-            err
-        ) = await self._get_response(connection)
+            (
+                _,
+                err
+            ) = await self._get_response(connection)
 
-        if err:
-            timings['write_end'] = time.monotonic()
-            return (
-                connection,
-                None,
-                None,
-                err,
-            )
+            if err:
+                timings['write_end'] = time.monotonic()
+                return (
+                    connection,
+                    None,
+                    None,
+                    err,
+                )
+
+            connection.transfer_type = 'TYPE I'
         
         (
             data_connection,
@@ -2239,7 +2277,7 @@ class MercurySyncFTPConnection:
         return (
             connection,
             data_connection,
-            line,
+            file_bytes,
             None,
         )
 
@@ -2278,21 +2316,24 @@ class MercurySyncFTPConnection:
           The response code.
         """
 
-        connection.write(return_type.encode() + CRLF)
+        if connection.transfer_type != return_type:
+            connection.write(return_type.encode() + CRLF)
 
-        (
-            response,
-            err
-        ) = await self._get_response(connection)
+            (
+                response,
+                err
+            ) = await self._get_response(connection)
 
-        if err:
-            timings['write_end'] = time.monotonic()
-            return (
-                connection,
-                None,
-                None,
-                err,
-            )
+            if err:
+                timings['write_end'] = time.monotonic()
+                return (
+                    connection,
+                    None,
+                    None,
+                    err,
+                )
+
+            connection.transfer_type = return_type
 
         (
             data_connection,
@@ -2529,18 +2570,24 @@ class MercurySyncFTPConnection:
             port = int(parts[3])
 
         
-        (
-            err,
-            data_connection,
-            _
-        ) = await self._connect_to_url_location(
-            host,
-            connection_type='data',
-            port=port,
-            control_url=url,
-        )
+        data_connection = connection.data_connection
 
-        if err:
+        try:
+            await data_connection.make_connection(
+                host,
+                (
+                    connection.socket_family,
+                    socket.SOCK_STREAM,
+                    0,
+                    '',
+                    (host, port) if connection.socket_family == socket.AF_INET else (host, port, 0, 0),
+                ),
+                port,
+                ssl=self._ssl_context if 'ftps' in url.full else None,
+                timeout=self.timeouts.connect_timeout,
+            )
+
+        except Exception as err:
             return (
                 data_connection,
                 None,
@@ -2731,6 +2778,62 @@ class MercurySyncFTPConnection:
 
         return host, port
         
+    async def _resolve_directory(
+        self,
+        connection: FTPConnection,
+        directory: str,
+        timings: dict[
+            Literal[
+                "request_start",
+                "connect_start",
+                "connect_end",
+                "data_connect_start",
+                "data_connect_end",
+                "write_start",
+                "write_end",
+                "read_start",
+                "read_end",
+                "request_end",
+            ],
+            float | None,
+        ] = None,
+    ):
+        """
+        Resolve ``directory`` on the server and confirm it is one, leaving the
+        session's directory as it was: a pooled control connection goes back
+        to the pool in the directory it came out in. Returns the CWD reply,
+        the resolved absolute directory, and any error.
+        """
+        (
+            session_directory,
+            err,
+        ) = await self._pwd(connection, timings=timings)
+        if err:
+            return (None, None, err)
+
+        (
+            result,
+            err,
+        ) = await self._change_directory(connection, directory, timings=timings)
+        if err:
+            return (result, None, err)
+
+        (
+            resolved_directory,
+            err,
+        ) = await self._pwd(connection, timings=timings)
+        if err:
+            return (result, None, err)
+
+        (
+            _,
+            err,
+        ) = await self._change_directory(connection, session_directory.decode(), timings=timings)
+        if err:
+            return (result, None, err)
+
+        return (result, resolved_directory.decode(), None)
+
     async def _change_directory(
         self,
         connection: FTPConnection,
@@ -2760,68 +2863,52 @@ class MercurySyncFTPConnection:
                 None,
                 ValueError('an illegal newline character should not be contained'),
             )
-        
-        if dirname == '..':
-            try:
 
-                connection.write(directory.encode() + CRLF)
-                timings['write_end'] = time.monotonic()
-                if timings['read_start'] is None:
-                    timings['read_start'] = time.monotonic()
+        if directory == '..':
+            connection.write(b'CDUP' + CRLF)
+
+            (
+                response,
+                err,
+            ) = await self._get_response(connection)
+
+            if err is None and response[:3] == b'500':
+                # CDUP unsupported: fall back to CWD ..
+                connection.write(b'CWD ..' + CRLF)
 
                 (
                     response,
                     err,
                 ) = await self._get_response(connection)
-                if response[:1] != '2':
-                    timings['read_end'] = time.monotonic()
-                    return (
-                        None,
-                        Exception(response.decode())
-                    )
-                
-                timings['read_end'] = time.monotonic()
-                return (
-                    response,
-                    None,
-                )
-                    
-            except Exception as err:
-                timings['read_end'] = time.monotonic()
-                if err.args[0][:3] != '500':
-                    return (
-                        None,
-                        err
-                    )
 
-        elif dirname == '':
-            dirname = '.'  # does nothing, but could return error
+        else:
+            connection.write(b'CWD ' + (directory or '.').encode() + CRLF)
 
-        cmd = 'CWD ' + dirname
+            (
+                response,
+                err,
+            ) = await self._get_response(connection)
 
-        connection.write(cmd + CRLF)
         timings['write_end'] = time.monotonic()
-        if timings['read_start'] is None:
-            timings['read_start'] = time.monotonic()
-
-        (
-            response,
-            err,
-        ) = await self._get_response(connection)
+        timings['read_end'] = time.monotonic()
 
         if err:
-            timings['read_end'] = time.monotonic()
             return (
                 None,
                 err,
             )
-        
-        timings['read_end'] = time.monotonic()
+
+        if response[:1] != b'2':
+            return (
+                None,
+                Exception(response.decode()),
+            )
+
         return (
             response,
-            err,
+            None,
         )
-    
+
     async def _get_response(
         self,
         connection: FTPConnection
@@ -2911,119 +2998,111 @@ class MercurySyncFTPConnection:
 
     async def _connect_to_url_location(
         self,
+        connection: FTPConnection | None,
         request_url: str | URL,
-        connection_type: ConnectionType = 'control',
-        port: int | None = None,
-        control_url: FTPUrl | None = None
     ) -> Tuple[
         Exception | None,
         FTPConnection,
         FTPUrl,
-        bool,
     ]:
         has_optimized_url = isinstance(request_url, URL)
 
         if has_optimized_url:
             parsed_url = request_url.optimized
-
-
-        parsed_url = FTPUrl(
-            request_url,
-            family=self.address_family,
-            protocol=self.address_protocol,
-        )
-        
-        url: FTPUrl | None = None
-        
-        if connection_type == 'control':
-            url = self._url_cache.get(parsed_url.hostname)
-            dns_lock = self._dns_lock[parsed_url.hostname]
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
-            use_ssl = 'ftps' in request_url
+            requested_url = request_url.data
 
         else:
-            url = self._url_cache.get(request_url)
-            dns_lock = self._dns_lock[request_url]
-            dns_waiter = self._dns_waiters[request_url]
-            use_ssl = 'ftps' in control_url.full
+            parsed_url = FTPUrl(
+                request_url,
+                family=self.address_family,
+                protocol=self.address_protocol,
+            )
+            requested_url = request_url
+
+        # The address as given decides what a lookup resolves: the hostname
+        # alone is shared by every port on a host, and is None for an
+        # address without a scheme.
+        url = self._url_cache.get(requested_url)
+        dns_lock = self._dns_lock[requested_url]
+        dns_waiter = self._dns_waiters[requested_url]
+        use_ssl = 'ftps' in requested_url
 
         do_dns_lookup = (
             url is None
         ) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
+            try:
+                async with dns_lock:
+                    url = parsed_url
+                    await url.lookup_ftp(connection_type='control')
 
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup_ftp(
-                connection_type=connection_type,
-                port=port,
-            )
+                    self._url_cache[requested_url] = url
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
-
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
-
-            dns_lock.release()
+                if requested_url not in self._url_cache:
+                    del self._dns_waiters[requested_url]
 
         elif do_dns_lookup:
-            await dns_waiter
-            url = self._url_cache.get(parsed_url.hostname)
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
+            url = self._url_cache.get(requested_url)
 
         elif has_optimized_url:
             url = request_url.optimized
 
-        if connection_type == 'control':
+        if connection is None:
             connection = self._control_connections.pop()
-
-        else:
-            connection = self._data_connections.pop()
 
         connection_error: Exception | None = None
 
-        if url.address is None:
-            for address, ip_info in url:
-                try:
-                    port = await connection.make_connection(
-                        control_url.hostname if control_url else url.hostname, 
-                        ip_info,
-                        url.port,
-                        ssl=self._ssl_context if use_ssl else None,
-                        timeout=self.timeouts.connect_timeout,
-                    )
+        try:
+            # Reuses the connection's transport for this host; otherwise
+            # races a new one across the host's addresses.
+            address, socket_config, new_transport = await connection.connect_to_any(
+                requested_url,
+                url.hostname,
+                url.ip_addresses,
+                url.address_rotation,
+                ssl=self._ssl_context if use_ssl else None,
+                timeout=self.timeouts.connect_timeout,
+            )
 
-                    host, _ = address
+            if new_transport:
+                # Resolved addresses are host strings; literal ones
+                # are (host, port) tuples.
+                connection.host = address if isinstance(address, str) else address[0]
+                # The family of the address that connected: it picks PASV or
+                # EPSV and shapes the data connection's address.
+                connection.socket_family = socket_config[0]
+                url.address = address
+                url.socket_config = socket_config
 
-                    connection.host = host
-                    connection.socket_family = url.family
-                    parsed_url.address = address
-                    parsed_url.port = port
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                parsed_url,
+            )
 
-                    break
+        except Exception as err:
+            connection_error = err
 
-                except Exception as err:
-                    connection_error = err
+        try:
+            return (
+                connection_error,
+                connection,
+                parsed_url,
+            )
 
-        else:
-
-            try:
-                await connection.make_connection(
-                    control_url.hostname if control_url else url.hostname,
-                    ip_info,
-                    url.port,
-                    ssl=self._ssl_context if use_ssl else None,
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-            except Exception as err:
-                connection_error = err
-
-        return (
-            connection_error,
-            connection,
-            parsed_url,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None

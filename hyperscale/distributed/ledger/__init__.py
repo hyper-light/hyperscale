@@ -13,11 +13,12 @@ Key components:
 - JobIdGenerator: Region-encoded globally unique job IDs
 """
 
-from .consistency_level import ConsistencyLevel
 from .durability_level import DurabilityLevel
 from .job_id import JobIdGenerator
 from .job_state import JobState
+from .datacenter_reassignment import DatacenterReassignment
 from .job_ledger import JobLedger
+from .unsatisfiable_durability_error import UnsatisfiableDurabilityError
 
 from .events import (
     JobEventType,
@@ -30,6 +31,8 @@ from .events import (
     JobCompleted,
     JobFailed,
     JobTimedOut,
+    JobRelinquished,
+    JobDatacenterReassigned,
     JobEventUnion,
 )
 
@@ -64,7 +67,7 @@ __all__ = [
     "JobState",
     "JobIdGenerator",
     "DurabilityLevel",
-    "ConsistencyLevel",
+    "UnsatisfiableDurabilityError",
     "JobEventType",
     "JobEvent",
     "JobCreated",
@@ -75,6 +78,9 @@ __all__ = [
     "JobCompleted",
     "JobFailed",
     "JobTimedOut",
+    "JobRelinquished",
+    "JobDatacenterReassigned",
+    "DatacenterReassignment",
     "JobEventUnion",
     "WALEntryState",
     "WALEntry",

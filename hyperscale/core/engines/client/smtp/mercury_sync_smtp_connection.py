@@ -19,7 +19,7 @@ from pathlib import Path
 from re import Pattern
 from typing import Literal, Tuple, Callable
 from .protocols import SMTPConnection
-from .protocols.tcp import SMTP_LIMIT
+from .protocols.tcp import IMPLICIT_TLS_PORT, SMTP_LIMIT
 
 from hyperscale.core.engines.client.shared.models import URL as SMTPUrl
 from hyperscale.core.engines.client.shared.models import RequestType
@@ -41,19 +41,52 @@ CRLF = "\r\n"
 bCRLF = b"\r\n"
 _MAX_CHALLENGES = 5  # Maximum number of AUTH challenges sent
 COMMASPACE = ', '
+EHLO_FEATURE_PATTERN = re.compile(r'(?P<feature>[A-Za-z0-9][A-Za-z0-9\-]*) ?')
+LINE_ENDING_PATTERN = re.compile(r'(?:\r\n|\n|\r(?!\n))')
+DOT_STUFFING_PATTERN = re.compile(br'(?m)^\.')
 
 class MercurySyncSMTPConnection:
+    __slots__ = (
+        "_concurrency",
+        "timeouts",
+        "reset_connections",
+        "_cert_path",
+        "_key_path",
+        "_ssl_context",
+        "_loop",
+        "_dns_lock",
+        "_dns_waiters",
+        "_pending_queue",
+        "_client_waiters",
+        "_connections",
+        "_hosts",
+        "_connections_count",
+        "_semaphore",
+        "_url_cache",
+        "_optimized",
+        "address_family",
+        "address_protocol",
+        "_OLDSTYLE_AUTH",
+        "_executor",
+        "_ehlo_command",
+        "_check_start_tls_command",
+        "_email_key",
+        "_email_document",
+        "does_esmtp",
+    )
 
     def __init__(
         self,
         pool_size: int | None = None,
         cert_path: str | None = None,
         key_path: str | None = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ):
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._cert_path = cert_path
@@ -90,7 +123,9 @@ class MercurySyncSMTPConnection:
         self._ehlo_command = f"ehlo [127.0.0.1]{CRLF}".encode('ascii') 
         self._check_start_tls_command = f"STARTTLS{CRLF}".encode('ascii')
 
-        self._emails: dict[str, str] = {}
+        # The last message built, and everything that shaped it.
+        self._email_key: tuple | None = None
+        self._email_document: str | None = None
 
     async def send(
         self,
@@ -101,33 +136,52 @@ class MercurySyncSMTPConnection:
         email: str | Email,
         auth: tuple[str, str] = None,
         attachements: EmailAttachment | list[EmailAttachment] | None = None,
+        timeout: int | float | None = None,
     ):
         
         async with self._semaphore:
             try:
 
                 if isinstance(email, Email):
-                    self._emails[subject] = email.optimized
+                    email_document = email.optimized
 
-                email_document = self._emails.get(subject)
-
-                if email_document is None:
-                    email_document = await self.create_email(
+                else:
+                    # Reuse the last message built only while sends repeat
+                    # everything that shapes it.
+                    email_key = (
                         sender,
-                        recipients,
+                        recipients if isinstance(recipients, str) else tuple(recipients),
                         subject,
                         email,
-                        attachments=attachements,
+                        ((attachements.path, attachements.mime_type),)
+                        if isinstance(attachements, EmailAttachment)
+                        else tuple((attachment.path, attachment.mime_type) for attachment in attachements or ()),
                     )
 
-                    self._emails[subject] = email_document
+                    if email_key == self._email_key:
+                        email_document = self._email_document
 
-                return await self._execute(
-                    server,
-                    sender,
-                    recipients,
-                    email_document,
-                    auth=auth
+                    else:
+                        email_document = await self.create_email(
+                            sender,
+                            recipients,
+                            subject,
+                            email,
+                            attachments=attachements,
+                        )
+
+                        self._email_key = email_key
+                        self._email_document = email_document
+
+                return await asyncio.wait_for(
+                    self._execute(
+                        server,
+                        sender,
+                        recipients,
+                        email_document,
+                        auth=auth
+                    ),
+                    timeout=timeout,
                 )
 
             except asyncio.TimeoutError:
@@ -219,36 +273,27 @@ class MercurySyncSMTPConnection:
 
     async def _optimize_url(self, url: URL):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
-                    url,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                self._connections.append(connection)
-
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
                     _,
-                    connection,
-                    url,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(None, url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
-            self._url_cache[url.optimized.hostname] = url
+            optimized_url = url.optimized
+
+            # Plain-string requests for the same address reuse this lookup:
+            # cache the resolved URL itself, under the key the connect path
+            # reads, and only once the lookup actually resolved it.
+            if optimized_url is not None and optimized_url.ip_addresses:
+                self._url_cache[(url.data, None)] = optimized_url
+
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -283,7 +328,9 @@ class MercurySyncSMTPConnection:
 
 
         timings['request_start'] = time.monotonic()
-        
+
+        connection: SMTPConnection | None = None
+
         try:
             timings["connect_start"] = time.monotonic()
 
@@ -291,12 +338,17 @@ class MercurySyncSMTPConnection:
                 err,
                 connection,
                 url
-            ) = await self._connect_to_url_location(server)
+            ) = await self._connect_to_url_location(connection, server)
 
             timings["connect_end"] = time.monotonic()
 
             if err:
                 timings["request_end"] = time.monotonic()
+
+                encoding = connection.command_encoding
+                connection.reset()
+                self._connections.append(connection)
+
                 return SMTPResponse(
                     recipients=recipients,
                     sender=sender,
@@ -304,190 +356,64 @@ class MercurySyncSMTPConnection:
                     server=server,
                     error=err,
                     timings=timings,
-                    encoding=connection.command_encoding,
+                    encoding=encoding,
                 )
-            
-            timings["server_ack_start"] = time.monotonic()
-            
-            (code, message, err) = await self._get_reply(connection)
 
-            timings["server_ack_send"] = time.monotonic()
+            session_key = (url.full, auth)
+            options = connection.session_options
 
-            if code != 220:
-                err = Exception(f'Err. - {code} - {message}')
+            if options is None or connection.session_key != session_key:
+                if options is not None:
+                    # An open session for another server or credentials:
+                    # SMTP cannot re-authenticate within a session.
+                    connection.reset()
 
-            if err:
-                timings["request_end"] = time.monotonic()
-                return SMTPResponse(
-                    recipients=recipients,
-                    sender=sender,
-                    email=email,
-                    server=server,
-                    error=err,
-                    last_smtp_code=code,
-                    last_smtp_message=message,
-                    timings=timings,
-                    encoding=connection.command_encoding,
-                )
-                
-            timings["ehlo_start"] = time.monotonic()
-
-            (
-                code,
-                message,
-                options,
-                err,
-            ) = await self._ehlo(connection)
-
-            timings["ehlo_end"] = time.monotonic()
-
-            if options is None or code != 250:
-                err = Exception(f'Err. - {code} - {message}')
-
-            if err:
-                timings["request_end"] = time.monotonic()
-                return SMTPResponse(
-                    recipients=recipients,
-                    sender=sender,
-                    email=email,
-                    server=server,
-                    error=err,
-                    last_smtp_code=code,
-                    last_smtp_message=message,
-                    last_smtp_options=options,
-                    timings=timings,
-                    encoding=connection.command_encoding,
-                )
-            
-            resend_ehlo = False
-
-            if 'starttls' in options and url.port == 587:
-
-                timings["tls_check_start"] = time.monotonic()
-
-
-                connection.write(self._check_start_tls_command)
-                (code, message, err) = await self._get_reply(connection)
-
-                timings["tls_check_end"] = time.monotonic()
-
-
-                if code == 220 and err is None:
-
-                    timings["tls_upgrade_start"] = time.monotonic()
-
+                    # The same port: implicit TLS stays TLS from the first byte.
+                    implicit_tls = connection.port == IMPLICIT_TLS_PORT
                     await connection.make_connection(
-                        server,
-                        url.address,
-                        ssl=self._ssl_context,
-                        connection_type='tls',
-                        ssl_upgrade=True,
+                        url.full,
+                        connection.address_info,
+                        ssl=self._ssl_context if implicit_tls else None,
+                        connection_type='ssl' if implicit_tls else None,
                         timeout=self.timeouts.connect_timeout,
                     )
-
-                    timings["tls_upgrade_end"] = time.monotonic()
-
-                    resend_ehlo = True
-
-                else:
-                    err = Exception(f'Err. - {code} {message}')
-            
-            elif  'starttls' in options and url.port == 465:
-
-                timings["tls_upgrade_start"] = time.monotonic()
-
-                await connection.make_connection(
-                    server,
-                    url.address,
-                    ssl=self._ssl_context,
-                    connection_type='ssl',
-                    ssl_upgrade=True,
-                    timeout=self.timeouts.connect_timeout,
-                )
-                
-                timings["tls_upgrade_end"] = time.monotonic()
-
-                resend_ehlo = True
-
-            if err:
-                return SMTPResponse(
-                    recipients=recipients,
-                    sender=sender,
-                    email=email,
-                    server=server,
-                    error=err,
-                    last_smtp_code=code,
-                    last_smtp_message=message,
-                    last_smtp_options=options,
-                    timings=timings,
-                    encoding=connection.command_encoding,
-                )
-
-            if resend_ehlo:
-
-                timings["ehlo_tls_start"] = time.monotonic()
 
                 (
                     code,
                     message,
                     options,
                     err,
-                ) = await self._ehlo(connection)
-
-                timings["ehlo_tls_end"] = time.monotonic()
-
-                if options is None or code != 250:
-                    err = Exception(f'Err. - {code} - {message}')
-
-            if err:
-                timings["request_end"] = time.monotonic()
-                return SMTPResponse(
-                    recipients=recipients,
-                    sender=sender,
-                    email=email,
-                    server=server,
-                    error=err,
-                    last_smtp_code=code,
-                    last_smtp_message=message,
-                    last_smtp_options=options,
-                    timings=timings,
-                    encoding=connection.command_encoding,
-                )
-                
-            if 'auth' in options and auth and len(auth) == 2:
-
-                username, password = auth
-
-                timings["login_start"] = time.monotonic()
-
-                (
-                    code,
-                    message,
-                    err
-                ) = await self._login(
+                ) = await self._open_session(
                     connection,
-                    username,
-                    password,
-                    options,
+                    server,
+                    url,
+                    auth,
+                    timings,
                 )
-                
-                timings["login_end"] = time.monotonic()
 
-            if err:
-                timings["request_end"] = time.monotonic()
-                return SMTPResponse(
-                    recipients=recipients,
-                    sender=sender,
-                    email=email,
-                    server=server,
-                    error=err,
-                    last_smtp_code=code,
-                    last_smtp_message=message,
-                    last_smtp_options=options,
-                    timings=timings,
-                    encoding=connection.command_encoding,
-                )
-            
+                if err:
+                    timings["request_end"] = time.monotonic()
+
+                    encoding = connection.command_encoding
+                    connection.reset()
+                    self._connections.append(connection)
+
+                    return SMTPResponse(
+                        recipients=recipients,
+                        sender=sender,
+                        email=email,
+                        server=server,
+                        error=err,
+                        last_smtp_code=code,
+                        last_smtp_message=message,
+                        last_smtp_options=options,
+                        timings=timings,
+                        encoding=encoding,
+                    )
+
+                connection.session_key = session_key
+                connection.session_options = options
+
             timings["send_mail_start"] = time.monotonic()
             
             if isinstance(recipients, str):
@@ -508,6 +434,13 @@ class MercurySyncSMTPConnection:
             timings["send_mail_end"] = time.monotonic()
             timings["request_end"] = time.monotonic()
 
+            encoding = connection.command_encoding
+
+            if err:
+                # The transaction failed part-way: its session state is
+                # unknown, so the next send starts a fresh session.
+                connection.reset()
+
             self._connections.append(connection)
 
             return SMTPResponse(
@@ -520,15 +453,16 @@ class MercurySyncSMTPConnection:
                 last_smtp_message=message,
                 last_smtp_options=options,
                 timings=timings,
-                encoding=connection.command_encoding,
+                encoding=encoding,
             )
         
-        except Exception as err:
-            self._connections.append(
-                SMTPConnection(
-                    reset_connections=self.reset_connections,
-                )
-            )
+        except (
+            BaseException,
+            Exception,
+        ) as err:
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
             return SMTPResponse(
                 recipients=recipients,
@@ -538,6 +472,120 @@ class MercurySyncSMTPConnection:
                 error=err,
                 timings=timings,
             )
+
+    async def _open_session(
+        self,
+        connection: SMTPConnection,
+        server: str | URL,
+        url: SMTPUrl,
+        auth: tuple[str, str] | None,
+        timings: SMTPTimings,
+    ):
+        """Greeting, EHLO, STARTTLS when offered, and login: once per session."""
+        timings["server_ack_start"] = time.monotonic()
+
+        (code, message, err) = await self._get_reply(connection)
+
+        timings["server_ack_send"] = time.monotonic()
+
+        if code != 220:
+            err = Exception(f'Err. - {code} - {message}')
+
+        if err:
+            return (code, message, None, err)
+
+        timings["ehlo_start"] = time.monotonic()
+
+        (
+            code,
+            message,
+            options,
+            err,
+        ) = await self._ehlo(connection)
+
+        timings["ehlo_end"] = time.monotonic()
+
+        if options is None or code != 250:
+            err = Exception(f'Err. - {code} - {message}')
+
+        if err:
+            return (code, message, options, err)
+
+        resend_ehlo = False
+
+        # The connection's own port and address: every connect sets them, so a
+        # session reopened on a reused connection still upgrades to TLS.
+        if 'starttls' in options and connection.port == 587:
+
+            timings["tls_check_start"] = time.monotonic()
+
+            connection.write(self._check_start_tls_command)
+            (code, message, err) = await self._get_reply(connection)
+
+            timings["tls_check_end"] = time.monotonic()
+
+            if code == 220 and err is None:
+
+                timings["tls_upgrade_start"] = time.monotonic()
+
+                await connection.make_connection(
+                    server,
+                    connection.address_info,
+                    ssl=self._ssl_context,
+                    connection_type='tls',
+                    ssl_upgrade=True,
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+                timings["tls_upgrade_end"] = time.monotonic()
+
+                resend_ehlo = True
+
+            else:
+                err = Exception(f'Err. - {code} {message}')
+
+        if err:
+            return (code, message, options, err)
+
+        if resend_ehlo:
+
+            timings["ehlo_tls_start"] = time.monotonic()
+
+            (
+                code,
+                message,
+                options,
+                err,
+            ) = await self._ehlo(connection)
+
+            timings["ehlo_tls_end"] = time.monotonic()
+
+            if options is None or code != 250:
+                err = Exception(f'Err. - {code} - {message}')
+
+        if err:
+            return (code, message, options, err)
+
+        if 'auth' in options and auth and len(auth) == 2:
+
+            username, password = auth
+
+            timings["login_start"] = time.monotonic()
+
+            (
+                code,
+                message,
+                err
+            ) = await self._login(
+                connection,
+                username,
+                password,
+                options,
+            )
+
+            timings["login_end"] = time.monotonic()
+
+        return (code, message, options, err)
 
     async def _ehlo(
         self,
@@ -582,7 +630,7 @@ class MercurySyncSMTPConnection:
                 esmtp_features["auth"] = f'{auth_feature} {auth_additional}'
                 continue
 
-            if match := re.match(r'(?P<feature>[A-Za-z0-9][A-Za-z0-9\-]*) ?', each):
+            if match := EHLO_FEATURE_PATTERN.match(each):
                 feature = match.group("feature").lower()
                 params = match.string[match.end("feature"):].strip()
 
@@ -872,7 +920,7 @@ class MercurySyncSMTPConnection:
         
         encoded_body = body
         if isinstance(body, str):
-            encoded_body = re.sub(r'(?:\r\n|\n|\r(?!\n))', CRLF, body).encode('ascii')
+            encoded_body = LINE_ENDING_PATTERN.sub(CRLF, body).encode('ascii')
         
         if mail_options is None:
             mail_options = []
@@ -965,7 +1013,7 @@ class MercurySyncSMTPConnection:
                 )
             
         if send_errors == len(recipients):
-            await self._reset()
+            await self._reset(connection)
 
             return (
                 None,
@@ -990,7 +1038,7 @@ class MercurySyncSMTPConnection:
                 Exception(f'Err. - {code} - {message}'),
             )
         
-        quoted_message = re.sub(br'(?m)^\.', b'..', encoded_body)
+        quoted_message = DOT_STUFFING_PATTERN.sub(b'..', encoded_body)
         if quoted_message[-2:] != bCRLF:
             quoted_message = quoted_message + bCRLF
 
@@ -1088,6 +1136,7 @@ class MercurySyncSMTPConnection:
  
     async def _connect_to_url_location(
         self,
+        connection: SMTPConnection | None,
         request_url: str | URL,
         connection_type: Literal['insecure', 'ssl', 'tls'] | None = None,
         is_upgrade: bool = False
@@ -1108,35 +1157,45 @@ class MercurySyncSMTPConnection:
                 protocol=self.address_protocol,
             )
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+        # The address and the connection type decide what a lookup resolves:
+        # neither the hostname alone (bare server names have none, and the
+        # connection type picks the port) nor any looser key may share it.
+        cache_key = (request_url.data if has_optimized_url else request_url, connection_type)
+
+        url = self._url_cache.get(cache_key)
+        dns_lock = self._dns_lock[cache_key]
+        dns_waiter = self._dns_waiters[cache_key]
 
         do_dns_lookup = url is None and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            
-            await url.lookup_smtp(
-                url.full,
-                self._loop,
-                connection_type=connection_type,
-            )
-            
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+            try:
+                async with dns_lock:
+                    url = parsed_url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+                    await url.lookup_smtp(
+                        url.full,
+                        self._loop,
+                        connection_type=connection_type,
+                    )
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
+                    self._url_cache[cache_key] = url
 
-            dns_lock.release()
+            finally:
+                # However the lookup ended, release its waiters; after a
+                # failed or cancelled lookup the next request looks up
+                # again with a fresh waiter.
+                if dns_waiter.done() is False:
+                    dns_waiter.set_result(None)
+
+                if cache_key not in self._url_cache:
+                    del self._dns_waiters[cache_key]
 
         elif do_dns_lookup:
-            await dns_waiter
-            url = self._url_cache.get(parsed_url.hostname)
+            # Shielded: a waiter's cancellation must not cancel the
+            # lookup future every other waiter shares.
+            await asyncio.shield(dns_waiter)
+            url = self._url_cache.get(cache_key)
 
         elif has_optimized_url:
             url = request_url.optimized
@@ -1144,53 +1203,50 @@ class MercurySyncSMTPConnection:
         connection_error: Exception | None = None
         connection = self._connections.pop()
 
+        try:
+            # Reuses the connection's transport for this server; otherwise
+            # races a new one across the server's addresses.
+            socket_config, port, new_transport = await connection.connect_to_any(
+                url.full,
+                url.ip_addresses,
+                url.address_rotation,
+                ssl=self._ssl_context if connection_type in ['ssl', 'tls'] else None,
+                connection_type=connection_type,
+                ssl_upgrade=is_upgrade,
+                timeout=self.timeouts.connect_timeout,
+                implicit_tls=self._ssl_context,
+            )
 
-        if url.address is None:
-            for address_info in url:
-                try:
-                    port = await connection.make_connection(
-                        url.full,
-                        address_info,
-                        ssl=self._ssl_context if connection_type  in ['ssl', 'tls'] else None,
-                        connection_type=connection_type,
-                        timeout=self.timeouts.connect_timeout,
-                        ssl_upgrade=is_upgrade,
-                    )
+            if new_transport:
+                parsed_url.address = socket_config
+                parsed_url.port = port
 
-                    parsed_url.address = address_info
-                    parsed_url.port = port
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                parsed_url,
+            )
 
-                    break
+        except Exception as err:
+            connection_error = err
 
-                except Exception as err:
-                    connection_error = err
-                
-        else:
-            try:
-                
-                await connection.make_connection(
-                    url.full,
-                    url.address,
-                    ssl=self._ssl_context if connection_type  in ['ssl', 'tls'] else None,
-                    connection_type=connection_type,
-                    timeout=self.timeouts.connect_timeout,
-                    ssl_upgrade=is_upgrade,
-                )
+        try:
+            return (
+                connection_error if parsed_url.address is None else None,
+                connection,
+                parsed_url,
+            )
 
-            except Exception as err:
-                connection_error = err
-
-        
-        return (
-            connection_error if parsed_url.address is None else None,
-            connection,
-            parsed_url,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     def close(self):
 
         if self._executor:
-            self._executor.shutdown(cancel_futures=True)
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
         for connection in self._connections:
             connection.close()

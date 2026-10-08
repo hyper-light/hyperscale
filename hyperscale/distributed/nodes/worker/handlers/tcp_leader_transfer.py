@@ -4,7 +4,6 @@ Job leadership transfer TCP handler for worker.
 Handles job leadership transfer notifications from managers (AD-31, Section 8).
 """
 
-import time
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
@@ -18,8 +17,14 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
 )
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
-    from ..server import WorkerServer
+    from hyperscale.distributed.models import WorkflowProgress
+    from hyperscale.distributed.nodes.worker.server import WorkerServer
 
 
 class JobLeaderTransferHandler:
@@ -69,8 +74,14 @@ class JobLeaderTransferHandler:
         Returns:
             Serialized JobLeaderWorkerTransferAck
         """
-        self._server._transfer_metrics_received += 1
-        transfer_start_time = time.monotonic()
+        # ``WorkerServer`` exposes these counters as SETTER-LESS
+        # properties (and two of them not at all), so ``+=`` through
+        # the server raised AttributeError on this handler's FIRST
+        # statement — the whole job-leader transfer endpoint was
+        # dead. ``WorkerState`` owns the fields and publishes the
+        # lock-guarded increment API this now uses.
+        await self._server._worker_state.increment_transfer_received()
+        transfer_start_time = _DEFAULT_CLOCK.monotonic()
 
         try:
             transfer = JobLeaderWorkerTransfer.load(data)
@@ -98,19 +109,10 @@ class JobLeaderTransferHandler:
                 ) = self._apply_workflow_routing_updates(transfer)
 
                 # 8.3: Store pending transfer for late-arriving workflows
-                if workflows_not_found:
-                    self._server._pending_transfers[job_id] = PendingTransfer(
-                        job_id=job_id,
-                        workflow_ids=workflows_not_found,
-                        new_manager_id=transfer.new_manager_id,
-                        new_manager_addr=transfer.new_manager_addr,
-                        fence_token=transfer.fence_token,
-                        old_manager_id=transfer.old_manager_id,
-                        received_at=time.monotonic(),
-                    )
+                self._store_pending_transfer(transfer, job_id, workflows_not_found)
 
                 # 8.6: Update metrics
-                self._server._transfer_metrics_accepted += 1
+                await self._server._worker_state.increment_transfer_accepted()
 
                 # 8.7: Detailed logging
                 await self._log_transfer_result(
@@ -133,7 +135,7 @@ class JobLeaderTransferHandler:
                 ).dump()
 
         except Exception as error:
-            self._server._transfer_metrics_rejected_other += 1
+            await self._server._worker_state.increment_transfer_rejected_other()
             return JobLeaderWorkerTransferAck(
                 job_id="unknown",
                 worker_id=self._server._node_id.full,
@@ -142,6 +144,24 @@ class JobLeaderTransferHandler:
                 rejection_reason=str(error),
                 fence_token_received=0,
             ).dump()
+
+    def _store_pending_transfer(
+        self,
+        transfer: JobLeaderWorkerTransfer,
+        job_id: str,
+        workflows_not_found: list[str],
+    ) -> None:
+        """Keep the transfer for workflows not yet arrived (Section 8.3)."""
+        if workflows_not_found:
+            self._server._pending_transfers[job_id] = PendingTransfer(
+                job_id=job_id,
+                workflow_ids=workflows_not_found,
+                new_manager_id=transfer.new_manager_id,
+                new_manager_addr=transfer.new_manager_addr,
+                fence_token=transfer.fence_token,
+                old_manager_id=transfer.old_manager_id,
+                received_at=_DEFAULT_CLOCK.monotonic(),
+            )
 
     async def _log_transfer_start(
         self, transfer: JobLeaderWorkerTransfer, job_id: str
@@ -197,7 +217,7 @@ class JobLeaderTransferHandler:
             transfer.new_manager_id
         )
         if not manager_valid:
-            self._server._transfer_metrics_rejected_unknown_manager += 1
+            await self._server._worker_state.increment_transfer_rejected_unknown_manager()
             await self._server._udp_logger.log(
                 ServerWarning(
                     message=f"Rejected job leadership transfer for job {job_id[:8]}...: {manager_reason}",
@@ -226,20 +246,16 @@ class JobLeaderTransferHandler:
         job_leader = self._server._workflow_job_leader
 
         # Partition workflows into found vs not found (comprehension)
-        workflows_not_found = [
-            wf_id for wf_id in transfer.workflow_ids if wf_id not in active
-        ]
-        found_workflows = [wf_id for wf_id in transfer.workflow_ids if wf_id in active]
+        workflows_not_found = self._workflows_absent_from(transfer.workflow_ids, active)
+        found_workflows = self._workflows_present_in(transfer.workflow_ids, active)
 
         # Update job leader and collect states (comprehension with side effects via walrus)
         workflow_states = {}
         workflows_rescued = 0
         for workflow_id in found_workflows:
-            job_leader[workflow_id] = transfer.new_manager_addr
-            workflow_states[workflow_id] = active[workflow_id].status
-            # Clear orphan status if present (Section 2.7)
-            if workflow_id in orphaned:
-                del orphaned[workflow_id]
+            if self._route_found_workflow(
+                workflow_id, transfer, active, orphaned, job_leader, workflow_states
+            ):
                 workflows_rescued += 1
 
         return (
@@ -248,6 +264,34 @@ class JobLeaderTransferHandler:
             workflows_not_found,
             workflow_states,
         )
+
+    @staticmethod
+    def _workflows_absent_from(workflow_ids: list[str], active: dict[str, "WorkflowProgress"]) -> list[str]:
+        """The transfer's workflow ids not active on this worker."""
+        return [wf_id for wf_id in workflow_ids if wf_id not in active]
+
+    @staticmethod
+    def _workflows_present_in(workflow_ids: list[str], active: dict[str, "WorkflowProgress"]) -> list[str]:
+        """The transfer's workflow ids active on this worker."""
+        return [wf_id for wf_id in workflow_ids if wf_id in active]
+
+    @staticmethod
+    def _route_found_workflow(
+        workflow_id: str,
+        transfer: JobLeaderWorkerTransfer,
+        active: dict[str, "WorkflowProgress"],
+        orphaned: dict[str, float],
+        job_leader: dict[str, tuple[str, int]],
+        workflow_states: dict[str, str],
+    ) -> bool:
+        """Route a workflow to the new leader; True when it was rescued from orphan state."""
+        job_leader[workflow_id] = transfer.new_manager_addr
+        workflow_states[workflow_id] = active[workflow_id].status
+        # Clear orphan status if present (Section 2.7)
+        if workflow_id in orphaned:
+            del orphaned[workflow_id]
+            return True
+        return False
 
     async def _log_transfer_result(
         self,
@@ -259,16 +303,12 @@ class JobLeaderTransferHandler:
         start_time: float,
     ) -> None:
         """Log transfer result details."""
-        transfer_duration_ms = (time.monotonic() - start_time) * 1000
+        transfer_duration_ms = (_DEFAULT_CLOCK.monotonic() - start_time) * 1000
 
         if workflows_updated > 0 or workflows_not_found:
-            rescue_msg = ""
-            if workflows_rescued > 0:
-                rescue_msg = f" ({workflows_rescued} rescued from orphan state)"
-
-            pending_msg = ""
-            if workflows_not_found:
-                pending_msg = f" ({len(workflows_not_found)} stored as pending)"
+            rescue_msg, pending_msg = self._transfer_detail_messages(
+                workflows_rescued, workflows_not_found
+            )
 
             await self._server._udp_logger.log(
                 ServerInfo(
@@ -283,3 +323,21 @@ class JobLeaderTransferHandler:
                     node_id=self._server._node_id.short,
                 )
             )
+
+    @staticmethod
+    def _transfer_detail_messages(
+        workflows_rescued: int,
+        workflows_not_found: list[str],
+    ) -> tuple[str, str]:
+        """The rescued-from-orphan and stored-as-pending notes of a transfer log."""
+        rescue_msg = (
+            f" ({workflows_rescued} rescued from orphan state)"
+            if workflows_rescued > 0
+            else ""
+        )
+        pending_msg = (
+            f" ({len(workflows_not_found)} stored as pending)"
+            if workflows_not_found
+            else ""
+        )
+        return rescue_msg, pending_msg

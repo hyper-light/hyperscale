@@ -1,0 +1,10 @@
+# Build context for Dockerfile.source: only what the image installs.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!MANIFEST.in
+!hyperscale/
+**/__pycache__
+**/*.pyc

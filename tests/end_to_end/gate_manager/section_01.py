@@ -219,11 +219,10 @@ async def validate_1_2_route_learning_record_start() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        assert hasattr(gate, "_dispatch_time_tracker"), (
-            "Route learning expected _dispatch_time_tracker on gate"
-        )
-        assert callable(getattr(gate._dispatch_time_tracker, "record_start", None)), (
-            "Route learning expected record_start method"
+        # AD-45 samples each datacenter's time to accept a dispatch, so
+        # the dispatch coordinator records into the gate's tracker.
+        assert gate._dispatch_coordinator._observed_latency_tracker is gate._observed_latency_tracker, (
+            "Route learning expected the dispatch coordinator to record into the gate's tracker"
         )
     finally:
         await runtime.stop_cluster()
@@ -426,8 +425,8 @@ async def validate_1_4_job_forwarded_to_owner_gate() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        assert hasattr(gate, "_job_forwarding_tracker"), (
-            "Job forwarding expected _job_forwarding_tracker"
+        assert hasattr(gate, "_forward_job_final_result_to_peers"), (
+            "Job forwarding expected _forward_job_final_result_to_peers"
         )
     finally:
         await runtime.stop_cluster()
@@ -445,8 +444,8 @@ async def validate_1_4_forward_timeout() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        assert hasattr(gate, "_job_forwarding_tracker"), (
-            "Forward timeout expected _job_forwarding_tracker"
+        assert hasattr(gate, "_tcp_timeout_forward"), (
+            "Forward timeout expected _tcp_timeout_forward"
         )
     finally:
         await runtime.stop_cluster()
@@ -464,11 +463,9 @@ async def validate_1_4_max_forward_attempts_exceeded() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        assert hasattr(gate, "_job_forwarding_tracker"), (
-            "Max forward attempts expected _job_forwarding_tracker"
-        )
-        assert hasattr(gate._job_forwarding_tracker, "max_forward_attempts"), (
-            "Max forward attempts expected max_forward_attempts"
+        # Each peer is tried once per forward, behind its circuit breaker.
+        assert hasattr(gate, "_peer_gate_circuit_breaker"), (
+            "Max forward attempts expected _peer_gate_circuit_breaker"
         )
     finally:
         await runtime.stop_cluster()
@@ -486,11 +483,10 @@ async def validate_1_4_forward_loop_detection() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         gate = _get_gate(runtime)
-        assert hasattr(gate, "_job_forwarding_tracker"), (
-            "Forward loop detection expected _job_forwarding_tracker"
-        )
-        assert hasattr(gate._job_forwarding_tracker, "detect_loop"), (
-            "Forward loop detection expected detect_loop"
+        # A forwarded result arrives on its own action, which never
+        # forwards again: no result can circle between gates.
+        assert hasattr(gate, "job_final_result_forwarded"), (
+            "Forward loop detection expected job_final_result_forwarded"
         )
     finally:
         await runtime.stop_cluster()

@@ -29,6 +29,11 @@ class Provisioner:
         # Per-node tracking: node_id -> is_available
         self._available_nodes: Set[int] = set()
         self._all_nodes: List[int] = []
+        # Nodes whose executor process exited: out of every hand-out
+        # until a replacement at the same address completes its ready
+        # handshake (``readmit_node``). Bounded by the pool size — node
+        # ids are derived from executor addresses.
+        self._retired_nodes: Set[int] = set()
         self._node_lock: asyncio.Lock | None = None
 
     def setup(self, max_workers: int | None = None):
@@ -49,8 +54,40 @@ class Provisioner:
 
         Called when workers connect to track which specific nodes are available.
         """
-        self._all_nodes = list(node_ids)
-        self._available_nodes = set(node_ids)
+        self._all_nodes = [
+            node_id for node_id in node_ids if node_id not in self._retired_nodes
+        ]
+        self._available_nodes = set(self._all_nodes)
+
+    def retire_node(self, node_id: int) -> None:
+        """
+        Withdraw a node whose executor process exited.
+
+        Called from the pool's reap of the process: the node leaves both
+        the registered and the available sets at once, so no later
+        ``get_available_nodes`` can hand it out and a ``release_nodes``
+        from a workflow it was running cannot return it.
+        """
+        self._retired_nodes.add(node_id)
+        self._available_nodes.discard(node_id)
+        if node_id in self._all_nodes:
+            self._all_nodes.remove(node_id)
+
+    def readmit_node(self, node_id: int) -> None:
+        """
+        Return a retired node's slot once its replacement is ready.
+
+        Called when the replacement executor's start acknowledgement (its
+        ready handshake) reaches the leader. A node that was never
+        retired is left alone: initial acknowledgements are registered
+        through ``register_nodes``.
+        """
+        if node_id not in self._retired_nodes:
+            return
+
+        self._retired_nodes.discard(node_id)
+        self._all_nodes.append(node_id)
+        self._available_nodes.add(node_id)
 
     def get_available_node_count(self) -> int:
         """Return the count of currently available nodes."""
@@ -62,9 +99,16 @@ class Provisioner:
 
         Returns a list of node IDs that can be used. Does NOT mark them
         as unavailable - call allocate_nodes() to actually reserve them.
+
+        SORTED selection: this is the worker-selection primitive, and a
+        bare ``list(set)[:count]`` slices in the set's content-hash
+        order — which permutes whenever the id population changes (a
+        late-join replacement worker) and, before node ids were made
+        address-derived, permuted per RUN. Sorting makes which shard
+        runs which workflow a pure function of the registered
+        population.
         """
-        available_list = list(self._available_nodes)
-        return available_list[:count]
+        return sorted(self._available_nodes)[:count]
 
     def allocate_nodes(self, node_ids: List[int]) -> List[int]:
         """

@@ -4,9 +4,13 @@ import pytest
 
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.jobs.dispatch_outcome import DispatchOutcome
+from hyperscale.distributed.jobs.job_manager import JobManager
 from hyperscale.distributed.jobs.worker_pool import WorkerPool
 from hyperscale.distributed.jobs.workflow_dispatcher import WorkflowDispatcher
 from hyperscale.distributed.models import (
+    JobSubmission,
     NodeInfo,
     PendingWorkflow,
     TrackingToken,
@@ -15,6 +19,8 @@ from hyperscale.distributed.models import (
     WorkerState,
     WorkflowDispatch,
 )
+from hyperscale.distributed.runtime import RealClock
+from hyperscale.distributed.taskex import TaskRunner
 
 
 def _registration(
@@ -71,14 +77,22 @@ def _pending_workflow(workflow_id: str, vus: int) -> PendingWorkflow:
     )
 
 
+async def _ignore_dispatch_exhaustion(job_id: str, workflow_id: str, reason: str) -> None:
+    """These tests exercise allocation and fan-out; none spends a budget."""
+
+
+async def _ignore_plans_to_stop(job_id: str, plans: list[tuple[str, str]]) -> None:
+    """These tests exercise allocation and fan-out; none cancels a job."""
+
+
 def _dispatcher(
     max_concurrent_dispatches: int = 16,
 ) -> WorkflowDispatcher:
     async def send_dispatch(
         worker_id: str,
         dispatch: WorkflowDispatch,
-    ) -> bool:
-        return True
+    ) -> tuple[DispatchOutcome, str]:
+        return DispatchOutcome.ACCEPTED, ""
 
     return WorkflowDispatcher(
         job_manager=None,
@@ -86,11 +100,15 @@ def _dispatcher(
         send_dispatch=send_dispatch,
         datacenter="local",
         manager_id="manager-1",
+        task_runner=TaskRunner(),
+        on_dispatch_exhausted=_ignore_dispatch_exhaustion,
+        stop_dispatched_plans=_ignore_plans_to_stop,
         max_concurrent_dispatches=max_concurrent_dispatches,
     )
 
 
-def test_auto_allocation_caps_single_vu_to_one_core() -> None:
+@pytest.mark.asyncio
+async def test_auto_allocation_caps_single_vu_to_one_core() -> None:
     dispatcher = _dispatcher()
 
     allocations = dispatcher._calculate_allocations(
@@ -103,7 +121,8 @@ def test_auto_allocation_caps_single_vu_to_one_core() -> None:
     ]
 
 
-def test_auto_allocation_keeps_high_vu_parallelism() -> None:
+@pytest.mark.asyncio
+async def test_auto_allocation_keeps_high_vu_parallelism() -> None:
     dispatcher = _dispatcher()
 
     allocations = dispatcher._calculate_allocations(
@@ -209,11 +228,82 @@ async def test_allocation_excludes_reassignment_workers() -> None:
 
     allocations = await worker_pool.allocate_cores(
         1,
-        timeout=0.1,
         excluded_worker_ids={"worker-1"},
+        job_id="job-1",
+        dispatch_token_for=lambda worker_id: f"job-1:workflow-1:{worker_id}",
     )
 
     assert allocations == [("worker-2", 1)]
+
+
+async def _claimed_workflow_job_manager() -> JobManager:
+    """A JobManager holding ``workflow-1`` of ``job-1`` DISPATCHED: a
+    dispatch's plans go out only while their workflow is."""
+    job_manager = JobManager(
+        datacenter="local",
+        manager_id="manager-1",
+        clock=RealClock(),
+        max_budgeted_retries=Env().RETRY_BUDGET_PER_WORKFLOW_MAX,
+    )
+    await job_manager.create_job(
+        JobSubmission(job_id="job-1", workflows=b"", vus=5, timeout_seconds=60)
+    )
+    await job_manager.register_workflow(
+        "job-1",
+        "workflow-1",
+        "workflow-1",
+        Workflow(),
+        dependency_workflow_ids=frozenset(),
+        is_test=False,
+    )
+    assert await job_manager.claim_workflow_for_dispatch("job-1", "workflow-1")
+    return job_manager
+
+
+def _dispatch_plans(worker_count: int) -> list:
+    workflow_token = TrackingToken.for_workflow("local", "manager-1", "job-1", "workflow-1")
+    return [
+        (
+            f"worker-{worker_index}",
+            1,
+            workflow_token.to_sub_workflow_token(f"worker-{worker_index}"),
+            WorkflowDispatch(job_id="job-1", workflow_id=f"workflow-{worker_index}"),
+        )
+        for worker_index in range(worker_count)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_nothing_is_sent_for_a_workflow_that_left_the_dispatch() -> None:
+    sent: list[str] = []
+
+    async def send_dispatch(
+        worker_id: str,
+        dispatch: WorkflowDispatch,
+    ) -> tuple[DispatchOutcome, str]:
+        sent.append(worker_id)
+        return DispatchOutcome.ACCEPTED, ""
+
+    job_manager = await _claimed_workflow_job_manager()
+    dispatcher = WorkflowDispatcher(
+        job_manager=job_manager,
+        worker_pool=WorkerPool(),
+        send_dispatch=send_dispatch,
+        datacenter="local",
+        manager_id="manager-1",
+        task_runner=TaskRunner(),
+        on_dispatch_exhausted=_ignore_dispatch_exhaustion,
+        stop_dispatched_plans=_ignore_plans_to_stop,
+    )
+    # A cancellation lands between the claim and the sends.
+    assert await job_manager.cancel_workflows("job-1", None, "test") == ([], ["workflow-1"])
+
+    results = await dispatcher._send_dispatch_plans(
+        _pending_workflow("workflow-1", vus=5), _dispatch_plans(3)
+    )
+
+    assert sent == []
+    assert [result[3] for result in results] == [DispatchOutcome.WITHHELD] * 3
 
 
 @pytest.mark.asyncio
@@ -224,44 +314,30 @@ async def test_dispatch_plan_fanout_is_bounded() -> None:
     async def send_dispatch(
         worker_id: str,
         dispatch: WorkflowDispatch,
-    ) -> bool:
+    ) -> tuple[DispatchOutcome, str]:
         nonlocal active_dispatches
         nonlocal max_active_dispatches
         active_dispatches += 1
         max_active_dispatches = max(max_active_dispatches, active_dispatches)
         await asyncio.sleep(0.01)
         active_dispatches -= 1
-        return True
+        return DispatchOutcome.ACCEPTED, ""
 
     dispatcher = WorkflowDispatcher(
-        job_manager=None,
+        job_manager=await _claimed_workflow_job_manager(),
         worker_pool=WorkerPool(),
         send_dispatch=send_dispatch,
         datacenter="local",
         manager_id="manager-1",
+        task_runner=TaskRunner(),
+        on_dispatch_exhausted=_ignore_dispatch_exhaustion,
+        stop_dispatched_plans=_ignore_plans_to_stop,
         max_concurrent_dispatches=2,
     )
     pending = _pending_workflow("workflow-1", vus=5)
-    workflow_token = TrackingToken.for_workflow(
-        "local",
-        "manager-1",
-        "job-1",
-        "workflow-1",
-    )
-    dispatch_plans = [
-        (
-            f"worker-{worker_index}",
-            1,
-            workflow_token.to_sub_workflow_token(f"worker-{worker_index}"),
-            WorkflowDispatch(
-                job_id="job-1",
-                workflow_id=f"workflow-{worker_index}",
-            ),
-        )
-        for worker_index in range(5)
-    ]
+    dispatch_plans = _dispatch_plans(5)
 
     results = await dispatcher._send_dispatch_plans(pending, dispatch_plans)
 
-    assert all(result[3] for result in results)
+    assert [result[3] for result in results] == [DispatchOutcome.ACCEPTED] * len(dispatch_plans)
     assert max_active_dispatches == 2

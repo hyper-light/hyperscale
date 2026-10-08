@@ -11,6 +11,8 @@ from .terminal_ui import (
     create_ping_ui,
     colorize_ftp_or_scp_or_sftp,
 )
+from .ping_result_output import PingResultOutput
+from .ping_result_serializer import PingResultSerializer
 
 
 async def make_sftp_request(
@@ -44,6 +46,9 @@ async def make_sftp_request(
     if auth:
         username, password = auth
 
+    result_serializer = PingResultSerializer('sftp', url, 'GETCWD')
+    result_output = PingResultOutput(output_file, result_serializer)
+
     try:
         if quiet is False:
             await terminal.render(
@@ -59,19 +64,22 @@ async def make_sftp_request(
             timeout=timeout,
         )
 
-        assert len(response.transferred) == 1, "Err. - Too many results returned for GETCWD"
-
-        result = list(response.transferred.values()).pop()
-        result_path = result.file_path.decode(encoding=path_encoding)
+        await result_output.record(result_serializer.from_sftp_response, response)
 
         if quiet is False:
 
             response_status = 'OK'
-            response_text = f'Current dir: {result_path}'
             if response.error:
                 response_status = 'FAILED'
                 response_text = str(response.error)
-            
+
+            else:
+                assert len(response.transferred) == 1, "Err. - Too many results returned for GETCWD"
+
+                result = list(response.transferred.values()).pop()
+                result_path = result.file_path.decode(encoding=path_encoding)
+                response_text = f'Current dir: {result_path}'
+
             response_end = response.timings.get('request_end', 0)
             if response_end is None:
                 response_end = 0
@@ -86,23 +94,23 @@ async def make_sftp_request(
                 response_text = "Encountered unknown error."
 
 
-        updates = [
-            update_status(response_status),
-            update_text(response_text),
-            update_elapsed(elapsed),
-            update_params({}, {}),
-        ]
+            updates = [
+                update_status(response_status),
+                update_text(response_text),
+                update_elapsed(elapsed),
+                update_params({}, {}),
+            ]
 
-        await asyncio.sleep(0.5)
-        await asyncio.gather(*updates)
+            await asyncio.sleep(0.5)
+            await asyncio.gather(*updates)
 
-        if wait:
-            loop = asyncio.get_event_loop()
+            if wait:
+                loop = asyncio.get_event_loop()
 
-            await loop.create_future()
+                await loop.create_future()
 
-        await asyncio.sleep(0.5)
-        await terminal.stop()
+            await asyncio.sleep(0.5)
+            await terminal.stop()
 
     except (
         KeyboardInterrupt,
@@ -113,6 +121,7 @@ async def make_sftp_request(
             await terminal.stop()
 
     except Exception as err:
+        await result_output.record_failure(err)
         error_message = str(err)
         if str(err) == "":
             error_message = "Encountered unknown error"
@@ -120,3 +129,5 @@ async def make_sftp_request(
         if quiet is False:
             await update_text(error_message)
             await terminal.stop()
+
+    result_output.raise_on_write_failure()

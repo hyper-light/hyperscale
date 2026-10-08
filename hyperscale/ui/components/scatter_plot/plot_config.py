@@ -9,6 +9,7 @@ from pydantic import (
 from hyperscale.ui.config.mode import TerminalDisplayMode
 from hyperscale.ui.styling.colors import Colorizer
 
+from .models import PlotSeries
 from .point_char import PointCharName
 
 
@@ -27,3 +28,13 @@ class PlotConfig(BaseModel):
     line_color: Colorizer | None = None
     terminal_mode: TerminalDisplayMode = "compatability"
     point_char: PointCharName | None = None
+    # Several series in one plot (see ScatterPlot); None plots one series
+    # in ``line_color`` and ``point_char``.
+    series: list[PlotSeries] | None = None
+    # The order a multi-series plot's legend lists its series in, by name;
+    # None lists them in their declared (drawing) order.
+    legend_order: list[StrictStr] | None = None
+    # The fewest rows between two labelled value-axis ticks: 1 labels as
+    # many rows as nice ticks allow; plot_axes.TIME_MATCHED_VALUE_TICK_ROWS
+    # spaces them as far apart as the time axis' labels.
+    value_tick_rows: StrictInt = 1

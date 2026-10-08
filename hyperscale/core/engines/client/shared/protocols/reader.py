@@ -1,8 +1,35 @@
 import asyncio
 from asyncio import AbstractEventLoop, Future, Transport, get_event_loop
 from asyncio.exceptions import LimitOverrunError
+from typing import Dict, List, Optional, Tuple
 
 from .constants import _DEFAULT_LIMIT
+
+# RFC 9112 5.2: an obs-fold continuation line starts with SP or HTAB.
+_FOLD_LINE_STARTS = (0x20, 0x09)
+
+
+def parse_header_section(section: bytes) -> Dict[bytes, bytes]:
+    """
+    Parses HTTP/1.1 field lines (RFC 9112 5) into fields by lower-cased name,
+    a repeated name keeping its last value. An obs-fold continuation is joined
+    to its field with a space (RFC 9112 5.2); a line without a colon that is
+    not a continuation is skipped.
+    """
+    headers: Dict[bytes, bytes] = {}
+    field_name: Optional[bytes] = None
+
+    for line in section.split(b"\n"):
+        if field_name is not None and line and line[0] in _FOLD_LINE_STARTS:
+            headers[field_name] += b" " + line.strip()
+            continue
+
+        name, separator, value = line.strip().partition(b":")
+        if separator:
+            field_name = name.lower()
+            headers[field_name] = value.strip()
+
+    return headers
 
 
 class Reader:
@@ -110,7 +137,8 @@ class Reader:
         # to a read coroutine. Running two read coroutines at the same time
         # would have an unexpected behaviour. It would not possible to know
         # which coroutine would get the next data.
-        if self._waiter:
+        # A waiter already done has nobody waiting on it.
+        if self._waiter is not None and not self._waiter.done():
             raise RuntimeError(
                 f"{func_name}() called while another coroutine is "
                 f"already waiting for incoming data"
@@ -130,11 +158,98 @@ class Reader:
         finally:
             self._waiter = None
 
+    async def read_header_block(self) -> Dict[bytes, bytes]:
+        """
+        Reads an HTTP/1.1 response's header section -- the field lines after
+        the status line, through the empty line that ends them -- and returns
+        its fields (see ``parse_header_section``). Lines may end in CRLF or a
+        bare LF (RFC 9112 2.2).
+
+        The section is located with one search however the transport split
+        it, then parsed in a single pass.
+        """
+        while (section_end := self._find_header_section_end()) is None:
+            if self._exception is not None:
+                raise self._exception
+
+            if self._eof:
+                raise asyncio.IncompleteReadError(bytes(self._buffer), None)
+
+            if len(self._buffer) > self._limit:
+                raise LimitOverrunError("Header section exceeds the limit", len(self._buffer))
+
+            await self._wait_for_data("read_header_block")
+
+        section_length, consumed_length = section_end
+        section = bytes(self._buffer[:section_length])
+        del self._buffer[:consumed_length]
+        self._maybe_resume_transport()
+
+        return parse_header_section(section)
+
+    def _find_header_section_end(self) -> Optional[Tuple[int, int]]:
+        """
+        The length of the header section's field lines and of the section
+        with its ending empty line, or None until the empty line arrives.
+        """
+        buffer = self._buffer
+
+        if buffer.startswith(b"\r\n"):
+            return 0, 2
+
+        if buffer.startswith(b"\n"):
+            return 0, 1
+
+        crlf_end = buffer.find(b"\n\r\n")
+
+        # A bare-LF empty line only matters before the first CRLF one, so the
+        # body after the section is never scanned.
+        lf_end = buffer.find(b"\n\n", 0, len(buffer) if crlf_end == -1 else crlf_end + 1)
+        if lf_end != -1:
+            return lf_end + 1, lf_end + 2
+
+        if crlf_end != -1:
+            return crlf_end + 1, crlf_end + 3
+
+        return None
+
     async def read(self, n=-1):
+        """
+        Up to ``n`` bytes, waiting for some while none are buffered, and b""
+        at the end of the stream; with ``n`` negative, everything until the
+        end of the stream. Raises the transport's error -- as
+        StreamReader.read() does all of this.
+        """
+        if self._exception is not None:
+            raise self._exception
+
+        if n == 0:
+            return b""
+
+        if n < 0:
+            # A limit-sized block at a time until the end of the stream, as
+            # StreamReader.read() collects it.
+            blocks: List[bytes] = []
+            while True:
+                if self._exception is not None:
+                    raise self._exception
+
+                if not self._buffer and not self._eof:
+                    await self._wait_for_data("read")
+
+                if not self._buffer:
+                    return b"".join(blocks)
+
+                blocks.append(bytes(memoryview(self._buffer)[: self._limit]))
+                del self._buffer[: self._limit]
+
+                self._maybe_resume_transport()
+
         if not self._buffer and not self._eof:
             await self._wait_for_data("read")
 
-        data = bytes(self._buffer[:n])
+        # One copy: slicing the bytearray first would copy the data twice.
+        data = bytes(memoryview(self._buffer)[:n])
         del self._buffer[:n]
 
         self._maybe_resume_transport()
@@ -345,57 +460,6 @@ class Reader:
             headers[bytes(key).lower()] = value.strip()
 
         return headers
-
-    async def iter_headers(self, separator=b"\n"):
-        """Read data from the stream until ``separator`` is found.
-        On success, the data and separator will be removed from the
-        internal buffer (consumed). Returned data will include the
-        separator at the end.
-        Configured stream limit is used to check result. Limit sets the
-        maximal length of data that can be returned, not counting the
-        separator.
-        If an EOF occurs and the complete separator is still not found,
-        an IncompleteReadError exception will be raised, and the internal
-        buffer will be reset.  The IncompleteReadError.partial attribute
-        may contain the separator partially.
-        If the data cannot be read because of over limit, a
-        LimitOverrunError exception  will be raised, and the data
-        will be left in the internal buffer, so it can be read again.
-        """
-        seplen = len(separator)
-
-        while True:
-            if self._exception is not None:
-                raise self._exception
-
-            if not self._buffer:
-                if self._paused:
-                    self._paused = False
-                    self._transport.resume_reading()
-
-                self._waiter = self._loop.create_future()
-                try:
-                    await self._waiter
-                finally:
-                    self._waiter = None
-
-            isep = self._buffer.find(separator)
-            if isep < 0:
-                chunk = bytes(self._buffer)
-                self._buffer.clear()
-
-            else:
-                chunk = bytes(self._buffer[: isep + seplen])
-                del self._buffer[: isep + seplen]
-                self._maybe_resume_transport()
-
-            if b":" not in chunk:
-                break
-
-            decoded = chunk.strip().split(b":", 1)
-
-            key, value = decoded
-            yield key.lower(), value, chunk
 
     async def readexactly(self, n):
         """Read exactly `n` bytes.

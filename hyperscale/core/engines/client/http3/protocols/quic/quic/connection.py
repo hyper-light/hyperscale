@@ -363,7 +363,13 @@ class QuicConnection:
         self._streams_queue: List[QuicStream] = []
         self._streams_blocked_bidi: List[QuicStream] = []
         self._streams_blocked_uni: List[QuicStream] = []
-        self._streams_finished: Set[int] = set()
+        # Streams finished and discarded, by stream type (an ID's low two
+        # bits): every ID of a type below its mark has finished, and one
+        # that finished out of order above the mark waits in the type's set
+        # until the mark reaches it. A set of every finished ID would grow
+        # by one per stream for as long as the connection lives.
+        self._streams_finished_below: List[int] = [0, 1, 2, 3]
+        self._streams_finished_above: List[Set[int]] = [set(), set(), set(), set()]
         self._version: Optional[int] = None
         self._version_negotiation_count = 0
 
@@ -1280,12 +1286,18 @@ class QuicConnection:
         """
         Get or create a stream in response to a received frame.
         """
-        if stream_id in self._streams_finished:
-            # the stream was created, but its state was since discarded
-            raise StreamFinishedError
-
         stream = self._streams.get(stream_id, None)
         if stream is None:
+            # An open stream is never a finished one: only a stream that is
+            # not open is looked for among the finished.
+            stream_type = stream_id & 3
+            if (
+                stream_id < self._streams_finished_below[stream_type]
+                or stream_id in self._streams_finished_above[stream_type]
+            ):
+                # the stream was created, but its state was since discarded
+                raise StreamFinishedError
+
             # check initiator
             if stream_is_client_initiated(stream_id) == self._is_client:
                 raise QuicConnectionError(
@@ -2819,7 +2831,19 @@ class QuicConnection:
                     # if the stream is finished, discard it
                     if stream.is_finished:
                         self._streams.pop(stream.stream_id)
-                        self._streams_finished.add(stream.stream_id)
+                        stream_type = stream.stream_id & 3
+                        finished_below = self._streams_finished_below[stream_type]
+                        if stream.stream_id == finished_below:
+                            # Finished in order: the mark moves past it, and
+                            # past any just above it that finished earlier.
+                            finished_above = self._streams_finished_above[stream_type]
+                            finished_below += 4
+                            while finished_below in finished_above:
+                                finished_above.remove(finished_below)
+                                finished_below += 4
+                            self._streams_finished_below[stream_type] = finished_below
+                        elif stream.stream_id > finished_below:
+                            self._streams_finished_above[stream_type].add(stream.stream_id)
                         discarded.add(stream)
                         continue
 

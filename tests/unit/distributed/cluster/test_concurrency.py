@@ -30,12 +30,12 @@ from hyperscale.distributed.reliability.overload import (
 from hyperscale.distributed.reliability.load_shedding import (
     LoadShedder,
     RequestPriority,
+    classify_handler_to_priority,
 )
 from hyperscale.distributed.reliability.rate_limiting import (
     SlidingWindowCounter,
-    TokenBucket,
+    AdaptiveRateLimitConfig,
     ServerRateLimiter,
-    RateLimitConfig,
 )
 from hyperscale.distributed.reliability.backpressure import (
     StatsBuffer,
@@ -44,7 +44,6 @@ from hyperscale.distributed.reliability.backpressure import (
 from hyperscale.distributed.health.worker_health import WorkerHealthState
 from hyperscale.distributed.health.manager_health import ManagerHealthState
 from hyperscale.distributed.health.gate_health import GateHealthState
-from hyperscale.distributed.health.tracker import NodeHealthTracker
 from hyperscale.distributed.health.extension_tracker import ExtensionTracker
 from hyperscale.distributed.health.worker_health_manager import WorkerHealthManager
 from hyperscale.distributed.models import HealthcheckExtensionRequest
@@ -187,31 +186,31 @@ class TestLoadShedderConcurrency:
 
         results = []
 
-        async def check_shedding(message_type: str):
+        async def check_shedding(handler_name: str):
             for _ in range(50):
-                should_shed = shedder.should_shed(message_type)
+                should_shed = shedder.should_shed_handler(handler_name)
                 state = detector.get_state()
-                results.append((message_type, should_shed, state))
+                results.append((handler_name, should_shed, state))
                 await asyncio.sleep(0)
 
         # Run concurrent shedding checks
         await asyncio.gather(
-            check_shedding("JobSubmission"),
-            check_shedding("StatsQuery"),
-            check_shedding("HealthCheck"),
+            check_shedding("job_submission"),
+            check_shedding("workflow_progress"),
+            check_shedding("ping"),
         )
 
         # Verify shedding decisions match state
-        for message_type, should_shed, state in results:
-            priority = shedder.classify_request(message_type)
+        for handler_name, should_shed, state in results:
+            priority = classify_handler_to_priority(handler_name)
             if state == OverloadState.HEALTHY:
                 # Nothing should be shed when healthy
-                assert not should_shed, f"Shed {message_type} when HEALTHY"
+                assert not should_shed, f"Shed {handler_name} when HEALTHY"
             elif state == OverloadState.OVERLOADED:
                 # Only CRITICAL survives overload
                 if priority != RequestPriority.CRITICAL:
                     assert should_shed, (
-                        f"Didn't shed {message_type} ({priority}) when OVERLOADED"
+                        f"Didn't shed {handler_name} ({priority}) when OVERLOADED"
                     )
 
 
@@ -349,94 +348,6 @@ class TestSlidingWindowCounterConcurrency:
 # =============================================================================
 
 
-class TestTokenBucketConcurrency:
-    """Test TokenBucket under concurrent async access (legacy)."""
-
-    @pytest.mark.asyncio
-    async def test_concurrent_acquire_never_exceeds_bucket_size(self):
-        """Concurrent acquires should never grant more tokens than available."""
-        # Use very slow refill so bucket doesn't refill during test
-        bucket = TokenBucket(bucket_size=100, refill_rate=0.001)
-
-        acquired_count = 0
-        lock = asyncio.Lock()
-
-        async def try_acquire():
-            nonlocal acquired_count
-            success = bucket.acquire(10)
-            if success:
-                async with lock:
-                    acquired_count += 10
-
-        # 20 coroutines trying to acquire 10 tokens each = 200 requested
-        # Only 100 available, so max 100 should be acquired
-        tasks = [try_acquire() for _ in range(20)]
-        await asyncio.gather(*tasks)
-
-        assert acquired_count <= 100, (
-            f"Acquired {acquired_count} tokens from 100-token bucket"
-        )
-
-    @pytest.mark.asyncio
-    async def test_acquire_async_serializes_waiters(self):
-        """Verify that acquire_async serializes concurrent waiters.
-
-        This directly tests that the lock prevents concurrent waits.
-        """
-        bucket = TokenBucket(bucket_size=100, refill_rate=100.0)
-
-        # Drain bucket
-        bucket.acquire(100)
-
-        execution_order = []
-        order_lock = asyncio.Lock()
-
-        async def acquire_and_record(task_id: int):
-            async with order_lock:
-                execution_order.append(f"start_{task_id}")
-
-            # This should serialize due to internal lock
-            result = await bucket.acquire_async(tokens=10, max_wait=1.0)
-
-            async with order_lock:
-                execution_order.append(f"end_{task_id}_{result}")
-
-        # Launch concurrent tasks
-        tasks = [acquire_and_record(i) for i in range(3)]
-        await asyncio.gather(*tasks)
-
-        # Verify all events recorded
-        assert len(execution_order) == 6, f"Expected 6 events, got {execution_order}"
-
-    @pytest.mark.asyncio
-    async def test_concurrent_refill_timing_consistency(self):
-        """Refill should be consistent under concurrent access."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=100.0)
-
-        # Drain bucket
-        bucket.acquire(100)
-
-        # Wait for some refill
-        await asyncio.sleep(0.5)  # Should refill ~50 tokens
-
-        # Multiple concurrent reads of available tokens
-        readings = []
-
-        async def read_available():
-            for _ in range(10):
-                readings.append(bucket.available_tokens)
-                await asyncio.sleep(0.01)
-
-        await asyncio.gather(*[read_available() for _ in range(5)])
-
-        # Readings should be monotonically non-decreasing (refill continues)
-        # Allow small variance due to timing
-        for i in range(1, len(readings)):
-            assert readings[i] >= readings[i - 1] - 1, (
-                f"Token count decreased unexpectedly: {readings[i - 1]} -> {readings[i]}"
-            )
-
-
 # =============================================================================
 # Test ServerRateLimiter Concurrency (AD-24)
 # =============================================================================
@@ -448,11 +359,8 @@ class TestServerRateLimiterConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_rate_limit_checks_per_client(self):
         """Rate limits should be enforced per-client under concurrency."""
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=10.0,
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=1.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 1.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         results_by_client: dict[str, list[bool]] = {"client_a": [], "client_b": []}
         lock = asyncio.Lock()
@@ -479,12 +387,9 @@ class TestServerRateLimiterConcurrency:
     @pytest.mark.asyncio
     async def test_cleanup_under_concurrent_access(self):
         """Counter cleanup should not cause errors during concurrent access."""
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=10.0,
-        )
-        # Use short cleanup interval via constructor parameter
-        limiter = ServerRateLimiter(config, inactive_cleanup_seconds=0.1)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=1.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 1.0)}, inactive_cleanup_seconds=0.1)
+        # Short cleanup interval
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         errors = []
 
@@ -518,11 +423,8 @@ class TestServerRateLimiterConcurrency:
         This validates that ServerRateLimiter's async API properly uses
         the SlidingWindowCounter's lock-based serialization for waiting coroutines.
         """
-        config = RateLimitConfig(
-            default_bucket_size=10,
-            default_refill_rate=0.001,  # Very slow refill for deterministic behavior
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=10, default_window_size=10000.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (10, 10000.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         success_count = 0
         failure_count = 0
@@ -557,11 +459,8 @@ class TestServerRateLimiterConcurrency:
 
         This tests the compatibility API used by TCP/UDP protocols.
         """
-        config = RateLimitConfig(
-            default_bucket_size=5,
-            default_refill_rate=0.001,  # Very slow refill for deterministic behavior
-        )
-        limiter = ServerRateLimiter(config)
+        config = AdaptiveRateLimitConfig(default_max_requests=5, default_window_size=5000.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (5, 5000.0)})
+        limiter = ServerRateLimiter(adaptive_config=config)
 
         results_by_addr: dict[str, list[bool]] = {}
         lock = asyncio.Lock()
@@ -685,83 +584,6 @@ class TestStatsBufferConcurrency:
 # =============================================================================
 # Test NodeHealthTracker Concurrency (AD-19)
 # =============================================================================
-
-
-class TestNodeHealthTrackerConcurrency:
-    """Test NodeHealthTracker under concurrent async access."""
-
-    @pytest.mark.asyncio
-    async def test_concurrent_state_updates_dont_corrupt_tracking(self):
-        """Concurrent state updates should maintain tracker integrity."""
-        tracker: NodeHealthTracker[WorkerHealthState] = NodeHealthTracker()
-
-        async def update_worker(worker_id: str):
-            for i in range(50):
-                state = WorkerHealthState(
-                    worker_id=worker_id,
-                    consecutive_liveness_failures=i % 5,
-                    accepting_work=i % 2 == 0,
-                    available_capacity=100 - i,
-                )
-                tracker.update_state(worker_id, state)
-                await asyncio.sleep(0)
-
-        # Update multiple workers concurrently
-        await asyncio.gather(*[update_worker(f"worker_{j}") for j in range(10)])
-
-        # All workers should be tracked
-        for j in range(10):
-            state = tracker.get_state(f"worker_{j}")
-            assert state is not None
-
-    @pytest.mark.asyncio
-    async def test_concurrent_get_healthy_nodes_returns_consistent_list(self):
-        """get_healthy_nodes should return consistent results under concurrency."""
-        tracker: NodeHealthTracker[WorkerHealthState] = NodeHealthTracker()
-
-        # Set up initial states
-        for j in range(10):
-            state = WorkerHealthState(
-                worker_id=f"worker_{j}",
-                consecutive_liveness_failures=0,
-                accepting_work=True,
-                available_capacity=100,
-            )
-            tracker.update_state(f"worker_{j}", state)
-
-        results = []
-        lock = asyncio.Lock()
-
-        async def get_healthy():
-            for _ in range(50):
-                healthy = tracker.get_healthy_nodes()
-                async with lock:
-                    results.append(len(healthy))
-                await asyncio.sleep(0)
-
-        async def toggle_health():
-            for i in range(50):
-                worker_id = f"worker_{i % 10}"
-                state = WorkerHealthState(
-                    worker_id=worker_id,
-                    consecutive_liveness_failures=3
-                    if i % 2 == 0
-                    else 0,  # Toggle unhealthy
-                    accepting_work=True,
-                    available_capacity=100,
-                )
-                tracker.update_state(worker_id, state)
-                await asyncio.sleep(0)
-
-        await asyncio.gather(
-            get_healthy(),
-            get_healthy(),
-            toggle_health(),
-        )
-
-        # Results should be valid counts (0-10 workers)
-        for count in results:
-            assert 0 <= count <= 10
 
 
 # =============================================================================
@@ -908,8 +730,8 @@ class TestCrossComponentConcurrency:
         async def check_shedding():
             for _ in range(100):
                 try:
-                    shedder.should_shed("JobSubmission")
-                    shedder.should_shed("StatsQuery")
+                    shedder.should_shed_handler("job_submission")
+                    shedder.should_shed_handler("workflow_progress")
                 except Exception as e:
                     errors.append(("shed", e))
                 await asyncio.sleep(0)
@@ -937,9 +759,8 @@ class TestCrossComponentConcurrency:
         # Set up full stack
         detector = HybridOverloadDetector()
         shedder = LoadShedder(detector)
-        rate_limiter = ServerRateLimiter(RateLimitConfig())
+        rate_limiter = ServerRateLimiter(adaptive_config=AdaptiveRateLimitConfig(default_max_requests=100, default_window_size=10.0, operation_limits={"stats_update": (500, 10.0), "heartbeat": (200, 10.0), "progress_update": (300, 10.0), "job_submit": (50, 10.0), "job_status": (100, 10.0), "workflow_dispatch": (100, 10.0), "cancel": (20, 10.0), "reconnect": (10, 10.0), "default": (100, 10.0)}))
         stats_buffer = StatsBuffer()
-        health_tracker: NodeHealthTracker[WorkerHealthState] = NodeHealthTracker()
 
         errors = []
 
@@ -951,7 +772,7 @@ class TestCrossComponentConcurrency:
                     return
 
                 # Check load shedding
-                if shedder.should_shed("JobSubmission"):
+                if shedder.should_shed_handler("job_submission"):
                     return
 
                 # Record latency
@@ -960,17 +781,6 @@ class TestCrossComponentConcurrency:
 
                 # Record stats
                 stats_buffer.record(latency)
-
-                # Update health
-                health_tracker.update_state(
-                    client_id,
-                    WorkerHealthState(
-                        worker_id=client_id,
-                        consecutive_liveness_failures=0,
-                        accepting_work=True,
-                        available_capacity=100,
-                    ),
-                )
 
             except Exception as e:
                 errors.append((client_id, request_num, e))

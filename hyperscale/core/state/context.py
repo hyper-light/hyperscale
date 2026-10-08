@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict
+from typing import Dict
 
 from .workflow_context import WorkflowContext
 
@@ -38,7 +38,7 @@ class Context:
     def __contains__(self, key: str) -> bool:
         return key in self._context
 
-    def dict(self) -> Dict[str, Dict[str, Any]]:
+    def dict(self) -> Dict[str, Dict[str, object]]:
         """Return the full context as nested dictionaries."""
         return {key: value.dict() for key, value in self._context.items()}
     
@@ -49,7 +49,7 @@ class Context:
             for workflow, ctx in self._context.items()
         }
     
-    async def from_dict(self, workflow: str, values: dict[str, Any]) -> "Context":
+    async def from_dict(self, workflow: str, values: dict[str, object]) -> "Context":
         """Load context values from a dictionary (no timestamps = always apply)."""
         if self._context.get(workflow) is None:
             self._context[workflow] = WorkflowContext()
@@ -73,7 +73,7 @@ class Context:
         self,
         workflow: str,
         key: str,
-        value: Any,
+        value: object,
         timestamp: int | None = None,
         source_node: str | None = None,
     ):

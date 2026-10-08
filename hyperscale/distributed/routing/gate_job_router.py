@@ -1,387 +1,176 @@
 """
-Gate job router with Vivaldi-based multi-factor routing (AD-36).
-
-Integrates all routing components to make datacenter selection decisions.
+Gate job router: AD-36 routing through a pluggable placement policy (D-62).
 """
 
-from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Callable
+from operator import attrgetter
 
-from hyperscale.distributed.routing.bootstrap import BootstrapModeManager
-from hyperscale.distributed.routing.bucket_selector import BucketSelector
-from hyperscale.distributed.routing.candidate_filter import (
-    CandidateFilter,
-    DatacenterCandidate,
-)
-from hyperscale.distributed.routing.fallback_chain import (
-    FallbackChain,
-    FallbackChainBuilder,
-)
-from hyperscale.distributed.routing.hysteresis import (
-    HysteresisConfig,
-    HysteresisManager,
-)
-from hyperscale.distributed.routing.routing_state import (
-    DatacenterRoutingScore,
-    JobRoutingState,
-    RoutingDecisionReason,
-    RoutingStateManager,
-)
-from hyperscale.distributed.routing.scoring import RoutingScorer, ScoringConfig
-from hyperscale.distributed.swim.coordinates.coordinate_tracker import (
-    CoordinateTracker,
-)
-
-
-@dataclass(slots=True)
-class RoutingDecision:
-    """Result of a routing decision."""
-
-    job_id: str
-    primary_datacenters: list[str]
-    fallback_datacenters: list[str]
-    primary_bucket: str | None
-    reason: RoutingDecisionReason
-    in_bootstrap_mode: bool
-    scores: dict[str, float]
-
-    # State tracking
-    switched: bool
-    previous_primary: str | None
-
-
-@dataclass
-class GateJobRouterConfig:
-    """Configuration for the gate job router."""
-
-    # Scoring
-    scoring_config: ScoringConfig = field(default_factory=ScoringConfig)
-
-    # Hysteresis
-    hysteresis_config: HysteresisConfig = field(default_factory=HysteresisConfig)
-
-    # Selection limits
-    max_primary_dcs: int = 2
-
-    # Cooldown penalty
-    cooldown_penalty_multiplier: float = 2.0
+from .constrained_placement_policy import HEALTH_BUCKET_RANK
+from .datacenter_candidate import DatacenterCandidate
+from .exclusion_reason import ExclusionReason
+from .job_dispatch_cooldowns import JobDispatchCooldowns
+from .placement_policy import PlacementPolicy
+from .models import PlacementRequest
+from .routing_decision import RoutingDecision
 
 
 class GateJobRouter:
     """
-    Vivaldi-based job router for gates (AD-36).
+    Routes a job to the datacenters it runs in (AD-36).
 
-    Routes jobs to optimal datacenters while:
-    - Preserving AD-17 health bucket ordering
-    - Using Vivaldi RTT UCB for latency awareness
-    - Applying multi-factor scoring (RTT × load × quality)
-    - Enforcing hysteresis to prevent routing churn
-    - Supporting graceful bootstrap mode
-
-    Usage:
-        router = GateJobRouter(
-            coordinate_tracker=coord_tracker,
-            get_datacenter_candidates=my_dc_getter,
-        )
-
-        decision = router.route_job(
-            job_id="job-123",
-            preferred_datacenters={"us-east-1"},
-        )
-
-        # Use decision.primary_datacenters and decision.fallback_datacenters
+    Every known datacenter becomes a candidate; the placement policy
+    (``ConstrainedPlacementPolicy`` on a gate) answers which of them the
+    job may be placed in, best first. The first ``datacenter_count`` are
+    the primaries -- a job asking for more datacenters than the best
+    bucket holds fills from the next -- and the rest are its fallbacks, in
+    order. The router keeps what outlives one decision: the datacenters
+    cooling down from a failed dispatch of each job, and the AD-36 Part 11
+    counters.
     """
 
     def __init__(
         self,
-        coordinate_tracker: CoordinateTracker | None = None,
-        get_datacenter_candidates: Callable[[], list[DatacenterCandidate]]
-        | None = None,
-        config: GateJobRouterConfig | None = None,
+        get_datacenter_candidates: Callable[[], list[DatacenterCandidate]],
+        placement_policy: PlacementPolicy,
+        dispatch_cooldowns: JobDispatchCooldowns,
     ) -> None:
-        self._config = config or GateJobRouterConfig()
-        self._coordinate_tracker = coordinate_tracker
-
-        # Injected data source
-        self._get_datacenter_candidates = get_datacenter_candidates or (lambda: [])
-
-        # Components
-        self._candidate_filter = CandidateFilter()
-        self._bucket_selector = BucketSelector()
-        self._scorer = RoutingScorer(self._config.scoring_config)
-        self._bootstrap_manager = BootstrapModeManager()
-        self._hysteresis_manager = HysteresisManager(self._config.hysteresis_config)
-        self._fallback_builder = FallbackChainBuilder(self._bucket_selector)
-        self._state_manager = RoutingStateManager(
-            hold_down_seconds=self._config.hysteresis_config.hold_down_seconds,
-            improvement_ratio=self._config.hysteresis_config.improvement_ratio,
-            cooldown_seconds=self._config.hysteresis_config.cooldown_seconds,
-        )
-
-    def reset_primary_for_partitioned_datacenters(
-        self,
-        affected_datacenters: list[str],
-    ) -> int:
-        """Reset routing state for jobs in partitioned datacenters."""
-        return len(
-            self.reset_primary_for_partitioned_datacenters_with_jobs(
-                affected_datacenters
-            )
-        )
-
-    def reset_primary_for_partitioned_datacenters_with_jobs(
-        self,
-        affected_datacenters: list[str],
-    ) -> list[str]:
-        """Reset routing state for partitioned datacenters and return job IDs."""
-        if not affected_datacenters:
-            return []
-
-        return self._state_manager.reset_primary_for_datacenters_with_jobs(
-            set(affected_datacenters)
-        )
+        self._get_datacenter_candidates = get_datacenter_candidates
+        self._placement_policy = placement_policy
+        self._dispatch_cooldowns = dispatch_cooldowns
+        # AD-36 Part 11 counters, since start: decisions by the worst
+        # health bucket among their primaries ("none" when nothing was
+        # eligible), datacenters excluded by reason, fallbacks a dispatch
+        # used (from, to), and dispatch failures that cooled a datacenter
+        # for a job.
+        self._decisions_by_bucket: dict[str, int] = {}
+        self._exclusions_by_reason: dict[str, int] = {}
+        self._fallbacks_used: dict[tuple[str, str], int] = {}
+        self._cooldowns_recorded = 0
 
     def route_job(
         self,
         job_id: str,
-        preferred_datacenters: set[str] | None = None,
+        datacenter_count: int,
+        placement_constraint: set[str] | None,
+        occupied_datacenters: frozenset[str] = frozenset(),
+        dispatch_latency_budget_ms: float = 0.0,
     ) -> RoutingDecision:
         """
-        Route a job to optimal datacenters (AD-36 Part 9).
-
-        Flow:
-        1. Get datacenter candidates
-        2. Filter (exclude UNHEALTHY, no managers, etc.)
-        3. Select primary health bucket
-        4. Check bootstrap mode
-        5. Score candidates
-        6. Apply hysteresis
-        7. Build fallback chain
-
-        Args:
-            job_id: Job identifier
-            preferred_datacenters: Optional set of preferred DC IDs
-
-        Returns:
-            RoutingDecision with primary and fallback datacenters
+        Route ``job_id`` to ``datacenter_count`` datacenters, within
+        ``placement_constraint`` when one is given, outside
+        ``occupied_datacenters`` -- those already running, or already lost
+        by, the job when a lost datacenter's work is placed anew -- and
+        under ``dispatch_latency_budget_ms`` when one is set (D-62).
         """
-        # Get job routing state
-        job_state = self._state_manager.get_or_create_state(job_id)
-        job_state.cleanup_expired_cooldowns()
-
-        # Step 1: Get candidates
-        candidates = self._get_datacenter_candidates()
-
-        # Enrich with Vivaldi data
-        self._enrich_with_vivaldi(candidates)
-
-        # Step 2: Filter candidates
-        eligible, excluded = self._candidate_filter.filter_datacenters(candidates)
-
-        # Diagnostic: report what we saw at the gate's job-routing
-        # entry. Useful when the gate rejects submission with
-        # "all unhealthy" — tells us exactly which DCs were
-        # considered and why each was excluded.
-        import sys as _sys
-        _candidate_summary = [
-            {
-                "dc": c.datacenter_id,
-                "health": c.health_bucket,
-                "total_mgrs": c.total_managers,
-                "healthy_mgrs": c.healthy_managers,
-                "cores": c.available_cores,
-                "total_cores": c.total_cores,
-            }
-            for c in candidates
-        ]
-        _exclusion_summary = [
-            {
-                "dc": c.datacenter_id,
-                "reason": (
-                    c.exclusion_reason.name
-                    if c.exclusion_reason is not None
-                    else None
-                ),
-                "health": c.health_bucket,
-            }
-            for c in excluded
-        ]
-        _sys.stderr.write(
-            f"[L3-ROUTE job_id={job_id[:12]}] "
-            f"candidates={_candidate_summary} "
-            f"excluded={_exclusion_summary} "
-            f"eligible_count={len(eligible)}\n"
+        request = self._placement_request(
+            job_id, datacenter_count, placement_constraint, occupied_datacenters, dispatch_latency_budget_ms
         )
-        _sys.stderr.flush()
-
-        if not eligible:
-            return self._empty_decision(job_id, job_state)
-
-        # Step 3: Select primary bucket
-        bucket_result = self._bucket_selector.select_bucket(eligible)
-
-        if not bucket_result.primary_candidates:
-            return self._empty_decision(job_id, job_state)
-
-        # Step 4: Check bootstrap mode
-        in_bootstrap = self._check_bootstrap_mode()
-
-        # Step 5: Score candidates
-        if in_bootstrap:
-            # Use capacity-based ranking
-            sorted_primary = self._bootstrap_manager.rank_by_capacity(
-                bucket_result.primary_candidates
-            )
-            primary_scores = [
-                DatacenterRoutingScore(
-                    datacenter_id=c.datacenter_id,
-                    health_bucket=c.health_bucket,
-                    rtt_ucb_ms=c.rtt_ucb_ms,
-                    load_factor=1.0,
-                    quality_penalty=1.0,
-                    final_score=idx,  # Use rank as score
-                    is_preferred=c.datacenter_id in (preferred_datacenters or set()),
-                )
-                for idx, c in enumerate(sorted_primary)
-            ]
-        else:
-            # Use full scoring
-            primary_scores = self._scorer.score_datacenters(
-                bucket_result.primary_candidates,
-                preferred_datacenters,
-            )
-
-        # Apply cooldown penalties
-        primary_scores = self._hysteresis_manager.apply_cooldown_penalty(
-            primary_scores,
-            job_state,
-            self._config.cooldown_penalty_multiplier,
+        plan = self._placement_policy.place(request, self._get_datacenter_candidates())
+        primaries = plan.ordered[:datacenter_count]
+        worst_primary_health_bucket = self._worst_health_bucket(primaries)
+        self._count_decision(worst_primary_health_bucket, plan.exclusions)
+        return RoutingDecision(
+            job_id=job_id,
+            primary_datacenters=list(map(attrgetter("datacenter_id"), primaries)),
+            fallback_datacenters=list(map(attrgetter("datacenter_id"), plan.ordered[datacenter_count:])),
+            worst_primary_health_bucket=worst_primary_health_bucket,
+            scores=plan.scores,
+            exclusions=plan.exclusions,
+            cooling_datacenters=request.cooling_datacenters,
+            latency_budget_relaxed=plan.latency_budget_relaxed,
         )
 
-        # Step 6: Apply hysteresis
-        excluded_set = {c.datacenter_id for c in excluded}
-        hysteresis_result = self._hysteresis_manager.evaluate_switch(
-            job_state,
-            primary_scores,
-            excluded_set,
+    def spillover_candidates(
+        self,
+        job_id: str,
+        primary_datacenter: str,
+        fallback_datacenters: list[str],
+        dispatch_latency_budget_ms: float,
+    ) -> list[str]:
+        """The ``fallback_datacenters`` AD-43 spillover may move ``job_id``'s
+        share in ``primary_datacenter`` to, as its placement policy allows."""
+        request = self._placement_request(job_id, 1, None, frozenset(), dispatch_latency_budget_ms)
+        return self._placement_policy.spillover_candidates(
+            request,
+            primary_datacenter,
+            fallback_datacenters,
+            self._get_datacenter_candidates(),
         )
 
-        # Update state if switching
-        switched = False
-        previous_primary = job_state.primary_datacenter
+    def _placement_request(
+        self,
+        job_id: str,
+        datacenter_count: int,
+        placement_constraint: set[str] | None,
+        occupied_datacenters: frozenset[str],
+        dispatch_latency_budget_ms: float,
+    ) -> PlacementRequest:
+        """What one routing of ``job_id`` asks of its placement, with the
+        datacenters cooling down for it now."""
+        return PlacementRequest(
+            job_id=job_id,
+            datacenter_count=datacenter_count,
+            affinity=frozenset(placement_constraint) if placement_constraint else None,
+            occupied_datacenters=occupied_datacenters,
+            cooling_datacenters=self._dispatch_cooldowns.cooling_datacenters(job_id),
+            dispatch_latency_budget_ms=dispatch_latency_budget_ms,
+        )
 
-        if hysteresis_result.should_switch and hysteresis_result.selected_datacenter:
-            job_state.select_primary(
-                hysteresis_result.selected_datacenter,
-                hysteresis_result.selected_score,
+    @staticmethod
+    def _worst_health_bucket(primaries: list[DatacenterCandidate]) -> str | None:
+        """The worst health bucket among the primaries, None without any."""
+        return (
+            max(
+                map(attrgetter("health_bucket"), primaries),
+                key=HEALTH_BUCKET_RANK.__getitem__,
             )
-            switched = True
+            if primaries
+            else None
+        )
 
-        # Step 7: Build fallback chain
-        fallback_scores = {
-            s.datacenter_id: s
-            for s in self._scorer.score_datacenters(
-                bucket_result.fallback_candidates,
-                preferred_datacenters,
+    def _count_decision(
+        self,
+        worst_primary_health_bucket: str | None,
+        exclusions: dict[str, ExclusionReason],
+    ) -> None:
+        """Count a decision by its worst primary bucket and its exclusions
+        by reason (AD-36 Part 11)."""
+        decision_bucket = worst_primary_health_bucket or "none"
+        self._decisions_by_bucket[decision_bucket] = self._decisions_by_bucket.get(decision_bucket, 0) + 1
+        for exclusion_reason in exclusions.values():
+            self._exclusions_by_reason[exclusion_reason.value] = (
+                self._exclusions_by_reason.get(exclusion_reason.value, 0) + 1
             )
+
+    def record_dispatch_failure(self, job_id: str, datacenter_id: str) -> None:
+        """Demote ``datacenter_id`` for ``job_id`` after a failed dispatch."""
+        self._dispatch_cooldowns.record_failure(job_id, datacenter_id)
+        self._cooldowns_recorded += 1
+
+    def record_fallback_used(self, from_datacenter: str, to_datacenter: str) -> None:
+        """A dispatch that failed at ``from_datacenter`` landed on its
+        fallback ``to_datacenter``."""
+        route = (from_datacenter, to_datacenter)
+        self._fallbacks_used[route] = self._fallbacks_used.get(route, 0) + 1
+
+    def get_metrics(self) -> dict[str, int]:
+        """The AD-36 Part 11 counters, as ``kind:label`` keys: ``decision:
+        <bucket>``, ``exclusion:<reason>``, ``fallback:<from>><to>`` and
+        ``cooldowns``."""
+        return {
+            **{f"decision:{bucket}": count for bucket, count in self._decisions_by_bucket.items()},
+            **{f"exclusion:{reason}": count for reason, count in self._exclusions_by_reason.items()},
+            **self._fallback_metrics(),
+            "cooldowns": self._cooldowns_recorded,
         }
 
-        chain = self._fallback_builder.build_chain(
-            primary_scores,
-            bucket_result.fallback_candidates,
-            fallback_scores,
-            max_primary=self._config.max_primary_dcs,
-        )
-
-        return RoutingDecision(
-            job_id=job_id,
-            primary_datacenters=chain.primary_datacenters,
-            fallback_datacenters=chain.fallback_datacenters,
-            primary_bucket=chain.primary_bucket,
-            reason=hysteresis_result.reason,
-            in_bootstrap_mode=in_bootstrap,
-            scores=chain.scores,
-            switched=switched,
-            previous_primary=previous_primary,
-        )
-
-    def _enrich_with_vivaldi(
-        self,
-        candidates: list[DatacenterCandidate],
-    ) -> None:
-        """Enrich candidates with Vivaldi coordinate data."""
-        if self._coordinate_tracker is None:
-            return
-
-        for candidate in candidates:
-            peer_coord = self._coordinate_tracker.get_peer_coordinate(
-                candidate.datacenter_id
-            )
-            if peer_coord is not None:
-                candidate.has_coordinate = True
-                candidate.rtt_ucb_ms = self._coordinate_tracker.estimate_rtt_ucb_ms(
-                    peer_coord
-                )
-                candidate.coordinate_quality = (
-                    self._coordinate_tracker.coordinate_quality(peer_coord)
-                )
-
-    def _check_bootstrap_mode(self) -> bool:
-        """Check if we're in coordinate-unaware bootstrap mode."""
-        if self._coordinate_tracker is None:
-            return True
-
-        coord = self._coordinate_tracker.get_coordinate()
-        return self._bootstrap_manager.is_in_bootstrap_mode(
-            coord.sample_count,
-            coord.error,
-        )
-
-    def _empty_decision(
-        self,
-        job_id: str,
-        job_state: JobRoutingState,
-    ) -> RoutingDecision:
-        """Return empty decision when no candidates available."""
-        return RoutingDecision(
-            job_id=job_id,
-            primary_datacenters=[],
-            fallback_datacenters=[],
-            primary_bucket=None,
-            reason=RoutingDecisionReason.EXCLUSION_FORCED,
-            in_bootstrap_mode=True,
-            scores={},
-            switched=False,
-            previous_primary=job_state.primary_datacenter,
-        )
-
-    def record_dispatch_failure(
-        self,
-        job_id: str,
-        datacenter_id: str,
-    ) -> None:
-        """Record a dispatch failure for cooldown tracking."""
-        job_state = self._state_manager.get_or_create_state(job_id)
-        job_state.record_failure(
-            datacenter_id,
-            self._config.hysteresis_config.cooldown_seconds,
-        )
+    def _fallback_metrics(self) -> dict[str, int]:
+        """The ``fallback:<from>><to>`` counters of AD-36 Part 11."""
+        return {
+            f"fallback:{from_datacenter}>{to_datacenter}": count
+            for (from_datacenter, to_datacenter), count in self._fallbacks_used.items()
+        }
 
     def cleanup_job_state(self, job_id: str) -> None:
-        """Clean up routing state for a completed job."""
-        self._state_manager.remove_state(job_id)
-
-    def get_metrics(self) -> dict:
-        """Get router metrics."""
-        bootstrap_status = {}
-        if self._coordinate_tracker:
-            coord = self._coordinate_tracker.get_coordinate()
-            bootstrap_status = self._bootstrap_manager.get_bootstrap_status(
-                coord.sample_count,
-                coord.error,
-            )
-
-        return {
-            "tracked_jobs": self._state_manager.get_job_count(),
-            "bootstrap_status": bootstrap_status,
-        }
+        """Forget a finished job's routing state."""
+        self._dispatch_cooldowns.clear_job(job_id)

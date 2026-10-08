@@ -167,13 +167,11 @@ class HTTP2Trace:
         self,
         span: Span,
         connection_url: str,
-        ssl_upgrade_url: str | None = None,
     ):
         span.add_event(
             'http2.connection_create_start',
             attributes={
                 'http2.connection_url': connection_url,
-                'http2.ssl_upgrade_url': ssl_upgrade_url,
                 'http2.ssl_version': self.ssl_version,
             },
             timestamp=int(time.monotonic())
@@ -431,7 +429,6 @@ class HTTP2Trace:
         redirect_url: str,
         redirects_taken: int,
         max_redirects: int,
-        is_ssl_upgrade: bool = False
     ):
         span.add_event(
             'http2.request_redirect',
@@ -439,7 +436,6 @@ class HTTP2Trace:
                 'http2.redirect_url': redirect_url,
                 'http2.redirects_taken': redirects_taken,
                 'http2.max_redirects': max_redirects,
-                'http2.is_ssl_upgrade': is_ssl_upgrade,
             },
             timestamp=int(time.monotonic())
         )

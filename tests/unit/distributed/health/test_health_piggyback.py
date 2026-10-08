@@ -266,6 +266,7 @@ class TestWorkerStateEmbedderHealthPiggyback:
             get_cpu_percent=lambda: 30.0,
             get_memory_percent=lambda: 45.0,
             get_state_version=lambda: 1,
+            get_total_cores=lambda: 8,
             get_active_workflows=lambda: {"wf-1": "running"},
             # Health piggyback callbacks
             get_health_accepting_work=lambda: True,
@@ -293,6 +294,7 @@ class TestWorkerStateEmbedderHealthPiggyback:
             get_cpu_percent=lambda: 20.0,
             get_memory_percent=lambda: 30.0,
             get_state_version=lambda: 1,
+            get_total_cores=lambda: 8,
             get_active_workflows=lambda: {},
         )
 

@@ -5,6 +5,10 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
 from tests.end_to_end.workflows.base_scenario_workflow import BaseScenarioWorkflow
+from tests.end_to_end.workflow_lifecycle_checks import (
+    assert_retry_budgets_released,
+    assert_workflow_lifecycle_sound,
+)
 from tests.framework.results.scenario_outcome import ScenarioOutcome
 from tests.framework.results.scenario_result import ScenarioResult
 from tests.framework.runner.scenario_runner import ScenarioRunner
@@ -219,7 +223,7 @@ async def validate_18_2_metrics_fields() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert state._workflow_latency_digest is not None, (
+        assert state._dispatch_latency_digest is not None, (
             "Metrics fields expected latency digest"
         )
     finally:
@@ -238,10 +242,8 @@ async def validate_18_2_error_fields() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert isinstance(state._workflow_retries, dict), (
-            "Error fields expected workflow retries"
-        )
+        assert_workflow_lifecycle_sound(manager, "Error fields expected workflow retries")
+        assert_retry_budgets_released(manager, "Error fields expected workflow retries")
     finally:
         await runtime.stop_cluster()
 

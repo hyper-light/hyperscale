@@ -18,6 +18,9 @@ class RetryBudgetState:
     per_workflow_max: int
     consumed: int = 0
     per_workflow_consumed: dict[str, int] = field(default_factory=dict)
+    # Retries refused because a budget was spent (AD-44
+    # ``retry_budget_exhausted_total``).
+    refused: int = 0
 
     def can_retry(self, workflow_id: str) -> tuple[bool, str]:
         """
@@ -44,6 +47,14 @@ class RetryBudgetState:
         self.per_workflow_consumed[workflow_id] = (
             self.per_workflow_consumed.get(workflow_id, 0) + 1
         )
+
+    def record_refusal(self, workflow_id: str) -> tuple[str, int, int]:
+        """Count a refused retry; the spent budget that refused it as
+        (scope, consumed, budget) -- ``job`` or ``workflow``."""
+        self.refused += 1
+        if self.consumed >= self.total_budget:
+            return "job", self.consumed, self.total_budget
+        return "workflow", self.per_workflow_consumed.get(workflow_id, 0), self.per_workflow_max
 
     def get_remaining(self) -> int:
         """Get remaining job-level retries."""

@@ -7,7 +7,7 @@ job leadership, cancellation tracking, and metrics.
 
 import asyncio
 from collections import defaultdict, deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
     GateInfo,
@@ -16,13 +16,23 @@ from hyperscale.distributed.models import (
     WorkerRegistration,
     CancelledWorkflowInfo,
     JobSubmission,
-    ProvisionRequest,
     ManagerState as ManagerStateEnum,
 )
 from hyperscale.distributed.server.events import VersionedStateClock
 from hyperscale.distributed.swim.core import ErrorStats
 from hyperscale.distributed.protocol.version import NegotiatedCapabilities
-from hyperscale.distributed.slo import TimeWindowedTDigest
+from hyperscale.distributed.slo import LatencySLO, SLOConfig, TimeWindowedTDigest
+
+from .models import WorkerEvictionNoticeState
+from .models.manager_gate_metrics import ManagerGateMetrics
+from hyperscale.distributed.slo import SLOSummary
+
+
+# Cap on outstanding worker-eviction notice obligations. Entries are
+# discharged on worker ack or re-registration; a worker that never
+# returns leaves one entry behind, so the map is bounded here (oldest
+# obligation dropped on overflow) to honor the no-leaks rule.
+_MAX_EVICTION_NOTICES = 256
 
 if TYPE_CHECKING:
     from hyperscale.core.state.context import Context
@@ -30,7 +40,6 @@ if TYPE_CHECKING:
         WorkflowProgressSnapshot,
     )
     from hyperscale.distributed.jobs.timeout_strategy import TimeoutStrategy
-    from hyperscale.distributed.workflow import WorkflowStateMachine
     from hyperscale.reporting.common.results_types import WorkflowStats
     from hyperscale.distributed.slo import LatencyObservation, SLOSummary
 
@@ -49,29 +58,33 @@ class ManagerState:
            await of any other lock here.
         2. _peer_manager_health_lock — guards _peer_manager_health_states.
            Acquired only after _resource_creation_lock has been released.
-        3. _provision_lock — guards _pending_provisions / _provision_confirmations.
-           Independent of the health lock; never nest the two.
-        4. _core_allocation_lock / _eager_dispatch_lock — innermost; guard
+        3. _core_allocation_lock / _eager_dispatch_lock — innermost; guard
            short core-bookkeeping critical sections only.
-        5. _counter_lock — innermost; pure atomic-increment guard. Never
+        4. _counter_lock — innermost; pure atomic-increment guard. Never
            held across awaits on any other lock above.
 
     Per-resource locks (_peer_state_locks[addr], _gate_state_locks[id],
-    _workflow_cancellation_locks[id], _dispatch_semaphores[id]) are leaf
+    _dispatch_semaphores[id]) are leaf
     locks: they are acquired AFTER the relevant lookup-time critical
     section in _resource_creation_lock has been released, and never
     held while acquiring any of the locks above.
     """
 
-    def __init__(self) -> None:
-        """Initialize empty state containers."""
+    def __init__(self, slo_config: SLOConfig) -> None:
+        """
+        Initialize empty state containers.
+
+        Args:
+            slo_config: The manager's SLO settings (AD-42), from its Env:
+                the workflow latency digest and the gossiped SLO summary
+                are built with them.
+        """
         # Counter protection lock (for race-free increments)
         self._counter_lock: asyncio.Lock | None = None
 
         # Lock for creating per-resource locks and semaphores
         self._resource_creation_lock: asyncio.Lock | None = None
         self._peer_manager_health_lock: asyncio.Lock | None = None
-        self._provision_lock: asyncio.Lock | None = None
 
         # Gate tracking
         self._known_gates: dict[str, GateInfo] = {}
@@ -117,6 +130,14 @@ class ManagerState:
         # cross_dc_correlation. Worker entries are evicted when the
         # worker is removed from the registry.
         self._worker_lhm_scores: dict[str, int] = {}
+        # Outstanding worker-eviction notice obligations: the manager
+        # deregistered these workers via a failure/reap path and owes
+        # each an eviction notice until the worker acks it or
+        # re-registers (two-sided deregistration — without this a live
+        # evicted worker never learns and never re-registers). Bounded
+        # by _MAX_EVICTION_NOTICES; oldest obligation dropped on
+        # overflow.
+        self._evicted_worker_notices: dict[str, WorkerEvictionNoticeState] = {}
         # Phase H3 — per-workflow last-known progress snapshot used by
         # the AD-26 multi-witness extension decision (H5). Keyed by
         # ``workflow_id`` so leader transfer can preserve the entry
@@ -132,16 +153,16 @@ class ManagerState:
         self._versioned_clock: VersionedStateClock = VersionedStateClock()
 
         # Quorum protocol state
-        self._pending_provisions: dict[str, ProvisionRequest] = {}
-        self._provision_confirmations: dict[str, set[str]] = {}
 
         # Job leader tracking (Context Consistency Protocol)
         self._job_leaders: dict[str, str] = {}
         self._job_leader_addrs: dict[str, tuple[str, int]] = {}
         self._job_fencing_tokens: dict[str, int] = {}
-        self._job_layer_version: dict[str, int] = {}
-        self._job_contexts: dict[str, "Context"] = {}
-        self._context_lamport_clock: int = 0
+        # AD-38 Part 8: per job this manager follows, the newest view its
+        # leader synced here -- (fence token, the leader's monotonic time of
+        # the view, this manager's monotonic time it arrived) -- what a
+        # SESSION or BOUNDED_STALENESS read answered here is judged by.
+        self._job_leader_views: dict[str, tuple[int, float, float]] = {}
 
         # Client callbacks
         self._job_callbacks: dict[str, tuple[str, int]] = {}
@@ -172,19 +193,13 @@ class ManagerState:
         # Cancellation tracking (AD-20)
         self._cancellation_pending_workflows: dict[str, set[str]] = defaultdict(set)
         self._cancellation_errors: dict[str, list[str]] = defaultdict(list)
-        self._cancellation_completion_events: dict[str, asyncio.Event] = {}
-        self._cancellation_initiated_at: dict[str, float] = {}
-        self._cancelled_workflows: dict[str, CancelledWorkflowInfo] = {}
-        self._workflow_cancellation_locks: dict[str, asyncio.Lock] = {}
-
-        # Workflow lifecycle (AD-33)
-        self._workflow_lifecycle_states: "WorkflowStateMachine | None" = None
-        self._workflow_completion_events: dict[str, asyncio.Event] = {}
+        # Per job: the workflows this manager had workers cancel, with why
+        # (an AD-41 kill's reason is what its failure reports). Dropped
+        # with the job.
+        self._cancelled_workflows: dict[str, dict[str, CancelledWorkflowInfo]] = {}
 
         # Job tracking
         self._job_submissions: dict[str, JobSubmission] = {}
-        self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
-        self._workflow_retries: dict[str, tuple[int, bytes, set[str]]] = {}
         self._job_timeout_strategies: dict[str, "TimeoutStrategy"] = {}
         self._job_aggregated_results: dict[str, list["WorkflowStats"]] = defaultdict(
             list
@@ -215,12 +230,24 @@ class ManagerState:
         self._dispatch_throughput_last_value: float = 0.0
         self._dispatch_failure_count: int = 0
 
-        self._workflow_latency_digest: TimeWindowedTDigest = TimeWindowedTDigest()
+        self._slo_config: SLOConfig = slo_config
+        self._latency_slo: LatencySLO = LatencySLO.from_config(slo_config)
+        # AD-42's latency SLO sample: a workflow dispatch's round trip to
+        # its worker's answer (dispatch -> response), the DC's
+        # responsiveness. A workflow's run time is its workload's design,
+        # minutes for a load test, and says nothing about the DC.
+        self._dispatch_latency_digest: TimeWindowedTDigest = TimeWindowedTDigest(
+            config=slo_config
+        )
+        # The same samples per worker (D-5), for the metrics surface: which
+        # worker is slow to answer. Opened when a worker registers, closed
+        # when it unregisters; a sample for a worker no longer registered
+        # counts only toward the datacenter digest.
+        self._worker_dispatch_latency_digests: dict[str, TimeWindowedTDigest] = {}
 
         # Background tasks
         self._dead_node_reap_task: asyncio.Task | None = None
         self._orphan_scan_task: asyncio.Task | None = None
-        self._discovery_maintenance_task: asyncio.Task | None = None
 
     def initialize_locks(self) -> None:
         self._core_allocation_lock = asyncio.Lock()
@@ -228,7 +255,6 @@ class ManagerState:
         self._counter_lock = asyncio.Lock()
         self._resource_creation_lock = asyncio.Lock()
         self._peer_manager_health_lock = asyncio.Lock()
-        self._provision_lock = asyncio.Lock()
 
     def _get_counter_lock(self) -> asyncio.Lock:
         if self._counter_lock is None:
@@ -239,11 +265,6 @@ class ManagerState:
         if self._resource_creation_lock is None:
             self._resource_creation_lock = asyncio.Lock()
         return self._resource_creation_lock
-
-    def _get_provision_lock(self) -> asyncio.Lock:
-        if self._provision_lock is None:
-            self._provision_lock = asyncio.Lock()
-        return self._provision_lock
 
     async def get_peer_manager_health_lock(self) -> asyncio.Lock:
         async with self._get_resource_creation_lock():
@@ -262,12 +283,6 @@ class ManagerState:
             if gate_id not in self._gate_state_locks:
                 self._gate_state_locks[gate_id] = asyncio.Lock()
             return self._gate_state_locks[gate_id]
-
-    async def get_workflow_cancellation_lock(self, workflow_id: str) -> asyncio.Lock:
-        async with self._get_resource_creation_lock():
-            if workflow_id not in self._workflow_cancellation_locks:
-                self._workflow_cancellation_locks[workflow_id] = asyncio.Lock()
-            return self._workflow_cancellation_locks[workflow_id]
 
     async def get_dispatch_semaphore(
         self, worker_id: str, max_concurrent: int
@@ -312,11 +327,6 @@ class ManagerState:
             self._external_incarnation += 1
             return self._external_incarnation
 
-    async def increment_context_lamport_clock(self) -> int:
-        async with self._get_counter_lock():
-            self._context_lamport_clock += 1
-            return self._context_lamport_clock
-
     def get_active_peer_count(self) -> int:
         """Get count of active manager peers (including self)."""
         return len(self._active_manager_peers) + 1
@@ -339,35 +349,44 @@ class ManagerState:
         """Clear cancellation tracking state for a job."""
         self._cancellation_pending_workflows.pop(job_id, None)
         self._cancellation_errors.pop(job_id, None)
-        self._cancellation_completion_events.pop(job_id, None)
-        self._cancellation_initiated_at.pop(job_id, None)
+
+    def record_job_leader_view(self, job_id: str, fence_token: int, view_time: float, received_at: float) -> None:
+        """A sync from the job's leader brought its view of the job, as of
+        ``view_time`` on the leader's clock, under ``fence_token``. Only a
+        newer view replaces the one held."""
+        held = self._job_leader_views.get(job_id)
+        if held is None or (fence_token, view_time) > (held[0], held[1]):
+            self._job_leader_views[job_id] = (fence_token, view_time, received_at)
+
+    def get_job_leader_view(self, job_id: str) -> tuple[int, float, float] | None:
+        """The newest leader view of ``job_id`` synced here: (fence token,
+        leader's view time, local arrival time)."""
+        return self._job_leader_views.get(job_id)
 
     def clear_job_state(self, job_id: str) -> None:
+        self._job_leader_views.pop(job_id, None)
         self._job_leaders.pop(job_id, None)
         self._job_leader_addrs.pop(job_id, None)
         self._job_fencing_tokens.pop(job_id, None)
-        self._job_layer_version.pop(job_id, None)
-        self._job_contexts.pop(job_id, None)
         self._job_callbacks.pop(job_id, None)
         self._client_callbacks.pop(job_id, None)
         self._job_origin_gates.pop(job_id, None)
         self._progress_callbacks.pop(job_id, None)
         self._job_submissions.pop(job_id, None)
         self._job_gate_routing_fences.pop(job_id, None)
-        prefix_keys = [
-            key for key in self._workflow_result_sequences if key[0] == job_id
-        ]
+        prefix_keys = self._workflow_result_sequence_keys(job_id)
         for key in prefix_keys:
             self._workflow_result_sequences.pop(key, None)
-        reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
-        if reporter_tasks:
-            for task in reporter_tasks.values():
-                if not task.done():
-                    task.cancel()
         self._job_timeout_strategies.pop(job_id, None)
         self._job_aggregated_results.pop(job_id, None)
         self.clear_cancellation_state(job_id)
-        self._workflow_cancellation_locks.pop(job_id, None)
+        self._cancelled_workflows.pop(job_id, None)
+
+    def _workflow_result_sequence_keys(self, job_id: str) -> list[tuple]:
+        """Workflow-result sequence keys prefixed by ``job_id``."""
+        return [
+            key for key in self._workflow_result_sequences if key[0] == job_id
+        ]
 
     def remove_gate_lock(self, gate_id: str) -> None:
         """Remove lock when gate disconnects to prevent memory leak."""
@@ -385,13 +404,17 @@ class ManagerState:
         self._peer_state_epoch.pop(peer_addr, None)
         self._manager_peer_info.pop(peer_addr, None)
         self._recovery_verification_pending.pop(peer_addr, None)
-        stale_udp_addrs = [
+        stale_udp_addrs = self._manager_udp_addrs_mapped_to(peer_addr)
+        for udp_addr in stale_udp_addrs:
+            self._manager_udp_to_tcp.pop(udp_addr, None)
+
+    def _manager_udp_addrs_mapped_to(self, peer_addr: tuple[str, int]) -> list[tuple[str, int]]:
+        """Manager UDP addresses whose UDP->TCP mapping points at ``peer_addr``."""
+        return [
             udp_addr
             for udp_addr, tcp_addr in self._manager_udp_to_tcp.items()
             if tcp_addr == peer_addr
         ]
-        for udp_addr in stale_udp_addrs:
-            self._manager_udp_to_tcp.pop(udp_addr, None)
 
     def remove_peer_latency_samples(self, peer_id: str) -> None:
         """Remove latency sample deque for a peer to prevent memory leak.
@@ -403,6 +426,7 @@ class ManagerState:
     def remove_worker_state(self, worker_id: str) -> None:
         """Remove all state associated with a dead worker to prevent memory leaks."""
         self._worker_latency_samples.pop(worker_id, None)
+        self._worker_dispatch_latency_digests.pop(worker_id, None)
         self._worker_circuits.pop(worker_id, None)
         self._worker_unhealthy_since.pop(worker_id, None)
         self._worker_deadlines.pop(worker_id, None)
@@ -416,14 +440,28 @@ class ManagerState:
         # includes the worker_id (TrackingToken sub-workflow tokens),
         # so substring match is sufficient and avoids a separate
         # workflow→worker reverse index.
-        stale_workflow_ids = [
+        stale_workflow_ids = self._stale_workflow_progress_ids(worker_id)
+        for wf_id in stale_workflow_ids:
+            self._workflow_last_progress_snapshot.pop(wf_id, None)
+
+        progress_keys_to_remove = self._job_progress_keys_for_worker(worker_id)
+        for key in progress_keys_to_remove:
+            self._worker_job_last_progress.pop(key, None)
+        self._dispatch_semaphores.pop(worker_id, None)
+
+    def _stale_workflow_progress_ids(self, worker_id: str) -> list[str]:
+        """Progress-snapshot workflow ids embedding ``worker_id`` (Phase H3 substring match)."""
+        return [
             wf_id
             for wf_id in self._workflow_last_progress_snapshot
             if worker_id in wf_id
         ]
-        for wf_id in stale_workflow_ids:
-            self._workflow_last_progress_snapshot.pop(wf_id, None)
-        self._dispatch_semaphores.pop(worker_id, None)
+
+    def _job_progress_keys_for_worker(self, worker_id: str) -> list[tuple[str, str]]:
+        """The (job_id, worker_id) progress keys recorded for ``worker_id``."""
+        return [
+            key for key in self._worker_job_last_progress if key[1] == worker_id
+        ]
 
     def get_workflow_last_progress_snapshot(
         self, workflow_id: str
@@ -448,19 +486,12 @@ class ManagerState:
         """Drop the per-workflow progress snapshot when the workflow terminates."""
         self._workflow_last_progress_snapshot.pop(workflow_id, None)
 
-        progress_keys_to_remove = [
-            key for key in self._worker_job_last_progress if key[0] == worker_id
-        ]
-        for key in progress_keys_to_remove:
-            self._worker_job_last_progress.pop(key, None)
-
     def get_quorum_metrics(self) -> dict[str, int]:
         """Get quorum-related metrics."""
         return {
             "active_peer_count": len(self._active_manager_peers),
             "known_peer_count": len(self._known_manager_peers),
             "dead_manager_count": len(self._dead_managers),
-            "pending_provision_count": len(self._pending_provisions),
         }
 
     def get_worker_metrics(self) -> dict[str, int]:
@@ -471,7 +502,7 @@ class ManagerState:
             "worker_circuits_count": len(self._worker_circuits),
         }
 
-    def get_gate_metrics(self) -> dict[str, Any]:
+    def get_gate_metrics(self) -> ManagerGateMetrics:
         """Get gate-related metrics."""
         return {
             "known_gate_count": len(self._known_gates),
@@ -486,32 +517,52 @@ class ManagerState:
             "job_leader_count": len(self._job_leaders),
             "job_callback_count": len(self._job_callbacks),
             "job_submission_count": len(self._job_submissions),
-            "cancelled_workflow_count": len(self._cancelled_workflows),
+            "cancelled_workflow_count": sum(
+                len(job_cancelled_workflows)
+                for job_cancelled_workflows in self._cancelled_workflows.values()
+            ),
             "pending_cancellation_count": len(self._cancellation_pending_workflows),
         }
 
-    def record_workflow_latency(self, latency_ms: float) -> None:
-        self._workflow_latency_digest.add(latency_ms)
+    def record_dispatch_latency(self, worker_id: str, latency_ms: float, now: float) -> None:
+        """Record one dispatch round trip to ``worker_id``: the datacenter's
+        AD-42 sample, and the worker's own while it is registered."""
+        self._dispatch_latency_digest.add(latency_ms, now)
+        if (worker_digest := self._worker_dispatch_latency_digests.get(worker_id)) is not None:
+            worker_digest.add(latency_ms, now)
 
-    def get_workflow_latency_observation(self) -> "LatencyObservation | None":
-        return self._workflow_latency_digest.get_recent_observation(
-            target_id="workflows"
+    def get_worker_dispatch_latency_observations(self, now: float) -> dict[str, "LatencyObservation"]:
+        """Each registered worker's dispatch round-trip percentiles over the
+        SLO windows recent at ``now``; a worker with none recent is left out."""
+        return {
+            worker_id: observation
+            for worker_id, worker_digest in self._worker_dispatch_latency_digests.items()
+            if (observation := worker_digest.get_recent_observation(target_id=worker_id, now=now)) is not None
+        }
+
+    def get_dispatch_latency_observation(self, now: float) -> "LatencyObservation | None":
+        return self._dispatch_latency_digest.get_recent_observation(
+            target_id="dispatches",
+            now=now,
         )
 
-    def get_slo_summary(self) -> "SLOSummary":
+    def get_slo_summary(self, now: float) -> "SLOSummary":
         """AD-42 Phase E: build the compact SLOSummary for gossip.
 
-        Returns ``SLOSummary.empty()`` when no workflow latency
+        Returns ``SLOSummary.empty()`` when no dispatch latency
         observations have been recorded yet so receivers see a
         neutral baseline (compliance_score=1.0, routing_factor=1.0)
         until real data flows.
         """
-        from hyperscale.distributed.slo import SLOSummary
 
-        observation = self.get_workflow_latency_observation()
+        observation = self.get_dispatch_latency_observation(now)
         if observation is None:
             return SLOSummary.empty()
-        return SLOSummary.from_observation(observation=observation)
+        return SLOSummary.from_observation(
+            observation=observation,
+            slo=self._latency_slo,
+            config=self._slo_config,
+        )
 
     # =========================================================================
     # Worker Accessors (16 direct accesses)
@@ -604,49 +655,18 @@ class ManagerState:
         return self._job_timeout_strategies.pop(job_id, None)
 
     # =========================================================================
-    # Job Contexts Accessors (7 direct accesses)
-    # =========================================================================
-
-    def get_job_context(self, job_id: str) -> "Context | None":
-        return self._job_contexts.get(job_id)
-
-    def set_job_context(self, job_id: str, context: "Context") -> None:
-        self._job_contexts[job_id] = context
-
-    def has_job_context(self, job_id: str) -> bool:
-        return job_id in self._job_contexts
-
-    def get_or_create_job_context(self, job_id: str) -> "Context":
-        """Get existing job context or create a new one if it doesn't exist."""
-        context = self._job_contexts.get(job_id)
-        if context is None:
-            # ``Context`` is a TYPE_CHECKING-only import at module
-            # scope to avoid a circular import; instantiate via a
-            # runtime local import. The class is small and the
-            # import is cached on first call.
-            from hyperscale.core.state.context import Context
-
-            context = Context()
-            self._job_contexts[job_id] = context
-        return context
-
-    # =========================================================================
     # Cancelled Workflows Accessors (7 direct accesses)
     # =========================================================================
 
-    def get_cancelled_workflow(self, workflow_id: str) -> CancelledWorkflowInfo | None:
-        return self._cancelled_workflows.get(workflow_id)
+    def get_cancelled_workflow(
+        self, job_id: str, workflow_id: str
+    ) -> CancelledWorkflowInfo | None:
+        return self._cancelled_workflows.get(job_id, {}).get(workflow_id)
 
     def set_cancelled_workflow(
-        self, workflow_id: str, info: CancelledWorkflowInfo
+        self, job_id: str, workflow_id: str, info: CancelledWorkflowInfo
     ) -> None:
-        self._cancelled_workflows[workflow_id] = info
-
-    def has_cancelled_workflow(self, workflow_id: str) -> bool:
-        return workflow_id in self._cancelled_workflows
-
-    def iter_cancelled_workflows(self) -> list[tuple[str, CancelledWorkflowInfo]]:
-        return list(self._cancelled_workflows.items())
+        self._cancelled_workflows.setdefault(job_id, {})[workflow_id] = info
 
     # =========================================================================
     # Known Manager Peers Accessors (6 direct accesses)
@@ -736,30 +756,14 @@ class ManagerState:
         leader_id: str,
         leader_addr: tuple[str, int],
         fencing_token: int,
-        layer_version: int | None = None,
     ) -> bool:
         """Apply a fenced job-leadership claim to manager-visible state."""
-        current_token = self._job_fencing_tokens.get(job_id)
-        current_leader = self._job_leaders.get(job_id)
-        accepts_newer_token = current_token is None or fencing_token > current_token
-        accepts_idempotent_claim = (
-            current_token == fencing_token
-            and (current_leader is None or current_leader == leader_id)
-        )
-
-        if not accepts_newer_token and not accepts_idempotent_claim:
+        if not self._accepts_job_leadership_claim(job_id, leader_id, fencing_token):
             return False
 
         self._job_leaders[job_id] = leader_id
         self._job_leader_addrs[job_id] = leader_addr
         self._job_fencing_tokens[job_id] = fencing_token
-
-        if layer_version is not None:
-            current_layer_version = self._job_layer_version.get(job_id, 0)
-            if layer_version > current_layer_version:
-                self._job_layer_version[job_id] = layer_version
-        else:
-            self._job_layer_version.setdefault(job_id, 0)
 
         return True
 
@@ -807,6 +811,44 @@ class ManagerState:
 
     def iter_worker_deadlines(self) -> list[tuple[str, float]]:
         return list(self._worker_deadlines.items())
+
+    # =========================================================================
+    # Worker Eviction Notice Accessors (two-sided deregistration)
+    # =========================================================================
+
+    def record_eviction_notice(
+        self, notice_state: WorkerEvictionNoticeState
+    ) -> None:
+        """Record the obligation to notify a deregistered worker.
+
+        Bounded: on overflow the oldest outstanding obligation is
+        dropped so a stream of never-returning workers cannot grow the
+        map without limit.
+        """
+        if (
+            notice_state.worker_id not in self._evicted_worker_notices
+            and len(self._evicted_worker_notices) >= _MAX_EVICTION_NOTICES
+        ):
+            oldest_worker_id = min(
+                self._evicted_worker_notices,
+                key=lambda worker_id: self._evicted_worker_notices[
+                    worker_id
+                ].evicted_at,
+            )
+            self._evicted_worker_notices.pop(oldest_worker_id, None)
+        self._evicted_worker_notices[notice_state.worker_id] = notice_state
+
+    def clear_eviction_notice(self, worker_id: str) -> None:
+        """Discharge the notice obligation (worker acked or re-registered)."""
+        self._evicted_worker_notices.pop(worker_id, None)
+
+    def get_eviction_notice(
+        self, worker_id: str
+    ) -> WorkerEvictionNoticeState | None:
+        return self._evicted_worker_notices.get(worker_id)
+
+    def iter_eviction_notices(self) -> list[WorkerEvictionNoticeState]:
+        return list(self._evicted_worker_notices.values())
 
     # =========================================================================
     # Manager Peer Health Accessors (5 direct accesses)
@@ -925,24 +967,6 @@ class ManagerState:
         return new_value
 
     # =========================================================================
-    # Job Layer Version Accessors (4 direct accesses)
-    # =========================================================================
-
-    def get_job_layer_version(self, job_id: str, default: int = 0) -> int:
-        return self._job_layer_version.get(job_id, default)
-
-    def set_job_layer_version(self, job_id: str, version: int) -> None:
-        self._job_layer_version[job_id] = version
-
-    def setdefault_job_layer_version(self, job_id: str, default: int = 0) -> int:
-        return self._job_layer_version.setdefault(job_id, default)
-
-    def increment_job_layer_version(self, job_id: str) -> int:
-        current = self._job_layer_version.get(job_id, 0)
-        self._job_layer_version[job_id] = current + 1
-        return current + 1
-
-    # =========================================================================
     # Gate UDP to TCP Mapping Accessors (4 direct accesses)
     # =========================================================================
 
@@ -1010,12 +1034,45 @@ class ManagerState:
             self._dispatch_failure_count += 1
             return self._dispatch_failure_count
 
+    def _accepts_job_leadership_claim(
+        self,
+        job_id: str,
+        leader_id: str,
+        fencing_token: int,
+    ) -> bool:
+        """A strictly newer fence token, or the same token from the same (or no) leader."""
+        current_token = self._job_fencing_tokens.get(job_id)
+        current_leader = self._job_leaders.get(job_id)
+        accepts_newer_token = current_token is None or fencing_token > current_token
+        accepts_idempotent_claim = self._is_idempotent_leadership_claim(
+            current_token, current_leader, fencing_token, leader_id
+        )
+        return accepts_newer_token or accepts_idempotent_claim
+
+    @staticmethod
+    def _is_idempotent_leadership_claim(
+        current_token: int | None,
+        current_leader: str | None,
+        fencing_token: int,
+        leader_id: str,
+    ) -> bool:
+        """The same fence token re-claimed by the current (or an unset) leader."""
+        return (
+            current_token == fencing_token
+            and (current_leader is None or current_leader == leader_id)
+        )
+
+    @staticmethod
+    def _dispatch_throughput_now(now: float | None) -> float:
+        """The caller's timestamp, else the running loop's clock."""
+        return now if now is not None else asyncio.get_running_loop().time()
+
     async def update_dispatch_throughput(
         self,
         interval_seconds: float,
         now: float | None = None,
     ) -> float:
-        current_time = now if now is not None else asyncio.get_running_loop().time()
+        current_time = self._dispatch_throughput_now(now)
         async with self._get_counter_lock():
             elapsed = current_time - self._dispatch_throughput_interval_start
             if elapsed >= interval_seconds and elapsed > 0:
@@ -1041,63 +1098,6 @@ class ManagerState:
     @property
     def dispatch_throughput_last_value(self) -> float:
         return self._dispatch_throughput_last_value
-
-    # =========================================================================
-    # Workflow Retries Accessors (2 direct accesses)
-    # =========================================================================
-
-    def get_workflow_retry(
-        self, workflow_id: str
-    ) -> tuple[int, bytes, set[str]] | None:
-        return self._workflow_retries.get(workflow_id)
-
-    def set_workflow_retry(
-        self, workflow_id: str, retry_data: tuple[int, bytes, set[str]]
-    ) -> None:
-        self._workflow_retries[workflow_id] = retry_data
-
-    def remove_workflow_retry(self, workflow_id: str) -> None:
-        self._workflow_retries.pop(workflow_id, None)
-
-    def iter_workflow_retries_for_job(
-        self, job_id: str
-    ) -> list[tuple[str, tuple[int, bytes, set[str]]]]:
-        return [
-            (wf_id, data)
-            for wf_id, data in self._workflow_retries.items()
-            if wf_id.startswith(f"{job_id}:")
-        ]
-
-    # =========================================================================
-    # Workflow Completion Events Accessors (2 direct accesses)
-    # =========================================================================
-
-    def get_workflow_completion_event(self, workflow_id: str) -> asyncio.Event | None:
-        return self._workflow_completion_events.get(workflow_id)
-
-    def set_workflow_completion_event(
-        self, workflow_id: str, event: asyncio.Event
-    ) -> None:
-        self._workflow_completion_events[workflow_id] = event
-
-    def remove_workflow_completion_event(self, workflow_id: str) -> None:
-        self._workflow_completion_events.pop(workflow_id, None)
-
-    def remove_workflow_completion_events_for_job(self, job_id: str) -> None:
-        workflow_ids_to_remove = [
-            wf_id
-            for wf_id in self._workflow_completion_events
-            if wf_id.startswith(f"{job_id}:")
-        ]
-        for wf_id in workflow_ids_to_remove:
-            self._workflow_completion_events.pop(wf_id, None)
-
-    def remove_workflow_retries_for_job(self, job_id: str) -> None:
-        workflow_ids_to_remove = [
-            wf_id for wf_id in self._workflow_retries if wf_id.startswith(f"{job_id}:")
-        ]
-        for wf_id in workflow_ids_to_remove:
-            self._workflow_retries.pop(wf_id, None)
 
     # =========================================================================
     # Progress Callbacks Accessors (2 direct accesses)
@@ -1145,22 +1145,6 @@ class ManagerState:
     def iter_job_submissions(self) -> list[tuple[str, JobSubmission]]:
         return list(self._job_submissions.items())
 
-    def set_job_reporter_task(
-        self, job_id: str, reporter_type: str, task: asyncio.Task
-    ) -> None:
-        self._job_reporter_tasks.setdefault(job_id, {})[reporter_type] = task
-
-    def get_job_reporter_tasks(self, job_id: str) -> dict[str, asyncio.Task] | None:
-        return self._job_reporter_tasks.get(job_id)
-
-    def remove_job_reporter_task(self, job_id: str, reporter_type: str) -> None:
-        job_tasks = self._job_reporter_tasks.get(job_id)
-        if not job_tasks:
-            return
-        job_tasks.pop(reporter_type, None)
-        if not job_tasks:
-            self._job_reporter_tasks.pop(job_id, None)
-
     # =========================================================================
     # Healthy Gate IDs Accessors (2 direct accesses)
     # =========================================================================
@@ -1201,32 +1185,8 @@ class ManagerState:
     def add_cancellation_error(self, job_id: str, error: str) -> None:
         self._cancellation_errors[job_id].append(error)
 
-    def get_cancellation_completion_event(self, job_id: str) -> asyncio.Event | None:
-        return self._cancellation_completion_events.get(job_id)
-
-    def set_cancellation_completion_event(
-        self, job_id: str, event: asyncio.Event
-    ) -> None:
-        self._cancellation_completion_events[job_id] = event
-
-    def get_cancellation_initiated_at(self, job_id: str) -> float | None:
-        return self._cancellation_initiated_at.get(job_id)
-
-    def set_cancellation_initiated_at(self, job_id: str, timestamp: float) -> None:
-        self._cancellation_initiated_at[job_id] = timestamp
-
-    def clear_cancellation_initiated_at(self, job_id: str) -> None:
-        self._cancellation_initiated_at.pop(job_id, None)
-
     def clear_cancellation_pending_workflows(self, job_id: str) -> None:
         self._cancellation_pending_workflows.pop(job_id, None)
-
-    def clear_cancellation_completion_events(self, job_id: str) -> None:
-        self._cancellation_completion_events.pop(job_id, None)
-
-    # =========================================================================
-    # Single-Access Field Accessors
-    # =========================================================================
 
     def get_manager_peer_unhealthy_since(self, peer_id: str) -> float | None:
         return self._manager_peer_unhealthy_since.get(peer_id)

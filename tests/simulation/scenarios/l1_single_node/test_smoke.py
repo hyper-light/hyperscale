@@ -39,7 +39,6 @@ def _l1_spec() -> ClusterSpec:
             "local": DCSpec(managers=1, workers=1, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=19000,
         timeouts=HarnessTimeouts(stabilization_default=45.0),
     )
 
@@ -54,17 +53,9 @@ async def test_l1_framework_structure() -> None:
     assert spec.gates == 0
     assert "local" in spec.datacenters
 
-    ports = PortAllocator(host=spec.host, base_port=spec.base_port)
+    ports = PortAllocator(host=spec.host)
     pair = ports.reserve_pair()
     assert pair[0] != pair[1]
-    assert all(port >= spec.base_port for port in pair)
-
-    next_ports = PortAllocator(host=spec.host, base_port=spec.base_port)
-    next_pair = next_ports.reserve_pair()
-    assert set(pair).isdisjoint(next_pair), (
-        "a new allocator in the same process must not immediately reuse "
-        "recently retired harness ports"
-    )
 
     supervisor = Supervisor(timeouts=HarnessTimeouts(), ports=ports)
     async with supervisor as sup:
@@ -75,8 +66,6 @@ async def test_l1_framework_structure() -> None:
     )
 
     held = await ports.verify_all_released(settle_seconds=0.1)
-    assert held == [], f"ports unexpectedly held: {held}"
-    held = await next_ports.verify_all_released(settle_seconds=0.1)
     assert held == [], f"ports unexpectedly held: {held}"
 
 

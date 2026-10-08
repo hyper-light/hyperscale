@@ -1,14 +1,12 @@
 """
 Worker discovery service manager (AD-28).
 
-Handles discovery service integration and maintenance loop
-for adaptive peer selection and DNS-based discovery.
+Handles discovery service integration for adaptive peer selection; the
+discovery maintenance (DNS, failure decay) runs in the worker's
+background loops.
 """
 
-import asyncio
 from typing import TYPE_CHECKING
-
-from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 if TYPE_CHECKING:
     from hyperscale.distributed.discovery import DiscoveryService
@@ -27,7 +25,6 @@ class WorkerDiscoveryManager:
         self,
         discovery_service: "DiscoveryService",
         logger: "Logger",
-        failure_decay_interval: float = 60.0,
     ) -> None:
         """
         Initialize discovery manager.
@@ -35,100 +32,40 @@ class WorkerDiscoveryManager:
         Args:
             discovery_service: DiscoveryService instance for peer selection
             logger: Logger instance for logging
-            failure_decay_interval: Interval for decaying failure counts
         """
         self._discovery_service: "DiscoveryService" = discovery_service
         self._logger: "Logger" = logger
-        self._failure_decay_interval: float = failure_decay_interval
-        self._running: bool = False
-
-    async def run_maintenance_loop(self) -> None:
-        """
-        Background loop for discovery service maintenance (AD-28).
-
-        Periodically:
-        - Runs DNS discovery for new managers
-        - Decays failure counts to allow recovery
-        - Cleans up expired DNS cache entries
-        """
-        self._running = True
-        while self._running:
-            try:
-                await asyncio.sleep(self._failure_decay_interval)
-
-                # Decay failure counts to allow peers to recover
-                self._discovery_service.decay_failures()
-
-                # Clean up expired DNS cache entries
-                self._discovery_service.cleanup_expired_dns()
-
-                # Optionally discover new peers via DNS (if configured)
-                if self._discovery_service.config.dns_names:
-                    await self._discovery_service.discover_peers()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as maintenance_error:
-                dns_names = (
-                    self._discovery_service.config.dns_names
-                    if self._discovery_service.config
-                    else []
-                )
-                await self._logger.log(
-                    ServerWarning(
-                        message=(
-                            f"Discovery maintenance loop error: {maintenance_error} "
-                            f"(dns_names={dns_names}, decay_interval={self._failure_decay_interval}s)"
-                        ),
-                        node_host="worker",
-                        node_port=0,
-                        node_id="discovery",
-                    )
-                )
-
-    def stop(self) -> None:
-        """Stop the maintenance loop."""
-        self._running = False
 
     def select_best_manager(
         self,
         key: str,
         healthy_manager_ids: set[str],
-    ) -> tuple[str, int] | None:
+    ) -> str | None:
         """
-        Select the best manager for a given key using adaptive selection (AD-28).
+        Select a manager for ``key`` using adaptive selection (AD-28).
 
-        Uses Power of Two Choices with EWMA for load-aware selection,
-        with locality preferences if configured.
+        Weighted rendezvous ranking, then Power of Two Choices on EWMA
+        latency, restricted to ``healthy_manager_ids``. Discovery peers are
+        keyed by manager node id (registration adds them that way).
 
         Args:
-            key: Key for consistent selection (e.g., workflow_id)
-            healthy_manager_ids: Set of healthy manager IDs to consider
+            key: Rendezvous key (the worker's own node id spreads workers
+                across managers deterministically)
+            healthy_manager_ids: Manager node ids eligible for selection
 
         Returns:
-            Tuple of (host, port) for the selected manager, or None if unavailable
+            The selected manager node id, or None if none is eligible
         """
+        selection = self._discovery_service.select_peer_with_filter(
+            key,
+            healthy_manager_ids.__contains__,
+        )
+        return selection.peer_id if selection is not None else None
 
-        def is_healthy(peer_id: str) -> bool:
-            return peer_id in healthy_manager_ids
+    def record_success(self, manager_id: str, latency_ms: float) -> None:
+        """Feed a successful round trip into the manager's EWMA latency."""
+        self._discovery_service.record_success(manager_id, latency_ms)
 
-        selection = self._discovery_service.select_peer_with_filter(key, is_healthy)
-        if not selection:
-            return None
-
-        # Parse host:port from selection
-        if ":" in selection:
-            host, port_str = selection.rsplit(":", 1)
-            return (host, int(port_str))
-
-        return None
-
-    def record_success(self, peer_addr: tuple[str, int]) -> None:
-        """Record a successful interaction with a peer."""
-        peer_id = f"{peer_addr[0]}:{peer_addr[1]}"
-        self._discovery_service.record_success(peer_id)
-
-    def record_failure(self, peer_addr: tuple[str, int]) -> None:
-        """Record a failed interaction with a peer."""
-        peer_id = f"{peer_addr[0]}:{peer_addr[1]}"
-        self._discovery_service.record_failure(peer_id)
+    def record_failure(self, manager_id: str) -> None:
+        """Record a failed interaction with a manager."""
+        self._discovery_service.record_failure(manager_id)

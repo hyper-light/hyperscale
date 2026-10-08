@@ -94,7 +94,6 @@ def _l1_spec() -> ClusterSpec:
             "local": DCSpec(managers=1, workers=1, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=19500,
         timeouts=HarnessTimeouts(stabilization_default=45.0),
     )
 

@@ -11,10 +11,10 @@ Tests the full consensus lifecycle:
 """
 
 import asyncio
-import time
 from collections import defaultdict
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+from hyperscale.distributed.raft.store.volatile_raft_storage import VolatileRaftStorage
 from hyperscale.distributed.raft.models import (
     AppendEntries,
     AppendEntriesResponse,
@@ -22,6 +22,7 @@ from hyperscale.distributed.raft.models import (
     RequestVoteResponse,
 )
 from hyperscale.distributed.raft.raft_node import RaftNode
+from tests.unit.distributed.hlc.hlc_factory import new_hybrid_logical_clock
 
 
 class MockNetwork:
@@ -136,18 +137,20 @@ def create_cluster(
     nodes: dict[str, RaftNode] = {}
     for node_id in node_ids:
         logger_mock = MagicMock()
-        logger_mock.log = MagicMock(return_value=asyncio.coroutine(lambda: None)())
+        logger_mock.log = AsyncMock()
 
         node = RaftNode(
+            clock=new_hybrid_logical_clock(),
+            may_lead=lambda: True,
             job_id="job-1",
             node_id=node_id,
-            members=members,
+            initial_voters=frozenset(members),
             member_addrs=member_addrs,
             send_message=network.make_send_callback(node_id),
             apply_command=network.make_apply_callback(node_id),
             on_become_leader=None,
             on_lose_leadership=None,
-            logger=logger_mock,
+            logger=logger_mock, storage=VolatileRaftStorage()
         )
         addr = member_addrs[node_id]
         network.add_node(node_id, addr, node)
@@ -167,6 +170,24 @@ def find_leader(nodes: dict[str, RaftNode]) -> str | None:
 def count_role(nodes: dict[str, RaftNode], role: str) -> int:
     """Count nodes with a given role."""
     return sum(1 for node in nodes.values() if node.role == role)
+
+
+async def propose_with_delivery(
+    network: MockNetwork,
+    leader: RaftNode,
+    command: bytes,
+) -> tuple[bool, int]:
+    """Propose on ``leader`` while the network delivers its replication.
+
+    ``propose`` resolves only once the entry commits, which needs the
+    followers' AppendEntries responses -- so delivery must run while the
+    proposal is pending.
+    """
+    proposal = asyncio.ensure_future(leader.propose(command, "CREATE_JOB"))
+    while not proposal.done():
+        await network.deliver_all_messages()
+        await asyncio.sleep(0)
+    return proposal.result()
 
 
 # =============================================================================
@@ -198,20 +219,17 @@ async def test_log_replication() -> None:
     await network.deliver_all_messages()
     await network.deliver_all_messages()
     assert nodes["node-1"].is_leader()
+    # The new leader opens its term with its own entry (Raft 5.4.2/8)
+    term_start_index = nodes["node-1"].last_log_index
+    assert term_start_index == 1
 
-    # Propose a command
-    success, index = await nodes["node-1"].propose(b"command-1", "CREATE_JOB")
+    # Propose a command: it replicates and commits before resolving
+    success, index = await propose_with_delivery(network, nodes["node-1"], b"command-1")
     assert success is True
-    assert index == 1
-
-    # Replicate to followers
-    await nodes["node-1"].replicate_to_followers()
-    await network.deliver_all_messages()
-    # Deliver AppendEntries responses
-    await network.deliver_all_messages()
+    assert index == term_start_index + 1
 
     # Leader should have advanced commit
-    assert nodes["node-1"].commit_index == 1
+    assert nodes["node-1"].commit_index == index
 
 
 async def test_follower_applies_committed_entries() -> None:
@@ -223,24 +241,19 @@ async def test_follower_applies_committed_entries() -> None:
     await network.deliver_all_messages()
     await network.deliver_all_messages()
 
-    await nodes["node-1"].propose(b"cmd-1", "CREATE_JOB")
-    await nodes["node-1"].replicate_to_followers()
-    await network.deliver_all_messages()
-    await network.deliver_all_messages()
+    _, index = await propose_with_delivery(network, nodes["node-1"], b"cmd-1")
 
     # Leader sends another heartbeat with updated commit index
     await nodes["node-1"].replicate_to_followers()
     await network.deliver_all_messages()
     await network.deliver_all_messages()
 
-    # Followers should now have commit_index = 1
+    # Followers apply the entry the moment they learn it committed: no
+    # separate apply pass is needed, and none finds anything left over
     for node_id in ["node-2", "node-3"]:
-        assert nodes[node_id].commit_index == 1
-
-    # Apply on followers
-    for node_id in ["node-2", "node-3"]:
-        applied = await nodes[node_id].apply_committed_entries()
-        assert applied == 1
+        assert nodes[node_id].commit_index == index
+        assert [entry.command for entry in network._applied_entries[node_id]] == [b"cmd-1"]
+        assert await nodes[node_id].apply_committed_entries() == 0
 
 
 async def test_multiple_proposals() -> None:
@@ -250,24 +263,22 @@ async def test_multiple_proposals() -> None:
     await nodes["node-1"].start_election()
     await network.deliver_all_messages()
     await network.deliver_all_messages()
+    # The new leader opens its term with its own entry (Raft 5.4.2/8)
+    term_start_index = nodes["node-1"].last_log_index
 
     # Propose 5 commands
     for idx in range(5):
-        success, _ = await nodes["node-1"].propose(
-            f"cmd-{idx}".encode(), "CREATE_JOB"
+        success, _ = await propose_with_delivery(
+            network, nodes["node-1"], f"cmd-{idx}".encode()
         )
         assert success is True
 
-    # Replicate and deliver
-    await nodes["node-1"].replicate_to_followers()
-    await network.deliver_all_messages()
-    await network.deliver_all_messages()
+    assert nodes["node-1"].commit_index == term_start_index + 5
 
-    assert nodes["node-1"].commit_index == 5
-
-    # Apply on leader
-    applied = await nodes["node-1"].apply_committed_entries()
-    assert applied == 5
+    # The leader applied each entry in order as it committed
+    assert [entry.command for entry in network._applied_entries["node-1"]] == [
+        f"cmd-{idx}".encode() for idx in range(5)
+    ]
 
 
 async def test_step_down_on_higher_term() -> None:
@@ -341,39 +352,15 @@ async def test_single_node_consensus() -> None:
     await nodes["solo"].start_election()
     assert nodes["solo"].is_leader()
     assert nodes["solo"].current_term == 1
+    # The new leader opens its term with its own entry (Raft 5.4.2/8)
+    term_start_index = nodes["solo"].last_log_index
 
     success, index = await nodes["solo"].propose(b"cmd", "CREATE_JOB")
     assert success is True
-    assert index == 1
+    assert index == term_start_index + 1
+    assert nodes["solo"].commit_index == index
 
-    # Single node commits immediately (quorum = 1)
-    applied = await nodes["solo"].apply_committed_entries()
-    assert applied == 1
+    # Single node commits and applies within the proposal (quorum = 1)
+    assert [entry.command for entry in network._applied_entries["solo"]] == [b"cmd"]
+    assert await nodes["solo"].apply_committed_entries() == 0
 
-
-if __name__ == "__main__":
-    print("Running Raft consensus integration tests...")
-
-    tests = [
-        ("Leader election (3 nodes)", test_leader_election_three_nodes),
-        ("Log replication", test_log_replication),
-        ("Follower applies committed", test_follower_applies_committed_entries),
-        ("Multiple proposals", test_multiple_proposals),
-        ("Step down on higher term", test_step_down_on_higher_term),
-        ("Re-election after leader loss", test_re_election_after_leader_loss),
-        ("Cleanup releases state", test_cleanup_releases_all_state),
-        ("Single node consensus", test_single_node_consensus),
-    ]
-
-    passed = 0
-    failed = 0
-    for name, test_func in tests:
-        try:
-            asyncio.run(test_func())
-            print(f"  PASS: {name}")
-            passed += 1
-        except Exception as error:
-            print(f"  FAIL: {name} -- {error}")
-            failed += 1
-
-    print(f"\nResults: {passed} passed, {failed} failed out of {len(tests)} tests")

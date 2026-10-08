@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import itertools
 from typing import (
-    Any,
     Optional,
 )
 
@@ -58,7 +57,7 @@ class Spinner:
     def size(self):
         return self._base_size
 
-    async def update(self, _: Any):
+    async def update(self, _: object):
         pass
 
     async def fit(
@@ -99,13 +98,13 @@ class Spinner:
         pass
 
     async def stop(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()
 
         await self.ok()
 
     async def abort(self):
-        if self._update_lock.locked():
+        if self._update_lock is not None and self._update_lock.locked():
             self._update_lock.release()
 
         await self.fail()

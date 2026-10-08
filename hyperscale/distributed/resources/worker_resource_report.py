@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from time import monotonic
 
 from hyperscale.distributed.resources.resource_metrics import ResourceMetrics
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -16,8 +20,8 @@ class WorkerResourceReport:
     total_system_memory_bytes: int = 0
     total_system_cpu_count: int = 0
     version: int = 0
-    timestamp_monotonic: float = field(default_factory=monotonic)
+    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
     def is_stale(self, max_age_seconds: float = 30.0) -> bool:
         """Return True if this report is older than max_age_seconds."""
-        return (monotonic() - self.timestamp_monotonic) > max_age_seconds
+        return (_DEFAULT_CLOCK.monotonic() - self.timestamp_monotonic) > max_age_seconds

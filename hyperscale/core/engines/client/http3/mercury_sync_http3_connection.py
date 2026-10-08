@@ -2,7 +2,7 @@ import asyncio
 import base64
 import ssl
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from typing import (
     Dict,
     Iterator,
@@ -40,7 +40,7 @@ from hyperscale.core.engines.client.shared.models import (
     HTTPEncodableValue,
     URLMetadata,
 )
-from hyperscale.core.engines.client.shared.protocols import NEW_LINE
+from hyperscale.core.engines.client.shared.models.url import DEFAULT_PORTS
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.testing.models import (
     URL,
@@ -62,14 +62,16 @@ class MercurySyncHTTP3Connection:
     def __init__(
         self,
         pool_size: Optional[int] = None,
-        timeouts: Timeouts = Timeouts(),
+        timeouts: Timeouts | None = None,
         reset_connections: bool = False,
     ) -> None:
         if pool_size is None:
             pool_size = 100
 
         self._concurrency = pool_size
-        self.timeouts = timeouts
+        # Each engine gets its own Timeouts: a default argument would be one
+        # instance shared by every engine built without timeouts.
+        self.timeouts = timeouts if timeouts is not None else Timeouts()
         self.reset_connections = reset_connections
 
         self._client_ssl_context: Optional[ssl.SSLContext] = None
@@ -423,38 +425,25 @@ class MercurySyncHTTP3Connection:
 
     async def _optimize_url(self, url: URL):
         try:
-            upgrade_ssl: bool = False
             if url:
                 (
                     _,
                     connection,
-                    url,
-                    upgrade_ssl,
+                    optimized_url,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
+                    self._connect_to_url_location(None, url),
+                    timeout=self.timeouts.request_timeout,
                 )
 
+                connection.reset()
                 self._connections.append(connection)
 
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
+            # Plain-string requests for the same address reuse this lookup:
+            # the resolved URL, under the key the connect path reads. One
+            # that never resolved is left for the connect path to look up.
+            if optimized_url.ip_addresses:
+                self._url_cache[optimized_url.target] = optimized_url
 
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                self._connections.append(connection)
-
-            self._url_cache[url.optimized.hostname] = url
             self._optimized[url.call_name] = url
 
         except Exception:
@@ -509,23 +498,10 @@ class MercurySyncHTTP3Connection:
         if redirect and (
             location := result.headers.get(b'location')
         ):
-            location = location.decode()
-
-            upgrade_ssl = False
-
-            if "http" not in location and "https" not in location:
-                parsed_url: ParseResult = urlparse(url)
-
-                if parsed_url.params:
-                    location += parsed_url.params
-
-                location = urljoin(
-                    f'{parsed_url.scheme}://{parsed_url.hostname}',
-                    location
-                )
-
-            if "https" in location and "https" not in url:
-                upgrade_ssl = True
+            # Each location resolves against the address it came from (RFC
+            # 3986: absolute, host-relative and path-relative alike).
+            previous_location = url.data if isinstance(url, URL) else url
+            location = urljoin(previous_location, location.decode())
 
             for _ in range(redirects):
                 result, redirect, timings = await self._execute(
@@ -536,7 +512,6 @@ class MercurySyncHTTP3Connection:
                     headers=headers,
                     params=params,
                     data=data,
-                    upgrade_ssl=upgrade_ssl,
                     redirect_url=location,
                     timings=timings,
                 )
@@ -544,11 +519,11 @@ class MercurySyncHTTP3Connection:
                 if redirect is False:
                     break
 
-                location = result.headers.get(b"location").decode()
+                if (next_location := result.headers.get(b"location")) is None:
+                    break
 
-                upgrade_ssl = False
-                if "https" in location and "https" not in url:
-                    upgrade_ssl = True
+                previous_location = location
+                location = urljoin(previous_location, next_location.decode())
 
         timings["request_end"] = time.monotonic()
         result.timings.update(timings)
@@ -564,7 +539,6 @@ class MercurySyncHTTP3Connection:
         headers: Optional[Dict[str, str] | Headers] = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         data: Optional[str | BaseModel | tuple | dict | list | Data] = None,
-        upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
             Literal[
@@ -599,38 +573,26 @@ class MercurySyncHTTP3Connection:
         if redirect_url:
             request_url = redirect_url
 
+        connection: HTTP3Connection | None = None
+
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
-            (error, connection, url, upgrade_ssl) = await asyncio.wait_for(
+            (error, connection, url) = await asyncio.wait_for(
                 self._connect_to_url_location(
-                    request_url, 
-                    ssl_redirect_url=request_url if upgrade_ssl else None,
+                    connection,
+                    request_url,
                 ),
-                timeout=self.timeouts.connect_timeout,
+                timeout=self.timeouts.request_timeout,
             )
 
-            if upgrade_ssl:
-                ssl_redirect_url = request_url.replace("http://", "https://")
-
-                (error, connection, url, _) = await asyncio.wait_for(
-                    self._connect_to_url_location(
-                        request_url, 
-                        ssl_redirect_url=ssl_redirect_url,
-                    ),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                request_url = ssl_redirect_url
-
-            if connection.protocol is None or error:
+            if error or connection is None or connection.protocol is None:
                 timings["connect_end"] = time.monotonic()
-                self._connections.append(
-                    HTTP3Connection(
-                        reset_connections=self.reset_connections,
-                    )
-                )
+
+                if connection:
+                    connection.reset()
+                    self._connections.append(connection)
 
                 return (
                     HTTP3Response(
@@ -662,6 +624,7 @@ class MercurySyncHTTP3Connection:
                 auth=auth,
                 params=params,
                 headers=headers,
+                cookies=cookies,
             )
 
             encoder, frame_data = connection.protocol.encoder.encode(
@@ -675,6 +638,12 @@ class MercurySyncHTTP3Connection:
                 encoder,
             )
 
+            # The body as sent, encoded ahead of the headers: a request with
+            # none -- no data, or data that encodes to nothing -- ends its
+            # stream on HEADERS, and data that is falsy but encodes to bytes
+            # ({} or []) is sent like any other.
+            encoded_data = self._encode_data(data) if data is not None else None
+
             # update state and send headers
             if stream.headers_send_state == HeadersState.INITIAL:
                 stream.headers_send_state = HeadersState.AFTER_HEADERS
@@ -684,15 +653,13 @@ class MercurySyncHTTP3Connection:
             connection.protocol.quic.send_stream_data(
                 stream_id,
                 encode_frame(FrameType.HEADERS, frame_data),
-                end_stream=not data,
+                end_stream=not encoded_data,
             )
 
-            if data:
+            if encoded_data:
                 stream = connection.protocol.get_or_create_stream(stream_id)
                 if stream.headers_send_state != HeadersState.AFTER_HEADERS:
                     raise Exception("DATA frame is not allowed in this state")
-
-                encoded_data = self._encode_data(data)
 
                 connection.protocol.quic.send_stream_data(
                     stream_id,
@@ -704,7 +671,6 @@ class MercurySyncHTTP3Connection:
                 )
 
             waiter = connection.protocol.loop.create_future()
-            connection.protocol.request_events[stream_id] = deque()
             connection.protocol._request_waiter[stream_id] = waiter
             connection.protocol.transmit()
 
@@ -722,6 +688,10 @@ class MercurySyncHTTP3Connection:
             headers: Dict[str, Union[bytes, int]] = {}
             for header_key, header_value in response_frames.headers_frame.headers:
                 headers[header_key] = header_value
+
+            trailers: Dict[bytes, bytes] | None = None
+            if (trailers_frame := response_frames.trailers_frame) is not None:
+                trailers = dict(trailers_frame.headers)
 
             status = int(headers.get(b":status", b"400"))
 
@@ -746,6 +716,7 @@ class MercurySyncHTTP3Connection:
                         method=method,
                         status=status,
                         headers=headers,
+                        trailers=trailers,
                         timings=timings,
                     ),
                     True,
@@ -768,6 +739,7 @@ class MercurySyncHTTP3Connection:
                     method=method,
                     status=status,
                     headers=headers,
+                    trailers=trailers,
                     content=response_frames.body,
                     timings=timings,
                 ),
@@ -775,10 +747,13 @@ class MercurySyncHTTP3Connection:
                 timings,
             )
 
-        except Exception as request_exception:
-            self._connections.append(
-                HTTP3Connection(reset_connections=self.reset_connections)
-            )
+        except (
+            BaseException,
+            Exception,
+        ) as request_exception:
+            if connection:
+                connection.reset()
+                self._connections.append(connection)
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -801,7 +776,12 @@ class MercurySyncHTTP3Connection:
                     ),
                     method=method,
                     status=400,
-                    status_message=str(request_exception),
+                    # A TimeoutError's own message is empty.
+                    status_message=(
+                        "Request timed out."
+                        if isinstance(request_exception, asyncio.TimeoutError)
+                        else str(request_exception)
+                    ),
                     timings=timings,
                 ),
                 False,
@@ -810,99 +790,104 @@ class MercurySyncHTTP3Connection:
 
     async def _connect_to_url_location(
         self,
+        connection: HTTP3Connection | None,
         request_url: str | URL,
-        ssl_redirect_url: Optional[str] = None,
     ) -> Tuple[
         Optional[Exception],
         HTTP3Connection,
         HTTPUrl,
-        bool,
     ]:
-        has_optimized_url = isinstance(request_url, URL)
-
-        if has_optimized_url:
-            parsed_url = request_url.optimized
-
-        elif ssl_redirect_url:
-            parsed_url = HTTPUrl(ssl_redirect_url)
+        if isinstance(request_url, URL):
+            # Resolved when the workflow prepared it: never looked up here,
+            # and never read from or added to the lookup cache.
+            url = parsed_url = request_url.optimized
 
         else:
             parsed_url = HTTPUrl(request_url)
 
-        url = self._url_cache.get(parsed_url.hostname)
-        dns_lock = self._dns_lock[parsed_url.hostname]
-        dns_waiter = self._dns_waiters[parsed_url.hostname]
+            # A lookup serves only the address it resolved: its target (scheme
+            # and authority), not the hostname every port on a host shares.
+            cache_key = parsed_url.target
+            url = self._url_cache.get(cache_key)
 
-        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
+            if url is None:
+                dns_lock = self._dns_lock[cache_key]
+                dns_waiter = self._dns_waiters[cache_key]
 
-        if do_dns_lookup and dns_lock.locked() is False:
-            await dns_lock.acquire()
-            url = parsed_url
-            await url.lookup()
+                if dns_lock.locked() is False:
+                    try:
+                        async with dns_lock:
+                            url = parsed_url
+                            await url.lookup()
 
-            self._dns_lock[parsed_url.hostname] = dns_lock
-            self._url_cache[parsed_url.hostname] = url
+                            self._url_cache[cache_key] = url
 
-            dns_waiter = self._dns_waiters[parsed_url.hostname]
+                    finally:
+                        # However the lookup ended, release its waiters; after
+                        # a failed or cancelled lookup the next request looks
+                        # up again with a fresh waiter.
+                        if dns_waiter.done() is False:
+                            dns_waiter.set_result(None)
 
-            if dns_waiter.done() is False:
-                dns_waiter.set_result(None)
+                        if cache_key not in self._url_cache:
+                            del self._dns_waiters[cache_key]
 
-            dns_lock.release()
-
-        elif do_dns_lookup:
-            await dns_waiter
-            url = self._url_cache.get(parsed_url.hostname)
-
-        elif has_optimized_url:
-            url = request_url.optimized
+                else:
+                    # Shielded: a waiter's cancellation must not cancel the
+                    # lookup future every other waiter shares.
+                    await asyncio.shield(dns_waiter)
+                    url = self._url_cache.get(cache_key)
 
         connection = self._connections.pop()
+
+        if url.is_ssl is False:
+            # QUIC always carries TLS: an http:// address names no HTTP/3
+            # server.
+            return (
+                ConnectionError(f"HTTP/3 requires an https:// address, not {url.full}"),
+                connection,
+                parsed_url,
+            )
+
         connection_error: Optional[Exception] = None
 
-        if url.address is None or ssl_redirect_url:
-            for address, ip_info in url:
-                try:
-                    await connection.make_connection(
-                        address,
-                        url.port,
-                        ip_info,
-                        server_name=url.hostname,
-                    )
+        try:
+            # Reuses the connection's QUIC connection to this host; otherwise
+            # opens a new one across the host's addresses.
+            address, socket_config, new_connection = await connection.connect_to_any(
+                parsed_url.target,
+                url.ip_addresses,
+                url.port,
+                url.address_rotation,
+                server_name=url.hostname,
+                ssl=self._client_ssl_context,
+            )
 
-                    url.address = address
-                    url.socket_config = ip_info
+            if new_connection:
+                url.address = address
+                url.socket_config = socket_config
 
-                except Exception as err:
-                    if "server_hostname is only meaningful with ssl" in str(err):
-                        return (
-                            None,
-                            None,
-                            parsed_url,
-                            True,
-                        )
+        except asyncio.CancelledError as err:
+            return (
+                err,
+                connection,
+                parsed_url,
+            )
 
-        else:
-            try:
-                await connection.make_connection(
-                    url.address,
-                    url.port,
-                    url.socket_config,
-                    server_name=url.hostname,
-                )
+        except Exception as err:
+            connection_error = err
 
-            except Exception as err:
-                if "server_hostname is only meaningful with ssl" in str(err):
-                    return None, parsed_url, True
+        try:
+            return (
+                connection_error,
+                connection,
+                parsed_url,
+            )
 
-                connection_error = err
-
-        return (
-            connection_error,
-            connection,
-            parsed_url,
-            False,
-        )
+        finally:
+            # The error's traceback holds this frame: release the frame's
+            # hold on the error, or the two keep each other alive as garbage.
+            connection_error = None
 
     def _encode_headers(
         self,
@@ -918,18 +903,29 @@ class MercurySyncHTTP3Connection:
 
         url_path = url.path
 
+        # The params follow any query the address has of its own: after "&"
+        # then, else after "?" (RFC 3986 3.4).
         if isinstance(params, Params):
-            url_path += params.optimized
+            query = params.optimized[1:]
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
         elif params:
-            url_params = urlencode(params)
-            url_path += f"?{url_params}"
+            query = urlencode(params)
+            url_path = f"{url_path}&{query}" if "?" in url_path else f"{url_path}?{query}"
 
-        
+        # :authority names the target as RFC 9114 4.3.1 does: the host, an
+        # IPv6 address in brackets, and the port unless it is the scheme's
+        # default.
+        hostname = url.hostname
+        scheme = url.scheme
+        authority = f"[{hostname}]" if ":" in hostname else hostname
+        if url.port != DEFAULT_PORTS.get(scheme):
+            authority = f"{authority}:{url.port}"
+
         encoded_headers: List[Tuple[bytes, bytes]] = [
             (b":method", method.encode()),
-            (b":authority", url.hostname.encode()),
-            (b":scheme", url.scheme.encode()),
+            (b":authority", authority.encode()),
+            (b":scheme", scheme.encode()),
             (b":path", url_path.encode()),
         ]
 
@@ -957,14 +953,6 @@ class MercurySyncHTTP3Connection:
                 ]
             )
 
-        else:
-            encoded_headers: List[Tuple[bytes, bytes]] = [
-                (b":method", method.encode()),
-                (b":authority", url.hostname.encode()),
-                (b":scheme", url.scheme.encode()),
-                (b":path", url_path.encode()),
-            ]
-
         if isinstance(cookies, Cookies):
             encoded_headers.append(cookies.optimized)
 
@@ -979,7 +967,8 @@ class MercurySyncHTTP3Connection:
                     cookie_name, cookie_value = cookie_data
                     encoded_cookies.append(f"{cookie_name}={cookie_value}")
 
-            encoded_headers.append(("cookie", "; ".join(encoded_cookies)))
+            # A header field as the QPACK encoder takes one: bytes.
+            encoded_headers.append((b"cookie", "; ".join(encoded_cookies).encode()))
 
         return encoded_headers
 
@@ -993,14 +982,9 @@ class MercurySyncHTTP3Connection:
             return data.optimized
 
         elif isinstance(data, Iterator) and not isinstance(data, list):
-            chunks = []
-            for chunk in data:
-                chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
-                encoded_chunk = chunk_size.encode() + chunk + NEW_LINE.encode()
-                chunks.append(encoded_chunk)
-
-            self.is_stream = True
-            encoded_data = chunks
+            # HTTP/3 has no chunked transfer coding: a DATA frame carries the
+            # body as it is (RFC 9114 4.1).
+            encoded_data = b"".join(data)
 
         elif isinstance(data, BaseModel):
             encoded_data = orjson.dumps(data.model_dump())
@@ -1023,11 +1007,13 @@ class MercurySyncHTTP3Connection:
         self,
         auth: tuple[str, str] | tuple[str],
     ):
+        # The Basic scheme ahead of the credentials (RFC 7617 2), as the
+        # HTTP/1 client sends them.
         if len(auth) > 1:
             credentials_string = f"{auth[0]}:{auth[1]}"
             return (
                 b"authorization",
-                base64.b64encode(
+                b"Basic " + base64.b64encode(
                     credentials_string.encode()
                 )
             )
@@ -1035,7 +1021,7 @@ class MercurySyncHTTP3Connection:
         else:
             return (
                 b"authorization",
-                base64.b64encode(
+                b"Basic " + base64.b64encode(
                     auth[0].encode()
                 )
             )

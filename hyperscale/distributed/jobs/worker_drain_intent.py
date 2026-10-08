@@ -1,7 +1,11 @@
 """Worker dispatch drain intent state."""
 
-import time
 from dataclasses import dataclass, field
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -11,4 +15,4 @@ class WorkerDrainIntent:
     worker_id: str
     epoch: int
     reason: str
-    started_at: float = field(default_factory=time.monotonic)
+    started_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())

@@ -27,19 +27,11 @@ Coverage:
 6. ``test_idempotent_event_replay`` — re-disseminated events from
    multiple peers don't double-count.
 
-Run as::
-
-    python tests/integration/extensions/test_extension_dissemination.py
+Run with ``pytest tests/integration/extensions/test_extension_dissemination.py``.
 """
 
 from __future__ import annotations
 
-import os
-import sys
-
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
 
 from hyperscale.distributed.health.alpha_posterior import (
     HierarchicalAlphaTuner,
@@ -47,8 +39,6 @@ from hyperscale.distributed.health.alpha_posterior import (
 )
 from hyperscale.distributed.health.extension_decision import (
     ExtensionDecisionConfig,
-    ExtensionDecisionEvaluator,
-    ExtensionDenialCode,
 )
 from hyperscale.distributed.health.extension_outcome import (
     ExtensionOutcomeEvent,
@@ -73,17 +63,6 @@ from hyperscale.distributed.swim.gossip import (
     ExtensionDecisionGossipBuffer,
     ExtensionOutcomeGossipBuffer,
 )
-
-
-_FAILURES: list[str] = []
-
-
-def check(condition: bool, label: str) -> None:
-    if condition:
-        print(f"  ✓ {label}")
-    else:
-        print(f"  ✗ {label}")
-        _FAILURES.append(label)
 
 
 def make_manager() -> WorkerHealthManager:
@@ -145,7 +124,6 @@ def make_snapshot(
 
 
 def test_decision_dissemination_round_trip() -> None:
-    print("\n[1] H7b decision dissemination round-trip")
 
     leader = make_manager()
     follower = make_manager()
@@ -166,47 +144,37 @@ def test_decision_dissemination_round_trip() -> None:
             active_in_dc=1,
             active_on_manager=1,
             active_on_worker=1,
+            workflow_class="LoadTest",
             job_id="job-1",
             fence_token=42,
             leader_term=7,
         )
     )
-    check(response.granted, "extension granted on leader")
-    check(decision.granted, "decision granted on leader")
-    check(
-        leader.ledger.workflow_count == 1,
-        "leader ledger holds the workflow",
-    )
-    check(
-        follower.ledger.workflow_count == 0,
-        "follower ledger empty before dissemination",
-    )
+    assert response.granted, "extension granted on leader"
+    assert decision.granted, "decision granted on leader"
+    assert leader.ledger.workflow_count == 1, "leader ledger holds the workflow"
+    assert follower.ledger.workflow_count == 0, "follower ledger empty before dissemination"
 
     leader_buffer.add_event(event, number_of_managers=2)
     frame = leader_buffer.encode_piggyback()
-    check(frame.startswith(b"#|x"), "frame is #|x-prefixed")
+    assert frame.startswith(b"#|x"), "frame is #|x-prefixed"
 
     received = ExtensionDecisionGossipBuffer.decode_piggyback(frame)
-    check(len(received) == 1, "follower decoded exactly one event")
+    assert len(received) == 1, "follower decoded exactly one event"
     for ingested_event in received:
         follower.ingest_remote_decision_event(ingested_event)
 
-    check(
-        follower.ledger.workflow_count == 1,
-        "follower ledger inherited the workflow after ingest",
-    )
+    assert follower.ledger.workflow_count == 1, "follower ledger inherited the workflow after ingest"
     follower_entry = follower.ledger.get_workflow_entry("wf-1")
     leader_entry = leader.ledger.get_workflow_entry("wf-1")
-    check(follower_entry is not None, "follower entry constructed")
-    check(
-        leader_entry.cumulative_extended == follower_entry.cumulative_extended,
-        "cumulative_extended matches across managers",
-    )
-    check(
+    assert follower_entry is not None, "follower entry constructed"
+    assert (
+        leader_entry.cumulative_extended == follower_entry.cumulative_extended
+    ), "cumulative_extended matches across managers"
+    assert (
         leader_entry.last_decision.fence_token
-        == follower_entry.last_decision.fence_token,
-        "fence_token matches across managers",
-    )
+        == follower_entry.last_decision.fence_token
+    ), "fence_token matches across managers"
 
 
 # ============================================================================
@@ -215,7 +183,6 @@ def test_decision_dissemination_round_trip() -> None:
 
 
 def test_outcome_dissemination_round_trip() -> None:
-    print("\n[2] H8b outcome dissemination round-trip")
 
     leader = make_manager()
     follower = make_manager()
@@ -234,6 +201,7 @@ def test_outcome_dissemination_round_trip() -> None:
         active_in_dc=1,
         active_on_manager=1,
         active_on_worker=1,
+        workflow_class="LoadTest",
         job_id="job-1",
         fence_token=42,
         leader_term=7,
@@ -253,34 +221,24 @@ def test_outcome_dissemination_round_trip() -> None:
     leader_posterior_mean = leader.alpha_tuner.get(
         "LoadTestHomepage"
     ).posterior_mean
-    check(
-        leader.ledger.get_workflow_entry("wf-1").outcome is not None,
-        "leader ledger entry carries the outcome",
-    )
-    check(
-        leader_posterior_mean > 0.0,
-        f"leader posterior advanced (mean={leader_posterior_mean:.4f})",
-    )
+    assert leader.ledger.get_workflow_entry("wf-1").outcome is not None, "leader ledger entry carries the outcome"
+    assert leader_posterior_mean > 0.0, f"leader posterior advanced (mean={leader_posterior_mean:.4f})"
 
     outcome_buffer.add_event(outcome_event, number_of_managers=2)
     frame = outcome_buffer.encode_piggyback()
-    check(frame.startswith(b"#|o"), "frame is #|o-prefixed")
+    assert frame.startswith(b"#|o"), "frame is #|o-prefixed"
 
     received = ExtensionOutcomeGossipBuffer.decode_piggyback(frame)
-    check(len(received) == 1, "follower decoded exactly one outcome")
+    assert len(received) == 1, "follower decoded exactly one outcome"
     for ingested_event in received:
         follower.ingest_remote_outcome_event(ingested_event)
 
     follower_posterior = follower.alpha_tuner.get("LoadTestHomepage")
-    check(
-        follower_posterior is not None,
-        "follower built the per-class posterior on first outcome",
-    )
-    check(
-        abs(follower_posterior.posterior_mean - leader_posterior_mean) < 1e-9,
+    assert follower_posterior is not None, "follower built the per-class posterior on first outcome"
+    assert abs(follower_posterior.posterior_mean - leader_posterior_mean) < 1e-9, (
         f"follower posterior matches leader after one event "
         f"({follower_posterior.posterior_mean:.6f} vs "
-        f"{leader_posterior_mean:.6f})",
+        f"{leader_posterior_mean:.6f})"
     )
 
 
@@ -290,7 +248,6 @@ def test_outcome_dissemination_round_trip() -> None:
 
 
 def test_outcome_drives_alpha_posterior_convergence() -> None:
-    print("\n[3] Posterior convergence across managers (5 events)")
 
     leader = make_manager()
     follower = make_manager()
@@ -320,35 +277,19 @@ def test_outcome_drives_alpha_posterior_convergence() -> None:
 
     frame = buffer.encode_piggyback(max_count=10)
     received = ExtensionOutcomeGossipBuffer.decode_piggyback(frame)
-    check(
-        len(received) == 5,
-        f"follower decoded all five outcomes (got {len(received)})",
-    )
+    assert len(received) == 5, f"follower decoded all five outcomes (got {len(received)})"
     for ingested_event in received:
         follower.ingest_remote_outcome_event(ingested_event)
 
     leader_post = leader.alpha_tuner.get("LoadTestHomepage")
     follower_post = follower.alpha_tuner.get("LoadTestHomepage")
-    check(
-        leader_post.successes == 3,
-        f"leader counted 3 successes (got {leader_post.successes})",
-    )
-    check(
-        leader_post.failures == 2,
-        f"leader counted 2 failures (got {leader_post.failures})",
-    )
-    check(
-        leader_post.successes == follower_post.successes,
-        "follower success count matches leader",
-    )
-    check(
-        leader_post.failures == follower_post.failures,
-        "follower failure count matches leader",
-    )
-    check(
-        abs(leader_post.posterior_mean - follower_post.posterior_mean) < 1e-9,
-        "follower posterior_mean matches leader exactly",
-    )
+    assert leader_post.successes == 3, f"leader counted 3 successes (got {leader_post.successes})"
+    assert leader_post.failures == 2, f"leader counted 2 failures (got {leader_post.failures})"
+    assert leader_post.successes == follower_post.successes, "follower success count matches leader"
+    assert leader_post.failures == follower_post.failures, "follower failure count matches leader"
+    assert (
+        abs(leader_post.posterior_mean - follower_post.posterior_mean) < 1e-9
+    ), "follower posterior_mean matches leader exactly"
 
 
 # ============================================================================
@@ -357,7 +298,6 @@ def test_outcome_drives_alpha_posterior_convergence() -> None:
 
 
 def test_leader_transfer_replay_round_trip() -> None:
-    print("\n[4] H8c persistence + leader-transfer replay round-trip")
 
     old_leader = make_manager()
     state = TimeoutTrackingState(
@@ -382,6 +322,7 @@ def test_leader_transfer_replay_round_trip() -> None:
             active_in_dc=1,
             active_on_manager=1,
             active_on_worker=1,
+            workflow_class="LoadTest",
             job_id="job-1",
             fence_token=42,
             leader_term=7,
@@ -424,24 +365,19 @@ def test_leader_transfer_replay_round_trip() -> None:
     # New leader takes over and replays.
     new_leader = make_manager()
     replayed = new_leader.replay_persisted_state(state)
-    check(replayed >= 2, f"new leader replayed at least 2 events ({replayed})")
+    assert replayed >= 2, f"new leader replayed at least 2 events ({replayed})"
 
     new_post = new_leader.alpha_tuner.get("LoadTestHomepage")
-    check(new_post is not None, "new leader has the workflow-class posterior")
-    check(
-        new_post.successes == expected_successes,
+    assert new_post is not None, "new leader has the workflow-class posterior"
+    assert new_post.successes == expected_successes, (
         f"successes preserved through replay "
-        f"(expected {expected_successes}, got {new_post.successes})",
+        f"(expected {expected_successes}, got {new_post.successes})"
     )
-    check(
-        new_post.failures == expected_failures,
+    assert new_post.failures == expected_failures, (
         f"failures preserved through replay "
-        f"(expected {expected_failures}, got {new_post.failures})",
+        f"(expected {expected_failures}, got {new_post.failures})"
     )
-    check(
-        abs(new_post.posterior_mean - expected_mean) < 1e-9,
-        "posterior mean preserved exactly through replay",
-    )
+    assert abs(new_post.posterior_mean - expected_mean) < 1e-9, "posterior mean preserved exactly through replay"
 
 
 # ============================================================================
@@ -450,7 +386,6 @@ def test_leader_transfer_replay_round_trip() -> None:
 
 
 def test_progress_weighted_negative_evidence() -> None:
-    print("\n[5] Progress-weighted negative evidence (early-fail vs late-fail)")
 
     early_dier_tuner = HierarchicalAlphaTuner(HierarchicalAlphaTunerConfig())
     late_dier_tuner = HierarchicalAlphaTuner(HierarchicalAlphaTunerConfig())
@@ -492,16 +427,14 @@ def test_progress_weighted_negative_evidence() -> None:
     late_post = late_dier_tuner.get("LoadTest")
     # Negative evidence increment = 1 + (1 - progress). Early-die
     # adds ~1.95 to beta; late-die adds ~1.05.
-    check(
-        early_post.beta > late_post.beta,
+    assert early_post.beta > late_post.beta, (
         f"early-die hits beta harder ({early_post.beta:.4f} > "
-        f"{late_post.beta:.4f})",
+        f"{late_post.beta:.4f})"
     )
-    check(
-        early_post.posterior_mean < late_post.posterior_mean,
+    assert early_post.posterior_mean < late_post.posterior_mean, (
         f"early-die yields tighter alpha posterior "
         f"({early_post.posterior_mean:.6f} < "
-        f"{late_post.posterior_mean:.6f})",
+        f"{late_post.posterior_mean:.6f})"
     )
 
 
@@ -511,7 +444,6 @@ def test_progress_weighted_negative_evidence() -> None:
 
 
 def test_idempotent_event_replay() -> None:
-    print("\n[6] Idempotent event replay (no double-counting)")
 
     follower = make_manager()
     leader = make_manager()
@@ -528,6 +460,7 @@ def test_idempotent_event_replay() -> None:
         active_in_dc=1,
         active_on_manager=1,
         active_on_worker=1,
+        workflow_class="LoadTest",
         job_id="job-1",
         fence_token=42,
         leader_term=7,
@@ -538,10 +471,9 @@ def test_idempotent_event_replay() -> None:
         follower.ingest_remote_decision_event(event)
 
     follower_entry = follower.ledger.get_workflow_entry("wf-1")
-    check(
-        len(follower_entry.decisions) == 1,
+    assert len(follower_entry.decisions) == 1, (
         f"follower stored exactly one decision after 3 ingests "
-        f"({len(follower_entry.decisions)})",
+        f"({len(follower_entry.decisions)})"
     )
 
     # Same idempotency for outcomes.
@@ -557,18 +489,15 @@ def test_idempotent_event_replay() -> None:
         leader_term=7,
     )
     leader_post_mean = leader.alpha_tuner.get("LoadTest").posterior_mean
-    for _ in range(3):
-        follower.ingest_remote_outcome_event(outcome)
+    first_copies = [follower.ingest_remote_outcome_event(outcome) for _ in range(3)]
+    assert first_copies == [True, False, False], f"follower admits only the first outcome copy ({first_copies})"
+    assert leader.ingest_remote_outcome_event(outcome) is False, "leader drops the echo of its own outcome"
     follower_post = follower.alpha_tuner.get("LoadTest")
-    # The outcome event itself isn't deduped on the tuner — but the
-    # ledger's record_outcome rejects re-records past leader_term.
-    # Tuner sees 3 applications. Either way, both managers should
-    # converge eventually; we just verify no exception.
-    check(
-        follower_post is not None,
-        "follower posterior present after redundant ingest",
-    )
-    del leader_post_mean  # variant retained for future stricter check
+    assert (
+        follower_post is not None
+        and abs(follower_post.posterior_mean - leader_post_mean) < 1e-9
+        and follower_post.total_seen == 1
+    ), "one outcome counts once on every manager however many copies arrive"
 
 
 # ============================================================================
@@ -576,27 +505,3 @@ def test_idempotent_event_replay() -> None:
 # ============================================================================
 
 
-def main() -> int:
-    print("=" * 72)
-    print("AD-26 H7/H8 INTEGRATION TESTS")
-    print("=" * 72)
-
-    test_decision_dissemination_round_trip()
-    test_outcome_dissemination_round_trip()
-    test_outcome_drives_alpha_posterior_convergence()
-    test_leader_transfer_replay_round_trip()
-    test_progress_weighted_negative_evidence()
-    test_idempotent_event_replay()
-
-    print()
-    if _FAILURES:
-        print(f"=== {len(_FAILURES)} FAILURE(S) ===")
-        for failure in _FAILURES:
-            print(f"  - {failure}")
-        return 1
-    print("=== ALL AD-26 H7/H8 INTEGRATION CHECKS PASSED ===")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

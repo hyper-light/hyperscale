@@ -1,21 +1,6 @@
-from enum import Enum
 from typing import Dict, Literal
 
-
-class BackgroundCharType(Enum):
-    EMPTY = " "
-    DASH = "-"
-    CENTER_PERIOD = "∙"
-    PERIOD = "."
-    EMPTY_SLANT_RECT = "▱"
-    NOISE_LIGHT = "░"
-    EMPTY_DOT = "o"
-    TRIPLE_EQUALS = "≡"
-    TOGGLE = "⊷"
-    CIRCLE_TOGGLE = "◎"
-    EMPTY_SQUARE = "□"
-    LEFT_ARROW_EMPTY = "▹"
-
+from .background_char_type import BackgroundCharType as BackgroundCharType
 
 BackgroundCharName = Literal[
     "empty",

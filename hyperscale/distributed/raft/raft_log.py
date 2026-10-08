@@ -48,6 +48,11 @@ class RaftLog:
         return self._job_id
 
     @property
+    def max_entries(self) -> int:
+        """The most entries the log holds before refusing appends."""
+        return self._max_entries
+
+    @property
     def snapshot_index(self) -> int:
         """Index of the last entry included in snapshot."""
         return self._snapshot_index

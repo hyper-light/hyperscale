@@ -769,10 +769,11 @@ class TestHealthGossipBufferCallback:
 
         callback.assert_not_called()
 
-    def test_callback_exception_does_not_affect_gossip(self) -> None:
-        """Test that callback exceptions don't break gossip processing."""
+    def test_callback_exception_reaches_the_caller(self) -> None:
+        """A failing callback's error reaches the caller -- errors are
+        never dropped -- with the received entry already stored."""
         buffer = HealthGossipBuffer()
-        callback = MagicMock(side_effect=Exception("Callback error"))
+        callback = MagicMock(side_effect=RuntimeError("Callback error"))
         buffer.set_health_update_callback(callback)
 
         health = HealthPiggyback(
@@ -781,9 +782,8 @@ class TestHealthGossipBufferCallback:
             timestamp=time.monotonic(),
         )
 
-        # Should not raise despite callback error
-        accepted = buffer.process_received_health(health)
-        assert accepted is True
+        with pytest.raises(RuntimeError, match="Callback error"):
+            buffer.process_received_health(health)
         assert buffer.get_health("node-1") is not None
 
 

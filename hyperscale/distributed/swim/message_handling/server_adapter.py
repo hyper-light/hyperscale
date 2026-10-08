@@ -5,14 +5,40 @@ This adapter translates between the ServerInterface protocol expected by
 handlers and the actual HealthAwareServer implementation.
 """
 
-from typing import TYPE_CHECKING, Any
+import asyncio
+from collections.abc import Callable, Coroutine
+from typing import TYPE_CHECKING, TypeVar
 
-from hyperscale.distributed.swim.core.types import UpdateType
+from hyperscale.distributed.swim.core.protocols import TaskRunnerProtocol
+from hyperscale.distributed.swim.core.types import (
+    UpdateType,
+)
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.server.context.context_value_lease import (
+        ContextValueLease,
+    )
+    from hyperscale.distributed.swim.core.audit_log import AuditLog
+    from hyperscale.distributed.swim.core.node_state import NodeState
+    from hyperscale.distributed.swim.detection.hierarchical_failure_detector import (
+        HierarchicalFailureDetector,
+    )
+    from hyperscale.distributed.swim.detection.incarnation_tracker import (
+        IncarnationTracker,
+    )
+    from hyperscale.distributed.swim.detection.indirect_probe_manager import (
+        IndirectProbeManager,
+    )
+    from hyperscale.distributed.swim.detection.probe_scheduler import ProbeScheduler
     from hyperscale.distributed.swim.health_aware_server import (
         HealthAwareServer,
     )
+    from hyperscale.distributed.swim.leadership.local_leader_election import (
+        LocalLeaderElection,
+    )
+    from hyperscale.distributed.taskex import TaskRunner
+
+GatherResultT = TypeVar("GatherResultT")
 
 
 class ServerAdapter:
@@ -53,7 +79,7 @@ class ServerAdapter:
 
     # === State Access ===
 
-    def read_nodes(self) -> dict[tuple[str, int], Any]:
+    def read_nodes(self) -> dict[tuple[str, int], "NodeState"]:
         """Return node states from IncarnationTracker (AD-46)."""
         return self._server._incarnation_tracker.node_states
 
@@ -131,13 +157,9 @@ class ServerAdapter:
         """Decrease LHM score."""
         await self._server.decrease_failure_detector(reason)
 
-    def get_lhm_adjusted_timeout(
-        self,
-        base_timeout: float,
-        target_node_id: str | None = None,
-    ) -> float:
+    def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
         """Get timeout adjusted for current LHM."""
-        return self._server.get_lhm_adjusted_timeout(base_timeout, target_node_id)
+        return self._server.get_lhm_adjusted_timeout(base_timeout)
 
     # === Suspicion ===
 
@@ -232,42 +254,42 @@ class ServerAdapter:
     # === Component Access ===
 
     @property
-    def leader_election(self) -> Any:
+    def leader_election(self) -> "LocalLeaderElection":
         """Get leader election component."""
         return self._server._leader_election
 
     @property
-    def hierarchical_detector(self) -> Any:
+    def hierarchical_detector(self) -> "HierarchicalFailureDetector":
         """Get hierarchical failure detector."""
         return self._server._hierarchical_detector
 
     @property
-    def task_runner(self) -> Any:
+    def task_runner(self) -> "TaskRunner":
         """Get task runner."""
         return self._server._task_runner
 
     @property
-    def probe_scheduler(self) -> Any:
+    def probe_scheduler(self) -> "ProbeScheduler":
         """Get probe scheduler."""
         return self._server._probe_scheduler
 
     @property
-    def incarnation_tracker(self) -> Any:
+    def incarnation_tracker(self) -> "IncarnationTracker":
         """Get incarnation tracker."""
         return self._server._incarnation_tracker
 
     @property
-    def audit_log(self) -> Any:
+    def audit_log(self) -> "AuditLog":
         """Get audit log."""
         return self._server._audit_log
 
     @property
-    def indirect_probe_manager(self) -> Any:
+    def indirect_probe_manager(self) -> "IndirectProbeManager":
         """Get indirect probe manager."""
         return self._server._indirect_probe_manager
 
     @property
-    def pending_probe_acks(self) -> dict[tuple[str, int], Any]:
+    def pending_probe_acks(self) -> dict[tuple[str, int], asyncio.Future[bool]]:
         """Get pending probe ack futures."""
         return self._server._pending_probe_acks
 
@@ -347,7 +369,7 @@ class ServerAdapter:
 
     async def safe_queue_put(
         self,
-        queue: Any,
+        queue: object,
         item: tuple[int, bytes],
         node: tuple[str, int],
     ) -> bool:
@@ -403,11 +425,9 @@ class ServerAdapter:
 
     # === Context Management ===
 
-    async def context_with_value(self, target: tuple[str, int]) -> Any:
+    async def context_with_value(self, target: tuple[str, int]) -> "ContextValueLease":
         return await self._server._context.with_value(target)
 
-    async def write_context(self, key: Any, value: Any) -> None:
-        await self._server._context.write(key, value)
 
     def notify_node_join(self, node: tuple[str, int]) -> None:
         """Fire the registered ``_on_node_join_callbacks`` for ``node``.
@@ -422,17 +442,34 @@ class ServerAdapter:
             return
         task_runner = getattr(self._server, "_task_runner", None)
         for callback in callbacks:
-            try:
-                callback(node)
-            except Exception as callback_error:
-                if task_runner is not None and hasattr(
-                    self._server, "handle_exception"
-                ):
-                    task_runner.run(
-                        self._server.handle_exception,
-                        callback_error,
-                        "on_node_join_callback (join_handler)",
-                    )
+            self._invoke_join_callback(callback, node, task_runner)
+
+    def _invoke_join_callback(
+        self,
+        callback: Callable[[tuple[str, int]], None],
+        node: tuple[str, int],
+        task_runner: TaskRunnerProtocol | None,
+    ) -> None:
+        """Run one join callback; its failure goes to the server's handle_exception."""
+        try:
+            callback(node)
+        except Exception as callback_error:
+            self._report_join_callback_error(callback_error, task_runner)
+
+    def _report_join_callback_error(
+        self,
+        callback_error: Exception,
+        task_runner: TaskRunnerProtocol | None,
+    ) -> None:
+        """Hand a join-callback failure to the server's handle_exception via its task runner, when both exist."""
+        if task_runner is not None and hasattr(
+            self._server, "handle_exception"
+        ):
+            task_runner.run(
+                self._server.handle_exception,
+                callback_error,
+                "on_node_join_callback (join_handler)",
+            )
 
     def notify_node_dead(
         self,
@@ -477,10 +514,10 @@ class ServerAdapter:
 
     async def gather_with_errors(
         self,
-        coros: list[Any],
+        coros: list[Coroutine[object, object, GatherResultT]],
         operation: str,
         timeout: float,
-    ) -> tuple[list[Any], list[Exception]]:
+    ) -> tuple[list[GatherResultT], list[Exception]]:
         """Gather coroutines with error collection."""
         return await self._server._gather_with_errors(
             coros, operation=operation, timeout=timeout

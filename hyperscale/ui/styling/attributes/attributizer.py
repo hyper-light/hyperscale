@@ -1,16 +1,16 @@
-from typing import Callable, Any
+from typing import Callable
 from .attribute import AttributeName
 
 
 Attributizer = (
     AttributeName
     | Callable[
-        [Any],
+        [object],
         AttributeName | None,
     ]
     | list[
         Callable[
-            [Any],
+            [object],
             AttributeName | None,
         ]
     ]

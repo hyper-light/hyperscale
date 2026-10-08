@@ -15,7 +15,6 @@ import time
 import inspect
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -48,11 +47,6 @@ class MockEnv:
     MERCURY_SYNC_MAX_PENDING_WORKFLOWS: int = 100
     DISCOVERY_PROBE_INTERVAL: float = 30.0
     DISCOVERY_FAILURE_DECAY_INTERVAL: float = 60.0
-    
-    def get_discovery_config(self, **kwargs) -> MagicMock:
-        mock_config = MagicMock()
-        mock_config.dns_names = []
-        return mock_config
 
 
 class MockTaskRunner:
@@ -785,10 +779,20 @@ class TestOrphanConfiguration:
     
     @pytest.mark.asyncio
     async def test_default_grace_period(self) -> None:
+        """The grace is the cluster's time to replace a dead job leader:
+        the managers' worst-case suspicion window, a leader election and the
+        transfer's request -- not a constant."""
         from hyperscale.distributed.env import Env
-        
+        from hyperscale.distributed.nodes.worker.worker_config_derivation import derive_orphan_grace_seconds
+
         env = Env()
-        assert env.WORKER_ORPHAN_GRACE_PERIOD == 5.0
+        assert derive_orphan_grace_seconds(env) == (
+            max(env.SWIM_SUSPICION_MAX_TIMEOUT, env.SWIM_NO_WITNESS_SUSPICION_TIMEOUT)
+            + env.LEADER_PRE_VOTE_TIMEOUT
+            + env.LEADER_ELECTION_TIMEOUT_BASE
+            + env.LEADER_ELECTION_TIMEOUT_JITTER
+            + env.MANAGER_TCP_TIMEOUT_STANDARD
+        )
     
     @pytest.mark.asyncio
     async def test_default_check_interval(self) -> None:
