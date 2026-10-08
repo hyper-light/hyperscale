@@ -1,17 +1,21 @@
 
 # <b>Hyperscale</b>
-[![PyPI version](https://img.shields.io/pypi/v/hyperscale?color=blue)](https://pypi.org/project/hyperscale/)
+[![PyPI version][pypi-version]](https://pypi.org/project/hyperscale/)
 [![License](https://img.shields.io/github/license/hyper-light/hyperscale)](https://github.com/hyper-light/hyperscale/blob/main/LICENSE)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](https://github.com/hyper-light/hyperscale/blob/main/CODE_OF_CONDUCT.md)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/hyperscale?color=red)](https://pypi.org/project/hyperscale/)
+[![Python requirement][python-requirement]](https://pypi.org/project/hyperscale/)
 
 
 | Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
-| Version     | 0.8.1                                                           |
+| Version     | [![PyPI version][pypi-version]](https://pypi.org/project/hyperscale/) |
 | Download    | https://pypi.org/project/hyperscale/                            | 
 | Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
+
+<!-- Dynamic JSON badges allow a five-minute cache; the dedicated PyPI badges enforce a longer minimum. -->
+[pypi-version]: https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fpypi.org%2Fpypi%2Fhyperscale%2Fjson&query=%24.info.version&label=pypi&prefix=v&color=blue&cacheSeconds=300
+[python-requirement]: https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fpypi.org%2Fpypi%2Fhyperscale%2Fjson&query=%24.info.requires_python&label=python&color=red&cacheSeconds=300
 
 Hyperscale is a Python performance and scalable unit/integration testing framework that makes creating and running complex test workflows easy.
 
@@ -57,7 +61,7 @@ ___________
 
 ## <b>Requirements and Getting Started</b>
 
-Hyperscale makes use of the latest and greatest Python features, and requires Python 3.11+. We also recommend installing the latest LTS version of OpenSSL if you wish to perform DTLS UDP testing or run tests over SSL encrypted connections.
+Hyperscale makes use of the latest and greatest Python features, and requires Python 3.12+. We also recommend installing the latest LTS version of OpenSSL if you wish to perform DTLS UDP testing or run tests over SSL encrypted connections.
 
 <br/>
 
