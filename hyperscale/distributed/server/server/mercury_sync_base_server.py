@@ -1078,15 +1078,26 @@ class MercurySyncBaseServer(Generic[T]):
         address: Tuple[str, int],
         worker_socket: Optional[socket.socket],
     ) -> socket.socket:
-        """The worker's socket, or a new one connected to ``address``."""
+        """The worker's socket, or a new one connected to ``address``.
+
+        Connected on the loop (``sock_connect``), never by a blocking
+        ``connect`` on an executor thread: cancelling the caller cannot stop
+        a thread, and one dialing an address that drops packets -- a
+        restarted Kubernetes pod's old IP -- stayed blocked for the kernel's
+        whole SYN retry budget (minutes), holding the process's exit in
+        ``asyncio.run``'s executor shutdown until it was SIGKILLed. The
+        socket is closed when the connect fails or is cancelled."""
         if worker_socket is not None:
             return worker_socket
 
         tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        await self._loop.run_in_executor(None, tcp_socket.connect, address)
-
         tcp_socket.setblocking(False)
+        try:
+            await self._loop.sock_connect(tcp_socket, address)
+        except BaseException:
+            tcp_socket.close()
+            raise
 
         return tcp_socket
 
