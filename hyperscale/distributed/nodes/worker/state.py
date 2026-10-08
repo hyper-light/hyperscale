@@ -6,6 +6,7 @@ core allocation, backpressure, and metrics.
 """
 
 import asyncio
+import math
 from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
@@ -105,7 +106,10 @@ class WorkerState:
         # Backpressure tracking (AD-23)
         self._manager_backpressure: dict[str, BackpressureLevel] = {}
         self._manager_backpressure_delay_ms: dict[str, int] = {}
-        self._backpressure_delay_ms: int = 0
+        # When each manager's last signal stops holding: a signal is a
+        # lease, renewed only by the manager's next ack (see
+        # ``apply_manager_backpressure``).
+        self._manager_backpressure_expires_at: dict[str, float] = {}
 
         # Orphaned workflow tracking (Section 2.7)
         self._orphaned_workflows: dict[str, float] = {}
@@ -510,32 +514,57 @@ class WorkerState:
         self._manager_backpressure[manager_id] = level
 
     def get_max_backpressure_level(self) -> BackpressureLevel:
-        """Get maximum backpressure level across all managers."""
-        if not self._manager_backpressure:
-            return BackpressureLevel.NONE
-        return max(self._manager_backpressure.values(), key=lambda x: x.value)
+        """The highest level among the managers' signals still holding."""
+        return max(
+            (self._manager_backpressure[manager_id] for manager_id in self._held_backpressure_managers()),
+            key=lambda level: level.value,
+            default=BackpressureLevel.NONE,
+        )
 
-    def set_backpressure_delay_ms(self, delay_ms: int) -> None:
-        """Set backpressure delay from manager."""
-        self._backpressure_delay_ms = delay_ms
+    def apply_manager_backpressure(
+        self, manager_id: str, level: BackpressureLevel, delay_ms: int, hold_seconds: float
+    ) -> None:
+        """Record a manager's current signal, NONE included, holding for
+        ``hold_seconds`` (AD-23/AD-37: the worker returns to NO_BACKPRESSURE
+        once every manager clears).
 
-    def apply_manager_backpressure(self, manager_id: str, level: BackpressureLevel, delay_ms: int) -> None:
-        """Record a manager's current signal, NONE included, and take the
-        delay as the largest any manager currently asks for (AD-23/AD-37:
-        the worker returns to NO_BACKPRESSURE once every manager clears)."""
+        A signal is a lease, as a TCP zero window is (RFC 9293 section
+        3.8.6.1, the persist timer): only the manager's next ack renews it,
+        and under REJECT the worker drops the progress those acks answer. A
+        REJECT that held until renewed never lapsed -- the worker sent
+        nothing more to hear the manager clear, stayed REJECT idle after the
+        load that caused it, and reported itself overloaded to the next job.
+        Holding for the backoff its level imposes, it lapses, the worker
+        sends again, and the answer renews or clears it."""
         self._manager_backpressure[manager_id] = level
         self._manager_backpressure_delay_ms[manager_id] = delay_ms
-        self._backpressure_delay_ms = max(self._manager_backpressure_delay_ms.values())
+        self._manager_backpressure_expires_at[manager_id] = _DEFAULT_CLOCK.monotonic() + hold_seconds
 
     def remove_manager_backpressure(self, manager_id: str) -> None:
         """Forget a removed manager's signal so its last level stops counting."""
         self._manager_backpressure.pop(manager_id, None)
         self._manager_backpressure_delay_ms.pop(manager_id, None)
-        self._backpressure_delay_ms = max(self._manager_backpressure_delay_ms.values(), default=0)
+        self._manager_backpressure_expires_at.pop(manager_id, None)
 
     def get_backpressure_delay_ms(self) -> int:
-        """Get current backpressure delay."""
-        return self._backpressure_delay_ms
+        """The largest delay among the managers' signals still holding."""
+        return max(
+            (
+                self._manager_backpressure_delay_ms.get(manager_id, 0)
+                for manager_id in self._held_backpressure_managers()
+            ),
+            default=0,
+        )
+
+    def _held_backpressure_managers(self) -> list[str]:
+        """The managers whose last signal still holds; a signal set
+        without a hold (``set_manager_backpressure``) holds until replaced."""
+        now = _DEFAULT_CLOCK.monotonic()
+        return [
+            manager_id
+            for manager_id in self._manager_backpressure
+            if self._manager_backpressure_expires_at.get(manager_id, math.inf) > now
+        ]
 
     # =========================================================================
     # Progress Buffer (AD-37)

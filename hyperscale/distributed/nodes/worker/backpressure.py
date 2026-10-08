@@ -172,14 +172,6 @@ class WorkerBackpressureManager:
         """
         return self._state.get_max_backpressure_level()
 
-    def set_backpressure_delay_ms(self, delay_ms: int) -> None:
-        """
-        Set backpressure delay from manager.
-
-        Delegates to WorkerState (single source of truth).
-        """
-        self._state.set_backpressure_delay_ms(delay_ms)
-
     def get_backpressure_delay_ms(self) -> int:
         """
         Get current backpressure delay.
@@ -230,9 +222,13 @@ class WorkerBackpressureManager:
 
         Returns delay in seconds based on backpressure state.
         """
-        level = self.get_max_backpressure_level()
-        delay_ms = self.get_backpressure_delay_ms()
+        return self.hold_seconds(self.get_max_backpressure_level(), self.get_backpressure_delay_ms())
 
+    def hold_seconds(self, level: BackpressureLevel, delay_ms: int) -> float:
+        """How long a manager's ``level`` signal (with its ``delay_ms``)
+        holds: the backoff that level imposes (AD-37), none for NONE. After
+        it the worker sends again, and the manager's answer renews or clears
+        the signal (``WorkerState.apply_manager_backpressure``)."""
         if level == BackpressureLevel.NONE:
             return 0.0
         delay_multiplier, minimum_delay_ms = self._throttle_delay_parameters(level)

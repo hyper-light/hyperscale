@@ -428,6 +428,7 @@ class WorkerServer(HealthAwareServer):
             registry=self._registry,
             state=self._worker_state,
             config=self._config,
+            backpressure_hold_seconds=self._backpressure_manager.hold_seconds,
             logger=self._udp_logger,
         )
 

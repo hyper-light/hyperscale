@@ -18,11 +18,22 @@ from hyperscale.distributed.env import Env
 from hyperscale.distributed.models import WorkflowFinalResult
 from hyperscale.distributed.nodes.worker import worker_progress_reporter
 from hyperscale.distributed.nodes.worker.models.worker_config import WorkerConfig
+from hyperscale.distributed.nodes.worker.backpressure import WorkerBackpressureManager
 from hyperscale.distributed.nodes.worker.progress import WorkerProgressReporter
 
 SETTINGS = Env()
 # Longer than any age a result was ever kept for.
 ISOLATION_SECONDS = 3600.0
+
+
+def backpressure_hold_policy(env: Env):
+    """The worker's hold policy for a manager's signal, configured from Env."""
+    return WorkerBackpressureManager(
+        state=None,
+        throttle_delay_ms=env.WORKER_BACKPRESSURE_THROTTLE_DELAY_MS,
+        batch_delay_ms=env.WORKER_BACKPRESSURE_BATCH_DELAY_MS,
+        reject_delay_ms=env.WORKER_BACKPRESSURE_REJECT_DELAY_MS,
+    ).hold_seconds
 
 
 class SteppedClock:
@@ -42,7 +53,12 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> SteppedClock:
 
 def reporter() -> WorkerProgressReporter:
     config = WorkerConfig.from_env(SETTINGS, host="127.0.0.1", tcp_port=9000, udp_port=9001)
-    return WorkerProgressReporter(registry=SimpleNamespace(), state=SimpleNamespace(), config=config)
+    return WorkerProgressReporter(
+        registry=SimpleNamespace(),
+        state=SimpleNamespace(),
+        config=config,
+        backpressure_hold_seconds=backpressure_hold_policy(SETTINGS),
+    )
 
 
 def final_result() -> WorkflowFinalResult:

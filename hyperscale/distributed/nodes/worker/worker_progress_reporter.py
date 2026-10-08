@@ -4,7 +4,7 @@
 from typing import TYPE_CHECKING
 import asyncio
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from hyperscale.distributed.models import (
     RateLimitResponse,
     WorkflowFinalResult,
@@ -81,12 +81,17 @@ class WorkerProgressReporter:
         registry: "WorkerRegistry",
         state: "WorkerState",
         config: "WorkerConfig",
+        backpressure_hold_seconds: Callable[[BackpressureLevel, int], float],
         logger: "Logger | None" = None,
         task_runner_run: RunTask | None = None,
     ) -> None:
         self._registry: "WorkerRegistry" = registry
         self._state: "WorkerState" = state
         self._config: "WorkerConfig" = config
+        # How long a manager's backpressure signal holds before the worker
+        # sends again to hear it renewed or cleared
+        # (``WorkerBackpressureManager.hold_seconds``).
+        self._backpressure_hold_seconds: Callable[[BackpressureLevel, int], float] = backpressure_hold_seconds
         self._logger: "Logger | None" = logger
         self._task_runner_run: RunTask | None = task_runner_run
         self._pending_results: deque[PendingResult] = deque(
@@ -1165,10 +1170,12 @@ class WorkerProgressReporter:
         """Apply an ack's backpressure signal (AD-23), NONE included: a
         manager's release must reach the worker, or the level and delay
         stay at their peak (base 2e6d0532 ``worker_progress_reporter.py:1168-1180``)."""
+        level = BackpressureLevel(ack.backpressure_level)
         self._state.apply_manager_backpressure(
             ack.manager_id,
-            BackpressureLevel(ack.backpressure_level),
+            level,
             ack.backpressure_delay_ms,
+            self._backpressure_hold_seconds(level, ack.backpressure_delay_ms),
         )
 
     def _log_unparsed_progress_ack(self, data: bytes, error: Exception) -> None:

@@ -17,9 +17,24 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.worker import backpressure as backpressure_module
 from hyperscale.distributed.nodes.worker.backpressure import WorkerBackpressureManager
+from hyperscale.distributed.nodes.worker.state import WorkerState
 from hyperscale.distributed.reliability import BackpressureLevel
+
+
+def _real_state() -> WorkerState:
+    """A real WorkerState: a manager's signal is set as an ack sets it."""
+    return WorkerState(
+        core_allocator=MagicMock(),
+        throughput_interval_seconds=Env().WORKER_THROUGHPUT_INTERVAL_SECONDS,
+        completion_times_max_samples=Env().WORKER_COMPLETION_TIMES_MAX_SAMPLES,
+    )
+
+
+# Longer than any test here runs: the signal holds throughout.
+HOLD_SECONDS = 3600.0
 
 
 def _create_mock_state():
@@ -147,12 +162,12 @@ class TestWorkerBackpressureManagerBackpressureTracking:
         level = manager.get_max_backpressure_level()
         assert level == BackpressureLevel.BATCH  # BATCH > THROTTLE
 
-    def test_set_backpressure_delay_ms(self):
-        """Test setting backpressure delay."""
-        state = _create_mock_state()
+    def test_backpressure_delay_is_the_managers_signal(self):
+        """A manager's signalled delay is the worker's delay while it holds."""
+        state = _real_state()
         manager = WorkerBackpressureManager(state)
 
-        manager.set_backpressure_delay_ms(500)
+        state.apply_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE, 500, HOLD_SECONDS)
 
         assert manager.get_backpressure_delay_ms() == 500
 
@@ -273,40 +288,36 @@ class TestWorkerBackpressureManagerThrottleDelay:
 
     def test_get_throttle_delay_throttle(self):
         """Test throttle delay with THROTTLE level."""
-        state = _create_mock_state()
+        state = _real_state()
         manager = WorkerBackpressureManager(state)
-        manager.set_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE)
-        manager.set_backpressure_delay_ms(0)
+        state.apply_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE, 0, HOLD_SECONDS)
 
         delay = manager.get_throttle_delay_seconds()
         assert delay == 0.5  # Default 500ms
 
     def test_get_throttle_delay_throttle_with_delay(self):
         """Test throttle delay with THROTTLE level and suggested delay."""
-        state = _create_mock_state()
+        state = _real_state()
         manager = WorkerBackpressureManager(state)
-        manager.set_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE)
-        manager.set_backpressure_delay_ms(1000)
+        state.apply_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE, 1000, HOLD_SECONDS)
 
         delay = manager.get_throttle_delay_seconds()
         assert delay == 1.0  # 1000ms
 
     def test_get_throttle_delay_batch(self):
         """Test throttle delay with BATCH level."""
-        state = _create_mock_state()
+        state = _real_state()
         manager = WorkerBackpressureManager(state)
-        manager.set_manager_backpressure("mgr-1", BackpressureLevel.BATCH)
-        manager.set_backpressure_delay_ms(500)
+        state.apply_manager_backpressure("mgr-1", BackpressureLevel.BATCH, 500, HOLD_SECONDS)
 
         delay = manager.get_throttle_delay_seconds()
         assert delay == 1.0  # 500ms * 2
 
     def test_get_throttle_delay_reject(self):
         """Test throttle delay with REJECT level."""
-        state = _create_mock_state()
+        state = _real_state()
         manager = WorkerBackpressureManager(state)
-        manager.set_manager_backpressure("mgr-1", BackpressureLevel.REJECT)
-        manager.set_backpressure_delay_ms(500)
+        state.apply_manager_backpressure("mgr-1", BackpressureLevel.REJECT, 500, HOLD_SECONDS)
 
         delay = manager.get_throttle_delay_seconds()
         assert delay == 2.0  # 500ms * 4
