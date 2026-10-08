@@ -59,6 +59,15 @@ ELECTION_TIMEOUT_MIN: float = 0.150
 ELECTION_TIMEOUT_MAX: float = 0.300
 HEARTBEAT_INTERVAL: float = 0.050
 
+# How a Raft state write that did not complete is reported, by whether it
+# was cancelled. A cancelled write -- a node shutting down, a cancelled
+# caller -- may or may not have reached disk, so the member leaves the
+# group all the same; but nothing failed, so it is no error.
+_UNWRITTEN_STATE_REPORTS: dict[bool, tuple[type[RaftWarning] | type[RaftError], str]] = {
+    True: (RaftWarning, "Raft state write cancelled; this member left the group"),
+    False: (RaftError, "Raft state could not be written; this member left the group"),
+}
+
 
 class RaftNode:
     """
@@ -2098,7 +2107,9 @@ class RaftNode:
 
         A write that fails leaves memory ahead of disk: this member can
         no longer answer as itself, so the group stops here (fail-stop)
-        and the error goes on to the caller.
+        and the error goes on to the caller. A cancelled write stops the
+        group the same way -- it may or may not have reached disk -- and
+        is reported as a cancellation, below ERROR (``_UNWRITTEN_STATE_REPORTS``).
         """
         term = self._current_term
         voted_for = self._voted_for
@@ -2132,8 +2143,14 @@ class RaftNode:
                 await self._storage.write(records)
             except BaseException as storage_error:
                 self.destroy()
-                await self._logger.log(RaftError(
-                    message=f"Raft state could not be written; this member left the group: {storage_error}",
+                # One handler, reports picked by table: this path runs per
+                # heartbeat, so it gains no branch (complexity ratchet) and
+                # no call.
+                unwritten_state_report, unwritten_state_message = _UNWRITTEN_STATE_REPORTS[
+                    isinstance(storage_error, asyncio.CancelledError)
+                ]
+                await self._logger.log(unwritten_state_report(
+                    message=f"{unwritten_state_message}: {storage_error!r}",
                     node_id=self._node_id,
                     job_id=self._job_id,
                     term=term,

@@ -8,6 +8,7 @@ import math
 import os
 import shutil
 import signal
+import stat
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -22,6 +23,7 @@ from typing import (
     TypeVar,
 )
 
+from hyperscale.logging.streams.regular_file_stream_writer import RegularFileStreamWriter
 from hyperscale.ui.state import Action, ActionData, SubscriptionSet, observe
 
 try:
@@ -361,27 +363,7 @@ class Terminal:
             self._loop = asyncio.get_event_loop()
 
         self._stdout = await self._dup_stdout()
-
-        transport, protocol = await self._loop.connect_write_pipe(
-            lambda: TerminalProtocol(),
-            self._stdout,
-        )
-
-        try:
-            if has_uvloop:
-                transport.close = patch_transport_close(transport, self._loop)
-
-        except Exception:
-            pass
-
-        self._transport = transport
-        self._protocol = protocol
-        self._writer = Writer(
-            transport,
-            protocol,
-            None,
-            self._loop,
-        )
+        self._writer = await self._create_writer(self._stdout)
 
         width: int | None = None
         height: int | None = None
@@ -663,6 +645,39 @@ class Terminal:
             if sig and sig_handler:
                 signal.signal(sig, sig_handler)
 
+    async def _create_writer(self, stdout: io.TextIOWrapper) -> Writer | RegularFileStreamWriter:
+        """A writer for the duplicated stdout: asyncio's pipe transport for a
+        pipe, socket or terminal, or a buffered off-loop writer for a
+        regular file (``> run.log``), which the pipe transport rejects."""
+        stdout_mode = (await self._loop.run_in_executor(None, os.fstat, stdout.fileno())).st_mode
+        if stat.S_ISREG(stdout_mode):
+            return RegularFileStreamWriter(stdout.fileno(), self._loop)
+
+        return await self._create_pipe_writer(stdout)
+
+    async def _create_pipe_writer(self, stdout: io.TextIOWrapper) -> Writer:
+        """A writer over asyncio's pipe transport for the duplicated stdout."""
+        transport, protocol = await self._loop.connect_write_pipe(
+            lambda: TerminalProtocol(),
+            stdout,
+        )
+
+        try:
+            if has_uvloop:
+                transport.close = patch_transport_close(transport, self._loop)
+
+        except Exception:
+            pass
+
+        self._transport = transport
+        self._protocol = protocol
+        return Writer(
+            transport,
+            protocol,
+            None,
+            self._loop,
+        )
+
     async def close(self):
         """Release what the terminal holds past stop() or abort(): its
         components' subscriptions to the actions, and its duplicate of
@@ -675,6 +690,9 @@ class Terminal:
         # wrote: its process may exit right after.
         self._writer.close()
         await self._writer.wait_closed()
+        # A pipe transport closed the duplicate with itself (closing it
+        # again does nothing); a regular file's writer does not own it.
+        self._stdout.close()
 
     def _register_signal_handlers(self):
         self._loop.add_signal_handler(signal.SIGWINCH, self._on_resize_signal)

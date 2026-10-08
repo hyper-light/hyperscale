@@ -194,6 +194,35 @@ A secret shorter than 16 characters, or a known weak or default value such as `h
 ___________
 
 
+## <b>Running in GitHub Actions</b>
+
+The Hyperscale action installs Hyperscale and runs `hyperscale run workflow [OPTIONS...] <path>` in your pipeline, with CI output and one worker per CPU the runner gives the job. A run that does not complete fails the step.
+
+```yaml
+- uses: actions/checkout@v4
+- uses: hyper-light/hyperscale@main
+  with:
+    workflow: tests/load/test_api.py
+```
+
+To run on a Hyperscale cluster instead of the runner, name its managers (or gates) and pass the cluster's secret from a repository secret:
+
+```yaml
+- uses: hyper-light/hyperscale@main
+  with:
+    workflow: tests/load/test_api.py
+    managers: manager-1.internal:9000 manager-2.internal:9000
+    host: ${{ env.RUNNER_ADDRESS }}
+    auth-secret: ${{ secrets.HYPERSCALE_AUTH_SECRET }}
+```
+
+Other inputs: `workers`, `name`, `config`, `log-level`, `gates`, `args` (any other `run workflow` options), `working-directory` (where results and logs are written), `version`, `extras` (for example `playwright`), `with` (packages your test file imports), `python-version`, and `install-browsers` for Playwright workflows. See [action.yml](action.yml).
+
+<br/>
+
+___________
+
+
 ## <b>Running in Docker</b>
 
 Hyperscale offers a Docker image that allows you to create and run tests in any Docker compatible environment. To run the Hyperscale Docker image run:

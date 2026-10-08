@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import inspect
+import pickle
 from types import MethodType
 import time
 
@@ -27,12 +28,15 @@ from typing import (
     Tuple,
 )
 
+import cloudpickle
 import networkx
 
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models import (
+    JobContext,
+    WorkflowJob,
     WorkflowThrottleUpdate,
     CancellationUpdate,
     InstanceRoleType,
@@ -45,6 +49,7 @@ from hyperscale.core.jobs.models import (
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.protocols.node_id_derivation import derive_protocol_node_id
+from hyperscale.core.jobs.protocols.restricted_unpickler import SecurityError, restricted_loads
 from hyperscale.core.jobs.workers import Provisioner, StagePriority
 from hyperscale.core.runtime import TransportFactory
 from hyperscale.core.state import (
@@ -1052,6 +1057,10 @@ class RemoteGraphManager:
                     threads,
                 )
 
+                # A workflow its workers would refuse fails here, at once,
+                # saying why -- not as a submission no worker answers.
+                self._refuse_an_unloadable_workflow(run_id, workflow, loaded_context)
+
                 # The run's time budget starts at submission: setup and the
                 # synchronized start count against it, as setup always has.
                 submitted_at = _DEFAULT_MONOTONIC_SOURCE()
@@ -1336,6 +1345,34 @@ class RemoteGraphManager:
 
         except Exception as err:
             raise err
+
+    def _refuse_an_unloadable_workflow(self, run_id: int, workflow: Workflow, context: Context) -> None:
+        """
+        Raise if the workflow's workers would refuse to load it.
+
+        A workflow travels to its workers pickled, and they load it with the
+        restricted unpickler, refusing what it blocks (a ``pathlib.Path`` the
+        test file holds, for one). A refused message cannot be told apart
+        from any other -- its request id is inside it -- so the worker's
+        error reply answers no request and the submission only times out.
+        Leader and workers share the unpickler, so the leader loads the
+        workflow as its workers will, before submitting it.
+        """
+        try:
+            restricted_loads(
+                cloudpickle.dumps(
+                    JobContext(WorkflowJob(workflow, context, workflow.vus), run_id=run_id),
+                    pickle.HIGHEST_PROTOCOL,
+                )
+            )
+
+        except SecurityError as refusal:
+            raise SecurityError(
+                f"Workflow {workflow.name} cannot run: its workers refuse to load it ({refusal}). "
+                "Workflows reach their workers pickled and are loaded with a restricted unpickler; "
+                "keep the refused value out of the workflow and the module globals its steps use "
+                "(use a str for a path)."
+            ) from refusal
 
     async def _wait_for_workflow_completion(
         self,

@@ -1503,7 +1503,7 @@ EXPECTED_COMPLEXITY_VIOLATIONS: dict[str, int] = {
     'hyperscale/ui/components/terminal/terminal.py::Terminal.__init__': 15,
     'hyperscale/ui/components/terminal/terminal.py::Terminal._execute_render_loop': 7,
     'hyperscale/ui/components/terminal/terminal.py::Terminal._handle_keyboard_interrupt': 4,
-    'hyperscale/ui/components/terminal/terminal.py::Terminal._initialize_canvas': 10,
+    'hyperscale/ui/components/terminal/terminal.py::Terminal._initialize_canvas': 8,
     'hyperscale/ui/components/terminal/terminal.py::Terminal._reset_signal_handlers': 4,
     'hyperscale/ui/components/terminal/terminal.py::Terminal.abort': 5,
     'hyperscale/ui/components/terminal/terminal.py::Terminal.pause': 5,

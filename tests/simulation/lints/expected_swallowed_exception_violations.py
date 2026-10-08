@@ -219,7 +219,7 @@ EXPECTED_SWALLOWED_EXCEPTION_VIOLATIONS: dict[str, int] = {
     'hyperscale/ui/components/scatter_plot/plotille/_input_formatter.py::InputFormatter.__init__': 1,
     'hyperscale/ui/components/terminal/terminal.py::Terminal._execute_render_loop': 2,
     'hyperscale/ui/components/terminal/terminal.py::Terminal._handle_keyboard_interrupt': 1,
-    'hyperscale/ui/components/terminal/terminal.py::Terminal._initialize_canvas': 1,
+    'hyperscale/ui/components/terminal/terminal.py::Terminal._create_pipe_writer': 1,
     'hyperscale/ui/components/terminal/terminal.py::Terminal.abort': 2,
     'hyperscale/ui/components/terminal/terminal.py::Terminal.pause': 2,
     'hyperscale/ui/components/terminal/terminal.py::Terminal.stop': 2,

@@ -5143,10 +5143,32 @@ class ManagerServer(HealthAwareServer):
         refused): there is no job to keep, so its state is cleaned up.
         """
         if known_status is None or not job.workflows:
-            await self._cleanup_job_state(job.job_id)
+            await self._drop_or_take_over_unheld_job_copy(job, known_status)
             return
         await self._apply_settled_job_copy_status(job, known_status, current_time)
         await self._raft.consensus.destroy_job_raft(job.job_id)
+
+    async def _drop_or_take_over_unheld_job_copy(self, job: JobInfo, known_status: str | None) -> None:
+        """
+        Settle a copy its leader holds no record of, or one never admitted.
+
+        Admitted (it has workflows), unknown where it is led, and not shown
+        ended by the replicated ledger: the leader lost it -- restarted
+        without it, or came back with no disk -- while its workers may
+        still run it. Dropped, the job had no leader and timed out with its
+        results unread. The cluster leader takes it over, fenced, as it
+        does a dead leader's job; other managers keep their copy for it. A
+        job never admitted, or settled with no workflows, is cleaned up.
+        """
+        if known_status is None and job.workflows:
+            await self._take_over_lost_job(job.job_id)
+            return
+        await self._cleanup_job_state(job.job_id)
+
+    async def _take_over_lost_job(self, job_id: str) -> None:
+        """Take a job its leader lost over, when this manager leads the cluster."""
+        if self.is_leader():
+            await self._take_over_job_of_failed_leader(job_id)
 
     @staticmethod
     async def _apply_settled_job_copy_status(
@@ -12427,6 +12449,7 @@ class ManagerServer(HealthAwareServer):
             total_failed=total_failed,
             overall_rate=overall_rate,
             elapsed_seconds=job.elapsed_seconds(),
+            leader_node_id=self._node_id.full if self._leases.is_job_leader(job_id) else "",
         )
 
     async def _ledger_job_status(self, job_id: str) -> GlobalJobStatus | None:
@@ -13739,15 +13762,37 @@ class ManagerServer(HealthAwareServer):
             return False
         return None
 
-    @staticmethod
+    @classmethod
     def _recovered_job_holders(
+        cls,
         peer_addresses: list[tuple[str, int]],
         answers: list[bytes | None],
     ) -> list[tuple[str, int]]:
-        """The peers whose answer shows they hold the recovered job."""
+        """The peers whose answer shows the recovered job is theirs: they
+        lead it (they took it over) or it already ended there. A peer
+        answering from a replica of the job this manager led does not hold
+        it: relinquished to a replica, the job had no leader, and the
+        replicas, asking this manager, heard it had no such job and dropped
+        theirs."""
+        status_order = JobStatusOrder()
         return [
-            peer_address for peer_address, answer in zip(peer_addresses, answers) if answer
+            peer_address
+            for peer_address, answer in zip(peer_addresses, answers)
+            if cls._answer_holds_recovered_job(answer, status_order)
         ]
+
+    @classmethod
+    def _answer_holds_recovered_job(cls, answer: bytes | None, status_order: JobStatusOrder) -> bool:
+        """Whether a peer answered at all, naming itself the job's leader
+        or the job ended (an empty answer: it holds no such job)."""
+        return bool(answer) and cls._status_holds_recovered_job(GlobalJobStatus.load(answer), status_order)
+
+    @staticmethod
+    def _status_holds_recovered_job(status: GlobalJobStatus, status_order: JobStatusOrder) -> bool:
+        """Whether a peer's status names it the job's leader, or the job
+        ended. Read with a default: a peer not yet upgraded sends no
+        ``leader_node_id``, and an unset slot raises."""
+        return bool(getattr(status, "leader_node_id", "")) or status_order.is_terminal(status.status)
 
     async def _relinquish_recovered_job(self, job_id: str, holder: tuple[str, int]) -> None:
         """Relinquish a recovered job a peer holds: close its record here, discard its payload, and log it."""

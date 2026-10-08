@@ -47,3 +47,8 @@ class RegularFileStreamWriter:
 
     def close(self) -> None:
         self._closing = True
+
+    async def wait_closed(self) -> None:
+        """Write what was buffered before ``close()``, as a closed transport
+        flushes before its process may exit."""
+        await self.drain()

@@ -270,11 +270,24 @@ async def run_locally(
 
 def local_outcome(name: str, result: RunResults | BaseException) -> RunOutcome:
     """A local run's outcome: completed, with each workflow's final
-    results (those its reporters were given), or the error it ended on."""
+    results (those its reporters were given); failed, with each workflow
+    that raised or timed out and why; or the error it ended on."""
     if isinstance(result, BaseException):
         return RunOutcome(f"{name}: failed: {type(result).__name__}: {result}", FAILED_EXIT_STATUS)
 
+    if failed_workflows := failed_workflows_line(result):
+        return RunOutcome(f"{name}: failed: {failed_workflows}", FAILED_EXIT_STATUS, local_workflow_stats(result))
+
     return RunOutcome(f"{name}: completed", 0, local_workflow_stats(result))
+
+
+def failed_workflows_line(result: RunResults) -> str:
+    """Each workflow of the run that raised or timed out, with its error,
+    in workflow-name order; empty when none did."""
+    return "; ".join(
+        f"workflow {workflow_name}: {type(workflow_error).__name__}: {workflow_error}"
+        for workflow_name, workflow_error in sorted(result.get("timeouts", {}).items())
+    )
 
 
 def local_workflow_stats(result: RunResults) -> dict[str, WorkflowStats]:
