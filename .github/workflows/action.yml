@@ -1,0 +1,49 @@
+name: Action
+
+# Runs the repository's own GitHub Action (action.yml) the way a user's
+# pipeline would: installed from this checkout, against a local server.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: Action smoke run
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel and builds from
+        # source, which needs krb5-config (libkrb5-dev).
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
+      - name: Start a local target
+        run: |
+          mkdir -p "$RUNNER_TEMP/site"
+          echo "hello hyperscale" > "$RUNNER_TEMP/site/index.html"
+          (cd "$RUNNER_TEMP/site" && nohup python3 -m http.server 8000 >/dev/null 2>&1 &)
+          for attempt in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/ >/dev/null && exit 0
+            sleep 1
+          done
+          echo "the local target never answered" >&2
+          exit 1
+      - name: Run the smoke workflow through the action
+        id: hyperscale
+        uses: ./
+        with:
+          package: "."
+          workflow: .github/hyperscale-action/smoke_workflow.py
+          name: smoke
+          working-directory: ${{ runner.temp }}
+      - name: The run completed and wrote its results
+        env:
+          EXIT_CODE: ${{ steps.hyperscale.outputs.exit-code }}
+        run: |
+          test "$EXIT_CODE" = "0"
+          test -s "$RUNNER_TEMP/workflow_results.json"
+          test -s "$RUNNER_TEMP/step_results.json"

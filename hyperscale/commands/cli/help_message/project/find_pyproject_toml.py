@@ -1,4 +1,6 @@
+import importlib.metadata
 import inspect
+import json
 from pathlib import Path
 import tomllib as toml
 
@@ -6,12 +8,51 @@ import tomllib as toml
 PYPROJECT_TABLE_NAME = "project-paths"
 
 
-def find_caller_relative_path_to_pyproject() -> Path:
+def find_caller_relative_path_to_pyproject() -> dict:
+    """
+    The calling module's project metadata, as a pyproject.toml holds it.
+
+    An installed project answers from its distribution's metadata: an
+    installed package has no pyproject.toml above it, and the nearest one
+    above a virtual environment is whichever project it sits in. An editable
+    install's metadata is as old as the install, so it -- like code that is
+    not installed -- answers from the pyproject.toml found by walking up from
+    the source.
+    """
+    mod_name, _ = _find_caller_module_name_and_file()
+    top_level_package = mod_name.partition(".")[0]
+    distribution = next(
+        (
+            importlib.metadata.distribution(distribution_name)
+            for distribution_name in importlib.metadata.packages_distributions().get(top_level_package, [])
+        ),
+        None,
+    )
+    if _answers_from_metadata(distribution):
+        distribution_metadata = distribution.metadata
+        return {
+            "project": {
+                "name": distribution_metadata["Name"],
+                "version": distribution_metadata["Version"],
+            }
+        }
+
     pyproject_toml_path = _get_pyproject_toml_path()
 
     pyproject_toml = _parse_pyproject_toml(pyproject_toml_path)
 
     return pyproject_toml
+
+def _answers_from_metadata(distribution: importlib.metadata.Distribution | None) -> bool:
+    """Whether ``distribution`` -- the calling module's, if it is installed --
+    answers from its metadata: installed, and not editable (PEP 660's
+    direct_url.json)."""
+    if distribution is None:
+        return False
+
+    direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
+    return not direct_url.get("dir_info", {}).get("editable", False)
+
 
 def _get_pyproject_toml_path() -> Path:
     """

@@ -1,0 +1,151 @@
+name: Hyperscale
+description: Install Hyperscale and run a test workflow -- `hyperscale run workflow [OPTIONS...] <path>` -- locally on the runner or as a job on a Hyperscale cluster.
+author: hyper-light
+branding:
+  icon: activity
+  color: blue
+
+inputs:
+  workflow:
+    description: Path to the test file (a Python file defining one or more Workflow classes), relative to the repository root.
+    required: true
+  workers:
+    description: Worker processes for a local run. Empty uses every CPU available to the runner.
+    default: ""
+  name:
+    description: The run's name (--name).
+    default: default
+  config:
+    description: Path to a .hyperscale.json config file (--config), relative to the repository root.
+    default: ""
+  log-level:
+    description: Log level for the run's log files (--log-level).
+    default: fatal
+  managers:
+    description: Space-separated host:port of one datacenter's managers, to run on a cluster instead of the runner (--managers).
+    default: ""
+  gates:
+    description: Space-separated host:port of a cluster's gates, to run through them (--gates).
+    default: ""
+  host:
+    description: The address the cluster pushes the run's progress to, reachable from the cluster (--host; cluster runs).
+    default: ""
+  auth-secret:
+    description: The cluster's shared secret (cluster runs). Pass it from a repository secret; local runs generate their own.
+    default: ""
+  args:
+    description: Any other `hyperscale run workflow` options, appended as given.
+    default: ""
+  working-directory:
+    description: Where the run executes -- its results and logs are written there -- relative to the repository root.
+    default: "."
+  package:
+    description: What to install Hyperscale from -- a PyPI name, or a local path such as ".".
+    default: hyperscale
+  version:
+    description: The Hyperscale version to install from PyPI (for example "0.8.0"). Empty installs the latest release.
+    default: ""
+  extras:
+    description: Comma-separated Hyperscale extras the test file's clients need (for example "playwright,grpc").
+    default: ""
+  with:
+    description: Space-separated extra packages the test file imports, installed beside Hyperscale.
+    default: ""
+  python-version:
+    description: The Python version to run Hyperscale on (3.12 or later).
+    default: "3.13"
+  install-browsers:
+    description: Install Playwright's Chromium and its system dependencies, for browser workflows (needs the "playwright" extra).
+    default: "false"
+
+outputs:
+  exit-code:
+    description: The run's exit status (0 when it completed).
+    value: ${{ steps.run.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install Hyperscale
+      shell: bash
+      env:
+        HYPERSCALE_PACKAGE: ${{ inputs.package }}
+        HYPERSCALE_VERSION: ${{ inputs.version }}
+        HYPERSCALE_EXTRAS: ${{ inputs.extras }}
+        HYPERSCALE_WITH: ${{ inputs.with }}
+        HYPERSCALE_PYTHON: ${{ inputs.python-version }}
+      run: |
+        requirement="$HYPERSCALE_PACKAGE"
+        if [ -n "$HYPERSCALE_EXTRAS" ]; then
+          requirement="${requirement}[${HYPERSCALE_EXTRAS}]"
+        fi
+        if [ -n "$HYPERSCALE_VERSION" ]; then
+          requirement="${requirement}==${HYPERSCALE_VERSION}"
+        fi
+        with_arguments=()
+        for extra_package in $HYPERSCALE_WITH; do
+          with_arguments+=(--with "$extra_package")
+        done
+        uv tool install --python "$HYPERSCALE_PYTHON" "${with_arguments[@]}" "$requirement"
+
+    - name: Install Playwright's Chromium
+      if: inputs.install-browsers == 'true'
+      shell: bash
+      run: '"$(uv tool dir)/hyperscale/bin/playwright" install --with-deps chromium'
+
+    - name: Run the workflow
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKFLOW_PATH: ${{ inputs.workflow }}
+        RUN_WORKERS: ${{ inputs.workers }}
+        RUN_NAME: ${{ inputs.name }}
+        RUN_CONFIG: ${{ inputs.config }}
+        RUN_LOG_LEVEL: ${{ inputs.log-level }}
+        RUN_MANAGERS: ${{ inputs.managers }}
+        RUN_GATES: ${{ inputs.gates }}
+        RUN_HOST: ${{ inputs.host }}
+        RUN_ARGS: ${{ inputs.args }}
+        MERCURY_SYNC_AUTH_SECRET: ${{ inputs.auth-secret }}
+      run: |
+        # Paths are given from the repository root; the run may execute
+        # elsewhere (working-directory).
+        absolute_path() {
+          case "$1" in
+            /*) printf '%s' "$1" ;;
+            *) printf '%s' "$GITHUB_WORKSPACE/$1" ;;
+          esac
+        }
+        # Every CPU the runner gives the job (its affinity on Linux).
+        if [ -z "$RUN_WORKERS" ]; then
+          RUN_WORKERS="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu)"
+        fi
+        options=(--output-mode ci --workers "$RUN_WORKERS" --name "$RUN_NAME" --log-level "$RUN_LOG_LEVEL")
+        if [ -n "$RUN_CONFIG" ]; then
+          options+=(--config "$(absolute_path "$RUN_CONFIG")")
+        fi
+        if [ -n "$RUN_MANAGERS" ]; then
+          options+=(--managers $RUN_MANAGERS)
+        fi
+        if [ -n "$RUN_GATES" ]; then
+          options+=(--gates $RUN_GATES)
+        fi
+        if [ -n "$RUN_HOST" ]; then
+          options+=(--host "$RUN_HOST")
+        fi
+        # An empty secret is no secret: a local run generates its own.
+        if [ -z "$MERCURY_SYNC_AUTH_SECRET" ]; then
+          unset MERCURY_SYNC_AUTH_SECRET
+        fi
+        set +e
+        "$(uv tool dir --bin)/hyperscale" run workflow "${options[@]}" $RUN_ARGS "$(absolute_path "$WORKFLOW_PATH")"
+        exit_code=$?
+        set -e
+        echo "exit-code=$exit_code" >> "$GITHUB_OUTPUT"
+        exit "$exit_code"
