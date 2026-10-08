@@ -19,6 +19,7 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.worker.models.worker_config import WorkerConfig
+from hyperscale.distributed.nodes.worker.backpressure import WorkerBackpressureManager
 from hyperscale.distributed.nodes.worker.progress import WorkerProgressReporter
 from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
 from hyperscale.distributed.nodes.worker.state import WorkerState
@@ -45,6 +46,16 @@ class RecordingSendTcp:
         return self.response, 0.0
 
 
+def backpressure_hold_policy(env: Env):
+    """The worker's hold policy for a manager's signal, configured from Env."""
+    return WorkerBackpressureManager(
+        state=None,
+        throttle_delay_ms=env.WORKER_BACKPRESSURE_THROTTLE_DELAY_MS,
+        batch_delay_ms=env.WORKER_BACKPRESSURE_BATCH_DELAY_MS,
+        reject_delay_ms=env.WORKER_BACKPRESSURE_REJECT_DELAY_MS,
+    ).hold_seconds
+
+
 def make_reporter() -> tuple[WorkerProgressReporter, WorkerRegistry]:
     logger = MagicMock()
     logger.log = AsyncMock()
@@ -56,7 +67,16 @@ def make_reporter() -> tuple[WorkerProgressReporter, WorkerRegistry]:
     )
     state.set_workflow_job_leader(WORKFLOW_ID, JOB_LEADER_ADDR)
     config = WorkerConfig.from_env(env=Env(), host="127.0.0.1", tcp_port=9000, udp_port=9001)
-    return WorkerProgressReporter(registry=registry, state=state, config=config, logger=logger), registry
+    return (
+        WorkerProgressReporter(
+            registry=registry,
+            state=state,
+            config=config,
+            backpressure_hold_seconds=backpressure_hold_policy(Env()),
+            logger=logger,
+        ),
+        registry,
+    )
 
 
 def make_progress(completed_count: int) -> WorkflowProgress:

@@ -71,7 +71,7 @@ class TestWorkerStateInitialization:
         assert state._state_version == 0
         assert state._transfer_metrics_received == 0
         assert state._transfer_metrics_accepted == 0
-        assert state._backpressure_delay_ms == 0
+        assert state.get_backpressure_delay_ms() == 0
         assert state._throughput_completions == 0
 
 
@@ -512,13 +512,14 @@ class TestWorkerStateBackpressure:
         level = state.get_max_backpressure_level()
         assert level == BackpressureLevel.BATCH
 
-    def test_set_backpressure_delay_ms(self):
-        """Test setting backpressure delay."""
+    def test_backpressure_delay_is_the_largest_held_signal(self):
+        """The delay is the largest any manager's held signal asks for."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator, **WORKER_STATE_SETTINGS)
 
-        state.set_backpressure_delay_ms(500)
-        assert state.get_backpressure_delay_ms() == 500
+        state.apply_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE, 500, 3600.0)
+        state.apply_manager_backpressure("mgr-2", BackpressureLevel.BATCH, 800, 3600.0)
+        assert state.get_backpressure_delay_ms() == 800
 
 
 class TestWorkerStateThroughputTracking:
