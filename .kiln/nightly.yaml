@@ -1,0 +1,122 @@
+# Nightly simulation campaigns: kiln translation of the jobs .github/workflows/ci.yml
+# runs on its "0 7 * * *" cron (and on workflow_dispatch with swarm=nightly):
+# `vopr` and `vopr-swarm-nightly`. The test tiers that cron also re-ran are left
+# to ci.yaml, which already runs them on every push to main.
+#
+# Six 3-CPU / 6Gi pods (VOPR + one swarm leg per suite) fill the shared job quota
+# (18 CPU / 36Gi) for about three hours; jobs beyond it queue until a pod finishes.
+# No concurrency group on purpose: a manual run must not cancel a scheduled one.
+name: nightly
+
+on:
+  schedule: ["0 7 * * *"]
+  manual: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  # What astral-sh/setup-uv's `python-version` input does: pin uv's interpreter.
+  UV_PYTHON: "3.13"
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  vopr:
+    name: VOPR campaigns
+    # Wall-clock heavy: chaos schedules, gate tiers and soak horizons.
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 180
+    resources: { cpu: "3", memory: 6Gi }
+    env:
+      # The soak's default corpus (one 1800-virtual-second horizon, judge + replay
+      # twin, plus the kill-horizon pin) measured 57 s locally on 2026-10-07.
+      HYPERSCALE_SIM_SOAK: "1"
+    # A nightly chaos failure is the one run nobody watched, so its dump and seed
+    # are the only way back to it (uploaded whether the steps pass or fail).
+    artifacts: ["tests/simulation/_artifacts"]
+    steps:
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel: --all-extras builds it
+        # from source, which needs krb5-config (libkrb5-dev). Pods run as root.
+        run: apt-get update && apt-get install -y libkrb5-dev
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+      - name: Run VOPR and scenario suites
+        run: uv run pytest tests/simulation --ignore=tests/simulation/lints -q
+
+  # D-42 / F2: the standing seed swarm, one time-budgeted leg per suite. Every seed
+  # runs as its own --sim-replay invocation (tests/simulation/soak/run_swarm.py),
+  # so a failing seed never hides the rest, and every failure lands in a ledger
+  # (seed + commit + exact replay command) that the next run replays first until
+  # the seed passes. Budget = the 180-min job cap minus 10 min of setup.
+  vopr-swarm-nightly:
+    name: VOPR swarm (nightly)
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 180
+    resources: { cpu: "3", memory: 6Gi }
+    matrix:
+      suite: [vopr, vopr_gates, vopr_mdc, vopr_chaos, soak]
+    env:
+      SWARM_BUDGET_SECONDS: "10200"
+      SWARM_LEDGER: tests/simulation/_artifacts/swarm_failing_seeds.json
+      # GHA wrote this to $GITHUB_STEP_SUMMARY; here it is printed and uploaded.
+      SWARM_SUMMARY: tests/simulation/_artifacts/swarm_summary.md
+      # Stand-in for actions/cache restore/save: kiln has no cache step, so the
+      # ledger is kept on the shared build-cache volume mounted at /cache (where
+      # UV_CACHE_DIR lives). Best effort, like a cache miss: that volume is one
+      # directory per node, and without /cache the ledger simply starts empty.
+      SWARM_LEDGER_STORE: /cache/hyperscale-swarm-ledger
+    artifacts:
+      - tests/simulation/_artifacts/swarm_failing_seeds.json
+      - tests/simulation/_artifacts/swarm_seed_log.jsonl
+      - tests/simulation/_artifacts/swarm_summary.md
+      - tests/simulation/_artifacts/swarm
+    steps:
+      - name: Install system build dependencies
+        # procps too: run_swarm.py shells out to pgrep before taking its lock.
+        run: apt-get update && apt-get install -y libkrb5-dev procps
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+      - name: Restore failing-seed ledger
+        run: |
+          stored="$SWARM_LEDGER_STORE/${{ matrix.suite }}.json"
+          if [ -f "$stored" ]; then
+            mkdir -p "$(dirname "$SWARM_LEDGER")"
+            cp "$stored" "$SWARM_LEDGER"
+            echo "restored $stored:"
+            cat "$SWARM_LEDGER"
+          else
+            echo "no stored ledger for ${{ matrix.suite }}; starting empty"
+          fi
+      - name: Run the swarm
+        # The window starts where no earlier run's window reached: GHA used
+        # github.run_id; kiln's run id is a UUID, so the first seed is the run
+        # number times the window length (the window length is the budget in
+        # seconds -- no seed finishes under a second, so the budget ends the run).
+        # The ledger is saved in this step so it is kept when seeds fail (GHA:
+        # actions/cache/save with `if: !cancelled()`).
+        run: |
+          set +e
+          uv run python tests/simulation/soak/run_swarm.py \
+            --suites tests/simulation/${{ matrix.suite }} \
+            --first-seed "$(( KILN_RUN_NUMBER * SWARM_BUDGET_SECONDS ))" \
+            --count "$SWARM_BUDGET_SECONDS" \
+            --budget-seconds "$SWARM_BUDGET_SECONDS" \
+            --ledger "$SWARM_LEDGER" \
+            --summary-markdown "$SWARM_SUMMARY"
+          swarm_status=$?
+          set -e
+          cat "$SWARM_SUMMARY" 2>/dev/null || true
+          if [ -f "$SWARM_LEDGER" ] && [ -d "$(dirname "$SWARM_LEDGER_STORE")" ]; then
+            stored="$SWARM_LEDGER_STORE/${{ matrix.suite }}.json"
+            { mkdir -p "$SWARM_LEDGER_STORE" \
+                && cp "$SWARM_LEDGER" "$stored.tmp.$$" \
+                && mv -f "$stored.tmp.$$" "$stored" \
+                && echo "saved ledger to $stored"; } \
+              || echo "warning: could not save the ledger to $stored" >&2
+          fi
+          exit "$swarm_status"

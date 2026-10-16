@@ -1,0 +1,69 @@
+# kiln translation of .github/workflows/action.yml: run the repository's own
+# GitHub Action (the composite action.yml at the repo root) the way a user's
+# pipeline would -- installed from this checkout, against a local server.
+# kiln has no `uses:`, so the composite's steps are inlined with the inputs the
+# GHA job passed (package ".", the smoke workflow, name "smoke") and the
+# defaults it left (python-version 3.13, log-level fatal, workers = every CPU).
+name: action
+
+on:
+  push: { branches: [main] }
+  pull_request: {}
+  manual: true
+
+# Not "ci-...": kiln concurrency groups are scoped to the repository, not the
+# pipeline, so sharing ci.yaml's group would make the two pipelines that one
+# push starts cancel each other.
+concurrency: { group: "action-${{ branch }}", cancel-in-progress: true }
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  smoke:
+    name: Action smoke run
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 20
+    resources: { cpu: "2", memory: 4Gi }
+    env:
+      HYPERSCALE_PACKAGE: "."
+      HYPERSCALE_PYTHON: "3.13"
+      WORKFLOW_PATH: .github/hyperscale-action/smoke_workflow.py
+      RUN_NAME: smoke
+      RUN_LOG_LEVEL: fatal
+    steps:
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel and builds from source,
+        # which needs krb5-config (libkrb5-dev).
+        run: apt-get update && apt-get install -y libkrb5-dev
+      - name: Install Hyperscale (action.yml)
+        run: uv tool install --python "$HYPERSCALE_PYTHON" "$HYPERSCALE_PACKAGE"
+      - name: Run the smoke workflow against a local target
+        # One step on purpose: kiln reaps whatever a step leaves running when it
+        # exits, so a target started in an earlier step would already be gone.
+        # $TMPDIR/hyperscale-smoke stands in for $RUNNER_TEMP (the action's
+        # working-directory, where the run writes its results). A non-zero exit
+        # fails the step, which is what the GHA job's exit-code check asserted.
+        run: |
+          run_dir="$TMPDIR/hyperscale-smoke"
+          mkdir -p "$run_dir/site"
+          echo "hello hyperscale" > "$run_dir/site/index.html"
+          (cd "$run_dir/site" && nohup python3 -m http.server 8000 >/dev/null 2>&1 &)
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/ >/dev/null; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != 1 ]; then
+            echo "the local target never answered" >&2
+            exit 1
+          fi
+          cd "$run_dir"
+          "$(uv tool dir --bin)/hyperscale" run workflow \
+            --output-mode ci --workers "$(nproc)" --name "$RUN_NAME" --log-level "$RUN_LOG_LEVEL" \
+            "$KILN_WORKSPACE/$WORKFLOW_PATH"
+      - name: The run completed and wrote its results
+        run: |
+          test -s "$TMPDIR/hyperscale-smoke/workflow_results.json"
+          test -s "$TMPDIR/hyperscale-smoke/step_results.json"

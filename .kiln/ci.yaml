@@ -1,0 +1,111 @@
+# Test gate: kiln translation of .github/workflows/ci.yml (push / pull request /
+# manual), plus the build half of .github/workflows/release.yml.
+#
+# Tiers are separate jobs so a failure names itself: a red `lints` is a ratchet,
+# a red `units` is behavior, a red `simulation` is a determinism or timing
+# regression. Integration tests are deliberately absent -- they are run by hand
+# against real infrastructure.
+#
+# ci.yml's scheduled campaigns are their own pipelines (kiln cannot tell which
+# cron fired, and its `workflow_dispatch` has no inputs -- run the file instead):
+#   nightly.yaml  "0 7 * * *"   VOPR campaigns + time-budgeted seed swarm
+#   weekly.yaml   "0 12 * * 0"  fixed 500-seed swarm corpus, sharded
+# action.yaml reproduces .github/workflows/action.yml.
+# Not reproduced (secrets): release.yml's PyPI upload and Docker Hub image push,
+# fast-track-pypi.yml.
+name: ci
+
+on:
+  push: { branches: [main] }
+  pull_request: {}
+  manual: true
+
+concurrency: { group: "ci-${{ branch }}", cancel-in-progress: true }
+
+env:
+  PYTHON_VERSION: "3.13"
+  # What astral-sh/setup-uv's `python-version` input does: pin uv's interpreter.
+  UV_PYTHON: "3.13"
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  lints:
+    name: Ratchet lints
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 10
+    resources: { cpu: "2", memory: 4Gi }
+    steps:
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) ships no Linux wheel: --all-extras builds it
+        # from source, which needs krb5-config (libkrb5-dev). Pods run as root.
+        run: apt-get update && apt-get install -y libkrb5-dev
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+      - name: Run ratchet lints
+        # Invariants that cannot be unit tests: no raw asyncio.create_task, no
+        # direct time/random, no direct disk IO, no duplicate method definitions,
+        # no phantom attributes. Each fails in BOTH directions, so fixing a
+        # violation without shrinking its snapshot is also an error.
+        run: uv run pytest tests/simulation/lints -q
+
+  units:
+    name: Unit tier
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 45
+    resources: { cpu: "4", memory: 8Gi }
+    steps:
+      - name: Install system build dependencies
+        run: apt-get update && apt-get install -y libkrb5-dev
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+      - name: Install Chromium for the Playwright engine tests
+        run: uv run playwright install --with-deps chromium
+      - name: Run unit tests
+        run: uv run pytest tests/unit/core tests/unit/distributed tests/unit/logging -q
+
+  simulation:
+    name: Deterministic simulation
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 90
+    resources: { cpu: "4", memory: 8Gi }
+    # A failed scenario writes its dump -- including the seed that replays the run
+    # exactly -- under _artifacts/. kiln uploads artifacts after the steps whether
+    # they passed or failed (GHA: upload-artifact with `if: !cancelled()`).
+    artifacts: ["tests/simulation/_artifacts"]
+    steps:
+      - name: Install system build dependencies
+        run: apt-get update && apt-get install -y libkrb5-dev
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+      - name: Run multi-process SIM suite
+        # Real processes under the SimulationCoordinator's GRANT/REPORT lockstep,
+        # asserting on pinned simulated-time bounds: kept off the parallel runner,
+        # since xdist would let two scenarios contend for the machine-wide lock.
+        run: uv run pytest tests/unit/simulation -q
+
+  package:
+    # The build half of release.yml's publish_to_pypi (the upload needs
+    # PYPI_API_TOKEN): `uv build`, then the metadata check that
+    # pypa/gh-action-pypi-publish runs before uploading (verify-metadata).
+    name: Build sdist + wheel
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 15
+    resources: { cpu: "1", memory: 2Gi }
+    artifacts: ["dist/*"]
+    steps:
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+      - name: Build the sdist and wheel
+        run: uv build
+      - name: Check the distribution metadata
+        run: uvx twine check dist/*

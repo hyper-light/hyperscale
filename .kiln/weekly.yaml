@@ -1,0 +1,64 @@
+# Weekly fixed-corpus swarm: kiln translation of `vopr-swarm-weekly` from
+# .github/workflows/ci.yml (its "0 12 * * 0" cron, and workflow_dispatch with
+# swarm=weekly). The fixed corpus of 500 seeds per suite (seeds 1-500) runs in
+# five shards of 100. A shard that cannot finish inside the budget fails loudly
+# (--require-all) and lists its unrun seeds rather than passing short.
+#
+# 25 legs at 3 CPU / 6Gi: six run at a time under the shared job quota, the rest
+# queue for capacity (a leg's timeout starts when its pod starts, not when queued).
+# No concurrency group on purpose: a manual run must not cancel a scheduled one.
+name: weekly
+
+on:
+  schedule: ["0 12 * * 0"]
+  manual: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  # What astral-sh/setup-uv's `python-version` input does: pin uv's interpreter.
+  UV_PYTHON: "3.13"
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  vopr-swarm-weekly:
+    name: VOPR swarm (weekly)
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 180
+    resources: { cpu: "3", memory: 6Gi }
+    matrix:
+      suite: [vopr, vopr_gates, vopr_mdc, vopr_chaos, soak]
+      shard: [0, 1, 2, 3, 4]
+    env:
+      SWARM_BUDGET_SECONDS: "10200"
+      SWARM_SHARD_SEEDS: "100"
+      # GHA wrote this to $GITHUB_STEP_SUMMARY; here it is printed and uploaded.
+      SWARM_SUMMARY: tests/simulation/_artifacts/swarm_summary.md
+    artifacts:
+      - tests/simulation/_artifacts/swarm_failing_seeds.json
+      - tests/simulation/_artifacts/swarm_seed_log.jsonl
+      - tests/simulation/_artifacts/swarm_summary.md
+      - tests/simulation/_artifacts/swarm
+    steps:
+      - name: Install system build dependencies
+        # gssapi (hyperscale[ssh]) builds from source and needs krb5-config
+        # (libkrb5-dev); procps because run_swarm.py shells out to pgrep.
+        run: apt-get update && apt-get install -y libkrb5-dev procps
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+      - name: Run the shard
+        run: |
+          set +e
+          uv run python tests/simulation/soak/run_swarm.py \
+            --suites tests/simulation/${{ matrix.suite }} \
+            --first-seed "$(( 1 + ${{ matrix.shard }} * SWARM_SHARD_SEEDS ))" \
+            --count "$SWARM_SHARD_SEEDS" \
+            --budget-seconds "$SWARM_BUDGET_SECONDS" \
+            --require-all \
+            --summary-markdown "$SWARM_SUMMARY"
+          swarm_status=$?
+          set -e
+          cat "$SWARM_SUMMARY" 2>/dev/null || true
+          exit "$swarm_status"
